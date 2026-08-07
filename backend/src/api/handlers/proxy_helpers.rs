@@ -1167,6 +1167,34 @@ pub async fn proxy_check_cache(
     }
 }
 
+/// Normalise a recorded digest into a value the cache-commit gates can
+/// actually enforce (#2929).
+///
+/// Returns `Some(digest)` only for a bare lowercase 64-hex SHA-256. Anything
+/// else — a `sha256:`-prefixed value, an uppercase or truncated digest, an
+/// MD5/SHA-1, an empty string — yields `None`, meaning "no digest available",
+/// and the caller falls through to its previous unverified behaviour.
+///
+/// The permissive fallback is deliberate and load-bearing. The gates compare
+/// against the streamed/refetched SHA-256 in bare lowercase hex, so passing a
+/// differently-shaped value through would never match: the entry would be
+/// rejected on every fetch, nothing would ever cache, and every request would
+/// re-pull upstream. A digest we cannot compare against must degrade to the
+/// status quo, not to a permanent hard failure.
+pub(crate) fn normalize_expected_sha256(raw: &str) -> Option<String> {
+    let candidate = raw.trim();
+    if candidate.len() == 64 && candidate.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Reject uppercase/mixed case rather than lowercasing it: a value that
+        // is not already in the comparison's canonical form did not come from
+        // this codebase's hashing path, so treating it as authoritative would
+        // be a guess about its provenance.
+        if candidate.bytes().all(|b| !b.is_ascii_uppercase()) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
 /// Generic helper for remote proxy-backed cache reads.
 ///
 /// Tries `storage.get(storage_key)`. If it returns `AppError::NotFound`, the
@@ -1186,26 +1214,38 @@ pub async fn proxy_check_cache(
 /// client can retry later. Non-`NotFound` storage errors are propagated as 500
 /// responses so operators still see real backend failures.
 ///
-/// No production caller remains: this is the BUFFERED repair primitive, and every
-/// format handler whose repair path pulls an artifact body has moved to a
-/// streaming repair so a body larger than the buffered metadata ceiling is not
-/// 502'd (PyPI wheels via `get_remote_cached_or_refetch_stream`, #2192 / #1608
-/// Phase 4c; NuGet `.nupkg` via `proxy_v3_flatcontainer(.., streaming = true)`).
-/// It is retained — with its coverage below — as the cluster-coordinated
-/// (#1609) buffered form for a future caller whose payload is genuinely small;
-/// anything artifact-sized must use a streaming repair instead.
-#[allow(dead_code)]
+/// This is the BUFFERED repair primitive. A repair that does NOT need to verify
+/// what it pulled should prefer a streaming repair, so a body larger than the
+/// buffered ceiling is not 502'd (PyPI wheels via
+/// `get_remote_cached_or_refetch_stream`, #2192 / #1608 Phase 4c; NuGet
+/// `.nupkg` via `proxy_v3_flatcontainer(.., streaming = true)`).
+///
+/// A repair that DOES need to verify what it pulled has to buffer, and that is
+/// what `expected_sha256` is for (#2929). The digest of a streamed body is only
+/// known after its last byte has been forwarded, so a streaming repair can only
+/// discover a mismatch once the client already holds the bytes — aborting the
+/// transfer at that point leaves the client with a truncated file it may cache
+/// or retry into, which is a worse outcome than refusing the repair outright.
+/// Verify-then-serve is therefore the only shape that can honour the contract
+/// #2929 is about: `check_artifact_download` authorises on the artifact row, so
+/// the hash an admin reviewed when releasing that row from quarantine must be
+/// the hash the client actually receives. Callers taking this path accept the
+/// buffering cost and are expected to bound it (see the NuGet repair arm).
 pub(crate) async fn get_cached_or_refetch<F, Fut>(
     db: &PgPool,
     artifact_id: Uuid,
     storage: &dyn crate::storage::StorageBackend,
     storage_key: &str,
+    expected_sha256: Option<&str>,
     refetch: F,
 ) -> Result<Bytes, Response>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Bytes, Response>>,
 {
+    // #2929: the caller's authoritative digest for this artifact, when it has
+    // one in a shape the comparison can use. See `normalize_expected_sha256`.
+    let expected_sha256 = expected_sha256.and_then(normalize_expected_sha256);
     let hydration_lease_key = format!("artifact-repair:{}", storage_key);
     // #1609: single-flight the missing-file repair CLUSTER-WIDE (was per-process)
     // via the config-selected advisory-lock coordinator, so concurrent replicas
@@ -1228,6 +1268,42 @@ where
             );
 
             let bytes = refetch().await?;
+
+            // #2929: the repair refetch pulls fresh bytes from upstream (or
+            // from a warm proxy-cache object under a DIFFERENT key) and writes
+            // them back under THIS artifact row's storage key. Nothing
+            // previously compared them against the row's own
+            // `checksum_sha256`, so the row's recorded hash described a blob
+            // that no longer existed while a completely unrelated body was
+            // served and persisted in its place. That also made the quarantine
+            // control weaker than it looks: `check_artifact_download` authorises
+            // on the row, so an admin releasing an artifact from quarantine was
+            // approving a hash never enforced against what clients then receive.
+            //
+            // Fail the repair instead of persisting a mismatch. The object is
+            // NOT written back, so the entry stays missing and the next request
+            // retries — a transient bad upstream self-heals, and a persistently
+            // wrong one surfaces as a hard error rather than silent corruption.
+            if let Some(ref expected) = expected_sha256 {
+                let actual = crate::services::storage_service::StorageService::calculate_hash(&bytes);
+                if &actual != expected {
+                    tracing::warn!(
+                        target: "security",
+                        artifact_id = %artifact_id,
+                        storage_key = %storage_key,
+                        expected_sha256 = %expected,
+                        actual_sha256 = %actual,
+                        "refetched proxy payload does not match the artifact row's recorded \
+                         checksum; refusing to write it back or serve it"
+                    );
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        "refetched artifact failed checksum verification",
+                    )
+                        .into_response());
+                }
+            }
+
             if let Err(e) = storage.put(storage_key, bytes.clone()).await {
                 tracing::warn!(
                     artifact_id = %artifact_id,
@@ -7645,14 +7721,21 @@ mod tests {
                           start: StdArc<tokio::sync::Barrier>| {
             tokio::spawn(async move {
                 start.wait().await;
-                get_cached_or_refetch(&pool, artifact_id, storage.as_ref(), "proxy/test", || {
-                    let refetch_calls = refetch_calls.clone();
-                    async move {
-                        refetch_calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        Ok(Bytes::from_static(b"remote-bytes"))
-                    }
-                })
+                get_cached_or_refetch(
+                    &pool,
+                    artifact_id,
+                    storage.as_ref(),
+                    "proxy/test",
+                    None,
+                    || {
+                        let refetch_calls = refetch_calls.clone();
+                        async move {
+                            refetch_calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(Bytes::from_static(b"remote-bytes"))
+                        }
+                    },
+                )
                 .await
             })
         };
@@ -7851,16 +7934,17 @@ mod tests {
         let refetched_bytes = Bytes::from_static(b"refetched-body");
         let storage_key = "proxy-cache/repo/pkg/__content__";
 
-        let result = super::get_cached_or_refetch(&pool, artifact_id, &storage, storage_key, {
-            let refetch_calls = refetch_calls.clone();
-            let refetched_bytes = refetched_bytes.clone();
-            move || async move {
-                refetch_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(refetched_bytes)
-            }
-        })
-        .await
-        .expect("miss path should recover via refetch");
+        let result =
+            super::get_cached_or_refetch(&pool, artifact_id, &storage, storage_key, None, {
+                let refetch_calls = refetch_calls.clone();
+                let refetched_bytes = refetched_bytes.clone();
+                move || async move {
+                    refetch_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(refetched_bytes)
+                }
+            })
+            .await
+            .expect("miss path should recover via refetch");
 
         assert_eq!(result, refetched_bytes);
         // The hydration coordinator uses a double-checked-locking pattern: the
@@ -7881,6 +7965,161 @@ mod tests {
         };
         assert_eq!(recorded_key, storage_key);
         assert_eq!(recorded_bytes, refetched_bytes);
+    }
+
+    // ── #2929: the repair refetch must honour the artifact row's digest ──
+    //
+    // `get_cached_or_refetch` rewrites the artifact row's OWN storage key with
+    // bytes pulled fresh from upstream (or from a warm proxy-cache object under
+    // a different key). Nothing compared them to `artifacts.checksum_sha256`,
+    // so the row's recorded hash described a blob that no longer existed while
+    // an unrelated body was persisted and served under it — and
+    // `check_artifact_download` had already authorised on that row, which is
+    // what makes a quarantine release weaker than it appears.
+
+    /// The digest that `RecordingStorage`-backed tests below refetch against:
+    /// SHA-256 of `b"refetched-body"`.
+    fn refetched_body_digest() -> String {
+        crate::services::storage_service::StorageService::calculate_hash(&Bytes::from_static(
+            b"refetched-body",
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_or_refetch_rejects_a_refetch_that_fails_the_recorded_digest() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        let storage = RecordingStorage::new_with_get_behavior(false, RecordingGetBehavior::Miss);
+        let artifact_id = Uuid::new_v4();
+        let storage_key = "proxy-cache/repo/pkg/__content__";
+        // The row says one thing; the upstream repair hands back another.
+        let recorded_digest = refetched_body_digest();
+
+        let result = super::get_cached_or_refetch(
+            &pool,
+            artifact_id,
+            &storage,
+            storage_key,
+            Some(recorded_digest.as_str()),
+            move || async move { Ok(Bytes::from_static(b"a-completely-different-body")) },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a refetch that does not match the artifact row's recorded checksum must fail \
+             the repair, not be served"
+        );
+        assert_eq!(
+            storage.put_calls.load(Ordering::SeqCst),
+            0,
+            "mismatched bytes MUST NOT be written back under the authorised row's storage key"
+        );
+    }
+
+    /// Positive control for the guard above. Without it, hard-failing every
+    /// repair — or writing back nothing at all — would satisfy the test above.
+    #[tokio::test]
+    async fn test_get_cached_or_refetch_writes_back_a_refetch_that_matches_the_digest() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        let storage = RecordingStorage::new_with_get_behavior(false, RecordingGetBehavior::Miss);
+        let artifact_id = Uuid::new_v4();
+        let storage_key = "proxy-cache/repo/pkg/__content__";
+        let refetched_bytes = Bytes::from_static(b"refetched-body");
+        let recorded_digest = refetched_body_digest();
+
+        let result = super::get_cached_or_refetch(
+            &pool,
+            artifact_id,
+            &storage,
+            storage_key,
+            Some(recorded_digest.as_str()),
+            {
+                let refetched_bytes = refetched_bytes.clone();
+                move || async move { Ok(refetched_bytes) }
+            },
+        )
+        .await
+        .expect("a digest-matching refetch must still repair the entry");
+
+        assert_eq!(result, refetched_bytes);
+        assert_eq!(
+            storage.put_calls.load(Ordering::SeqCst),
+            1,
+            "a matching refetch must still be written back, or the guard has simply \
+             disabled proxy-cache repair"
+        );
+    }
+
+    /// A digest the comparison cannot use must degrade to the previous
+    /// unverified behaviour, NOT to a permanent failure. A `sha256:`-prefixed
+    /// or uppercase value would never equal the bare lowercase hex the hasher
+    /// produces, so treating it as authoritative would reject every repair
+    /// forever and re-pull upstream on every single request.
+    #[tokio::test]
+    async fn test_get_cached_or_refetch_ignores_a_non_canonical_digest() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        let storage = RecordingStorage::new_with_get_behavior(false, RecordingGetBehavior::Miss);
+        let artifact_id = Uuid::new_v4();
+        let storage_key = "proxy-cache/repo/pkg/__content__";
+        let prefixed = format!("sha256:{}", refetched_body_digest());
+
+        let result = super::get_cached_or_refetch(
+            &pool,
+            artifact_id,
+            &storage,
+            storage_key,
+            Some(prefixed.as_str()),
+            move || async move { Ok(Bytes::from_static(b"refetched-body")) },
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a non-canonical digest means 'no digest available' and must not fail the repair"
+        );
+        assert_eq!(storage.put_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── #2929: normalize_expected_sha256 ────────────────────────────────
+
+    #[test]
+    fn test_normalize_expected_sha256_accepts_only_bare_lowercase_hex() {
+        let good = "a".repeat(64);
+        assert_eq!(
+            super::normalize_expected_sha256(&good),
+            Some(good.clone()),
+            "a bare lowercase 64-hex digest is the one enforceable shape"
+        );
+        assert_eq!(
+            super::normalize_expected_sha256(&format!("  {good}  ")),
+            Some(good.clone()),
+            "surrounding whitespace is not a different digest"
+        );
+
+        for bad in [
+            String::new(),
+            format!("sha256:{good}"),
+            good.to_uppercase(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            "d41d8cd98f00b204e9800998ecf8427e".to_string(), // md5
+        ] {
+            assert_eq!(
+                super::normalize_expected_sha256(&bad),
+                None,
+                "{bad:?} is not a comparable SHA-256 and must read as 'no digest'"
+            );
+        }
     }
 
     // ── classify_remote_or_virtual tests ───────────────────────────────
