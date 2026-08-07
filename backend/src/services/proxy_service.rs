@@ -1547,18 +1547,28 @@ impl CachePersister {
                         // SHA-256 does not match it. The bytes were already
                         // forwarded to the client — which independently verifies
                         // the digest — but the proxy cache must never be poisoned
-                        // with mismatched content addressed by that digest. Skip
-                        // the metadata sidecar so the next request refetches
-                        // upstream (self-heal). Deliberately do NOT delete
-                        // cache_key_for_writer here (#3068): put_stream above
-                        // already committed this request's bytes as the current
-                        // version, so exists() is always true by this point and
-                        // can't distinguish "only my bad write is here" from "a
-                        // prior good version is one behind it" -- deleting
-                        // either way risks stacking a marker over real content
-                        // from before this request. The missing sidecar alone
-                        // is what forces the refetch; nothing here depends on
-                        // the object also being gone.
+                        // with mismatched content addressed by that digest. Treat
+                        // a mismatch exactly like the truncated/empty reject path:
+                        // delete the object and skip the metadata sidecar so the
+                        // next request refetches upstream (self-heal).
+                        //
+                        // The delete is load-bearing, NOT belt-and-braces: the
+                        // missing sidecar is not sufficient on its own, because
+                        // several read paths reach the content key without
+                        // consulting it. `handle_streaming_leader_upstream_error`
+                        // serves `get_stream(cache_key)` as an RFC 5861
+                        // stale-if-error response and only loads the sidecar
+                        // afterwards, best-effort, for headers; `is_fresh`
+                        // degrades to a bare `exists()` when either ETag is
+                        // multipart-shaped (#2120) or when a legacy sidecar has
+                        // no pinned ETag; and the presigned-redirect paths sign a
+                        // 302 straight to the object with no checksum check at
+                        // all. Leaving rejected bytes in place therefore makes
+                        // them servable. Deleting is also what self-heals on a
+                        // versioned bucket: nothing in this codebase ever reads a
+                        // non-current version (there is no version_id support in
+                        // the storage layer), so a delete marker simply reads as
+                        // NotFound and forces the refetch.
                         if let Some(expected) = template.expected_checksum.as_deref() {
                             if result.checksum_sha256 != expected {
                                 tracing::warn!(
@@ -1567,6 +1577,15 @@ impl CachePersister {
                                      not caching (no metadata sidecar) so the cache entry cannot \
                                      be poisoned"
                                 );
+                                if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                                    tracing::debug!(
+                                        cache_key = %cache_key_for_writer,
+                                        error = %e,
+                                        "best-effort delete of digest-mismatched proxy-cache \
+                                         object failed; the missing metadata sidecar still forces \
+                                         a refetch"
+                                    );
+                                }
                                 return;
                             }
                         }
@@ -1663,19 +1682,31 @@ impl CachePersister {
                         // `Content-Length`) would serve a short, SHA-mismatched
                         // blob and clients hit "unexpected BufError" extracting
                         // the archive. Skip the sidecar (entry treated as a
-                        // miss) so a later GET refetches upstream (self-heal).
-                        // The buffered sibling [`Self::write_buffered`] applies
-                        // the empty-body guard before the content write.
+                        // miss) and delete the bad object so a later GET
+                        // refetches upstream (self-heal). The buffered sibling
+                        // [`Self::write_buffered`] applies the empty-body guard
+                        // before the content write, so it can return early and
+                        // never needs the delete.
                         //
-                        // Deliberately do NOT delete cache_key_for_writer here
-                        // (#3068): put_stream above already committed this
-                        // request's (bad) bytes as the current version, so an
-                        // exists() check is always true by this point and
-                        // can't tell "only my bad write is here" apart from "a
-                        // prior good version is one behind it" -- either way,
-                        // deleting risks stacking a marker over real content
-                        // that predates this request. The missing sidecar is
-                        // what actually forces the refetch.
+                        // Both halves are required. Skipping the sidecar is not
+                        // sufficient on its own, because several readers reach
+                        // the content key without consulting it:
+                        // `handle_streaming_leader_upstream_error` streams
+                        // `get_stream(cache_key)` as an RFC 5861 stale-if-error
+                        // response (sidecar loaded afterwards, best-effort, only
+                        // for headers), the PyPI Remote arm streams
+                        // `artifacts.storage_key` directly, and `is_fresh`
+                        // degrades to a bare `exists()` whenever an ETag is
+                        // multipart-shaped (#2120) or a legacy sidecar carries no
+                        // pinned ETag -- after which the presigned paths sign a
+                        // 302 to the object with no checksum check at all.
+                        //
+                        // The delete is also what self-heals on a versioned
+                        // bucket. Nothing in this codebase reads a non-current
+                        // version (the storage layer has no version_id concept),
+                        // so a delete marker simply reads as NotFound and forces
+                        // the refetch -- it cannot mask content that was already
+                        // unreachable.
                         match rejected {
                             StreamWriteOutcome::RejectTruncated { expected, actual } => {
                                 tracing::warn!(
@@ -1695,6 +1726,15 @@ impl CachePersister {
                                      refetches upstream"
                                 );
                             }
+                        }
+                        if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                            tracing::debug!(
+                                cache_key = %cache_key_for_writer,
+                                error = %e,
+                                "best-effort delete of rejected proxy-cache object failed; \
+                                 the missing metadata sidecar still forces a refetch on the \
+                                 sidecar-gated read paths"
+                            );
                         }
                     }
                 },
@@ -8664,12 +8704,13 @@ mod tests {
     /// which a subsequent GET served as `Content-Length: 0`, breaking
     /// Gradle POM parsing ("Content is not allowed in prolog.").
     ///
-    /// #3068: the writer must NOT delete cache_key_for_writer either -- by
-    /// this point put_stream already committed the zero-byte write as the
-    /// key's current version, so a delete can't tell "only this bad write is
-    /// here" apart from "a prior good version sits one behind it," and would
-    /// risk stacking a marker over real content. The missing sidecar alone
-    /// is what forces the refetch.
+    /// The writer must ALSO delete the zero-byte object it wrote. The sidecar
+    /// skip alone is not enough: `handle_streaming_leader_upstream_error`
+    /// streams the content key as a stale-if-error response without gating on
+    /// the sidecar, the PyPI Remote arm streams it directly, and `is_fresh`
+    /// degrades to a bare `exists()` on a multipart-ETag mismatch (#2120) --
+    /// after which a presigned 302 points straight at it. Leaving the object
+    /// behind therefore leaves it servable (#3068 review).
     #[tokio::test]
     async fn test_tee_empty_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
@@ -8696,11 +8737,11 @@ mod tests {
             "zero-byte upstream body MUST NOT write a metadata sidecar; \
              otherwise the next GET serves a Content-Length: 0 cache hit (#1365)"
         );
-        assert!(
-            backend.deletes.lock().await.is_empty(),
-            "the writer must NOT delete on reject (#3068): put_stream already \
-             committed this write as the current version, so a delete here \
-             could mask real content from before this request"
+        assert_eq!(
+            backend.deletes.lock().await.as_slice(),
+            ["cache-key".to_string()],
+            "the empty cache object must be deleted so the next request refetches; \
+             the sidecar skip alone does not protect the sidecar-less read paths"
         );
     }
 
@@ -8750,10 +8791,10 @@ mod tests {
     /// "unexpected BufError" extracting it. The writer must skip the
     /// metadata sidecar so the next request refetches.
     ///
-    /// #3068: same reasoning as the empty-body sibling above -- the writer
-    /// must NOT delete the partial object either, since put_stream already
-    /// committed it as the current version and a delete can't distinguish
-    /// it from a prior good version one behind it.
+    /// Same reasoning as the empty-body sibling above: the writer must ALSO
+    /// delete the partial object, because the sidecar skip does not protect
+    /// the read paths that reach the content key without consulting it
+    /// (#3068 review).
     #[tokio::test]
     async fn test_tee_truncated_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
@@ -8783,11 +8824,11 @@ mod tests {
             backend.metadata_writes.lock().await.is_empty(),
             "truncated upstream body MUST NOT write a metadata sidecar (#1912)"
         );
-        assert!(
-            backend.deletes.lock().await.is_empty(),
-            "the writer must NOT delete on reject (#3068): put_stream already \
-             committed this write as the current version, so a delete here \
-             could mask real content from before this request"
+        assert_eq!(
+            backend.deletes.lock().await.as_slice(),
+            ["cache-key".to_string()],
+            "the truncated cache object must be deleted so the next request refetches; \
+             the sidecar skip alone does not protect the sidecar-less read paths"
         );
     }
 
@@ -8825,6 +8866,35 @@ mod tests {
             2,
             "each negative-cache renewal still writes its metadata sidecar \
              regardless of the delete guard"
+        );
+    }
+
+    /// Positive control for the guard above. Without this, replacing the
+    /// `exists()` check with `if false` would still pass the whole suite --
+    /// the same criticism the #3068 author correctly applied to the
+    /// `local_fetch_or_redirect` test and did not apply here.
+    ///
+    /// When a real positive body IS present, `write_negative_cache` must still
+    /// drop it, so a future read can never serve stale content alongside the
+    /// negative marker.
+    #[tokio::test]
+    async fn test_write_negative_cache_deletes_an_existing_positive_body() {
+        let backend = TeeRecordingBackend::ok();
+        backend
+            .object_written
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let proxy = ProxyService::new(test_catalog_pool(), storage);
+
+        proxy
+            .write_negative_cache("cache-key", "meta-key", "some/path")
+            .await;
+
+        assert_eq!(
+            backend.deletes.lock().await.as_slice(),
+            ["cache-key".to_string()],
+            "a prior positive body MUST be dropped when the negative marker is \
+             written, otherwise a read can serve it alongside the marker"
         );
     }
 

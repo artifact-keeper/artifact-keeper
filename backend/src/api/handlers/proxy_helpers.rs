@@ -3152,17 +3152,50 @@ pub async fn local_fetch_or_redirect(
                 // redirect signed for a missing key 404s at the object store,
                 // where the client is beyond any fallback we control — and the
                 // row keeps serving dead redirects until manual repair. So
-                // honor `try_proxy_cache_redirect`'s contract (caller performs
-                // a metadata-only freshness check first, as
-                // `proxy_fetch_or_redirect` does via `is_cache_fresh`): probe
-                // existence through the same no-prefix handle before signing.
-                // Capability check first, mirroring #1555 — never pay the
-                // probe on a backend that cannot redirect anyway. On a miss
-                // fall through to the buffered read below, whose NotFound lets
-                // virtual-member resolution continue to the remote member's
-                // upstream re-fetch, repopulating the cache.
+                // probe existence through the same no-prefix handle before
+                // signing. Capability check first, mirroring #1555 — never pay
+                // the probe on a backend that cannot redirect anyway.
+                //
+                // Scope, deliberately understated: this is an EXISTENCE probe,
+                // strictly narrower than the `is_cache_fresh` gate the sibling
+                // paths (`proxy_fetch_or_redirect`, `try_member_cache_redirect`)
+                // apply. Those additionally read the `__cache_meta__.json`
+                // sidecar for TTL, revalidate the pinned ETag, and apply
+                // `cache_quarantine_gate` for the #2075 Package Age Policy hold.
+                // None of that happens here, so a present-but-stale or
+                // still-held entry can still be signed. That gap is
+                // pre-existing (this argument was hardcoded `true`); closing it
+                // needs the repo_key/path pair and is tracked separately. This
+                // change only removes the dead-redirect case.
+                //
+                // On a miss the buffered read below takes over. Note it does
+                // NOT simply return NotFound: it routes through
+                // `coordinated_retry_get`, which takes a cluster-wide advisory
+                // lease (#1609) and returns 507 if the object is still absent.
+                // The self-heal comes from the sole caller (the PyPI
+                // virtual-member loop) discarding that error and continuing to
+                // the remote member's upstream re-fetch.
+                //
+                // An `Err` from the probe means "unknown", not "absent", so it
+                // is logged rather than swallowed — otherwise an object-store
+                // brownout silently converts every redirect on this path into a
+                // fully-buffered read through the backend, with no signal that
+                // it happened. We still fall through on `Err` (never sign a
+                // redirect we could not verify); the log is what makes that
+                // transition visible.
                 let object_present = b.supports_redirect()
-                    && matches!(b.exists(&artifact.storage_key).await, Ok(true));
+                    && match b.exists(&artifact.storage_key).await {
+                        Ok(present) => present,
+                        Err(e) => {
+                            tracing::warn!(
+                                storage_key = %artifact.storage_key,
+                                error = %e,
+                                "proxy-cache existence probe failed; treating as absent \
+                                 and falling through to the buffered read"
+                            );
+                            false
+                        }
+                    };
                 try_proxy_cache_redirect(
                     b.as_ref(),
                     &artifact.storage_key,
@@ -10880,7 +10913,11 @@ mod tests {
             // exists() == false case has something real to fall through to.
             let body: &[u8] = b"still-here";
             let artifact_path = "simple/foo/foo-1.0-py3-none-any.whl";
-            let storage_key = format!("proxy-cache/{}/{}", fx.repo_key, artifact_path);
+            // Use the real content-key shape `CacheKeys::derive` produces
+            // (`proxy-cache/<repo>/<path>/__content__`), not just something
+            // that satisfies the `proxy-cache/` prefix check — otherwise the
+            // fixture exercises a key namespace the cache writer never emits.
+            let storage_key = format!("proxy-cache/{}/{}/__content__", fx.repo_key, artifact_path);
             tdh::seed_artifact(
                 &state,
                 &fx.pool,
