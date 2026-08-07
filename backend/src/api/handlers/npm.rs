@@ -8982,20 +8982,30 @@ mod tests {
         use axum::Router;
         use tower::ServiceExt;
 
-        let etag = compute_etag(b"{\"name\":\"left-pad\"}");
-        let expected = etag.clone();
-        let app = Router::new()
-            .route(
-                "/pkg",
-                get(move |headers: HeaderMap| {
-                    let etag = etag.clone();
-                    async move {
-                        check_conditional_request(&headers, &etag)
-                            .unwrap_or_else(|| build_json_metadata_response("{}".to_string()))
-                    }
-                }),
-            )
-            .layer(npm_metadata_compression_layer());
+        let body = b"{\"name\":\"left-pad\"}";
+        let expected = compute_etag(body);
+        // Routed through THIS module's response builder, not the shared
+        // `check_conditional_request` helper. Calling the helper directly made
+        // this test pass on a tree with every line of this change removed --
+        // it pinned tower-http's treatment of a 304, which is worth having,
+        // but said nothing about the packument path that produces one.
+        let app =
+            Router::new()
+                .route(
+                    "/pkg",
+                    get(move |headers: HeaderMap| {
+                        let entry = CachedPackument {
+                            bytes: Bytes::from_static(b"{\"name\":\"left-pad\"}"),
+                            content_type: "application/json".to_string(),
+                            content_encoding: None,
+                            etag: compute_etag(b"{\"name\":\"left-pad\"}"),
+                        };
+                        async move {
+                            cached_packument_response(&entry, &headers, NPM_CACHE_CONTROL_CACHED)
+                        }
+                    }),
+                )
+                .layer(npm_metadata_compression_layer());
 
         let response = app
             .oneshot(
@@ -9016,13 +9026,14 @@ mod tests {
             response.headers().get(CONTENT_ENCODING)
         );
         assert_eq!(response.headers()[ETAG], expected);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, max-age=60");
+        let received = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("read body");
         assert!(
-            body.is_empty(),
+            received.is_empty(),
             "a 304 must not carry a body, got {} bytes",
-            body.len()
+            received.len()
         );
     }
 
