@@ -1635,7 +1635,6 @@ async fn download_or_metadata(
                 &state,
                 auth.as_ref(),
                 &repo,
-                &project,
                 &normalized,
                 requested_version.as_deref(),
                 real_filename,
@@ -1686,11 +1685,15 @@ async fn download_or_metadata(
 /// the same authorization and curation boundaries as the regular download
 /// path. A missing distribution falls through to the next member; other
 /// failures remain visible instead of being misreported as a 404.
+/// Takes ONLY the normalized project name. The raw path segment is
+/// deliberately not a parameter: every gate here keys on the PEP 503 form, and
+/// an earlier revision passed the raw segment to the upstream fetch, which
+/// re-normalizes with a DIFFERENT function. Not having the raw name in scope
+/// is what stops that from being reintroduced.
 async fn serve_virtual_metadata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     virtual_repo: &RepoInfo,
-    project: &str,
     normalized_project: &str,
     requested_version: Option<&str>,
     filename: &str,
@@ -1757,7 +1760,23 @@ async fn serve_virtual_metadata(
                         member.id,
                         &member.key,
                         upstream_url,
-                        project,
+                        // The NORMALIZED name, not the raw path segment.
+                        //
+                        // Every gate above keys on `normalized_project`
+                        // (`normalize_pep503`), but the upstream fetch
+                        // re-normalizes with `PypiHandler::normalize_name`,
+                        // and the two disagree: `normalize_pep503` silently
+                        // DROPS any character outside [A-Za-z0-9._-] without
+                        // marking a separator, while `normalize_name` maps
+                        // every non-alphanumeric to '-'. So "acme sdk" clears
+                        // the gate as "acmesdk" -- owned by nobody -- and then
+                        // fetches "acme-sdk", which is precisely the private
+                        // package the gate exists to protect.
+                        //
+                        // `normalize_name` is idempotent on PEP 503 output, so
+                        // passing the normalized name keeps the policy string
+                        // and the fetch string identical.
+                        normalized_project,
                         filename,
                     )
                     .await
@@ -9610,6 +9629,114 @@ mod tests {
             status,
             StatusCode::NOT_FOUND,
             "remote-only metadata must stay hidden when the local owner outranks the remote"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_isolation_survives_a_divergent_project_spelling() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "acme-sdk";
+        let local_wheel = "acme_sdk-1.0-cp39-cp39-manylinux_2_17_x86_64.whl";
+        let remote_wheel = "acme_sdk-9.9.9-py3-none-any.whl";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(pep658_index_html(remote_wheel)),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{remote_wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Metadata-Version: 2.1\nName: acme-sdk\nVersion: 9.9.9\n"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (remote_id, _remote_key, remote_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make local owner public");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach higher-priority local owner");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)",
+        )
+        .bind(local_id)
+        .bind(format!("simple/{project}/{local_wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind("test-local-owner")
+        .bind("application/zip")
+        .bind(format!("local/{local_wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed local ownership artifact");
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, _body) = tdh::send(
+            app,
+            // Same request, but the project segment is spelled with a
+            // character that the two normalizers disagree about. axum
+            // percent-decodes the segment, so the handler sees "demo x".
+            //
+            // `normalize_pep503` (the gate) DROPS any character outside
+            // [A-Za-z0-9._-] without marking a separator, so it yields
+            // "demox" and no local owner is found. `PypiHandler::normalize_name`
+            // (the upstream fetch) maps every non-alphanumeric to '-', so it
+            // yields "demo-x" and asks upstream for a different project than
+            // the one the gate cleared.
+            // "acme sdk" -- one space. axum percent-decodes it.
+            //
+            // `normalize_pep503` (the GATE) drops any character outside
+            // [A-Za-z0-9._-] without marking a separator  -> "acmesdk",
+            // which no local member owns, so nothing is suppressed.
+            // `PypiHandler::normalize_name` (the upstream FETCH) maps every
+            // non-alphanumeric to '-'                      -> "acme-sdk",
+            // which is exactly the private package the gate was supposed to
+            // protect. The upstream mock below answers on that spelling, the
+            // way public PyPI would for an attacker-published shadow.
+            tdh::get(format!(
+                "/{}/simple/acme%20sdk/{remote_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        cleanup_virtual_member(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "isolation must not depend on how the client spells the project. If the \
+             string used for the policy check differs from the string used to fetch, \
+             one percent-encoded character turns the dependency-confusion gate off."
         );
     }
 
