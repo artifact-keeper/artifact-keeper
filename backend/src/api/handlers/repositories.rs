@@ -218,6 +218,41 @@ pub(crate) async fn require_repo_admin(
     }
 }
 
+/// Resolve the caller's repository visibility (issues #3081, #3163).
+///
+/// This is the single derivation of [`RepoVisibility`] from an authenticated
+/// (or anonymous) principal, shared by the repository listing and by every
+/// path that aggregates over OTHER repositories on the caller's behalf — the
+/// virtual-repository storage total (#3081), and the virtual repository's
+/// member list and artifact listings (#3163). Those members are separate
+/// repositories with their own ACLs.
+///
+/// Note the contrast with
+/// [`crate::api::middleware::auth::AuthExtension::can_access_repo`], which
+/// answers "is this repository within my TOKEN's scope?" — a different
+/// question that is `true` for every repository whenever the principal is
+/// unscoped. Anywhere the question is "may this caller SEE it?", this is the
+/// derivation to use.
+///
+/// * anonymous              -> public repositories only
+/// * global admin           -> everything
+/// * repo-scoped API token  -> exactly the token's allowed set (checked before
+///   the general user arm; admin tokens are handled above and bypass scope)
+/// * any other principal    -> public repositories plus their own grants
+pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibility {
+    match auth {
+        None => RepoVisibility::PublicOnly,
+        Some(a) if a.is_admin => RepoVisibility::All,
+        Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
+            a.allowed_repo_ids
+                .as_allowed_repo_ids()
+                .unwrap_or_default()
+                .to_vec(),
+        ),
+        Some(a) => RepoVisibility::User(a.user_id),
+    }
+}
+
 /// Ensure a repository is visible to the current user.
 ///
 /// Public repos are visible to everyone. Private repos require authentication
@@ -2184,21 +2219,10 @@ pub async fn list_repositories(
         .map(|t| parse_repo_type(t))
         .transpose()?;
 
-    let visibility = match &auth {
-        None => RepoVisibility::PublicOnly,
-        Some(a) if a.is_admin => RepoVisibility::All,
-        // Repo-scoped token: the listing must reflect ONLY the token's
-        // allowed repositories, not every repo the owning user can reach.
-        // Checked before the general `User` arm. Admin tokens are handled
-        // above and bypass scope restrictions.
-        Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
-            a.allowed_repo_ids
-                .as_allowed_repo_ids()
-                .unwrap_or_default()
-                .to_vec(),
-        ),
-        Some(a) => RepoVisibility::User(a.user_id),
-    };
+    // The listing must reflect ONLY what this caller may see — including, for
+    // a repo-scoped token, only the token's allowed repositories rather than
+    // every repo the owning user can reach.
+    let visibility = visibility_for_auth(auth.as_ref());
     let service = RepositoryService::new(state.db.clone());
     let (repos, total) = service
         .list(
@@ -4498,6 +4522,7 @@ pub async fn list_artifacts(
             count_exact,
             page,
             per_page,
+            &visibility_for_auth(auth.as_ref()),
         )
         .await;
     }
@@ -4571,7 +4596,16 @@ pub async fn list_artifacts(
                 AppError::Internal("Failed to resolve virtual repository members".to_string())
             })?;
 
+        // #3163: `fetch_virtual_members` applies NO access predicate — only
+        // the virtual PARENT was `require_visible`d above. Aggregating over
+        // the raw member set therefore served the contents of private member
+        // repositories to anyone who could see the parent. Narrow to the
+        // members this caller may see, using the same predicate as the
+        // repository listing and `GET /{key}/members`.
         let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+        let member_ids = repo_service
+            .filter_visible_repo_ids(&member_ids, &visibility_for_auth(auth.as_ref()))
+            .await?;
 
         let page_rows = artifact_service
             .list_for_repos_page(
@@ -5421,6 +5455,10 @@ async fn list_artifacts_grouped_by_maven_component(
     count_exact: bool,
     page: u32,
     per_page: u32,
+    // The CALLER's repository visibility (#3163). Only consulted for a
+    // Virtual repo, whose members are separate repositories with their own
+    // ACLs; a non-virtual repo is already gated by `require_visible`.
+    visibility: &RepoVisibility,
 ) -> Result<Json<ArtifactListResponse>> {
     // Remote (proxy) repositories do NOT record cached items in the `artifacts`
     // table (#1278 / #1280), so `artifact_service.list` returns nothing for them
@@ -5502,7 +5540,14 @@ async fn list_artifacts_grouped_by_maven_component(
             .map_err(|_| {
                 AppError::Internal("Failed to resolve virtual repository members".to_string())
             })?;
-        members.iter().map(|m| m.id).collect()
+        // #3163: same unfiltered member walk as the flat listing — narrow to
+        // the members this caller may see before the catalog is queried, so a
+        // private member's GAV coordinates are not disclosed through the
+        // grouped view.
+        let member_ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
+        RepositoryService::new(state.db.clone())
+            .filter_visible_repo_ids(&member_ids, visibility)
+            .await?
     } else {
         vec![repo.id]
     };
@@ -8289,7 +8334,20 @@ pub async fn list_virtual_members(
     }
 
     // Caller must be able to see the virtual parent itself.
+    //
+    // BOTH gates run, because they answer different questions and neither
+    // subsumes the other (#3163):
+    //  * `require_repo_access` is the TOKEN-SCOPE check. It is kept ahead of
+    //    the visibility gate because `require_visible` short-circuits `Ok` on
+    //    a public repository, which would otherwise let a repo-scoped token
+    //    reach a public virtual outside its allowed set.
+    //  * `require_visible` is the canonical repository VISIBILITY gate. It was
+    //    missing entirely: token scope passes for any unscoped principal, so a
+    //    browser session holding no grant on a PRIVATE virtual repository
+    //    could confirm it exists and read its membership — while `GET /{key}`
+    //    on that same repository correctly 404s.
     require_repo_access(&auth, repo.id)?;
+    require_visible(&repo, &Some(auth.clone()), &service).await?;
 
     // Query members with their repository info
     let members: Vec<VirtualMemberRow> = sqlx::query_as(
@@ -8313,12 +8371,26 @@ pub async fn list_virtual_members(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Filter to members the caller has access to. Tokens with
-    // allowed_repo_ids = None (admins, JWT sessions, unrestricted API tokens)
-    // see everything by virtue of `can_access_repo` returning true.
+    // Filter to the members this caller may actually SEE (#3163).
+    //
+    // This used to be `auth.can_access_repo(row.member_repo_id)`, which is the
+    // caller's TOKEN SCOPE, not repository visibility: for any unscoped
+    // principal — a browser JWT session, an unrestricted API token, an admin —
+    // it returns `true` for every repository in the instance, so the response
+    // disclosed the key, name and type of private member repositories the
+    // caller holds no grant on. Members are separate repositories with their
+    // own ACLs, so they are filtered through the SAME predicate the repository
+    // listing uses. Priority order is preserved.
+    let visibility = visibility_for_auth(Some(&auth));
+    let member_ids: Vec<Uuid> = members.iter().map(|row| row.member_repo_id).collect();
+    let visible: std::collections::HashSet<Uuid> = service
+        .filter_visible_repo_ids(&member_ids, &visibility)
+        .await?
+        .into_iter()
+        .collect();
     let members = members
         .into_iter()
-        .filter(|row| auth.can_access_repo(row.member_repo_id))
+        .filter(|row| visible.contains(&row.member_repo_id))
         .map(map_member_row)
         .collect();
 
@@ -21077,5 +21149,440 @@ mod apt_validation_tests {
                 .await;
         }
         tdh::cleanup_user(&pool, user_id).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3163: virtual-repository member disclosure
+// ---------------------------------------------------------------------------
+
+/// A virtual repository must not disclose its members — or those members'
+/// contents — to a caller who is not allowed to see the member repositories
+/// themselves (issue #3163).
+///
+/// Every fixture here is three-repository shaped:
+///
+/// * `virt`    — the virtual parent. Private; `viewer` and `insider` hold a
+///   grant on it, `outsider` holds nothing.
+/// * `private` — a PRIVATE member. Only `insider` (and admins) may see it.
+/// * `public`  — a PUBLIC member. Everyone may see it.
+///
+/// so every leak assertion (`private` must be absent) ships with a positive
+/// control (`public` must still be listed, and `insider`/admin must still see
+/// `private`). A "fix" that hid every member would fail the controls.
+///
+/// The caller shape that matters is [`tdh::make_auth`]: a non-admin principal
+/// with `allowed_repo_ids = AccessScope::Admin` — i.e. unrestricted token
+/// scope. That is exactly a browser JWT session, and it is the shape for which
+/// the pre-fix `can_access_repo` filter returned `true` for every member.
+#[cfg(test)]
+mod virtual_member_visibility_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::auth::AuthExtension;
+    use sqlx::PgPool;
+
+    /// One virtual parent plus a private and a public member, and the three
+    /// principals the assertions are made as.
+    struct Fixture {
+        pool: PgPool,
+        state: SharedState,
+        virt_key: String,
+        virt_id: Uuid,
+        private_key: String,
+        private_id: Uuid,
+        public_key: String,
+        public_id: Uuid,
+        viewer: (Uuid, String),
+        insider: (Uuid, String),
+        outsider: (Uuid, String),
+        admin: (Uuid, String),
+        storage_dir: std::path::PathBuf,
+    }
+
+    /// Insert a `virtual_repo_members` row.
+    async fn link_member(pool: &PgPool, virt: Uuid, member: Uuid, priority: i32) {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virt)
+        .bind(member)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("link virtual member");
+    }
+
+    /// Insert one `artifacts` row directly. The listing paths read the DB
+    /// only, so no storage write is needed.
+    async fn seed_artifact_row(pool: &PgPool, repo: Uuid, path: &str, name: &str, version: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, 11, $5, 'application/octet-stream', $6)",
+        )
+        .bind(repo)
+        .bind(path)
+        .bind(name)
+        .bind(version)
+        .bind("0".repeat(64))
+        .bind(format!("k/{}", Uuid::new_v4()))
+        .execute(pool)
+        .await
+        .expect("seed artifact row");
+    }
+
+    /// Seed one complete Maven component in `repo`: the `packages` +
+    /// `package_versions` catalog pair that drives the grouped keyset page,
+    /// plus the `artifacts` row under the component's GAV path prefix that
+    /// `build_maven_components_for_keys` needs in order to emit the component
+    /// (a catalog key with no surviving file is dropped as stale).
+    ///
+    /// `name` is the catalog shape `groupId:artifactId`.
+    async fn seed_maven_component(pool: &PgPool, repo: Uuid, name: &str, version: &str) {
+        let (group_id, artifact_id) = name.split_once(':').expect("groupId:artifactId");
+        let path = format!(
+            "{}/{}/{}/{}-{}.jar",
+            group_id.replace('.', "/"),
+            artifact_id,
+            version,
+            artifact_id,
+            version
+        );
+        seed_artifact_row(pool, repo, &path, artifact_id, version).await;
+
+        let package_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO packages (id, repository_id, name, version) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(package_id)
+        .bind(repo)
+        .bind(name)
+        .bind(version)
+        .execute(pool)
+        .await
+        .expect("seed package");
+        sqlx::query(
+            "INSERT INTO package_versions (package_id, version, checksum_sha256) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(package_id)
+        .bind(version)
+        .bind("0".repeat(64))
+        .execute(pool)
+        .await
+        .expect("seed package version");
+    }
+
+    impl Fixture {
+        /// Build the parent + two members + three principals for `format`.
+        async fn seed(pool: &PgPool, format: &str) -> Fixture {
+            let (virt_id, virt_key, storage_dir) = tdh::create_repo(pool, "virtual", format).await;
+            let (private_id, private_key, _) = tdh::create_repo(pool, "local", format).await;
+            let (public_id, public_key, _) = tdh::create_repo(pool, "local", format).await;
+            sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+                .bind(public_id)
+                .execute(pool)
+                .await
+                .expect("publish public member");
+
+            link_member(pool, virt_id, private_id, 1).await;
+            link_member(pool, virt_id, public_id, 2).await;
+
+            let viewer = tdh::create_user(pool).await;
+            let insider = tdh::create_user(pool).await;
+            let outsider = tdh::create_user(pool).await;
+            let admin = tdh::create_user(pool).await;
+
+            // `viewer` and `insider` can both see the virtual parent; only
+            // `insider` additionally holds a grant on the private member.
+            tdh::grant_repo_access(pool, virt_id, viewer.0).await;
+            tdh::grant_repo_access(pool, virt_id, insider.0).await;
+            tdh::grant_repo_access(pool, private_id, insider.0).await;
+
+            let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+            Fixture {
+                pool: pool.clone(),
+                state,
+                virt_key,
+                virt_id,
+                private_key,
+                private_id,
+                public_key,
+                public_id,
+                viewer,
+                insider,
+                outsider,
+                admin,
+                storage_dir,
+            }
+        }
+
+        fn session(&self, who: &(Uuid, String)) -> AuthExtension {
+            tdh::make_auth(who.0, &who.1)
+        }
+
+        fn admin_session(&self) -> AuthExtension {
+            tdh::admin_auth(self.admin.0, &self.admin.1)
+        }
+
+        /// Drive a GET on the real `router()` as `auth` and return
+        /// `(status, parsed-json)`.
+        async fn get_as(
+            &self,
+            uri: String,
+            auth: AuthExtension,
+        ) -> (StatusCode, serde_json::Value) {
+            let router = tdh::router_with_auth(super::router(), self.state.clone(), auth);
+            let (status, body) = tdh::send(router, tdh::get(uri)).await;
+            let json = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }));
+            (status, json)
+        }
+
+        /// `GET /{virt}/members` as `auth` -> the `member_repo_key` list.
+        async fn members_seen(&self, auth: AuthExtension) -> (StatusCode, Vec<String>) {
+            let (status, json) = self
+                .get_as(format!("/{}/members", self.virt_key), auth)
+                .await;
+            let keys = json["members"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|r| r["member_repo_key"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (status, keys)
+        }
+
+        /// `GET /{virt}/artifacts` as `auth` -> the flat `items[].name` list.
+        async fn artifacts_seen(&self, auth: AuthExtension) -> (StatusCode, Vec<String>) {
+            let (status, json) = self
+                .get_as(format!("/{}/artifacts", self.virt_key), auth)
+                .await;
+            let names = json["items"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|r| r["name"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (status, names)
+        }
+
+        /// `GET /{virt}/artifacts?group_by=maven_component` as `auth` ->
+        /// the `components[].artifact_id` list.
+        async fn components_seen(&self, auth: AuthExtension) -> (StatusCode, Vec<String>) {
+            let (status, json) = self
+                .get_as(
+                    format!("/{}/artifacts?group_by=maven_component", self.virt_key),
+                    auth,
+                )
+                .await;
+            let names = json["components"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|r| r["artifact_id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (status, names)
+        }
+
+        async fn cleanup(self) {
+            for id in [self.virt_id, self.private_id, self.public_id] {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await;
+            }
+            for who in [&self.viewer, &self.insider, &self.outsider, &self.admin] {
+                tdh::cleanup_user(&self.pool, who.0).await;
+            }
+            let _ = std::fs::remove_dir_all(&self.storage_dir);
+        }
+    }
+
+    /// #3163 site 1: `GET /{key}/members` must list only the members the
+    /// caller may actually see.
+    ///
+    /// Pre-fix the handler filtered with `auth.can_access_repo(member_repo_id)`
+    /// — TOKEN SCOPE, not repository visibility. For a browser JWT session
+    /// (`allowed_repo_ids = AccessScope::Admin`) that predicate is `true` for
+    /// every repository in the instance, so `viewer` received the key, name and
+    /// type of the private member it holds no grant on.
+    #[tokio::test]
+    async fn members_endpoint_hides_members_the_caller_cannot_see_3163() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = Fixture::seed(&pool, "generic").await;
+
+        let (viewer_status, viewer_keys) = fx.members_seen(fx.session(&fx.viewer)).await;
+        let (insider_status, insider_keys) = fx.members_seen(fx.session(&fx.insider)).await;
+        let (admin_status, admin_keys) = fx.members_seen(fx.admin_session()).await;
+        let (private_key, public_key) = (fx.private_key.clone(), fx.public_key.clone());
+        fx.cleanup().await;
+
+        assert_eq!(viewer_status, StatusCode::OK, "viewer can see the virtual");
+        assert_eq!(insider_status, StatusCode::OK);
+        assert_eq!(admin_status, StatusCode::OK);
+
+        // The leak.
+        assert!(
+            !viewer_keys.contains(&private_key),
+            "#3163: a JWT session granted only the virtual parent must NOT see \
+             the private member {private_key} in the member list; got {viewer_keys:?}"
+        );
+        // Positive control 1: the public member is still listed, so the fix is
+        // not "hide everything".
+        assert!(
+            viewer_keys.contains(&public_key),
+            "the public member {public_key} must still be listed to the viewer; \
+             got {viewer_keys:?}"
+        );
+        // Positive control 2: a caller WITH a grant on the private member
+        // still sees it.
+        assert!(
+            insider_keys.contains(&private_key),
+            "a caller holding a grant on {private_key} must still see it; \
+             got {insider_keys:?}"
+        );
+        // Positive control 3: an admin still sees the whole membership.
+        assert!(
+            admin_keys.contains(&private_key) && admin_keys.contains(&public_key),
+            "an admin must still see every member; got {admin_keys:?}"
+        );
+    }
+
+    /// #3163 site 1, parent gate: the members endpoint gated the PARENT with
+    /// `require_repo_access` (token scope) and never ran the repository
+    /// visibility check, so any authenticated principal could confirm a private
+    /// virtual repository exists and read its public membership — while
+    /// `GET /{key}` on the same repository correctly 404s for them.
+    #[tokio::test]
+    async fn members_endpoint_hides_the_virtual_itself_from_outsiders_3163() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = Fixture::seed(&pool, "generic").await;
+
+        let (outsider_status, outsider_keys) = fx.members_seen(fx.session(&fx.outsider)).await;
+        let (viewer_status, _) = fx.members_seen(fx.session(&fx.viewer)).await;
+        fx.cleanup().await;
+
+        assert_eq!(
+            outsider_status,
+            StatusCode::NOT_FOUND,
+            "#3163: a principal with no grant on the PRIVATE virtual parent must \
+             get the existence-hiding 404 the rest of the API returns, not a \
+             200 listing its members; got {outsider_status} with {outsider_keys:?}"
+        );
+        // Positive control: the gate did not lock out a legitimate member.
+        assert_eq!(
+            viewer_status,
+            StatusCode::OK,
+            "a caller granted the virtual parent must still reach the endpoint"
+        );
+    }
+
+    /// #3163 site 2 (flat): `GET /{key}/artifacts` on a virtual repository
+    /// aggregated over `fetch_virtual_members`, which applies NO access
+    /// predicate at all — only the parent was `require_visible`d. The private
+    /// member's artifact contents were therefore served to any caller who
+    /// could see the parent.
+    #[tokio::test]
+    async fn virtual_artifact_listing_hides_invisible_member_artifacts_3163() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = Fixture::seed(&pool, "generic").await;
+        seed_artifact_row(
+            &pool,
+            fx.private_id,
+            "priv/secret-1.0.0.bin",
+            "secret",
+            "1.0.0",
+        )
+        .await;
+        seed_artifact_row(&pool, fx.public_id, "pub/open-1.0.0.bin", "open", "1.0.0").await;
+
+        let (viewer_status, viewer_names) = fx.artifacts_seen(fx.session(&fx.viewer)).await;
+        let (insider_status, insider_names) = fx.artifacts_seen(fx.session(&fx.insider)).await;
+        let (admin_status, admin_names) = fx.artifacts_seen(fx.admin_session()).await;
+        fx.cleanup().await;
+
+        assert_eq!(viewer_status, StatusCode::OK);
+        assert_eq!(insider_status, StatusCode::OK);
+        assert_eq!(admin_status, StatusCode::OK);
+
+        assert!(
+            !viewer_names.contains(&"secret".to_string()),
+            "#3163: the virtual artifact listing must not serve artifacts from a \
+             member the caller cannot see; got {viewer_names:?}"
+        );
+        assert!(
+            viewer_names.contains(&"open".to_string()),
+            "the public member's artifact must still be listed; got {viewer_names:?}"
+        );
+        assert!(
+            insider_names.contains(&"secret".to_string())
+                && insider_names.contains(&"open".to_string()),
+            "a caller granted the private member must still see both; got {insider_names:?}"
+        );
+        assert!(
+            admin_names.contains(&"secret".to_string())
+                && admin_names.contains(&"open".to_string()),
+            "an admin must still see both; got {admin_names:?}"
+        );
+    }
+
+    /// #3163 site 2 (Maven-grouped): the `group_by=maven_component` variant
+    /// resolves member ids through the same unfiltered `fetch_virtual_members`
+    /// call and feeds them to the package-catalog keyset query, leaking the
+    /// private member's GAV coordinates.
+    #[tokio::test]
+    async fn virtual_maven_grouped_listing_hides_invisible_member_components_3163() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = Fixture::seed(&pool, "maven").await;
+        seed_maven_component(&pool, fx.private_id, "com.example:secret-lib", "1.0.0").await;
+        seed_maven_component(&pool, fx.public_id, "com.example:open-lib", "1.0.0").await;
+
+        let (viewer_status, viewer_components) = fx.components_seen(fx.session(&fx.viewer)).await;
+        let (insider_status, insider_components) =
+            fx.components_seen(fx.session(&fx.insider)).await;
+        let (admin_status, admin_components) = fx.components_seen(fx.admin_session()).await;
+        fx.cleanup().await;
+
+        assert_eq!(viewer_status, StatusCode::OK);
+        assert_eq!(insider_status, StatusCode::OK);
+        assert_eq!(admin_status, StatusCode::OK);
+
+        assert!(
+            !viewer_components.contains(&"secret-lib".to_string()),
+            "#3163: the Maven-grouped virtual listing must not disclose components \
+             from a member the caller cannot see; got {viewer_components:?}"
+        );
+        assert!(
+            viewer_components.contains(&"open-lib".to_string()),
+            "the public member's component must still be listed; got {viewer_components:?}"
+        );
+        assert!(
+            insider_components.contains(&"secret-lib".to_string())
+                && insider_components.contains(&"open-lib".to_string()),
+            "a caller granted the private member must still see both; got {insider_components:?}"
+        );
+        assert!(
+            admin_components.contains(&"secret-lib".to_string())
+                && admin_components.contains(&"open-lib".to_string()),
+            "an admin must still see both; got {admin_components:?}"
+        );
     }
 }
