@@ -20903,6 +20903,53 @@ mod apt_validation_tests {
         id
     }
 
+    /// Link `members` (as `(member_repo_id, priority)`) under the virtual
+    /// repository `virt`. Shared by the virtual-storage tests so the identical
+    /// membership INSERT is written once.
+    async fn link_virtual_members_test(pool: &sqlx::PgPool, virt: Uuid, members: &[(Uuid, i32)]) {
+        for (member, prio) in members {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt)
+            .bind(member)
+            .bind(prio)
+            .execute(pool)
+            .await
+            .expect("add virtual member");
+        }
+    }
+
+    /// Seed one `oci_blobs` row of `size` bytes in `repo` (migration 182's
+    /// trigger charges the usage ledger). Returns the digest.
+    async fn seed_oci_blob_test(pool: &sqlx::PgPool, repo: Uuid, size: i64) -> String {
+        let digest = format!("sha256:{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo)
+        .bind(&digest)
+        .bind(size)
+        .bind(format!("oci-blobs/{digest}"))
+        .execute(pool)
+        .await
+        .expect("insert oci blob row");
+        digest
+    }
+
+    /// Drop the repositories seeded by a virtual-storage test.
+    async fn drop_repos_test(pool: &sqlx::PgPool, ids: &[Uuid]) {
+        for id in ids {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+
     /// End-to-end equivalence matrix for the ledger-backed listing (#3078):
     /// hosted bytes counted; a soft-deleted artifact excluded (seeded live,
     /// then flipped, so the trigger's decrement is exercised); a legacy
@@ -20987,27 +21034,8 @@ mod apt_validation_tests {
 
         // oci: one plain blob + one later marked pending_delete_at (the
         // mark-and-sweep marker is a zero-delta no-op: still counted).
-        let blob = |repo: Uuid, size: i64| {
-            let pool = pool.clone();
-            async move {
-                let digest = format!("sha256:{}", Uuid::new_v4().simple());
-                sqlx::query(
-                    "INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key) \
-                     VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind(Uuid::new_v4())
-                .bind(repo)
-                .bind(&digest)
-                .bind(size)
-                .bind(format!("oci-blobs/{digest}"))
-                .execute(&pool)
-                .await
-                .expect("insert oci blob row");
-                digest
-            }
-        };
-        blob(oci, 500_000).await;
-        let marked = blob(oci, 250_000).await;
+        seed_oci_blob_test(&pool, oci, 500_000).await;
+        let marked = seed_oci_blob_test(&pool, oci, 250_000).await;
         sqlx::query(
             "UPDATE oci_blobs SET pending_delete_at = NOW() \
              WHERE repository_id = $1 AND digest = $2",
@@ -21026,18 +21054,7 @@ mod apt_validation_tests {
             .expect("drop empty repo ledger row");
 
         // virt: union of hosted + oci members.
-        for (member, prio) in [(hosted, 1), (oci, 2)] {
-            sqlx::query(
-                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-                 VALUES ($1, $2, $3)",
-            )
-            .bind(virt)
-            .bind(member)
-            .bind(prio)
-            .execute(&pool)
-            .await
-            .expect("add virtual member");
-        }
+        link_virtual_members_test(&pool, virt, &[(hosted, 1), (oci, 2)]).await;
 
         // One listing call scoped to this run's repos, as an admin (sees all).
         let state = tdh::build_state(pool.clone(), "/tmp/lg3078-unused");
@@ -21096,12 +21113,7 @@ mod apt_validation_tests {
             );
         }
 
-        for id in [virt, hollow, hosted, proxied, oci, empty] {
-            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-                .bind(id)
-                .execute(&pool)
-                .await;
-        }
+        drop_repos_test(&pool, &[virt, hollow, hosted, proxied, oci, empty]).await;
         tdh::cleanup_user(&pool, user_id).await;
     }
     // -----------------------------------------------------------------------
@@ -21215,30 +21227,8 @@ mod apt_validation_tests {
         .execute(&pool)
         .await
         .expect("insert visible member artifact");
-        sqlx::query(
-            "INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key) \
-             VALUES ($1, $2, $3, 500000, $4)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(hidden)
-        .bind(format!("sha256:{}", Uuid::new_v4().simple()))
-        .bind(format!("oci-blobs/{}", Uuid::new_v4()))
-        .execute(&pool)
-        .await
-        .expect("insert hidden member blob");
-
-        for (member, prio) in [(vis, 1), (hidden, 2)] {
-            sqlx::query(
-                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-                 VALUES ($1, $2, $3)",
-            )
-            .bind(virt)
-            .bind(member)
-            .bind(prio)
-            .execute(&pool)
-            .await
-            .expect("add virtual member");
-        }
+        seed_oci_blob_test(&pool, hidden, 500_000).await;
+        link_virtual_members_test(&pool, virt, &[(vis, 1), (hidden, 2)]).await;
 
         let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
         let (member_id, member_name) = tdh::create_user(&pool).await;
@@ -21293,12 +21283,7 @@ mod apt_validation_tests {
             "a caller who can see all members must still get the full total"
         );
 
-        for id in [virt, vis, hidden] {
-            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-                .bind(id)
-                .execute(&pool)
-                .await;
-        }
+        drop_repos_test(&pool, &[virt, vis, hidden]).await;
         for id in [outsider_id, member_id, admin_id] {
             tdh::cleanup_user(&pool, id).await;
         }
@@ -21371,32 +21356,9 @@ mod apt_validation_tests {
             .await
             .expect("publish virtual + open member");
 
-        for (repo, size) in [(open, 3_000i64), (secret, 900_000i64)] {
-            sqlx::query(
-                "INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key) \
-                 VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(repo)
-            .bind(format!("sha256:{}", Uuid::new_v4().simple()))
-            .bind(size)
-            .bind(format!("oci-blobs/{}", Uuid::new_v4()))
-            .execute(&pool)
-            .await
-            .expect("insert member blob");
-        }
-        for (member, prio) in [(open, 1), (secret, 2)] {
-            sqlx::query(
-                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-                 VALUES ($1, $2, $3)",
-            )
-            .bind(virt)
-            .bind(member)
-            .bind(prio)
-            .execute(&pool)
-            .await
-            .expect("add virtual member");
-        }
+        seed_oci_blob_test(&pool, open, 3_000).await;
+        seed_oci_blob_test(&pool, secret, 900_000).await;
+        link_virtual_members_test(&pool, virt, &[(open, 1), (secret, 2)]).await;
 
         let virt_key = format!("{prefix}-virt");
         let state = tdh::build_state(pool.clone(), "/tmp/vp3081-unused");
@@ -21432,11 +21394,6 @@ mod apt_validation_tests {
             "anonymous listing must not disclose the private member's bytes"
         );
 
-        for id in [virt, open, secret] {
-            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-                .bind(id)
-                .execute(&pool)
-                .await;
-        }
+        drop_repos_test(&pool, &[virt, open, secret]).await;
     }
 }
