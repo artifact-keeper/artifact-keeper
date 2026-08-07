@@ -14724,10 +14724,22 @@ mod tests {
             sig_and_body.contains("require_auth(auth)"),
             "list_virtual_members must call require_auth (issue #913)"
         );
+        // #913 originally pinned `auth.can_access_repo(row.member_repo_id)`.
+        // That predicate is TOKEN SCOPE, not repository visibility -- it returns
+        // true for any unscoped principal, which includes every browser session,
+        // so as a visibility filter it was a no-op for the common caller
+        // (#3163). The filter is now the visibility clause.
+        //
+        // Assert on the CALL. Pinning the OLD needle would leave this guard
+        // satisfied by the handler's own explanatory comment, which still
+        // contains that string in prose -- the test would pass with the filter
+        // deleted entirely, which is exactly how it went vacuous. A negative
+        // assertion does not work here either, for the same reason: source-text
+        // matching cannot tell code from the comment describing it.
         assert!(
-            sig_and_body.contains("auth.can_access_repo(row.member_repo_id)"),
-            "list_virtual_members must filter the response by \
-             can_access_repo(member_repo_id) (issue #913)"
+            sig_and_body.contains("filter_visible_repo_ids("),
+            "list_virtual_members must filter the response by repository \
+             VISIBILITY, not by token scope (issue #913, corrected by #3163)"
         );
     }
 
