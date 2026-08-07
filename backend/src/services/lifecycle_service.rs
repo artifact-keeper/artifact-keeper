@@ -28,6 +28,179 @@ use crate::error::{AppError, Result};
 use crate::services::scheduler_service::normalize_cron_expression;
 use crate::storage::keys::prefix_matches;
 
+/// Rank every live artifact within its retention group, newest first, so a
+/// `max_versions` policy can keep the first N of each group.
+///
+/// Shared verbatim by the count query and the soft-delete, so the dry-run
+/// preview and the real run cannot disagree about which rows survive.
+///
+/// **Grouping.** OCI manifest artifacts carry the reference inside `name`
+/// (`namespace/image:tag`), so every tag of one image would otherwise be its
+/// own singleton group and nothing would ever be pruned (#2998). Stripping the
+/// trailing tag groups them. Three shapes deliberately keep their full name and
+/// stay singletons:
+///
+/// * digest references (`image:<algorithm>:<encoded>`) — children of a live
+///   multi-arch image are stored by digest with no `oci_tags` row;
+/// * cosign artifacts (`image:sha256-<digest>.sig` / `.att` / `.sbom`) — these
+///   are written AFTER the image they describe, so they are newer and would win
+///   the retention slots and evict the very manifests they sign. Observed on a
+///   `keep = 2` fixture before this exclusion: all four real image tags deleted
+///   while both signatures survived;
+/// * anything whose suffix is not a valid tag — the tag regex excludes `/`, so
+///   an untagged name carrying a registry port (`registry:5000/team/image`)
+///   cannot collapse to `registry`.
+///
+/// **Formats.** All six formats that `formats::handler_for` routes to the OCI
+/// handler share this naming, not just `docker`; gating on `docker` alone left
+/// #2998 open for podman, buildx, oras, wasm_oci and helm_oci. (`"oci"` is a
+/// parser alias, not a `repository_format` enum value, so it is not listed.)
+///
+/// **Recency.** Ordering is `COALESCE(oci_tags.updated_at, created_at)`, not
+/// `created_at`. A manifest PUT upserts the existing `artifacts` row and never
+/// touches `created_at`, so a rolling tag is always the OLDEST row of its image
+/// and would be evicted first no matter how recently it was pushed. `a.id`
+/// breaks ties so the survivor set is deterministic and the count query and the
+/// UPDATE cannot disagree.
+///
+/// **Shape.** A window function rather than a correlated `NOT IN` subquery.
+/// Wrapping the indexed `name` in `regexp_replace` on both sides of a
+/// correlated join makes the predicate non-sargable, so the index is unusable
+/// and the subplan degrades to a seq scan per outer row — measured at 4 ms →
+/// 212 s on 2,000 artifacts, inside the transaction `execute_policy` keeps
+/// short so `artifacts` row locks release promptly. The window form evaluates
+/// the regex once per row.
+macro_rules! max_versions_ranked_cte {
+    () => {
+        r#"
+WITH ranked AS (
+    SELECT a.id,
+           a.size_bytes,
+           row_number() OVER (
+               PARTITION BY
+                   CASE
+                       WHEN r.format IN ('docker', 'podman', 'buildx', 'oras', 'wasm_oci', 'helm_oci')
+                            AND a.name !~ ':[a-z0-9]+([+._-][a-z0-9]+)*:[A-Za-z0-9=_-]+$'
+                            AND a.name !~ ':sha256-[A-Fa-f0-9]+\.(sig|att|sbom)$'
+                            AND a.name ~ ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+                       THEN regexp_replace(a.name, ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$', '')
+                       ELSE a.name
+                   END
+               ORDER BY COALESCE(ot.updated_at, a.created_at) DESC, a.id DESC
+           ) AS rn
+    FROM artifacts a
+    JOIN repositories r ON r.id = a.repository_id
+    LEFT JOIN oci_tags ot
+           ON ot.repository_id = a.repository_id
+          AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag
+          AND a.version = ot.tag
+    WHERE a.repository_id = $1
+      AND a.is_deleted = false
+)
+"#
+    };
+}
+
+/// Build a max-age query with a shared effective timestamp expression.
+///
+/// An OCI manifest artifact ages from the matching logical reference row in
+/// `oci_tags`, keyed by `(repository, image, reference)`, rather than from the
+/// path-keyed artifact row's first-seen `created_at`. This applies to both
+/// human-readable tags and digest-shaped references. When no matching tag row
+/// exists, `COALESCE` retains the historical `artifacts.created_at` fallback
+/// used by non-OCI and legacy/content-addressed rows without tag metadata.
+///
+/// `oci_tags.updated_at` is deliberately a last-publish/cache-fill clock. Every
+/// successful hosted manifest PUT refreshes it, including a re-push of an
+/// unchanged digest because the tag upsert has no `IS DISTINCT FROM` guard. A
+/// valid Remote manifest cache fill (or refill after a local miss) that records
+/// a tag row also refreshes it; a normal warm Remote pull returns from local
+/// storage before the cache-upsert path and therefore does not extend
+/// retention.
+///
+/// The tag row is reached with a `LEFT JOIN`, not a correlated subquery. The
+/// subquery form is quadratic here: `oci_tags_repository_id_name_tag_key` is
+/// `(repository_id, name, tag)`, and `name` appears only inside the
+/// concatenation, so the middle column is unconstrained and every probe walks
+/// the whole `repository_id` range of the index -- once per artifact row, with
+/// parallelism lost. Measured on 50k artifacts / 25k tags: 58,946 ms as a
+/// subquery, 28 ms as a join, identical result sets. That matters because this
+/// runs twice per execution (count, then UPDATE), inside the transaction
+/// `execute_policy` deliberately keeps short so `artifacts` row locks release
+/// before further pool work, on a 6-hour cron -- and the global variant has no
+/// repository scope at all.
+///
+/// At most one tag row can match, so the join cannot duplicate artifact rows:
+/// `a.version = ot.tag` pins `tag`, which makes `name` fully determined by
+/// string arithmetic on `a.path`, and `UNIQUE(repository_id, name, tag)` does
+/// the rest. That predicate is load-bearing, not redundant -- without it a
+/// slash-bearing image name matches twice, because `name='a/manifests/b',
+/// tag='c'` and `name='a', tag='b/manifests/c'` both reconstruct
+/// `v2/a/manifests/b/manifests/c`.
+///
+/// The join deliberately does NOT also require
+/// `a.storage_key = 'oci-manifests/' || ot.manifest_digest`. That conjunct adds
+/// no identification for the logical reference -- path and version already pin
+/// the row -- and makes a partial write fail toward deletion: the `oci_tags`
+/// upsert is transactional while `upsert_manifest_artifact` is best-effort and
+/// only logs on failure, so the two tables can disagree on digest while the push
+/// still returns 201. With the conjunct, that disagreement makes the join miss,
+/// `COALESCE` falls back to the stale `created_at`, and the live reference's
+/// artifact row is soft-deleted despite its fresh tag mapping. The `oci_tags`
+/// row still protects the current manifest bytes, but the reference disappears
+/// from artifact-backed listings. Verified both ways against a live database.
+macro_rules! max_age_from_where {
+    ($repository_predicate:literal, $days_parameter:literal) => {
+        concat!(
+            r#"
+FROM artifacts a
+LEFT JOIN oci_tags ot
+       ON ot.repository_id = a.repository_id
+      AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag
+      AND a.version = ot.tag
+WHERE
+    "#,
+            $repository_predicate,
+            r#"a.is_deleted = false
+    AND COALESCE(ot.updated_at, a.created_at) < NOW() - make_interval(days => "#,
+            $days_parameter,
+            "::INT)\n"
+        )
+    };
+}
+
+/// Count/size query for a max-age policy.
+macro_rules! max_age_select_sql {
+    ($repository_predicate:literal, $days_parameter:literal) => {
+        concat!(
+            "SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes",
+            max_age_from_where!($repository_predicate, $days_parameter)
+        )
+    };
+}
+
+/// Soft-delete query for a max-age policy.
+///
+/// `UPDATE` cannot carry a `LEFT JOIN`, so the shared `FROM`/`WHERE` is reused
+/// verbatim inside an `IN` subselect. Both statements therefore still derive
+/// from one definition -- the property that makes dry-run counts and the real
+/// run agree, and the reason the previous two hand-maintained copies were
+/// collapsed into a macro in the first place.
+macro_rules! max_age_update_sql {
+    ($repository_predicate:literal, $days_parameter:literal) => {
+        concat!(
+            "UPDATE artifacts AS a SET is_deleted = true\nWHERE a.id IN (\n    SELECT a.id",
+            max_age_from_where!($repository_predicate, $days_parameter),
+            ")\n"
+        )
+    };
+}
+
+const MAX_AGE_SCOPED_SELECT_SQL: &str = max_age_select_sql!("a.repository_id = $1\n    AND ", "$2");
+const MAX_AGE_GLOBAL_SELECT_SQL: &str = max_age_select_sql!("", "$1");
+const MAX_AGE_SCOPED_UPDATE_SQL: &str = max_age_update_sql!("a.repository_id = $1\n    AND ", "$2");
+const MAX_AGE_GLOBAL_UPDATE_SQL: &str = max_age_update_sql!("", "$1");
+
 /// Delete `oci_tags` rows whose matching manifest artifact is soft-deleted.
 ///
 /// Each row in `oci_tags` is matched to its source artifact via the
@@ -123,10 +296,11 @@ WHERE a.is_deleted = true
   )
 "#;
 
-/// Compile-time guard: the `'oci-manifests/'` literal embedded in
-/// [`CASCADE_OCI_TAGS_SQL`] must match [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX).
-/// Postgres cannot reference the Rust constant directly, so this keeps the
-/// SQL literal and the write-path constant from drifting (#1413).
+/// Compile-time guard: the `'oci-manifests/'` literals embedded in the max-age
+/// SQL and [`CASCADE_OCI_TAGS_SQL`] must match
+/// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX).
+/// Postgres cannot reference the Rust constant directly, so this keeps the SQL
+/// literals and the write-path constant from drifting (#1413).
 const _: () = assert!(prefix_matches("oci-manifests/"));
 
 /// Scope of a lifecycle policy execution: either a specific repository or
@@ -898,63 +1072,35 @@ impl LifecycleService {
         let days = parse_i64_field(&policy.config, PolicyType::MaxAgeDays.as_wire_str(), "days")?;
 
         let matched = if policy.repository_id.is_some() {
-            sqlx::query_as::<_, CountBytes>(
-                r#"
-                SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0)::BIGINT as bytes
-                FROM artifacts
-                WHERE repository_id = $1
-                  AND is_deleted = false
-                  AND created_at < NOW() - make_interval(days => $2::INT)
-                "#,
-            )
-            .bind(policy.repository_id)
-            .bind(days as i32)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
+            sqlx::query_as::<_, CountBytes>(MAX_AGE_SCOPED_SELECT_SQL)
+                .bind(policy.repository_id)
+                .bind(days as i32)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
         } else {
-            sqlx::query_as::<_, CountBytes>(
-                r#"
-                SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0)::BIGINT as bytes
-                FROM artifacts
-                WHERE is_deleted = false
-                  AND created_at < NOW() - make_interval(days => $1::INT)
-                "#,
-            )
-            .bind(days as i32)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
+            sqlx::query_as::<_, CountBytes>(MAX_AGE_GLOBAL_SELECT_SQL)
+                .bind(days as i32)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
         };
 
         let mut removed = 0i64;
         if !dry_run && matched.count > 0 {
             let result = if policy.repository_id.is_some() {
-                sqlx::query(
-                    r#"
-                    UPDATE artifacts SET is_deleted = true
-                    WHERE repository_id = $1
-                      AND is_deleted = false
-                      AND created_at < NOW() - make_interval(days => $2::INT)
-                    "#,
-                )
-                .bind(policy.repository_id)
-                .bind(days as i32)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?
+                sqlx::query(MAX_AGE_SCOPED_UPDATE_SQL)
+                    .bind(policy.repository_id)
+                    .bind(days as i32)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?
             } else {
-                sqlx::query(
-                    r#"
-                    UPDATE artifacts SET is_deleted = true
-                    WHERE is_deleted = false
-                      AND created_at < NOW() - make_interval(days => $1::INT)
-                    "#,
-                )
-                .bind(days as i32)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?
+                sqlx::query(MAX_AGE_GLOBAL_UPDATE_SQL)
+                    .bind(days as i32)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?
             };
             removed = result.rows_affected() as i64;
         }
@@ -983,23 +1129,22 @@ impl LifecycleService {
             AppError::Validation("max_versions requires a repository_id".to_string())
         })?;
 
-        // Find artifacts to remove: for each (name), keep only the latest N
-        let matched = sqlx::query_as::<_, CountBytes>(
-            r#"
-            SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes
-            FROM artifacts a
-            WHERE a.repository_id = $1
-              AND a.is_deleted = false
-              AND a.id NOT IN (
-                  SELECT a2.id FROM artifacts a2
-                  WHERE a2.repository_id = $1
-                    AND a2.name = a.name
-                    AND a2.is_deleted = false
-                  ORDER BY a2.created_at DESC
-                  LIMIT $2
-              )
-            "#,
-        )
+        // Find artifacts to remove: for each package/image, keep only the latest N.
+        // Docker manifest artifacts store a reference as part of `name`
+        // (`namespace/image:tag`), while other formats store the package name
+        // independently from its version. Partition Docker entries by image
+        // only when the suffix is a valid tag. A digest reference has the
+        // shape `image:<algorithm>:<encoded>` and must stay a distinct,
+        // full-name partition: children of a live multi-arch image can be
+        // stored by digest without an `oci_tags` row. The tag regex excludes
+        // `/`, so an untagged synthetic name with a registry port, such as
+        // `registry:5000/team/image`, cannot collapse to just `registry`.
+        let matched = sqlx::query_as::<_, CountBytes>(concat!(
+            max_versions_ranked_cte!(),
+            "SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0)::BIGINT as bytes\n\
+             FROM ranked\n\
+             WHERE rn > $2\n"
+        ))
         .bind(repo_id)
         .bind(keep)
         .fetch_one(&mut *conn)
@@ -1008,21 +1153,11 @@ impl LifecycleService {
 
         let mut removed = 0i64;
         if !dry_run && matched.count > 0 {
-            let result = sqlx::query(
-                r#"
-                UPDATE artifacts SET is_deleted = true
-                WHERE repository_id = $1
-                  AND is_deleted = false
-                  AND id NOT IN (
-                      SELECT a2.id FROM artifacts a2
-                      WHERE a2.repository_id = $1
-                        AND a2.name = artifacts.name
-                        AND a2.is_deleted = false
-                      ORDER BY a2.created_at DESC
-                      LIMIT $2
-                  )
-                "#,
-            )
+            let result = sqlx::query(concat!(
+                max_versions_ranked_cte!(),
+                "UPDATE artifacts SET is_deleted = true\n\
+                 WHERE id IN (SELECT id FROM ranked WHERE rn > $2)\n"
+            ))
             .bind(repo_id)
             .bind(keep)
             .execute(&mut *conn)
@@ -1361,6 +1496,350 @@ mod tests {
     // validate_policy_config tests: max_age_days
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn test_max_age_timestamp_uses_oci_reference_update_with_created_fallback() {
+        for sql in [
+            MAX_AGE_SCOPED_SELECT_SQL,
+            MAX_AGE_GLOBAL_SELECT_SQL,
+            MAX_AGE_SCOPED_UPDATE_SQL,
+            MAX_AGE_GLOBAL_UPDATE_SQL,
+        ] {
+            // Pin the join and the comparison as ONE exact substring, not as
+            // independent `contains` fragments. Fragment assertions pass on any
+            // arrangement of the same vocabulary, so they survive mutations that
+            // fully restore the bug: swapping the COALESCE arguments makes
+            // `a.created_at` win unconditionally (it is NOT NULL), and flipping
+            // `<` to `>` soft-deletes everything NEWER than the window. Both were
+            // demonstrated to pass against the fragment form.
+            assert!(
+                sql.contains(
+                    "LEFT JOIN oci_tags ot\n       ON ot.repository_id = a.repository_id\n      \
+                     AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag\n      \
+                     AND a.version = ot.tag\n"
+                ),
+                "the tag join must stay exactly this shape -- a.version = ot.tag is what \
+                 guarantees at most one match, and reaching oci_tags by correlated subquery \
+                 instead of a join is quadratic: {sql}"
+            );
+            assert!(
+                sql.contains(
+                    "COALESCE(ot.updated_at, a.created_at) < NOW() - make_interval(days => "
+                ),
+                "the tag's last push must take precedence over the artifact row's created_at, \
+                 and the comparison must select artifacts OLDER than the window: {sql}"
+            );
+            // The digest conjunct must stay OUT: with it, a disagreement between
+            // oci_tags and the best-effort artifacts upsert makes the join miss
+            // and a tag pushed seconds ago gets soft-deleted by its stale
+            // created_at -- the very bug this predicate exists to fix.
+            assert!(
+                !sql.contains("ot.manifest_digest"),
+                "joining on manifest_digest makes a partial write fail toward deletion: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_age_sql_keeps_scope_specific_bind_positions() {
+        for sql in [MAX_AGE_SCOPED_SELECT_SQL, MAX_AGE_SCOPED_UPDATE_SQL] {
+            assert!(sql.contains("a.repository_id = $1"));
+            assert!(sql.contains("days => $2::INT"));
+        }
+        for sql in [MAX_AGE_GLOBAL_SELECT_SQL, MAX_AGE_GLOBAL_UPDATE_SQL] {
+            assert!(!sql.contains("a.repository_id = $1"));
+            assert!(sql.contains("days => $1::INT"));
+        }
+    }
+
+    async fn insert_max_age_test_repository(conn: &mut sqlx::PgConnection) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = format!("max-age-test-{id}");
+        sqlx::query(
+            r#"
+            INSERT INTO repositories (id, key, name, storage_path, repo_type, format)
+            VALUES ($1, $2, $2, $3, 'local', 'docker')
+            "#,
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("/tmp/{key}"))
+        .execute(conn)
+        .await
+        .expect("failed to insert max-age test repository");
+        id
+    }
+
+    async fn insert_max_age_test_artifact(
+        conn: &mut sqlx::PgConnection,
+        repository_id: Uuid,
+        path: &str,
+        version: &str,
+        storage_key: &str,
+        days_ago: i32,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, created_at, updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, 123,
+                repeat('a', 64), 'application/octet-stream', $6,
+                NOW() - make_interval(days => $7::INT),
+                NOW() - make_interval(days => $7::INT)
+            )
+            "#,
+        )
+        .bind(id)
+        .bind(repository_id)
+        .bind(path)
+        .bind(format!("max-age-test-{id}"))
+        .bind(version)
+        .bind(storage_key)
+        .bind(days_ago)
+        .execute(conn)
+        .await
+        .expect("failed to insert max-age test artifact");
+        id
+    }
+
+    async fn insert_max_age_test_tag(
+        conn: &mut sqlx::PgConnection,
+        repository_id: Uuid,
+        image: &str,
+        reference: &str,
+        manifest_digest: &str,
+        days_ago: i32,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO oci_tags (
+                repository_id, name, tag, manifest_digest,
+                manifest_content_type, updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4,
+                'application/vnd.oci.image.manifest.v1+json',
+                NOW() - make_interval(days => $5::INT)
+            )
+            "#,
+        )
+        .bind(repository_id)
+        .bind(image)
+        .bind(reference)
+        .bind(manifest_digest)
+        .bind(days_ago)
+        .execute(conn)
+        .await
+        .expect("failed to insert max-age test OCI reference");
+    }
+
+    fn max_age_test_policy(repository_id: Option<Uuid>, days: i64) -> LifecyclePolicy {
+        let mut policy = make_policy(Uuid::new_v4(), "Max age coverage", "max_age_days");
+        policy.repository_id = repository_id;
+        policy.config = json!({"days": days});
+        policy
+    }
+
+    #[tokio::test]
+    async fn test_execute_max_age_scoped_uses_reference_timestamp_and_fallback() {
+        let Some(pool) = crate::testing::try_pool_with(1).await else {
+            return;
+        };
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("failed to begin test transaction");
+        let repository_id = insert_max_age_test_repository(&mut tx).await;
+
+        // Exact human-readable tag, digest-shaped reference, and partial-write
+        // digest drift all use the matching logical reference's fresh clock.
+        let exact_digest = format!("sha256:{}", "b".repeat(64));
+        let digest_reference = format!("sha256:{}", "c".repeat(64));
+        let drift_artifact_digest = format!("sha256:{}", "d".repeat(64));
+        let drift_tag_digest = format!("sha256:{}", "e".repeat(64));
+        let reference_cases = [
+            (
+                "exact-app",
+                "latest",
+                exact_digest.as_str(),
+                exact_digest.as_str(),
+            ),
+            (
+                "digest-app",
+                digest_reference.as_str(),
+                digest_reference.as_str(),
+                digest_reference.as_str(),
+            ),
+            (
+                "drift-app",
+                "latest",
+                drift_artifact_digest.as_str(),
+                drift_tag_digest.as_str(),
+            ),
+        ];
+        let mut retained_artifact_ids = Vec::new();
+        for (image, reference, artifact_digest, tag_digest) in reference_cases {
+            let artifact_id = insert_max_age_test_artifact(
+                &mut tx,
+                repository_id,
+                &format!("v2/{image}/manifests/{reference}"),
+                reference,
+                &format!("oci-manifests/{artifact_digest}"),
+                91,
+            )
+            .await;
+            insert_max_age_test_tag(&mut tx, repository_id, image, reference, tag_digest, 0).await;
+            retained_artifact_ids.push(artifact_id);
+        }
+
+        // Both rows reconstruct the same path, but only the first row has a tag
+        // equal to artifacts.version. The stale ambiguous row must not make the
+        // fresh logical reference eligible for deletion.
+        let ambiguous_digest = format!("sha256:{}", "f".repeat(64));
+        let ambiguous_artifact_id = insert_max_age_test_artifact(
+            &mut tx,
+            repository_id,
+            "v2/a/manifests/b/manifests/c",
+            "c",
+            &format!("oci-manifests/{ambiguous_digest}"),
+            91,
+        )
+        .await;
+        insert_max_age_test_tag(
+            &mut tx,
+            repository_id,
+            "a/manifests/b",
+            "c",
+            &ambiguous_digest,
+            0,
+        )
+        .await;
+        insert_max_age_test_tag(
+            &mut tx,
+            repository_id,
+            "a",
+            "b/manifests/c",
+            &ambiguous_digest,
+            91,
+        )
+        .await;
+        retained_artifact_ids.push(ambiguous_artifact_id);
+
+        // A structurally identical digest-shaped artifact without an oci_tags
+        // row keeps the historical created_at fallback and is the positive
+        // control that proves the predicate still selects old artifacts.
+        let untagged_digest = format!("sha256:{}", "9".repeat(64));
+        let untagged_artifact_id = insert_max_age_test_artifact(
+            &mut tx,
+            repository_id,
+            &format!("v2/untagged-app/manifests/{untagged_digest}"),
+            &untagged_digest,
+            &format!("oci-manifests/{untagged_digest}"),
+            91,
+        )
+        .await;
+
+        let policy = max_age_test_policy(Some(repository_id), 90);
+        let dry_run = LifecycleService::execute_max_age(&mut tx, &policy, true)
+            .await
+            .expect("scoped max-age dry-run failed");
+        assert_eq!(dry_run.artifacts_matched, 1);
+        assert_eq!(dry_run.artifacts_removed, 0);
+
+        let fallback_execution = LifecycleService::execute_max_age(&mut tx, &policy, false)
+            .await
+            .expect("scoped max-age fallback execution failed");
+        assert_eq!(fallback_execution.artifacts_matched, 1);
+        assert_eq!(fallback_execution.artifacts_removed, 1);
+        assert_eq!(fallback_execution.bytes_freed, 123);
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT is_deleted FROM artifacts WHERE id = $1")
+                .bind(untagged_artifact_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("failed to inspect untagged digest artifact")
+        );
+        for artifact_id in &retained_artifact_ids {
+            assert!(!sqlx::query_scalar::<_, bool>(
+                "SELECT is_deleted FROM artifacts WHERE id = $1"
+            )
+            .bind(artifact_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("failed to inspect retained OCI artifact"));
+        }
+
+        sqlx::query(
+            "UPDATE oci_tags SET updated_at = NOW() - INTERVAL '91 days' \
+             WHERE repository_id = $1",
+        )
+        .bind(repository_id)
+        .execute(&mut *tx)
+        .await
+        .expect("failed to backdate OCI references");
+
+        let executed = LifecycleService::execute_max_age(&mut tx, &policy, false)
+            .await
+            .expect("scoped max-age execution failed");
+        assert_eq!(executed.artifacts_matched, 4);
+        assert_eq!(executed.artifacts_removed, 4);
+        assert_eq!(executed.bytes_freed, 492);
+        for artifact_id in retained_artifact_ids {
+            assert!(sqlx::query_scalar::<_, bool>(
+                "SELECT is_deleted FROM artifacts WHERE id = $1"
+            )
+            .bind(artifact_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("failed to inspect expired OCI artifact"));
+        }
+
+        tx.rollback().await.expect("failed to roll back test data");
+    }
+
+    #[tokio::test]
+    async fn test_execute_max_age_global_uses_created_at_fallback() {
+        const ISOLATED_MAX_AGE_DAYS: i32 = 1_000_000;
+
+        let Some(pool) = crate::testing::try_pool_with(1).await else {
+            return;
+        };
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("failed to begin test transaction");
+        let repository_id = insert_max_age_test_repository(&mut tx).await;
+        let artifact_id = insert_max_age_test_artifact(
+            &mut tx,
+            repository_id,
+            &format!("global-max-age/{repository_id}"),
+            "1.0.0",
+            &format!("max-age-tests/{repository_id}"),
+            ISOLATED_MAX_AGE_DAYS + 1,
+        )
+        .await;
+        let policy = max_age_test_policy(None, i64::from(ISOLATED_MAX_AGE_DAYS));
+
+        let executed = LifecycleService::execute_max_age(&mut tx, &policy, false)
+            .await
+            .expect("global max-age execution failed");
+        assert_eq!(executed.artifacts_matched, 1);
+        assert_eq!(executed.artifacts_removed, 1);
+        assert_eq!(executed.bytes_freed, 123);
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT is_deleted FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("failed to inspect global artifact")
+        );
+
+        tx.rollback().await.expect("failed to roll back test data");
+    }
+
     #[tokio::test]
     async fn test_validate_max_age_days_valid() {
         let svc = make_service_for_validation();
@@ -1458,6 +1937,315 @@ mod tests {
         let svc = make_service_for_validation();
         let config = json!({"keep": 7, "max_versions": -1});
         assert!(svc.validate_policy_config("max_versions", &config).is_ok());
+    }
+
+    // This is deliberately DB-backed rather than a mocked SQL assertion: the
+    // coverage job provisions Postgres and executes library tests, so it
+    // protects the Docker-specific partition key used by execute_max_versions.
+    /// Guards the three things the docker-only sibling test above cannot see.
+    ///
+    /// 1. **Sibling OCI formats.** `podman` (and buildx/oras/wasm_oci/helm_oci)
+    ///    share the OCI handler and its `image:tag` naming, so gating grouping
+    ///    on `format = 'docker'` left #2998 open for them -- they pruned
+    ///    nothing at all.
+    /// 2. **Cosign artifacts.** `image:sha256-<digest>.sig` / `.att` are
+    ///    written AFTER the manifest they sign, so they are newer and win the
+    ///    retention slots. Grouped with the image, a `keep = 2` policy deleted
+    ///    every real tag and kept only the signatures.
+    /// 3. **Recency signal.** A manifest PUT upserts the existing `artifacts`
+    ///    row without touching `created_at`, so a rolling tag is always the
+    ///    OLDEST row of its image. Ordering by `created_at` evicts the tag that
+    ///    was pushed most recently; ordering by `COALESCE(oci_tags.updated_at,
+    ///    created_at)` keeps it.
+    ///
+    /// Reverting any one of the three fails this test.
+    #[tokio::test]
+    async fn test_max_versions_covers_sibling_oci_formats_cosign_and_last_push() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let repository_id = Uuid::new_v4();
+        let suffix = repository_id.simple();
+        let repository_key = format!("lifecycle-podman-{suffix}");
+        // podman, deliberately NOT docker.
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'local', 'podman'::repository_format)",
+        )
+        .bind(repository_id)
+        .bind(&repository_key)
+        .bind(format!("/tmp/{repository_key}"))
+        .execute(&pool)
+        .await
+        .expect("insert podman repository");
+
+        // (name, version, created_at age in days, tag push age in hours or None)
+        let rows: Vec<(&str, &str, i64, Option<i64>)> = vec![
+            // `latest` is the OLDEST row but the most recently PUSHED tag.
+            ("app:latest", "latest", 200, Some(0)),
+            ("app:v1", "v1", 3, Some(72)),
+            ("app:v2", "v2", 2, Some(48)),
+            // Cosign artifacts for the image: newest rows of all.
+            ("app:sha256-deadbeef.sig", "sha256-deadbeef.sig", 0, None),
+            ("app:sha256-deadbeef.att", "sha256-deadbeef.att", 0, None),
+        ];
+        for (name, version, age_days, tag_push_hours) in rows {
+            let artifact_id = Uuid::new_v4();
+            let image = name.split(':').next().unwrap().to_string();
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    id, repository_id, path, name, version, size_bytes,
+                    checksum_sha256, content_type, storage_key, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, 100, $6,
+                        'application/vnd.oci.image.manifest.v1+json', $7, $8)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(repository_id)
+            .bind(format!("v2/{image}/manifests/{version}"))
+            .bind(name)
+            .bind(version)
+            .bind("0".repeat(64))
+            .bind(format!("oci-manifests/{artifact_id}"))
+            .bind(Utc::now() - chrono::Duration::days(age_days))
+            .execute(&pool)
+            .await
+            .expect("insert oci manifest artifact");
+
+            if let Some(hours) = tag_push_hours {
+                sqlx::query(
+                    "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(repository_id)
+                .bind(&image)
+                .bind(version)
+                .bind(format!("sha256:{}", "e".repeat(64)))
+                .bind(Utc::now() - chrono::Duration::hours(hours))
+                .execute(&pool)
+                .await
+                .expect("insert oci tag");
+            }
+        }
+
+        let service = LifecycleService::new(pool.clone());
+        let policy = service
+            .create_policy(CreateLifecyclePolicyRequest {
+                repository_id: Some(repository_id),
+                name: format!("retain-two-{suffix}"),
+                description: None,
+                policy_type: "max_versions".to_string(),
+                config: json!({"keep": 2}),
+                priority: None,
+                cron_schedule: None,
+            })
+            .await
+            .expect("create lifecycle policy");
+
+        let execution = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute lifecycle policy");
+
+        let states: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT name, is_deleted FROM artifacts \
+             WHERE repository_id = $1 ORDER BY name",
+        )
+        .bind(repository_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read lifecycle results");
+
+        let deleted = |n: &str| -> bool {
+            states
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, d)| *d)
+                .unwrap_or_else(|| panic!("missing artifact {n} in {states:?}"))
+        };
+
+        // A podman repo must prune at all -- docker-only gating pruned nothing.
+        assert_eq!(
+            execution.artifacts_removed, 1,
+            "podman shares the OCI handler and must group tags too: {states:?}"
+        );
+        // The most recently PUSHED tag survives even though its row is oldest.
+        assert!(
+            !deleted("app:latest"),
+            "a rolling tag pushed moments ago must not be evicted by its stale \
+             created_at: {states:?}"
+        );
+        assert!(
+            !deleted("app:v2"),
+            "second-newest push survives: {states:?}"
+        );
+        assert!(
+            deleted("app:v1"),
+            "oldest push is the one pruned: {states:?}"
+        );
+        // Cosign artifacts are their own partitions and never displace a manifest.
+        assert!(
+            !deleted("app:sha256-deadbeef.sig"),
+            "cosign signature must not be pruned: {states:?}"
+        );
+        assert!(
+            !deleted("app:sha256-deadbeef.att"),
+            "cosign attestation must not be pruned: {states:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .execute(&pool)
+            .await;
+    }
+
+    // A Docker manifest stores its tag in `artifacts.name`; retaining one
+    // version must group `image:v1`, `image:v2`, and `image:v3` as one image,
+    // without grouping digest-reference or tagless artifacts.
+    #[tokio::test]
+    async fn test_max_versions_groups_docker_tags_by_image() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let repository_id = Uuid::new_v4();
+        let suffix = repository_id.simple();
+        let repository_key = format!("lifecycle-docker-tags-{suffix}");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'local', 'docker'::repository_format)",
+        )
+        .bind(repository_id)
+        .bind(&repository_key)
+        .bind(format!("/tmp/{repository_key}"))
+        .execute(&pool)
+        .await
+        .expect("insert docker repository");
+
+        let digest_a = format!("sha256:{}", "a".repeat(64));
+        let digest_b = format!("sha256:{}", "b".repeat(64));
+        let artifacts = vec![
+            (
+                "registry:5000/team/image:v1".to_string(),
+                "v1".to_string(),
+                7,
+            ),
+            (
+                "registry:5000/team/image:v2".to_string(),
+                "v2".to_string(),
+                6,
+            ),
+            (
+                "registry:5000/team/image:v3".to_string(),
+                "v3".to_string(),
+                5,
+            ),
+            (
+                "registry:5000/team/other:v1".to_string(),
+                "v1".to_string(),
+                1,
+            ),
+            (
+                format!("registry:5000/team/image:{digest_a}"),
+                digest_a.clone(),
+                10,
+            ),
+            (
+                format!("registry:5000/team/image:{digest_b}"),
+                digest_b.clone(),
+                9,
+            ),
+            (
+                "registry:5000/team/tagless-a".to_string(),
+                "untagged-a".to_string(),
+                11,
+            ),
+            (
+                "registry:5000/team/tagless-b".to_string(),
+                "untagged-b".to_string(),
+                8,
+            ),
+        ];
+        for (name, version, age_days) in artifacts {
+            let artifact_id = Uuid::new_v4();
+            let path = format!("v2/{name}/manifests/{version}");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    id, repository_id, path, name, version, size_bytes,
+                    checksum_sha256, content_type, storage_key, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, 100, $6,
+                        'application/vnd.oci.image.manifest.v1+json', $7, $8)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(repository_id)
+            .bind(&path)
+            .bind(&name)
+            .bind(&version)
+            .bind("0".repeat(64))
+            .bind(format!("oci-manifests/{artifact_id}"))
+            .bind(Utc::now() - chrono::Duration::days(age_days))
+            .execute(&pool)
+            .await
+            .expect("insert docker manifest artifact");
+        }
+
+        let service = LifecycleService::new(pool.clone());
+        let policy = service
+            .create_policy(CreateLifecyclePolicyRequest {
+                repository_id: Some(repository_id),
+                name: format!("retain-latest-docker-tag-{suffix}"),
+                description: None,
+                policy_type: "max_versions".to_string(),
+                config: json!({"keep": 1}),
+                priority: None,
+                cron_schedule: None,
+            })
+            .await
+            .expect("create lifecycle policy");
+
+        let execution = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute lifecycle policy");
+        assert_eq!(execution.artifacts_matched, 2);
+        assert_eq!(execution.artifacts_removed, 2);
+
+        let states: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT name, is_deleted FROM artifacts \
+             WHERE repository_id = $1 ORDER BY name",
+        )
+        .bind(repository_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read lifecycle results");
+        let mut expected = vec![
+            ("registry:5000/team/image:v1".to_string(), true),
+            ("registry:5000/team/image:v2".to_string(), true),
+            ("registry:5000/team/image:v3".to_string(), false),
+            ("registry:5000/team/other:v1".to_string(), false),
+            (format!("registry:5000/team/image:{digest_a}"), false),
+            (format!("registry:5000/team/image:{digest_b}"), false),
+            ("registry:5000/team/tagless-a".to_string(), false),
+            ("registry:5000/team/tagless-b".to_string(), false),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(states, expected);
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup docker repository");
     }
 
     #[tokio::test]

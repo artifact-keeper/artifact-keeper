@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -947,6 +947,14 @@ async fn download(
                     if let Some(size) = result.content_length {
                         builder = builder.header(CONTENT_LENGTH, size.to_string());
                     }
+                    // The proxy no longer decodes upstream bodies (see
+                    // `http_client::base_client_builder`), so a content-coded body
+                    // must be declared as such or cargo silently writes compressed
+                    // bytes to disk and fails the checksum. `content_length` above
+                    // is the coded length, which is what the client reads.
+                    if let Some(ref encoding) = result.content_encoding {
+                        builder = builder.header(CONTENT_ENCODING, encoding);
+                    }
                     return Ok(builder.body(Body::from_stream(result.body)).unwrap());
                 }
             }
@@ -1025,6 +1033,11 @@ async fn download(
                     .header("cache-control", "public, max-age=31536000, immutable");
                 if let Some(size) = result.content_length {
                     builder = builder.header(CONTENT_LENGTH, size.to_string());
+                }
+                // Same reason as the Remote arm above: an undeclared content
+                // coding reaches cargo as compressed bytes it will not inflate.
+                if let Some(ref encoding) = result.content_encoding {
+                    builder = builder.header(CONTENT_ENCODING, encoding);
                 }
                 return Ok(builder.body(Body::from_stream(result.body)).unwrap());
             }
@@ -1740,6 +1753,181 @@ mod tests {
             &warm_body[..],
             &body[..],
             "warm read must serve the identical bytes"
+        );
+    }
+
+    /// #2920: a content-coded upstream `.crate` must arrive declared.
+    ///
+    /// The Remote arm builds its response by hand rather than through
+    /// `build_streaming_response_with_disposition`, deliberately, so the content
+    /// type stays pinned to `application/x-tar` instead of taking upstream's
+    /// `application/gzip`. The hand-rolled builder read `content_length` off
+    /// `StreamingFetchResult` and dropped `content_encoding` one line later.
+    ///
+    /// Since #2915 the proxy no longer decodes upstream bodies, so an undeclared
+    /// coding reaches cargo as compressed bytes it will not inflate: the client
+    /// writes them to disk and fails the index `cksum`. This needs an
+    /// intermediary that applies a transfer coding (a corporate proxy, nginx
+    /// with gzip on, a mirror); crates.io itself does not trigger it.
+    ///
+    /// The body is asserted to arrive still compressed and byte-identical, so a
+    /// regression that re-enables transparent decoding fails here too.
+    #[tokio::test]
+    async fn test_remote_crate_download_forwards_upstream_content_encoding() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+
+        let name = "coded-crate";
+        let version = "0.4.1";
+        let plain = b"\x1f\x8b fake .crate tarball payload, repeated. ".repeat(64);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&plain).expect("gzip encode");
+        let compressed = encoder.finish().expect("gzip finish");
+        assert_ne!(
+            compressed, plain,
+            "fixture must actually be coded or the test proves nothing"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/api/v1/crates/{name}/{version}/download")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(compressed.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        // `tdh::send` drops the headers, which are the subject of this test.
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(format!(
+                "/cargo/{}/api/v1/crates/{}/{}/download",
+                fx.repo_key, name, version
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "upstream Content-Encoding must be forwarded, or cargo writes \
+             undecodable bytes to disk and fails the checksum",
+        );
+        assert_eq!(
+            &body[..],
+            &compressed[..],
+            "the coded bytes must be passed through untouched",
+        );
+        // The pinned content type is the reason this arm hand-rolls its
+        // response; guard it here so a future move to the shared helper cannot
+        // silently start forwarding upstream's `application/gzip`.
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-tar"),
+        );
+    }
+
+    /// Sibling of the Remote-arm test above, for the VIRTUAL arm.
+    ///
+    /// #2920 names both download arms, and both hand-roll their response, so
+    /// both dropped `content_encoding`. The fix touched both but shipped a test
+    /// for only one -- leaving the virtual arm free to regress silently. This
+    /// closes that: it fails on the pre-fix code exactly as the Remote-arm test
+    /// does.
+    #[tokio::test]
+    async fn test_virtual_crate_download_forwards_upstream_content_encoding() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Remote member that actually proxies, plus the virtual repo in front.
+        let Some(member) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+        let Some(virt) = tdh::Fixture::setup("virtual", "cargo").await else {
+            member.teardown().await;
+            return;
+        };
+
+        let name = "virt-coded-crate";
+        let version = "1.2.3";
+        let plain = b"\x1f\x8b fake .crate tarball payload, repeated. ".repeat(64);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&plain).expect("gzip encode");
+        let compressed = encoder.finish().expect("gzip finish");
+        assert_ne!(
+            compressed, plain,
+            "fixture must actually be coded or the test proves nothing"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/api/v1/crates/{name}/{version}/download")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(compressed.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt.repo_id)
+        .bind(member.repo_id)
+        .execute(&virt.pool)
+        .await
+        .expect("link remote member into the virtual repo");
+
+        let (state, _dir) = tdh::rewire_remote_proxy(&member, &server.uri()).await;
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(format!(
+                "/cargo/{}/api/v1/crates/{}/{}/download",
+                virt.repo_key, name, version
+            )),
+        )
+        .await;
+
+        virt.teardown().await;
+        member.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the virtual arm must forward upstream Content-Encoding too, or \
+             cargo writes undecodable bytes and fails the checksum",
+        );
+        assert_eq!(
+            &body[..],
+            &compressed[..],
+            "the coded bytes must be passed through untouched",
         );
     }
 

@@ -532,6 +532,117 @@ async fn insert_oci_tag(pool: &PgPool, repo_id: Uuid, image: &str, tag: &str, di
     .expect("failed to insert oci_tag");
 }
 
+/// Mirror the two timestamp-bearing upserts in the live OCI manifest PUT path:
+/// `oci_tags` is authoritative for the tag's last successful push, while the
+/// path-keyed `artifacts` row preserves its original `created_at`.
+async fn simulate_oci_manifest_push(
+    pool: &PgPool,
+    repo_id: Uuid,
+    image: &str,
+    tag: &str,
+    digest: &str,
+    size: i64,
+) -> Uuid {
+    sqlx::query(
+        r#"
+        INSERT INTO oci_tags (
+            repository_id, name, tag, manifest_digest, manifest_content_type
+        )
+        VALUES (
+            $1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json'
+        )
+        ON CONFLICT (repository_id, name, tag) DO UPDATE SET
+            manifest_digest = EXCLUDED.manifest_digest,
+            manifest_content_type = EXCLUDED.manifest_content_type,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(tag)
+    .bind(digest)
+    .execute(pool)
+    .await
+    .expect("failed to upsert oci_tag");
+
+    let name = format!("{image}:{tag}");
+    let path = format!("v2/{image}/manifests/{tag}");
+    let storage_key = format!("oci-manifests/{digest}");
+    let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
+    sqlx::query_scalar(
+        r#"
+        INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes, checksum_sha256,
+            content_type, storage_key
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6,
+            'application/vnd.oci.image.manifest.v1+json', $7
+        )
+        ON CONFLICT (repository_id, path) DO UPDATE SET
+            version = EXCLUDED.version,
+            size_bytes = EXCLUDED.size_bytes,
+            checksum_sha256 = EXCLUDED.checksum_sha256,
+            content_type = EXCLUDED.content_type,
+            storage_key = EXCLUDED.storage_key,
+            is_deleted = false,
+            updated_at = NOW()
+        RETURNING id
+        "#,
+    )
+    .bind(repo_id)
+    .bind(&path)
+    .bind(&name)
+    .bind(tag)
+    .bind(size)
+    .bind(checksum)
+    .bind(&storage_key)
+    .fetch_one(pool)
+    .await
+    .expect("failed to upsert oci manifest artifact")
+}
+
+/// Make one OCI tag mapping genuinely old by backdating both the artifact's
+/// first-seen timestamp and the authoritative `oci_tags.updated_at`.
+async fn backdate_oci_manifest_push(
+    pool: &PgPool,
+    repo_id: Uuid,
+    artifact_id: Uuid,
+    image: &str,
+    tag: &str,
+    days_ago: i32,
+) {
+    sqlx::query(
+        r#"
+        UPDATE artifacts
+        SET created_at = NOW() - make_interval(days => $2::INT),
+            updated_at = NOW() - make_interval(days => $2::INT)
+        WHERE id = $1
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(days_ago)
+    .execute(pool)
+    .await
+    .expect("failed to backdate oci manifest artifact");
+
+    sqlx::query(
+        r#"
+        UPDATE oci_tags
+        SET created_at = NOW() - make_interval(days => $4::INT),
+            updated_at = NOW() - make_interval(days => $4::INT)
+        WHERE repository_id = $1 AND name = $2 AND tag = $3
+        "#,
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(tag)
+    .bind(days_ago)
+    .execute(pool)
+    .await
+    .expect("failed to backdate oci_tag");
+}
+
 /// Re-evaluate the storage GC orphan predicate for a single
 /// (storage_key, repository_id) tuple. This mirrors the NOT EXISTS chain in
 /// `backend/src/services/storage_gc_service.rs::ORPHAN_PREDICATE_SQL`. We
@@ -736,12 +847,8 @@ async fn test_max_age_days_cascades_oci_tags() {
     insert_oci_manifest_artifact(&pool, repo_id, "myimg", "fresh-alias", old_digest, 100).await;
     insert_oci_tag(&pool, repo_id, "myimg", "fresh-alias", old_digest).await;
 
-    // Backdate the artifact to look 10 days old.
-    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '10 days' WHERE id = $1")
-        .bind(old_id)
-        .execute(&pool)
-        .await
-        .expect("backdate failed");
+    // Backdate both timestamps so the tag's current digest is genuinely old.
+    backdate_oci_manifest_push(&pool, repo_id, old_id, "myimg", "old", 10).await;
 
     let policy = svc
         .create_policy(CreateLifecyclePolicyRequest {
@@ -766,6 +873,136 @@ async fn test_max_age_days_cascades_oci_tags() {
     assert!(
         oci_tag_exists(&pool, repo_id, "myimg", "fresh-alias").await,
         "the fresh sibling tag protecting the same digest must survive"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// Regression for #3026: a moving tag keeps the artifact row's original
+/// `created_at`, but every manifest PUT refreshes `oci_tags.updated_at`.
+/// `max_age_days` must age the current tag mapping, not the path's first use.
+///
+/// This fails on main: the dry-run matches `latest`, execution soft-deletes
+/// its artifact, and the surviving `1.2.3` sibling licenses the lifecycle
+/// cascade to prune the `latest` alias even though both tags point to the
+/// manifest pushed moments ago.
+#[tokio::test]
+#[ignore]
+async fn test_max_age_days_uses_last_push_for_moving_oci_tag() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-moving-tag-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+    let old_digest = "sha256:30260000000000000000000000000000000000000000000000000000000000d0";
+    let fresh_digest = "sha256:30260000000000000000000000000000000000000000000000000000000000d1";
+
+    // Day 0: first use of `latest`, then age that original mapping past the
+    // retention cutoff.
+    let latest_id =
+        simulate_oci_manifest_push(&pool, repo_id, "app", "latest", old_digest, 100).await;
+    backdate_oci_manifest_push(&pool, repo_id, latest_id, "app", "latest", 91).await;
+
+    // Today: publish a version tag and move `latest` to the same fresh digest.
+    // The latest artifact is upserted in place: updated_at moves, created_at
+    // intentionally remains the 91-day-old first-use timestamp.
+    let version_id =
+        simulate_oci_manifest_push(&pool, repo_id, "app", "1.2.3", fresh_digest, 200).await;
+    let repushed_latest_id =
+        simulate_oci_manifest_push(&pool, repo_id, "app", "latest", fresh_digest, 200).await;
+    assert_eq!(
+        repushed_latest_id, latest_id,
+        "moving tags must reuse their path-keyed artifacts row"
+    );
+
+    let state: (bool, bool, bool, String, String) = sqlx::query_as(
+        r#"
+        SELECT
+            a.created_at < NOW() - INTERVAL '90 days',
+            a.updated_at >= NOW() - INTERVAL '90 days',
+            ot.updated_at >= NOW() - INTERVAL '90 days',
+            a.storage_key,
+            ot.manifest_digest
+        FROM artifacts a
+        JOIN oci_tags ot
+          ON ot.repository_id = a.repository_id
+         AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag
+        WHERE a.id = $1
+        "#,
+    )
+    .bind(latest_id)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to inspect moving-tag timestamps");
+    assert!(state.0, "latest must retain its original old created_at");
+    assert!(state.1, "artifact updated_at must record the fresh re-push");
+    assert!(state.2, "oci_tags.updated_at must record the fresh re-push");
+    assert_eq!(
+        state.3,
+        format!("oci-manifests/{fresh_digest}"),
+        "latest artifact must point at the fresh manifest"
+    );
+    assert_eq!(
+        state.4, fresh_digest,
+        "latest tag must point at the fresh manifest"
+    );
+
+    let legacy_match_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+          AND created_at < NOW() - INTERVAL '90 days'
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to evaluate the pre-fix max-age predicate");
+    assert_eq!(
+        legacy_match_count, 1,
+        "the pre-fix created_at predicate must reproduce the erroneous latest match"
+    );
+
+    let policy = svc
+        .create_policy(CreateLifecyclePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Drop > 90 days".to_string(),
+            description: None,
+            policy_type: "max_age_days".to_string(),
+            config: serde_json::json!({"days": 90}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .expect("failed to create max-age policy");
+
+    let dry_result = svc
+        .execute_policy(policy.id, true)
+        .await
+        .expect("max-age dry-run failed");
+    assert_eq!(
+        dry_result.artifacts_matched, 0,
+        "fresh OCI tag mappings must not match by their artifact row's old created_at"
+    );
+
+    let result = svc
+        .execute_policy(policy.id, false)
+        .await
+        .expect("max-age execution failed");
+    assert_eq!(result.artifacts_matched, 0);
+    assert_eq!(result.artifacts_removed, 0);
+    assert!(!is_deleted(&pool, latest_id).await);
+    assert!(!is_deleted(&pool, version_id).await);
+    assert!(
+        oci_tag_exists(&pool, repo_id, "app", "latest").await,
+        "fresh moving tag must survive max_age_days"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_id, "app", "1.2.3").await,
+        "fresh immutable sibling must survive max_age_days"
     );
 
     cleanup(&pool, repo_id).await;
@@ -935,14 +1172,10 @@ async fn test_cascade_handles_digest_reference() {
     insert_oci_manifest_artifact(&pool, repo_id, image, "stable", digest, 200).await;
     insert_oci_tag(&pool, repo_id, image, "stable", digest).await;
 
-    // Backdate the row and run a max_age_days policy: this matches by
-    // age, not by name, so we exercise the cascade SQL without depending
-    // on the (broken) regex shape.
-    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
-        .bind(id)
-        .execute(&pool)
-        .await
-        .expect("backdate failed");
+    // Backdate the current digest mapping and run a max_age_days policy:
+    // this matches by age, not by name, so we exercise the cascade SQL
+    // without depending on the (broken) regex shape.
+    backdate_oci_manifest_push(&pool, repo_id, id, image, reference, 30).await;
 
     let policy = svc
         .create_policy(CreateLifecyclePolicyRequest {
@@ -1266,20 +1499,20 @@ async fn test_max_versions_cascades_oci_tags() {
         .expect("failed to connect to database");
 
     let repo_id = create_test_repo(&pool, &format!("test-cascade-mv-{}", Uuid::new_v4())).await;
+    sqlx::query("UPDATE repositories SET format = 'docker' WHERE id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("failed to make lifecycle test repository a docker repository");
     let svc = LifecycleService::new(pool.clone());
 
-    // Three artifacts share the same `name` ("img:rolling") so max_versions
-    // with keep=1 will soft-delete the two older ones. Each has its own
-    // (digest, tag) so the cascade has three distinct (path, storage_key)
-    // join targets to consider.
+    // Three tags of one Docker image must form one max_versions partition.
+    // The Docker artifact name includes the tag (`img:rolling-N`), so this is
+    // a regression test for grouping by image name rather than full tag.
     let digest_old = "sha256:1407aa00000000000000000000000000000000000000000000000000000001";
     let digest_mid = "sha256:1407aa00000000000000000000000000000000000000000000000000000002";
     let digest_new = "sha256:1407aa00000000000000000000000000000000000000000000000000000003";
 
-    // insert_oci_manifest_artifact sets `name = "{image}:{tag}"`. To make all
-    // three rows share the same name (the field max_versions partitions on),
-    // we insert them via a single-image, single-tag shape and override the
-    // tag per row to keep `(repository_id, path)` unique.
     let _id_old =
         insert_oci_manifest_artifact(&pool, repo_id, "img", "rolling-1", digest_old, 100).await;
     let _id_mid =
@@ -1290,27 +1523,18 @@ async fn test_max_versions_cascades_oci_tags() {
     insert_oci_tag(&pool, repo_id, "img", "rolling-2", digest_mid).await;
     insert_oci_tag(&pool, repo_id, "img", "rolling-3", digest_new).await;
 
-    // Force all three rows to share the same `name` so they form one
-    // max_versions partition. The insert helper writes "img:<tag>"; rewrite
-    // it to a single canonical name. The cascade still keys on `path`, not
-    // `name`, so this rewrite does not weaken the join.
-    sqlx::query("UPDATE artifacts SET name = 'img:rolling' WHERE repository_id = $1")
-        .bind(repo_id)
-        .execute(&pool)
-        .await
-        .expect("failed to align names for max_versions partition");
-
     // Surviving sibling tags for the two doomed digests, each in its OWN
-    // single-member max_versions partition (distinct names, keep=1 keeps
-    // each), so the cascade may prune the rolling-1/rolling-2 tags without
-    // orphaning those digests (#1682 guard). Inserted AFTER the
-    // name-alignment UPDATE so they are not pulled into the `img:rolling`
-    // partition. The insert helper already writes a distinct name per row
-    // ("img:alias-old", "img:alias-mid"), so no rename is needed.
-    insert_oci_manifest_artifact(&pool, repo_id, "img", "alias-old", digest_old, 100).await;
-    insert_oci_tag(&pool, repo_id, "img", "alias-old", digest_old).await;
-    insert_oci_manifest_artifact(&pool, repo_id, "img", "alias-mid", digest_mid, 100).await;
-    insert_oci_tag(&pool, repo_id, "img", "alias-mid", digest_mid).await;
+    // single-member partition, so the cascade may prune rolling-1/rolling-2
+    // without orphaning those digests (#1682 guard).
+    // NOTE: these must be two DIFFERENT image names. Sharing one image name
+    // would put both in the same retention partition, so `keep = 1` would prune
+    // one of them and `artifacts_removed` would be 3, not 2 -- which is exactly
+    // how this test failed before, on the PR head as well as here. The test
+    // only runs on main/release branches, so a PR could not surface it.
+    insert_oci_manifest_artifact(&pool, repo_id, "other-old", "alias-old", digest_old, 100).await;
+    insert_oci_tag(&pool, repo_id, "other-old", "alias-old", digest_old).await;
+    insert_oci_manifest_artifact(&pool, repo_id, "other-mid", "alias-mid", digest_mid, 100).await;
+    insert_oci_tag(&pool, repo_id, "other-mid", "alias-mid", digest_mid).await;
 
     // Backdate so created_at ordering is deterministic.
     sqlx::query(
@@ -1360,11 +1584,11 @@ async fn test_max_versions_cascades_oci_tags() {
     );
     // The surviving sibling tags protecting digest_old / digest_mid remain.
     assert!(
-        oci_tag_exists(&pool, repo_id, "img", "alias-old").await,
+        oci_tag_exists(&pool, repo_id, "other-old", "alias-old").await,
         "surviving sibling protecting digest_old must remain"
     );
     assert!(
-        oci_tag_exists(&pool, repo_id, "img", "alias-mid").await,
+        oci_tag_exists(&pool, repo_id, "other-mid", "alias-mid").await,
         "surviving sibling protecting digest_mid must remain"
     );
 
@@ -1642,12 +1866,8 @@ async fn test_lifecycle_cascade_unblocks_storage_gc_orphan_detection() {
     // the module-level `is_storage_key_orphan` helper so the #1682 retention
     // tests can reuse the exact same orphan-detection SQL.
 
-    // Backdate so a max_age_days policy will pick it up.
-    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
-        .bind(id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Backdate the current digest mapping so max_age_days will pick it up.
+    backdate_oci_manifest_push(&pool, repo_id, id, "img", "drop-me", 30).await;
 
     // Pre-cascade sanity: the predicate must consider the key NOT orphan
     // because the artifact is still live AND the oci_tags row is still
