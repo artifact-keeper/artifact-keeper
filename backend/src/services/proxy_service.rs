@@ -4324,7 +4324,20 @@ impl ProxyService {
             };
             // Require an exact suffix, not just "non-empty", so a leftover
             // tee_stream staging object can't make a failed write look cached.
-            if name.is_empty() || !matches!(tail, "__content__" | "__cache_meta__.json") {
+            //
+            // Match the LAST segment, not the whole tail: PyPI caches
+            // distribution files one level deeper than the index.
+            // `build_pypi_proxy_cache_path` produces `simple/<name>/<filename>`,
+            // so a cached wheel keys as
+            // `proxy-cache/<repo>/simple/requests/requests-2.31.0.tar.gz/__content__`
+            // and its tail is `requests-2.31.0.tar.gz/__content__`. Comparing the
+            // whole tail dropped every project represented only by cached
+            // distributions -- and since proxy-cached items have no `artifacts`
+            // rows (#1278), this listing is their only local record. Matching the
+            // last segment still excludes staging objects, whose final segment is
+            // `__content__.tee-staging.<uuid>`.
+            let last = tail.rsplit('/').next().unwrap_or(tail);
+            if name.is_empty() || !matches!(last, "__content__" | "__cache_meta__.json") {
                 continue;
             }
             names.insert(name.to_string());
@@ -9881,6 +9894,45 @@ mod tests {
         let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
         // Deduped (flask appears twice across content + metadata) and sorted.
         assert_eq!(names, vec!["flask", "numpy", "requests"]);
+    }
+
+    /// PyPI caches distribution files one level deeper than the index --
+    /// `build_pypi_proxy_cache_path` yields `simple/<name>/<filename>` -- so a
+    /// cached wheel's tail is `<filename>/__content__`, not `__content__`.
+    /// Comparing the whole tail dropped every project represented only by
+    /// cached distributions, and proxy-cached items have no `artifacts` rows
+    /// (#1278), so this listing is their only local record.
+    #[test]
+    fn test_pypi_package_names_from_cache_keys_includes_nested_distributions() {
+        let keys = vec![
+            // distribution files, the shape build_pypi_proxy_cache_path produces
+            "proxy-cache/pypi-remote/simple/requests/requests-2.31.0.tar.gz/__content__",
+            "proxy-cache/pypi-remote/simple/requests/requests-2.31.0.tar.gz/__cache_meta__.json",
+            "proxy-cache/pypi-remote/simple/urllib3/urllib3-2.2.1-py3-none-any.whl/__content__",
+            // index-only project, still listed
+            "proxy-cache/pypi-remote/simple/flask/__content__",
+        ];
+        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        assert_eq!(
+            names,
+            vec!["flask", "requests", "urllib3"],
+            "a project cached only as distribution files must still be listed"
+        );
+    }
+
+    /// The staging suffix must stay excluded now that matching is per-segment:
+    /// a rejected tee_stream write must not make a project look cached.
+    #[test]
+    fn test_pypi_package_names_from_cache_keys_skips_staging_objects() {
+        let keys = vec![
+            "proxy-cache/pypi-remote/simple/ghost/__content__.tee-staging.             0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            "proxy-cache/pypi-remote/simple/ghost/ghost-1.0.tar.gz/__content__.tee-staging.             0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+        ];
+        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        assert!(
+            names.is_empty(),
+            "a leftover staging object must not make a failed write look cached: {names:?}"
+        );
     }
 
     #[test]
