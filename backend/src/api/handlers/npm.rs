@@ -170,6 +170,35 @@ const NPM_CACHE_CONTROL_CACHED: &str = "private, max-age=60";
 const NPM_CACHE_CONTROL_UNCACHED: &str = "private, no-cache";
 const NPM_VARY: &str = "Accept, Accept-Encoding";
 
+/// Which client-side `Cache-Control` a repo type may hand out.
+///
+/// Extracted as a pure function purely so it can be tested. Inline, this
+/// decision was structurally untestable: the only way to observe it was through
+/// `get_package_metadata_cached`, and every test that drove that function with
+/// a Virtual repo threw the response headers away. Collapsing it to
+/// `NPM_CACHE_CONTROL_CACHED` left the whole suite green while re-opening the
+/// read-your-writes window on Virtual repos -- the same "computed, threaded,
+/// then dropped" shape that has now bitten this change twice, one call frame
+/// apart. A pure function with a table test cannot go inert unnoticed.
+///
+/// See [`NPM_CACHE_CONTROL_CACHED`] / [`NPM_CACHE_CONTROL_UNCACHED`] for why
+/// Remote is the only type that earns a freshness window.
+fn client_cache_control_for(repo_type: &str) -> &'static str {
+    // Parsed rather than string-compared so the decision fails CLOSED. The
+    // column is a raw `String` here, and `from_db_str`'s own docs note that
+    // `resolve_repo_by_key` yields an empty string when the column read fails
+    // -- an unparseable or future type must not fall into a freshness window
+    // by default. Variants are enumerated for the same reason: adding a
+    // RepositoryType should be a compile error here, not a silent `_ =>`.
+    match RepositoryType::from_db_str(repo_type) {
+        Some(RepositoryType::Remote) => NPM_CACHE_CONTROL_CACHED,
+        Some(RepositoryType::Local)
+        | Some(RepositoryType::Virtual)
+        | Some(RepositoryType::Staging) => NPM_CACHE_CONTROL_UNCACHED,
+        None => NPM_CACHE_CONTROL_UNCACHED,
+    }
+}
+
 /// True when the client advertises `gzip` (or `*`) in `Accept-Encoding`, i.e.
 /// the metadata compression layer would have gzipped the response. Only gzip
 /// is pre-encoded; brotli-only clients are served the identity variant (which
@@ -489,11 +518,7 @@ async fn get_package_metadata_cached(
     // for an invalidation to miss. Stated this way because a future "serve
     // local rows when upstream is down" change would silently invalidate it,
     // and that is the change to re-check this directive against.
-    let client_cache_control = if repo.repo_type == RepositoryType::Remote {
-        NPM_CACHE_CONTROL_CACHED
-    } else {
-        NPM_CACHE_CONTROL_UNCACHED
-    };
+    let client_cache_control = client_cache_control_for(&repo.repo_type);
     let Some(cache) = state.npm_packument_cache.clone().filter(|_| cache_eligible) else {
         let response =
             get_package_metadata(state, repo_key, package_name, base_url, want_abbreviated).await?;
@@ -8579,6 +8604,43 @@ mod tests {
     ///
     /// Both assertions are literals on purpose: comparing against the
     /// constant production reads is what hid this in the first place.
+    /// The repo-type -> directive decision itself, which was previously
+    /// impossible to observe: it lived inline in `get_package_metadata_cached`,
+    /// and every test that drove that function with a Virtual repo threw the
+    /// response headers away. Collapsing it to `NPM_CACHE_CONTROL_CACHED` left
+    /// the whole suite green while re-opening the Virtual read-your-writes
+    /// window -- the same "computed, threaded, then dropped" failure as the
+    /// commit before this one, one call frame up.
+    ///
+    /// Literals on the right-hand side, deliberately.
+    #[test]
+    fn test_client_cache_control_for_repo_type_table() {
+        assert_eq!(
+            client_cache_control_for("remote"),
+            "private, max-age=60",
+            "Remote is answered purely from the upstream proxy and has no \
+             local publish path to invalidate against, so it earns a window"
+        );
+        for hosted_or_aggregating in ["virtual", "local", "staging"] {
+            assert_eq!(
+                client_cache_control_for(hosted_or_aggregating),
+                "private, no-cache",
+                "{hosted_or_aggregating} can serve a write target; a client \
+                 freshness window there is unreachable by invalidation"
+            );
+        }
+        // Fails closed. `from_db_str` returns None for an unknown type, and
+        // `resolve_repo_by_key` yields an empty string when the column read
+        // fails -- neither may default into a freshness window.
+        for unknown in ["", "REMOTE", "federated", "remote "] {
+            assert_eq!(
+                client_cache_control_for(unknown),
+                "private, no-cache",
+                "an unparseable repo_type ({unknown:?}) must fail closed"
+            );
+        }
+    }
+
     #[test]
     fn test_cached_packument_response_emits_the_directive_it_is_given() {
         let entry = CachedPackument {
@@ -9076,7 +9138,7 @@ mod db_cov_tests {
         state: &crate::api::SharedState,
         repo_key: &str,
         package: &str,
-    ) -> (axum::http::StatusCode, serde_json::Value) {
+    ) -> (axum::http::StatusCode, Option<String>, serde_json::Value) {
         let response = super::get_package_metadata_cached(
             state,
             repo_key,
@@ -9087,11 +9149,19 @@ mod db_cov_tests {
         .await
         .unwrap_or_else(|error_response| error_response);
         let status = response.status();
+        // Surfaced deliberately: this helper used to drop the headers, which is
+        // why three Virtual-fixture tests drove the repo-type decision six
+        // times over and still could not see which directive it produced.
+        let cache_control = response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("read packument body");
         let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-        (status, json)
+        (status, cache_control, json)
     }
 
     /// Minimal `npm publish` body for one version.
@@ -9159,7 +9229,7 @@ mod db_cov_tests {
         let state =
             tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
 
-        let (status_first, first) =
+        let (status_first, _, first) =
             fetch_packument_json(&state, &fx.repo_key, "cache-widget").await;
 
         // Break every non-cache path: unroutable upstream + wiped raw proxy
@@ -9172,7 +9242,7 @@ mod db_cov_tests {
         std::fs::remove_dir_all(&fx.storage_dir).expect("wipe proxy cache");
         std::fs::create_dir_all(&fx.storage_dir).expect("recreate storage dir");
 
-        let (status_second, second) =
+        let (status_second, _, second) =
             fetch_packument_json(&state, &fx.repo_key, "cache-widget").await;
 
         fx.teardown().await;
@@ -9573,8 +9643,22 @@ mod db_cov_tests {
         assert!(published.is_ok(), "publish 1.0.0 must succeed");
 
         // Warm the virtual repo's computed-packument cache.
-        let (status, warm) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        let (status, cache_control, warm) =
+            fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
         assert_eq!(status, StatusCode::OK);
+        // The repo-type decision, observed through the real wiring rather than
+        // by handing the response builder a constant. This fixture already
+        // aggregates a hosted member and publishes to it below, which is
+        // exactly the topology that makes a client freshness window unsafe:
+        // the #2490 fanout drops the server entry, but nothing reaches npm's
+        // `cacache`. A literal, because comparing against the constant
+        // production reads is what hid this the first two times.
+        assert_eq!(
+            cache_control.as_deref(),
+            Some("private, no-cache"),
+            "a Virtual repo aggregates a hosted write target -- it must not \
+             hand clients a freshness window on the body-carrying response"
+        );
         assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
 
         // Seed a version directly in the member's tables, bypassing the
@@ -9593,7 +9677,7 @@ mod db_cov_tests {
             fx.user_id,
         )
         .await;
-        let (_, cached) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        let (_, _, cached) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
         assert!(
             cached["versions"]["9.9.9"].is_null(),
             "a fresh virtual cache hit must serve the cached packument, not recompute; \
@@ -9613,7 +9697,7 @@ mod db_cov_tests {
         )
         .await;
         assert!(republished.is_ok(), "publish 2.0.0 must succeed");
-        let (_, after_publish) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        let (_, _, after_publish) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
         assert!(
             after_publish["versions"]["2.0.0"].is_object()
                 && after_publish["versions"]["9.9.9"].is_object(),
@@ -9635,7 +9719,7 @@ mod db_cov_tests {
         )
         .await;
         assert!(tagged.is_ok(), "dist-tag add must succeed");
-        let (_, after_tag) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        let (_, _, after_tag) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
 
         cleanup_member(&fx, member_id, &member_dir).await;
         fx.teardown().await;
@@ -9680,7 +9764,7 @@ mod db_cov_tests {
         assert!(published.is_ok(), "publish must succeed");
 
         // Warm the virtual repo's cache.
-        let (status, warm) = fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
+        let (status, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
 
@@ -9703,7 +9787,8 @@ mod db_cov_tests {
         // Without invalidation the virtual repo would keep serving the cached
         // packument for the whole fresh window; with it, the recompute finds
         // no versions and the package is gone.
-        let (status_after, after) = fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
+        let (status_after, _, after) =
+            fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
 
         cleanup_member(&fx, member_id, &member_dir).await;
         fx.teardown().await;
@@ -9807,7 +9892,7 @@ mod db_cov_tests {
         let state = build_state_with_fresh_ttl(&fx, 0);
 
         // Miss: computes v1 and stores it.
-        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
+        let (status, _, first) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
 
@@ -9825,7 +9910,7 @@ mod db_cov_tests {
 
         // Stale hit: the OLD body is served immediately while the refresh
         // runs in the background.
-        let (status, stale) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
+        let (status, _, stale) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             stale["versions"]["1.0.0"].is_object() && stale["versions"]["2.0.0"].is_null(),
@@ -9837,7 +9922,7 @@ mod db_cov_tests {
         let mut refreshed = stale;
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let (_, current) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
+            let (_, _, current) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
             refreshed = current;
             if refreshed["versions"]["2.0.0"].is_object() {
                 break;
@@ -9931,7 +10016,7 @@ mod db_cov_tests {
         let state = std::sync::Arc::new(app_state);
 
         // Miss: computes v1 inline — the one permitted upstream request.
-        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
+        let (status, _, first) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
 
@@ -9940,7 +10025,7 @@ mod db_cov_tests {
         repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
 
         // Stale hit: served from cache; the refresh must be lease-skipped.
-        let (status, stale) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
+        let (status, _, stale) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(stale["versions"]["1.0.0"].is_object(), "got {stale:?}");
 
@@ -9996,7 +10081,7 @@ mod db_cov_tests {
         let state = build_state_with_fresh_ttl(&fx, 0);
 
         // Warm the cache with the live packument.
-        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
+        let (status, _, first) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
         assert_eq!(status, StatusCode::OK);
         assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
 
@@ -10011,7 +10096,7 @@ mod db_cov_tests {
         // requests must converge on 404 rather than the ghost packument.
         let mut final_status = StatusCode::OK;
         for _ in 0..50 {
-            let (status, _) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
+            let (status, _, _) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
             final_status = status;
             if final_status == StatusCode::NOT_FOUND {
                 break;
@@ -10035,7 +10120,7 @@ mod db_cov_tests {
     /// client sees.
     #[tokio::test]
     async fn test_gzip_variant_served_pre_encoded() {
-        use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, VARY};
+        use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ETAG, VARY};
         use axum::http::{HeaderMap, StatusCode};
         use flate2::read::GzDecoder;
         use std::io::Read;
@@ -10061,6 +10146,7 @@ mod db_cov_tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let mut gzip_etags: Vec<String> = Vec::new();
         // Twice: the first request stores both variants, the second is a
         // warm gzip hit.
         for pass in ["cold", "warm"] {
@@ -10087,6 +10173,14 @@ mod db_cov_tests {
                 Some("Accept, Accept-Encoding"),
                 "{pass}: pre-encoded responses must declare Vary themselves"
             );
+            gzip_etags.push(
+                response
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| panic!("{pass}: gzip variant must carry an ETag")),
+            );
             let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
                 .expect("read body");
@@ -10099,6 +10193,58 @@ mod db_cov_tests {
             assert!(
                 json["versions"]["1.0.0"].is_object(),
                 "{pass}: gunzipped body must be the packument, got {json:?}"
+            );
+        }
+
+        // The cross-variant invariant: the gzip entry must carry the
+        // IDENTITY-derived tag, not a hash of its own compressed bytes.
+        //
+        // This has to be asserted across variants. Checking that the gzip
+        // response's tag equals `compute_etag` over the gzip body would be
+        // self-consistent under the very bug it is meant to catch, and the
+        // existing variant-sharing test hand-builds both cache entries with
+        // the same tag, so it only proves a struct field gets copied --
+        // `compute_and_store_packument`, which is what actually decides this,
+        // is never invoked by it.
+        //
+        // If the two variants disagree, `If-None-Match` stops matching the
+        // moment a client's `Accept-Encoding` shifts or an intermediary strips
+        // gzip, and the 304 this whole change exists to produce silently never
+        // fires again for that client.
+        let identity_response = super::get_package_metadata_cached(
+            &state,
+            &fx.repo_key,
+            "gzpkg",
+            "http://localhost",
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|error_response| error_response);
+        assert_eq!(identity_response.status(), StatusCode::OK);
+        assert!(
+            identity_response.headers().get(CONTENT_ENCODING).is_none(),
+            "the identity request must not get a pre-encoded body"
+        );
+        let identity_etag = identity_response
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .expect("identity variant must carry an ETag")
+            .to_string();
+        let identity_body = axum::body::to_bytes(identity_response.into_body(), 1024 * 1024)
+            .await
+            .expect("read identity body");
+
+        assert_eq!(
+            identity_etag,
+            crate::api::handlers::cache_headers::compute_etag(&identity_body),
+            "the identity tag must be derived from the identity body"
+        );
+        for (pass, gzip_etag) in ["cold", "warm"].iter().zip(&gzip_etags) {
+            assert_eq!(
+                gzip_etag, &identity_etag,
+                "{pass}: the gzip variant must advertise the identity-derived \
+                 ETag so a client that switches encodings still revalidates"
             );
         }
 
