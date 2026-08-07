@@ -5782,6 +5782,15 @@ mod tests {
         assert!(!ProxyService::is_proxy_cache_key(""));
         // Substring, not a path segment prefix — must not match.
         assert!(!ProxyService::is_proxy_cache_key("not-proxy-cache/x"));
+        // Load-bearing: tee_stream staging objects must NOT be treated as
+        // proxy-cache keys, or they become reachable through the presigned
+        // redirect path while a write is still in flight. This holds only
+        // because of the trailing slash in the "proxy-cache/" prefix -- renaming
+        // TEE_STAGING_KEY_PREFIX to "proxy-cache/staging/" would silently
+        // invert it, which is why this is pinned rather than left to inspection.
+        assert!(!ProxyService::is_proxy_cache_key(&format!(
+            "{TEE_STAGING_KEY_PREFIX}0f8fad5b-d9cb-469f-a165-70867728950e"
+        )));
     }
 
     #[test]
@@ -9167,6 +9176,122 @@ mod tests {
         let copies = backend.copies.lock().await;
         assert_eq!(copies.len(), 1, "only the commit publishes via copy()");
         assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// The test that actually distinguishes this fix from `main`.
+    ///
+    /// Everything else in this module -- including the real-backend round trip
+    /// below -- is satisfied by the PRE-FIX code, because the pre-fix reject
+    /// arm called `delete(&cache_key)` (merge-base `proxy_service.rs:1580` and
+    /// `:1730`). Streaming straight to the live key and then deleting it
+    /// reaches the same final state as never writing there at all, so a
+    /// faithful revert leaves the observable end state identical.
+    ///
+    /// The difference only becomes observable when that cleanup delete FAILS
+    /// -- which is the production incident this PR was written for. Pre-fix,
+    /// a failed delete leaves the truncated body sitting at the live cache key
+    /// for the sidecar-bypassing readers to serve. Post-fix, the live key was
+    /// never written, so a failed delete leaks a staging object and nothing
+    /// more.
+    ///
+    /// So: a real filesystem backend whose `delete` always errors.
+    #[tokio::test]
+    async fn test_rejected_write_leaves_live_key_absent_even_when_cleanup_fails() {
+        use crate::services::storage_service::FilesystemBackend;
+
+        /// A real `FilesystemBackend` with exactly one fault injected: every
+        /// `delete` fails. Everything else is genuine filesystem I/O, so the
+        /// live key's contents are real state, not a mock's recollection.
+        struct DeleteAlwaysFails {
+            inner: FilesystemBackend,
+            /// Counts delete ATTEMPTS. Used as the writer-finished signal
+            /// instead of polling for a staging object, so the synchronization
+            /// does not itself assume the fix is present: both the staged and
+            /// the write-live shapes attempt exactly one delete on the reject
+            /// arm, so this is a fair barrier for either.
+            delete_attempts: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ServiceStorageBackend for DeleteAlwaysFails {
+            async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+                self.inner.put(key, content).await
+            }
+            async fn get(&self, key: &str) -> Result<Bytes> {
+                self.inner.get(key).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                self.inner.exists(key).await
+            }
+            async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+                self.inner.list(prefix).await
+            }
+            async fn delete(&self, _key: &str) -> Result<()> {
+                self.delete_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(AppError::Storage("injected delete failure".to_string()))
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: ServiceBoxStream<'static, Result<Bytes>>,
+            ) -> Result<ServicePutStreamResult> {
+                self.inner.put_stream(key, stream).await
+            }
+            async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+                self.inner.copy(source, dest).await
+            }
+            async fn size(&self, key: &str) -> Result<u64> {
+                self.inner.size(key).await
+            }
+        }
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let delete_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let storage = Arc::new(RealStorageService::new(Arc::new(DeleteAlwaysFails {
+            inner: FilesystemBackend::new(temp_dir.path().to_path_buf()),
+            delete_attempts: Arc::clone(&delete_attempts),
+        })));
+
+        // Content-Length promises 999; upstream delivers 5 and stops. That is
+        // RejectTruncated -- a body that must never be cached.
+        let mut client = CachePersister::new(test_catalog_pool(), Arc::clone(&storage)).tee_stream(
+            upstream_chunks(vec![&b"short"[..]]),
+            "proxy-cache/repo/truncated".to_string(),
+            "proxy-cache/repo/truncated.meta".to_string(),
+            template(),
+            Some(999),
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        // Wait for the writer to have reached its cleanup, using a positive
+        // signal rather than a bare sleep. Without this barrier the assertion
+        // below could pass simply because the spawned task had not been
+        // scheduled yet -- an absence assertion cannot tell "correctly avoided
+        // the live key" from "nothing has happened".
+        let mut writer_ran = false;
+        for _ in 0..200 {
+            if delete_attempts.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                writer_ran = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            writer_ran,
+            "the writer task must have run and attempted its cleanup delete"
+        );
+
+        assert!(
+            !storage.exists("proxy-cache/repo/truncated").await.unwrap(),
+            "a rejected write must leave the live cache key absent even when \
+             the cleanup delete fails. Before this fix the truncated 5-byte \
+             body was streamed straight to the live key and only removed by a \
+             best-effort delete; when that delete failed, the next request \
+             served 5 bytes as though they were the whole artifact."
+        );
     }
 
     /// The staging->publish round trip against a REAL `FilesystemBackend`,
