@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -15,6 +16,63 @@ use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
+
+/// Domain for the synthetic address stored when the IdP releases no usable
+/// `email` claim. `.invalid` is reserved by RFC 2606 and can never resolve, so
+/// the address cannot be confused with — or collide against — a real mailbox.
+const NO_EMAIL_DOMAIN: &str = "no-email.oidc.invalid";
+
+/// Longest sanitized subject prefix kept in the synthetic local-part. Bounds the
+/// result well inside `users.email VARCHAR(255)` for arbitrarily long subjects.
+const MAX_SYNTHETIC_LOCAL_PREFIX: usize = 48;
+
+/// Resolve the address to store in `users.email` for a federated (OIDC) user.
+///
+/// The `email` claim is optional in OIDC — it is released only when the `email`
+/// scope is granted *and* the IdP chooses to disclose it. `users.email` is
+/// `UNIQUE NOT NULL` (`backend/migrations/001_users.sql:8`), so defaulting a
+/// missing claim to a shared sentinel such as `""` lets only the *first*
+/// claim-less user provision; every later one dies on `users_email_key`
+/// (issue #3119).
+///
+/// When the claim is absent — or present but blank, which some IdPs send for
+/// machine identities — derive a per-subject synthetic address instead. This
+/// mirrors what the SAML (`saml_service.rs`) and LDAP (`ldap_service.rs`) paths
+/// already do with `{username}@unknown`, but keys off the OIDC subject, which is
+/// the stable per-user identifier this service already provisions against.
+pub(crate) fn resolve_federated_email(claim: Option<&str>, sub: &str) -> String {
+    match claim.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(email) => email.to_string(),
+        None => synthetic_email_for_sub(sub),
+    }
+}
+
+/// Build a stable, unique, non-routable address for a subject with no email.
+///
+/// The subject is opaque: it may contain characters that are invalid in an
+/// address local-part and may be longer than the column allows. Keep a
+/// sanitized, human-recognizable prefix for operators, then append a digest of
+/// the *raw* subject so two distinct subjects can never sanitize down to the
+/// same address.
+fn synthetic_email_for_sub(sub: &str) -> String {
+    let fingerprint = hex::encode(&Sha256::digest(sub.as_bytes())[..8]);
+
+    let sanitized: String = sub
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(MAX_SYNTHETIC_LOCAL_PREFIX)
+        .collect();
+    let prefix = sanitized.trim_matches(|c| matches!(c, '.' | '-' | '_'));
+    let prefix = if prefix.is_empty() { "user" } else { prefix };
+
+    format!("{}.{}@{}", prefix, fingerprint, NO_EMAIL_DOMAIN)
+}
 
 /// OIDC provider configuration
 #[derive(Debug, Clone)]
@@ -383,12 +441,13 @@ impl OidcService {
             .unwrap_or(&claims.sub)
             .to_string();
 
-        let email = claims
-            .extra
-            .get(&self.config.email_claim)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let email = resolve_federated_email(
+            claims
+                .extra
+                .get(&self.config.email_claim)
+                .and_then(|v| v.as_str()),
+            &claims.sub,
+        );
 
         let display_name = claims
             .extra
@@ -457,11 +516,12 @@ impl OidcService {
             .unwrap_or(&sub)
             .to_string();
 
-        let email = claims
-            .get(&self.config.email_claim)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let email = resolve_federated_email(
+            claims
+                .get(&self.config.email_claim)
+                .and_then(|v| v.as_str()),
+            &sub,
+        );
 
         let display_name = claims
             .get(&self.config.display_name_claim)
@@ -1289,5 +1349,243 @@ mod tests {
         assert!(claims.aud.contains("client-a"));
         assert!(claims.aud.contains("client-b"));
         assert!(!claims.aud.contains("client-c"));
+    }
+
+    // ------------------------------------------------------------------
+    // #3119: a missing `email` claim must not collapse to a shared sentinel.
+    //
+    // `users.email` is UNIQUE NOT NULL (migrations/001_users.sql:8), so when
+    // every claim-less federated user is stored with the same value, only the
+    // first can provision; the next one dies on `users_email_key`.
+    // ------------------------------------------------------------------
+
+    /// An `OidcService` that never reaches a database. `connect_lazy` defers the
+    /// connection, and the claim-extraction paths under test issue no queries.
+    fn offline_service() -> OidcService {
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy");
+        OidcService::with_config(pool, test_oidc_config())
+    }
+
+    /// A currently-valid claim set for `test_oidc_config`, packed into an
+    /// unsigned ID token — `extract_user_from_id_token` decodes without
+    /// verifying the signature.
+    fn id_token_for(sub: &str, username: &str, email: Option<&str>) -> String {
+        use base64::Engine as _;
+        let mut claims = serde_json::json!({
+            "iss": "https://issuer.example.com",
+            "aud": ["client"],
+            "exp": chrono::Utc::now().timestamp() + 3600,
+            "iat": chrono::Utc::now().timestamp(),
+            "sub": sub,
+            "preferred_username": username,
+        });
+        if let Some(email) = email {
+            claims["email"] = serde_json::Value::String(email.to_string());
+        }
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).expect("claims serialize"));
+        format!("header.{}.signature", payload)
+    }
+
+    fn user_from_token(sub: &str, username: &str, email: Option<&str>) -> OidcUserInfo {
+        offline_service()
+            .extract_user_from_id_token(&id_token_for(sub, username, email))
+            .expect("valid ID token")
+    }
+
+    #[tokio::test]
+    async fn missing_email_claim_gives_each_subject_a_distinct_address() {
+        let alice = user_from_token("sub-alice-001", "alice", None);
+        let bob = user_from_token("sub-bob-002", "bob", None);
+
+        assert!(
+            !alice.email.trim().is_empty(),
+            "a missing email claim must not yield a blank address: every \
+             claim-less user would then share one value and collide on \
+             users_email_key (#3119)"
+        );
+        assert_ne!(
+            alice.email, bob.email,
+            "two subjects with no email claim must not share a stored address"
+        );
+    }
+
+    // Positive control: the fix must not disturb providers that DO send email.
+    #[tokio::test]
+    async fn provider_supplied_email_is_stored_verbatim() {
+        let user = user_from_token("sub-carol-003", "carol", Some("carol@example.com"));
+        assert_eq!(user.email, "carol@example.com");
+    }
+
+    #[tokio::test]
+    async fn blank_email_claim_is_treated_as_missing() {
+        // Some IdPs release the claim with an empty or whitespace value rather
+        // than omitting it. That collides exactly the same way.
+        let blank = user_from_token("sub-dave-004", "dave", Some("   "));
+        let absent = user_from_token("sub-erin-005", "erin", None);
+        assert!(!blank.email.trim().is_empty());
+        assert_ne!(blank.email, absent.email);
+    }
+
+    #[tokio::test]
+    async fn synthetic_address_is_stable_across_logins() {
+        // Re-login writes `email` back to the row; an unstable value would
+        // rewrite the user on every single login.
+        let first = user_from_token("sub-frank-006", "frank", None).email;
+        let second = user_from_token("sub-frank-006", "frank", None).email;
+        assert!(!first.trim().is_empty());
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn synthetic_address_fits_the_column_and_is_non_routable() {
+        // Subjects are opaque: they can be long, non-ASCII, and full of
+        // characters that are invalid in an address local-part.
+        let hostile = format!("{}@evil.example/ ünïcode", "x".repeat(400));
+        let email = user_from_token(&hostile, "hostile", None).email;
+
+        assert!(
+            email.len() <= 255,
+            "must fit users.email VARCHAR(255), got {} chars: {}",
+            email.len(),
+            email
+        );
+        assert_eq!(email.matches('@').count(), 1, "exactly one @: {}", email);
+        assert!(
+            email.ends_with("@no-email.oidc.invalid"),
+            "must land in a reserved, never-resolving domain: {}",
+            email
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_subjects_that_sanitize_alike_still_differ() {
+        // Sanitizing the subject is lossy; the digest is what keeps distinct
+        // subjects mapped to distinct addresses.
+        assert_ne!(
+            user_from_token("a b", "u1", None).email,
+            user_from_token("a/b", "u2", None).email
+        );
+    }
+
+    // The other defaulting site: claims read from the userinfo endpoint rather
+    // than the ID token. Both sources must agree for a given subject.
+    #[tokio::test]
+    async fn userinfo_without_email_claim_matches_the_id_token_address() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"sub": "sub-grace-007", "preferred_username": "grace"}),
+            ))
+            .mount(&server)
+            .await;
+
+        let user = offline_service()
+            .fetch_userinfo("access-token", &format!("{}/userinfo", server.uri()))
+            .await
+            .expect("userinfo request");
+
+        assert!(
+            !user.email.trim().is_empty(),
+            "userinfo with no email claim must not yield a blank address (#3119)"
+        );
+        assert_eq!(
+            user.email,
+            user_from_token("sub-grace-007", "grace", None).email,
+            "both claim sources must derive the same address for one subject"
+        );
+    }
+
+    // End-to-end shape from #3119, against a real database: provision two
+    // federated users whose IdP released no email claim. Before the fix the
+    // second INSERT failed with
+    //   duplicate key value violates unique constraint "users_email_key"
+    // DB-backed; no-ops without DATABASE_URL.
+    #[tokio::test]
+    async fn two_oidc_users_without_email_claim_both_provision() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = OidcService::with_config(pool.clone(), test_oidc_config());
+        let run = Uuid::new_v4();
+
+        let mut created = Vec::new();
+        for who in ["alice", "bob"] {
+            let info = user_from_token(
+                &format!("{}-{}", who, run),
+                &format!("{}_{}", who, run),
+                None,
+            );
+            let user = svc
+                .get_or_create_user(&info)
+                .await
+                .unwrap_or_else(|e| panic!("provisioning {} with no email claim: {}", who, e));
+            created.push(user);
+        }
+
+        assert!(!created[0].email.is_empty());
+        assert_ne!(
+            created[0].email, created[1].email,
+            "stored addresses must differ or the second user could never exist"
+        );
+
+        for user in &created {
+            sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    // Existing-bad-data path. A deployment that already stranded one user with
+    // an empty email keeps that row; this asserts the row is repaired on that
+    // user's next login (the profile-sync UPDATE writes because the address
+    // now differs), so no data migration is needed.
+    #[tokio::test]
+    async fn stranded_empty_email_row_is_repaired_on_next_login() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = OidcService::with_config(pool.clone(), test_oidc_config());
+        let id = Uuid::new_v4();
+        let sub = format!("stranded-{}", id);
+
+        // Only one empty-email row can exist at a time — that is the bug. Clear
+        // any left behind by an earlier run before seeding this one.
+        sqlx::query!("DELETE FROM users WHERE email = '' AND auth_provider = 'oidc'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, auth_provider, external_id, \
+                 is_active, is_admin, last_login_at) \
+             VALUES ($1, $2, '', 'oidc', $3, true, false, NOW())",
+            id,
+            format!("stranded_{}", id),
+            sub
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let info = user_from_token(&sub, &format!("stranded_{}", id), None);
+        svc.get_or_create_user(&info).await.unwrap();
+
+        let stored: String = sqlx::query_scalar!("SELECT email FROM users WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !stored.is_empty(),
+            "an already-stranded empty email must be repaired on next login, \
+             even inside the 5-minute profile-sync throttle window"
+        );
+
+        sqlx::query!("DELETE FROM users WHERE id = $1", id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
