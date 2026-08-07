@@ -1,0 +1,42 @@
+name: Release Preflight
+
+# On-demand pre-tag readiness check (issue #3042).
+#
+# Run this from the Actions UI (or `gh workflow run "Release Preflight"`)
+# BEFORE cutting a release/RC tag. It runs scripts/ci/release-preflight.sh,
+# which asserts `main` is actually releasable so a stale main does not cost a
+# full re-cut cycle (see #3039: v1.7.0-rc.1 stalled ~90 min at docker-publish's
+# Security Scan because two trivy-CLI CVE suppressions were never forward-ported
+# from release/1.6.x to main).
+#
+# This publishes NOTHING. It only reads: the repo tree, the .trivyignore of
+# active release/* branches, and the latest main Docker Publish run status.
+# A red run means "do not tag yet"; a green run means main is safe to cut.
+
+on:
+  workflow_dispatch:
+  # Also surface drift proactively on a schedule so a stale main is caught
+  # before anyone even tries to cut. Advisory only -- never blocks a merge.
+  schedule:
+    - cron: '17 13 * * 1-5'  # weekday mid-morning US, after the overnight merges
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  preflight:
+    name: Pre-tag readiness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Run release preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFLIGHT_REPO: ${{ github.repository }}
+        run: bash scripts/ci/release-preflight.sh

@@ -38,8 +38,11 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::future::Future;
 use std::ops::Deref;
 use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -164,6 +167,73 @@ impl<T> Deref for Claimed<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Durable claim renewal
+// ---------------------------------------------------------------------------
+
+/// Background heartbeat for a durable claim.
+///
+/// Dropping the guard aborts the heartbeat. It does not release the claim;
+/// the owning service must still finalize through its token-guarded path.
+#[derive(Debug)]
+pub struct RenewalGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RenewalGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn renewal_interval(ttl_secs: f64) -> Duration {
+    let ttl_secs = if ttl_secs.is_finite() && ttl_secs > 0.0 {
+        ttl_secs
+    } else {
+        1.0
+    };
+    Duration::from_secs_f64((ttl_secs / 3.0).clamp(5.0, 300.0))
+}
+
+/// Spawn a best-effort token-guarded heartbeat for a durable claim.
+///
+/// `Ok(false)` means ownership was lost and stops the loop. Transient errors
+/// are logged and retried; the original TTL remains the failover boundary if
+/// the database stays unavailable.
+pub fn spawn_renewal_loop<F, Fut>(
+    label: impl Into<String>,
+    ttl_secs: f64,
+    mut renew: F,
+) -> RenewalGuard
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = std::result::Result<bool, String>> + Send + 'static,
+{
+    let label = label.into();
+    let every = renewal_interval(ttl_secs);
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(every);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+            match renew().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(claim = %label, "claim renewal stopped because ownership was lost");
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(claim = %label, error = %e, "claim renewal failed; will retry");
+                }
+            }
+        }
+    });
+
+    RenewalGuard { handle }
+}
+
+// ---------------------------------------------------------------------------
 // Singleton scheduler leases
 // ---------------------------------------------------------------------------
 
@@ -186,26 +256,33 @@ impl SchedulerLease {
         self.lease_expires_at
     }
 
+    /// Keep this scheduler lease alive until the returned guard is dropped.
+    ///
+    /// This is for singleton jobs whose side effects may run longer than one
+    /// fixed TTL (large lifecycle cycles, curation syncs, bootstrap
+    /// reindexes). The guard aborts the heartbeat on drop; the caller still
+    /// releases (or lets the TTL lapse) through its own path.
+    pub fn spawn_renewal(&self, db: PgPool, ttl_secs: f64) -> RenewalGuard {
+        let job_name = self.job_name.clone();
+        let claim_token = self.claim_token;
+        spawn_renewal_loop(format!("scheduler lease {job_name}"), ttl_secs, move || {
+            let db = db.clone();
+            let job_name = job_name.clone();
+            async move {
+                renew_scheduler_lease_by_token(&db, &job_name, claim_token, ttl_secs)
+                    .await
+                    .map(|expires| expires.is_some())
+                    .map_err(|e| e.to_string())
+            }
+        })
+    }
+
     /// Extend the lease by `ttl_secs` from now. Returns `false` (and stops
     /// being the holder) if the lease was lost — expired and re-claimed by
     /// another replica — in which case the caller should stop side effects.
     pub async fn renew(&mut self, db: &PgPool, ttl_secs: f64) -> Result<bool> {
-        let renewed: Option<DateTime<Utc>> = sqlx::query_scalar(
-            r#"
-            UPDATE scheduler_leases
-            SET lease_expires_at = NOW() + make_interval(secs => $3),
-                updated_at = NOW()
-            WHERE job_name = $1
-              AND claim_token = $2
-            RETURNING lease_expires_at
-            "#,
-        )
-        .bind(&self.job_name)
-        .bind(self.claim_token)
-        .bind(ttl_secs)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let renewed =
+            renew_scheduler_lease_by_token(db, &self.job_name, self.claim_token, ttl_secs).await?;
 
         match renewed {
             Some(expires) => {
@@ -237,6 +314,30 @@ impl SchedulerLease {
             tracing::debug!(job = %self.job_name, error = %e, "scheduler lease release failed");
         }
     }
+}
+
+async fn renew_scheduler_lease_by_token(
+    db: &PgPool,
+    job_name: &str,
+    claim_token: Uuid,
+    ttl_secs: f64,
+) -> Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar(
+        r#"
+        UPDATE scheduler_leases
+        SET lease_expires_at = NOW() + make_interval(secs => $3),
+            updated_at = NOW()
+        WHERE job_name = $1
+          AND claim_token = $2
+        RETURNING lease_expires_at
+        "#,
+    )
+    .bind(job_name)
+    .bind(claim_token)
+    .bind(ttl_secs)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Try to claim the named singleton job lease for `ttl_secs`.
@@ -327,6 +428,72 @@ mod tests {
         let a = WorkerIdentity::for_process().as_str().to_string();
         let b = WorkerIdentity::for_process().as_str().to_string();
         assert_eq!(a, b, "identity must be stable for the process lifetime");
+    }
+
+    #[test]
+    fn renewal_interval_is_bounded() {
+        assert_eq!(renewal_interval(0.0), Duration::from_secs(5));
+        assert_eq!(renewal_interval(f64::NAN), Duration::from_secs(5));
+        assert_eq!(renewal_interval(f64::INFINITY), Duration::from_secs(5));
+        assert_eq!(renewal_interval(90.0), Duration::from_secs(30));
+        assert_eq!(renewal_interval(6.0 * 3600.0), Duration::from_secs(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewal_loop_retries_errors_and_stops_after_ownership_loss() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let guard = spawn_renewal_loop("test claim", 15.0, move || {
+            let attempt = observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match attempt {
+                    0 => Err("temporary database error".to_string()),
+                    1 => Ok(true),
+                    _ => Ok(false),
+                }
+            }
+        });
+
+        // Let the spawned task create its delayed interval before advancing
+        // paused time. The first immediate tick is intentionally consumed by
+        // spawn_renewal_loop, so renewal begins one interval later.
+        tokio::task::yield_now().await;
+        for expected in 1..=3 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(attempts.load(Ordering::SeqCst), expected);
+        }
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "ownership loss must terminate the renewal task"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_renewal_guard_aborts_before_the_next_heartbeat() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let guard = spawn_renewal_loop("aborted claim", 15.0, move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok(true) }
+        });
+
+        tokio::task::yield_now().await;
+        drop(guard);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
     }
 
     #[test]

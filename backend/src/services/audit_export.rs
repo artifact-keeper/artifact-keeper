@@ -122,7 +122,9 @@ impl AuditAction {
             | AuditAction::AgeGateQueued
             | AuditAction::AgeGateApproved
             | AuditAction::AgeGateReopened
-            | AuditAction::CurationSyncTriggered => Outcome::Success,
+            | AuditAction::CurationSyncTriggered
+            | AuditAction::CurationVersionCreated
+            | AuditAction::CurationVersionPublished => Outcome::Success,
         }
     }
 }
@@ -375,6 +377,11 @@ pub mod details {
         /// Minimum upstream publish age for that policy change.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub age_gate_min_age_days: Option<i32>,
+        /// Age-source mode (`upstream_publish_time` / `first_seen`) for that
+        /// policy change. A mode switch changes which basis existing review
+        /// decisions are honored under, so it is audit-relevant on its own.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub age_gate_mode: Option<String>,
     }
 
     /// `ROLE_ASSIGNED` / `ROLE_REVOKED` / `REPOSITORY_PERMISSION_CHANGED`.
@@ -1094,6 +1101,7 @@ mod tests {
             visibility: None,
             age_gate_enabled: None,
             age_gate_min_age_days: None,
+            age_gate_mode: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

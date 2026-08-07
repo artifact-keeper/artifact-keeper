@@ -126,6 +126,11 @@ fn caller_owns_token(auth: &AuthExtension, created_by_user_id: Option<Uuid>) -> 
 /// `write:repositories` (repository administration — needs `admin`). Read
 /// scopes and non-repository scopes require no mutation authority (`None`), so
 /// a member can always self-manage read-scoped tokens on a repo it can see.
+///
+/// Note this bounds the caller's *repository permission* only. The separate
+/// scope-set ceiling — a scoped credential may not mint a token exceeding its
+/// own scopes, which also covers the read family — is enforced by
+/// [`AuthExtension::enforce_mint_ceiling`] at the call site (#2996).
 fn delegated_scope_repo_action(scope: &str) -> Option<&'static str> {
     match scope {
         "write:artifacts" => Some("write"),
@@ -397,6 +402,18 @@ pub async fn create_repo_token(
     // the holder could do directly. Global admins bypass; read-only scopes need
     // no mutation authority; the admin-class scopes above are already refused.
     require_delegatable_scopes(&auth, repo.id, &payload.scopes, &state.permission_service).await?;
+
+    // Delegation ceiling (#2996). `require_delegatable_scopes` above bounds the
+    // caller's REPOSITORY authority, but it maps read-family and non-repository
+    // scopes to `None` (no mutation authority needed), so it never consults the
+    // presenting credential's own scope ceiling. Apply the same ceiling the
+    // other three mint handlers use so all four are uniform: a scoped API token
+    // cannot mint a token carrying a scope it does not itself hold (e.g. a
+    // `write:repositories`-only token minting `read:users`). Interactive
+    // sessions (`scopes: None`) short-circuit, so console and repo-admin
+    // minting are unaffected. Kept in addition to — not instead of — the
+    // repo-action check above.
+    auth.enforce_mint_ceiling(&payload.scopes)?;
 
     // Generate the token
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
@@ -1218,7 +1235,16 @@ mod admin_scope_policy_tests {
 
         let mut auth = tdh::make_auth(user_id, &username);
         auth.is_api_token = true;
-        auth.scopes = Some(vec!["write:repositories".to_string()]);
+        // The presenting credential holds every scope minted below, so the
+        // #2996 scope ceiling is satisfied and this test isolates the
+        // dimension it was written for: the REPOSITORY-permission delegation
+        // ceiling. (The scope-ceiling dimension has its own tests in
+        // `mint_ceiling_repo_path_tests`.)
+        auth.scopes = Some(vec![
+            "write:repositories".to_string(),
+            "read:artifacts".to_string(),
+            "write:artifacts".to_string(),
+        ]);
 
         // (a) non-writer minting write:artifacts -> 403 (exceeds effective perm).
         let (deny_status, deny_body) = tdh::send(
@@ -1267,6 +1293,104 @@ mod admin_scope_policy_tests {
             .await;
         cleanup(&pool, user_id, &repo_key).await;
     }
+
+    // -----------------------------------------------------------------------
+    // #2996 scope ceiling on the repo-token mint path.
+    //
+    // `require_delegatable_scopes` (#2603 G3) bounds the caller's REPOSITORY
+    // permission, but maps read-family and non-repository scopes to `None`, so
+    // it never consults the presenting credential's own scope set. Without the
+    // `enforce_mint_ceiling` call, a `write:repositories`-only token could mint
+    // a `read:users` token it never held — while the identical request was
+    // already 403 on /auth, /profile and /users. These tests pin the ceiling on
+    // the fourth mint handler so all four behave identically.
+    // -----------------------------------------------------------------------
+
+    /// A scoped credential cannot mint repo-scoped tokens carrying scopes it
+    /// does not itself hold — including the read family that the repo-action
+    /// ceiling deliberately ignores.
+    #[tokio::test]
+    async fn scoped_token_cannot_mint_repo_token_beyond_its_own_scopes() {
+        let Some((pool, state, user_id, username, repo_key)) = setup().await else {
+            return;
+        };
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_api_token = true;
+        // Holds ONLY write:repositories (enough to reach this handler).
+        auth.scopes = Some(vec!["write:repositories".to_string()]);
+
+        for beyond in ["read:users", "read:artifacts", "read:repositories"] {
+            let (status, body) = tdh::send(
+                build_app(state.clone(), auth.clone()),
+                post_repo_token_request(&repo_key, "beyond-ceiling", &[beyond]),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "minting repo token with unheld scope {beyond:?} MUST 403; got {} body: {}",
+                status,
+                String::from_utf8_lossy(&body),
+            );
+        }
+
+        cleanup(&pool, user_id, &repo_key).await;
+    }
+
+    /// No over-restriction: a credential that DOES hold the scope can still
+    /// mint it through the repo path.
+    #[tokio::test]
+    async fn scoped_token_can_mint_repo_token_within_its_own_scopes() {
+        let Some((pool, state, user_id, username, repo_key)) = setup().await else {
+            return;
+        };
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_api_token = true;
+        auth.scopes = Some(vec![
+            "write:repositories".to_string(),
+            "read:artifacts".to_string(),
+        ]);
+
+        let (status, body) = tdh::send(
+            build_app(state, auth),
+            post_repo_token_request(&repo_key, "within-ceiling", &["read:artifacts"]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a credential holding read:artifacts must still mint it; got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+
+        cleanup(&pool, user_id, &repo_key).await;
+    }
+
+    /// Interactive principals (`scopes: None`) are action-unrestricted, so the
+    /// ceiling short-circuits and console/repo-admin minting is unaffected.
+    #[tokio::test]
+    async fn interactive_principal_repo_mint_unaffected_by_ceiling() {
+        let Some((pool, state, user_id, username, repo_key)) = setup().await else {
+            return;
+        };
+        // Interactive session: scopes = None (tdh::make_auth default).
+        let auth = tdh::make_auth(user_id, &username);
+        let (status, body) = tdh::send(
+            build_app(state, auth),
+            post_repo_token_request(&repo_key, "interactive-ok", &["read:artifacts"]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "interactive repo-token mint MUST stay 200; got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+
+        cleanup(&pool, user_id, &repo_key).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,11 +1421,17 @@ mod ownership_gate_tests {
     }
 
     /// A non-admin caller with the delegatable `write:repositories` scope (so
-    /// it clears `require_repo_write`).
+    /// it clears `require_repo_write`) plus `read:artifacts` (so the #2996
+    /// mint ceiling is satisfied for the `read:artifacts` tokens these tests
+    /// seed). These tests exercise the per-token OWNERSHIP gate, not the
+    /// scope ceiling.
     fn member_auth(user_id: Uuid, username: &str) -> AuthExtension {
         let mut auth = tdh::make_auth(user_id, username);
         auth.is_api_token = true;
-        auth.scopes = Some(vec!["write:repositories".to_string()]);
+        auth.scopes = Some(vec![
+            "write:repositories".to_string(),
+            "read:artifacts".to_string(),
+        ]);
         auth
     }
 

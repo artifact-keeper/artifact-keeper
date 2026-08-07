@@ -506,23 +506,40 @@ async fn complete(
     let user_id = auth.user_id;
     let is_replication_request = super::is_replication_request(&headers);
 
-    // C3: Verify user owns this session
+    // C3: Verify user owns this session.
+    //
+    // complete_session takes the completion lease (pending/in_progress ->
+    // 'committing' with a state token) before verifying chunks/size/checksum,
+    // so a duplicate complete request — even one routed to another replica —
+    // gets a conflict here instead of a second storage copy + artifact
+    // upsert. Everything below runs under that lease and the terminal
+    // transition is token-guarded.
     let session = UploadService::complete_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
+    let commit_renewal = UploadService::spawn_commit_lease_renewal(state.db.clone(), &session);
 
     // #2603 G1: re-check repository write authorization before committing the
     // artifact. Finalizing a session is the actual write, so access revoked
     // after the chunks were staged must still block the commit. Routed through
     // the same canonical choke-point.
-    require_repo_action(
+    //
+    // A denial (or a transient permission-service error) here is a failure
+    // *after* the lease was taken, so it must release the lease like every
+    // other failure path below. Returning while the session is still
+    // `committing` would wedge it for the full lease TTL: retries get "already
+    // in progress" and cancel refuses to touch a live committer.
+    if let Err(e) = require_repo_action(
         &auth,
         session.repository_id,
         "write",
         &state.permission_service,
     )
     .await
-    .map_err(IntoResponse::into_response)?;
+    {
+        UploadService::release_commit_lease(&state.db, &session).await;
+        return Err(e.into_response());
+    }
 
     // Resolve the *repo-scoped* storage backend and use a content-addressable
     // key, matching how non-chunked uploads work (issue #1168 part 3).
@@ -539,23 +556,36 @@ async fn complete(
         &session.checksum_sha256,
     );
 
-    let repo = crate::services::repository_service::RepositoryService::new(state.db.clone())
+    let repo = match crate::services::repository_service::RepositoryService::new(state.db.clone())
         .get_by_id(session.repository_id)
         .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    {
+        Ok(repo) => repo,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+    let storage = match state.storage_for_repo(&repo.storage_location()) {
+        Ok(storage) => storage,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
 
     let temp_path = std::path::PathBuf::from(&session.temp_file_path);
 
     // C1: Use put_file to stream from disk instead of reading the entire file
     // into memory. The default implementation still reads into memory, but
     // backends can override for true streaming (S3 multipart, etc.).
-    storage
-        .put_file(&storage_key, &temp_path)
-        .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    //
+    // A storage failure is retryable — the temp file is still on disk — so
+    // release the commit lease and let the client re-issue the complete.
+    if let Err(e) = storage.put_file(&storage_key, &temp_path).await {
+        UploadService::release_commit_lease(&state.db, &session).await;
+        return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
 
     // #2588: packages pushed through the generic chunked flow must still
     // surface format metadata (the native format routes parse it at upload
@@ -602,14 +632,26 @@ async fn complete(
     // commit. Replication sessions keep their documented exemption (artifacts
     // that legitimately predate a quota change must still replicate; the
     // background reconciler folds their bytes into the ledger).
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    //
+    // Every failure from here on is terminal for the commit lease: the temp
+    // file was already removed after the storage copy, so a retry could not
+    // re-verify the payload. Fail the session under its token rather than
+    // leaving it wedged in `committing` for the whole staleness window.
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("could not open the artifact transaction: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
     if !is_replication_request {
         let admission =
-            crate::services::repository_service::RepositoryService::new(state.db.clone())
+            match crate::services::repository_service::RepositoryService::new(state.db.clone())
                 .check_quota_locked(
                     &mut tx,
                     session.repository_id,
@@ -617,17 +659,36 @@ async fn complete(
                     session.total_size,
                 )
                 .await
-                .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            {
+                Ok(admission) => admission,
+                Err(e) => {
+                    drop(tx);
+                    UploadService::fail_committing(
+                        &state.db,
+                        &session,
+                        &format!("quota admission failed: {e}"),
+                    )
+                    .await;
+                    return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+                }
+            };
         if !admission.allowed {
             // Drop `tx` (rolls back). The stored blob is content-addressed;
             // if this upload orphaned it, storage GC reclaims it.
+            drop(tx);
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                "repository storage quota exceeded",
+            )
+            .await;
             return Err(map_err(
                 StatusCode::INSUFFICIENT_STORAGE,
                 "Repository storage quota exceeded",
             ));
         }
     }
-    let artifact_id: Uuid = sqlx::query_scalar(
+    let inserted_artifact_id = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
                                checksum_sha256, content_type, storage_key, uploaded_by)
@@ -649,11 +710,29 @@ async fn complete(
     .bind(&storage_key)
     .bind(user_id)
     .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    tx.commit()
-        .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .await;
+    let artifact_id: Uuid = match inserted_artifact_id {
+        Ok(id) => id,
+        Err(e) => {
+            drop(tx);
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("artifact upsert failed: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+    if let Err(e) = tx.commit().await {
+        UploadService::fail_committing(
+            &state.db,
+            &session,
+            &format!("artifact commit failed: {e}"),
+        )
+        .await;
+        return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
 
     if let (Some(format), Some(metadata)) = (
         session.artifact_metadata_format.as_deref(),
@@ -664,10 +743,18 @@ async fn complete(
             .clone()
             .unwrap_or_else(|| serde_json::json!({}));
         let artifact_service = state.create_artifact_service(storage.clone());
-        artifact_service
+        if let Err(e) = artifact_service
             .set_metadata(artifact_id, format, metadata, properties)
             .await
-            .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        {
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("artifact metadata write failed: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
     } else if let Some(prefix) = &format_header_prefix {
         // #2588: extract RPM header metadata for generically-pushed packages,
         // mirroring what the native RPM upload route records. Best-effort:
@@ -693,7 +780,7 @@ async fn complete(
             .try_create_or_update_from_artifact(
                 session.repository_id,
                 &package_name,
-                package_version,
+                &package_version,
                 session.total_size,
                 &session.checksum_sha256,
                 completed_package_description(&session),
@@ -701,6 +788,16 @@ async fn complete(
             )
             .await;
     }
+
+    // Terminal transition, token-guarded. A lost lease here means the commit
+    // took longer than the 6h staleness window and a newer complete request
+    // reclaimed the session — the artifact upsert above is idempotent, so
+    // the only consequence is that the newer owner also finalizes.
+    let finalize_result = UploadService::finalize_completed(&state.db, &session).await;
+    settle_completed_session(&state.db, &session, finalize_result)
+        .await
+        .map_err(map_upload_err)?;
+    drop(commit_renewal);
 
     tracing::info!(
         "Finalized chunked upload {} -> artifact {} ({}B, sha256:{})",
@@ -818,6 +915,43 @@ fn map_upload_err(e: UploadError) -> Response {
     super::with_retry_after_on_503(
         (status, axum::Json(serde_json::json!({"error": msg}))).into_response(),
     )
+}
+
+/// Finish the post-artifact session transition without reporting success while
+/// the session still appears active. A database failure here happens after the
+/// artifact transaction committed and the temp file was removed, so replay is
+/// no longer safe: token-fence the session to `failed`, matching the existing
+/// post-commit metadata-failure policy, and propagate the database error.
+async fn settle_completed_session(
+    db: &sqlx::PgPool,
+    session: &upload_service::UploadSession,
+    finalize_result: Result<bool, UploadError>,
+) -> Result<(), UploadError> {
+    match finalize_result {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::warn!(
+                session = %session.id,
+                "chunked upload finalized but its completion lease was lost; \
+                 a newer complete request owns the session"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(
+                session = %session.id,
+                error = %e,
+                "failed to mark upload session completed"
+            );
+            UploadService::fail_committing(
+                db,
+                session,
+                &format!("artifact committed but session completion update failed: {e}"),
+            )
+            .await;
+            Err(e)
+        }
+    }
 }
 
 /// Map any displayable error to an HTTP error response.
@@ -1009,17 +1143,40 @@ fn maven_package_metadata_from_artifact_metadata(
     Some(catalog)
 }
 
-fn completed_package_catalog_entry<'a>(
-    session: &'a upload_service::UploadSession,
+fn completed_package_catalog_entry(
+    session: &upload_service::UploadSession,
     format: &crate::models::repository::RepositoryFormat,
-) -> Option<(String, &'a str)> {
-    let version = completed_artifact_version(session)?;
+) -> Option<(String, String)> {
+    use crate::models::repository::RepositoryFormat;
     // #2723: Maven/Gradle grouped listings key the catalog `packages` row on
     // `groupId:artifactId`. Prefer the replicated POM metadata's coordinates;
     // otherwise, for a Maven/Gradle repo, derive the grouped name from the
     // artifact path so a generically-pushed asset joins the same component
     // instead of landing under a bare artifactId/filename.
-    let name = replicated_maven_artifact_metadata(session)
+    //
+    // #3064: for Maven/Gradle repos the catalog `package_versions.version`
+    // must come from the same GAV coordinates as the name — the replicated POM
+    // metadata's version when present, else the version segment of the
+    // artifact path. Requiring an explicit create-session version dropped
+    // chunked Maven uploads that carry their coordinates only in the path.
+    let metadata = replicated_maven_artifact_metadata(session);
+    let maven_layout = matches!(format, RepositoryFormat::Maven | RepositoryFormat::Gradle);
+    let version = if maven_layout {
+        metadata
+            .and_then(|m| m.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                crate::formats::maven::MavenHandler::parse_coordinates(&session.artifact_path)
+                    .ok()
+                    .map(|coords| coords.version)
+            })
+            .or_else(|| completed_artifact_version(session).map(str::to_string))
+    } else {
+        completed_artifact_version(session).map(str::to_string)
+    }?;
+    let name = metadata
         .and_then(maven_package_name_from_metadata)
         .or_else(|| maven_grouped_name_for_format(session, format))
         .unwrap_or_else(|| completed_artifact_name(session).to_string());
@@ -1485,6 +1642,8 @@ mod tests {
             temp_file_path: "/tmp/upload-session".to_string(),
             status: "completed".to_string(),
             error_message: None,
+            state_token: None,
+            committing_expires_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
@@ -1524,7 +1683,7 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
-            Some(("large-check".to_string(), "20260603T082854Z"))
+            Some(("large-check".to_string(), "20260603T082854Z".to_string()))
         );
     }
 
@@ -1541,12 +1700,56 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
-            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+            Some((
+                "org.example.ak.maven:ak-core".to_string(),
+                "1.0.0".to_string()
+            ))
         );
         // A non-Maven repo keeps the bare artifact name.
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
-            Some(("ak-core-1.0.0.jar".to_string(), "1.0.0"))
+            Some(("ak-core-1.0.0.jar".to_string(), "1.0.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_derives_version_from_gav_path() {
+        // #3064: a chunked Maven upload without an explicit create-session
+        // version must still produce a catalog row — name AND version come
+        // from the GAV path.
+        let session = test_upload_session("com/example/demo/app/1.2.3/app-1.2.3.jar", None, None);
+
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
+            Some(("com.example.demo:app".to_string(), "1.2.3".to_string()))
+        );
+        // A Generic repo keeps the legacy behaviour: no explicit version, no
+        // catalog row.
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
+            None
+        );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_path_version_beats_explicit_for_maven() {
+        // #3064: for Maven/Gradle repos the GAV path is the authoritative
+        // coordinate; an explicit create-session version that disagrees with
+        // the path must not split the component across two version rows.
+        let session = test_upload_session(
+            "com/example/demo/app/1.2.3/app-1.2.3.jar",
+            Some("app"),
+            Some("example"),
+        );
+
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
+            Some(("com.example.demo:app".to_string(), "1.2.3".to_string()))
+        );
+        // Non-Maven formats keep the explicit version as-is.
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
+            Some(("app".to_string(), "example".to_string()))
         );
     }
 
@@ -1572,7 +1775,10 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
-            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+            Some((
+                "org.example.ak.maven:ak-core".to_string(),
+                "1.0.0".to_string()
+            ))
         );
         assert_eq!(
             completed_package_description(&session),
@@ -1604,7 +1810,10 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
-            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+            Some((
+                "org.example.ak.maven:ak-core".to_string(),
+                "1.0.0".to_string()
+            ))
         );
         assert_eq!(completed_package_description(&session), None);
         assert_eq!(completed_package_metadata(&session), None);
@@ -3205,6 +3414,192 @@ mod tests {
             .bind(session_id)
             .execute(&f.pool)
             .await;
+        f.teardown().await;
+    }
+
+    /// Stage a verifiable session directly in the database (temp file on disk,
+    /// size and checksum consistent) so `complete` gets past
+    /// `complete_session` — and therefore past the point where the commit
+    /// lease is taken — without needing an authorized create/PATCH first.
+    async fn stage_completable_session(
+        f: &tdh::Fixture,
+        payload: &[u8],
+    ) -> (Uuid, std::path::PathBuf) {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let checksum = hex::encode(hasher.finalize());
+
+        let dir = std::env::temp_dir().join("ak_upload_authz_release_test");
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let temp_path = dir.join(format!("staged-{}", Uuid::new_v4()));
+        tokio::fs::write(&temp_path, payload).await.expect("write");
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO upload_sessions \
+                 (user_id, repository_id, repository_key, artifact_path, \
+                  total_size, chunk_size, total_chunks, completed_chunks, \
+                  bytes_received, checksum_sha256, temp_file_path, status) \
+             VALUES ($1, $2, $3, 'authz/staged.bin', $4, 1048576, 1, 1, $4, $5, $6, \
+                     'in_progress') \
+             RETURNING id",
+        )
+        .bind(f.user_id)
+        .bind(f.repo_id)
+        .bind(&f.repo_key)
+        .bind(payload.len() as i64)
+        .bind(&checksum)
+        .bind(temp_path.to_string_lossy().as_ref())
+        .fetch_one(&f.pool)
+        .await
+        .expect("insert staged session");
+
+        (session_id, temp_path)
+    }
+
+    /// A database error from the final `committing -> completed` update happens
+    /// after the artifact is durable and the temp file is gone. It must produce
+    /// a non-success response and leave a terminal session instead of logging
+    /// the error and returning 200 with the row still `committing`.
+    #[tokio::test]
+    async fn finalize_database_error_marks_committing_session_failed() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"post-artifact-finalize-db-error";
+        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+        let session = UploadService::complete_session(&f.pool, session_id, f.user_id)
+            .await
+            .expect("claim completion lease");
+
+        // Synthesize the error result from finalize_completed while keeping the
+        // fixture pool healthy so the token-fenced failure transition itself is
+        // observable.
+        let err = settle_completed_session(
+            &f.pool,
+            &session,
+            Err(UploadError::Database(sqlx::Error::PoolClosed)),
+        )
+        .await
+        .expect_err("a failed terminal update must not report success");
+        assert_eq!(
+            map_upload_err(err).status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the handler must not return 200 after losing the terminal update"
+        );
+
+        let (status, token, deadline, message): (
+            String,
+            Option<Uuid>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, state_token, committing_expires_at, error_message \
+             FROM upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read terminal session state");
+        assert_eq!(status, "failed");
+        assert!(
+            token.is_none(),
+            "terminal failure must clear the lease token"
+        );
+        assert!(
+            deadline.is_none(),
+            "terminal failure must clear the lease deadline"
+        );
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("session completion update failed")),
+            "terminal failure must explain the post-artifact database error"
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    fn complete_req(session_id: Uuid) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/complete", session_id))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// Access revoked between staging the chunks and finalizing must deny the
+    /// commit *and* release the completion lease. Returning while the session
+    /// is still `committing` would wedge it for the full 6h lease TTL: retries
+    /// get "completion already in progress" and cancel refuses to touch a live
+    /// committer.
+    #[tokio::test]
+    async fn complete_releases_commit_lease_when_authorization_is_revoked() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"authz-revoked-mid-upload";
+        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+
+        // Revoke: drop the fixture's role assignment and leave only a rule
+        // that grants a different principal, so the caller is a non-member on
+        // a ruled repo (403 under the deny-by-default choke-point).
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
+        grant_repo_permission(&f.pool, f.repo_id, Uuid::new_v4(), &["read", "write"]).await;
+        f.state.permission_service.invalidate_cache();
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, _body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a revoked writer must not be able to commit a staged session"
+        );
+
+        let (session_status, token): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT status, state_token FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read session state");
+        assert_eq!(
+            session_status, "in_progress",
+            "a denied commit must release the lease, not wedge the session in 'committing'"
+        );
+        assert!(token.is_none(), "a released lease must clear its token");
+
+        // Not wedged: once access is restored the same session completes.
+        grant_repo_permission(&f.pool, f.repo_id, f.user_id, &["read", "write"]).await;
+        f.state.permission_service.invalidate_cache();
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the released session must still be completable; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        delete_repo_permissions(&f.pool, f.repo_id).await;
         f.teardown().await;
     }
 

@@ -1551,6 +1551,24 @@ impl CachePersister {
                         // a mismatch exactly like the truncated/empty reject path:
                         // delete the object and skip the metadata sidecar so the
                         // next request refetches upstream (self-heal).
+                        //
+                        // The delete is load-bearing, NOT belt-and-braces: the
+                        // missing sidecar is not sufficient on its own, because
+                        // several read paths reach the content key without
+                        // consulting it. `handle_streaming_leader_upstream_error`
+                        // serves `get_stream(cache_key)` as an RFC 5861
+                        // stale-if-error response and only loads the sidecar
+                        // afterwards, best-effort, for headers; `is_fresh`
+                        // degrades to a bare `exists()` when either ETag is
+                        // multipart-shaped (#2120) or when a legacy sidecar has
+                        // no pinned ETag; and the presigned-redirect paths sign a
+                        // 302 straight to the object with no checksum check at
+                        // all. Leaving rejected bytes in place therefore makes
+                        // them servable. Deleting is also what self-heals on a
+                        // versioned bucket: nothing in this codebase ever reads a
+                        // non-current version (there is no version_id support in
+                        // the storage layer), so a delete marker simply reads as
+                        // NotFound and forces the refetch.
                         if let Some(expected) = template.expected_checksum.as_deref() {
                             if result.checksum_sha256 != expected {
                                 tracing::warn!(
@@ -1667,7 +1685,28 @@ impl CachePersister {
                         // miss) and delete the bad object so a later GET
                         // refetches upstream (self-heal). The buffered sibling
                         // [`Self::write_buffered`] applies the empty-body guard
-                        // before the content write.
+                        // before the content write, so it can return early and
+                        // never needs the delete.
+                        //
+                        // Both halves are required. Skipping the sidecar is not
+                        // sufficient on its own, because several readers reach
+                        // the content key without consulting it:
+                        // `handle_streaming_leader_upstream_error` streams
+                        // `get_stream(cache_key)` as an RFC 5861 stale-if-error
+                        // response (sidecar loaded afterwards, best-effort, only
+                        // for headers), the PyPI Remote arm streams
+                        // `artifacts.storage_key` directly, and `is_fresh`
+                        // degrades to a bare `exists()` whenever an ETag is
+                        // multipart-shaped (#2120) or a legacy sidecar carries no
+                        // pinned ETag -- after which the presigned paths sign a
+                        // 302 to the object with no checksum check at all.
+                        //
+                        // The delete is also what self-heals on a versioned
+                        // bucket. Nothing in this codebase reads a non-current
+                        // version (the storage layer has no version_id concept),
+                        // so a delete marker simply reads as NotFound and forces
+                        // the refetch -- it cannot mask content that was already
+                        // unreachable.
                         match rejected {
                             StreamWriteOutcome::RejectTruncated { expected, actual } => {
                                 tracing::warn!(
@@ -1693,7 +1732,8 @@ impl CachePersister {
                                 cache_key = %cache_key_for_writer,
                                 error = %e,
                                 "best-effort delete of rejected proxy-cache object failed; \
-                                 the missing metadata sidecar still forces a refetch"
+                                 the missing metadata sidecar still forces a refetch on the \
+                                 sidecar-gated read paths"
                             );
                         }
                     }
@@ -1841,16 +1881,23 @@ impl UpstreamClient {
         repo_id: Uuid,
         accept: Option<&str>,
         max: usize,
+        auth_mode: crate::services::upstream_auth::UpstreamAuthMode,
     ) -> Result<UpstreamResponse> {
         let diagnostic_url = redact_url_for_diagnostics(url);
         tracing::info!(
-            "Fetching artifact from upstream: {} (accept={:?})",
+            "Fetching artifact from upstream: {} (accept={:?}, auth_mode={:?})",
             diagnostic_url,
-            accept
+            accept,
+            auth_mode
         );
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        // #3130: `Anonymous` short-circuits to `None` before the credential
+        // store is read, so neither the initial request nor the bearer retry
+        // below can attach the repo's configured upstream credentials.
+        let upstream_auth = crate::services::upstream_auth::load_upstream_auth_for_mode(
+            &self.db, repo_id, auth_mode,
+        )
+        .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self.http_client.get(url);
@@ -4967,8 +5014,19 @@ impl ProxyService {
     /// re-asks upstream.
     async fn write_negative_cache(&self, cache_key: &str, metadata_key: &str, cache_path: &str) {
         // Drop any stale positive body so a future read can never serve it
-        // alongside the negative marker.
-        let _ = self.storage.delete(cache_key).await;
+        // alongside the negative marker. Probe first (#1611 follow-up):
+        // every negative-cache *renewal* on an already-, or never-, cached
+        // path re-enters this function every TTL window, and on a versioned
+        // backend an unconditional delete() always writes a new
+        // delete-marker version even when there is nothing to delete --
+        // observed stacking to 9+ marker versions on repeatedly-missed
+        // paths (e.g. checksum-file probes for deps that never publish a
+        // .sha1) with zero real content ever written. Gate the delete on a
+        // real object being present so renewals of an existing negative (or
+        // a path that never had content) don't write a redundant marker.
+        if matches!(self.storage.exists(cache_key).await, Ok(true)) {
+            let _ = self.storage.delete(cache_key).await;
+        }
 
         let now = Utc::now();
         let neg_ttl = chrono::Duration::seconds(cache_classifier::NEGATIVE_CACHE_TTL_SECS);
@@ -5087,8 +5145,49 @@ impl ProxyService {
         max: usize,
     ) -> Result<UpstreamResponse> {
         self.upstream_client
-            .fetch_buffered(url, repo_id, accept, max)
+            .fetch_buffered(
+                url,
+                repo_id,
+                accept,
+                max,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
             .await
+    }
+
+    /// Buffered, byte-capped upstream metadata fetch that NEVER attaches the
+    /// repository's configured upstream credentials (#3130 / #2925).
+    ///
+    /// For URLs a service index legitimately advertises on a host other than
+    /// the configured upstream (nuget.org's `SearchQueryService` lives on
+    /// `azuresearch-*.nuget.org` while its `index.json` is on
+    /// `api.nuget.org`). The request still goes through the shared proxy HTTP
+    /// client — so the connect-time SSRF DNS guard (`is_blocked_resolved_ip`,
+    /// #1832/#2570) and the `max`-byte body ceiling both apply — but auth
+    /// resolution is [`UpstreamAuthMode::Anonymous`], which short-circuits
+    /// before the credential store is read.
+    ///
+    /// Deliberately does NOT touch the proxy cache: every cached-entry code
+    /// path (single-flight refill, stale revalidation via `check_etag_changed`,
+    /// conditional refetch) loads the repo's credentials, so an uncached
+    /// direct fetch is the narrowest surface that provably cannot carry them.
+    pub async fn fetch_metadata_capped_anonymous(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        max: usize,
+    ) -> Result<(Bytes, Option<String>)> {
+        let resp = self
+            .upstream_client
+            .fetch_buffered(
+                url,
+                repo_id,
+                None,
+                max,
+                crate::services::upstream_auth::UpstreamAuthMode::Anonymous,
+            )
+            .await?;
+        Ok((resp.content, resp.content_type))
     }
 
     /// Streaming variant of [`Self::fetch_from_upstream`] used by the
@@ -8418,6 +8517,13 @@ mod tests {
         metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
         deletes: tokio::sync::Mutex<Vec<String>>,
         put_stream_fails: bool,
+        // #1611-style guard support: a successful put_stream (even a
+        // zero-byte one) creates a real object at the key, same as a real S3
+        // PutObject. exists() reflects that so the reject-arm delete tests
+        // below exercise the same exists()-before-delete guard as prod,
+        // rather than the guard vacuously short-circuiting on an
+        // always-absent mock.
+        object_written: std::sync::atomic::AtomicBool,
     }
 
     impl TeeRecordingBackend {
@@ -8427,6 +8533,7 @@ mod tests {
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: false,
+                object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
         fn failing() -> Arc<Self> {
@@ -8435,6 +8542,7 @@ mod tests {
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: true,
+                object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -8454,7 +8562,9 @@ mod tests {
             Err(AppError::NotFound("not relevant for tee tests".into()))
         }
         async fn exists(&self, _key: &str) -> Result<bool> {
-            Ok(false)
+            Ok(self
+                .object_written
+                .load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn delete(&self, key: &str) -> Result<()> {
             self.deletes.lock().await.push(key.to_string());
@@ -8488,6 +8598,8 @@ mod tests {
                 total += chunk.len() as u64;
                 chunks.push(chunk);
             }
+            self.object_written
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(ServicePutStreamResult {
                 checksum_sha256: format!("{:x}", hasher.finalize()),
                 bytes_written: total,
@@ -8634,12 +8746,19 @@ mod tests {
     /// #1365 regression: an empty upstream body (a 204, an empty 200, or a
     /// HEAD-style probe that reaches the streaming download path) must NOT
     /// be cached. The client still receives the empty body for this
-    /// request, but the writer must (a) skip the metadata sidecar so a
-    /// later GET is a cache miss, and (b) delete the zero-byte object it
-    /// wrote so the next request refetches the real body from upstream.
+    /// request, but the writer must skip the metadata sidecar so a later
+    /// GET is a cache miss and refetches the real body from upstream.
     /// Before the fix the writer persisted a `size_bytes: 0` sidecar,
     /// which a subsequent GET served as `Content-Length: 0`, breaking
     /// Gradle POM parsing ("Content is not allowed in prolog.").
+    ///
+    /// The writer must ALSO delete the zero-byte object it wrote. The sidecar
+    /// skip alone is not enough: `handle_streaming_leader_upstream_error`
+    /// streams the content key as a stale-if-error response without gating on
+    /// the sidecar, the PyPI Remote arm streams it directly, and `is_fresh`
+    /// degrades to a bare `exists()` on a multipart-ETag mismatch (#2120) --
+    /// after which a presigned 302 points straight at it. Leaving the object
+    /// behind therefore leaves it servable (#3068 review).
     #[tokio::test]
     async fn test_tee_empty_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
@@ -8669,7 +8788,8 @@ mod tests {
         assert_eq!(
             backend.deletes.lock().await.as_slice(),
             ["cache-key".to_string()],
-            "the empty cache object must be deleted so the next request refetches"
+            "the empty cache object must be deleted so the next request refetches; \
+             the sidecar skip alone does not protect the sidecar-less read paths"
         );
     }
 
@@ -8716,8 +8836,13 @@ mod tests {
     /// #1912 regression: a truncated upstream body (bytes written < the
     /// advertised `Content-Length`) must NOT be cached. Committing it would
     /// serve a short, SHA-mismatched archive on the next GET and clients hit
-    /// "unexpected BufError" extracting it. The writer must skip the metadata
-    /// sidecar and delete the partial object so the next request refetches.
+    /// "unexpected BufError" extracting it. The writer must skip the
+    /// metadata sidecar so the next request refetches.
+    ///
+    /// Same reasoning as the empty-body sibling above: the writer must ALSO
+    /// delete the partial object, because the sidecar skip does not protect
+    /// the read paths that reach the content key without consulting it
+    /// (#3068 review).
     #[tokio::test]
     async fn test_tee_truncated_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
@@ -8750,7 +8875,74 @@ mod tests {
         assert_eq!(
             backend.deletes.lock().await.as_slice(),
             ["cache-key".to_string()],
-            "the truncated cache object must be deleted so the next request refetches"
+            "the truncated cache object must be deleted so the next request refetches; \
+             the sidecar skip alone does not protect the sidecar-less read paths"
+        );
+    }
+
+    /// #1611 regression: `write_negative_cache`'s `exists()`-gated delete must
+    /// not fire when nothing real is present, on the FIRST negative-cache
+    /// write for a path AND on every renewal after it. Before the guard, an
+    /// unconditional delete() on a versioned backend stacked a redundant
+    /// marker version on every renewal (observed up to 9+ on a single key)
+    /// even though no real content was ever written there.
+    #[tokio::test]
+    async fn test_write_negative_cache_skips_delete_when_nothing_present() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let proxy = ProxyService::new(test_catalog_pool(), storage);
+
+        // Two consecutive negative-cache writes, simulating the initial
+        // write plus one TTL renewal against a path that never had real
+        // content -- exactly the "checksum-file probe for a dep that never
+        // publishes a .sha1" case from the #1611 investigation.
+        proxy
+            .write_negative_cache("cache-key", "meta-key", "some/path")
+            .await;
+        proxy
+            .write_negative_cache("cache-key", "meta-key", "some/path")
+            .await;
+
+        assert!(
+            backend.deletes.lock().await.is_empty(),
+            "write_negative_cache must not delete when exists() reports \
+             nothing present (#1611); doing so on every renewal stacks a \
+             redundant marker version with zero real content behind it"
+        );
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            2,
+            "each negative-cache renewal still writes its metadata sidecar \
+             regardless of the delete guard"
+        );
+    }
+
+    /// Positive control for the guard above. Without this, replacing the
+    /// `exists()` check with `if false` would still pass the whole suite --
+    /// the same criticism the #3068 author correctly applied to the
+    /// `local_fetch_or_redirect` test and did not apply here.
+    ///
+    /// When a real positive body IS present, `write_negative_cache` must still
+    /// drop it, so a future read can never serve stale content alongside the
+    /// negative marker.
+    #[tokio::test]
+    async fn test_write_negative_cache_deletes_an_existing_positive_body() {
+        let backend = TeeRecordingBackend::ok();
+        backend
+            .object_written
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let proxy = ProxyService::new(test_catalog_pool(), storage);
+
+        proxy
+            .write_negative_cache("cache-key", "meta-key", "some/path")
+            .await;
+
+        assert_eq!(
+            backend.deletes.lock().await.as_slice(),
+            ["cache-key".to_string()],
+            "a prior positive body MUST be dropped when the negative marker is \
+             written, otherwise a read can serve it alongside the marker"
         );
     }
 

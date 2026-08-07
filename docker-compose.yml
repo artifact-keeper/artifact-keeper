@@ -129,6 +129,11 @@ services:
       - shared_config:/shared
     environment:
       DTRACK_INIT_FORCE_ROTATE: ${DTRACK_INIT_FORCE_ROTATE:-false}
+      # Owner (uid:gid) for /shared/dtrack-api-key (#2865). Must match the UID
+      # the backend runs as so it can read the key; the hardened backend image
+      # runs as artifact = 1001:0 (docker/Dockerfile.backend). Override only if
+      # you run a custom backend image with a different UID.
+      DTRACK_INIT_KEY_OWNER: ${DTRACK_INIT_KEY_OWNER:-1001:0}
       # Opt-in OSV mirror (#1972). NVD-only matches by CPE and misses purl-based
       # language dependencies; set to true to also mirror OSV (purl matching).
       DTRACK_INIT_OSV_ENABLED: ${DTRACK_INIT_OSV_ENABLED:-false}

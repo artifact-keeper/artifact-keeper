@@ -177,7 +177,7 @@ mod tests {
     // drop. Without this, set_var calls in these tests leaked process-wide:
     // env is global and ENV_MUTEX only serializes writers among smtp tests,
     // so parallel tests reading DATABASE_URL via try_pool() saw the bogus
-    // "postgres://test@localhost/test" URL until the next smtp test ran.
+    // "postgres://test@127.0.0.1:1/test" URL until the next smtp test ran.
     struct EnvVarGuard {
         saved: Vec<(&'static str, Option<String>)>,
     }
@@ -216,7 +216,7 @@ mod tests {
     fn test_config_no_smtp() -> Config {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
-        env::set_var("DATABASE_URL", "postgres://test@localhost/test");
+        env::set_var("DATABASE_URL", "postgres://test@127.0.0.1:1/test");
         env::set_var(
             "JWT_SECRET",
             "smtp-suite-passphrase-with-varied-glyphs-2468",
@@ -233,7 +233,7 @@ mod tests {
     fn test_config_with_smtp() -> Config {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
-        env::set_var("DATABASE_URL", "postgres://test@localhost/test");
+        env::set_var("DATABASE_URL", "postgres://test@127.0.0.1:1/test");
         env::set_var(
             "JWT_SECRET",
             "smtp-suite-passphrase-with-varied-glyphs-2468",
@@ -287,7 +287,7 @@ mod tests {
     fn test_invalid_from_address_returns_config_error() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
-        env::set_var("DATABASE_URL", "postgres://test@localhost/test");
+        env::set_var("DATABASE_URL", "postgres://test@127.0.0.1:1/test");
         env::set_var(
             "JWT_SECRET",
             "smtp-suite-passphrase-with-varied-glyphs-2468",
@@ -326,7 +326,7 @@ mod tests {
     fn test_tls_mode_fallback_on_invalid() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
-        env::set_var("DATABASE_URL", "postgres://test@localhost/test");
+        env::set_var("DATABASE_URL", "postgres://test@127.0.0.1:1/test");
         env::set_var(
             "JWT_SECRET",
             "smtp-suite-passphrase-with-varied-glyphs-2468",
@@ -340,7 +340,7 @@ mod tests {
     async fn test_dangerous_mode_builds_transport() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
-        env::set_var("DATABASE_URL", "postgres://test@localhost/test");
+        env::set_var("DATABASE_URL", "postgres://test@127.0.0.1:1/test");
         env::set_var(
             "JWT_SECRET",
             "smtp-suite-passphrase-with-varied-glyphs-2468",

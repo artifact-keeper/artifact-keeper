@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::Extension;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -30,6 +31,7 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use artifact_keeper_backend::api::handlers::pypi;
+use artifact_keeper_backend::api::middleware::auth::AuthExtension;
 use artifact_keeper_backend::api::{AppState, SharedState};
 use artifact_keeper_backend::config::Config;
 use artifact_keeper_backend::services::proxy_service::ProxyService;
@@ -92,7 +94,7 @@ async fn cleanup(pool: &PgPool, id: Uuid) {
 }
 
 /// Upstream PEP 691 JSON for `requests`, with a CDN download URL, a PEP 700
-/// `upload-time`, and a PEP 714 `core-metadata` signal to exercise stripping.
+/// `upload-time`, and a PEP 714 `core-metadata` signal to exercise preservation.
 fn upstream_pep691_json() -> String {
     serde_json::json!({
         "meta": {"api-version": "1.1"},
@@ -134,7 +136,9 @@ async fn remote_pypi_proxy_serves_pep691_json_with_upload_time() {
     let (repo_id, repo_key) = create_remote_pypi_repo(&pool, &upstream.uri()).await;
     let state = build_state(pool.clone(), &storage_path);
 
-    let app = pypi::router().with_state(state);
+    let app = pypi::router()
+        .with_state(state)
+        .layer(Extension::<Option<AuthExtension>>(None));
     let req = Request::builder()
         .method("GET")
         .uri(format!("/{}/simple/requests/", repo_key))
@@ -191,6 +195,7 @@ async fn remote_pypi_proxy_serves_pep691_json_with_upload_time() {
     );
     assert_eq!(file["requires-python"], ">=3.8");
 
-    // PEP 658/714 metadata signal stripped — the proxy can't serve .metadata.
-    assert!(file.get("core-metadata").is_none());
+    // PEP 658/714 metadata signal is preserved so clients can request the
+    // upstream .metadata resource through the proxy.
+    assert_eq!(file["core-metadata"]["sha256"], "deadbeefcafe");
 }

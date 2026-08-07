@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
+use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
 
 /// OIDC provider configuration
 #[derive(Debug, Clone)]
@@ -223,9 +224,11 @@ impl OidcService {
                 )));
             }
 
-            let discovery: OidcDiscovery = response.json().await.map_err(|e| {
-                AppError::Internal(format!("Failed to parse OIDC discovery: {}", e))
-            })?;
+            let discovery: OidcDiscovery = read_json_capped(response, MAX_OIDC_RESPONSE_BYTES)
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("Failed to parse OIDC discovery: {}", e))
+                })?;
 
             self.discovery = Some(discovery);
         }
@@ -320,8 +323,7 @@ impl OidcService {
             )));
         }
 
-        response
-            .json()
+        read_json_capped(response, MAX_OIDC_RESPONSE_BYTES)
             .await
             .map_err(|e| AppError::Authentication(format!("Failed to parse token response: {}", e)))
     }
@@ -436,10 +438,12 @@ impl OidcService {
             return Err(AppError::Authentication("Userinfo request failed".into()));
         }
 
-        let claims: HashMap<String, serde_json::Value> = response
-            .json()
-            .await
-            .map_err(|e| AppError::Authentication(format!("Failed to parse userinfo: {}", e)))?;
+        let claims: HashMap<String, serde_json::Value> =
+            read_json_capped(response, MAX_OIDC_RESPONSE_BYTES)
+                .await
+                .map_err(|e| {
+                    AppError::Authentication(format!("Failed to parse userinfo: {}", e))
+                })?;
 
         let sub = claims
             .get("sub")

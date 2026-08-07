@@ -155,6 +155,13 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
 
     tracing::Span::current().record("correlation_id", tracing::field::display(&correlation_id));
 
+    // Kubernetes polls the health/readiness/liveness probes on a tight loop
+    // forever; their per-request "Request completed" lines bury real request
+    // logs. They are suppressed unless the operator opts in via
+    // LOG_PROBE_REQUESTS, except a non-success response always logs (see
+    // should_log_completed). Decided after the response so the status is known.
+    let is_probe = is_probe_path(request.uri().path());
+
     // Scope the task-local around the whole downstream future so audit
     // emitters anywhere under this request observe the same correlation ID
     // the span carries and the response header echoes (#2414).
@@ -165,15 +172,97 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
             response.headers_mut().insert(CORRELATION_ID_HEADER, value);
         }
 
-        tracing::info!(
-            correlation_id = %correlation_id,
-            status = %response.status().as_u16(),
-            "Request completed"
-        );
+        if should_log_completed(
+            is_probe,
+            log_probe_requests(),
+            response.status().is_success(),
+        ) {
+            tracing::info!(
+                correlation_id = %correlation_id,
+                status = %response.status().as_u16(),
+                "Request completed"
+            );
+        }
 
         response
     })
     .await
+}
+
+/// Health/readiness/liveness probe paths, exactly as wired in `api::routes`.
+/// Kubernetes hits these continuously, so their per-request logs are pure noise.
+/// Matched on the full, unstripped path because this middleware sits outside
+/// every `nest()`.
+///
+/// `/metrics` is deliberately absent: the only such route is the admin-scoped
+/// `/api/v1/admin/metrics`, and Prometheus in the chart scrapes the separate
+/// unauthenticated `METRICS_PORT` listener, which carries no correlation
+/// middleware and so never emits a "Request completed" line to suppress.
+fn is_probe_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/health" | "/healthz" | "/ready" | "/readyz" | "/livez"
+    )
+}
+
+/// Whether to emit the "Request completed" line for a request. Probe requests
+/// are suppressed unless the operator opts in, but a non-success response
+/// (e.g. `/readyz` 503 when Postgres is down) always logs: relying on
+/// `TraceLayer`'s implicit ERROR emission would be silently lost to a future
+/// `on_failure`/`EnvFilter` change. Pure, so it is unit testable.
+fn should_log_completed(is_probe: bool, opt_in: bool, is_success: bool) -> bool {
+    !is_probe || opt_in || !is_success
+}
+
+/// Force-resolve the `LOG_PROBE_REQUESTS` toggle at startup so an unrecognized
+/// value (a typo like `treu`) is surfaced by a warning immediately, rather than
+/// only when the first probe request happens to initialize the `OnceLock`.
+/// Idempotent: the resolved value is memoised in [`log_probe_requests`].
+pub fn init_probe_request_logging() {
+    let _ = log_probe_requests();
+}
+
+/// Whether probe requests should still be logged. Defaults to off (silent);
+/// set `LOG_PROBE_REQUESTS=1|true|yes|on` to restore per-probe request logging.
+/// Read once — env is fixed for the process lifetime.
+fn log_probe_requests() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        resolve_log_probe_requests(std::env::var("LOG_PROBE_REQUESTS").ok().as_deref())
+    })
+}
+
+/// Resolve the toggle from the raw env value, warning once on a value that is
+/// set but unrecognized (e.g. a typo) so it is not silently treated as off.
+/// Unset or empty is the default (off, no warning).
+fn resolve_log_probe_requests(value: Option<&str>) -> bool {
+    match parse_log_probe_requests(value) {
+        Some(enabled) => enabled,
+        None => {
+            if let Some(raw) = value {
+                if !raw.trim().is_empty() {
+                    tracing::warn!(
+                        value = %raw,
+                        "LOG_PROBE_REQUESTS is set to an unrecognized value; treating as off \
+                         (expected one of 1/true/yes/on or 0/false/no/off)"
+                    );
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Pure parse of the `LOG_PROBE_REQUESTS` toggle: `Some(true|false)` for a
+/// recognized value, `None` when unset or set to something unrecognized. Split
+/// out so it is unit testable without the environment or the `OnceLock`. The
+/// truthy/falsy sets match the `env_bool` helper in `sync_worker`.
+fn parse_log_probe_requests(value: Option<&str>) -> Option<bool> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "true" | "yes" | "on") => Some(true),
+        Some("0" | "false" | "no" | "off") => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +273,69 @@ mod tests {
     fn test_correlation_id_generate() {
         let id = CorrelationId::generate();
         assert!(Uuid::parse_str(id.as_str()).is_ok());
+    }
+
+    #[test]
+    fn probe_paths_match_routes_and_nothing_else() {
+        // Exactly the health routes wired in api::routes.
+        for p in ["/health", "/healthz", "/ready", "/readyz", "/livez"] {
+            assert!(is_probe_path(p), "{p} should be treated as a probe");
+        }
+        // Never suppressed. `/api/v1/admin/metrics` is the real (admin) metrics
+        // route: this asserts it stays logged, and fails loudly if the layer is
+        // ever moved inside a nest() where the prefix would strip to `/metrics`.
+        for p in [
+            "/api/v1/admin/metrics",
+            "/metrics",
+            "/api/v1/packages",
+            "/health/dashboard",
+            "/",
+            "/readyz/x",
+        ] {
+            assert!(!is_probe_path(p), "{p} must not be suppressed");
+        }
+    }
+
+    #[test]
+    fn parse_log_probe_requests_truthy_falsy_and_unrecognized() {
+        for v in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert_eq!(parse_log_probe_requests(Some(v)), Some(true), "{v:?}");
+        }
+        for v in ["0", "false", "no", "off", " off "] {
+            assert_eq!(parse_log_probe_requests(Some(v)), Some(false), "{v:?}");
+        }
+        // Set-but-unrecognized and unset both parse to None; `resolve` tells
+        // them apart (only the former warns).
+        for v in ["", "treu", "nope"] {
+            assert_eq!(parse_log_probe_requests(Some(v)), None, "{v:?}");
+        }
+        assert_eq!(parse_log_probe_requests(None), None);
+    }
+
+    #[test]
+    fn resolve_log_probe_requests_defaults_off_and_warns_on_garbage() {
+        assert!(!resolve_log_probe_requests(None)); // unset -> off
+        assert!(resolve_log_probe_requests(Some("on"))); // recognized -> on
+        assert!(!resolve_log_probe_requests(Some("off"))); // recognized -> off
+        assert!(!resolve_log_probe_requests(Some("treu"))); // typo -> off (warns)
+        assert!(!resolve_log_probe_requests(Some(""))); // empty -> off (no warn)
+    }
+
+    #[test]
+    fn log_probe_requests_defaults_off_when_unset() {
+        // LOG_PROBE_REQUESTS is unset in the test environment.
+        assert!(!log_probe_requests());
+    }
+
+    #[test]
+    fn should_log_completed_rules() {
+        // Non-probe requests always log.
+        assert!(should_log_completed(false, false, true));
+        // Probe success is silenced unless the operator opts in.
+        assert!(!should_log_completed(true, false, true));
+        assert!(should_log_completed(true, true, true));
+        // Probe failure (e.g. /readyz 503) always logs, opt-in or not.
+        assert!(should_log_completed(true, false, false));
     }
 
     #[test]

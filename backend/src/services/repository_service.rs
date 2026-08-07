@@ -1721,24 +1721,109 @@ impl RepositoryService {
         Ok(usage)
     }
 
+    /// Batched sibling of [`Self::get_virtual_storage_usage`] for the listing
+    /// endpoint (issue #3078): resolve the reachable non-virtual leaves of
+    /// EVERY requested virtual root in ONE query (the listing used to call the
+    /// per-repo method once per virtual on the page — an N+1 whose every call
+    /// also re-scanned every reachable member's artifact rows).
+    ///
+    /// The recursion is the per-repo CTE with the root id threaded through it,
+    /// so roots stay independent: two virtuals sharing a leaf each count it,
+    /// under their own root. `UNION` (not `UNION ALL`) plus the
+    /// `depth < MAX_VIRTUAL_DEPTH` bound keeps the same cycle/nesting
+    /// termination, and `SELECT DISTINCT root_id, repo_id` keeps the #2785
+    /// union semantics — a leaf reachable through two paths under one root is
+    /// counted once.
+    ///
+    /// Per-leaf bytes come from the trigger-maintained
+    /// `repository_usage_ledger` (migrations 171/182), which is byte-for-byte
+    /// equivalent to the live 3-way SUM the per-repo method computes (same
+    /// `is_deleted` / `proxy-cache/%` predicates in 182's triggers), so the
+    /// aggregation input shrinks from O(artifacts under all members) to
+    /// O(member repositories). `LEFT JOIN` + `COALESCE` make a leaf with no
+    /// ledger row contribute 0 rather than poisoning the SUM with NULL. A root
+    /// with no resolvable members has no row in the returned map — the caller
+    /// renders 0 for it.
+    pub async fn get_virtual_storage_usage_batch(
+        &self,
+        virtual_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, i64>> {
+        if virtual_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+            r#"
+            WITH RECURSIVE reachable(root_id, repo_id, depth) AS (
+                SELECT vrm.virtual_repo_id, vrm.member_repo_id, 1
+                  FROM virtual_repo_members vrm
+                 WHERE vrm.virtual_repo_id = ANY($1)
+              UNION
+                SELECT reachable.root_id, vrm.member_repo_id, reachable.depth + 1
+                  FROM reachable
+                  JOIN repositories parent
+                    ON parent.id = reachable.repo_id
+                   AND parent.repo_type = 'virtual'
+                  JOIN virtual_repo_members vrm
+                    ON vrm.virtual_repo_id = reachable.repo_id
+                 WHERE reachable.depth < $2
+            ),
+            leaves AS (
+                SELECT DISTINCT reachable.root_id AS root_id, reachable.repo_id AS id
+                  FROM reachable
+                  JOIN repositories leaf ON leaf.id = reachable.repo_id
+                 WHERE leaf.repo_type <> 'virtual'
+            )
+            SELECT leaves.root_id,
+                   COALESCE(SUM(l.hosted_bytes + l.proxy_bytes + l.oci_bytes), 0)::BIGINT
+              FROM leaves
+              LEFT JOIN repository_usage_ledger l ON l.repository_id = leaves.id
+             GROUP BY leaves.root_id
+            "#,
+        )
+        .bind(virtual_ids)
+        .bind(MAX_VIRTUAL_DEPTH as i32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows.into_iter().collect())
+    }
+
     /// Reconcile the FULL member set of a virtual repository to exactly
     /// `desired` (issue #2785 defect B).
     ///
-    /// Editing a virtual repository after creation must be able to add and
-    /// remove members, not merely reorder the ones added at create time. This
-    /// replaces the membership with exactly the `(member_repo_id, priority)`
-    /// pairs in `desired`, in a single transaction guarded by the same
-    /// process-wide member-graph advisory lock that `add_virtual_member` and
+    /// # Contract: full-set replace, not a partial update
+    ///
+    /// `desired` is the COMPLETE desired membership. This replaces the
+    /// membership with exactly the `(member_repo_id, priority)` pairs it
+    /// contains, in a single transaction guarded by the same process-wide
+    /// member-graph advisory lock that `add_virtual_member` and
     /// `update_virtual_member_priorities` take (so it never contends with a
     /// concurrent membership mutation):
     ///
-    ///   * members not present in `desired` are removed;
-    ///   * members already present have their priority updated;
-    ///   * new members are inserted.
+    ///   * members NOT present in `desired` are REMOVED;
+    ///   * members already present have their priority UPDATED;
+    ///   * members present in `desired` but not yet in the table are INSERTED;
+    ///   * an empty `desired` removes every member.
     ///
-    /// An empty `desired` removes every member. Caller-side authorization
-    /// (repo-admin on the virtual parent + token-scope / cycle / format checks
-    /// per member) is enforced by the handler before this runs.
+    /// This is destructive by design. A caller that passes a partial list in
+    /// order to reorder priorities will DELETE the members it omitted, so
+    /// callers must always assemble the full member list first.
+    ///
+    /// Editing a virtual repository after creation must be able to add and
+    /// remove members, not merely reorder the ones added at create time, which
+    /// is why PR #2795 (issue #2785) changed
+    /// `PUT /api/v1/repositories/{key}/members` from a priorities-only
+    /// update to this replace. Issue #2899 reviewed the
+    /// resulting breaking API-semantics change and RATIFIED it: replace
+    /// semantics are the intended, supported contract of this function and of
+    /// that endpoint. Do not narrow it back to a priorities-only update; the
+    /// removal arm is covered by
+    /// `test_set_virtual_members_edits_after_create_2785`.
+    ///
+    /// Caller-side authorization (repo-admin on the virtual parent +
+    /// token-scope / cycle / format checks per member) is enforced by the
+    /// handler before this runs.
     pub async fn set_virtual_members(
         &self,
         virtual_repo_id: Uuid,
@@ -1908,6 +1993,14 @@ impl RepositoryService {
     /// directly, proxy-cache fills, OCI blob pushes, deletes, lifecycle and
     /// GC. The background reconciler ([`Self::reconcile_usage_ledger`])
     /// remains as a drift safety net only.
+    ///
+    /// NOTE on migration 182's header comment (#3080): it claims
+    /// "`check_quota_locked` still reads the authoritative live sum". That
+    /// was true when 182 shipped but is stale — quota admission has read the
+    /// `repository_usage_ledger` row under `FOR UPDATE` (the query below)
+    /// since #2516/#2992. The migration file cannot be corrected because
+    /// sqlx validates checksums of applied migrations, so THIS comment is
+    /// the authoritative statement of how admission reads usage.
     ///
     /// Usage at the target `path` is netted out (unique-index lookup on
     /// `(repository_id, path)`), so an in-place overwrite is charged only its
@@ -4861,10 +4954,248 @@ mod tests {
             cleanup_repo(&pool, leaf.id).await;
         }
 
+        /// #3078: the batched ledger-backed virtual read
+        /// (`get_virtual_storage_usage_batch`) must agree exactly with the
+        /// per-repo live-SUM walk (`get_virtual_storage_usage`, the oracle)
+        /// for every root: a diamond overlap is counted once, a nested virtual
+        /// (depth 2) contributes its leaves, and two independent roots sharing
+        /// a leaf each count it under their own root. The leaves are seeded by
+        /// real source-table INSERTs so migration 182's triggers populate the
+        /// ledger — the test exercises trigger↔read equivalence end-to-end.
+        #[tokio::test]
+        async fn test_virtual_storage_batch_matches_live_oracle_3078() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+
+            // leaf1: 1_000 hosted + 2_500 proxy-cached. leaf2: 500_000 OCI.
+            let leaf1 = service
+                .create(make_create_req(
+                    &format!("{suffix}l1"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create leaf1");
+            let leaf2 = service
+                .create(make_create_req(
+                    &format!("{suffix}l2"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create leaf2");
+            insert_artifact(
+                &pool,
+                leaf1.id,
+                "p/1",
+                &format!("cas/aa/{}", Uuid::new_v4()),
+                1_000,
+            )
+            .await;
+            insert_proxy_cache(&pool, leaf1.id, "cached/x.tgz", 2_500).await;
+            insert_oci_blob(
+                &pool,
+                leaf2.id,
+                &format!("sha256:{}", Uuid::new_v4().simple()),
+                500_000,
+            )
+            .await;
+
+            // Diamond: v -> a -> leaf1 and v -> leaf1 (leaf1 reachable twice
+            // under v, and a is a nested virtual member at depth 2).
+            let a = service
+                .create(make_virtual_req(
+                    &format!("{suffix}a"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create a");
+            let v = service
+                .create(make_virtual_req(
+                    &format!("{suffix}v"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create v");
+            // Independent root sharing leaf1 with the diamond, plus leaf2.
+            let w = service
+                .create(make_virtual_req(
+                    &format!("{suffix}w"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create w");
+            // No resolvable members: must be ABSENT from the batch result.
+            let hollow = service
+                .create(make_virtual_req(
+                    &format!("{suffix}h"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create hollow");
+            service
+                .add_virtual_member(a.id, leaf1.id, Some(1))
+                .await
+                .expect("a->leaf1");
+            service
+                .add_virtual_member(v.id, a.id, Some(1))
+                .await
+                .expect("v->a");
+            service
+                .add_virtual_member(v.id, leaf1.id, Some(2))
+                .await
+                .expect("v->leaf1");
+            service
+                .add_virtual_member(w.id, leaf1.id, Some(1))
+                .await
+                .expect("w->leaf1");
+            service
+                .add_virtual_member(w.id, leaf2.id, Some(2))
+                .await
+                .expect("w->leaf2");
+
+            let roots = [v.id, a.id, w.id, hollow.id];
+            let batch = service
+                .get_virtual_storage_usage_batch(&roots)
+                .await
+                .expect("batch read");
+            for (label, root) in [("v", v.id), ("a", a.id), ("w", w.id)] {
+                let oracle = service
+                    .get_virtual_storage_usage(root)
+                    .await
+                    .expect("per-repo oracle");
+                assert_eq!(
+                    batch.get(&root).copied(),
+                    Some(oracle),
+                    "batched ledger read must equal the live-SUM oracle for {label}"
+                );
+            }
+            assert_eq!(
+                batch[&v.id], 3_500,
+                "diamond: leaf1 reachable via two paths counts ONCE under v"
+            );
+            assert_eq!(
+                batch[&w.id], 503_500,
+                "independent roots each count a shared leaf under their own root"
+            );
+            assert!(
+                !batch.contains_key(&hollow.id),
+                "root with no resolvable members is absent (caller renders 0)"
+            );
+            assert!(
+                service
+                    .get_virtual_storage_usage_batch(&[])
+                    .await
+                    .expect("empty batch")
+                    .is_empty(),
+                "empty input short-circuits to an empty map"
+            );
+
+            for repo in [v, a, w, hollow, leaf1, leaf2] {
+                cleanup_repo(&pool, repo.id).await;
+            }
+        }
+
+        /// #3078: an A→B→A membership cycle (forced via direct INSERTs — the
+        /// API's cycle guard refuses to create one) must terminate under the
+        /// depth-bounded `UNION` recursion and count each reachable leaf once,
+        /// with the batched ledger read agreeing with the per-repo live-SUM
+        /// oracle for both roots.
+        #[tokio::test]
+        async fn test_virtual_storage_batch_cycle_terminates_3078() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+
+            let leaf = service
+                .create(make_create_req(
+                    &format!("{suffix}cl"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create leaf");
+            insert_artifact(
+                &pool,
+                leaf.id,
+                "c/1",
+                &format!("cas/cc/{}", Uuid::new_v4()),
+                1_000,
+            )
+            .await;
+            let a = service
+                .create(make_virtual_req(
+                    &format!("{suffix}ca"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create a");
+            let b = service
+                .create(make_virtual_req(
+                    &format!("{suffix}cb"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create b");
+            service
+                .add_virtual_member(a.id, b.id, Some(1))
+                .await
+                .expect("a->b");
+            service
+                .add_virtual_member(b.id, leaf.id, Some(1))
+                .await
+                .expect("b->leaf");
+            // Close the cycle behind the API's guard.
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, 9)",
+            )
+            .bind(b.id)
+            .bind(a.id)
+            .execute(&pool)
+            .await
+            .expect("force b->a cycle edge");
+
+            let batch = service
+                .get_virtual_storage_usage_batch(&[a.id, b.id])
+                .await
+                .expect("batch read under cycle");
+            for (label, root) in [("a", a.id), ("b", b.id)] {
+                let oracle = service
+                    .get_virtual_storage_usage(root)
+                    .await
+                    .expect("per-repo oracle under cycle");
+                assert_eq!(oracle, 1_000, "cycle walk reaches the leaf once ({label})");
+                assert_eq!(
+                    batch.get(&root).copied(),
+                    Some(oracle),
+                    "batched read equals the oracle under a cycle ({label})"
+                );
+            }
+
+            for repo in [a, b, leaf] {
+                cleanup_repo(&pool, repo.id).await;
+            }
+        }
+
         /// #2785 defect B: a virtual repository's member list is editable after
         /// creation — `set_virtual_members` adds, removes, and reorders members
         /// to match exactly the supplied set (the pre-fix PUT endpoint only
         /// reordered members that already existed).
+        ///
+        /// #2899 ratified the resulting full-set REPLACE semantics as the
+        /// intended contract of `PUT /api/v1/repositories/{key}/members`.
+        /// This test pins that contract: a call whose `desired` list omits a
+        /// current member REMOVES that member. That is destructive on purpose,
+        /// so the removal arm is asserted explicitly here (members A, B, C then
+        /// a reconcile with only [A, B] must leave exactly A and B). If a
+        /// future change reverts to a priorities-only update, or makes the
+        /// reconcile merge rather than replace, this test must fail rather than
+        /// be relaxed.
         #[tokio::test]
         async fn test_set_virtual_members_edits_after_create_2785() {
             let Some(pool) = tdh::try_pool().await else {
@@ -4919,6 +5250,36 @@ mod tests {
                 ids(&service.get_virtual_members(virt.id).await.expect("list")),
                 vec![b.id, a.id],
                 "B (prio 2) then A (prio 5) after add + reprioritise"
+            );
+
+            // #2899 replace semantics, the destructive arm. Bring the set to
+            // exactly {A, B, C}, then reconcile with a PARTIAL list [A, B].
+            // C is absent from the request, so C must be removed: a caller
+            // that sends a subset to reorder loses the members it omitted.
+            service
+                .set_virtual_members(virt.id, &[(a.id, 1), (b.id, 2), (c.id, 3)])
+                .await
+                .expect("reconcile to A, B, C");
+            assert_eq!(
+                ids(&service.get_virtual_members(virt.id).await.expect("list")),
+                vec![a.id, b.id, c.id],
+                "precondition: membership is exactly {{A, B, C}}"
+            );
+
+            service
+                .set_virtual_members(virt.id, &[(a.id, 1), (b.id, 2)])
+                .await
+                .expect("reconcile to the partial list A, B");
+            let after_partial = service.get_virtual_members(virt.id).await.expect("list");
+            assert_eq!(
+                ids(&after_partial),
+                vec![a.id, b.id],
+                "PUT with only [A, B] leaves exactly A and B: C, omitted from the \
+                 request, is REMOVED (full-set replace, #2795/#2899)"
+            );
+            assert!(
+                !ids(&after_partial).contains(&c.id),
+                "C is gone, not merely reordered behind A and B"
             );
 
             // Edit: replace the whole set with C only (removes A and B).

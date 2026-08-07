@@ -133,7 +133,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 state: 'open',
-                labels: 'security',
+                labels: 'type:security',
                 per_page: 100
               });
 
@@ -157,7 +157,7 @@ jobs:
                     '',
                     'SARIF reports have been uploaded to the Security tab and as workflow artifacts.',
                   ].join('\n'),
-                  labels: ['security']
+                  labels: ['type:security']
                 });
               }
             }

@@ -714,16 +714,19 @@ impl CiOidcService {
             "{}/.well-known/openid-configuration",
             issuer_url.trim_end_matches('/')
         );
-        let discovery: serde_json::Value = self
+        let response = self
             .http
             .get(&url)
             .timeout(OIDC_HTTP_TIMEOUT)
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("CI OIDC discovery fetch failed: {e}")))?
-            .json()
-            .await
-            .map_err(|e| AppError::Internal(format!("CI OIDC discovery parse failed: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("CI OIDC discovery fetch failed: {e}")))?;
+        let discovery: serde_json::Value = crate::services::http_client::read_json_capped(
+            response,
+            crate::services::http_client::MAX_OIDC_RESPONSE_BYTES,
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("CI OIDC discovery parse failed: {e}")))?;
         Ok(discovery)
     }
 
@@ -737,16 +740,19 @@ impl CiOidcService {
             }
         }
 
-        let jwks: serde_json::Value = self
+        let response = self
             .http
             .get(jwks_uri)
             .timeout(OIDC_HTTP_TIMEOUT)
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("CI JWKS fetch failed: {e}")))?
-            .json()
-            .await
-            .map_err(|e| AppError::Internal(format!("CI JWKS parse failed: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("CI JWKS fetch failed: {e}")))?;
+        let jwks: serde_json::Value = crate::services::http_client::read_json_capped(
+            response,
+            crate::services::http_client::MAX_OIDC_RESPONSE_BYTES,
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("CI JWKS parse failed: {e}")))?;
 
         let mut cache = jwks_cache().write().await;
         cache.insert(

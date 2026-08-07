@@ -353,7 +353,7 @@ async fn resolve_virtual_manifest_rejects_digest_ref_mismatch_and_falls_through(
     let res = resolve_virtual_manifest(&state, virt_id, "myimage", &digest, None).await;
 
     match res {
-        Some((returned_digest, _ct, body)) => {
+        Some((returned_digest, _ct, body, _member)) => {
             assert_eq!(
                 returned_digest, digest,
                 "returned digest must equal requested digest"

@@ -26,6 +26,21 @@
 # by backend/src/migration_repair.rs::repair_release_1_5_x_divergence) are
 # pinned by SHA-384 in the allowlist so the build is green today and fails
 # ONLY on new, unhandled reuse.
+#
+# Exit-code contract (#2902 / #2984):
+#   0  clean          — no unhandled divergence.
+#   1  DIVERGENCE     — a genuine, unhandled migration-ledger divergence.
+#                       This is the condition the gate exists for; NEVER
+#                       retry it away.
+#   2  INFRA          — git/network/config failure (ls-remote, fetch, or
+#                       branch reads still failing after bounded retries,
+#                       malformed allowlist). Retryable; NOT a divergence.
+# Transient git failures — including the shallow-clone race
+# `fatal: shallow file has changed since we read it` (#2902) — are retried
+# with backoff (LEDGER_RETRY_ATTEMPTS, default 3; delays 5s, 15s; override
+# LEDGER_RETRY_BASE_DELAY for tests) before an INFRA exit. A hard INFRA fail
+# after exhausted retries is deliberate: a soft-pass would let a real
+# divergence through whenever origin is unreachable.
 
 set -euo pipefail
 
@@ -42,10 +57,18 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 root, migrations_dir, allowlist_path, branches_override = sys.argv[1:5]
 
 VER = re.compile(r"^(\d+)_.*\.sql$")
+
+# Exit-code contract (see header): 1 = genuine divergence, 2 = infra/config.
+EXIT_DIVERGENCE = 1
+EXIT_INFRA = 2
+
+RETRY_ATTEMPTS = max(1, int(os.environ.get("LEDGER_RETRY_ATTEMPTS", "3")))
+RETRY_BASE_DELAY = float(os.environ.get("LEDGER_RETRY_BASE_DELAY", "5"))
 
 
 def git(*args, capture_bytes=False):
@@ -58,18 +81,66 @@ def git(*args, capture_bytes=False):
     ).stdout
 
 
+def git_retry(*args, capture_bytes=False):
+    """Run a git command, retrying transient failures with backoff (#2902).
+
+    Covers the shallow-clone race (`fatal: shallow file has changed since we
+    read it`) and network blips on ls-remote/fetch/branch reads. Any failure
+    of these commands is either transient or persistent infrastructure — a
+    genuine ledger divergence can never surface here — so retrying every
+    CalledProcessError is safe. Re-raises the last error after
+    RETRY_ATTEMPTS tries.
+    """
+    last = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return git(*args, capture_bytes=capture_bytes)
+        except subprocess.CalledProcessError as exc:
+            last = exc
+            stderr = exc.stderr
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", "replace")
+            if attempt < RETRY_ATTEMPTS:
+                delay = RETRY_BASE_DELAY * (3 ** (attempt - 1))
+                sys.stderr.write(
+                    f"warn: git {args[0]} failed "
+                    f"(attempt {attempt}/{RETRY_ATTEMPTS}), "
+                    f"retrying in {delay:g}s:\n{stderr}\n"
+                )
+                time.sleep(delay)
+    raise last
+
+
+def infra_fail(message, exc=None):
+    """Report an infrastructure/transient failure and exit EXIT_INFRA (#2984).
+
+    Distinct from EXIT_DIVERGENCE so callers can tell "retry me" from "you
+    have a real migration problem"."""
+    detail = ""
+    if exc is not None:
+        stderr = getattr(exc, "stderr", "") or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        detail = f":\n{stderr}"
+    sys.stderr.write(
+        f"INFRA: {message} after {RETRY_ATTEMPTS} attempt(s){detail}\n"
+        "INFRA: this is a git/network failure, NOT a migration-ledger "
+        "divergence — re-running the job should clear it.\n"
+    )
+    sys.exit(EXIT_INFRA)
+
+
 def discover_release_branches():
     if branches_override.strip():
         return branches_override.split()
     try:
-        out = git("ls-remote", "--heads", "origin", "release/*")
+        out = git_retry("ls-remote", "--heads", "origin", "release/*")
     except subprocess.CalledProcessError as exc:
-        sys.stderr.write(
-            "ERROR: could not enumerate release branches via "
-            "`git ls-remote --heads origin 'release/*'`:\n"
-            f"{exc.stderr}\n"
+        infra_fail(
+            "could not enumerate release branches via "
+            "`git ls-remote --heads origin 'release/*'`",
+            exc,
         )
-        sys.exit(2)
     branches = []
     for line in out.splitlines():
         line = line.strip()
@@ -83,10 +154,15 @@ def discover_release_branches():
 
 def ensure_fetched(branch):
     """Shallow-fetch a release branch so its tree is readable on a shallow
-    CI checkout. Idempotent; tolerates already-present refs when offline."""
+    CI checkout. Idempotent; tolerates already-present refs when offline.
+
+    Retried (#2902): this fetch is where the transient
+    `fatal: shallow file has changed since we read it` race lands on the
+    depth-1 CI checkout. Re-fetching at depth 1 keeps the checkout shallow;
+    `--unshallow` would pull full history on every PR run for no benefit."""
     remote_ref = f"refs/remotes/origin/{branch}"
     try:
-        git(
+        git_retry(
             "fetch",
             "--depth=1",
             "origin",
@@ -94,14 +170,12 @@ def ensure_fetched(branch):
         )
     except subprocess.CalledProcessError as exc:
         # If the ref is already present (e.g. offline test run) keep going;
-        # otherwise the read below will surface a clear error.
+        # otherwise fail with the INFRA code — this is a fetch problem, not
+        # a ledger divergence.
         try:
             git("rev-parse", "--verify", "--quiet", remote_ref)
         except subprocess.CalledProcessError:
-            sys.stderr.write(
-                f"ERROR: could not fetch release branch {branch}:\n{exc.stderr}\n"
-            )
-            sys.exit(2)
+            infra_fail(f"could not fetch release branch {branch}", exc)
 
 
 def ledger_from_tree():
@@ -118,23 +192,27 @@ def ledger_from_tree():
 
 
 def ledger_from_branch(branch):
-    """version -> (filename, sha384) for a release branch's migrations dir."""
+    """version -> (filename, sha384) for a release branch's migrations dir.
+
+    Reads are retried and a persistent failure exits EXIT_INFRA (#2984):
+    previously an uncaught CalledProcessError here terminated the
+    interpreter with exit 1, indistinguishable from a genuine divergence."""
     ref = f"origin/{branch}"
     rel = os.path.relpath(migrations_dir, root)
     out = {}
-    names = git("ls-tree", "-r", "--name-only", ref, "--", rel).splitlines()
-    for path in names:
-        name = path.split("/")[-1]
-        m = VER.match(name)
-        if not m:
-            continue
-        blob = subprocess.run(
-            ["git", "-C", root, "show", f"{ref}:{path}"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        ).stdout
-        out[int(m.group(1))] = (name, hashlib.sha384(blob).hexdigest())
+    try:
+        names = git_retry(
+            "ls-tree", "-r", "--name-only", ref, "--", rel
+        ).splitlines()
+        for path in names:
+            name = path.split("/")[-1]
+            m = VER.match(name)
+            if not m:
+                continue
+            blob = git_retry("show", f"{ref}:{path}", capture_bytes=True)
+            out[int(m.group(1))] = (name, hashlib.sha384(blob).hexdigest())
+    except subprocess.CalledProcessError as exc:
+        infra_fail(f"could not read migrations from release branch {branch}", exc)
     return out
 
 
@@ -151,10 +229,10 @@ def load_allowlist():
             fields = line.split()
             if len(fields) != 6:
                 sys.stderr.write(
-                    f"ERROR: malformed allowlist line {allowlist_path}:{lineno} "
+                    f"INFRA: malformed allowlist line {allowlist_path}:{lineno} "
                     f"(expected 6 fields, got {len(fields)}): {line}\n"
                 )
-                sys.exit(2)
+                sys.exit(EXIT_INFRA)
             branch, version, main_name, main_sha, rel_name, rel_sha = fields
             allow[(branch, int(version))] = (main_name, main_sha, rel_name, rel_sha)
     return allow
@@ -209,7 +287,7 @@ def main():
 
     if violations:
         sys.stderr.write(
-            "\nERROR: migration-ledger divergence detected (issue #2689).\n"
+            "\nDIVERGENCE: migration-ledger divergence detected (issue #2689).\n"
             "The same migration version number carries DIFFERENT content on\n"
             "`main` and a release branch. A database upgraded across this fork\n"
             "will hit `sqlx migrate run` VersionMismatch and fail to start.\n\n"
@@ -227,10 +305,15 @@ def main():
             f"({os.path.relpath(allowlist_path, root)}), or renumber the\n"
             "migration so the version numbers no longer collide.\n"
         )
-        sys.exit(1)
+        sys.exit(EXIT_DIVERGENCE)
 
     print("OK: no unhandled migration-ledger divergences.")
 
 
-main()
+try:
+    main()
+except subprocess.CalledProcessError as exc:
+    # Safety net (#2984): no git failure may escape as an uncaught traceback,
+    # whose interpreter exit code (1) would collide with EXIT_DIVERGENCE.
+    infra_fail(f"unexpected git failure ({exc.cmd})", exc)
 PY

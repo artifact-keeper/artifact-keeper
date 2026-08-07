@@ -1454,3 +1454,44 @@ git commit -m "chore: update SQLx offline cache for curation queries"
 | 7 | Background sync job: scheduler integration | Compiles |
 | 8 | E2E tests: mock repos, Docker Compose, yum/apt client tests | 22 E2E scenarios |
 | 9 | SQLx offline cache, full CI verification | Full suite passes |
+
+---
+
+## RPM Phase-3: curated snapshot publish + signed immutable `@N` serving (#2358)
+
+Phase-3 freezes the *approved* subset of a curation repo's synced packages into a
+monotonic `repository_version` and publishes it as **AK-signed, immutable**
+repodata served under `/rpm/{key}/@N/`.
+
+- **`POST /api/v1/curation/repos/{key}/versions`** snapshots
+  `curation_packages WHERE status = 'approved'` into version `N = MAX + 1`
+  (allocated in one serializable transaction, so `N` is monotonic under
+  concurrency). It fails closed (400) on an empty approved set and on any
+  approved package missing its retained upstream `primary_xml_snippet` (rows
+  synced before snippet retention must be re-synced first — a package is never
+  emitted without its snippet).
+- **`POST .../versions/{n}/publish`** re-emits an upstream-faithful `primary.xml`
+  from the retained member snippets, generates pkgid-consistent stub
+  `filelists.xml`/`other.xml`, builds and **signs** a `repomd.xml`, and stores
+  every blob (including the detached signature and the public key **as they are
+  at publish time**) under `curation/{repo_id}/publications/{N}/repodata/…`. It
+  then sets `repositories.active_publication_id`.
+- Both endpoints reuse the sync trigger's DUAL gate verbatim: the global
+  capability (admin OR an API token with `trigger:sync`) AND, independently of
+  the admin flag, the tenant-ownership gate — never the weaker
+  `require_repo_access`.
+
+### Trust model (C2)
+
+- The metadata served under `/rpm/{key}/@N/` is **immutable and AK-signed**: the
+  stored `repomd.xml` is frozen and its detached `repomd.xml.asc` /
+  `repomd.xml.key` are stored alongside it, so a later signing-key **rotation
+  never retroactively invalidates a published `@N`** (the serving path returns
+  the *stored* signature and key, not the repo's current key).
+- `repo_gpgcheck` covers this **metadata** chain: dnf validates `repomd.xml`
+  against `@N/repodata/repomd.xml.key`, and every payload (`primary`/`filelists`/
+  `other`) is pinned by the signed `repomd`'s `<checksum>`.
+- Package **BYTES are best-effort until Phase-4**: `@N` serves only the frozen
+  metadata blobs from storage; a package `href` under `@N` falls through to the
+  repo's normal (proxy/cache) package path rather than a frozen, content-addressed
+  copy. Package-level `gpgcheck` is therefore out of scope for P3.

@@ -162,21 +162,21 @@ fn parse_path(raw_path: &str) -> Result<GoProxyRequest, Response> {
     if let Some(version) = operation.strip_suffix(".info") {
         return Ok(GoProxyRequest::Info {
             module,
-            version: version.to_string(),
+            version: decode_module_path(version),
         });
     }
 
     if let Some(version) = operation.strip_suffix(".mod") {
         return Ok(GoProxyRequest::Mod {
             module,
-            version: version.to_string(),
+            version: decode_module_path(version),
         });
     }
 
     if let Some(version) = operation.strip_suffix(".zip") {
         return Ok(GoProxyRequest::Zip {
             module,
-            version: version.to_string(),
+            version: decode_module_path(version),
         });
     }
 
@@ -422,6 +422,232 @@ async fn try_proxy_go_metadata(
     Err(())
 }
 
+/// Parse a goproxy `@v/list` document into its version lines.
+fn parse_version_list(body: &str) -> Vec<String> {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Rebuild a goproxy `@v/list` document without the blocked versions,
+/// preserving the order of the surviving lines.
+fn filter_version_list(body: &str, blocked: &std::collections::HashSet<String>) -> String {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !blocked.contains(*line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Fetch a Go metadata document from the repository's upstream — or, for a
+/// virtual repository, from its remote members in priority order — returning
+/// the id of the repository that actually served it alongside the body. The
+/// source id is what the age-gate listing filter resolves policy from: for a
+/// virtual repository each member's own gate configuration governs its
+/// contribution (#2264).
+async fn fetch_go_metadata_with_source(
+    state: &SharedState,
+    repo: &RepoInfo,
+    upstream_path: &str,
+) -> Option<(uuid::Uuid, Bytes)> {
+    let proxy = state.proxy_service.as_ref()?;
+    if repo.repo_type == RepositoryType::Remote {
+        let upstream_url = repo.upstream_url.as_deref()?;
+        let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            upstream_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await
+        .ok()?;
+        return Some((repo.id, content));
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
+            .await
+            .ok()?;
+        for member in members {
+            if member.repo_type != crate::models::repository::RepositoryType::Remote {
+                continue;
+            }
+            let Some(upstream_url) = member.upstream_url.as_deref() else {
+                continue;
+            };
+            if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await
+            {
+                return Some((member.id, content));
+            }
+        }
+    }
+    None
+}
+
+/// Filter a `@v/list` document through the serving repository's download age
+/// gate. Parsing and rebuilding are pure; the policy runs through the shared
+/// batch evaluation, so the version list and the `.zip` download gate decide
+/// from the same clock — a version withheld here is refused there, and vice
+/// versa. Ungated repositories pass through with no policy reads.
+async fn filter_go_version_list(
+    state: &SharedState,
+    repository_id: uuid::Uuid,
+    module: &str,
+    body: &str,
+) -> Result<String, Response> {
+    let Some(age_gate) = state.age_gate_service.as_ref() else {
+        return Ok(body.to_string());
+    };
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repository_id)
+        .await
+        .map_err(|e| e.into_response())?;
+    if !crate::services::age_gate_service::AgeGateService::gating_requested(&params) {
+        return Ok(body.to_string());
+    }
+    // `@v/list` lines carry no timestamps; under `first_seen` (the only mode
+    // Go supports) the basis is this server's own observation of each listed
+    // version — the upstream-served document is the existence evidence.
+    let versions: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = parse_version_list(body)
+        .into_iter()
+        .map(|version| (version, None))
+        .collect();
+    let blocked = age_gate
+        .evaluate_versions_batch(&params, module, &versions)
+        .await
+        .map_err(|e| e.into_response())?;
+    Ok(filter_version_list(body, &blocked))
+}
+
+/// Whether the age gate withholds `version` from `@latest`-shaped responses
+/// for the serving repository. A blocked latest surfaces as 404 to the `go`
+/// client, which then resolves from the filtered `@v/list` — so "latest"
+/// quietly becomes the newest version old enough to serve.
+async fn go_latest_version_is_blocked(
+    state: &SharedState,
+    repository_id: uuid::Uuid,
+    module: &str,
+    version: &str,
+    time: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<bool, Response> {
+    let Some(age_gate) = state.age_gate_service.as_ref() else {
+        return Ok(false);
+    };
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repository_id)
+        .await
+        .map_err(|e| e.into_response())?;
+    if !crate::services::age_gate_service::AgeGateService::gating_requested(&params) {
+        return Ok(false);
+    }
+    let blocked = age_gate
+        .evaluate_versions_batch(&params, module, &[(version.to_string(), time)])
+        .await
+        .map_err(|e| e.into_response())?;
+    Ok(blocked.contains(version))
+}
+
+/// Enforce the download age gate for one repository serving `module@version`
+/// as a `.zip` (#2264). Policy is re-resolved from the repositories row; the
+/// caller's struct only pre-screens. Under `first_seen` — the only mode Go
+/// supports — an existing observation is the basis; otherwise a successful
+/// upstream `.info` fetch is the existence evidence that starts the clock. A
+/// version with no basis blocks (451, review row created), so an unpublished
+/// name cannot be pre-aged by requesting it early.
+async fn enforce_go_zip_age_gate(
+    state: &SharedState,
+    repository_id: uuid::Uuid,
+    module: &str,
+    version: &str,
+) -> Result<(), Response> {
+    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+
+    let params = resolve_repo_params(&state.db, repository_id)
+        .await
+        .map_err(|e| e.into_response())?;
+    if !AgeGateService::gating_requested(&params) {
+        return Ok(());
+    }
+    AgeGateService::require_enforceable(&params).map_err(|e| e.into_response())?;
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &params.key,
+            module,
+        ));
+    };
+    // Lookup-only pass first: the common case (version already observed via a
+    // listing) needs no upstream round-trip.
+    let mut basis = svc
+        .download_basis(&params, module, version, None, false)
+        .await
+        .map_err(|e| e.into_response())?;
+    if basis.is_none() {
+        let exists = go_version_exists_upstream(state, &params, module, version).await;
+        if exists {
+            basis = svc
+                .download_basis(&params, module, version, None, true)
+                .await
+                .map_err(|e| e.into_response())?;
+        }
+    }
+    // Go has no last-known-good substitution: a block is the terminal 451.
+    let lkg_opt = proxy_helpers::enforce_age_gate(
+        state.age_gate_service.as_deref(),
+        &params,
+        module,
+        version,
+        basis,
+    )
+    .await?;
+    if let Some(blocked) = lkg_opt {
+        return Err(proxy_helpers::age_gate_blocked_response(
+            blocked.review_id,
+            module,
+            version,
+            params.age_gate_min_age_days,
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Positive existence evidence for `module@version`: the upstream serves its
+/// `.info` document. Failures are treated as "no evidence" — the gate then
+/// blocks without starting a clock, never the reverse.
+async fn go_version_exists_upstream(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    module: &str,
+    version: &str,
+) -> bool {
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return false;
+    };
+    let Some(upstream_url) = params.upstream_url.as_deref() else {
+        return false;
+    };
+    let upstream_path = build_go_upstream_path(module, version, "info");
+    proxy_helpers::proxy_fetch_capped(
+        proxy,
+        params.id,
+        &params.key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    .is_ok()
+}
+
 async fn list_versions(
     state: &SharedState,
     repo: &RepoInfo,
@@ -445,27 +671,33 @@ async fn list_versions(
     .map_err(crate::api::handlers::db_err)?;
 
     let body = build_version_list(&versions);
+    // A remote repository can hold hydrated `artifacts` rows; its local list
+    // is filtered against the same policy as the proxied one (ungated repos
+    // pass straight through).
+    let body = filter_go_version_list(state, repo.id, module, &body).await?;
 
     if body.is_empty() {
         // Virtual repo: the version list also lives in the artifact tables of
         // local (non-Remote) member repos, which `try_proxy_go_metadata` does
-        // not consult. Aggregate distinct versions across all members first so
+        // not consult. Aggregate distinct versions across those members so
         // a module stored only in a Local member is listed (#1782).
         if repo.repo_type == RepositoryType::Virtual {
-            let member_versions: Vec<Option<String>> = sqlx::query_scalar!(
+            let member_versions: Vec<Option<String>> = sqlx::query_scalar(
                 r#"
                 SELECT DISTINCT a.version
                 FROM artifacts a
                 INNER JOIN virtual_repo_members vrm ON a.repository_id = vrm.member_repo_id
+                INNER JOIN repositories member ON member.id = vrm.member_repo_id
                 WHERE vrm.virtual_repo_id = $1
+                  AND member.repo_type != 'remote'::repository_type
                   AND a.name = $2
                   AND a.is_deleted = false
                   AND a.version IS NOT NULL
                 ORDER BY a.version
                 "#,
-                repo.id,
-                module
             )
+            .bind(repo.id)
+            .bind(module)
             .fetch_all(&state.db)
             .await
             .map_err(crate::api::handlers::db_err)?;
@@ -482,10 +714,17 @@ async fn list_versions(
         }
 
         let upstream_path = build_go_upstream_list_path(module);
-        if let Ok(resp) =
-            try_proxy_go_metadata(state, repo, &upstream_path, "text/plain; charset=utf-8").await
+        if let Some((source_repo_id, content)) =
+            fetch_go_metadata_with_source(state, repo, &upstream_path).await
         {
-            return Ok(resp);
+            let upstream_body = String::from_utf8_lossy(&content).into_owned();
+            let filtered =
+                filter_go_version_list(state, source_repo_id, module, &upstream_body).await?;
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Body::from(filtered))
+                .unwrap());
         }
 
         return Err((StatusCode::NOT_FOUND, "module not found").into_response());
@@ -736,6 +975,14 @@ async fn download_zip(
     version: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // Age gate (#2264): the `.zip` is the gated artifact. The struct only
+    // pre-screens (ungated repositories skip the policy read); the gate
+    // itself re-resolves policy from the repositories row. Virtual members
+    // are gated per member below, each under its own configuration.
+    if repo.age_gate_enabled {
+        enforce_go_zip_age_gate(state, repo.id, module, version).await?;
+    }
+
     let artifact = sqlx::query!(
         r#"
         SELECT id, storage_key, size_bytes, checksum_sha256
@@ -786,16 +1033,36 @@ async fn download_zip(
                 }
             }
 
-            // Virtual repo: try each member in priority order
+            // Virtual repo: try each member in priority order. Gated remote
+            // members that withhold this version are excluded up front —
+            // another (ungated, or aged-past-threshold) member may still
+            // serve it. If a gated member blocked and nobody else served,
+            // the structured 451 is the answer, not a bare 404.
             if repo.repo_type == RepositoryType::Virtual {
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let mut allowed = Vec::with_capacity(members.len());
+                let mut blocked_response = None;
+                for member in members {
+                    if member.repo_type == crate::models::repository::RepositoryType::Remote
+                        && member.age_gate_enabled
+                    {
+                        if let Err(resp) =
+                            enforce_go_zip_age_gate(state, member.id, module, version).await
+                        {
+                            blocked_response = Some(resp);
+                            continue;
+                        }
+                    }
+                    allowed.push(member);
+                }
+
                 let db = state.db.clone();
                 let upstream_path = build_go_upstream_path(module, version, "zip");
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
-                let result = proxy_helpers::resolve_virtual_download(
-                    &state.db,
+                let result = proxy_helpers::resolve_virtual_download_from_members(
+                    allowed,
                     state.proxy_service.as_deref(),
-                    repo.id,
                     &upstream_path,
                     |member_id, location| {
                         let db = db.clone();
@@ -810,9 +1077,14 @@ async fn download_zip(
                         }
                     },
                 )
-                .await?;
+                .await;
 
-                return proxy_helpers::stream_fetch_result(result, "application/zip", None);
+                return match result {
+                    Ok(fetched) => {
+                        proxy_helpers::stream_fetch_result(fetched, "application/zip", None)
+                    }
+                    Err(err) => Err(blocked_response.unwrap_or(err)),
+                };
             }
 
             return Err(not_found);
@@ -891,10 +1163,41 @@ async fn latest_version(
         Ok(a) => a,
         Err(not_found) => {
             let upstream_path = build_go_upstream_latest_path(module);
-            if let Ok(resp) =
-                try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
+            if let Some((source_repo_id, content)) =
+                fetch_go_metadata_with_source(state, repo, &upstream_path).await
             {
-                return Ok(resp);
+                // Gate the advertised version: a blocked (or unparseable)
+                // "latest" is withheld as 404 so the client re-resolves from
+                // the filtered version list instead of learning about — and
+                // then failing on — a version this repository will not serve.
+                let json: Option<serde_json::Value> = serde_json::from_slice(&content).ok();
+                let version = json
+                    .as_ref()
+                    .and_then(|j| j.get("Version"))
+                    .and_then(|v| v.as_str());
+                let Some(version) = version else {
+                    return Err(
+                        (StatusCode::NOT_FOUND, "no latest version available").into_response()
+                    );
+                };
+                let time = json
+                    .as_ref()
+                    .and_then(|j| j.get("Time"))
+                    .and_then(|t| t.as_str())
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc));
+                if go_latest_version_is_blocked(state, source_repo_id, module, version, time)
+                    .await?
+                {
+                    return Err(
+                        (StatusCode::NOT_FOUND, "no latest version available").into_response()
+                    );
+                }
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(content))
+                    .unwrap());
             }
             return Err(not_found);
         }
@@ -902,6 +1205,12 @@ async fn latest_version(
 
     let version = artifact.version.unwrap_or_default();
     let time_str = format_go_timestamp(&artifact.created_at);
+
+    // Same policy for the local-rows arm: a remote repository's hydrated
+    // artifact must not advertise a version its download gate withholds.
+    if go_latest_version_is_blocked(state, repo.id, module, &version, None).await? {
+        return Err((StatusCode::NOT_FOUND, "no latest version available").into_response());
+    }
 
     let info = build_version_info_json(&version, &time_str);
 
@@ -1223,8 +1532,9 @@ fn build_go_zip_content_disposition(module: &str, version: &str) -> String {
 
 /// Build the upstream path for a Go module request (used by remote/virtual repos).
 fn build_go_upstream_path(module: &str, version: &str, ext: &str) -> String {
-    let encoded = encode_module_path(module);
-    format!("{}/@v/{}.{}", encoded, version, ext)
+    let encoded_module = encode_module_path(module);
+    let encoded_version = encode_module_path(version);
+    format!("{}/@v/{}.{}", encoded_module, encoded_version, ext)
 }
 
 /// Build the upstream path for a Go module version-list request.
@@ -1242,6 +1552,196 @@ fn build_go_upstream_latest_path(module: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[test]
+    fn parse_version_list_trims_and_drops_blank_lines() {
+        assert_eq!(
+            parse_version_list("v1.0.0\n  v1.1.0 \n\nv2.0.0\n"),
+            vec!["v1.0.0", "v1.1.0", "v2.0.0"]
+        );
+        assert!(parse_version_list("").is_empty());
+    }
+
+    #[test]
+    fn filter_version_list_preserves_order_of_survivors() {
+        let blocked: std::collections::HashSet<String> =
+            ["v1.1.0".to_string()].into_iter().collect();
+        assert_eq!(
+            filter_version_list("v1.0.0\nv1.1.0\nv2.0.0", &blocked),
+            "v1.0.0\nv2.0.0"
+        );
+        assert_eq!(
+            filter_version_list("v1.1.0", &blocked),
+            "",
+            "a fully blocked list is empty, not absent"
+        );
+    }
+
+    /// End-to-end Go age-gate slice (#2264): a gated `first_seen` remote repo
+    /// filters young versions from `@v/list`, withholds a young `@latest` as
+    /// 404 (the client then resolves from the filtered list), and blocks the
+    /// `.zip` download with the structured 451 — then serves all three once
+    /// the observations age past the threshold. `.info` stays readable
+    /// throughout (version-addressed metadata, deliberately ungated).
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: buffering response bodies in test assertions is not an artifact path (#1608)
+    #[tokio::test]
+    async fn go_age_gate_filters_list_latest_and_blocks_zip_db() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let module = "example.com/gated";
+        Mock::given(method("GET"))
+            .and(path(format!("/{module}/@v/list")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("v1.0.0\nv1.1.0"))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{module}/@latest")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Version": "v1.1.0",
+                "Time": "2020-01-01T00:00:00Z",
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{module}/@v/v1.1.0.zip")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"zip-bytes".to_vec()))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{module}/@v/v1.1.0.info")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Version": "v1.1.0",
+                "Time": "2020-01-01T00:00:00Z",
+            })))
+            .mount(&upstream)
+            .await;
+
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = 30, age_gate_mode = 'first_seen' WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure gated go repo");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo = fx.repo_info("remote", Some(&upstream.uri()));
+        // The struct pre-screens; the gate re-resolves policy from the row
+        // updated above, so both must agree the gate is on.
+        repo.format = "go".to_string();
+        repo.age_gate_enabled = true;
+        repo.age_gate_min_age_days = 30;
+        repo.age_gate_mode = "first_seen".to_string();
+
+        async fn body_string(response: Response) -> String {
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        // First sight: the upstream-served list is the existence evidence,
+        // both versions are observed and withheld.
+        let listed = list_versions(&state, &repo, module)
+            .await
+            .expect("list must succeed");
+        assert_eq!(body_string(listed).await, "", "young versions are withheld");
+        let observations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM age_gate_version_observations WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count observations");
+        assert_eq!(observations, 2, "listing observes every advertised version");
+
+        // Young @latest is withheld as 404 (client falls back to the list).
+        let err = latest_version(&state, &repo, module)
+            .await
+            .expect_err("young latest must be withheld");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+        // Seed an older cached version so the shared seam returns an LKG
+        // outcome. Go deliberately does not substitute it, but its terminal
+        // 451 must still carry the real review id from that outcome.
+        let lkg_id = tdh::seed_artifact(
+            &state,
+            &fx.pool,
+            &repo,
+            &format!("go/{module}/v0.9.0.zip"),
+            &format!("{module}/v0.9.0/v0.9.0.zip"),
+            module,
+            "v0.9.0",
+            "application/zip",
+            bytes::Bytes::from_static(b"PK\x03\x04 old-lkg"),
+            fx.user_id,
+        )
+        .await;
+
+        // The requested artifact itself blocks with the structured 451.
+        let ctx = Default::default();
+        let err = download_zip(&state, &repo, module, "v1.1.0", &ctx)
+            .await
+            .expect_err("young zip must block");
+        assert_eq!(err.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        let blocked: serde_json::Value =
+            serde_json::from_str(&body_string(err).await).expect("451 JSON body");
+        let review_id = blocked["review_id"]
+            .as_str()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .expect("real review id");
+        assert_ne!(review_id, uuid::Uuid::nil());
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(lkg_id)
+            .execute(&fx.pool)
+            .await
+            .expect("remove temporary LKG fixture");
+
+        // Version-addressed metadata stays readable while the zip is gated.
+        let info = version_info(&state, &repo, module, "v1.1.0")
+            .await
+            .expect(".info is metadata and passes");
+        assert_eq!(info.status(), StatusCode::OK);
+
+        // Age the observations: list, latest, and zip all serve.
+        sqlx::query(
+            "UPDATE age_gate_version_observations SET first_seen_at = NOW() - INTERVAL '90 days' \
+             WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("backdate observations");
+
+        let listed = list_versions(&state, &repo, module)
+            .await
+            .expect("aged list must succeed");
+        assert_eq!(body_string(listed).await, "v1.0.0\nv1.1.0");
+        let latest = latest_version(&state, &repo, module)
+            .await
+            .expect("aged latest must serve");
+        let latest_body = body_string(latest).await;
+        assert!(latest_body.contains("v1.1.0"), "got {latest_body}");
+        let zip = download_zip(&state, &repo, module, "v1.1.0", &ctx)
+            .await
+            .expect("aged zip must serve");
+        assert_eq!(zip.status(), StatusCode::OK);
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+    }
 
     #[test]
     fn test_decode_module_path() {
@@ -1742,6 +2242,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_build_go_upstream_path_encodes_version() {
+        assert_eq!(
+            build_go_upstream_path("github.com/Azure/go-sdk", "v2.0.0-RC1", "info"),
+            "github.com/!azure/go-sdk/@v/v2.0.0-!r!c1.info"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // encode_module_path round-trip
     // -----------------------------------------------------------------------
@@ -1925,6 +2433,56 @@ mod tests {
         .await
         .expect("insert virtual member");
 
+        // A hydrated Remote member must not leak its cached rows through the
+        // virtual repo's Local-member aggregation. Its versions are evaluated
+        // only through the source-aware upstream path, under that member's
+        // own gate.
+        let remote_id = Uuid::new_v4();
+        let remote_key = format!("r-go-gated-{}", remote_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories
+             (id, key, name, storage_path, repo_type, format, upstream_url,
+              age_gate_enabled, age_gate_min_age_days, age_gate_mode)
+             VALUES ($1, $2, $2, $3, 'remote'::repository_type,
+                     'go'::repository_format, 'https://proxy.golang.org',
+                     true, 30, 'first_seen')",
+        )
+        .bind(remote_id)
+        .bind(&remote_key)
+        .bind(fx.storage_dir.to_string_lossy().as_ref())
+        .execute(&fx.pool)
+        .await
+        .expect("insert gated remote member");
+        let remote = tdh::make_repo_info(
+            remote_id,
+            &remote_key,
+            &fx.storage_dir,
+            "remote",
+            Some("https://proxy.golang.org"),
+        );
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &remote,
+            &format!("go/{module}/v9.9.9.zip"),
+            &format!("{module}/v9.9.9/v9.9.9.zip"),
+            module,
+            "v9.9.9",
+            "application/zip",
+            Bytes::from_static(b"PK\x03\x04 young-remote-version"),
+            fx.user_id,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 2)",
+        )
+        .bind(virtual_id)
+        .bind(remote_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert gated remote virtual member");
+
         let send = |uri: String| {
             let router = fx.router_with_auth(super::router());
             async move {
@@ -1956,6 +2514,10 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(virtual_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
             .execute(&fx.pool)
             .await;
         fx.teardown().await;
