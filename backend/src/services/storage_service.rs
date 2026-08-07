@@ -255,7 +255,36 @@ impl StorageBackend for FilesystemBackend {
             fs::create_dir_all(parent).await?;
         }
 
-        fs::copy(&source_path, &dest_path).await?;
+        // Copy to a temp file then rename, same as `put` above — a bare
+        // fs::copy truncates dest in place, so a reader mid-copy could see a
+        // torn file.
+        let temp_path = self.temp_write_path(&dest_path)?;
+        if let Err(e) = fs::copy(&source_path, &temp_path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", source))
+            } else {
+                AppError::Storage(e.to_string())
+            });
+        }
+        let file = match fs::File::open(&temp_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(AppError::Storage(e.to_string()));
+            }
+        };
+        if let Err(e) = file.sync_all().await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(e.to_string()));
+        }
+        drop(file);
+
+        if let Err(e) = fs::rename(&temp_path, &dest_path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(e.to_string()));
+        }
+
         Ok(())
     }
 

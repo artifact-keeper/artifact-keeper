@@ -311,6 +311,15 @@ const TEE_CHANNEL_DEPTH: usize = 64;
 /// docstring above. Smaller upstream chunks pass through unchanged.
 const TEE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Suffix `CachePersister::tee_stream` appends to a content key to derive
+/// its private staging key. Shared with `ProxyService::check_cache_key_length`
+/// so the two can't drift apart.
+const TEE_STAGING_KEY_SUFFIX: &str = ".tee-staging.";
+
+/// Byte length of a hyphenated UUID v4 string (`Uuid::new_v4().to_string()`),
+/// e.g. "550e8400-e29b-41d4-a716-446655440000". Always exactly 36.
+const UUID_STRING_LEN: usize = 36;
+
 /// Default TTL for APT InRelease/Release index files (5 minutes).
 /// Controls how often the proxy re-checks upstream for changes.
 pub const DEFAULT_DISTS_INDEX_TTL_SECS: i64 = 300;
@@ -948,6 +957,20 @@ async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<S
     })
 }
 
+/// Best-effort cleanup of a `CachePersister::tee_stream` staging object. A
+/// failure here only leaks a staging object — the live cache key is never
+/// touched by this call. `warn`, not `debug`: nothing else sweeps leaked
+/// staging keys, so this is the only signal one is accumulating.
+async fn discard_staging(storage: &StorageService, staging_key: &str) {
+    if let Err(e) = storage.delete(staging_key).await {
+        tracing::warn!(
+            staging_key = %staging_key,
+            error = %e,
+            "best-effort delete of proxy-cache staging object failed"
+        );
+    }
+}
+
 /// Storage keys for a single proxy-cache entry: the artifact body and its
 /// `__cache_meta__.json` sidecar.
 ///
@@ -1502,6 +1525,16 @@ impl CachePersister {
     ///   metric buckets honest: a flaky mirror does not inflate the
     ///   `STORAGE_ERROR` rate, and a genuine cache backend failure does
     ///   not get hidden as `BAD_GATEWAY`.
+    ///
+    /// Publishes via a staging key: the body is written to a private
+    /// per-write key, never to `cache_key` directly, and only
+    /// [`StorageBackend::copy`]'d onto `cache_key` once classified
+    /// [`StreamWriteOutcome::Commit`]. A rejected write never touches the
+    /// live key at all, so it can't leave a corrupt object at that key
+    /// regardless of whether the subsequent cleanup succeeds — closing the
+    /// scenario the sidecar-bypassing read paths described on the reject
+    /// arm below actually depend on (there is nothing bad ever sitting at
+    /// `cache_key` for them to serve).
     fn tee_stream(
         &self,
         upstream: BoxStream<'static, Result<Bytes>>,
@@ -1523,10 +1556,16 @@ impl CachePersister {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(TEE_CHANNEL_DEPTH);
 
         // Spawn the storage writer. It consumes the channel as a stream
-        // and calls put_stream. On completion, writes the metadata sidecar
-        // with the observed SHA-256 + byte count.
+        // and calls put_stream against a private staging key, never
+        // `cache_key` directly (see the `copy` call below). On completion,
+        // writes the metadata sidecar with the observed SHA-256 + byte count.
         let storage_clone = storage.clone();
         let cache_key_for_writer = cache_key.clone();
+        // Unique per write so concurrent writers for the same hot key never share one.
+        let staging_key = format!(
+            "{cache_key_for_writer}{TEE_STAGING_KEY_SUFFIX}{}",
+            Uuid::new_v4()
+        );
         tokio::spawn(async move {
             // Adapter: receiver -> futures::Stream<Result<Bytes>>.
             let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -1534,7 +1573,7 @@ impl CachePersister {
             });
 
             let put_result = storage_clone
-                .put_stream(&cache_key_for_writer, Box::pin(rx_stream))
+                .put_stream(&staging_key, Box::pin(rx_stream))
                 .await;
 
             match put_result {
@@ -1549,26 +1588,9 @@ impl CachePersister {
                         // the digest — but the proxy cache must never be poisoned
                         // with mismatched content addressed by that digest. Treat
                         // a mismatch exactly like the truncated/empty reject path:
-                        // delete the object and skip the metadata sidecar so the
-                        // next request refetches upstream (self-heal).
-                        //
-                        // The delete is load-bearing, NOT belt-and-braces: the
-                        // missing sidecar is not sufficient on its own, because
-                        // several read paths reach the content key without
-                        // consulting it. `handle_streaming_leader_upstream_error`
-                        // serves `get_stream(cache_key)` as an RFC 5861
-                        // stale-if-error response and only loads the sidecar
-                        // afterwards, best-effort, for headers; `is_fresh`
-                        // degrades to a bare `exists()` when either ETag is
-                        // multipart-shaped (#2120) or when a legacy sidecar has
-                        // no pinned ETag; and the presigned-redirect paths sign a
-                        // 302 straight to the object with no checksum check at
-                        // all. Leaving rejected bytes in place therefore makes
-                        // them servable. Deleting is also what self-heals on a
-                        // versioned bucket: nothing in this codebase ever reads a
-                        // non-current version (there is no version_id support in
-                        // the storage layer), so a delete marker simply reads as
-                        // NotFound and forces the refetch.
+                        // discard the staging object and skip the sidecar so
+                        // the next request refetches (self-heal); `cache_key`
+                        // was never touched.
                         if let Some(expected) = template.expected_checksum.as_deref() {
                             if result.checksum_sha256 != expected {
                                 tracing::warn!(
@@ -1577,18 +1599,29 @@ impl CachePersister {
                                      not caching (no metadata sidecar) so the cache entry cannot \
                                      be poisoned"
                                 );
-                                if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
-                                    tracing::debug!(
-                                        cache_key = %cache_key_for_writer,
-                                        error = %e,
-                                        "best-effort delete of digest-mismatched proxy-cache \
-                                         object failed; the missing metadata sidecar still forces \
-                                         a refetch"
-                                    );
-                                }
+                                discard_staging(&storage_clone, &staging_key).await;
                                 return;
                             }
                         }
+                        // Publish: copy the validated staging object onto the
+                        // live key via the backend's native copy (atomic —
+                        // readers see the old or new version, never a partial
+                        // write). A copy failure degrades like a reject.
+                        if let Err(e) = storage_clone
+                            .copy(&staging_key, &cache_key_for_writer)
+                            .await
+                        {
+                            tracing::warn!(
+                                cache_key = %cache_key_for_writer,
+                                error = %e,
+                                "failed to publish staged proxy-cache object to the live key; \
+                                 not caching (no metadata sidecar) so the next request refetches \
+                                 upstream"
+                            );
+                            discard_staging(&storage_clone, &staging_key).await;
+                            return;
+                        }
+                        discard_staging(&storage_clone, &staging_key).await;
                         let now = Utc::now();
                         // #1618 S9 / #1051: pin the storage backend's ETag at
                         // write time so the fast path can re-HEAD on each hit
@@ -1682,31 +1715,14 @@ impl CachePersister {
                         // `Content-Length`) would serve a short, SHA-mismatched
                         // blob and clients hit "unexpected BufError" extracting
                         // the archive. Skip the sidecar (entry treated as a
-                        // miss) and delete the bad object so a later GET
-                        // refetches upstream (self-heal). The buffered sibling
-                        // [`Self::write_buffered`] applies the empty-body guard
-                        // before the content write, so it can return early and
-                        // never needs the delete.
-                        //
-                        // Both halves are required. Skipping the sidecar is not
-                        // sufficient on its own, because several readers reach
-                        // the content key without consulting it:
-                        // `handle_streaming_leader_upstream_error` streams
-                        // `get_stream(cache_key)` as an RFC 5861 stale-if-error
-                        // response (sidecar loaded afterwards, best-effort, only
-                        // for headers), the PyPI Remote arm streams
-                        // `artifacts.storage_key` directly, and `is_fresh`
-                        // degrades to a bare `exists()` whenever an ETag is
-                        // multipart-shaped (#2120) or a legacy sidecar carries no
-                        // pinned ETag -- after which the presigned paths sign a
-                        // 302 to the object with no checksum check at all.
-                        //
-                        // The delete is also what self-heals on a versioned
-                        // bucket. Nothing in this codebase reads a non-current
-                        // version (the storage layer has no version_id concept),
-                        // so a delete marker simply reads as NotFound and forces
-                        // the refetch -- it cannot mask content that was already
-                        // unreachable.
+                        // miss) and discard the staging object (self-heal).
+                        // `cache_key` was never touched, so a failed discard
+                        // just leaks a staging key — unlike the buffered
+                        // sibling's pre-write guard, there is no risk of the
+                        // sidecar-bypassing read paths (stale-if-error, PyPI
+                        // Remote, `is_fresh`'s multipart fallback) ever
+                        // serving rejected bytes from this key, because none
+                        // were ever written there.
                         match rejected {
                             StreamWriteOutcome::RejectTruncated { expected, actual } => {
                                 tracing::warn!(
@@ -1727,15 +1743,7 @@ impl CachePersister {
                                 );
                             }
                         }
-                        if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
-                            tracing::debug!(
-                                cache_key = %cache_key_for_writer,
-                                error = %e,
-                                "best-effort delete of rejected proxy-cache object failed; \
-                                 the missing metadata sidecar still forces a refetch on the \
-                                 sidecar-gated read paths"
-                            );
-                        }
+                        discard_staging(&storage_clone, &staging_key).await;
                     }
                 },
                 Err(e) => {
@@ -1744,6 +1752,8 @@ impl CachePersister {
                         error = %e,
                         "proxy cache put_stream failed; cache will refetch next request"
                     );
+                    // May leave a partial staging object; cache_key is untouched.
+                    discard_staging(&storage_clone, &staging_key).await;
                 }
             }
         });
@@ -4312,7 +4322,9 @@ impl ProxyService {
             let Some((name, tail)) = rest.split_once('/') else {
                 continue;
             };
-            if name.is_empty() || tail.is_empty() {
+            // Require an exact suffix, not just "non-empty", so a leftover
+            // tee_stream staging object can't make a failed write look cached.
+            if name.is_empty() || !matches!(tail, "__content__" | "__cache_meta__.json") {
                 continue;
             }
             names.insert(name.to_string());
@@ -4625,20 +4637,19 @@ impl ProxyService {
     /// Reject cache paths whose final formatted key would exceed
     /// [`Self::MAX_STORAGE_KEY_BYTES`].
     ///
-    /// Both `cache_storage_key` (`__content__` suffix, 11 chars) and
-    /// `cache_metadata_key` (`__cache_meta__.json` suffix, 19 chars) are
-    /// checked against the *larger* suffix so a path can't slip through
-    /// `cache_storage_key` only to fail when the matching metadata key is
-    /// later derived. Returning `Validation` early keeps the failure local
-    /// to the helper instead of surfacing as an opaque 400/500 from the
-    /// object-store SDK mid-fetch (#1044).
+    /// Checked against the largest of the three derived suffixes
+    /// (`__content__`, `__cache_meta__.json`, and `tee_stream`'s staging key,
+    /// `__content__` + [`TEE_STAGING_KEY_SUFFIX`] + a UUID) so a path can't
+    /// pass one derivation and silently fail — with no cache ever forming —
+    /// on another. Returning `Validation` early keeps the failure local
+    /// instead of surfacing as an opaque 400/500 mid-fetch (#1044).
     fn check_cache_key_length(repo_key: &str, trimmed_path: &str) -> Result<()> {
-        // Worst case suffix is "__cache_meta__.json" (19 bytes).
         const PREFIX: &str = "proxy-cache/";
-        const WORST_SUFFIX: &str = "__cache_meta__.json";
+        const WORST_SUFFIX_LEN: usize =
+            "__content__".len() + TEE_STAGING_KEY_SUFFIX.len() + UUID_STRING_LEN;
         // Two interior '/' separators are added by the format!() calls.
         let worst_len =
-            PREFIX.len() + repo_key.len() + 1 + trimmed_path.len() + 1 + WORST_SUFFIX.len();
+            PREFIX.len() + repo_key.len() + 1 + trimmed_path.len() + 1 + WORST_SUFFIX_LEN;
         if worst_len > Self::MAX_STORAGE_KEY_BYTES {
             return Err(AppError::Validation(format!(
                 "Proxy cache key exceeds {}-byte object-store limit (would be {} bytes)",
@@ -6201,12 +6212,11 @@ mod tests {
 
     #[test]
     fn test_cache_storage_key_just_under_limit_succeeds() {
-        // Pick a path length that lands the metadata key (worst case)
-        // exactly at MAX_STORAGE_KEY_BYTES. Both helpers should accept it.
-        // metadata key = "proxy-cache/" (12) + repo + "/" (1) + path + "/" (1)
-        //               + "__cache_meta__.json" (19)
+        // Lands the staging key's worst case exactly at the limit; the
+        // metadata key's own 19-byte suffix comes in well under it.
+        let worst_suffix_len = "__content__".len() + TEE_STAGING_KEY_SUFFIX.len() + UUID_STRING_LEN;
         let repo = "r";
-        let fixed = 12 + repo.len() + 1 + 1 + 19;
+        let fixed = 12 + repo.len() + 1 + 1 + worst_suffix_len;
         let path_len = ProxyService::MAX_STORAGE_KEY_BYTES - fixed;
         let path = "a".repeat(path_len);
 
@@ -6215,8 +6225,14 @@ mod tests {
         let metadata_key = ProxyService::cache_metadata_key(repo, &path)
             .expect("metadata key just under limit should succeed");
 
-        assert_eq!(metadata_key.len(), ProxyService::MAX_STORAGE_KEY_BYTES);
         assert!(storage_key.len() <= ProxyService::MAX_STORAGE_KEY_BYTES);
+        assert!(metadata_key.len() <= ProxyService::MAX_STORAGE_KEY_BYTES);
+        // A hypothetical staging key for this content key lands exactly at
+        // the limit — the actual boundary this test is pinned to.
+        assert_eq!(
+            storage_key.len() + TEE_STAGING_KEY_SUFFIX.len() + UUID_STRING_LEN,
+            ProxyService::MAX_STORAGE_KEY_BYTES
+        );
     }
 
     #[test]
@@ -6238,18 +6254,10 @@ mod tests {
 
     #[test]
     fn test_cache_storage_key_rejects_when_only_metadata_overflows() {
-        // Construct a path where the storage-suffix key (`__content__`,
-        // 11 bytes) would fit in 1024 but the metadata-suffix key
-        // (`__cache_meta__.json`, 19 bytes) would not. Both helpers must
-        // reject so callers cannot enter a state where storage is
-        // writable but metadata is not.
+        // The __content__ key (11-byte suffix) fits at 1024 on its own, but
+        // the staging key (60-byte suffix) would overflow. Both must reject.
         let repo = "r";
-        // storage-only fixed bytes: 12 + repo + "/" + "/" + 11 (__content__) = 26
         let storage_fixed = 12 + repo.len() + 1 + 1 + 11;
-        // Pick a path length that fits the storage variant but is 1 byte
-        // too long for the metadata variant (which has an 8-byte longer
-        // suffix). Any value in [MAX-storage_fixed-7, MAX-storage_fixed]
-        // works; pick the largest legal storage length.
         let path_len = ProxyService::MAX_STORAGE_KEY_BYTES - storage_fixed;
         let path = "a".repeat(path_len);
 
@@ -6257,9 +6265,6 @@ mod tests {
         let direct_storage_len = storage_fixed + path.len();
         assert_eq!(direct_storage_len, ProxyService::MAX_STORAGE_KEY_BYTES);
 
-        // But the metadata variant overflows by 8 bytes (suffix delta),
-        // and the helper rejects both because we measure against the
-        // worst-case suffix.
         let storage_result = ProxyService::cache_storage_key(repo, &path);
         let metadata_result = ProxyService::cache_metadata_key(repo, &path);
 
@@ -8514,15 +8519,19 @@ mod tests {
     /// consuming the stream.
     struct TeeRecordingBackend {
         put_stream_chunks: tokio::sync::Mutex<Vec<Bytes>>,
+        // Keys passed to put_stream, so tests can assert the live key is
+        // never written directly.
+        put_stream_keys: tokio::sync::Mutex<Vec<String>>,
+        // (source, dest) pairs passed to copy() — the only thing that
+        // publishes a staged write onto the live key.
+        copies: tokio::sync::Mutex<Vec<(String, String)>>,
         metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
         deletes: tokio::sync::Mutex<Vec<String>>,
         put_stream_fails: bool,
-        // #1611-style guard support: a successful put_stream (even a
-        // zero-byte one) creates a real object at the key, same as a real S3
-        // PutObject. exists() reflects that so the reject-arm delete tests
-        // below exercise the same exists()-before-delete guard as prod,
-        // rather than the guard vacuously short-circuiting on an
-        // always-absent mock.
+        copy_fails: bool,
+        // #1611-style guard support (used by write_negative_cache tests): a
+        // successful put_stream (even a zero-byte one) creates a real
+        // object at the key, same as a real S3 PutObject.
         object_written: std::sync::atomic::AtomicBool,
     }
 
@@ -8530,18 +8539,37 @@ mod tests {
         fn ok() -> Arc<Self> {
             Arc::new(Self {
                 put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
+                put_stream_keys: tokio::sync::Mutex::new(Vec::new()),
+                copies: tokio::sync::Mutex::new(Vec::new()),
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: false,
+                copy_fails: false,
                 object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
         fn failing() -> Arc<Self> {
             Arc::new(Self {
                 put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
+                put_stream_keys: tokio::sync::Mutex::new(Vec::new()),
+                copies: tokio::sync::Mutex::new(Vec::new()),
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: true,
+                copy_fails: false,
+                object_written: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        /// `put_stream` succeeds but `copy` (the publish step) always fails.
+        fn copy_failing() -> Arc<Self> {
+            Arc::new(Self {
+                put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
+                put_stream_keys: tokio::sync::Mutex::new(Vec::new()),
+                copies: tokio::sync::Mutex::new(Vec::new()),
+                metadata_writes: tokio::sync::Mutex::new(Vec::new()),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
+                put_stream_fails: false,
+                copy_fails: true,
                 object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
@@ -8573,7 +8601,14 @@ mod tests {
         async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
             Ok(vec![])
         }
-        async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+        async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+            self.copies
+                .lock()
+                .await
+                .push((src.to_string(), dst.to_string()));
+            if self.copy_fails {
+                return Err(AppError::Storage("simulated copy failure".to_string()));
+            }
             Ok(())
         }
         async fn size(&self, _key: &str) -> Result<u64> {
@@ -8581,9 +8616,10 @@ mod tests {
         }
         async fn put_stream(
             &self,
-            _key: &str,
+            key: &str,
             stream: ServiceBoxStream<'static, Result<Bytes>>,
         ) -> Result<ServicePutStreamResult> {
+            self.put_stream_keys.lock().await.push(key.to_string());
             if self.put_stream_fails {
                 return Err(AppError::Storage("simulated storage failure".to_string()));
             }
@@ -8785,11 +8821,16 @@ mod tests {
             "zero-byte upstream body MUST NOT write a metadata sidecar; \
              otherwise the next GET serves a Content-Length: 0 cache hit (#1365)"
         );
-        assert_eq!(
-            backend.deletes.lock().await.as_slice(),
-            ["cache-key".to_string()],
-            "the empty cache object must be deleted so the next request refetches; \
-             the sidecar skip alone does not protect the sidecar-less read paths"
+        let deletes = backend.deletes.lock().await;
+        assert_eq!(deletes.len(), 1);
+        assert!(
+            deletes[0].starts_with("cache-key.tee-staging."),
+            "delete must target the staging key, never cache-key: got {:?}",
+            deletes[0]
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a rejected write must never publish onto the live key"
         );
     }
 
@@ -8838,11 +8879,6 @@ mod tests {
     /// serve a short, SHA-mismatched archive on the next GET and clients hit
     /// "unexpected BufError" extracting it. The writer must skip the
     /// metadata sidecar so the next request refetches.
-    ///
-    /// Same reasoning as the empty-body sibling above: the writer must ALSO
-    /// delete the partial object, because the sidecar skip does not protect
-    /// the read paths that reach the content key without consulting it
-    /// (#3068 review).
     #[tokio::test]
     async fn test_tee_truncated_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
@@ -8872,11 +8908,16 @@ mod tests {
             backend.metadata_writes.lock().await.is_empty(),
             "truncated upstream body MUST NOT write a metadata sidecar (#1912)"
         );
-        assert_eq!(
-            backend.deletes.lock().await.as_slice(),
-            ["cache-key".to_string()],
-            "the truncated cache object must be deleted so the next request refetches; \
-             the sidecar skip alone does not protect the sidecar-less read paths"
+        let deletes = backend.deletes.lock().await;
+        assert_eq!(deletes.len(), 1);
+        assert!(
+            deletes[0].starts_with("cache-key.tee-staging."),
+            "delete must target the staging key, never cache-key: got {:?}",
+            deletes[0]
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a truncated write must never publish onto the live key"
         );
     }
 
@@ -8972,9 +9013,170 @@ mod tests {
             1,
             "a complete body with a matching Content-Length writes its sidecar"
         );
+        // Publishes via copy(), then cleans up the now-redundant staging object.
+        let deletes = backend.deletes.lock().await;
+        assert_eq!(deletes.len(), 1);
+        assert!(deletes[0].starts_with("cache-key.tee-staging."));
+        let copies = backend.copies.lock().await;
+        assert_eq!(copies.len(), 1);
+        assert!(copies[0].0.starts_with("cache-key.tee-staging."));
+        assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// A failed publish (copy) must degrade like a reject: no sidecar,
+    /// staging discarded, live key untouched.
+    #[tokio::test]
+    async fn test_tee_copy_publish_failure_is_not_cached() {
+        let backend = TeeRecordingBackend::copy_failing();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+            Some(11),
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(backend.metadata_writes.lock().await.is_empty());
+        let copies = backend.copies.lock().await;
+        assert_eq!(copies.len(), 1);
+        assert!(copies[0].0.starts_with("cache-key.tee-staging."));
+        assert_eq!(copies[0].1, "cache-key");
+        let deletes = backend.deletes.lock().await;
+        assert_eq!(deletes.len(), 1, "the staging object must be discarded");
+        assert!(deletes[0].starts_with("cache-key.tee-staging."));
+    }
+
+    /// Two concurrent tee_stream calls for the same cache key — one reject,
+    /// one commit — must never let the rejected write touch the live key,
+    /// regardless of interleaving. Every put_stream call targets a per-write
+    /// staging key, never `cache_key` directly, so there's nothing to race.
+    #[tokio::test]
+    async fn test_tee_concurrent_reject_and_commit_never_touch_live_key_directly() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let rejecting = upstream_chunks(vec![]);
+        let mut reject_client = CachePersister::new(test_catalog_pool(), storage.clone())
+            .tee_stream(
+                rejecting,
+                "cache-key".to_string(),
+                "meta-key".to_string(),
+                template(),
+                None,
+            );
+
+        let committing = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut commit_client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            committing,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+            Some(11),
+        );
+
+        // Drain both client streams concurrently, mirroring two real
+        // concurrent requests racing each other for the same cold key.
+        let (reject_drain, commit_drain) = tokio::join!(
+            async {
+                while let Some(chunk) = reject_client.next().await {
+                    let _ = chunk.unwrap();
+                }
+            },
+            async {
+                while let Some(chunk) = commit_client.next().await {
+                    let _ = chunk.unwrap();
+                }
+            }
+        );
+        let _ = (reject_drain, commit_drain);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let put_stream_keys = backend.put_stream_keys.lock().await;
+        assert_eq!(put_stream_keys.len(), 2);
         assert!(
-            backend.deletes.lock().await.is_empty(),
-            "a complete body must not be deleted"
+            put_stream_keys
+                .iter()
+                .all(|k| k != "cache-key" && k.starts_with("cache-key.tee-staging.")),
+            "neither writer may put_stream to the live cache-key: got {:?}",
+            *put_stream_keys
+        );
+        assert_ne!(
+            put_stream_keys[0], put_stream_keys[1],
+            "each writer must get its own independent staging key"
+        );
+
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "only the commit writes a sidecar"
+        );
+
+        let deletes = backend.deletes.lock().await;
+        assert_eq!(
+            deletes.len(),
+            2,
+            "each writer discards its own staging object"
+        );
+        assert!(
+            deletes.iter().all(|k| k != "cache-key"),
+            "the live cache-key must never be deleted: got {:?}",
+            *deletes
+        );
+
+        let copies = backend.copies.lock().await;
+        assert_eq!(copies.len(), 1, "only the commit publishes via copy()");
+        assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// #2274: a digest mismatch on a pinned expected checksum (OCI blob
+    /// fallback) must degrade like a reject — no sidecar, no publish — even
+    /// though `classify_stream_write` alone would call this a `Commit`.
+    /// Previously untested.
+    #[tokio::test]
+    async fn test_tee_digest_mismatch_is_not_cached() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut mismatched_template = template();
+        mismatched_template.expected_checksum =
+            Some("0000000000000000000000000000000000000000000000000000000000000".to_string());
+
+        let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            mismatched_template,
+            Some(11),
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a digest mismatch must not write a metadata sidecar (#2274)"
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a digest mismatch must never publish onto the live key"
+        );
+        let deletes = backend.deletes.lock().await;
+        assert_eq!(deletes.len(), 1, "the staging object must be discarded");
+        assert!(
+            deletes[0].starts_with("cache-key.tee-staging."),
+            "the discard must target the staging key, never the live \
+             cache-key: got {:?}",
+            deletes[0]
         );
     }
 
