@@ -1291,12 +1291,17 @@ async fn test_max_versions_cascades_oci_tags() {
     insert_oci_tag(&pool, repo_id, "img", "rolling-3", digest_new).await;
 
     // Surviving sibling tags for the two doomed digests, each in its OWN
-    // single-member partition (a different image name), so the cascade may
-    // prune rolling-1/rolling-2 without orphaning those digests (#1682 guard).
-    insert_oci_manifest_artifact(&pool, repo_id, "other", "alias-old", digest_old, 100).await;
-    insert_oci_tag(&pool, repo_id, "other", "alias-old", digest_old).await;
-    insert_oci_manifest_artifact(&pool, repo_id, "other", "alias-mid", digest_mid, 100).await;
-    insert_oci_tag(&pool, repo_id, "other", "alias-mid", digest_mid).await;
+    // single-member partition, so the cascade may prune rolling-1/rolling-2
+    // without orphaning those digests (#1682 guard).
+    // NOTE: these must be two DIFFERENT image names. Sharing one image name
+    // would put both in the same retention partition, so `keep = 1` would prune
+    // one of them and `artifacts_removed` would be 3, not 2 -- which is exactly
+    // how this test failed before, on the PR head as well as here. The test
+    // only runs on main/release branches, so a PR could not surface it.
+    insert_oci_manifest_artifact(&pool, repo_id, "other-old", "alias-old", digest_old, 100).await;
+    insert_oci_tag(&pool, repo_id, "other-old", "alias-old", digest_old).await;
+    insert_oci_manifest_artifact(&pool, repo_id, "other-mid", "alias-mid", digest_mid, 100).await;
+    insert_oci_tag(&pool, repo_id, "other-mid", "alias-mid", digest_mid).await;
 
     // Backdate so created_at ordering is deterministic.
     sqlx::query(
@@ -1346,11 +1351,11 @@ async fn test_max_versions_cascades_oci_tags() {
     );
     // The surviving sibling tags protecting digest_old / digest_mid remain.
     assert!(
-        oci_tag_exists(&pool, repo_id, "other", "alias-old").await,
+        oci_tag_exists(&pool, repo_id, "other-old", "alias-old").await,
         "surviving sibling protecting digest_old must remain"
     );
     assert!(
-        oci_tag_exists(&pool, repo_id, "other", "alias-mid").await,
+        oci_tag_exists(&pool, repo_id, "other-mid", "alias-mid").await,
         "surviving sibling protecting digest_mid must remain"
     );
 
