@@ -94,6 +94,30 @@ fn is_prov_filename(filename: &str) -> bool {
     filename.ends_with(PROV_SUFFIX)
 }
 
+/// OCI manifest rows are not classic Helm chart packages and must never be
+/// rendered into `index.yaml`.
+///
+/// The path check repairs the read side for rows already written through the
+/// OCI Distribution API before repository-format validation was added (#3150).
+/// The media-type check is a second guard in case an imported manifest uses a
+/// non-standard path.
+fn is_oci_manifest_artifact(path: &str, content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+
+    (path.starts_with("v2/") && path.contains("/manifests/"))
+        || matches!(
+            media_type,
+            "application/vnd.oci.image.manifest.v1+json"
+                | "application/vnd.oci.image.index.v1+json"
+                | "application/vnd.docker.distribution.manifest.v2+json"
+                | "application/vnd.docker.distribution.manifest.list.v2+json"
+        )
+}
+
 /// Validate that an uploaded `prov` part really is a clearsigned provenance
 /// document before it is stored.
 ///
@@ -174,7 +198,7 @@ async fn query_charts_from_repo(
 ) -> Result<(), Response> {
     let rows = sqlx::query(
         r#"
-        SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256,
+        SELECT a.id, a.name, a.version, a.path, a.content_type, a.checksum_sha256,
                a.created_at,
                am.metadata
         FROM artifacts a
@@ -194,9 +218,14 @@ async fn query_charts_from_repo(
         let name: String = row.get("name");
         let version: Option<String> = row.get("version");
         let path: String = row.get("path");
+        let content_type: String = row.get("content_type");
         let checksum_sha256: String = row.get("checksum_sha256");
         let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
         let metadata: Option<serde_json::Value> = row.get("metadata");
+
+        if is_oci_manifest_artifact(&path, &content_type) {
+            continue;
+        }
 
         let version = match version {
             Some(v) => v,
@@ -1312,6 +1341,31 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
     }
 
     #[test]
+    fn test_oci_manifests_are_not_classic_helm_chart_artifacts() {
+        for content_type in [
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.oci.image.index.v1+json; charset=utf-8",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        ] {
+            assert!(is_oci_manifest_artifact("imported/manifest", content_type));
+        }
+
+        assert!(is_oci_manifest_artifact(
+            "v2/keycloak/manifests/26.7.0",
+            "application/json"
+        ));
+        assert!(!is_oci_manifest_artifact(
+            "keycloak/26.7.0/keycloak-26.7.0.tgz",
+            "application/gzip"
+        ));
+        assert!(!is_oci_manifest_artifact(
+            "keycloak-26.7.0.tgz",
+            "application/octet-stream"
+        ));
+    }
+
+    #[test]
     fn test_sha256_computation() {
         let mut hasher = Sha256::new();
         hasher.update(b"chart content");
@@ -1452,6 +1506,58 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
             "the URL helm derives from index.yaml must serve the chart"
         );
         assert_eq!(&got[..], b"helm-chart-bytes");
+
+        f.teardown().await;
+    }
+
+    /// Regression guard for #3150: OCI manifest rows written into a classic
+    /// Helm repository by older versions must not leak into `index.yaml`.
+    #[tokio::test]
+    async fn test_helm_index_excludes_existing_oci_manifest_rows() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "helm/keycloak/26.7.0/keycloak-26.7.0.tgz",
+            "keycloak/26.7.0/keycloak-26.7.0.tgz",
+            "keycloak",
+            "26.7.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"classic-chart"),
+            f.user_id,
+        )
+        .await;
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "oci/manifests/abcdef",
+            "v2/keycloak/manifests/26.7.0",
+            "keycloak:26.7.0",
+            "26.7.0",
+            "application/vnd.oci.image.manifest.v1+json",
+            bytes::Bytes::from_static(br#"{"schemaVersion":2}"#),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "index generation failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let index: HelmIndex = serde_yaml::from_slice(&body).expect("valid Helm index");
+        assert_eq!(index.entries.len(), 1);
+        assert!(index.entries.contains_key("keycloak"));
+        assert!(!index.entries.contains_key("keycloak:26.7.0"));
 
         f.teardown().await;
     }
