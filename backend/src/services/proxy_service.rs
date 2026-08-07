@@ -9169,6 +9169,115 @@ mod tests {
         assert_eq!(copies[0].1, "cache-key");
     }
 
+    /// The staging->publish round trip against a REAL `FilesystemBackend`,
+    /// not a recording mock. Every other tee test asserts on the *calls* the
+    /// persister makes (`put_stream` went to a staging key, `copy` went to the
+    /// live key); none of them proves those calls actually move the bytes. A
+    /// mock whose `copy` is a no-op that records `(src, dest)` satisfies all
+    /// of them while storing nothing, so the whole suite would stay green if
+    /// publishing were silently broken end to end.
+    ///
+    /// This drives the same code path through the filesystem backend and
+    /// checks the state that actually matters to a subsequent cache hit: the
+    /// bytes readable at `cache_key`, and the absence of a leaked staging
+    /// object. Also covers the reject arm, which is where the bug in this PR
+    /// lived — a rejected write must leave the live key ABSENT, not corrupt.
+    #[tokio::test]
+    async fn test_tee_publish_round_trip_on_a_real_filesystem_backend() {
+        use crate::services::storage_service::FilesystemBackend;
+
+        // Counts every object under the staging prefix, so a leak is visible
+        // as state rather than as an unasserted call.
+        fn staging_objects(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let staging_root = root.join(TEE_STAGING_KEY_PREFIX.trim_end_matches('/'));
+            let mut out = Vec::new();
+            let mut stack = vec![staging_root];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        out.push(path);
+                    }
+                }
+            }
+            out
+        }
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let storage = Arc::new(RealStorageService::new(Arc::new(FilesystemBackend::new(
+            root.clone(),
+        ))));
+
+        // --- commit arm: the bytes must be readable at the live key ---
+        let body: &[u8] = b"first-chunk";
+        let mut client = CachePersister::new(test_catalog_pool(), Arc::clone(&storage)).tee_stream(
+            upstream_chunks(vec![body]),
+            "proxy-cache/repo/committed".to_string(),
+            "proxy-cache/repo/committed.meta".to_string(),
+            template(),
+            Some(body.len() as u64),
+        );
+        let mut client_bytes = Vec::new();
+        while let Some(chunk) = client.next().await {
+            client_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(client_bytes, body, "the client must receive the full body");
+
+        // The writer is a spawned task, so poll for the published object
+        // rather than racing a fixed sleep.
+        let mut published = None;
+        for _ in 0..100 {
+            if let Ok(bytes) = storage.get("proxy-cache/repo/committed").await {
+                published = Some(bytes);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            published.as_deref(),
+            Some(body),
+            "a committed write must be readable at the live key with the exact \
+             upstream bytes -- this is what the next cache hit serves"
+        );
+
+        // --- reject arm: the live key must not exist at all ---
+        let mut reject_client = CachePersister::new(test_catalog_pool(), Arc::clone(&storage))
+            .tee_stream(
+                upstream_chunks(vec![&b"short"[..]]),
+                "proxy-cache/repo/rejected".to_string(),
+                "proxy-cache/repo/rejected.meta".to_string(),
+                template(),
+                // Content-Length lies: 999 promised, 5 delivered -> truncated
+                // upstream, which classify_stream_write rejects.
+                Some(999),
+            );
+        while let Some(chunk) = reject_client.next().await {
+            let _ = chunk.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !storage.exists("proxy-cache/repo/rejected").await.unwrap(),
+            "a rejected write must leave the live key absent -- before this PR \
+             the truncated body was streamed straight to cache_key, so a later \
+             hit served 5 bytes as if they were the whole artifact"
+        );
+
+        // Neither arm may leave a staging object behind. Nothing in-process
+        // reaps these, so a leak here is permanent storage growth.
+        let leaked = staging_objects(&root);
+        assert!(
+            leaked.is_empty(),
+            "both arms must discard their staging object: leaked {:?}",
+            leaked
+        );
+    }
+
     /// #2274: a digest mismatch on a pinned expected checksum (OCI blob
     /// fallback) must degrade like a reject — no sidecar, no publish — even
     /// though `classify_stream_write` alone would call this a `Commit`.
