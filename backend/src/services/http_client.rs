@@ -842,6 +842,13 @@ mod tests {
         body_finished_rx
             .await
             .expect("server finished response body");
+        // The loopback write has completed, but client-side socket readiness is
+        // delivered by the OS in wall-clock time. Leaving Tokio paused here can
+        // auto-advance straight to reqwest's read deadline before that readiness
+        // event arrives. Resume real time for the final body read. Any accidental
+        // total deadline shorter than the 20-second jump is already expired and
+        // is still observed when reqwest next polls the body.
+        tokio::time::resume();
 
         assert_eq!(request.await.expect("request task").as_ref(), b"OK");
         server.await.expect("server task");
