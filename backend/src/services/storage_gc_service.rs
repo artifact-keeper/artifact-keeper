@@ -1903,11 +1903,36 @@ impl StorageGcService {
     ///    destructive act, and the #1682 "never orphan a live image" guard in
     ///    `lifecycle_service`.
     ///
-    /// The renewal and the re-check are one atomic `UPDATE`: a row that has
-    /// become live cannot have its lease extended, so there is no ordering in
-    /// which the caller both holds a fresh lease and proceeds to delete a live
-    /// object. `kind` selects the predicate matching the calling sweep's own
-    /// row `DELETE`.
+    /// The renewal and the re-check are one atomic `UPDATE`, so a row that has
+    /// become live cannot have its lease extended. `kind` selects the predicate
+    /// matching the calling sweep's own row `DELETE`.
+    ///
+    /// This NARROWS the window; it does not close it. Be precise about what is
+    /// and is not guaranteed here, because the difference decides whether
+    /// anyone finishes the job:
+    ///
+    /// The `UPDATE` runs on the pool as a single autocommit statement, so its
+    /// row lock — which is on `oci_upload_cleanup_keys`, never on `oci_blobs` —
+    /// is released the instant it commits. The caller then performs an
+    /// object-store `DELETE` with no lock held. A push that commits its
+    /// `oci_blobs` row inside that gap still has its bytes destroyed. Nothing
+    /// in the push path serializes against this: `register_oci_upload_cleanup_key`
+    /// is `ON CONFLICT (storage_key) DO NOTHING`, which against an already
+    /// claimed row is a complete no-op.
+    ///
+    /// What this buys is a large reduction, not a proof. Before the re-check,
+    /// liveness was evaluated once per batch in the candidate `SELECT`, so the
+    /// exposure spanned the entire batch walk — up to
+    /// `OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT` sequential object-store deletes,
+    /// which is minutes. It is now one storage round trip, order tens of
+    /// milliseconds.
+    ///
+    /// Closing it properly requires the push and the sweep to serialize on the
+    /// journal row — an explicit transaction holding `SELECT ... FOR UPDATE`
+    /// across the storage delete, with the push taking the same row lock before
+    /// committing `oci_blobs` — or a two-phase tombstone, which this codebase
+    /// already implements for blob GC via `oci_blobs.pending_delete_at`
+    /// (migration 141, `run_blob_gc_mark` / `run_blob_gc_sweep`).
     async fn hold_cleanup_key_claim_for_delete(
         &self,
         cleanup_key: &OciUploadCleanupKey,
