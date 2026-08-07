@@ -1630,6 +1630,18 @@ async fn download_or_metadata(
             return Err(AppError::NotFound(format!("File not found: {}", filename)).into_response());
         }
         let real_filename = distribution;
+        if repo.repo_type == RepositoryType::Virtual {
+            return serve_virtual_metadata(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &project,
+                &normalized,
+                requested_version.as_deref(),
+                real_filename,
+            )
+            .await;
+        }
         if repo.repo_type == RepositoryType::Remote {
             if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
                 return serve_remote_metadata(
@@ -1665,6 +1677,81 @@ async fn download_or_metadata(
         &ctx,
     )
     .await
+}
+
+/// Resolve a PEP 658 metadata request through a virtual repository's members.
+///
+/// Virtual repositories do not own artifacts, so metadata cannot be served
+/// against the virtual repository ID. Resolve members in priority order, using
+/// the same authorization and curation boundaries as the regular download
+/// path. A missing distribution falls through to the next member; other
+/// failures remain visible instead of being misreported as a 404.
+async fn serve_virtual_metadata(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    virtual_repo: &RepoInfo,
+    project: &str,
+    normalized_project: &str,
+    requested_version: Option<&str>,
+    filename: &str,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo.id).await?;
+    if members.is_empty() {
+        return Err(
+            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
+        );
+    }
+
+    let members =
+        proxy_helpers::authorize_virtual_members(&state.permission_service, auth, members).await;
+
+    for member in members {
+        let member_info = proxy_helpers::repo_info_from_member(&member);
+        if enforce_pypi_curation(state, &member_info, normalized_project, requested_version)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+
+        let result = if member.repo_type == RepositoryType::Remote {
+            match (&member.upstream_url, state.proxy_service.as_ref()) {
+                (Some(upstream_url), Some(proxy)) => {
+                    serve_remote_metadata(
+                        state,
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        project,
+                        filename,
+                    )
+                    .await
+                }
+                _ => continue,
+            }
+        } else {
+            serve_metadata(
+                state,
+                &state.db,
+                member.id,
+                &member.storage_location(),
+                filename,
+            )
+            .await
+        };
+
+        match result {
+            Ok(response) => return Ok(response),
+            Err(response) if response.status() == StatusCode::NOT_FOUND => continue,
+            Err(response) => return Err(response),
+        }
+    }
+
+    Err(
+        AppError::NotFound("Metadata not found in any member repository".to_string())
+            .into_response(),
+    )
 }
 
 async fn serve_remote_metadata(
@@ -9334,6 +9421,71 @@ mod tests {
             &body[..],
             metadata,
             "served metadata must be the wheel's METADATA bytes"
+        );
+    }
+
+    /// A virtual repository has no artifacts of its own. PEP 658 metadata must
+    /// therefore resolve through its remote member, just as a wheel download
+    /// does. This exercises the PR #3077 404-to-wheel fallback through the
+    /// virtual route that previously passed the virtual repository ID to
+    /// `serve_metadata` and returned 404.
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_resolves_remote_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(wheel_with_metadata("demo-1.0", metadata)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "virtual metadata request must resolve its member"
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "virtual member must return wheel METADATA"
         );
     }
 
