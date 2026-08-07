@@ -1831,6 +1831,92 @@ mod tests {
         );
     }
 
+    /// Sibling of the Remote-arm test above, for the VIRTUAL arm.
+    ///
+    /// #2920 names both download arms, and both hand-roll their response, so
+    /// both dropped `content_encoding`. The fix touched both but shipped a test
+    /// for only one -- leaving the virtual arm free to regress silently. This
+    /// closes that: it fails on the pre-fix code exactly as the Remote-arm test
+    /// does.
+    #[tokio::test]
+    async fn test_virtual_crate_download_forwards_upstream_content_encoding() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Remote member that actually proxies, plus the virtual repo in front.
+        let Some(member) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+        let Some(virt) = tdh::Fixture::setup("virtual", "cargo").await else {
+            member.teardown().await;
+            return;
+        };
+
+        let name = "virt-coded-crate";
+        let version = "1.2.3";
+        let plain = b"\x1f\x8b fake .crate tarball payload, repeated. ".repeat(64);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&plain).expect("gzip encode");
+        let compressed = encoder.finish().expect("gzip finish");
+        assert_ne!(
+            compressed, plain,
+            "fixture must actually be coded or the test proves nothing"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/api/v1/crates/{name}/{version}/download")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(compressed.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt.repo_id)
+        .bind(member.repo_id)
+        .execute(&virt.pool)
+        .await
+        .expect("link remote member into the virtual repo");
+
+        let (state, _dir) = tdh::rewire_remote_proxy(&member, &server.uri()).await;
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(format!(
+                "/cargo/{}/api/v1/crates/{}/{}/download",
+                virt.repo_key, name, version
+            )),
+        )
+        .await;
+
+        virt.teardown().await;
+        member.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the virtual arm must forward upstream Content-Encoding too, or \
+             cargo writes undecodable bytes and fails the checksum",
+        );
+        assert_eq!(
+            &body[..],
+            &compressed[..],
+            "the coded bytes must be passed through untouched",
+        );
+    }
+
     fn make_publish_payload(metadata: &serde_json::Value, crate_data: &[u8]) -> Bytes {
         let json_bytes = serde_json::to_vec(metadata).unwrap();
         let json_len = json_bytes.len() as u32;
