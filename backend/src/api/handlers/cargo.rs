@@ -146,6 +146,77 @@ async fn resolve_upstream_dl_url(
     Some(dl_url)
 }
 
+/// Extract the `cksum` recorded for `version` from a sparse-index document
+/// (#2929).
+///
+/// The sparse index is NDJSON: one JSON object per line, each carrying `vers`
+/// and `cksum`. `cksum` is the SHA-256 of the `.crate` file — it is exactly
+/// what cargo itself verifies the download against, and on a split-host
+/// registry (crates.io serves the index from `index.crates.io` and the
+/// `.crate` from a separate download host) it is sourced independently of the
+/// host that serves the bytes.
+///
+/// Returns `None` when the document is unparseable, the version is absent, or
+/// the recorded value is not a bare lowercase SHA-256 — all of which mean "no
+/// enforceable digest", so the caller falls back to an unverified fetch rather
+/// than failing the download.
+fn cksum_for_version(index_ndjson: &[u8], version: &str) -> Option<String> {
+    let text = std::str::from_utf8(index_ndjson).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            // A single malformed line must not hide a later good one.
+            continue;
+        };
+        if entry.get("vers").and_then(|v| v.as_str()) != Some(version) {
+            continue;
+        }
+        return entry
+            .get("cksum")
+            .and_then(|v| v.as_str())
+            .and_then(proxy_helpers::normalize_expected_sha256);
+    }
+    None
+}
+
+/// Resolve the sparse-index `cksum` for `{name}/{version}` from the upstream
+/// registry so the streamed `.crate` download can be digest-gated (#2929).
+///
+/// Best-effort by construction: any failure (no proxy, index fetch error,
+/// missing version, non-canonical digest) returns `None` and the download
+/// proceeds unverified, exactly as it did before. The index fetch uses the
+/// same proxy-cached, capped metadata helper the sparse-index handler uses, so
+/// a cargo client — which always reads the index immediately before
+/// downloading — finds it warm.
+async fn resolve_index_cksum(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    name_lower: &str,
+    version: &str,
+) -> Option<String> {
+    let proxy = state.proxy_service.as_ref()?;
+    let base_url = repo
+        .index_upstream_url
+        .as_deref()
+        .or(repo.upstream_url.as_deref())?;
+    let index_path = cargo_sparse_index_path_upstream(name_lower);
+    let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        repo_key,
+        base_url,
+        &index_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    .ok()?;
+    cksum_for_version(&content, version)
+}
+
 /// Build the full download URL for a crate, using the upstream `dl` template
 /// when available. Falls back to `{upstream_url}/api/v1/crates/{name}/{version}/download`.
 ///
@@ -916,13 +987,34 @@ async fn download(
                     // The *metadata* fetches on this handler (config.json, sparse
                     // index) stay capped and buffered — an 8 MiB ceiling is
                     // correct for those.
-                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                    // #2929: gate the proxy-cache commit on the sparse index's
+                    // recorded `cksum` for this exact `{name}/{version}`. The
+                    // index entry this same handler serves already carries the
+                    // digest cargo verifies the download against, but the
+                    // download arm reached the streaming helper that hardcodes
+                    // `expected_checksum: None`, so the digest was decorative:
+                    // a `.crate` whose bytes disagreed with it was committed to
+                    // the cache and served warm from then on.
+                    //
+                    // This cannot catch a wholly compromised registry — index
+                    // and bytes could both be forged — but on a split-host
+                    // registry (crates.io: `index.crates.io` vs the download
+                    // host) it catches a misbehaving or compromised download
+                    // host while the index is intact, and it catches ordinary
+                    // corruption or a clean-EOF truncation on either. A body
+                    // that fails the gate is still streamed to the client
+                    // (which verifies it independently and errors); it is only
+                    // kept out of the cache.
+                    let expected_cksum =
+                        resolve_index_cksum(&state, &repo, &repo_key, &name_lower, &version).await;
+                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         repo.id,
                         &repo_key,
                         &dl_base,
                         &dl_path,
                         &cache_path,
+                        expected_cksum,
                         RepositoryFormat::Cargo,
                     )
                     .await?;
@@ -1660,6 +1752,95 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
+
+    // ── #2929: the sparse-index cksum must gate the .crate cache commit ──
+
+    const CKSUM_A: &str = "abc1230000000000000000000000000000000000000000000000000000000def";
+
+    #[test]
+    fn test_cksum_for_version_picks_the_matching_version() {
+        let ndjson = format!(
+            "{{\"name\":\"serde\",\"vers\":\"1.0.0\",\"cksum\":\"{}\"}}\n\
+             {{\"name\":\"serde\",\"vers\":\"1.0.1\",\"cksum\":\"{}\"}}",
+            CKSUM_A,
+            "2".repeat(64)
+        );
+        assert_eq!(
+            super::cksum_for_version(ndjson.as_bytes(), "1.0.0").as_deref(),
+            Some(CKSUM_A),
+            "the digest must be the one recorded for the requested version"
+        );
+        assert_eq!(
+            super::cksum_for_version(ndjson.as_bytes(), "1.0.1").as_deref(),
+            Some("2".repeat(64).as_str())
+        );
+        assert_ne!(
+            CKSUM_A,
+            CKSUM_A.to_uppercase(),
+            "the fixture must contain hex letters or the case test below is vacuous"
+        );
+        assert_eq!(
+            super::cksum_for_version(ndjson.as_bytes(), "9.9.9"),
+            None,
+            "an absent version means no enforceable digest, not a wrong one"
+        );
+    }
+
+    #[test]
+    fn test_cksum_for_version_degrades_on_unusable_input() {
+        // A non-canonical cksum must read as "no digest available" rather than
+        // being enforced: it could never equal the streamed lowercase-hex
+        // SHA-256, so enforcing it would reject the crate on every fetch and
+        // re-pull upstream forever.
+        let prefixed = format!("{{\"vers\":\"1.0.0\",\"cksum\":\"sha256:{CKSUM_A}\"}}");
+        assert_eq!(super::cksum_for_version(prefixed.as_bytes(), "1.0.0"), None);
+
+        let upper = format!(
+            "{{\"vers\":\"1.0.0\",\"cksum\":\"{}\"}}",
+            CKSUM_A.to_uppercase()
+        );
+        assert_eq!(super::cksum_for_version(upper.as_bytes(), "1.0.0"), None);
+
+        assert_eq!(super::cksum_for_version(b"not json at all", "1.0.0"), None);
+        assert_eq!(super::cksum_for_version(b"", "1.0.0"), None);
+        assert_eq!(
+            super::cksum_for_version(b"{\"vers\":\"1.0.0\"}", "1.0.0"),
+            None,
+            "an entry with no cksum is not a digest"
+        );
+    }
+
+    /// A malformed line must not hide a good entry further down: the sparse
+    /// index is NDJSON produced by a third party, and a single bad line
+    /// silently disabling the digest gate for the whole crate would make the
+    /// guard trivially bypassable by a hostile index.
+    #[test]
+    fn test_cksum_for_version_skips_a_malformed_line() {
+        let ndjson = format!("this-is-not-json\n{{\"vers\":\"1.0.0\",\"cksum\":\"{CKSUM_A}\"}}");
+        assert_eq!(
+            super::cksum_for_version(ndjson.as_bytes(), "1.0.0").as_deref(),
+            Some(CKSUM_A)
+        );
+    }
+
+    /// Source pin (#2929): the Remote `.crate` download must go through the
+    /// DIGEST-GATED streaming helper AND actually hand it a resolved digest.
+    /// The unverified sibling hardcodes `expected_checksum: None`, so a revert
+    /// to it — or keeping the verified helper but passing `None` — would
+    /// compile, pass the rest of the suite, and silently un-enforce the index
+    /// cksum again.
+    #[test]
+    fn test_cargo_remote_download_uses_the_verified_streaming_helper_2929() {
+        let src = include_str!("cargo.rs");
+        assert!(
+            src.contains("proxy_helpers::proxy_fetch_streaming_with_cache_key_verified("),
+            "the cargo remote download MUST call the digest-gated streaming helper (#2929)"
+        );
+        assert!(
+            src.contains("let expected_cksum =\n                        resolve_index_cksum("),
+            "the digest passed to the gate must come from the sparse index, not be None (#2929)"
+        );
+    }
 
     /// Regression test for the cargo instance of the buffered-download class
     /// (#895 / #2192).

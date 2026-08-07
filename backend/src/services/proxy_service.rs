@@ -1502,6 +1502,16 @@ impl CachePersister {
     ///   metric buckets honest: a flaky mirror does not inflate the
     ///   `STORAGE_ERROR` rate, and a genuine cache backend failure does
     ///   not get hidden as `BAD_GATEWAY`.
+    ///
+    /// `max_cache_bytes` is the per-object proxy-cache ceiling (#2928). When
+    /// `Some(limit)`, the tee counts the bytes it has handed to the cache
+    /// writer and, the moment the cumulative count would exceed `limit`,
+    /// abandons the CACHE half of the tee: it forwards an error to the writer
+    /// (so `put_stream` aborts and drops its partial object) and stops feeding
+    /// it, while continuing to yield every remaining byte to the client. That
+    /// matches the buffered path's over-quota behaviour — serve the body, skip
+    /// the cache write — except that it bounds bytes-to-disk mid-stream rather
+    /// than after the whole object has already landed.
     fn tee_stream(
         &self,
         upstream: BoxStream<'static, Result<Bytes>>,
@@ -1509,6 +1519,7 @@ impl CachePersister {
         metadata_key: String,
         template: CacheMetadataTemplate,
         expected_len: Option<u64>,
+        max_cache_bytes: Option<u64>,
     ) -> BoxStream<'static, Result<Bytes>> {
         let storage = Arc::clone(&self.storage);
         // Cloned into the spawned writer task so the streaming Commit arm can
@@ -1756,6 +1767,13 @@ impl CachePersister {
         // sees the error and aborts cleanly) and surface to the client.
         let tee_stream = async_stream::try_stream! {
             let mut upstream = upstream;
+            // #2928: cumulative bytes handed to the cache writer, and the
+            // latch that says we have stopped doing so. Counted on the tee
+            // side rather than after `put_stream` returns, because the whole
+            // point of the guard is to bound bytes-to-disk: a post-hoc check
+            // only fires once the unbounded object has already been written.
+            let mut cached_bytes: u64 = 0;
+            let mut cache_abandoned = false;
             while let Some(chunk_result) = upstream.next().await {
                 match chunk_result {
                     Ok(mut bytes) => {
@@ -1769,11 +1787,34 @@ impl CachePersister {
                         while !bytes.is_empty() {
                             let take = bytes.len().min(TEE_MAX_CHUNK_BYTES);
                             let slice = bytes.split_to(take);
+                            // #2928: over-ceiling check BEFORE the send, so the
+                            // chunk that crosses the limit is never written.
+                            // Forwarding an Err makes `put_stream` return Err,
+                            // which drops its partial object and takes the
+                            // writer down its existing abandon-the-cache arm —
+                            // no metadata sidecar, so the entry reads as a miss.
+                            if !cache_abandoned {
+                                if let Some(limit) = max_cache_bytes {
+                                    if cached_bytes.saturating_add(slice.len() as u64) > limit {
+                                        cache_abandoned = true;
+                                        let _ = tx.send(Err(AppError::Validation(format!(
+                                            "proxy-cache object exceeds the repository's \
+                                             single-object ceiling of {} bytes; abandoning the \
+                                             cache write and serving the body to the client",
+                                            limit
+                                        )))).await;
+                                    } else {
+                                        cached_bytes += slice.len() as u64;
+                                    }
+                                }
+                            }
                             // Best-effort send to the cache writer. If the
                             // writer is gone (it already failed and dropped
                             // its receiver), drop the caching half silently
                             // and keep yielding to the client.
-                            let _ = tx.send(Ok(slice.clone())).await;
+                            if !cache_abandoned {
+                                let _ = tx.send(Ok(slice.clone())).await;
+                            }
                             yield slice;
                         }
                     }
@@ -2977,8 +3018,17 @@ impl ProxyService {
                         // larger than the repository's configured quota on its
                         // own is never cached, even though nothing tracks
                         // cumulative usage below that ceiling yet.
+                        //
+                        // #2928: the quota is resolved from the repository row
+                        // rather than read off `repo.quota_bytes`. Every
+                        // handler-driven proxy fetch synthesizes its
+                        // `Repository` with `quota_bytes: None` hardcoded, so
+                        // reading the field directly made this guard inert on
+                        // exactly the paths that serve proxy traffic. See
+                        // [`Self::resolve_quota_bytes`].
+                        let quota_bytes = self.resolve_quota_bytes(repo).await;
                         let quota_ok = !cache_classifier::exceeds_single_object_quota(
-                            repo.quota_bytes,
+                            quota_bytes,
                             resp.content.len() as i64,
                         );
                         if !quota_ok {
@@ -2988,7 +3038,7 @@ impl ProxyService {
                                 cache_key = %cache_key,
                                 path = %cache_path,
                                 object_len = resp.content.len(),
-                                quota_bytes = ?repo.quota_bytes,
+                                quota_bytes = ?quota_bytes,
                                 "proxy-fetched object exceeds repository quota_bytes; skipping \
                                  cache write (Phase-1 interim single-object guard, serving body \
                                  to client)"
@@ -3551,6 +3601,40 @@ impl ProxyService {
             commit_sha: upstream.commit_sha.clone(),
         };
 
+        // #2928: the streaming write path had no byte bound of any kind — the
+        // `TEE_CHANNEL_DEPTH * TEE_MAX_CHUNK_BYTES` budget bounds MEMORY per
+        // stream, not total bytes written. Resolve the repository's
+        // single-object ceiling and apply it on both sides:
+        //
+        //   * pre-flight, when the upstream advertises a `Content-Length` over
+        //     the ceiling: skip the cache tee entirely and hand the client the
+        //     raw upstream body, so not one byte is written;
+        //   * mid-stream otherwise (see [`CachePersister::tee_stream`]), which
+        //     is what covers a chunked / connection-close upstream that never
+        //     advertises a length.
+        //
+        // Either way the client is still served in full, matching the buffered
+        // path's over-quota behaviour.
+        let max_cache_bytes = Self::quota_to_cache_ceiling(self.resolve_quota_bytes(repo).await);
+        if let (Some(limit), Some(advertised)) = (max_cache_bytes, upstream.content_length) {
+            if advertised > limit {
+                tracing::warn!(
+                    target: "security",
+                    repository = %repo.key,
+                    path = %cache_path,
+                    advertised_bytes = advertised,
+                    quota_bytes = limit,
+                    "upstream advertises an object larger than the repository quota; \
+                     streaming it to the client without any proxy-cache write"
+                );
+                crate::services::metrics_service::record_proxy_cache_quota_exceeded(&repo.key);
+                return Ok(StreamHandle {
+                    body: upstream.body,
+                    headers,
+                });
+            }
+        }
+
         let body = self.cache_persister.tee_stream(
             upstream.body,
             cache_key,
@@ -3570,6 +3654,7 @@ impl ProxyService {
                 upstream_url: Some(full_url.clone()),
             },
             upstream.content_length,
+            max_cache_bytes,
         );
 
         Ok(StreamHandle { body, headers })
@@ -4491,6 +4576,50 @@ impl ProxyService {
                     .unwrap_or(default_ttl_secs)
             }
         }
+    }
+
+    /// Resolve the repository's configured `quota_bytes` (#2928).
+    ///
+    /// Every handler-driven proxy fetch synthesizes its [`Repository`] through
+    /// `proxy_helpers::build_remote_repo_with_format`, which hardcodes
+    /// `quota_bytes: None`. That made the single-object guard at the buffered
+    /// cache-write site structurally unreachable: it read `repo.quota_bytes`,
+    /// which was `None` on every path that actually serves proxy traffic, and
+    /// `cache_classifier::exceeds_single_object_quota(None, _)` is `false`
+    /// unconditionally. So an operator who set a quota on a Remote repository
+    /// got no enforcement and no warning.
+    ///
+    /// Rather than thread the column through the eight `proxy_fetch*` wrapper
+    /// signatures (and leave the next synthesizing helper free to reintroduce
+    /// the same hole), resolve it here from `repo.id` — the synthesized repo
+    /// does carry the true id. Same shape as
+    /// [`Self::get_cache_ttl_override`], which exists for the same reason.
+    /// A repo that already carries a real value (a row loaded from the DB)
+    /// short-circuits without a query.
+    ///
+    /// Returns `None` when no quota is configured or the lookup fails, which
+    /// preserves today's unbounded behaviour rather than failing a fetch on a
+    /// transient DB error.
+    async fn resolve_quota_bytes(&self, repo: &Repository) -> Option<i64> {
+        if repo.quota_bytes.is_some() {
+            return repo.quota_bytes;
+        }
+        sqlx::query_scalar::<_, Option<i64>>("SELECT quota_bytes FROM repositories WHERE id = $1")
+            .bind(repo.id)
+            .fetch_optional(&self.db)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+    }
+
+    /// The configured quota expressed as the per-object cache ceiling used by
+    /// the streaming write path, matching
+    /// [`cache_classifier::exceeds_single_object_quota`]'s semantics: the quota
+    /// is an inclusive ceiling, and a (nonsensical) negative quota rejects
+    /// every object rather than silently disabling the guard.
+    fn quota_to_cache_ceiling(quota_bytes: Option<i64>) -> Option<u64> {
+        quota_bytes.map(|q| u64::try_from(q).unwrap_or(0))
     }
 
     /// Read the optional repo-level `cache_ttl_secs` override. Returns `None`
@@ -8635,6 +8764,7 @@ mod tests {
             metadata_key,
             template,
             None,
+            None,
         )
     }
 
@@ -8856,6 +8986,7 @@ mod tests {
             "meta-key".to_string(),
             template(),
             Some(100),
+            None,
         );
 
         let mut total: usize = 0;
@@ -8946,6 +9077,267 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // #2928: per-object byte ceiling on the STREAMING proxy-cache write.
+    //
+    // The streaming path had no byte bound of any kind. `TEE_CHANNEL_DEPTH *
+    // TEE_MAX_CHUNK_BYTES` bounds MEMORY per stream (~4 MiB in flight); the
+    // chunk splitting preserves the total payload, so an upstream response of
+    // any size was written to cache storage in full, with no eviction path.
+    // The one guard that existed (`exceeds_single_object_quota`) was on the
+    // buffered path AND was fed `repo.quota_bytes` off a synthesized
+    // `Repository` that hardcodes `None`, so it never fired either.
+    // -----------------------------------------------------------------------
+
+    /// Build a `max_cache_bytes`-sized-ish upstream: `total` bytes delivered in
+    /// 64 KiB pieces, with no advertised `Content-Length` (the connection-close
+    /// / chunked framing case, which is also where the #2929 truncation gap
+    /// lives).
+    fn upstream_of_len(total: usize) -> BoxStream<'static, Result<Bytes>> {
+        let piece = Bytes::from(vec![0xABu8; 64 * 1024]);
+        let mut chunks = Vec::new();
+        let mut left = total;
+        while left > 0 {
+            let take = left.min(piece.len());
+            chunks.push(Ok(piece.slice(0..take)));
+            left -= take;
+        }
+        Box::pin(futures::stream::iter(chunks))
+    }
+
+    async fn run_tee_with_ceiling(
+        backend: Arc<TeeRecordingBackend>,
+        total: usize,
+        max_cache_bytes: Option<u64>,
+    ) -> usize {
+        let storage = Arc::new(RealStorageService::new(backend));
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_of_len(total),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+            None, // upstream advertised no Content-Length
+            max_cache_bytes,
+        );
+        let mut served = 0usize;
+        while let Some(chunk) = client.next().await {
+            served += chunk.expect("client stream must not error").len();
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        served
+    }
+
+    /// The guard. A body past the repository's single-object ceiling must be
+    /// served to the client in full, but must NOT be cached: no metadata
+    /// sidecar (so the entry reads as a miss), and the bytes handed to the
+    /// storage writer must stop at the ceiling rather than running to the end
+    /// of the object.
+    ///
+    /// Revert-proof: delete the `max_cache_bytes` check in `tee_stream`'s
+    /// forward loop and this fails on both assertions — the sidecar is written
+    /// and all 4 MiB reach storage.
+    #[tokio::test]
+    async fn test_tee_abandons_cache_write_past_the_object_ceiling() {
+        const LIMIT: u64 = 1024 * 1024;
+        const TOTAL: usize = 4 * 1024 * 1024;
+
+        let backend = TeeRecordingBackend::ok();
+        let served = run_tee_with_ceiling(backend.clone(), TOTAL, Some(LIMIT)).await;
+
+        assert_eq!(
+            served, TOTAL,
+            "the client must still receive the whole body; the ceiling bounds the CACHE \
+             write, not the response"
+        );
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "an over-ceiling object MUST NOT write a metadata sidecar, or it becomes a \
+             warm cache hit forever"
+        );
+        let written: usize = backend
+            .put_stream_chunks
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.len())
+            .sum();
+        assert!(
+            (written as u64) <= LIMIT,
+            "bytes-to-storage must stop at the ceiling ({LIMIT}), got {written}; a check \
+             that only fires after put_stream returns has already written the whole object"
+        );
+    }
+
+    /// Positive control 1: an object UNDER the ceiling still caches normally.
+    /// Without this, `if true { abandon }` would satisfy the guard test above.
+    #[tokio::test]
+    async fn test_tee_caches_an_object_under_the_ceiling() {
+        const LIMIT: u64 = 1024 * 1024;
+        const TOTAL: usize = 256 * 1024;
+
+        let backend = TeeRecordingBackend::ok();
+        let served = run_tee_with_ceiling(backend.clone(), TOTAL, Some(LIMIT)).await;
+
+        assert_eq!(served, TOTAL, "client receives the body");
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "an under-ceiling object must still be cached"
+        );
+        let written: usize = backend
+            .put_stream_chunks
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.len())
+            .sum();
+        assert_eq!(written, TOTAL, "the whole under-ceiling object is written");
+    }
+
+    /// Positive control 2: an object exactly AT the ceiling is accepted. The
+    /// quota is an inclusive ceiling, matching
+    /// `cache_classifier::exceeds_single_object_quota`, so an off-by-one here
+    /// would silently stop caching objects the buffered path accepts.
+    #[tokio::test]
+    async fn test_tee_caches_an_object_exactly_at_the_ceiling() {
+        const LIMIT: u64 = 256 * 1024;
+
+        let backend = TeeRecordingBackend::ok();
+        let served = run_tee_with_ceiling(backend.clone(), LIMIT as usize, Some(LIMIT)).await;
+
+        assert_eq!(served, LIMIT as usize);
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "an object exactly at the quota does NOT exceed it (inclusive ceiling)"
+        );
+    }
+
+    /// Positive control 3: with no ceiling configured, behaviour is unchanged —
+    /// an arbitrarily large object still caches. The guard must not become a
+    /// silent global cap on repositories that never configured a quota.
+    #[tokio::test]
+    async fn test_tee_without_a_ceiling_caches_an_arbitrarily_large_object() {
+        const TOTAL: usize = 4 * 1024 * 1024;
+
+        let backend = TeeRecordingBackend::ok();
+        let served = run_tee_with_ceiling(backend.clone(), TOTAL, None).await;
+
+        assert_eq!(served, TOTAL);
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "no configured quota means no ceiling; this path must be unchanged"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2928: making the quota reachable at all.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_quota_to_cache_ceiling_table() {
+        assert_eq!(
+            ProxyService::quota_to_cache_ceiling(None),
+            None,
+            "no configured quota means no ceiling"
+        );
+        assert_eq!(ProxyService::quota_to_cache_ceiling(Some(100)), Some(100));
+        assert_eq!(
+            ProxyService::quota_to_cache_ceiling(Some(0)),
+            Some(0),
+            "a zero quota caches nothing, matching exceeds_single_object_quota"
+        );
+        assert_eq!(
+            ProxyService::quota_to_cache_ceiling(Some(-1)),
+            Some(0),
+            "a negative quota must reject every object, not silently disable the guard"
+        );
+    }
+
+    /// A `Repository` that already carries a real quota is used as-is, with no
+    /// query. Proven by handing the service a pool that can never connect: if
+    /// the short-circuit were removed this would fall through to the lookup,
+    /// fail, and return `None`.
+    #[tokio::test]
+    async fn test_resolve_quota_bytes_uses_a_quota_already_on_the_repo() {
+        let backend = TeeRecordingBackend::ok();
+        let service = build_proxy_service_with_storage(backend);
+        let mut repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            Uuid::new_v4(),
+            "npm-remote",
+            "https://registry.npmjs.org",
+            crate::models::repository::RepositoryFormat::Npm,
+        );
+        repo.quota_bytes = Some(4096);
+
+        assert_eq!(service.resolve_quota_bytes(&repo).await, Some(4096));
+    }
+
+    /// A failed lookup degrades to "no quota" rather than failing the fetch:
+    /// a transient DB error must not turn every proxy download into an error.
+    #[tokio::test]
+    async fn test_resolve_quota_bytes_degrades_to_none_when_the_lookup_fails() {
+        let backend = TeeRecordingBackend::ok();
+        let service = build_proxy_service_with_storage(backend);
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            Uuid::new_v4(),
+            "npm-remote",
+            "https://registry.npmjs.org",
+            crate::models::repository::RepositoryFormat::Npm,
+        );
+        assert_eq!(repo.quota_bytes, None);
+
+        assert_eq!(service.resolve_quota_bytes(&repo).await, None);
+    }
+
+    /// The reachability proof for #2928 finding 1, against a real row.
+    ///
+    /// `build_remote_repo_with_format` is what EVERY handler-driven proxy fetch
+    /// uses, and it hardcodes `quota_bytes: None`. Reading the field directly —
+    /// which is what the buffered guard did — therefore fed
+    /// `exceeds_single_object_quota(None, _)`, which is `false` unconditionally.
+    /// Resolving by `repo.id` recovers the operator's configured value.
+    ///
+    /// Revert-proof: change `resolve_quota_bytes` back to `repo.quota_bytes`
+    /// and the final assertion fails with `None`.
+    #[tokio::test]
+    async fn test_resolve_quota_bytes_reads_the_row_for_a_synthesized_proxy_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET quota_bytes = $1 WHERE id = $2")
+            .bind(1_048_576i64)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set quota_bytes");
+
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend));
+        let service = ProxyService::new(fx.pool.clone(), storage);
+
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            fx.repo_id,
+            &fx.repo_key,
+            "https://registry.npmjs.org",
+            crate::models::repository::RepositoryFormat::Npm,
+        );
+        assert_eq!(
+            repo.quota_bytes, None,
+            "the synthesized proxy Repository still hardcodes None; that is exactly why \
+             the guard has to resolve the value instead of reading the field"
+        );
+        assert_eq!(
+            service.resolve_quota_bytes(&repo).await,
+            Some(1_048_576),
+            "the operator's configured quota must reach the guard"
+        );
+
+        fx.teardown().await;
+    }
+
     /// A complete streamed body whose byte count matches the advertised
     /// `Content-Length` is cached normally — the #1912 guard does not fire on
     /// well-formed responses.
@@ -8961,6 +9353,7 @@ mod tests {
             "meta-key".to_string(),
             template(),
             Some(11),
+            None,
         );
         while let Some(chunk) = client.next().await {
             let _ = chunk.unwrap();
