@@ -21,6 +21,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Health monitoring, lifecycle execution, and the OpenSearch bootstrap reindex are cluster-leased** (#2219): the health monitor's `consecutive_failures` counter has a single writer, due lifecycle policies execute once per cycle instead of once per replica, and a fresh multi-replica deployment starts one full reindex rather than one per replica. Long-running leases heartbeat while their owner is alive.
 - **Curation sync honors `curation_sync_interval_secs`** (#2219): the configured interval was read and discarded, so every enabled staging repository re-fetched upstream metadata on every five-minute tick. Repositories now record `curation_last_synced_at` after a successful fetch-and-evaluate and are skipped until their interval elapses (60s floor); the manual single-repository sync trigger still runs immediately.
 
+## [1.7.1] - 2026-08-07
+
+A maintenance release. The headline is that the bundled Trivy scanner is now built and hardened in-house, which clears a HIGH advisory that no upstream Trivy release fixes yet and had been blocking the release pipeline. Alongside it: NuGet remote-repository search now actually reaches the upstream feed, a scan-gate evaluation bug that could let a blocked artifact through is closed, and a cluster of Maven, PyPI, OIDC and multi-replica correctness fixes.
+
+### Upgrade note — proxy downloads may start being blocked
+
+The repository age gate is now genuinely enforced on **npm, PyPI and Go proxy downloads**. It was configurable before but silently did not apply to those formats, so a repository with an age gate configured was not actually gating them. After upgrading, package downloads that are younger than the configured `min_age_days` will return `451` where they previously succeeded.
+
+**Am I affected?** Only if you have the age gate enabled on a remote/proxy repository serving npm, PyPI or Go. Check with `GET /api/v1/repositories/{key}/age-gate` (admin only as of this release). If you were relying on the previous non-enforcement, either raise the threshold or disable the gate before upgrading. The `451` body carries `min_age_days` so blocked callers can see the policy that stopped them.
+
+### Security
+
+- **The bundled Trivy scanner is now built in-house from pinned upstream source.** The scanner-adapter image vendored `ghcr.io/aquasecurity/trivy:0.73.0`, whose bundled `oras-go v2.6.1` carries CVE-2026-50163 (HIGH). Upstream merged the fix on `main` but has not released it, and 0.73.0 remains the latest release, so there was no upstream tag to move to. The scanner is now built from the same upstream v0.73.0 source with a pinned Go toolchain and one documented dependency override, on a hardened UBI 9 base, in [artifact-keeper/trivy](https://github.com/artifact-keeper/trivy) — with its own blocking CVE gate, DISA STIG evaluation and build verification. The shipped binary also now carries its licence, NOTICE and modification record, which the runtime previously omitted.
+- **Scan gates are evaluated across all scanners, not just the most recent result** (#3138). A repository scanned by more than one scanner had its download gate decided by whichever row was newest, so an `OpenSCAP` result registering last could leave the severity gate inert for npm, PyPI, Maven and generic downloads.
+- **Age-gate policy is enforced on npm, PyPI and Go proxy downloads**, and the age-gate config read endpoint now requires admin (#2264) rather than returning gate posture to any authenticated caller with read scope.
+- **OIDC outbound responses are size-capped** (userinfo, token, discovery and JWKS), so a hostile or malfunctioning identity provider cannot exhaust memory through an unbounded response body.
+
+### Added
+
+- System stats now report proxy-cache storage consumption and artifact count.
+
+### Fixed
+
+- **NuGet remote repositories now proxy search to the upstream feed.** A remote repository advertised `SearchQueryService` in its service index but answered every query from the local database, so a proxy repository with nothing cached returned zero results — "No packages found" in Visual Studio — while `dotnet restore` against the same repository worked. Search now reaches upstream, rewrites result URLs back through the proxy, and degrades to local results rather than erroring if the upstream feed offers no search.
+- **Per-repository storage-GC estimates work again.** The web UI's per-repository storage panel called `POST /api/v1/repositories/{key}/storage-gc` for its "reclaimable now" figure, but only the instance-wide route existed, so every estimate returned 404.
+- **Maven catalog versions are derived from the GAV path** on the generic and chunked upload paths, and migration 192 no longer aborts startup on a UNIQUE violation when a package has two broken catalog rows and one candidate version.
+- **PyPI proxying**: an upstream `<base href>` on a proxied Simple index no longer re-anchors rewritten download URLs onto the upstream origin; PEP 658 `core-metadata` is advertised for wheels so installers can skip downloading whole wheels to resolve; the PEP 691 `versions` array is ordered by PEP 440 rather than byte order; invalid PEP 440 local versions are rejected instead of silently mangled; and an advertised-but-unavailable metadata file now falls back instead of failing the install.
+- **OCI**: a manifest pushed by digest is verified against that digest rather than accepted with a mismatch, and cross-repository blob mount (`?mount=&from=`) is implemented so a client can mount an existing layer instead of re-uploading it.
+- **Multi-replica background jobs** claim their remaining cluster-work items, so replicas no longer duplicate or drop work.
+- Probe endpoints (`/health`, `/healthz`, `/ready`, `/readyz`, `/livez`) no longer emit a per-request log line, which had buried real request logs under Kubernetes polling. A non-success probe response is still logged. Set `LOG_PROBE_REQUESTS=1` to restore the previous behavior.
+- The hardened backend image includes `xz`, which Incus `.tar.xz` extraction requires.
+
+### Performance
+
+- Repository listing reads storage totals from the usage ledger instead of computing a live `SUM`.
+
 ## [1.7.0] - 2026-07-31
 
 A supply-chain-enforcement and release-assurance release closing the 1.7.0 milestone. The headline is that scan and curation policy now *block at serve time*: an inline scan-and-block gate rejects vulnerable artifacts on download across proxy and hosted repositories (PyPI, npm, Docker/OCI) and the virtual repos that aggregate them, while a new typed curation engine adds publisher-trust and popularity/typo-squat rules — including Unicode-confusable (homoglyph) and affix detection — that stop suspect packages before they reach a client. Underneath the features, the release re-architects the release pipeline into a real assurance gate (blocking security suite, DTF gate against the candidate digest, promote-by-digest, dispatch-rehearsable dry runs), makes the repository usage ledger authoritative to enable O(1) quota admission, and lands a broad performance pass (keyset pagination, GIN-indexed full-text search, off-hot-path side effects). It also closes a cluster of token, refresh, and federated-admin authorization gaps (several with GHSA advisories) and a deep set of cloud-storage, migration, and native-format fidelity fixes.
