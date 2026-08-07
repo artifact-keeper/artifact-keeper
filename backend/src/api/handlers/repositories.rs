@@ -218,6 +218,33 @@ pub(crate) async fn require_repo_admin(
     }
 }
 
+/// Resolve the caller's repository visibility (issue #3081).
+///
+/// This is the single derivation of [`RepoVisibility`] from an authenticated
+/// (or anonymous) principal, shared by the repository listing and by every
+/// path that aggregates over OTHER repositories on the caller's behalf — today
+/// the virtual-repository storage total, whose members are separate
+/// repositories with their own ACLs.
+///
+/// * anonymous              -> public repositories only
+/// * global admin           -> everything
+/// * repo-scoped API token  -> exactly the token's allowed set (checked before
+///   the general user arm; admin tokens are handled above and bypass scope)
+/// * any other principal    -> public repositories plus their own grants
+pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibility {
+    match auth {
+        None => RepoVisibility::PublicOnly,
+        Some(a) if a.is_admin => RepoVisibility::All,
+        Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
+            a.allowed_repo_ids
+                .as_allowed_repo_ids()
+                .unwrap_or_default()
+                .to_vec(),
+        ),
+        Some(a) => RepoVisibility::User(a.user_id),
+    }
+}
+
 /// Ensure a repository is visible to the current user.
 ///
 /// Public repos are visible to everyone. Private repos require authentication
@@ -2184,21 +2211,10 @@ pub async fn list_repositories(
         .map(|t| parse_repo_type(t))
         .transpose()?;
 
-    let visibility = match &auth {
-        None => RepoVisibility::PublicOnly,
-        Some(a) if a.is_admin => RepoVisibility::All,
-        // Repo-scoped token: the listing must reflect ONLY the token's
-        // allowed repositories, not every repo the owning user can reach.
-        // Checked before the general `User` arm. Admin tokens are handled
-        // above and bypass scope restrictions.
-        Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
-            a.allowed_repo_ids
-                .as_allowed_repo_ids()
-                .unwrap_or_default()
-                .to_vec(),
-        ),
-        Some(a) => RepoVisibility::User(a.user_id),
-    };
+    // The listing must reflect ONLY what this caller may see — including, for
+    // a repo-scoped token, only the token's allowed repositories rather than
+    // every repo the owning user can reach.
+    let visibility = visibility_for_auth(auth.as_ref());
     let service = RepositoryService::new(state.db.clone());
     let (repos, total) = service
         .list(
@@ -2206,7 +2222,7 @@ pub async fn list_repositories(
             per_page as i64,
             format_filter,
             type_filter,
-            visibility,
+            visibility.clone(),
             query.q.as_deref(),
             query.project,
         )
@@ -2272,9 +2288,12 @@ pub async fn list_repositories(
         for id in &virtual_ids {
             storage_map.insert(*id, 0);
         }
+        // #3081: aggregate only over the members THIS caller may see — a
+        // member the caller cannot read must not disclose its byte size
+        // through the virtual's total.
         storage_map.extend(
             service
-                .get_virtual_storage_usage_batch(&virtual_ids)
+                .get_virtual_storage_usage_batch(&virtual_ids, &visibility)
                 .await?,
         );
     }
@@ -2793,7 +2812,11 @@ pub async fn get_repository(
     require_visible(&repo, &auth, &service).await?;
     // #2785: virtual repos report the union of their members' contents, not
     // their own (empty) rows, so the displayed total matches the child repos.
-    let storage_used = service.get_display_storage_usage(&repo).await?;
+    // #3081: that union is scoped to the members THIS caller may see, so the
+    // aggregate cannot disclose the size of a member whose own GET 404s.
+    let storage_used = service
+        .get_display_storage_usage(&repo, &visibility_for_auth(auth.as_ref()))
+        .await?;
     let auth_type =
         crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
 
@@ -3621,7 +3644,10 @@ pub async fn update_repository(
     }
 
     // #2785: virtual repos report the union of their members' contents.
-    let storage_used = service.get_display_storage_usage(&repo).await?;
+    // #3081: scoped to the members this caller may see.
+    let storage_used = service
+        .get_display_storage_usage(&repo, &visibility_for_auth(Some(&auth)))
+        .await?;
 
     state.event_bus.emit_repository_event(
         "repository.updated",
@@ -21050,7 +21076,7 @@ mod apt_validation_tests {
         for (id, tag, expected) in matrix {
             let oracle = if tag == "virt" || tag == "hollow" {
                 service
-                    .get_virtual_storage_usage(id)
+                    .get_virtual_storage_usage(id, &RepoVisibility::All)
                     .await
                     .expect("virtual oracle")
             } else {
@@ -21077,5 +21103,340 @@ mod apt_validation_tests {
                 .await;
         }
         tdh::cleanup_user(&pool, user_id).await;
+    }
+    // -----------------------------------------------------------------------
+    // #3081: a virtual repository's storage total must not disclose the byte
+    // size of member repositories the caller cannot read. Both aggregation
+    // paths are covered: the per-repo walk behind `GET /{key}` and the
+    // ledger-backed batch behind the listing (#3079).
+    // -----------------------------------------------------------------------
+
+    /// Read `storage_used_bytes` for `key` from `GET /{key}` (detail, the
+    /// per-repo walk) and from `GET /?q={prefix}` (listing, the batch), as
+    /// `auth`. Both must agree; the shared value is returned.
+    async fn virtual_total_seen_by_3081(
+        pool: &sqlx::PgPool,
+        prefix: &str,
+        key: &str,
+        auth: crate::api::middleware::auth::AuthExtension,
+    ) -> i64 {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let state = tdh::build_state(pool.clone(), "/tmp/vs3081-unused");
+        let router = tdh::router_with_auth(super::router(), state, auth.clone());
+        let (status, body) = tdh::send(router, tdh::get(format!("/{key}"))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "detail GET /{key} failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let detail: serde_json::Value = serde_json::from_slice(&body).expect("detail json");
+        let from_detail = detail["storage_used_bytes"]
+            .as_i64()
+            .expect("detail storage figure");
+
+        let state = tdh::build_state(pool.clone(), "/tmp/vs3081-unused");
+        let router = tdh::router_with_auth(super::router(), state, auth);
+        let (status, body) = tdh::send(router, tdh::get(format!("/?q={prefix}&per_page=50"))).await;
+        assert_eq!(status, StatusCode::OK, "listing failed");
+        let listing: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
+        let from_listing = listing["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .find(|item| item["key"].as_str() == Some(key))
+            .map(|item| item["storage_used_bytes"].as_i64().expect("listing figure"))
+            .expect("virtual repo present in listing");
+
+        assert_eq!(
+            from_detail, from_listing,
+            "detail (per-repo walk) and listing (ledger batch) must report the same \
+             caller-scoped total for {key}"
+        );
+        from_detail
+    }
+
+    /// Assert `GET /{key}` returns 404 for this caller (the existence-hiding
+    /// denial `require_visible` produces for an invisible private repo).
+    async fn assert_repo_hidden_3081(
+        pool: &sqlx::PgPool,
+        key: &str,
+        auth: crate::api::middleware::auth::AuthExtension,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let state = tdh::build_state(pool.clone(), "/tmp/vs3081-unused");
+        let router = tdh::router_with_auth(super::router(), state, auth);
+        let (status, _body) = tdh::send(router, tdh::get(format!("/{key}"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{key} must be hidden");
+    }
+
+    /// #3081 regression: the virtual total is aggregated ONLY over members the
+    /// caller may see.
+    ///
+    /// Fixture: private virtual `virt` with two private members — `vis`
+    /// (1,000 bytes) and `hidden` (500,000 bytes).
+    ///
+    /// * `outsider` holds the virtual only  -> 0 (both members hidden)
+    /// * `member` holds the virtual + `vis` -> 1,000 (`hidden`'s bytes excluded
+    ///   while `vis`'s are still counted — this is the control that a
+    ///   fix which always returned 0 would fail)
+    /// * `admin`                            -> 501,000, the full correct total
+    ///
+    /// Before the fix every caller saw 501,000 even though `GET` on both
+    /// members correctly 404s for `outsider` and on `hidden` for `member`.
+    #[tokio::test]
+    async fn test_virtual_storage_total_excludes_invisible_members_3081() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let prefix = format!("vs3081{}", &Uuid::new_v4().simple().to_string()[..12]);
+
+        let virt = seeded_repo_3078(&pool, &prefix, "virt", "virtual").await;
+        let vis = seeded_repo_3078(&pool, &prefix, "vis", "local").await;
+        let hidden = seeded_repo_3078(&pool, &prefix, "hidden", "local").await;
+
+        // `vis` holds 1,000 hosted bytes; `hidden` holds a 500,000-byte blob.
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+             checksum_sha256, content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, $3, $3, 1000, repeat('b', 64), 'application/octet-stream', $4, false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(vis)
+        .bind(format!("p/{prefix}"))
+        .bind(format!("cas/00/{}", Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .expect("insert visible member artifact");
+        sqlx::query(
+            "INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, 500000, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(hidden)
+        .bind(format!("sha256:{}", Uuid::new_v4().simple()))
+        .bind(format!("oci-blobs/{}", Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .expect("insert hidden member blob");
+
+        for (member, prio) in [(vis, 1), (hidden, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt)
+            .bind(member)
+            .bind(prio)
+            .execute(&pool)
+            .await
+            .expect("add virtual member");
+        }
+
+        let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
+        let (member_id, member_name) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, virt, outsider_id).await;
+        tdh::grant_repo_access(&pool, virt, member_id).await;
+        tdh::grant_repo_access(&pool, vis, member_id).await;
+
+        let virt_key = format!("{prefix}-virt");
+        let vis_key = format!("{prefix}-vis");
+        let hidden_key = format!("{prefix}-hidden");
+
+        // The premise: both members are genuinely invisible to `outsider`, and
+        // `hidden` is invisible to `member`.
+        let outsider = tdh::make_auth(outsider_id, &outsider_name);
+        assert_repo_hidden_3081(&pool, &vis_key, outsider.clone()).await;
+        assert_repo_hidden_3081(&pool, &hidden_key, outsider.clone()).await;
+        assert_repo_hidden_3081(&pool, &hidden_key, tdh::make_auth(member_id, &member_name)).await;
+
+        // A caller who can see the virtual but neither member learns nothing.
+        assert_eq!(
+            virtual_total_seen_by_3081(&pool, &prefix, &virt_key, outsider).await,
+            0,
+            "virtual total must not disclose bytes of members the caller cannot read"
+        );
+
+        // Control against an always-zero "fix": the visible member's bytes are
+        // still counted, and only the hidden member's are withheld.
+        assert_eq!(
+            virtual_total_seen_by_3081(
+                &pool,
+                &prefix,
+                &virt_key,
+                tdh::make_auth(member_id, &member_name)
+            )
+            .await,
+            1_000,
+            "a caller who can see one member must still get that member's bytes"
+        );
+
+        // Positive control: an admin sees every member, so the total is the
+        // full, correct union — unchanged from before the fix.
+        assert_eq!(
+            virtual_total_seen_by_3081(
+                &pool,
+                &prefix,
+                &virt_key,
+                tdh::admin_auth(admin_id, &admin_name)
+            )
+            .await,
+            501_000,
+            "a caller who can see all members must still get the full total"
+        );
+
+        for id in [virt, vis, hidden] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        for id in [outsider_id, member_id, admin_id] {
+            tdh::cleanup_user(&pool, id).await;
+        }
+    }
+    /// #3081: the caller-visibility derivation shared by the listing and the
+    /// virtual-storage aggregation. DB-free — it is a pure mapping from the
+    /// authenticated principal to a `RepoVisibility` variant.
+    #[test]
+    fn test_visibility_for_auth_maps_each_principal_3081() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::access_scope::AccessScope;
+
+        assert_eq!(visibility_for_auth(None), RepoVisibility::PublicOnly);
+
+        let user_id = Uuid::new_v4();
+        let admin = tdh::admin_auth(user_id, "admin-3081");
+        assert_eq!(visibility_for_auth(Some(&admin)), RepoVisibility::All);
+
+        let plain = tdh::make_auth(user_id, "user-3081");
+        assert_eq!(
+            visibility_for_auth(Some(&plain)),
+            RepoVisibility::User(user_id)
+        );
+
+        // A repo-scoped token is limited to exactly its allowed set, so a
+        // member outside that set contributes nothing to a virtual total.
+        let scoped_to = vec![Uuid::new_v4()];
+        let scoped = AuthExtension {
+            allowed_repo_ids: AccessScope::Restricted(scoped_to.clone()),
+            ..tdh::make_auth(user_id, "scoped-3081")
+        };
+        assert_eq!(
+            visibility_for_auth(Some(&scoped)),
+            RepoVisibility::Ids(scoped_to)
+        );
+
+        // An ADMIN repo-scoped token still resolves to `All`: the admin arm is
+        // matched first, mirroring the listing.
+        let scoped_admin = AuthExtension {
+            is_admin: true,
+            ..scoped
+        };
+        assert_eq!(
+            visibility_for_auth(Some(&scoped_admin)),
+            RepoVisibility::All
+        );
+    }
+    /// #3081, anonymous arm: a PUBLIC virtual repository is readable without
+    /// authentication, so its total must count only its PUBLIC members. This
+    /// also exercises the `RepoVisibility::PublicOnly` bind shape of the two
+    /// aggregation queries, whose visibility parameter is bound but not
+    /// referenced by the generated clause.
+    #[tokio::test]
+    async fn test_public_virtual_total_excludes_private_members_3081() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let prefix = format!("vp3081{}", &Uuid::new_v4().simple().to_string()[..12]);
+
+        let virt = seeded_repo_3078(&pool, &prefix, "virt", "virtual").await;
+        let open = seeded_repo_3078(&pool, &prefix, "open", "local").await;
+        let secret = seeded_repo_3078(&pool, &prefix, "secret", "local").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![virt, open])
+            .execute(&pool)
+            .await
+            .expect("publish virtual + open member");
+
+        for (repo, size) in [(open, 3_000i64), (secret, 900_000i64)] {
+            sqlx::query(
+                "INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(format!("sha256:{}", Uuid::new_v4().simple()))
+            .bind(size)
+            .bind(format!("oci-blobs/{}", Uuid::new_v4()))
+            .execute(&pool)
+            .await
+            .expect("insert member blob");
+        }
+        for (member, prio) in [(open, 1), (secret, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt)
+            .bind(member)
+            .bind(prio)
+            .execute(&pool)
+            .await
+            .expect("add virtual member");
+        }
+
+        let virt_key = format!("{prefix}-virt");
+        let state = tdh::build_state(pool.clone(), "/tmp/vp3081-unused");
+        let router = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(router, tdh::get(format!("/{virt_key}"))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "anonymous GET of a public virtual failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let detail: serde_json::Value = serde_json::from_slice(&body).expect("detail json");
+        assert_eq!(
+            detail["storage_used_bytes"].as_i64(),
+            Some(3_000),
+            "anonymous total must count the public member only, not the private one"
+        );
+
+        let state = tdh::build_state(pool.clone(), "/tmp/vp3081-unused");
+        let router = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(router, tdh::get(format!("/?q={prefix}&per_page=50"))).await;
+        assert_eq!(status, StatusCode::OK, "anonymous listing failed");
+        let listing: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
+        let listed = listing["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .find(|item| item["key"].as_str() == Some(virt_key.as_str()))
+            .map(|item| item["storage_used_bytes"].as_i64().expect("listing figure"))
+            .expect("public virtual present in anonymous listing");
+        assert_eq!(
+            listed, 3_000,
+            "anonymous listing must not disclose the private member's bytes"
+        );
+
+        for id in [virt, open, secret] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
     }
 }

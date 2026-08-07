@@ -400,6 +400,21 @@ pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -
     )
 }
 
+/// Split a [`VisibilityBind`] into the two concrete positional-bind shapes a
+/// visibility-filtered query can carry: a single `Uuid` (`PublicOnly` / `All` /
+/// `User`) or a `Uuid[]` (`Ids`).
+///
+/// Exactly one is `Some` per call; the unused one stays `None` and binds as a
+/// typed NULL, which the generated clause never references. Shared by the
+/// repository listing and by the virtual-repository storage aggregation
+/// (#3081) so both bind the visibility parameter identically.
+pub(crate) fn split_visibility_bind(bind: VisibilityBind) -> (Option<Uuid>, Option<Vec<Uuid>>) {
+    match bind {
+        VisibilityBind::User(uid) => (uid, None),
+        VisibilityBind::Ids(ids) => (None, Some(ids)),
+    }
+}
+
 /// Build the SQL visibility clause and optional user_id bind value for
 /// repository listing queries.
 ///
@@ -1038,10 +1053,7 @@ impl RepositoryService {
         // Split the visibility bind into the two concrete `$3` shapes. Exactly
         // one is `Some` per call; the unused one stays `None` and binds as a
         // typed NULL, which the clause never references.
-        let (user_id_bind, ids_bind): (Option<Uuid>, Option<Vec<Uuid>>) = match visibility_bind {
-            VisibilityBind::User(uid) => (uid, None),
-            VisibilityBind::Ids(ids) => (None, Some(ids)),
-        };
+        let (user_id_bind, ids_bind) = split_visibility_bind(visibility_bind);
 
         // -- fetch page --
         // NOTE: the project-filter bind index differs between the page query
@@ -1646,9 +1658,18 @@ impl RepositoryService {
     /// that did not match the combined total of its child repos. For a virtual
     /// repo we instead sum over the union of its resolvable member contents;
     /// every other repo type keeps the existing per-repo figure unchanged.
-    pub async fn get_display_storage_usage(&self, repo: &Repository) -> Result<i64> {
+    ///
+    /// `visibility` is the CALLER's repository visibility (issue #3081): the
+    /// virtual total is aggregated only over the members that caller is
+    /// allowed to see. It is unused for non-virtual repositories, whose own
+    /// figure is already gated by the handler's `require_visible` check.
+    pub async fn get_display_storage_usage(
+        &self,
+        repo: &Repository,
+        visibility: &RepoVisibility,
+    ) -> Result<i64> {
         if repo.repo_type == RepositoryType::Virtual {
-            self.get_virtual_storage_usage(repo.id).await
+            self.get_virtual_storage_usage(repo.id, visibility).await
         } else {
             self.get_storage_usage(repo.id).await
         }
@@ -1671,8 +1692,28 @@ impl RepositoryService {
     /// Uses the dynamic query API (not the `query!` macro) so this path does
     /// not depend on an updated offline SQLx cache, matching the convention
     /// used by the cycle-detection walk.
-    pub async fn get_virtual_storage_usage(&self, virtual_repo_id: Uuid) -> Result<i64> {
-        let usage: i64 = sqlx::query_scalar(
+    ///
+    /// # Caller-scoped (issue #3081)
+    ///
+    /// The leaf set is filtered through the SAME visibility predicate the
+    /// repository listing uses ([`build_visibility_clause_for`]), so a caller
+    /// granted the virtual parent but not a member never sees that member's
+    /// bytes folded into the total. Without it the aggregate was a byte-size
+    /// oracle for private repositories whose direct `GET` correctly 404s.
+    /// [`RepoVisibility::All`] (admins, and internal oracles/reconcilers)
+    /// produces the literal `true` clause, i.e. the unfiltered pre-#3081 sum.
+    /// Only the LEAVES are filtered — the membership walk itself is unchanged,
+    /// so an invisible intermediate virtual still contributes the leaves the
+    /// caller *can* see.
+    pub async fn get_virtual_storage_usage(
+        &self,
+        virtual_repo_id: Uuid,
+        visibility: &RepoVisibility,
+    ) -> Result<i64> {
+        let (visibility_clause, visibility_bind) =
+            build_visibility_clause_for(visibility, "leaf", 2);
+        let (user_id_bind, ids_bind) = split_visibility_bind(visibility_bind);
+        let sql = format!(
             r#"
             WITH RECURSIVE reachable(repo_id, depth) AS (
                 SELECT vrm.member_repo_id, 1
@@ -1686,13 +1727,14 @@ impl RepositoryService {
                    AND parent.repo_type = 'virtual'
                   JOIN virtual_repo_members vrm
                     ON vrm.virtual_repo_id = reachable.repo_id
-                 WHERE reachable.depth < $2
+                 WHERE reachable.depth < $3
             ),
             leaves AS (
                 SELECT DISTINCT reachable.repo_id AS id
                   FROM reachable
                   JOIN repositories leaf ON leaf.id = reachable.repo_id
                  WHERE leaf.repo_type <> 'virtual'
+                   AND ({visibility_clause})
             )
             SELECT COALESCE(SUM(bytes), 0)::BIGINT
             FROM (
@@ -1710,13 +1752,19 @@ impl RepositoryService {
                   FROM oci_blobs
                  WHERE repository_id IN (SELECT id FROM leaves)
             ) t
-            "#,
-        )
-        .bind(virtual_repo_id)
-        .bind(MAX_VIRTUAL_DEPTH as i32)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            "#
+        );
+        let query = sqlx::query_scalar(&sql).bind(virtual_repo_id);
+        // `$2` shape depends on the visibility variant (single uuid vs uuid[]).
+        let query = match &ids_bind {
+            Some(ids) => query.bind(ids.clone()),
+            None => query.bind(user_id_bind),
+        };
+        let usage: i64 = query
+            .bind(MAX_VIRTUAL_DEPTH as i32)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(usage)
     }
@@ -1747,11 +1795,19 @@ impl RepositoryService {
     pub async fn get_virtual_storage_usage_batch(
         &self,
         virtual_ids: &[Uuid],
+        visibility: &RepoVisibility,
     ) -> Result<std::collections::HashMap<Uuid, i64>> {
         if virtual_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        // #3081: same caller-scoped leaf filter as the per-repo walk — the
+        // listing must not disclose the byte size of a member the caller
+        // cannot see. `RepoVisibility::All` yields the literal `true` clause,
+        // so an admin listing is byte-identical to the pre-#3081 aggregate.
+        let (visibility_clause, visibility_bind) =
+            build_visibility_clause_for(visibility, "leaf", 2);
+        let (user_id_bind, ids_bind) = split_visibility_bind(visibility_bind);
+        let sql = format!(
             r#"
             WITH RECURSIVE reachable(root_id, repo_id, depth) AS (
                 SELECT vrm.virtual_repo_id, vrm.member_repo_id, 1
@@ -1765,26 +1821,33 @@ impl RepositoryService {
                    AND parent.repo_type = 'virtual'
                   JOIN virtual_repo_members vrm
                     ON vrm.virtual_repo_id = reachable.repo_id
-                 WHERE reachable.depth < $2
+                 WHERE reachable.depth < $3
             ),
             leaves AS (
                 SELECT DISTINCT reachable.root_id AS root_id, reachable.repo_id AS id
                   FROM reachable
                   JOIN repositories leaf ON leaf.id = reachable.repo_id
                  WHERE leaf.repo_type <> 'virtual'
+                   AND ({visibility_clause})
             )
             SELECT leaves.root_id,
                    COALESCE(SUM(l.hosted_bytes + l.proxy_bytes + l.oci_bytes), 0)::BIGINT
               FROM leaves
               LEFT JOIN repository_usage_ledger l ON l.repository_id = leaves.id
              GROUP BY leaves.root_id
-            "#,
-        )
-        .bind(virtual_ids)
-        .bind(MAX_VIRTUAL_DEPTH as i32)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            "#
+        );
+        let query = sqlx::query_as(&sql).bind(virtual_ids);
+        // `$2` shape depends on the visibility variant (single uuid vs uuid[]).
+        let query = match &ids_bind {
+            Some(ids) => query.bind(ids.clone()),
+            None => query.bind(user_id_bind),
+        };
+        let rows: Vec<(Uuid, i64)> = query
+            .bind(MAX_VIRTUAL_DEPTH as i32)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(rows.into_iter().collect())
     }
@@ -4852,7 +4915,7 @@ mod tests {
             // Fix: the combined figure equals the sum of the members, and the
             // display helper routes a virtual repo through that union.
             let combined = service
-                .get_virtual_storage_usage(virt.id)
+                .get_virtual_storage_usage(virt.id, &RepoVisibility::All)
                 .await
                 .expect("virtual combined");
             assert_eq!(
@@ -4862,7 +4925,7 @@ mod tests {
             );
             assert_eq!(
                 service
-                    .get_display_storage_usage(&virt)
+                    .get_display_storage_usage(&virt, &RepoVisibility::All)
                     .await
                     .expect("display"),
                 combined,
@@ -4871,7 +4934,7 @@ mod tests {
             // A non-virtual repo keeps its own per-repo figure via the helper.
             assert_eq!(
                 service
-                    .get_display_storage_usage(&m1)
+                    .get_display_storage_usage(&m1, &RepoVisibility::All)
                     .await
                     .expect("display m1"),
                 m1_usage
@@ -4942,7 +5005,7 @@ mod tests {
             // B counted once despite two reachable paths.
             assert_eq!(
                 service
-                    .get_virtual_storage_usage(v.id)
+                    .get_virtual_storage_usage(v.id, &RepoVisibility::All)
                     .await
                     .expect("v combined"),
                 1_000,
@@ -5058,12 +5121,12 @@ mod tests {
 
             let roots = [v.id, a.id, w.id, hollow.id];
             let batch = service
-                .get_virtual_storage_usage_batch(&roots)
+                .get_virtual_storage_usage_batch(&roots, &RepoVisibility::All)
                 .await
                 .expect("batch read");
             for (label, root) in [("v", v.id), ("a", a.id), ("w", w.id)] {
                 let oracle = service
-                    .get_virtual_storage_usage(root)
+                    .get_virtual_storage_usage(root, &RepoVisibility::All)
                     .await
                     .expect("per-repo oracle");
                 assert_eq!(
@@ -5086,7 +5149,7 @@ mod tests {
             );
             assert!(
                 service
-                    .get_virtual_storage_usage_batch(&[])
+                    .get_virtual_storage_usage_batch(&[], &RepoVisibility::All)
                     .await
                     .expect("empty batch")
                     .is_empty(),
@@ -5161,12 +5224,12 @@ mod tests {
             .expect("force b->a cycle edge");
 
             let batch = service
-                .get_virtual_storage_usage_batch(&[a.id, b.id])
+                .get_virtual_storage_usage_batch(&[a.id, b.id], &RepoVisibility::All)
                 .await
                 .expect("batch read under cycle");
             for (label, root) in [("a", a.id), ("b", b.id)] {
                 let oracle = service
-                    .get_virtual_storage_usage(root)
+                    .get_virtual_storage_usage(root, &RepoVisibility::All)
                     .await
                     .expect("per-repo oracle under cycle");
                 assert_eq!(oracle, 1_000, "cycle walk reaches the leaf once ({label})");
