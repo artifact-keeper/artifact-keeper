@@ -119,12 +119,6 @@ pub struct MigrationConfig {
     pub exclude_repos: Vec<String>,
     #[serde(default)]
     pub exclude_paths: Vec<String>,
-    /// Rename repos as they migrate: source key -> target key
-    /// (e.g. network-team-python -> network-pypi). Empty keeps source names.
-    /// Targets are validated like a hand-created repository key, and two
-    /// sources may not map onto one target.
-    #[serde(default)]
-    pub repo_mappings: std::collections::HashMap<String, String>,
     #[serde(default = "default_true")]
     pub include_users: bool,
     #[serde(default = "default_true")]

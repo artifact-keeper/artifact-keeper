@@ -137,14 +137,6 @@ pub(crate) fn should_transfer_artifacts(repo_type: RepositoryType) -> bool {
     repo_type != RepositoryType::Virtual
 }
 
-/// Source vs destination repo key for one repo's transfer. They differ only
-/// when the job renames a repo (`repo_mappings`); otherwise both hold the same
-/// key. Read the source registry by `source`, write Artifact Keeper by `target`.
-struct RepoKeys {
-    source: String,
-    target: String,
-}
-
 /// Conflict resolution strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictResolution {
@@ -404,13 +396,7 @@ impl MigrationWorker {
             );
             e
         })?;
-        let mut plan = resolve_repos_for_provisioning(&repos, &source_repos);
-        // Honor any source -> target repo renames before provisioning destinations,
-        // so the conflict pre-pass below reuses the renamed repo instead of the source.
-        if let Err(why) = apply_repo_mappings(&mut plan.resolved, &config.repo_mappings) {
-            tracing::error!(job_id = %job_id, error = %why, "Invalid repo_mappings; aborting job");
-            return Err(MigrationError::ConfigError(why));
-        }
+        let plan = resolve_repos_for_provisioning(&repos, &source_repos);
         for missing_key in &plan.missing {
             tracing::error!(
                 job_id = %job_id, repo = %missing_key,
@@ -426,11 +412,10 @@ impl MigrationWorker {
             total_failed += 1;
         }
 
-        // (RepoKeys, package_type). source/target differ only for renamed repos
-        // (repo_mappings); package_type is threaded into
+        // (target_key, package_type) — package_type is threaded into
         // process_repository_artifacts so the INSERT can populate name+version
         // using format-aware filename parsing (see artifact_metadata module).
-        let mut repos_to_process: Vec<(RepoKeys, String)> = Vec::with_capacity(plan.resolved.len());
+        let mut repos_to_process: Vec<(String, String)> = Vec::with_capacity(plan.resolved.len());
         // Virtual (Nexus `group`) repos whose membership still needs to be
         // correlated to the migrated AK members. Collected here and wired up
         // *after* the whole provisioning loop so every possible member repo
@@ -445,27 +430,10 @@ impl MigrationWorker {
             if migration_config.repo_type == RepositoryType::Virtual
                 && !migration_config.members.is_empty()
             {
-                // `members` are SOURCE-side names. `correlate_virtual_repo_members`
-                // resolves each one with `SELECT id FROM repositories WHERE key
-                // = $1`, which only works while target_key == source_key. Once a
-                // member is renamed, that lookup misses and the member is dropped
-                // with a warning -- the migrated group ends up empty, which is
-                // exactly the failure #2783 fixed. Worse, if an unrelated repo
-                // already occupies the source key, the lookup resolves to IT and
-                // the group aggregates a repository that was never part of it.
-                // Translate to target names here, where the mapping is known.
-                let mapped_members: Vec<String> = migration_config
-                    .members
-                    .iter()
-                    .map(|m| {
-                        config
-                            .repo_mappings
-                            .get(m)
-                            .cloned()
-                            .unwrap_or_else(|| m.clone())
-                    })
-                    .collect();
-                virtual_members_to_wire.push((migration_config.target_key.clone(), mapped_members));
+                virtual_members_to_wire.push((
+                    migration_config.target_key.clone(),
+                    migration_config.members.clone(),
+                ));
             }
             // Skip if a repo with the same key already exists with a
             // compatible type+format; recreate would be ambiguous and
@@ -482,17 +450,6 @@ impl MigrationWorker {
             if conflict.has_conflict {
                 match conflict.conflict_type {
                     Some(ConflictType::SameKey) => {
-                        // A rename lands in a repo the operator didn't name, so
-                        // say whose artifacts are about to join it.
-                        if migration_config.target_key != migration_config.source_key {
-                            tracing::warn!(
-                                job_id = %job_id,
-                                repo = %migration_config.source_key,
-                                target = %migration_config.target_key,
-                                "repo_mappings target already exists; merging this \
-                                 repository's artifacts into it",
-                            );
-                        }
                         provisioned_repos += 1;
                         tracing::info!(
                             job_id = %job_id, repo = %migration_config.target_key,
@@ -523,18 +480,6 @@ impl MigrationWorker {
                         continue;
                     }
                 }
-            } else if self.config.dry_run {
-                // dry_run only gated the storage put, so previewing a rename
-                // left the renamed repo behind, typo and all.
-                provisioned_repos += 1;
-                tracing::info!(
-                    job_id = %job_id,
-                    repo = %migration_config.target_key,
-                    source = %migration_config.source_key,
-                    format = %migration_config.package_type,
-                    repo_type = ?migration_config.repo_type,
-                    "Dry run: would provision destination repository",
-                );
             } else {
                 // Auto-provisioned repos inherit the server's default storage
                 // backend; without this they fall back to the column default
@@ -572,13 +517,7 @@ impl MigrationWorker {
             // provisioned above and its membership is correlated below, so only
             // the artifact transfer is skipped here.
             if should_transfer_artifacts(migration_config.repo_type) {
-                repos_to_process.push((
-                    RepoKeys {
-                        source: migration_config.source_key,
-                        target: migration_config.target_key,
-                    },
-                    migration_config.package_type,
-                ));
+                repos_to_process.push((migration_config.target_key, migration_config.package_type));
             }
         }
 
@@ -589,13 +528,6 @@ impl MigrationWorker {
         // dangling references). Without this the migrated virtual repo has zero
         // members and both the API and the UI error out over it (issue #2783).
         for (virtual_key, member_names) in &virtual_members_to_wire {
-            if self.config.dry_run {
-                tracing::info!(
-                    job_id = %job_id, repo = %virtual_key, members = ?member_names,
-                    "Dry run: would correlate virtual repository members",
-                );
-                continue;
-            }
             match self
                 .migration_service
                 .correlate_virtual_repo_members(virtual_key, member_names)
@@ -646,7 +578,7 @@ impl MigrationWorker {
         }
 
         // Process each repository
-        for (keys, package_type) in &repos_to_process {
+        for (repo_key, package_type) in &repos_to_process {
             // Check for pause/cancel
             if self.cancel_token.is_cancelled() {
                 tracing::info!(job_id = %job_id, "Migration cancelled by user");
@@ -661,22 +593,10 @@ impl MigrationWorker {
             }
 
             if include_artifacts {
-                // Storage is resolved for the destination (target) repo.
-                let repo_storage = match self.storage_for_repo(keys.target.as_str()).await {
-                    // A dry run doesn't create the destination, so there is no
-                    // row to resolve. The handle is a placeholder: the artifact
-                    // loop counts and moves on before reading or writing
-                    // anything through it.
-                    Err(_) if self.config.dry_run => self
-                        .storage_registry
-                        .backend_for(&StorageLocation {
-                            backend: self.storage_registry.default_backend().to_string(),
-                            path: self.config.staging_path.clone(),
-                        })
-                        .map_err(|e| MigrationError::StorageError(e.to_string()))?,
+                let repo_storage = match self.storage_for_repo(repo_key).await {
                     Ok(storage) => storage,
                     Err(e) => {
-                        tracing::error!(repo = %keys.target, error = %e, "Failed to resolve repository storage");
+                        tracing::error!(repo = %repo_key, error = %e, "Failed to resolve repository storage");
                         continue;
                     }
                 };
@@ -686,7 +606,7 @@ impl MigrationWorker {
                         job_id,
                         client.clone(),
                         repo_storage,
-                        keys,
+                        repo_key,
                         package_type,
                         date_from.as_deref(),
                         date_to.as_deref(),
@@ -701,10 +621,10 @@ impl MigrationWorker {
                     .await
                 {
                     Ok(_) => {
-                        tracing::info!(repo = %keys.target, "Repository artifacts processed");
+                        tracing::info!(repo = %repo_key, "Repository artifacts processed");
                     }
                     Err(e) => {
-                        tracing::error!(repo = %keys.target, error = %e, "Failed to process repository");
+                        tracing::error!(repo = %repo_key, error = %e, "Failed to process repository");
                         // Continue with other repos
                     }
                 }
@@ -744,9 +664,6 @@ impl MigrationWorker {
             completed = total_completed,
             failed = total_failed,
             skipped = total_skipped,
-            transferred_bytes = total_transferred,
-            dry_run = self.config.dry_run,
-            // `completed` is "would transfer" on a dry run; nothing was written.
             "Migration job completed"
         );
 
@@ -760,7 +677,7 @@ impl MigrationWorker {
         job_id: Uuid,
         client: Arc<dyn SourceRegistry>,
         repo_storage: Arc<dyn StorageBackend>,
-        keys: &RepoKeys,
+        repo_key: &str,
         package_type: &str,
         date_from: Option<&str>,
         date_to: Option<&str>,
@@ -772,8 +689,6 @@ impl MigrationWorker {
         transferred: &mut i64,
         progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
     ) -> Result<(), MigrationError> {
-        // Read the source registry by source key (== target for unrenamed repos).
-        let repo_key = keys.source.as_str();
         let mut offset = 0i64;
         let limit = self.config.batch_size.max(1);
         let mut pages_fetched = 0usize;
@@ -814,16 +729,6 @@ impl MigrationWorker {
 
                 let source_path = build_source_path(repo_key, &artifact_path);
                 let size = artifact.size.unwrap_or(0);
-
-                // Dry run: report what would move and stop here. First branch
-                // in the body on purpose, ahead of every DB read/write, the
-                // download, and the storage put.
-                if self.config.dry_run {
-                    *completed += 1;
-                    *transferred += size;
-                    continue;
-                }
-
                 // Keep sha256 and sha1 separate so verification can compare
                 // each digest against the corresponding locally computed
                 // value. Picking a single "checksum" field and computing
@@ -846,7 +751,7 @@ impl MigrationWorker {
                 // duplicates that already exist, which makes delta migrations work
                 let should_skip_duplicate = self
                     .check_artifact_duplicate(
-                        keys.target.as_str(),
+                        repo_key,
                         &artifact_path,
                         &source_path,
                         &ExpectedChecksums {
@@ -892,7 +797,7 @@ impl MigrationWorker {
                     item_id,
                     client.clone(),
                     repo_storage.clone(),
-                    keys,
+                    repo_key,
                     package_type,
                     &artifact_path,
                     &source_path,
@@ -980,7 +885,7 @@ impl MigrationWorker {
         item_id: Uuid,
         client: Arc<dyn SourceRegistry>,
         repo_storage: Arc<dyn StorageBackend>,
-        keys: &RepoKeys,
+        repo_key: &str,
         package_type: &str,
         artifact_path: &str,
         source_path: &str,
@@ -993,11 +898,9 @@ impl MigrationWorker {
         skipped: &mut i32,
         transferred: &mut i64,
     ) -> Result<(), MigrationError> {
-        // Read the source by source key; write the destination by target key.
-        let repo_key = keys.source.as_str();
         let should_skip = self
             .check_artifact_duplicate(
-                keys.target.as_str(),
+                repo_key,
                 artifact_path,
                 source_path,
                 &expected,
@@ -1018,7 +921,7 @@ impl MigrationWorker {
             .transfer_artifact(
                 client,
                 repo_storage,
-                keys,
+                repo_key,
                 package_type,
                 artifact_path,
                 include_metadata,
@@ -1377,7 +1280,7 @@ impl MigrationWorker {
         &self,
         client: Arc<dyn SourceRegistry>,
         repo_storage: Arc<dyn StorageBackend>,
-        keys: &RepoKeys,
+        repo_key: &str,
         package_type: &str,
         artifact_path: &str,
         include_metadata: bool,
@@ -1385,11 +1288,6 @@ impl MigrationWorker {
     ) -> Result<TransferResult, MigrationError> {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
-
-        // Read from the source by source key (download, properties, and the OCI
-        // referenced-content walk, which also fetches from source). Destination
-        // writes below (repo-id lookup, stored path) use keys.target.
-        let repo_key = keys.source.as_str();
 
         // Open the source as a chunked stream rather than `download_artifact`,
         // which buffers the whole body in memory (#1422).
@@ -1653,7 +1551,7 @@ impl MigrationWorker {
             // Insert artifact record into the database
             let repo_id: Option<(Uuid,)> =
                 sqlx::query_as("SELECT id FROM repositories WHERE key = $1")
-                    .bind(keys.target.as_str())
+                    .bind(repo_key)
                     .fetch_optional(&self.db)
                     .await?;
 
@@ -1702,7 +1600,7 @@ impl MigrationWorker {
                     &parsed.name,
                     parsed.version.as_deref(),
                     filename,
-                    keys.target.as_str(),
+                    repo_key,
                     artifact_path,
                 );
                 // Path-traversal guard: `path_str` is stored verbatim and
@@ -1950,7 +1848,7 @@ impl MigrationWorker {
             }
         }
 
-        let target_path = build_source_path(keys.target.as_str(), artifact_path);
+        let target_path = build_source_path(repo_key, artifact_path);
 
         tracing::debug!(
             path = %artifact_path,
@@ -2578,111 +2476,6 @@ pub(crate) fn resolve_repos_for_provisioning(
         }
     }
     plan
-}
-
-/// Reject a mapped target key that a hand-created repository would never be
-/// allowed to have.
-///
-/// `repo_mappings` is the first place an operator supplies a repository key to
-/// the import path directly, and the import path does NOT go through
-/// `validate_repository_key` — the only two call sites of that validator are
-/// repository create and repository rename. So without this check a mapping
-/// reaches `create_repository` verbatim and is written to `repositories.key`
-/// (no CHECK constraint) and, for filesystem backends, concatenated into
-/// `repositories.storage_path` as `{storage_base}/{target_key}`. A `..`
-/// segment therefore escapes the configured storage root and migrated bytes
-/// land outside it. `FilesystemStorage` sanitizes the object key but never the
-/// base path, so it cannot catch this downstream.
-///
-/// The rules are deliberately identical to `validate_repository_key`: an
-/// imported repository must be indistinguishable from one created by hand.
-fn validate_mapped_target_key(target: &str) -> Result<(), String> {
-    if target.is_empty() || target.len() > 128 {
-        return Err("must be 1-128 characters".to_string());
-    }
-    if !target
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        // Rejects `/`, whitespace, NUL and non-ASCII. The last matters on its
-        // own: a Cyrillic `а` renders identically to ASCII `a`, so a homoglyph
-        // target is indistinguishable from a real repository in the UI.
-        return Err("may only contain ASCII letters, digits, '-', '_' and '.'".to_string());
-    }
-    if target.starts_with('.') || target.starts_with('-') {
-        return Err("may not start with '.' or '-'".to_string());
-    }
-    if target.contains("..") {
-        return Err("may not contain '..'".to_string());
-    }
-    Ok(())
-}
-
-/// Point each mapped repo's `target_key` at its new name (e.g.
-/// network-team-python -> network-pypi) so it migrates under that key.
-/// Unmapped repos are left alone.
-///
-/// Fails the whole job on a bad mapping rather than skipping the offending
-/// repository: a migration that silently lands under a different name than the
-/// operator asked for is worse than one that refuses to start.
-pub(crate) fn apply_repo_mappings(
-    resolved: &mut [crate::services::migration_service::RepositoryMigrationConfig],
-    mappings: &std::collections::HashMap<String, String>,
-) -> Result<(), String> {
-    if mappings.is_empty() {
-        return Ok(());
-    }
-
-    // Two sources mapped onto one target would transfer both repositories'
-    // artifacts into the same destination, colliding by artifact path.
-    let mut seen_targets: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for (source, target) in mappings {
-        validate_mapped_target_key(target)
-            .map_err(|why| format!("repo_mappings target '{target}' is invalid: {why}"))?;
-        if let Some(other) = seen_targets.insert(target.as_str(), source.as_str()) {
-            return Err(format!(
-                "repo_mappings maps both '{other}' and '{source}' onto '{target}'; \
-                 two source repositories cannot share one destination"
-            ));
-        }
-    }
-
-    for cfg in resolved.iter_mut() {
-        if let Some(target) = mappings.get(&cfg.source_key) {
-            cfg.target_key = target.clone();
-        }
-    }
-
-    // Same collision against an unmapped repo in this job: the check above only
-    // sees the mappings, so `a -> b` with `b` also migrating slips past it.
-    let mut taken: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for cfg in resolved.iter() {
-        match taken.insert(cfg.target_key.as_str(), cfg.source_key.as_str()) {
-            Some(other) if other != cfg.source_key => {
-                return Err(format!(
-                    "'{other}' and '{}' both migrate to '{}'; two source repositories cannot \
-                     share one destination",
-                    cfg.source_key, cfg.target_key
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    // A mapping that matched nothing is a typo, an excluded repo, or a repo the
-    // source never reported. Staying silent means the operator gets a
-    // "successful" migration under the original names.
-    let unapplied: Vec<&String> = mappings
-        .keys()
-        .filter(|k| !resolved.iter().any(|c| &c.source_key == *k))
-        .collect();
-    if !unapplied.is_empty() {
-        tracing::warn!(
-            unapplied = ?unapplied,
-            "repo_mappings entries matched no repository in this job and were ignored",
-        );
-    }
-    Ok(())
 }
 
 /// Determine the final job status based on completed and failed counts.
@@ -4920,7 +4713,8 @@ mod tests {
 
     #[test]
     fn test_resolve_repos_target_key_matches_source_key_by_default() {
-        // resolve keeps target_key == source_key; renames happen in apply_repo_mappings.
+        // We don't currently rename repos; documenting the contract so a
+        // future change that breaks it gets caught here.
         let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
         let requested = vec!["maven-releases".to_string()];
         let plan = resolve_repos_for_provisioning(&requested, &source);
@@ -4928,336 +4722,6 @@ mod tests {
         let cfg = &plan.resolved[0];
         assert_eq!(cfg.source_key, "maven-releases");
         assert_eq!(cfg.target_key, "maven-releases");
-    }
-
-    /// A mapped target must clear the same bar a hand-created repository key
-    /// does. Without this, `..` reaches `build_storage_path`, which for a
-    /// filesystem backend concatenates `{storage_base}/{target_key}` -- so the
-    /// repository's storage root escapes the configured base and migrated bytes
-    /// are written outside it as the server process user.
-    #[test]
-    fn test_apply_repo_mappings_rejects_invalid_target_keys() {
-        let source = vec![mk_source_repo("src-repo", "LOCAL", "Generic")];
-        let requested = vec!["src-repo".to_string()];
-
-        for bad in [
-            "../../../../tmp/ak-escape", // path traversal out of storage_base
-            "slash/in/key",              // nested path
-            "-leading-hyphen",
-            ".leading-dot",
-            "has space",
-            "\u{0430}dmin-cyrillic", // homoglyph: renders as "admin-cyrillic"
-            "",
-        ] {
-            let mut plan = resolve_repos_for_provisioning(&requested, &source);
-            let mut mappings = std::collections::HashMap::new();
-            mappings.insert("src-repo".to_string(), bad.to_string());
-            let err = apply_repo_mappings(&mut plan.resolved, &mappings)
-                .expect_err(&format!("target {bad:?} must be rejected"));
-            assert!(
-                err.contains("invalid"),
-                "error should name the offending target: {err}"
-            );
-            // And the rename must not have been applied on the way out.
-            assert_eq!(plan.resolved[0].target_key, "src-repo");
-        }
-
-        // An over-long key is rejected too (repositories.key is VARCHAR(255)
-        // with no CHECK, so nothing downstream would catch it).
-        let mut plan = resolve_repos_for_provisioning(&requested, &source);
-        let mut mappings = std::collections::HashMap::new();
-        mappings.insert("src-repo".to_string(), "x".repeat(129));
-        assert!(apply_repo_mappings(&mut plan.resolved, &mappings).is_err());
-
-        // Control: a well-formed target still applies.
-        let mut plan = resolve_repos_for_provisioning(&requested, &source);
-        let mut mappings = std::collections::HashMap::new();
-        mappings.insert("src-repo".to_string(), "good-target_1.0".to_string());
-        apply_repo_mappings(&mut plan.resolved, &mappings).expect("valid target");
-        assert_eq!(plan.resolved[0].target_key, "good-target_1.0");
-    }
-
-    /// Two sources mapped onto one target would transfer both repositories'
-    /// artifacts into the same destination, colliding by artifact path.
-    #[test]
-    fn test_apply_repo_mappings_rejects_duplicate_targets() {
-        let source = vec![
-            mk_source_repo("repo-a", "LOCAL", "Generic"),
-            mk_source_repo("repo-b", "LOCAL", "Generic"),
-        ];
-        let requested = vec!["repo-a".to_string(), "repo-b".to_string()];
-        let mut plan = resolve_repos_for_provisioning(&requested, &source);
-        let mut mappings = std::collections::HashMap::new();
-        mappings.insert("repo-a".to_string(), "merged".to_string());
-        mappings.insert("repo-b".to_string(), "merged".to_string());
-        let err = apply_repo_mappings(&mut plan.resolved, &mappings)
-            .expect_err("two sources onto one target must be rejected");
-        assert!(err.contains("cannot share one destination"), "{err}");
-    }
-
-    /// `repo-a -> repo-b` while `repo-b` also migrates under its own key.
-    #[test]
-    fn test_apply_repo_mappings_rejects_target_taken_by_unmapped_repo() {
-        let source = vec![
-            mk_source_repo("repo-a", "LOCAL", "Generic"),
-            mk_source_repo("repo-b", "LOCAL", "Generic"),
-        ];
-        let requested = vec!["repo-a".to_string(), "repo-b".to_string()];
-        let mut plan = resolve_repos_for_provisioning(&requested, &source);
-        let mut mappings = std::collections::HashMap::new();
-        mappings.insert("repo-a".to_string(), "repo-b".to_string());
-        let err = apply_repo_mappings(&mut plan.resolved, &mappings)
-            .expect_err("mapping onto another migrating repo must be rejected");
-        assert!(err.contains("cannot share one destination"), "{err}");
-    }
-
-    #[test]
-    fn test_apply_repo_mappings_allows_duplicate_request_of_one_repo() {
-        let source = vec![mk_source_repo("repo-a", "LOCAL", "Generic")];
-        let requested = vec!["repo-a".to_string(), "repo-a".to_string()];
-        let mut plan = resolve_repos_for_provisioning(&requested, &source);
-        let mut mappings = std::collections::HashMap::new();
-        mappings.insert("repo-a".to_string(), "renamed".to_string());
-        apply_repo_mappings(&mut plan.resolved, &mappings).expect("self is not a collision");
-        assert!(plan.resolved.iter().all(|c| c.target_key == "renamed"));
-    }
-
-    #[test]
-    fn test_apply_repo_mappings_overrides_only_mapped_target_key() {
-        // Only the mapped repo's target_key changes; source_key and the rest stay put.
-        let source = vec![
-            mk_source_repo("network-team-python", "LOCAL", "Generic"),
-            mk_source_repo("bridge-release-candidates", "LOCAL", "Generic"),
-        ];
-        let requested = vec![
-            "network-team-python".to_string(),
-            "bridge-release-candidates".to_string(),
-        ];
-        let mut plan = resolve_repos_for_provisioning(&requested, &source);
-        let mut mappings = std::collections::HashMap::new();
-        mappings.insert(
-            "network-team-python".to_string(),
-            "network-pypi".to_string(),
-        );
-        apply_repo_mappings(&mut plan.resolved, &mappings).expect("valid mappings");
-
-        let renamed = plan
-            .resolved
-            .iter()
-            .find(|c| c.source_key == "network-team-python")
-            .unwrap();
-        assert_eq!(renamed.target_key, "network-pypi");
-        let untouched = plan
-            .resolved
-            .iter()
-            .find(|c| c.source_key == "bridge-release-candidates")
-            .unwrap();
-        assert_eq!(untouched.target_key, "bridge-release-candidates");
-    }
-
-    #[test]
-    fn test_apply_repo_mappings_empty_is_noop() {
-        // The common no-rename case: an empty mapping leaves every target_key
-        // as resolve set it (== source_key).
-        let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
-        let requested = vec!["maven-releases".to_string()];
-        let mut plan = resolve_repos_for_provisioning(&requested, &source);
-        apply_repo_mappings(&mut plan.resolved, &std::collections::HashMap::new())
-            .expect("empty mappings are always valid");
-        let cfg = plan.resolved.first().unwrap();
-        assert_eq!(cfg.target_key, cfg.source_key);
-        assert_eq!(cfg.target_key, "maven-releases");
-    }
-
-    /// A dry run reports what would move and writes nothing: no destination
-    /// repository, no `artifacts` row, no `migration_items`. The mock panics on
-    /// download, so entering the transfer path at all fails the test.
-    ///
-    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
-    #[tokio::test]
-    async fn test_process_job_dry_run_reports_counts_and_writes_nothing() {
-        use crate::api::handlers::test_db_helpers as tdh;
-        use crate::services::artifactory_client::{
-            AqlRange, AqlResponse, AqlResult, ArtifactoryError, PropertiesResponse,
-        };
-        use crate::services::source_registry::SourceRegistry;
-        use async_trait::async_trait;
-        use std::sync::Arc;
-
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-
-        const ARTIFACT_SIZE: i64 = 4242;
-
-        struct DryRunSource;
-
-        #[async_trait]
-        impl SourceRegistry for DryRunSource {
-            async fn ping(&self) -> Result<bool, ArtifactoryError> {
-                Ok(true)
-            }
-            async fn get_version(
-                &self,
-            ) -> Result<crate::services::artifactory_client::SystemVersionResponse, ArtifactoryError>
-            {
-                unimplemented!("not called by process_job")
-            }
-            async fn list_repositories(
-                &self,
-            ) -> Result<
-                Vec<crate::services::artifactory_client::RepositoryListItem>,
-                ArtifactoryError,
-            > {
-                // A group over the renamed repo too, so the dry run also has
-                // membership it would have to correlate.
-                let mut group = mk_source_repo("dry-group", "GROUP", "Generic");
-                group.members = vec!["dry-src".to_string()];
-                Ok(vec![mk_source_repo("dry-src", "LOCAL", "Generic"), group])
-            }
-            async fn list_artifacts(
-                &self,
-                repo_key: &str,
-                offset: i64,
-                limit: i64,
-            ) -> Result<AqlResponse, ArtifactoryError> {
-                // One short page ends pagination; reads must use the SOURCE key.
-                assert_eq!(repo_key, "dry-src", "source must be read by source key");
-                Ok(AqlResponse {
-                    results: vec![AqlResult {
-                        repo: repo_key.to_string(),
-                        path: "pkg/1.0".into(),
-                        name: "thing.tar.gz".into(),
-                        size: Some(ARTIFACT_SIZE),
-                        created: None,
-                        modified: None,
-                        sha256: None,
-                        actual_sha1: None,
-                    }],
-                    range: AqlRange {
-                        start_pos: offset,
-                        end_pos: offset + limit,
-                        total: 1,
-                    },
-                })
-            }
-            async fn download_artifact(
-                &self,
-                _repo_key: &str,
-                _path: &str,
-            ) -> Result<bytes::Bytes, ArtifactoryError> {
-                panic!("a dry run must not download anything");
-            }
-            async fn get_properties(
-                &self,
-                _repo_key: &str,
-                _path: &str,
-            ) -> Result<PropertiesResponse, ArtifactoryError> {
-                panic!("a dry run must not read artifact properties");
-            }
-            fn source_type(&self) -> &'static str {
-                "dry-run-mock"
-            }
-        }
-
-        let conn_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
-             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
-        )
-        .bind(format!("dry-run-conn-{}", Uuid::new_v4()))
-        .bind(vec![1u8, 2, 3])
-        .fetch_one(&pool)
-        .await
-        .expect("seed source connection");
-
-        // Rename on import, so the dry run also exercises the mapped target.
-        let target_key = format!("dry-dst-{}", Uuid::new_v4().simple());
-        let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
-             VALUES ($1, 'full', $2) RETURNING id",
-        )
-        .bind(conn_id)
-        .bind(serde_json::json!({
-            "include_repos": ["dry-src", "dry-group"],
-            "repo_mappings": { "dry-src": target_key },
-            "dry_run": true,
-        }))
-        .fetch_one(&pool)
-        .await
-        .expect("seed migration job");
-
-        let registry = Arc::new(StorageRegistry::new(
-            std::collections::HashMap::new(),
-            "filesystem".to_string(),
-        ));
-        let worker = MigrationWorker::new(
-            pool.clone(),
-            registry,
-            WorkerConfig {
-                dry_run: true,
-                ..WorkerConfig::default()
-            },
-            CancellationToken::new(),
-        );
-
-        let (tx, mut rx) = mpsc::channel(8);
-        worker
-            .process_job(
-                job_id,
-                Arc::new(DryRunSource),
-                ConflictResolution::Skip,
-                Some(tx),
-            )
-            .await
-            .expect("dry run must not fail the job");
-
-        let mut last: Option<ProgressUpdate> = None;
-        while let Ok(update) = rx.try_recv() {
-            last = Some(update);
-        }
-        let final_update = last.expect("final progress update");
-        assert_eq!(
-            final_update.completed, 1,
-            "dry run must report the artifact it would transfer"
-        );
-        assert_eq!(final_update.transferred_bytes, ARTIFACT_SIZE);
-        assert_eq!(final_update.failed, 0);
-
-        let repo_created: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM repositories WHERE key = $1)")
-                .bind(&target_key)
-                .fetch_one(&pool)
-                .await
-                .expect("repo existence check");
-        assert!(
-            !repo_created,
-            "dry run created the destination repository '{target_key}'"
-        );
-
-        let group_created: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM repositories WHERE key = 'dry-group')",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("group existence check");
-        assert!(!group_created, "dry run created the virtual repository");
-
-        let items: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM migration_items WHERE job_id = $1")
-                .bind(job_id)
-                .fetch_one(&pool)
-                .await
-                .expect("item count");
-        assert_eq!(items, 0, "dry run wrote migration_items");
-
-        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM source_connections WHERE id = $1")
-            .bind(conn_id)
-            .execute(&pool)
-            .await;
     }
 
     #[test]
@@ -5514,10 +4978,7 @@ mod tests {
             .transfer_artifact(
                 Arc::new(ChunkedMockSource),
                 storage.clone(),
-                &RepoKeys {
-                    source: "irrelevant-repo".into(),
-                    target: "irrelevant-repo".into(),
-                },
+                "irrelevant-repo",
                 "generic",
                 "irrelevant/path",
                 false,
@@ -5714,10 +5175,7 @@ mod tests {
             .transfer_artifact(
                 Arc::new(ChunkedMockSource),
                 storage.clone(),
-                &RepoKeys {
-                    source: "irrelevant-repo".into(),
-                    target: "irrelevant-repo".into(),
-                },
+                "irrelevant-repo",
                 "generic",
                 "irrelevant/path",
                 false,
@@ -6042,17 +5500,13 @@ mod tests {
         package_type: &str,
         path: &str,
     ) -> Result<TransferResult, MigrationError> {
-        let keys = RepoKeys {
-            source: repo_key.to_string(),
-            target: repo_key.to_string(),
-        };
         worker
             .transfer_artifact(
                 Arc::new(MapSource {
                     files: files.clone(),
                 }),
                 storage.clone(),
-                &keys,
+                repo_key,
                 package_type,
                 path,
                 false,
@@ -6062,72 +5516,6 @@ mod tests {
                 },
             )
             .await
-    }
-
-    /// A renamed repo (`repo_mappings`) reads from the source key but must
-    /// land under the *target* repo. `process_single_artifact` is the method
-    /// that threads the source/target split through the duplicate check,
-    /// transfer, and DB write, so drive it with `source != target` and assert
-    /// the bytes get stored under the target repo. DB-gated via `try_pool`.
-    #[tokio::test]
-    async fn test_process_single_artifact_reads_source_writes_target() {
-        use crate::api::handlers::test_db_helpers as tdh;
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        // The destination repo exists under the TARGET key only.
-        let (worker, storage, _tmp, repo_id, target_key) =
-            setup_repo_for_import(&pool, "mig-rename", "generic").await;
-
-        let body = bytes::Bytes::from_static(b"rename-body-3021");
-        let artifact_path = "pkg/1.0/file.txt";
-        let mut files = std::collections::HashMap::new();
-        files.insert(artifact_path.to_string(), body.clone());
-
-        // source != target: MapSource keys by path (ignores repo key), so the
-        // source key is arbitrary; the DB write must resolve by target_key.
-        let keys = RepoKeys {
-            source: "network-team-python".to_string(),
-            target: target_key.clone(),
-        };
-
-        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
-        worker
-            .process_single_artifact(
-                Uuid::new_v4(), // no migration_items row; the status UPDATE no-ops
-                Arc::new(MapSource {
-                    files: files.clone(),
-                }),
-                storage.clone(),
-                &keys,
-                "generic",
-                artifact_path,
-                artifact_path,
-                body.len() as i64,
-                ExpectedChecksums {
-                    sha256: None,
-                    sha1: None,
-                },
-                ConflictResolution::Overwrite,
-                false,
-                &mut completed,
-                &mut failed,
-                &mut skipped,
-                &mut transferred,
-            )
-            .await
-            .expect("process_single_artifact");
-
-        assert_eq!((completed, failed, skipped), (1, 0, 0));
-        assert_eq!(transferred, body.len() as i64);
-        // The artifact row landed under the TARGET repo, not the source key.
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
-                .bind(repo_id)
-                .fetch_one(&pool)
-                .await
-                .expect("count artifacts under target repo");
-        assert_eq!(count, 1);
     }
 
     /// End-to-end #2457 import over the Artifactory source layout: a config
