@@ -26554,9 +26554,13 @@ mod content_encoding_forwarding_tests {
         assert_eq!(&body[..], &plain[..]);
     }
 
-    async fn insert_repo(pool: &sqlx::PgPool, kind: &str, upstream: Option<&str>) -> Uuid {
+    async fn insert_repo(
+        pool: &sqlx::PgPool,
+        kind: &str,
+        upstream: Option<&str>,
+    ) -> (Uuid, String) {
         let id = Uuid::new_v4();
-        let key = format!("oci-ce-{}-{}", kind, &id.to_string()[..8]);
+        let key = format!("ocice{}{}", kind, &id.to_string()[..8]);
         sqlx::query(
             "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, \
              upstream_url, is_public) \
@@ -26570,23 +26574,37 @@ mod content_encoding_forwarding_tests {
         .execute(pool)
         .await
         .expect("insert repo");
-        id
+        (id, key)
     }
 
-    /// End-to-end over the VIRTUAL blob path, asserting GET and HEAD agree.
+    fn anon_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer anonymous"),
+        );
+        h
+    }
+
+    /// End-to-end over the REAL virtual blob handlers, asserting GET and HEAD
+    /// agree on the upstream coding.
     ///
-    /// The virtual-blob HEAD arm used to re-derive its headers by hand and had
-    /// already drifted from GET (it forwarded type and length but not the
-    /// coding). RFC 9110 §9.3.2 requires HEAD to send the same header fields
-    /// the matching GET would, so this asserts the coding on BOTH and that the
-    /// two header sets agree — with HEAD carrying no body.
+    /// This drives `handle_get_blob` / `handle_head_blob` themselves rather
+    /// than re-rendering a resolution in the test. Rendering it here would only
+    /// assert that the test agrees with itself: an earlier draft did exactly
+    /// that and still passed with the HEAD arm reverted, which is the hollow
+    /// shape #3149 asks us not to repeat.
+    ///
+    /// The HEAD arm used to re-derive its headers by hand and had already
+    /// drifted from GET: it forwarded the upstream content type and length but
+    /// not the coding. RFC 9110 §9.3.2 requires HEAD to send the same header
+    /// fields the matching GET would.
     #[tokio::test]
     async fn test_virtual_blob_get_and_head_agree_on_upstream_content_encoding() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
         let (_plain, coded) = tdh::gzip_fixture(b"virtual oci layer payload. ");
-        // Digest of the DECODED layer, as a real registry would advertise.
         let digest = format!(
             "sha256:{}",
             crate::api::handlers::proxy_helpers::sha256_hex(&bytes::Bytes::from(coded.clone()))
@@ -26609,8 +26627,8 @@ mod content_encoding_forwarding_tests {
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
 
-        let member_id = insert_repo(&pool, "remote", Some(&server.uri())).await;
-        let virt_id = insert_repo(&pool, "virtual", None).await;
+        let (member_id, _mkey) = insert_repo(&pool, "remote", Some(&server.uri())).await;
+        let (virt_id, virt_key) = insert_repo(&pool, "virtual", None).await;
         sqlx::query(
             "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
              VALUES ($1, $2, 1)",
@@ -26621,46 +26639,16 @@ mod content_encoding_forwarding_tests {
         .await
         .expect("link member");
 
-        let resolution = super::resolve_virtual_blob(&state, virt_id, "ceimage", &digest).await;
-        let get_headers = match resolution {
-            Some(VirtualBlobResolution::RemoteStream { result }) => {
-                let resp = super::build_oci_streaming_proxy_response(
-                    result,
-                    &digest,
-                    "application/octet-stream",
-                );
-                let headers = resp.headers().clone();
-                let (_s, body, _h) = tdh::collect_response(resp).await;
-                assert_eq!(&body[..], &coded[..], "GET must stream the coded layer");
-                headers
-            }
-            other => {
-                let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
-                    .bind(virt_id)
-                    .execute(&pool)
-                    .await;
-                panic!(
-                    "expected a RemoteStream resolution, got {:?}",
-                    other.is_some()
-                );
-            }
-        };
-
-        // Same resolution again, rendered the way the HEAD arm renders it.
-        let head_resp = match super::resolve_virtual_blob(&state, virt_id, "ceimage", &digest).await
-        {
-            Some(VirtualBlobResolution::RemoteStream { result }) => {
-                let (parts, _body) = super::build_oci_streaming_proxy_response(
-                    result,
-                    &digest,
-                    "application/octet-stream",
-                )
-                .into_parts();
-                Response::from_parts(parts, Body::empty())
-            }
-            _ => panic!("expected a RemoteStream resolution on the HEAD pass"),
-        };
-        let head_headers = head_resp.headers().clone();
+        // HEAD first: a GET would warm the proxy cache and let the HEAD land on
+        // a different (cached) branch, which is how the hand-rolled HEAD arm
+        // escaped its own guard.
+        let image = format!("{virt_key}/ceimage");
+        let head_resp =
+            super::handle_head_blob(&state, &anon_headers(), "http://ak.test", &image, &digest)
+                .await;
+        let get_resp =
+            super::handle_get_blob(&state, &anon_headers(), "http://ak.test", &image, &digest)
+                .await;
 
         for id in [virt_id, member_id] {
             let _ = sqlx::query(
@@ -26676,6 +26664,17 @@ mod content_encoding_forwarding_tests {
         }
         let _ = std::fs::remove_dir_all(&tmp);
 
+        let get_headers = get_resp.headers().clone();
+        let head_headers = head_resp.headers().clone();
+        let (get_status, get_body, _h) = tdh::collect_response(get_resp).await;
+        let (head_status, head_body, _h2) = tdh::collect_response(head_resp).await;
+
+        assert_eq!(get_status, StatusCode::OK, "virtual blob GET must succeed");
+        assert_eq!(
+            head_status,
+            StatusCode::OK,
+            "virtual blob HEAD must succeed"
+        );
         assert_eq!(
             tdh::header_str(&get_headers, CONTENT_ENCODING).as_deref(),
             Some("gzip"),
@@ -26691,7 +26690,7 @@ mod content_encoding_forwarding_tests {
             get_headers, head_headers,
             "HEAD must send exactly the header fields the matching GET sends",
         );
-        let (_s, head_body, _h) = tdh::collect_response(head_resp).await;
+        assert_eq!(&get_body[..], &coded[..], "GET must stream the coded layer");
         assert!(head_body.is_empty(), "HEAD must carry no body");
     }
 }
