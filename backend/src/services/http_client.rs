@@ -777,6 +777,7 @@ mod tests {
             .await
             .expect("bind test server");
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (body_finished_tx, body_finished_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept request");
@@ -797,6 +798,7 @@ mod tests {
                 .expect("write first byte");
             tokio::time::sleep(Duration::from_secs(20)).await;
             socket.write_all(b"K").await.expect("write second byte");
+            body_finished_tx.send(()).expect("signal body finished");
         });
 
         // Serialize the client build against `test_configured_proxy_host_is_
@@ -833,6 +835,13 @@ mod tests {
             .expect("request task reached response headers");
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(20)).await;
+        // `advance` makes the server's sleep ready but does not guarantee the
+        // server task runs before the request task. Wait for the second byte to
+        // be written so Tokio cannot auto-advance to the client's 30-second
+        // read-inactivity timeout first under a heavily loaded full test run.
+        body_finished_rx
+            .await
+            .expect("server finished response body");
 
         assert_eq!(request.await.expect("request task").as_ref(), b"OK");
         server.await.expect("server task");

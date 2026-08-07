@@ -1705,6 +1705,26 @@ async fn serve_virtual_metadata(
     let members =
         proxy_helpers::authorize_virtual_members(&state.permission_service, auth, members).await;
 
+    // Keep PEP 658 metadata resolution symmetric with the simple-index and
+    // distribution-download paths. A higher-priority local owner suppresses a
+    // lower-priority Remote member unless the requested distribution is an
+    // admitted Case-A platform wheel. Without this gate, a direct or stale
+    // `.metadata` URL could expose a remote-only Case-B version that neither
+    // the index advertises nor the download route serves.
+    let owning_local_min_priority =
+        proxy_helpers::pypi_virtual_isolates_name(&state.db, virtual_repo.id, normalized_project)
+            .await?;
+    let member_priorities = if owning_local_min_priority.is_some() {
+        proxy_helpers::fetch_virtual_member_priorities(&state.db, virtual_repo.id).await?
+    } else {
+        Default::default()
+    };
+    let owned_profile = if owning_local_min_priority.is_some() {
+        pypi_owned_wheel_profile(&state.db, &members, normalized_project).await
+    } else {
+        OwnedWheelProfile::default()
+    };
+
     for member in members {
         let member_info = proxy_helpers::repo_info_from_member(&member);
         if enforce_pypi_curation(state, &member_info, normalized_project, requested_version)
@@ -1715,6 +1735,20 @@ async fn serve_virtual_metadata(
         }
 
         let result = if member.repo_type == RepositoryType::Remote {
+            let remote_suppressed = match owning_local_min_priority {
+                Some(local_min) => {
+                    local_min
+                        < member_priorities
+                            .get(&member.id)
+                            .copied()
+                            .unwrap_or(i32::MAX)
+                        && !owned_profile.admits(filename)
+                }
+                None => false,
+            };
+            if remote_suppressed {
+                continue;
+            }
             match (&member.upstream_url, state.proxy_service.as_ref()) {
                 (Some(upstream_url), Some(proxy)) => {
                     serve_remote_metadata(
@@ -9486,6 +9520,96 @@ mod tests {
             &body[..],
             metadata,
             "virtual member must return wheel METADATA"
+        );
+    }
+
+    /// A higher-priority local owner without a `tracks` declaration isolates
+    /// its project from lower-priority remote-only versions. PEP 658 metadata
+    /// must enforce the same Case-B suppression as the simple index and wheel
+    /// download, including for direct or stale `.metadata` URLs.
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_suppresses_remote_only_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let local_wheel = "demo-1.0-cp39-cp39-manylinux_2_17_x86_64.whl";
+        let remote_wheel = "demo-2.0-cp39-cp39-win_amd64.whl";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(pep658_index_html(remote_wheel)),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{remote_wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Metadata-Version: 2.1\nName: demo\nVersion: 2.0\n"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (remote_id, _remote_key, remote_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make local owner public");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach higher-priority local owner");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)",
+        )
+        .bind(local_id)
+        .bind(format!("simple/{project}/{local_wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind("test-local-owner")
+        .bind("application/zip")
+        .bind(format!("local/{local_wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed local ownership artifact");
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{remote_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        cleanup_virtual_member(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "remote-only metadata must stay hidden when the local owner outranks the remote"
         );
     }
 
