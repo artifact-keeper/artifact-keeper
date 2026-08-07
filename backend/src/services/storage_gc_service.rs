@@ -4,6 +4,7 @@
 //! by any live artifact, deletes the physical storage files, and hard-deletes
 //! the artifact records from the database.
 
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
@@ -208,7 +209,18 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 /// publishes, whose claim row is inserted just before the object bytes are
 /// written. Scan and per-row locked re-check share this constant so the two
 /// predicates cannot drift (the #1180 lesson).
-const ORPHAN_MAVEN_FLAT_PREDICATE_SQL: &str = r#"
+///
+/// Guards 2 and 5 -- the `files[]` reference tests -- are built from the
+/// shared [`crate::services::maven_flat_attribution::metadata_files_name_key_sql`]
+/// fragment rather than an inline copy. Their inline copies matched snake_case
+/// `storage_key` only, while the GAV-grouped upload handler writes camelCase
+/// `storageKey`; in a `NOT EXISTS` guard a missed reference means DELETE, so
+/// every live GAV companion (and every checksum sidecar of one) read as
+/// unreferenced and was purged by the sweep while its parent artifact was
+/// still serving it (#3156).
+static ORPHAN_MAVEN_FLAT_PREDICATE_SQL: Lazy<String> = Lazy::new(|| {
+    format!(
+        r#"
 o.storage_key LIKE 'maven/%'
 AND o.created_at < NOW() - INTERVAL '1 hour'
 AND NOT EXISTS (
@@ -222,11 +234,7 @@ AND NOT EXISTS (
     JOIN artifacts pa ON pa.id = am.artifact_id
     JOIN repositories pr ON pr.id = pa.repository_id
     WHERE pr.storage_backend = o.storage_backend
-      AND jsonb_typeof(am.metadata->'files') = 'array'
-      AND EXISTS (
-        SELECT 1 FROM jsonb_array_elements(am.metadata->'files') f
-        WHERE f->>'storage_key' = o.storage_key
-      )
+      AND {files_match}
 )
 AND NOT EXISTS (
     SELECT 1 FROM artifacts a2
@@ -255,14 +263,20 @@ AND NOT EXISTS (
     JOIN repositories pr2 ON pr2.id = pa2.repository_id
     WHERE o.storage_key ~ '\.(md5|sha1|sha256|sha512)$'
       AND pr2.storage_backend = o.storage_backend
-      AND jsonb_typeof(am2.metadata->'files') = 'array'
-      AND EXISTS (
-        SELECT 1 FROM jsonb_array_elements(am2.metadata->'files') f2
-        WHERE f2->>'storage_key'
-              = regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', '')
-      )
+      AND {sidecar_base_files_match}
 )
-"#;
+"#,
+        files_match = crate::services::maven_flat_attribution::metadata_files_name_key_sql(
+            "am.metadata->'files'",
+            "o.storage_key",
+        ),
+        sidecar_base_files_match =
+            crate::services::maven_flat_attribution::metadata_files_name_key_sql(
+                "am2.metadata->'files'",
+                r"regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', '')",
+            ),
+    )
+});
 
 /// Result of a storage GC run.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2217,7 +2231,7 @@ impl StorageGcService {
             ORDER BY o.storage_key
             LIMIT $1
             "#,
-            predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL,
+            predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL.as_str(),
             scope = repo_scope_clause("o.repository_id", 2, repo_scope),
         );
         let mut query = sqlx::query(&sql).bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT);
@@ -2413,7 +2427,7 @@ async fn is_maven_flat_object_still_orphan(
               AND {predicate}
         ) AS still_orphan
         "#,
-        predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL,
+        predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL.as_str(),
     );
     let row = sqlx::query(&sql)
         .bind(storage_backend)
@@ -3701,6 +3715,111 @@ mod tests {
             "the SQL sidecar regex alternation must be built from \
              MAVEN_SIDECAR_SUFFIXES; expected {expected_alternation}"
         );
+    }
+
+    /// #3156: a live parent artifact's metadata `files[]` must anchor its
+    /// row-less companion against the flat-object sweep under BOTH spellings —
+    /// primarily camelCase `storageKey`, which is what the GAV-grouped upload
+    /// handler writes. The two guards this covers are `NOT EXISTS`, so a missed
+    /// reference means DELETE: pre-fix, the sweep collected a live companion
+    /// (guard 2) and its checksum sidecar (guard 5) for purge while the parent
+    /// was still serving them.
+    ///
+    /// This test FAILS if either production predicate is reverted to the
+    /// `jsonb_array_elements ... f->>'storage_key'` form, and its positive
+    /// control (a genuinely unreferenced key) keeps the fix from passing by
+    /// never collecting anything.
+    ///
+    /// The scan is repository-scoped, so this test does not race the
+    /// cluster-wide `test_run_gc_*` tests and needs no GC lock (#1493 pattern).
+    #[tokio::test]
+    async fn test_orphan_maven_flat_scan_spares_camelcase_referenced_companion_3156() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let uid = Uuid::new_v4().simple().to_string();
+
+        let camel_key = format!("maven/gav3156/{uid}/demo-1.0.0.pom");
+        let camel_sidecar = format!("{camel_key}.sha1");
+        let snake_key = format!("maven/gav3156/{uid}/demo-1.0.0-sources.jar");
+        let orphan_key = format!("maven/gav3156/{uid}/gone-9.9.9.pom");
+
+        seed_flat_parent_metadata(
+            &fixture.pool,
+            fixture.repo_id,
+            fixture.user_id,
+            &format!("maven/gav3156/{uid}/demo-1.0.0.jar"),
+            "storageKey",
+            &camel_key,
+        )
+        .await;
+        seed_flat_parent_metadata(
+            &fixture.pool,
+            fixture.repo_id,
+            fixture.user_id,
+            &format!("maven/gav3156/{uid}/legacy-1.0.0.jar"),
+            "storage_key",
+            &snake_key,
+        )
+        .await;
+        for key in [&camel_key, &camel_sidecar, &snake_key, &orphan_key] {
+            insert_flat_attribution_row(&fixture.pool, fixture.repo_id, key, 2).await;
+        }
+
+        let rows = service
+            .select_orphan_maven_flat_objects(Some(fixture.repo_id))
+            .await;
+        let collected: Vec<String> = rows
+            .expect("scan succeeds")
+            .iter()
+            .map(|r| r.get::<String, _>("storage_key"))
+            .collect();
+        fixture.teardown().await;
+
+        assert!(
+            !collected.contains(&camel_key),
+            "guard 2: a companion its live parent lists as camelCase \
+             `storageKey` must NOT be collected for purge (#3156); \
+             collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&camel_sidecar),
+            "guard 5: the checksum sidecar of a camelCase-listed companion \
+             must NOT be collected either (#3156); collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&snake_key),
+            "the snake_case spelling must keep being honoured too; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&orphan_key),
+            "positive control: a key no parent references must still be \
+             collected for purge; collected: {collected:?}"
+        );
+    }
+
+    /// Seed a parent `artifacts` row plus an `artifact_metadata` row whose
+    /// `files[]` array lists a row-less companion under `json_key_name`.
+    async fn seed_flat_parent_metadata(
+        pool: &PgPool,
+        repo_id: Uuid,
+        user_id: Uuid,
+        parent_key: &str,
+        json_key_name: &str,
+        companion_key: &str,
+    ) {
+        insert_maven_artifact_row(pool, repo_id, user_id, parent_key, false).await;
+        crate::api::handlers::test_db_helpers::attach_maven_files_metadata(
+            pool,
+            parent_key,
+            json_key_name,
+            companion_key,
+        )
+        .await;
     }
 
     /// Insert a Maven `artifacts` row pointing at `storage_key`
