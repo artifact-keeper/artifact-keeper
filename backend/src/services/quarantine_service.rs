@@ -1293,4 +1293,204 @@ mod tests {
             other => panic!("unscanned artifact under block_unscanned must 403, got {other:?}"),
         }
     }
+
+    /// Seed a scan row for `artifact_id` and return its id. `completed_at` is
+    /// set only for `completed` rows, mirroring the production writers.
+    #[cfg(test)]
+    async fn seed_scan(
+        pool: &PgPool,
+        artifact_id: Uuid,
+        repo_id: Uuid,
+        scan_type: &str,
+        status: &str,
+        critical_count: i32,
+        age_seconds: i64,
+    ) -> Uuid {
+        let scan_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (
+                id, artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                completed_at, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $6, 0, 0, 0, 0,
+                    CASE WHEN $5 = 'completed'
+                         THEN NOW() - make_interval(secs => $7::double precision)
+                    END,
+                    NOW() - make_interval(secs => $7::double precision))
+            "#,
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .bind(repo_id)
+        .bind(scan_type)
+        .bind(status)
+        .bind(critical_count)
+        .bind(age_seconds as f64)
+        .execute(pool)
+        .await
+        .expect("insert scan_result");
+        scan_id
+    }
+
+    /// End-to-end regression test for the download-gate fail-open.
+    ///
+    /// The three pure `post_scan_gates` unit tests in `policy_service` pin the
+    /// helper, but the bug never lived there — it lived in the wiring, so those
+    /// tests pass even with the fail-open restored. This one drives the real
+    /// `enforce_download_gate` against Postgres with the shape that actually
+    /// reproduces it, and fails if the gate inputs regress to a single
+    /// newest-row read.
+    ///
+    /// Fixture per iteration: an OLDER `grype` scan that completed with an
+    /// unacknowledged critical finding, then a NEWER row from a second engine
+    /// whose status is not `completed`. Pre-fix, that newer row switched the
+    /// `max_severity` check off entirely and the artifact was served 200.
+    #[tokio::test]
+    async fn test_enforce_download_gate_severity_survives_newer_non_completed_scan() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        // block_unscanned / block_on_fail are OFF so max_severity is provably
+        // the only gate that can produce the block.
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', false, false, true)",
+        )
+        .bind(format!("gate-3138-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert max_severity policy");
+
+        let mut outcomes = Vec::new();
+        for (i, newest) in ["pending", "running", "not_applicable", "failed"]
+            .iter()
+            .enumerate()
+        {
+            let aid = seed_row(&fx, "local", &format!("com/example/s{i}/1.0/s{i}-1.0.jar")).await;
+
+            // Older completed scan carrying a real, unacknowledged critical.
+            let scan_id = seed_scan(&fx.pool, aid, fx.repo_id, "grype", "completed", 1, 7200).await;
+            sqlx::query(
+                "INSERT INTO scan_findings \
+                 (scan_result_id, artifact_id, severity, title, cve_id, source, is_acknowledged) \
+                 VALUES ($1, $2, 'critical', 'seeded critical', 'CVE-3138-0001', 'test', false)",
+            )
+            .bind(scan_id)
+            .bind(aid)
+            .execute(&fx.pool)
+            .await
+            .expect("insert critical finding");
+
+            // Newer row from a second engine that never reaches `completed`.
+            seed_scan(&fx.pool, aid, fx.repo_id, "dependency", newest, 0, 60).await;
+
+            outcomes.push((*newest, enforce_download_gate(&fx.pool, aid).await));
+        }
+
+        // Negative control: identical shape, but zero findings on record. If
+        // this one blocks, the test above proves nothing (it would pass by
+        // blocking unconditionally).
+        let clean_aid = seed_row(&fx, "local", "com/example/clean/1.0/clean-1.0.jar").await;
+        seed_scan(
+            &fx.pool,
+            clean_aid,
+            fx.repo_id,
+            "grype",
+            "completed",
+            0,
+            7200,
+        )
+        .await;
+        seed_scan(
+            &fx.pool,
+            clean_aid,
+            fx.repo_id,
+            "dependency",
+            "pending",
+            0,
+            60,
+        )
+        .await;
+        let clean = enforce_download_gate(&fx.pool, clean_aid).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        for (newest, result) in outcomes {
+            match result {
+                Err(AppError::Authorization(_)) => {}
+                other => panic!(
+                    "a newer '{newest}' scan row must not disable the max_severity gate: an \
+                     unacknowledged critical is on record, expected 403, got {other:?}"
+                ),
+            }
+        }
+        assert!(
+            clean.is_ok(),
+            "an artifact with no findings must still download: {clean:?}"
+        );
+    }
+
+    /// The same fail-open one layer down: `scanner_service` writes findings
+    /// BEFORE flipping the row to `completed`, so a scanner that dies in
+    /// between leaves an unacknowledged critical on record with no completed
+    /// row anywhere. Keying the severity gate on "a completed scan exists"
+    /// alone would serve that artifact 200.
+    #[tokio::test]
+    async fn test_enforce_download_gate_grades_findings_from_a_crashed_scan() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', false, false, true)",
+        )
+        .bind(format!("gate-3138-crash-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert max_severity policy");
+
+        let aid = seed_row(&fx, "local", "com/example/crash/1.0/crash-1.0.jar").await;
+        // Findings landed, then the scanner died: the janitor reaped the row
+        // from `running` to `failed`. No completed row exists for this artifact.
+        let scan_id = seed_scan(&fx.pool, aid, fx.repo_id, "grype", "failed", 0, 3600).await;
+        sqlx::query(
+            "INSERT INTO scan_findings \
+             (scan_result_id, artifact_id, severity, title, cve_id, source, is_acknowledged) \
+             VALUES ($1, $2, 'critical', 'finding from crashed scan', 'CVE-3138-0002', 'test', false)",
+        )
+        .bind(scan_id)
+        .bind(aid)
+        .execute(&fx.pool)
+        .await
+        .expect("insert critical finding");
+
+        let result = enforce_download_gate(&fx.pool, aid).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!(
+                "an unacknowledged critical from a crashed scan must still be graded, \
+                 expected 403, got {other:?}"
+            ),
+        }
+    }
 }

@@ -827,8 +827,21 @@ mod tests {
             "no completed scan must still yield zero rows"
         );
         // MAX, not SUM: per-scanner aggregates cover overlapping finding sets, so
-        // summing would double-count a CVE that two engines both report.
-        assert!(LATEST_SCAN_COUNTS_SQL.contains("MAX(critical_count)"));
+        // summing would double-count a CVE that two engines both report. Pin
+        // every count column -- leaving one un-aggregated would silently narrow
+        // the verdict back to a single scanner for that severity.
+        for col in [
+            "critical_count",
+            "high_count",
+            "medium_count",
+            "low_count",
+            "findings_count",
+        ] {
+            assert!(
+                LATEST_SCAN_COUNTS_SQL.contains(&format!("MAX({col})")),
+                "{col} must be aggregated across scanners"
+            );
+        }
         assert!(!LATEST_SCAN_COUNTS_SQL.contains("SUM("));
 
         // The counts query feeds the same latest-completed-scan contract.
@@ -2229,6 +2242,128 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("failed to create test artifact")
+    }
+
+    /// Insert one scan row for `artifact`, optionally carrying an
+    /// unacknowledged finding with `cve`. `age_seconds` orders the rows.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_scan_with_counts(
+        pool: &PgPool,
+        artifact: Uuid,
+        repo: Uuid,
+        scan_type: &str,
+        critical: i32,
+        high: i32,
+        cve: Option<&str>,
+        age_seconds: i64,
+    ) -> Uuid {
+        let scan_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO scan_results (
+                artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                started_at, completed_at, created_at
+            )
+            VALUES ($1, $2, $3, 'completed', $4 + $5, $4, $5, 0, 0, 0,
+                    NOW() - make_interval(secs => $6::double precision),
+                    NOW() - make_interval(secs => $6::double precision),
+                    NOW() - make_interval(secs => $6::double precision))
+            RETURNING id
+            "#,
+        )
+        .bind(artifact)
+        .bind(repo)
+        .bind(scan_type)
+        .bind(critical)
+        .bind(high)
+        .bind(age_seconds as f64)
+        .fetch_one(pool)
+        .await
+        .expect("failed to insert scan_result");
+
+        if let Some(cve) = cve {
+            sqlx::query(
+                "INSERT INTO scan_findings \
+                 (scan_result_id, artifact_id, severity, title, cve_id, source, is_acknowledged) \
+                 VALUES ($1, $2, 'critical', 'seeded', $3, 'test', false)",
+            )
+            .bind(scan_id)
+            .bind(artifact)
+            .bind(cve)
+            .execute(pool)
+            .await
+            .expect("failed to insert scan_finding");
+        }
+        scan_id
+    }
+
+    /// Executes the rewritten `LATEST_SCAN_COUNTS_SQL` and `OPEN_CVES_SQL`
+    /// against a real database with TWO scanners.
+    ///
+    /// The sibling test in this module pins the SQL *strings*, which guards
+    /// against a revert but proves nothing about what Postgres actually
+    /// returns — and these are runtime-checked `query_as` calls, so a broken
+    /// query ships and fails at request time. This test is the behavioural
+    /// half: a clean scan that completed AFTER a critical-bearing one from a
+    /// different engine must not hide that engine's findings.
+    #[tokio::test]
+    async fn cve_summary_spans_every_scanner_not_just_the_last_to_finish() {
+        let Some(pool) = sig_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let svc = PromotionPolicyService::new(pool.clone());
+        let repo = seed_repo(&pool).await;
+
+        let artifact = seed_artifact(&pool, repo).await;
+        // Older engine found a critical + 2 highs...
+        seed_scan_with_counts(
+            &pool,
+            artifact,
+            repo,
+            "grype",
+            1,
+            2,
+            Some("CVE-3138-1111"),
+            3600,
+        )
+        .await;
+        // ...a different engine then finished clean, more recently.
+        seed_scan_with_counts(&pool, artifact, repo, "dependency", 0, 0, None, 60).await;
+
+        let summary = svc
+            .get_cve_summary(artifact)
+            .await
+            .expect("cve summary query failed")
+            .expect("an artifact with completed scans must have a summary");
+
+        assert_eq!(
+            summary.critical_count, 1,
+            "a later clean scan from a second engine must not hide the first engine's critical"
+        );
+        assert_eq!(summary.high_count, 2, "high counts must span scanners too");
+        assert!(
+            summary.open_cves.contains(&"CVE-3138-1111".to_string()),
+            "the older engine's open CVE must still reach the gate, got {:?}",
+            summary.open_cves
+        );
+
+        // "Never scanned" must stay distinguishable from "scanned and clean":
+        // an ungrouped aggregate without `HAVING COUNT(*) > 0` would return one
+        // all-zeros row here and read as a clean scan.
+        let unscanned = seed_artifact(&pool, repo).await;
+        assert!(
+            svc.get_cve_summary(unscanned)
+                .await
+                .expect("cve summary query failed")
+                .is_none(),
+            "an artifact with no completed scan must yield None, not a zeroed summary"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
     }
 
     /// Insert a minimal signing_keys row (no real key material is needed: the
