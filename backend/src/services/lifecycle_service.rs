@@ -30,12 +30,20 @@ use crate::storage::keys::prefix_matches;
 
 /// Build a max-age query with a shared effective timestamp expression.
 ///
-/// Mutable OCI tags reuse the same `artifacts` row for every manifest PUT.
-/// Their `created_at` therefore describes when the tag path was first seen,
-/// not when its current digest was pushed. `oci_tags.updated_at` is refreshed
-/// by every successful manifest PUT, so it is the authoritative age for an
-/// exact live `(repository, digest, image, tag)` mapping. All other artifacts
-/// retain the historical `created_at` behavior.
+/// An OCI manifest artifact ages from the matching logical reference row in
+/// `oci_tags`, keyed by `(repository, image, reference)`, rather than from the
+/// path-keyed artifact row's first-seen `created_at`. This applies to both
+/// human-readable tags and digest-shaped references. When no matching tag row
+/// exists, `COALESCE` retains the historical `artifacts.created_at` fallback
+/// used by non-OCI and legacy/content-addressed rows without tag metadata.
+///
+/// `oci_tags.updated_at` is deliberately a last-publish/cache-fill clock. Every
+/// successful hosted manifest PUT refreshes it, including a re-push of an
+/// unchanged digest because the tag upsert has no `IS DISTINCT FROM` guard. A
+/// valid Remote manifest cache fill (or refill after a local miss) that records
+/// a tag row also refreshes it; a normal warm Remote pull returns from local
+/// storage before the cache-upsert path and therefore does not extend
+/// retention.
 ///
 /// The tag row is reached with a `LEFT JOIN`, not a correlated subquery. The
 /// subquery form is quadratic here: `oci_tags_repository_id_name_tag_key` is
@@ -59,14 +67,15 @@ use crate::storage::keys::prefix_matches;
 ///
 /// The join deliberately does NOT also require
 /// `a.storage_key = 'oci-manifests/' || ot.manifest_digest`. That conjunct adds
-/// no identification -- path and version already pin the row -- and it converts
-/// a partial write into data loss: the `oci_tags` upsert is transactional while
-/// `upsert_manifest_artifact` is best-effort and only logs on failure, so the
-/// two tables can disagree on digest while the push still returns 201. With the
-/// conjunct, that disagreement makes the join miss, `COALESCE` falls back to the
-/// stale `created_at`, and a tag pushed seconds ago is soft-deleted -- exactly
-/// the bug this code exists to fix, silently resurrected on any partial write.
-/// Verified both ways against a live database.
+/// no identification for the logical reference -- path and version already pin
+/// the row -- and makes a partial write fail toward deletion: the `oci_tags`
+/// upsert is transactional while `upsert_manifest_artifact` is best-effort and
+/// only logs on failure, so the two tables can disagree on digest while the push
+/// still returns 201. With the conjunct, that disagreement makes the join miss,
+/// `COALESCE` falls back to the stale `created_at`, and the live reference's
+/// artifact row is soft-deleted despite its fresh tag mapping. The `oci_tags`
+/// row still protects the current manifest bytes, but the reference disappears
+/// from artifact-backed listings. Verified both ways against a live database.
 macro_rules! max_age_from_where {
     ($repository_predicate:literal, $days_parameter:literal) => {
         concat!(
@@ -1426,7 +1435,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_max_age_timestamp_uses_exact_oci_tag_update_with_created_fallback() {
+    fn test_max_age_timestamp_uses_oci_reference_update_with_created_fallback() {
         for sql in [
             MAX_AGE_SCOPED_SELECT_SQL,
             MAX_AGE_GLOBAL_SELECT_SQL,
@@ -1463,7 +1472,7 @@ mod tests {
             // created_at -- the very bug this predicate exists to fix.
             assert!(
                 !sql.contains("ot.manifest_digest"),
-                "joining on manifest_digest turns a partial write into data loss: {sql}"
+                "joining on manifest_digest makes a partial write fail toward deletion: {sql}"
             );
         }
     }
@@ -1478,6 +1487,295 @@ mod tests {
             assert!(!sql.contains("a.repository_id = $1"));
             assert!(sql.contains("days => $1::INT"));
         }
+    }
+
+    async fn insert_max_age_test_repository(conn: &mut sqlx::PgConnection) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = format!("max-age-test-{id}");
+        sqlx::query(
+            r#"
+            INSERT INTO repositories (id, key, name, storage_path, repo_type, format)
+            VALUES ($1, $2, $2, $3, 'local', 'docker')
+            "#,
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("/tmp/{key}"))
+        .execute(conn)
+        .await
+        .expect("failed to insert max-age test repository");
+        id
+    }
+
+    async fn insert_max_age_test_artifact(
+        conn: &mut sqlx::PgConnection,
+        repository_id: Uuid,
+        path: &str,
+        version: &str,
+        storage_key: &str,
+        days_ago: i32,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, created_at, updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, 123,
+                repeat('a', 64), 'application/octet-stream', $6,
+                NOW() - make_interval(days => $7::INT),
+                NOW() - make_interval(days => $7::INT)
+            )
+            "#,
+        )
+        .bind(id)
+        .bind(repository_id)
+        .bind(path)
+        .bind(format!("max-age-test-{id}"))
+        .bind(version)
+        .bind(storage_key)
+        .bind(days_ago)
+        .execute(conn)
+        .await
+        .expect("failed to insert max-age test artifact");
+        id
+    }
+
+    async fn insert_max_age_test_tag(
+        conn: &mut sqlx::PgConnection,
+        repository_id: Uuid,
+        image: &str,
+        reference: &str,
+        manifest_digest: &str,
+        days_ago: i32,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO oci_tags (
+                repository_id, name, tag, manifest_digest,
+                manifest_content_type, updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4,
+                'application/vnd.oci.image.manifest.v1+json',
+                NOW() - make_interval(days => $5::INT)
+            )
+            "#,
+        )
+        .bind(repository_id)
+        .bind(image)
+        .bind(reference)
+        .bind(manifest_digest)
+        .bind(days_ago)
+        .execute(conn)
+        .await
+        .expect("failed to insert max-age test OCI reference");
+    }
+
+    fn max_age_test_policy(repository_id: Option<Uuid>, days: i64) -> LifecyclePolicy {
+        let mut policy = make_policy(Uuid::new_v4(), "Max age coverage", "max_age_days");
+        policy.repository_id = repository_id;
+        policy.config = json!({"days": days});
+        policy
+    }
+
+    #[tokio::test]
+    async fn test_execute_max_age_scoped_uses_reference_timestamp_and_fallback() {
+        let Some(pool) = crate::testing::try_pool_with(1).await else {
+            return;
+        };
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("failed to begin test transaction");
+        let repository_id = insert_max_age_test_repository(&mut tx).await;
+
+        // Exact human-readable tag, digest-shaped reference, and partial-write
+        // digest drift all use the matching logical reference's fresh clock.
+        let exact_digest = format!("sha256:{}", "b".repeat(64));
+        let digest_reference = format!("sha256:{}", "c".repeat(64));
+        let drift_artifact_digest = format!("sha256:{}", "d".repeat(64));
+        let drift_tag_digest = format!("sha256:{}", "e".repeat(64));
+        let reference_cases = [
+            (
+                "exact-app",
+                "latest",
+                exact_digest.as_str(),
+                exact_digest.as_str(),
+            ),
+            (
+                "digest-app",
+                digest_reference.as_str(),
+                digest_reference.as_str(),
+                digest_reference.as_str(),
+            ),
+            (
+                "drift-app",
+                "latest",
+                drift_artifact_digest.as_str(),
+                drift_tag_digest.as_str(),
+            ),
+        ];
+        let mut retained_artifact_ids = Vec::new();
+        for (image, reference, artifact_digest, tag_digest) in reference_cases {
+            let artifact_id = insert_max_age_test_artifact(
+                &mut tx,
+                repository_id,
+                &format!("v2/{image}/manifests/{reference}"),
+                reference,
+                &format!("oci-manifests/{artifact_digest}"),
+                91,
+            )
+            .await;
+            insert_max_age_test_tag(&mut tx, repository_id, image, reference, tag_digest, 0).await;
+            retained_artifact_ids.push(artifact_id);
+        }
+
+        // Both rows reconstruct the same path, but only the first row has a tag
+        // equal to artifacts.version. The stale ambiguous row must not make the
+        // fresh logical reference eligible for deletion.
+        let ambiguous_digest = format!("sha256:{}", "f".repeat(64));
+        let ambiguous_artifact_id = insert_max_age_test_artifact(
+            &mut tx,
+            repository_id,
+            "v2/a/manifests/b/manifests/c",
+            "c",
+            &format!("oci-manifests/{ambiguous_digest}"),
+            91,
+        )
+        .await;
+        insert_max_age_test_tag(
+            &mut tx,
+            repository_id,
+            "a/manifests/b",
+            "c",
+            &ambiguous_digest,
+            0,
+        )
+        .await;
+        insert_max_age_test_tag(
+            &mut tx,
+            repository_id,
+            "a",
+            "b/manifests/c",
+            &ambiguous_digest,
+            91,
+        )
+        .await;
+        retained_artifact_ids.push(ambiguous_artifact_id);
+
+        // A structurally identical digest-shaped artifact without an oci_tags
+        // row keeps the historical created_at fallback and is the positive
+        // control that proves the predicate still selects old artifacts.
+        let untagged_digest = format!("sha256:{}", "9".repeat(64));
+        let untagged_artifact_id = insert_max_age_test_artifact(
+            &mut tx,
+            repository_id,
+            &format!("v2/untagged-app/manifests/{untagged_digest}"),
+            &untagged_digest,
+            &format!("oci-manifests/{untagged_digest}"),
+            91,
+        )
+        .await;
+
+        let policy = max_age_test_policy(Some(repository_id), 90);
+        let dry_run = LifecycleService::execute_max_age(&mut tx, &policy, true)
+            .await
+            .expect("scoped max-age dry-run failed");
+        assert_eq!(dry_run.artifacts_matched, 1);
+        assert_eq!(dry_run.artifacts_removed, 0);
+
+        let fallback_execution = LifecycleService::execute_max_age(&mut tx, &policy, false)
+            .await
+            .expect("scoped max-age fallback execution failed");
+        assert_eq!(fallback_execution.artifacts_matched, 1);
+        assert_eq!(fallback_execution.artifacts_removed, 1);
+        assert_eq!(fallback_execution.bytes_freed, 123);
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT is_deleted FROM artifacts WHERE id = $1")
+                .bind(untagged_artifact_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("failed to inspect untagged digest artifact")
+        );
+        for artifact_id in &retained_artifact_ids {
+            assert!(!sqlx::query_scalar::<_, bool>(
+                "SELECT is_deleted FROM artifacts WHERE id = $1"
+            )
+            .bind(artifact_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("failed to inspect retained OCI artifact"));
+        }
+
+        sqlx::query(
+            "UPDATE oci_tags SET updated_at = NOW() - INTERVAL '91 days' \
+             WHERE repository_id = $1",
+        )
+        .bind(repository_id)
+        .execute(&mut *tx)
+        .await
+        .expect("failed to backdate OCI references");
+
+        let executed = LifecycleService::execute_max_age(&mut tx, &policy, false)
+            .await
+            .expect("scoped max-age execution failed");
+        assert_eq!(executed.artifacts_matched, 4);
+        assert_eq!(executed.artifacts_removed, 4);
+        assert_eq!(executed.bytes_freed, 492);
+        for artifact_id in retained_artifact_ids {
+            assert!(sqlx::query_scalar::<_, bool>(
+                "SELECT is_deleted FROM artifacts WHERE id = $1"
+            )
+            .bind(artifact_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("failed to inspect expired OCI artifact"));
+        }
+
+        tx.rollback().await.expect("failed to roll back test data");
+    }
+
+    #[tokio::test]
+    async fn test_execute_max_age_global_uses_created_at_fallback() {
+        const ISOLATED_MAX_AGE_DAYS: i32 = 1_000_000;
+
+        let Some(pool) = crate::testing::try_pool_with(1).await else {
+            return;
+        };
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("failed to begin test transaction");
+        let repository_id = insert_max_age_test_repository(&mut tx).await;
+        let artifact_id = insert_max_age_test_artifact(
+            &mut tx,
+            repository_id,
+            &format!("global-max-age/{repository_id}"),
+            "1.0.0",
+            &format!("max-age-tests/{repository_id}"),
+            ISOLATED_MAX_AGE_DAYS + 1,
+        )
+        .await;
+        let policy = max_age_test_policy(None, i64::from(ISOLATED_MAX_AGE_DAYS));
+
+        let executed = LifecycleService::execute_max_age(&mut tx, &policy, false)
+            .await
+            .expect("global max-age execution failed");
+        assert_eq!(executed.artifacts_matched, 1);
+        assert_eq!(executed.artifacts_removed, 1);
+        assert_eq!(executed.bytes_freed, 123);
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT is_deleted FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("failed to inspect global artifact")
+        );
+
+        tx.rollback().await.expect("failed to roll back test data");
     }
 
     #[tokio::test]
