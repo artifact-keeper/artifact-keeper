@@ -40,7 +40,7 @@ env:
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
-  # DOCS-ONLY GATE
+  # DOCS-ONLY / BACKEND-CHANGE GATE
   # ════════════════════════════════════════════════════════════════════════════
 
   # Decides whether a PR touches anything beyond the docs paths that used to
@@ -57,6 +57,11 @@ jobs:
   # `code != 'false'` so an empty output also runs full CI. The file list
   # comes from the pulls/files API (server-side, same source GitHub's own
   # path filtering uses) — not from attacker-influenced checkout content.
+  #
+  # The same pass also classifies the PR as backend-touching or not (#3124).
+  # `backend` drives whether the integration suite runs on the PR; see
+  # `test-backend-integration` below. It is a strict subset of `code`: the
+  # docs arm is matched first, so `backend/README.md` is docs, not backend.
   changes:
     name: 🔍 Docs-Only Gate
     runs-on: ubuntu-latest
@@ -66,6 +71,7 @@ jobs:
       pull-requests: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      backend: ${{ steps.filter.outputs.backend }}
     steps:
       - name: Determine whether non-docs files changed
         id: filter
@@ -74,25 +80,45 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "backend=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename'); then
             echo "PR file listing failed — failing open to full CI" >&2
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "backend=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           code=false
+          backend=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            # Keep in sync with the `push` trigger's paths-ignore list above
-            # (CLAUDE.md is already covered by *.md).
+            # First arm: keep in sync with the `push` trigger's paths-ignore
+            # list above (CLAUDE.md is already covered by *.md).
+            #
+            # Second arm: anything that can change what the integration
+            # suites compile to, what schema they run against, or how the
+            # job itself is defined. Keep in sync with `detect-changes`'
+            # `backend` filter, minus docker/Dockerfile.backend (the
+            # integration job compiles with cargo, it does not build an
+            # image) and plus .github/workflows/ci.yml (so a change to this
+            # gate exercises the gate).
             case "$f" in
-              site/*|*.md|.beads/*|LICENSE) ;;
-              *) code=true ;;
+              site/*|*.md|.beads/*|LICENSE)
+                ;;
+              backend/*|Cargo.toml|Cargo.lock|.sqlx/*|.github/workflows/ci.yml)
+                code=true
+                backend=true
+                ;;
+              *)
+                code=true
+                ;;
             esac
           done <<< "$files"
           echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "backend=$backend" >> "$GITHUB_OUTPUT"
           echo "non-docs changes: $code"
+          echo "backend changes: $backend"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BUMP GATE
@@ -900,14 +926,41 @@ jobs:
           path: lcov.info
 
   # ════════════════════════════════════════════════════════════════════════════
-  # TIER 2: INTEGRATION (Main Branch Push Only)
+  # TIER 2: INTEGRATION (main/release push + every backend-touching PR)
   # ════════════════════════════════════════════════════════════════════════════
 
+  # Until #3124 this job was gated to `main` / `release/*` pushes only, so it
+  # could not gate a pull request: a PR could break every integration test and
+  # still show all-green, with the breakage surfacing only after merge on a
+  # `main` push that blocks nothing and notifies nobody. That is exactly how
+  # #2905 shipped — its own CI shows `🔗 Backend Integration Tests` SKIPPING
+  # next to a green `✅ CI Complete` — and `main` stayed red for 11 days
+  # (#3118).
+  #
+  # The push arm is unchanged. The new arm runs the same suite, unmodified, on
+  # pull requests that touch backend code (`needs.changes.outputs.backend`).
+  # Non-backend PRs — web, docs, scripts, IaC — still skip it and pay nothing.
+  #
+  # Fails open to RUNNING: the PR arm tests `!= 'false'`, so if the `changes`
+  # job dies outright and the output is empty the suite runs anyway. The
+  # matching enforcement is in `ci-complete`, which fails closed: on a
+  # backend-touching PR a skipped integration job is a hard failure, not a
+  # pass.
   test-backend-integration:
     name: 🔗 Backend Integration Tests
     runs-on: ak-ci-runners
     timeout-minutes: 40
-    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [changes, release-bump]
+    if: >-
+      ${{ !cancelled()
+          && needs.release-bump.outputs.bump_only != 'true'
+          && (
+               (
+                 (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+                 && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+               )
+               || (github.event_name == 'pull_request' && needs.changes.outputs.backend != 'false')
+             ) }}
     # Disable incremental codegen (#1679): consistent with check-rust and the
     # other heavy Rust compile jobs. Useless in CI's clean checkout, inflates
     # peak RSS.
@@ -1337,6 +1390,7 @@ jobs:
           RESULT_BUILD_OPENSCAP: ${{ needs.build-openscap-image.result }}
           RESULT_SECURITY: ${{ needs.security-audit.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          BACKEND_CHANGED: ${{ needs.changes.outputs.backend }}
           BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
         run: |
           set -euo pipefail
@@ -1404,7 +1458,25 @@ jobs:
           require_success "security-audit" "$RESULT_SECURITY"
 
           allow_skip "smoke-e2e" "$RESULT_SMOKE"
-          allow_skip "integration-tests" "$RESULT_INTEGRATION"
+
+          # Integration tests are REQUIRED on a pull request that touches
+          # backend code (#3124). A skip there is precisely the hole that let
+          # #2905 merge green and leave `main` red for 11 days (#3118), so it
+          # must fail rather than pass. Fails closed: an empty BACKEND_CHANGED
+          # (the `changes` job itself died) counts as backend-touching, which
+          # matches the job's own fail-open-to-running condition.
+          #
+          # A skip still passes everywhere else: docs-only and version-bump-only
+          # PRs, PRs that touch no backend path, and pushes to branches other
+          # than main / release/*, none of which schedule the job.
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" \
+                && "$docs_only" != "true" && "$bump_only" != "true" \
+                && "$BACKEND_CHANGED" != "false" ]]; then
+            require_success "integration-tests" "$RESULT_INTEGRATION"
+          else
+            allow_skip "integration-tests" "$RESULT_INTEGRATION"
+          fi
+
           allow_skip "build-backend-image" "$RESULT_BUILD_BACKEND"
           allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
 

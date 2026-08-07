@@ -25,11 +25,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib
 ```
 
-### Integration Tests (Tier 2) - Main & Release Branches Only
+### Integration Tests (Tier 2) - Main/Release Pushes & Backend PRs
 ```bash
 # Backend integration tests (requires PostgreSQL)
 cargo test --workspace
 ```
+CI runs this suite on pushes to `main` / `release/*` **and** on every pull
+request that touches `backend/**`, `Cargo.toml`, `Cargo.lock`, `.sqlx/**`, or
+`.github/workflows/ci.yml`. On such a PR a skipped integration job fails
+`✅ CI Complete` (#3124).
 
 ### Full E2E Tests (Tier 3) - Release/Manual Only
 ```bash
