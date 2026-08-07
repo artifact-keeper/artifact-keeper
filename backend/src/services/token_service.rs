@@ -192,11 +192,35 @@ pub(crate) fn is_token_revoked(revoked_at: Option<DateTime<Utc>>) -> bool {
 }
 
 /// Check if a set of scopes grants access for a required scope.
-/// Scopes match if the exact scope is present, or `*` or `admin` is present.
+///
+/// A held scope satisfies the requirement iff one of:
+///   * it is the exact required scope (`write:artifacts` -> `write:artifacts`),
+///   * it is `*` or `admin` (wildcard short-circuit),
+///   * the required scope is colon-form (`action:resource`) and the held scope
+///     is its bare action parent — a broad `write` covers the specific
+///     `write:artifacts` (#2989).
+///
+/// The direction is deliberately broad-covers-specific ONLY. A held
+/// colon-form scope never satisfies a bare requirement and never satisfies a
+/// colon-form requirement for a *different* resource: `write:artifacts` does
+/// NOT satisfy bare `write` (which still gates non-artifact writes such as
+/// repository settings) and does NOT satisfy `write:repositories`. Widening
+/// either of those directions would let a least-privilege resource token cross
+/// into other resources.
 pub(crate) fn scopes_grant_access(scopes: &[String], required_scope: &str) -> bool {
-    scopes.contains(&required_scope.to_string())
-        || scopes.contains(&"*".to_string())
-        || scopes.contains(&"admin".to_string())
+    // `*` / `admin` wildcard policy, in the #1316-canonical form (the
+    // `check-no-legacy-admin-scope.sh` gate forbids `.any(...)` closures that
+    // compare against "admin" and `== "*"` / `== "admin"` on one line).
+    let has_admin_wildcard =
+        scopes.iter().any(|s| s == "*") || scopes.contains(&"admin".to_string());
+    if scopes.iter().any(|s| s == required_scope) || has_admin_wildcard {
+        return true;
+    }
+    // Bare-parent satisfaction: held `write` covers required `write:artifacts`.
+    match required_scope.split_once(':') {
+        Some((parent, _resource)) => !parent.is_empty() && scopes.iter().any(|s| s == parent),
+        None => false,
+    }
 }
 
 /// API Token Service for managing programmatic access tokens.
@@ -747,6 +771,71 @@ mod tests {
         assert!(validate_scopes_pure(&scopes).is_err());
     }
 
+    #[test]
+    fn test_validate_scopes_bare_action_parents_rejected() {
+        // Bare action parents are NOT vocabulary. This is load-bearing (#2996):
+        // `scopes_grant_access` treats a held bare parent as covering every
+        // colon-form child of that action (#2989), so if bare `delete` were
+        // mintable a non-admin could ride it into the admin-only
+        // `delete:artifacts`. The mint-primitive backstop in
+        // `generate_api_token` relies on these being rejected here.
+        for bare in ["read", "write", "delete", "promote", "trigger"] {
+            assert!(
+                validate_scopes_pure(&[bare.to_string()]).is_err(),
+                "bare action parent `{bare}` must not be valid scope vocabulary",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Consistency invariant: mintability classification vs. grant semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn non_admin_mintable_scope_never_grants_an_admin_only_scope() {
+        // For every scope a non-admin is allowed to MINT (vocabulary entry
+        // that passes `enforce_admin_only_scopes` for a non-admin), that scope
+        // must not grant ACCESS (via `scopes_grant_access`) to any admin-only
+        // scope. This pins the interaction between the explicit
+        // `ADMIN_ONLY_SCOPES` classification and the broad-covers-specific
+        // parent rule (#2989): the invariant holds today because no bare
+        // action parent is in `ALLOWED_SCOPES`. If a future change adds a
+        // mintable scope that covers e.g. `delete:artifacts` (say, by adding
+        // bare `delete` to the vocabulary without classifying it admin-only),
+        // this test fails and forces a decision (#2996).
+        for scope in ALLOWED_SCOPES {
+            let one = vec![scope.to_string()];
+            if enforce_admin_only_scopes(&one, false).is_ok() {
+                for admin_only in ADMIN_ONLY_SCOPES {
+                    assert!(
+                        !scopes_grant_access(&one, admin_only),
+                        "non-admin-mintable scope `{scope}` grants admin-only `{admin_only}`",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_bare_parent_of_an_admin_only_scope_is_unmintable() {
+        // Companion invariant: for each colon-form ADMIN_ONLY scope, the bare
+        // parent that would cover it under the #2989 parent rule must be
+        // rejected by the mint vocabulary (or itself be admin-only). Otherwise
+        // a non-admin could mint the bare parent and hold effective
+        // admin-only authority without ever requesting the classified scope.
+        for admin_only in ADMIN_ONLY_SCOPES {
+            if let Some((parent, _resource)) = admin_only.split_once(':') {
+                let bare = vec![parent.to_string()];
+                let mintable_by_non_admin = validate_scopes_pure(&bare).is_ok()
+                    && enforce_admin_only_scopes(&bare, false).is_ok();
+                assert!(
+                    !mintable_by_non_admin,
+                    "bare parent `{parent}` of admin-only `{admin_only}` is mintable by a non-admin",
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // enforce_admin_only_scopes (privilege-escalation gate on token issuance)
     // -----------------------------------------------------------------------
@@ -972,6 +1061,57 @@ mod tests {
     fn test_scopes_grant_access_empty_scopes() {
         let scopes: Vec<String> = vec![];
         assert!(!scopes_grant_access(&scopes, "read:artifacts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #2989 bare-parent satisfaction matrix. Broad-covers-specific ONLY:
+    // held bare `write` satisfies colon-form `write:*` requirements, but a
+    // held colon-form scope satisfies neither a bare requirement nor a
+    // colon-form requirement for a different resource.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scopes_grant_access_bare_parent_satisfies_colon_required() {
+        // held global `write` -> satisfies required `write:artifacts`
+        let scopes = vec!["write".to_string()];
+        assert!(scopes_grant_access(&scopes, "write:artifacts"));
+        assert!(scopes_grant_access(&scopes, "write:repositories"));
+        // ...but not a different action family.
+        assert!(!scopes_grant_access(&scopes, "read:artifacts"));
+        assert!(!scopes_grant_access(&scopes, "delete:artifacts"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_colon_held_does_not_satisfy_bare_required() {
+        // held `write:artifacts` must NOT satisfy bare `write` — bare `write`
+        // still gates non-artifact writes (repo settings, groups, projects).
+        let scopes = vec!["write:artifacts".to_string()];
+        assert!(!scopes_grant_access(&scopes, "write"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_colon_held_does_not_cross_resources() {
+        // held `write:repositories` must NOT satisfy `write:artifacts` and
+        // vice versa: specific never satisfies a different specific.
+        let repo_write = vec!["write:repositories".to_string()];
+        assert!(!scopes_grant_access(&repo_write, "write:artifacts"));
+        let artifact_write = vec!["write:artifacts".to_string()];
+        assert!(!scopes_grant_access(&artifact_write, "write:repositories"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_read_never_satisfies_write() {
+        for held in [vec!["read".to_string()], vec!["read:artifacts".to_string()]] {
+            assert!(!scopes_grant_access(&held, "write"));
+            assert!(!scopes_grant_access(&held, "write:artifacts"));
+        }
+    }
+
+    #[test]
+    fn test_scopes_grant_access_bare_read_satisfies_colon_read() {
+        // Symmetric bare-parent rule for the read family.
+        let scopes = vec!["read".to_string()];
+        assert!(scopes_grant_access(&scopes, "read:artifacts"));
     }
 
     // -----------------------------------------------------------------------

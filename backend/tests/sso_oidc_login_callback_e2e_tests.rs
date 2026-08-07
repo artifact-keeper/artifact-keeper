@@ -77,8 +77,8 @@ use artifact_keeper_backend::services::auth_config_service::{
 };
 
 use common::sso_support::{
-    allow_private_sso_ip, build_state, ensure_sso_encryption_key, non_loopback_bind_ip, sso_app,
-    try_pool,
+    allow_private_sso_ip, audit_row_eventually, build_state, ensure_sso_encryption_key,
+    non_loopback_bind_ip, sso_app, try_pool,
 };
 
 // ===========================================================================
@@ -880,31 +880,17 @@ async fn test_oidc_callback_emits_audit_records() {
     assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
 
     let (user_id, _, _) = get_user(&pool, &external_id).await.expect("provisioned");
-    let (login_rows, _) = audit
-        .query(
-            Some(user_id),
-            Some("LOGIN"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-            50,
-        )
-        .await
-        .expect("audit query LOGIN");
-    assert!(
-        login_rows.iter().any(|r| {
-            r.resource_type == "user"
-                && r.details
-                    .as_ref()
-                    .and_then(|d| d.get("provider"))
-                    .and_then(|p| p.as_str())
-                    == Some("oidc")
-        }),
-        "a LOGIN audit row with details.provider=oidc must exist for the user"
-    );
+    // Poll: the LOGIN row is written by a detached task (#2905), so it is not
+    // guaranteed to be visible the instant the callback returns.
+    let login_ok = audit_row_eventually(&audit, Some(user_id), "LOGIN", |r| {
+        r.resource_type == "user"
+            && r.details
+                .as_ref()
+                .and_then(|d| d.get("provider"))
+                .and_then(|p| p.as_str())
+                == Some("oidc")
+    })
+    .await;
 
     // --- failure -> LOGIN_FAILED ---
     // auto_create_users=false + a brand-new sub -> authenticate_federated errors,
@@ -935,38 +921,38 @@ async fn test_oidc_callback_emits_audit_records() {
         resp.status()
     );
 
-    let (fail_rows, _) = audit
-        .query(
-            None,
-            Some("LOGIN_FAILED"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-            200,
-        )
-        .await
-        .expect("audit query LOGIN_FAILED");
-    assert!(
-        fail_rows.iter().any(|r| {
-            let details = r.details.as_ref();
-            details
-                .and_then(|d| d.get("provider"))
-                .and_then(|p| p.as_str())
-                == Some("oidc")
-                && details
-                    .and_then(|d| d.get("username"))
-                    .and_then(|u| u.as_str())
-                    == Some(fail_username.as_str())
-        }),
-        "a LOGIN_FAILED audit row with details.provider=oidc for the attempted username must exist"
-    );
+    // Same detached-write race as the LOGIN row above.
+    let fail_ok = audit_row_eventually(&audit, None, "LOGIN_FAILED", |r| {
+        let details = r.details.as_ref();
+        details
+            .and_then(|d| d.get("provider"))
+            .and_then(|p| p.as_str())
+            == Some("oidc")
+            && details
+                .and_then(|d| d.get("username"))
+                .and_then(|u| u.as_str())
+                == Some(fail_username.as_str())
+    })
+    .await;
 
+    // Clean up BEFORE asserting. A panicking assertion would otherwise skip
+    // these deletes and strand a provisioned user, and because a federated user
+    // with no `email` claim is stored with an empty-string email against the
+    // `users_email_key` UNIQUE constraint, that single leftover row makes every
+    // later no-email-claim test in this file fail with a duplicate-key error.
+    // Deferring the asserts keeps one failure from cascading into three.
     delete_user_by_sub(&pool, &external_id).await;
     delete_provider(&pool, provider_id).await;
     delete_provider(&pool, fail_provider).await;
+
+    assert!(
+        login_ok,
+        "a LOGIN audit row with details.provider=oidc must exist for the user"
+    );
+    assert!(
+        fail_ok,
+        "a LOGIN_FAILED audit row with details.provider=oidc for the attempted username must exist"
+    );
 }
 
 /// IdP error redirect (RFC 6749 4.1.2.1): `?error=access_denied` -> 401, and

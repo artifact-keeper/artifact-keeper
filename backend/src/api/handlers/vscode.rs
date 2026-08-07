@@ -103,10 +103,7 @@ async fn query_extensions(
                 "extensionName": ext_name,
                 "versions": [{
                     "version": version,
-                    "assetUri": format!(
-                        "/vscode/{}/extensions/{}/{}/{}/download",
-                        repo_key, publisher, ext_name, version
-                    ),
+                    "assetUri": build_vscode_download_url(&repo_key, publisher, ext_name, &version),
                 }],
             })
         })
@@ -140,7 +137,7 @@ async fn download_vsix(
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
 
-    let extension_id = format!("{}.{}", publisher, name);
+    let extension_id = build_extension_id(&publisher, &name);
 
     let artifact = sqlx::query!(
         r#"
@@ -243,7 +240,7 @@ async fn download_vsix(
 
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    let filename = format!("{}.{}-{}.vsix", publisher, name, version);
+    let filename = build_vsix_download_filename(&publisher, &name, &version);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -268,7 +265,7 @@ async fn publish_extension(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "vscode", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "vscode", "write:artifacts")?.user_id;
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -305,15 +302,14 @@ async fn publish_extension(
                 .into_response()
         })?;
 
-    let extension_id = format!("{}.{}", publisher, ext_name);
+    let extension_id = build_extension_id(&publisher, &ext_name);
 
     // Compute SHA256
     let mut hasher = Sha256::new();
     hasher.update(&body);
     let computed_sha256 = format!("{:x}", hasher.finalize());
 
-    let filename = format!("{}-{}.vsix", extension_id, ext_version);
-    let artifact_path = format!("{}/{}/{}", publisher, ext_name, filename);
+    let artifact_path = build_vscode_artifact_path(&publisher, &ext_name, &ext_version);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -332,7 +328,7 @@ async fn publish_extension(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file
-    let storage_key = format!("vscode/{}/{}/{}", publisher, ext_name, filename);
+    let storage_key = build_vscode_storage_key(&publisher, &ext_name, &ext_version);
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state
@@ -346,12 +342,7 @@ async fn publish_extension(
             .into_response()
     })?;
 
-    let vscode_metadata = serde_json::json!({
-        "publisher": publisher,
-        "extension_name": ext_name,
-        "version": ext_version,
-        "filename": filename,
-    });
+    let vscode_metadata = build_vscode_metadata(&publisher, &ext_name, &ext_version);
 
     let size_bytes = body.len() as i64;
 
@@ -409,12 +400,11 @@ async fn publish_extension(
         .status(StatusCode::CREATED)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "publisher": publisher,
-                "name": ext_name,
-                "version": ext_version,
-                "message": "Successfully published extension",
-            }))
+            serde_json::to_string(&build_vscode_publish_response(
+                &publisher,
+                &ext_name,
+                &ext_version,
+            ))
             .unwrap(),
         ))
         .unwrap())
@@ -430,7 +420,7 @@ async fn latest_version(
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
 
-    let extension_id = format!("{}.{}", publisher, name);
+    let extension_id = build_extension_id(&publisher, &name);
 
     let artifact = sqlx::query!(
         r#"
@@ -460,10 +450,7 @@ async fn latest_version(
         "version": version,
         "sha256": artifact.checksum_sha256,
         "size": artifact.size_bytes,
-        "downloadUrl": format!(
-            "/vscode/{}/extensions/{}/{}/{}/download",
-            repo_key, publisher, name, version
-        ),
+        "downloadUrl": build_vscode_download_url(&repo_key, &publisher, &name, &version),
     });
 
     Ok(Response::builder()
@@ -471,6 +458,68 @@ async fn latest_version(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// ID/path/URL builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build a VS Code extension ID from publisher and name.
+fn build_extension_id(publisher: &str, name: &str) -> String {
+    format!("{}.{}", publisher, name)
+}
+
+/// Build a VSIX filename from publisher, name, and version.
+fn build_vsix_filename(publisher: &str, name: &str, version: &str) -> String {
+    let extension_id = build_extension_id(publisher, name);
+    format!("{}-{}.vsix", extension_id, version)
+}
+
+/// Build the artifact path for a VS Code extension.
+fn build_vscode_artifact_path(publisher: &str, name: &str, version: &str) -> String {
+    let filename = build_vsix_filename(publisher, name, version);
+    format!("{}/{}/{}", publisher, name, filename)
+}
+
+/// Build the storage key for a VS Code extension.
+fn build_vscode_storage_key(publisher: &str, name: &str, version: &str) -> String {
+    let filename = build_vsix_filename(publisher, name, version);
+    format!("vscode/{}/{}/{}", publisher, name, filename)
+}
+
+/// Build the download URL for a VS Code extension.
+fn build_vscode_download_url(repo_key: &str, publisher: &str, name: &str, version: &str) -> String {
+    format!(
+        "/vscode/{}/extensions/{}/{}/{}/download",
+        repo_key, publisher, name, version
+    )
+}
+
+/// Build the Content-Disposition filename for a VSIX download.
+fn build_vsix_download_filename(publisher: &str, name: &str, version: &str) -> String {
+    format!("{}.{}-{}.vsix", publisher, name, version)
+}
+
+/// Build the metadata JSON for a published VS Code extension.
+fn build_vscode_metadata(publisher: &str, name: &str, version: &str) -> serde_json::Value {
+    let filename = build_vsix_filename(publisher, name, version);
+    serde_json::json!({
+        "publisher": publisher,
+        "extension_name": name,
+        "version": version,
+        "filename": filename,
+    })
+}
+
+/// Build the publish success response JSON.
+fn build_vscode_publish_response(publisher: &str, name: &str, version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "publisher": publisher,
+        "name": name,
+        "version": version,
+        "message": "Successfully published extension",
+    })
 }
 
 #[cfg(test)]
@@ -516,76 +565,6 @@ mod tests {
         teardown().await;
     }
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (test-only)
-    // -----------------------------------------------------------------------
-
-    /// Build a VS Code extension ID from publisher and name.
-    fn build_extension_id(publisher: &str, name: &str) -> String {
-        format!("{}.{}", publisher, name)
-    }
-
-    /// Build a VSIX filename from publisher, name, and version.
-    fn build_vsix_filename(publisher: &str, name: &str, version: &str) -> String {
-        let extension_id = build_extension_id(publisher, name);
-        format!("{}-{}.vsix", extension_id, version)
-    }
-
-    /// Build the artifact path for a VS Code extension.
-    fn build_vscode_artifact_path(publisher: &str, name: &str, version: &str) -> String {
-        let filename = build_vsix_filename(publisher, name, version);
-        format!("{}/{}/{}", publisher, name, filename)
-    }
-
-    /// Build the storage key for a VS Code extension.
-    fn build_vscode_storage_key(publisher: &str, name: &str, version: &str) -> String {
-        let filename = build_vsix_filename(publisher, name, version);
-        format!("vscode/{}/{}/{}", publisher, name, filename)
-    }
-
-    /// Build the download URL for a VS Code extension.
-    fn build_vscode_download_url(
-        repo_key: &str,
-        publisher: &str,
-        name: &str,
-        version: &str,
-    ) -> String {
-        format!(
-            "/vscode/{}/extensions/{}/{}/{}/download",
-            repo_key, publisher, name, version
-        )
-    }
-
-    /// Build the Content-Disposition filename for a VSIX download.
-    fn build_vsix_download_filename(publisher: &str, name: &str, version: &str) -> String {
-        format!("{}.{}-{}.vsix", publisher, name, version)
-    }
-
-    /// Build the metadata JSON for a published VS Code extension.
-    fn build_vscode_metadata(publisher: &str, name: &str, version: &str) -> serde_json::Value {
-        let filename = build_vsix_filename(publisher, name, version);
-        serde_json::json!({
-            "publisher": publisher,
-            "extension_name": name,
-            "version": version,
-            "filename": filename,
-        })
-    }
-
-    /// Build the publish success response JSON.
-    fn build_vscode_publish_response(
-        publisher: &str,
-        name: &str,
-        version: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "publisher": publisher,
-            "name": name,
-            "version": version,
-            "message": "Successfully published extension",
-        })
-    }
 
     // -----------------------------------------------------------------------
     // extract_credentials — Bearer token
@@ -834,6 +813,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -857,6 +837,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };

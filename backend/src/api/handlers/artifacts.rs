@@ -101,6 +101,8 @@ struct ArtifactByIdRow {
     checksum_sha256: String,
     content_type: String,
     created_at: chrono::DateTime<chrono::Utc>,
+    quarantine_status: Option<String>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -140,7 +142,8 @@ pub async fn get_artifact(
 ) -> Result<Json<ArtifactResponse>> {
     let artifact: ArtifactByIdRow = sqlx::query_as(
         "SELECT a.id, r.key AS repository_key, a.path, a.name, a.version, \
-                a.size_bytes, a.checksum_sha256, a.content_type, a.created_at \
+                a.size_bytes, a.checksum_sha256, a.content_type, a.created_at, \
+                a.quarantine_status, a.quarantine_until \
          FROM artifacts a \
          JOIN repositories r ON r.id = a.repository_id \
          WHERE a.id = $1 AND a.is_deleted = false",
@@ -191,6 +194,12 @@ pub async fn get_artifact(
         // the by-id surface leaves it unset.
         revision: None,
         version_label: None,
+        // Surface the resolved row's quarantine state, matching the listing
+        // (#2940). Same joined query — no extra round-trip.
+        quarantine_status: crate::api::handlers::repositories::quarantine_status_label(
+            artifact.quarantine_status.as_deref(),
+        ),
+        quarantine_until: artifact.quarantine_until,
     }))
 }
 
@@ -350,6 +359,8 @@ mod tests {
             analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], id.to_string());
@@ -387,6 +398,8 @@ mod tests {
             analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         let obj = json.as_object().unwrap();
@@ -428,6 +441,8 @@ mod tests {
             analyzable: false,
             cache_cached_at: None,
             cache_expires_at: None,
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["size_bytes"], 0);
@@ -545,6 +560,8 @@ mod tests {
             analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let debug_str = format!("{:?}", resp);
         assert!(debug_str.contains("ArtifactResponse"));

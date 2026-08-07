@@ -35,6 +35,14 @@ BOOTSTRAP_MARKER="/shared/.dtrack-bootstrapped"
 PUBLIC_ID_MARKER="/shared/.dtrack-publicid"
 FORCE_ROTATE="${DTRACK_INIT_FORCE_ROTATE:-false}"
 
+# Owner for the API key file (#2865). This init container runs as root, but
+# the backend reads the key as the non-root `artifact` user (UID 1001, GID 0
+# — see docker/Dockerfile.backend). A root:root 0600 file on the shared
+# volume is unreadable by UID 1001, so the Dependency-Track integration
+# fails. Hand the file to the backend UID and keep it owner-only (0600)
+# rather than widening the mode to group/world read.
+KEY_OWNER="${DTRACK_INIT_KEY_OWNER:-1001:0}"
+
 # Opt-in OSV mirror (#1972). The bundled bootstrap only enables the NVD mirror,
 # which matches by CPE, so purl-based application dependencies (Maven, PyPI, npm,
 # Go, NuGet, RubyGems, crates.io, Packagist, ...) get few or no findings. OSV
@@ -92,7 +100,22 @@ ensure_team_permissions() {
   done
 }
 
+# Make the key file readable by the backend and only the backend: owner =
+# backend UID (KEY_OWNER), mode 0600. chown needs root; when the script runs
+# unprivileged (regression tests) the file is already owned by the writer,
+# so only the mode is enforced.
+ensure_key_file_access() {
+  if [ "$(id -u)" = "0" ]; then
+    chown "$KEY_OWNER" "$1"
+  fi
+  chmod 600 "$1"
+}
+
 finish_existing_key_path() {
+  # Self-heal deployments whose key file was written root:root 0600 by an
+  # earlier version of this script (#2865): fix owner/mode on the existing
+  # file without rotating the key.
+  ensure_key_file_access "$API_KEY_FILE"
   : > "$BOOTSTRAP_MARKER" 2>/dev/null || true
   echo "[dtrack-init] Existing API key preserved; done"
   exit 0
@@ -282,10 +305,12 @@ TMP_KEY_FILE="$API_KEY_FILE.tmp"
   umask 077
   printf '%s' "$API_KEY" > "$TMP_KEY_FILE"
 )
-chmod 600 "$TMP_KEY_FILE"
+# Set owner + mode on the temp file BEFORE the atomic rename so the key is
+# never observable at its final path with the wrong owner or mode (#2865).
+ensure_key_file_access "$TMP_KEY_FILE"
 mv "$TMP_KEY_FILE" "$API_KEY_FILE"
 
-echo "[dtrack-init] API key written to $API_KEY_FILE (mode 0600)"
+echo "[dtrack-init] API key written to $API_KEY_FILE (owner $KEY_OWNER, mode 0600)"
 
 TMP_PUBLIC_ID_MARKER="$PUBLIC_ID_MARKER.tmp"
 (

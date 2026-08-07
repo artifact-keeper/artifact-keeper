@@ -38,7 +38,7 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
-use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::age_gate_service::AgeGateService;
 use crate::services::upstream_metadata::metadata_http_client;
 use chrono::Utc;
 
@@ -233,6 +233,22 @@ pub(crate) fn version_from_pypi_filename(filename: &str) -> Option<String> {
     None
 }
 
+/// The distribution a request ultimately refers to, with any PEP 658
+/// `.metadata` suffix removed.
+///
+/// ALL trailing `.metadata` suffixes are stripped, not just one. The serve path
+/// resolves a metadata request back to a distribution the same way, and the
+/// curation gate must evaluate the distribution that will actually be served:
+/// when the two disagree, a request naming the same wheel through a different
+/// suffix shape (`…-1.0-py3-none-any.whl.metadata.metadata`) is version-parsed
+/// as `None` — which skips version-constrained rules — while still resolving to
+/// the blocked wheel, serving a blocked version's metadata. Both callers in
+/// `download_or_metadata` share one call to this function so they cannot drift
+/// apart again.
+fn pypi_distribution_filename(filename: &str) -> &str {
+    filename.trim_end_matches(".metadata")
+}
+
 /// Curation gate for PyPI proxy requests (#2912). Returns
 /// `Err(403 response)` when a block rule matches.
 ///
@@ -256,32 +272,10 @@ async fn enforce_pypi_curation(
     project: &str,
     version: Option<&str>,
 ) -> Result<(), Response> {
-    if !repo.curation_enabled || !matches!(repo.repo_type.as_str(), "remote" | "virtual") {
-        return Ok(());
-    }
-    let svc = crate::services::curation_service::CurationService::new(state.db.clone());
-    let eval = svc
-        .evaluate_pep503_package(repo.id, &repo.curation_default_action, project, version)
-        .await
-        .map_err(|e| {
-            tracing::warn!(
-                repo_id = %repo.id,
-                repo_key = %repo.key,
-                package = %project,
-                error = %e,
-                "curation evaluation failed; failing open"
-            );
-        })
-        .ok();
-    if let Some(eval) = eval {
-        if eval.action == "block" {
-            return Err(proxy_helpers::curation_blocked_response(
-                project,
-                &eval.reason,
-            ));
-        }
-    }
-    Ok(())
+    // Delegate to the shared, format-agnostic curation seam (#2930). PyPI was
+    // the original (and once only) enforced format; the seam now lives in
+    // `proxy_helpers` so every proxy format shares one implementation.
+    proxy_helpers::enforce_curation(&state.db, repo, project, version).await
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +899,13 @@ async fn simple_project(
 
             let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
             let mut remote_response: Option<(Bytes, Option<String>)> = None;
+            // #2967 R4: true when the surfaced remote_response came from a
+            // SUPPRESSED member and has already been reduced to its
+            // ownership-filtered form by `case_a_filter_remote_body`. Such a body
+            // must never be re-run through `rewrite_upstream_urls` (which applies
+            // no ownership filter); the render path below splices locals straight
+            // into the filtered document instead.
+            let mut remote_case_a = false;
 
             // First pass: collect distributions from every local (hosted /
             // staging) member. We must know whether a local member owns the
@@ -948,13 +949,10 @@ async fn simple_project(
             // Ownership / dependency-confusion guard (#1600), superseding the
             // name-only suppression from #1738. When a local member owns this
             // PEP 503 name and no operator `tracks` declaration permits merging,
-            // the virtual serves ONLY that member's distributions for the name
-            // — in both the simple index and the download — rather than
+            // the virtual isolates the name to that member — rather than
             // unioning the remote's versions for it. Unioning an unrelated
             // public package that merely shares the name is a supply-chain hole
-            // (`pip` prefers the higher public version) AND makes the index
-            // inconsistent with the download path, which is also tracks-aware
-            // and 404s for any version only the remote has. Local precedence is
+            // (`pip` prefers the higher public version). Local precedence is
             // the PEP 708-aligned default for a locally-owned name; a `tracks`
             // declaration re-enables the union (#1582).
             //
@@ -964,23 +962,46 @@ async fn simple_project(
             // at equal or higher priority than the owning local was explicitly
             // ranked above the internal package by the operator, so its
             // versions still surface.
-            // Second pass: fetch a remote index only from non-suppressed
-            // remote members.
+            //
+            // #2937: the suppression is distribution-granular, not name-coarse.
+            // For a suppressed Remote member the virtual still UNIONS Case-A
+            // distributions — platform/ABI-distinct wheels of a version the
+            // owning local already provides (local ships linux 2.0, remote ships
+            // windows 2.0) — while continuing to suppress Case-B distributions
+            // (a version only the remote has, or a same-platform rebuild). The
+            // profile is derived from the local owner's filenames collected in
+            // the first pass, so the download path (which rebuilds the same
+            // profile) admits the identical set and the two stay symmetric.
+            let owned_profile = if owning_local_min_priority.is_some() {
+                OwnedWheelProfile::from_filenames(
+                    local_artifacts
+                        .iter()
+                        .map(|a| a.path.rsplit('/').next().unwrap_or(a.path.as_str())),
+                )
+            } else {
+                OwnedWheelProfile::default()
+            };
+
+            // Second pass: fetch a remote index from every remote member, but
+            // narrow a suppressed member's contribution to its Case-A unions.
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
                 }
-                if let Some(local_min) = owning_local_min_priority {
-                    // A member missing from the priority map cannot outrank the
-                    // owning local: treat it as lowest priority (fail closed).
-                    let member_priority = member_priorities
-                        .get(&member.id)
-                        .copied()
-                        .unwrap_or(i32::MAX);
-                    if local_min < member_priority {
-                        continue;
+                // Suppressed (owning local outranks this remote): keep only its
+                // Case-A distributions rather than dropping it whole (#2937). A
+                // member missing from the priority map cannot outrank the owning
+                // local: treat it as lowest priority (fail closed → suppressed).
+                let case_a_only = match owning_local_min_priority {
+                    Some(local_min) => {
+                        let member_priority = member_priorities
+                            .get(&member.id)
+                            .copied()
+                            .unwrap_or(i32::MAX);
+                        local_min < member_priority
                     }
-                }
+                    None => false,
+                };
                 // Only take the first remote response; multiple remote
                 // members in one virtual is rare, and merging two upstream
                 // /simple/<pkg>/ listings deterministically is out of scope
@@ -1072,6 +1093,22 @@ async fn simple_project(
                         } else {
                             content
                         };
+                        // #2937: a suppressed Remote member contributes only its
+                        // Case-A distributions (platform/ABI-distinct wheels of a
+                        // version the owning local already provides); Case-B
+                        // entries (remote-only versions, same-platform rebuilds)
+                        // are dropped here, mirroring the download gate below.
+                        let content = if case_a_only {
+                            remote_case_a = true;
+                            case_a_filter_remote_body(
+                                &content,
+                                &owned_profile,
+                                &repo_key,
+                                &normalized,
+                            )
+                        } else {
+                            content
+                        };
                         remote_response = Some((content, content_type));
                     }
                     Err(_e) => {
@@ -1111,6 +1148,69 @@ async fn simple_project(
                 }
                 (_, Some((content, content_type))) => {
                     let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+
+                    // #2967 R4: a SUPPRESSED member's body has already been reduced
+                    // to its ownership-filtered form — a rebuilt AK-pathed PEP 503
+                    // index or a fail-closed PEP 691 listing — by
+                    // `case_a_filter_remote_body`. It must NEVER reach the in-place
+                    // `rewrite_upstream_urls` rewriter (no ownership filter; its
+                    // `[^>]*?` can't cross a `>`, so an anchor whose `href` follows a
+                    // `>` inside an attribute would be left off-site → dependency
+                    // confusion). Classify by the FILTERED body's own bytes (never the
+                    // upstream's possibly-mislabeled Content-Type) and splice locals
+                    // straight in.
+                    if remote_case_a {
+                        return match sniff_simple_index(&content) {
+                            SniffedSimpleIndex::Json => {
+                                let merged = merge_local_into_remote_simple_json(
+                                    &content,
+                                    &repo_key,
+                                    &normalized,
+                                    &local_artifacts,
+                                    &tracks,
+                                )
+                                .unwrap_or_else(|| empty_pep691_listing(&normalized));
+                                Ok(cacheable_response(
+                                    merged.into_bytes(),
+                                    PEP691_JSON_CONTENT_TYPE,
+                                    &headers,
+                                ))
+                            }
+                            SniffedSimpleIndex::Html => {
+                                // The rebuild is already AK-pathed; splice locals
+                                // WITHOUT rewrite_upstream_urls.
+                                let merged = merge_local_into_remote_simple_html(
+                                    &String::from_utf8_lossy(&content),
+                                    &repo_key,
+                                    &normalized,
+                                    &local_artifacts,
+                                    &tracks,
+                                );
+                                Ok(cacheable_response(
+                                    merged.into_bytes(),
+                                    "text/html; charset=utf-8",
+                                    &headers,
+                                ))
+                            }
+                            // Fail closed: filter emitted nothing usable → empty
+                            // listing, never raw upstream bytes.
+                            SniffedSimpleIndex::Binary => {
+                                let merged = merge_local_into_remote_simple_json(
+                                    empty_pep691_listing(&normalized).as_bytes(),
+                                    &repo_key,
+                                    &normalized,
+                                    &local_artifacts,
+                                    &tracks,
+                                )
+                                .unwrap_or_else(|| empty_pep691_listing(&normalized));
+                                Ok(cacheable_response(
+                                    merged.into_bytes(),
+                                    PEP691_JSON_CONTENT_TYPE,
+                                    &headers,
+                                ))
+                            }
+                        };
+                    }
 
                     // JSON client + JSON upstream: rewrite the upstream download
                     // URLs and splice in local entries, preserving PEP 700
@@ -1243,6 +1343,14 @@ fn build_simple_project_response(
                 if let Some(rp) = requires_python {
                     file["requires-python"] = serde_json::Value::String(rp);
                 }
+                // PEP 658/714: a wheel ships its METADATA and AK already serves
+                // it at `<file>.metadata`, so advertise `core-metadata` here so
+                // installers (pip/uv) can fetch metadata without downloading the
+                // whole wheel. sdists carry no such metadata, so they must not
+                // advertise it. Surfaced by the conformance corpus (pip harvest).
+                if filename.ends_with(".whl") {
+                    file["core-metadata"] = serde_json::Value::Bool(true);
+                }
                 // PEP 700: surface the distribution's upload timestamp as an
                 // RFC 3339 / ISO 8601 `upload-time` field (#1773).
                 if let Some(ut) = a.upload_time {
@@ -1253,12 +1361,28 @@ fn build_simple_project_response(
             })
             .collect();
 
-        let versions: Vec<String> = artifacts
+        // PEP 691 `versions`: dedupe, then order by PEP 440 instead of
+        // lexicographically, so `1.9` precedes `1.10` (#3106). Anything that
+        // does not parse as PEP 440 has no defined position, so it sorts after
+        // every parseable version (by string, for stability) rather than
+        // interleaving with them.
+        let mut versions: Vec<String> = artifacts
             .iter()
             .filter_map(|a| a.version.clone())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
+        versions.sort_by(|a, b| {
+            match (
+                PypiHandler::pep440_sort_key(a),
+                PypiHandler::pep440_sort_key(b),
+            ) {
+                (Some(ka), Some(kb)) => ka.cmp(&kb),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(b),
+            }
+        });
 
         // PEP 708 / Simple API v1.2: advertise v1.2 and, when the project has
         // operator `tracks` declarations, emit them under meta.tracks so
@@ -1303,10 +1427,18 @@ fn build_simple_project_response(
     html.push_str(&format!("<h1>Links for {}</h1>\n", normalized));
 
     for a in artifacts {
-        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        let raw_filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        // Security: the filename is publisher-controlled, so it must be
+        // HTML-escaped before it is spliced into this Simple-index page —
+        // otherwise a filename like `x"><script>...</script>.whl` is stored XSS
+        // that runs for anyone (incl. admins) viewing the index.
+        let filename = html_escape(raw_filename);
         let url = format!(
             "/pypi/{}/simple/{}/{}#sha256={}",
-            repo_key, normalized, filename, a.checksum_sha256
+            repo_key,
+            normalized,
+            filename,
+            html_escape(&a.checksum_sha256)
         );
 
         let requires_python = a
@@ -1327,9 +1459,17 @@ fn build_simple_project_response(
             .map(|ut| format!(" data-upload-time=\"{}\"", ut.format("%Y-%m-%dT%H:%M:%SZ")))
             .unwrap_or_default();
 
+        // PEP 658/714: advertise the wheel's METADATA (HTML parity with the JSON
+        // branch), since AK serves `<file>.metadata`.
+        let cm_attr = if raw_filename.ends_with(".whl") {
+            " data-core-metadata=\"true\""
+        } else {
+            ""
+        };
+
         html.push_str(&format!(
-            "<a href=\"{}\"{}{}>{}</a><br/>\n",
-            url, rp_attr, ut_attr, filename
+            "<a href=\"{}\"{}{}{}>{}</a><br/>\n",
+            url, rp_attr, ut_attr, cm_attr, filename
         ));
     }
 
@@ -1369,13 +1509,20 @@ fn merge_local_into_remote_simple_html(
 
     let mut local_lines = String::new();
     for a in local {
-        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
-        if existing.contains(filename) {
+        let raw_filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        if existing.contains(raw_filename) {
             continue;
         }
+        // Security: escape the publisher-controlled filename before splicing it
+        // into the merged HTML index (stored-XSS otherwise; see the sibling
+        // build_simple_project_response HTML branch).
+        let filename = html_escape(raw_filename);
         let url = format!(
             "/pypi/{}/simple/{}/{}#sha256={}",
-            repo_key, normalized, filename, a.checksum_sha256
+            repo_key,
+            normalized,
+            filename,
+            html_escape(&a.checksum_sha256)
         );
         let requires_python = a
             .metadata
@@ -1391,9 +1538,15 @@ fn merge_local_into_remote_simple_html(
             .upload_time
             .map(|ut| format!(" data-upload-time=\"{}\"", ut.format("%Y-%m-%dT%H:%M:%SZ")))
             .unwrap_or_default();
+        // PEP 658/714: advertise wheel METADATA (HTML parity with the JSON path).
+        let cm_attr = if raw_filename.ends_with(".whl") {
+            " data-core-metadata=\"true\""
+        } else {
+            ""
+        };
         local_lines.push_str(&format!(
-            "<a href=\"{}\"{}{}>{}</a><br/>\n",
-            url, rp_attr, ut_attr, filename
+            "<a href=\"{}\"{}{}{}>{}</a><br/>\n",
+            url, rp_attr, ut_attr, cm_attr, filename
         ));
     }
 
@@ -1450,13 +1603,47 @@ async fn download_or_metadata(
     // either branch below. The version is parsed from the distribution filename so
     // exact- and range-constrained rules apply on this path; an unrecognized
     // filename shape yields `None`, which matches on name only.
+    //
+    // `distribution` is resolved ONCE and reused by the metadata branch below:
+    // the gate must evaluate exactly the distribution the serve path resolves,
+    // or a suffix shape that parses to a different (or no) version slips past a
+    // version-constrained rule and is then served anyway.
     let normalized = normalize_pep503(&project);
-    let requested_version = version_from_pypi_filename(&filename);
+    let distribution = pypi_distribution_filename(&filename);
+    let requested_version = version_from_pypi_filename(distribution);
     enforce_pypi_curation(&state, &repo, &normalized, requested_version.as_deref()).await?;
 
-    // PEP 658: if filename ends with .metadata, serve extracted METADATA
+    // PEP 658: serve metadata from the remote upstream when possible. If the
+    // upstream advertises metadata but returns 404, fall back to extracting it
+    // from the wheel so clients do not see the hard failure that motivated
+    // stripping these attributes in the first place.
     if filename.ends_with(".metadata") {
-        let real_filename = filename.trim_end_matches(".metadata");
+        // PEP 658 names exactly one metadata resource per distribution,
+        // `<distribution>.metadata`; a stacked suffix names none. Refusing the
+        // shape outright keeps a request that is not a metadata request from
+        // resolving back to a distribution at all — defence in depth behind the
+        // shared `distribution` above, which is what actually gates curation.
+        if filename
+            .strip_suffix(".metadata")
+            .is_some_and(|rest| rest.ends_with(".metadata"))
+        {
+            return Err(AppError::NotFound(format!("File not found: {}", filename)).into_response());
+        }
+        let real_filename = distribution;
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
+                return serve_remote_metadata(
+                    &state,
+                    proxy,
+                    repo.id,
+                    &repo.key,
+                    upstream_url,
+                    &project,
+                    real_filename,
+                )
+                .await;
+            }
+        }
         return serve_metadata(
             &state,
             &state.db,
@@ -1480,6 +1667,93 @@ async fn download_or_metadata(
     .await
 }
 
+async fn serve_remote_metadata(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    project: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    let metadata_filename = format!("{}.metadata", filename);
+    let target = resolve_pypi_remote_fetch_target(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        &metadata_filename,
+        &index_path,
+    )
+    .await?;
+
+    let remote_repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        &target.fetch_base,
+        RepositoryFormat::Pypi,
+    );
+
+    match proxy
+        .fetch_upstream_direct_with_link(&remote_repo, &target.fetch_path)
+        .await
+    {
+        Ok((content, _content_type, _)) => {
+            // The content-type is fixed, never relayed from upstream: a PEP 658
+            // metadata resource is always the plain-text METADATA file, so a
+            // hostile or misconfigured upstream labelling it `text/html` must
+            // not get that type echoed back under this origin. Matches the
+            // wheel-extraction arm below.
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Body::from(content))
+                .unwrap())
+        }
+        Err(AppError::NotFound(_)) => {
+            let wheel_target = resolve_pypi_remote_fetch_target(
+                proxy,
+                repo_id,
+                repo_key,
+                upstream_url,
+                project,
+                filename,
+                &index_path,
+            )
+            .await?;
+            let wheel_repo = proxy_helpers::build_remote_repo_with_format(
+                repo_id,
+                repo_key,
+                &wheel_target.fetch_base,
+                RepositoryFormat::Pypi,
+            );
+            let (wheel, _) = proxy
+                .fetch_artifact_with_cache_path(
+                    &wheel_repo,
+                    &wheel_target.fetch_path,
+                    &wheel_target.cache_path,
+                )
+                .await
+                .map_err(|e| e.into_response())?;
+            let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
+                extract_metadata_from_wheel(&wheel)
+            })
+            .map_err(|e| e.into_response())?
+            .ok_or_else(|| {
+                AppError::NotFound("Metadata not available".to_string()).into_response()
+            })?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Body::from(metadata))
+                .unwrap())
+        }
+        Err(error) => Err(error.into_response()),
+    }
+}
+
 fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
     artifact_path
         .rsplit('/')
@@ -1496,10 +1770,11 @@ fn build_pypi_proxy_cache_path(normalized_project: &str, filename: &str) -> Stri
 /// index (#1944). The JSON and HTML representations of one index must
 /// withhold the same young versions, or a JSON-negotiating client (modern
 /// pip) sees everything the HTML filter hides. Mirrors the HTML hook in
-/// `simple_project`: a filter failure serves the unfiltered listing rather
-/// than failing the request — the download path re-checks every version
-/// independently and fails closed, so enforcement never rests on this
-/// listing-side filter.
+/// `simple_project`: an evaluation/filter failure serves the unfiltered
+/// listing rather than failing the request, while an authoritative policy
+/// resolution failure returns a structurally valid empty listing. The
+/// download path re-checks every version independently and fails closed, so
+/// enforcement never rests on this listing-side filter.
 async fn filter_pypi_simple_json_response(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1510,10 +1785,22 @@ async fn filter_pypi_simple_json_response(
     let Some(svc) = state.age_gate_service.as_ref() else {
         return json;
     };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
+    // Quick struct-derived check, then DB-resolve the authoritative policy
+    // (mode + upstream identity) — a virtual member's RepoInfo carries a
+    // defaulted mode (#2264). A resolve failure suppresses the listing with a
+    // valid PEP 691 empty response; the download path re-checks fail-closed.
+    if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
         return json;
     }
+    let params = match crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, repo_key = %repo.key, "Failed to resolve age-gate params for PyPI simple JSON response; suppressing listing");
+            return empty_pep691_listing(project);
+        }
+    };
     let Ok(mut index) = serde_json::from_str::<serde_json::Value>(&json) else {
         // `rewrite_upstream_simple_json` only returns JSON it serialized
         // itself, so this branch is unreachable in practice.
@@ -1548,19 +1835,40 @@ async fn filter_pypi_simple_html_response(
     let Some(svc) = state.age_gate_service.as_ref() else {
         return html;
     };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
+    // Quick struct-derived check, then DB-resolve the authoritative policy —
+    // same rationale as the JSON twin above (#2264).
+    if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
         return html;
     }
-    let Ok(client) = metadata_http_client() else {
-        return html;
-    };
-    let Ok(times) = svc
-        .metadata_cache()
-        .fetch_pypi_publish_times(&client, repo.id, effective_upstream, project)
+    let params = match crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
         .await
-    else {
-        return html;
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, repo_key = %repo.key, "Failed to resolve age-gate params for PyPI simple HTML response; suppressing listing");
+            return "<html><body></body></html>".to_string();
+        }
+    };
+    // Publish times are only the basis in `upstream_publish_time` mode;
+    // `first_seen` substitutes this server's own observations inside the
+    // filter, so the fetch is skipped (and a fetch failure must not skip
+    // filtering there).
+    let times = if params.age_gate_mode
+        == crate::services::age_gate_service::AgeGateMode::UpstreamPublishTime
+    {
+        let Ok(client) = metadata_http_client() else {
+            return html;
+        };
+        let Ok(times) = svc
+            .metadata_cache()
+            .fetch_pypi_publish_times(&client, repo.id, effective_upstream, project)
+            .await
+        else {
+            return html;
+        };
+        times
+    } else {
+        std::collections::HashMap::new()
     };
     match svc
         .filter_pypi_simple_index(&params, project, &times, &html)
@@ -1577,14 +1885,16 @@ async fn apply_pypi_download_age_gate(
     project: &str,
     filename: &str,
 ) -> Result<Option<String>, Response> {
-    let svc = match state.age_gate_service.as_ref() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
+    // Cheap struct-derived pre-check, then DB-resolve the authoritative
+    // policy (mode + upstream identity) by id — struct-derived params can
+    // carry a stale or defaulted mode (e.g. a virtual member's RepoInfo),
+    // and gate policy is enforcement input (#2264).
+    if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
         return Ok(None);
     }
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+        .await
+        .map_err(|e| e.into_response())?;
 
     let info = PypiHandler::parse_filename(filename)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
@@ -1592,44 +1902,41 @@ async fn apply_pypi_download_age_gate(
         AppError::Validation("Missing version in filename".to_string()).into_response()
     })?;
 
-    let published_at =
-        if let (Some(upstream_url), Ok(client)) = (&repo.upstream_url, metadata_http_client()) {
-            svc.metadata_cache()
-                .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
-                .await
-                .ok()
-                .and_then(|times| times.get(&version).copied())
-        } else {
-            None
-        };
-
-    match svc
-        .check(&params, project, &version, published_at)
-        .await
-        .map_err(|e| e.into_response())?
+    let svc = state.age_gate_service.as_deref();
+    // Publish-time evidence from the project's upstream JSON metadata; under
+    // `first_seen` the time itself is ignored, but presence in the document
+    // is the existence evidence that may start the observation clock.
+    let published_at = if let (Some(svc), Some(upstream_url), Ok(client)) =
+        (svc, &repo.upstream_url, metadata_http_client())
     {
-        AgeGateDecision::Allow => Ok(None),
-        AgeGateDecision::Block {
-            review_id: _,
-            last_known_good: Some(lkg),
-        } => Ok(Some(pypi_lkg_filename_from_artifact_path(
-            &lkg.artifact_path,
-        ))),
-        AgeGateDecision::Block {
-            review_id,
-            last_known_good: None,
-        } => {
-            let requested_age_days =
-                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
-            Err(proxy_helpers::age_gate_blocked_response(
-                review_id,
+        svc.metadata_cache()
+            .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
+            .await
+            .ok()
+            .and_then(|times| times.get(&version).copied())
+    } else {
+        None
+    };
+    let basis = match svc {
+        Some(svc) => svc
+            .download_basis(
+                &params,
                 project,
                 &version,
-                repo.age_gate_min_age_days,
-                requested_age_days,
-            ))
-        }
-    }
+                published_at,
+                published_at.is_some(),
+            )
+            .await
+            .map_err(|e| e.into_response())?,
+        None => published_at,
+    };
+
+    // The shared seam (#2264) owns the decision and the terminal 451; only
+    // the LKG wheel-filename substitution below is pypi-specific.
+    let lkg = proxy_helpers::enforce_age_gate(svc, &params, project, &version, basis).await?;
+    Ok(lkg.map(|blocked| {
+        pypi_lkg_filename_from_artifact_path(&blocked.last_known_good.artifact_path)
+    }))
 }
 
 /// Run the remote-PyPI download age gate and, when the requested version is
@@ -1739,6 +2046,40 @@ async fn serve_file(
                             .await?
                     {
                         return Ok(resp);
+                    }
+
+                    // #2954: when scan-on-proxy is enabled, route through the
+                    // inline scan-and-block path (buffered fetch + digest-keyed
+                    // verdict gate). It handles the cache internally, so we take
+                    // it INSTEAD of the streaming/redirect cache paths below,
+                    // which serve bytes without consulting a scan verdict. Repos
+                    // that have not enabled scan-on-proxy skip this entirely and
+                    // keep today's untouched streaming behavior (no regression).
+                    if crate::services::scan_config_service::ScanConfigService::new(
+                        state.db.clone(),
+                    )
+                    .is_proxy_scan_enabled(repo.id)
+                    .await
+                    .unwrap_or(false)
+                    {
+                        let action = crate::services::scan_config_service::ScanConfigService::new(
+                            state.db.clone(),
+                        )
+                        .proxy_scan_action(repo.id)
+                        .await
+                        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+                        return serve_scanned_pypi_file(
+                            state,
+                            proxy,
+                            repo.id,
+                            repo_key,
+                            upstream_url,
+                            project,
+                            filename,
+                            action,
+                            ctx,
+                        )
+                        .await;
                     }
 
                     // Try the proxy cache first using a predictable local
@@ -1876,6 +2217,20 @@ async fn serve_file(
                     Default::default()
                 };
 
+                // #2937: the owning local's per-version wheel-tag profile, so a
+                // suppressed Remote member can still serve a Case-A distribution
+                // (a platform/ABI-distinct wheel of a version the owner already
+                // provides) while a Case-B one (a remote-only version, or a
+                // same-platform rebuild) stays suppressed. Built from the same
+                // local-owner query the simple index uses, keeping the two paths
+                // symmetric: every distribution the index lists is downloadable
+                // and every one it hides 404s here.
+                let owned_profile = if owning_local_min_priority.is_some() {
+                    pypi_owned_wheel_profile(&state.db, &members, &normalized_project).await
+                } else {
+                    OwnedWheelProfile::default()
+                };
+
                 for member in &members {
                     // #2066: enforce THIS member's download age gate before any
                     // of its bytes can be served — including from a local
@@ -1954,7 +2309,7 @@ async fn serve_file(
                     // member already owns. A member missing from the priority
                     // map cannot outrank the owning local: it is treated as
                     // lowest priority (fail closed, suppressed).
-                    let remote_suppressed = match owning_local_min_priority {
+                    let mut remote_suppressed = match owning_local_min_priority {
                         Some(local_min) => {
                             local_min
                                 < member_priorities
@@ -1964,10 +2319,65 @@ async fn serve_file(
                         }
                         None => false,
                     };
+                    // #2937: a suppressed Remote member may still serve a Case-A
+                    // distribution — a platform/ABI-distinct wheel of a version
+                    // the owning local already provides — so the requested file
+                    // resolves iff the simple index would have listed it. A
+                    // Case-B request (a remote-only version, or a same-platform
+                    // rebuild of an owned version) stays suppressed and 404s,
+                    // preserving the #1600 dependency-confusion boundary.
+                    if remote_suppressed && owned_profile.admits(filename) {
+                        remote_suppressed = false;
+                    }
                     if member.repo_type == RepositoryType::Remote && !remote_suppressed {
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
                         {
+                            // #3023: gate this remote member's serve through the
+                            // inline scan-and-block path when the stricter-of-two
+                            // policy (virtual OR member) enables it, mirroring the
+                            // direct-Remote pypi path. A vulnerable digest is
+                            // blocked (403) / an inconclusive fail-closed is 423;
+                            // a not-found or other error falls through to the next
+                            // member. A member with scanning disabled keeps the
+                            // untouched streaming cache path below (no regression).
+                            let (scan_enabled, action) =
+                                proxy_helpers::effective_virtual_scan_policy(
+                                    &state.db, repo.id, member.id,
+                                )
+                                .await;
+                            if scan_enabled {
+                                match serve_scanned_pypi_file(
+                                    state,
+                                    proxy,
+                                    member.id,
+                                    &member.key,
+                                    upstream_url,
+                                    project,
+                                    filename,
+                                    action,
+                                    ctx,
+                                )
+                                .await
+                                {
+                                    Ok(resp) => return Ok(resp),
+                                    Err(resp) => {
+                                        let status = resp.status();
+                                        if status == StatusCode::FORBIDDEN
+                                            || status == StatusCode::LOCKED
+                                        {
+                                            return Err(resp);
+                                        }
+                                        debug!(
+                                            member_key = %member.key,
+                                            status = %status,
+                                            "scanned pypi virtual member did not serve; trying next member"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
                             // Check proxy cache first (same optimization as the
                             // direct Remote path). This avoids re-fetching the
                             // simple index from upstream when the file is already
@@ -2323,7 +2733,8 @@ async fn resolve_pypi_remote_fetch_target(
     // index request, and the relative paths in the HTML are relative to
     // the final serving URL, not the originally requested URL.
     let full_index_url = effective_url;
-    let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url));
+    let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url))
+        .or_else(|| find_upstream_metadata_url(&index_html, filename, Some(&full_index_url)));
 
     let fallback = || {
         let (base, path) = pypi_upstream_url_and_path(
@@ -2494,6 +2905,236 @@ fn build_streaming_file_response(
         .unwrap()
 }
 
+// ---------------------------------------------------------------------------
+// #2954: inline scan-and-block on proxy download (PyPI Phase 1).
+//
+// The format-agnostic pieces — digesting, the verdict state machine, the
+// block/lock response shapes, and the scan-and-record orchestration — were
+// lifted into `proxy_helpers` (#3003) so npm (and later OCI) share ONE
+// implementation of the #2954 fail-closed gate and the #2976 freshness gate.
+// This module keeps only the PyPI-specific glue: index-target resolution, the
+// synthetic-artifact shape, and the PyPI response builders.
+// ---------------------------------------------------------------------------
+
+use super::proxy_helpers::{is_over_cap_error, scan_pending_locked_response, sha256_hex};
+
+/// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
+/// that [`ScannerService::scan_content`] runs the leaf scanners over. There is
+/// NO `artifacts` row: proxy-cached bytes are deliberately not persisted as
+/// artifacts (#1278/#1280). The filename drives per-scanner applicability +
+/// workspace naming exactly as for a hosted wheel.
+fn pypi_synthetic_artifact(
+    repo_id: uuid::Uuid,
+    filename: &str,
+    digest: &str,
+    size: i64,
+) -> crate::models::artifact::Artifact {
+    let now = Utc::now();
+    crate::models::artifact::Artifact {
+        id: uuid::Uuid::new_v4(),
+        repository_id: repo_id,
+        path: filename.to_string(),
+        name: filename.to_string(),
+        version: version_from_pypi_filename(filename),
+        size_bytes: size,
+        checksum_sha256: digest.to_string(),
+        checksum_md5: None,
+        checksum_sha1: None,
+        content_type: pypi_content_type(filename).to_string(),
+        storage_key: String::new(),
+        is_deleted: false,
+        uploaded_by: None,
+        quarantine_status: None,
+        quarantine_until: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Build a buffered 200 response for scanned bytes. `pending` adds the loud
+/// `X-AK-Scan: pending` header for the fail-open serve-before-verdict path so a
+/// served-unscanned byte is observable (kills the #1274 silent gap).
+fn build_scanned_file_response(
+    filename: &str,
+    bytes: Bytes,
+    content_type: Option<String>,
+    digest: Option<&str>,
+    pending: bool,
+) -> Response {
+    let ct = content_type.unwrap_or_else(|| pypi_content_type(filename).to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, ct)
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, bytes.len().to_string())
+        .header("X-AK-Scan", if pending { "pending" } else { "clean" });
+    if let Some(d) = digest {
+        builder = builder.header("X-PyPI-File-SHA256", d);
+    }
+    builder.body(Body::from(bytes)).unwrap()
+}
+
+/// Inline scan-and-block for a PyPI proxy file download (#2954).
+///
+/// Runs ONLY when scan-on-proxy is enabled for the repo; the caller falls back
+/// to the untouched streaming path otherwise, so repos that have not opted in
+/// see NO change. Flow: buffered capped fetch (cache-first, so a repeat pull is
+/// served from cache with no upstream hit) → content digest → verdict lookup →
+/// serve / block / scan-inline per the fail-open/closed action.
+#[allow(clippy::too_many_arguments)]
+async fn serve_scanned_pypi_file(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    project: &str,
+    filename: &str,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    let target = resolve_pypi_remote_fetch_target(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        filename,
+        &index_path,
+    )
+    .await?;
+
+    // Buffered capped fetch (cache-first). The proxy caches the bytes under
+    // cache_path, so a repeat pull returns from cache with NO upstream fetch.
+    let repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        &target.fetch_base,
+        RepositoryFormat::Pypi,
+    );
+    let (bytes, content_type) = match proxy
+        .fetch_artifact_with_cache_path_capped(
+            &repo,
+            &target.fetch_path,
+            &target.cache_path,
+            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
+        )
+        .await
+    {
+        Ok(pair) => pair,
+        Err(e) if is_over_cap_error(&e) => {
+            // Over the byte cap: never buffer unbounded (#895 OOM).
+            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
+                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
+                    warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "proxy object exceeds scan byte cap; fail-closed -> 423"
+                    );
+                    Err(scan_pending_locked_response(filename))
+                }
+                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
+                    // Fail-open oversized: serve via the untouched streaming path
+                    // (loud: X-AK-Scan pending header carried on the stream).
+                    warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "proxy object exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
+                    );
+                    let result = fetch_from_pypi_remote_streaming(
+                        proxy,
+                        repo_id,
+                        repo_key,
+                        upstream_url,
+                        project,
+                        filename,
+                        &index_path,
+                        RepositoryFormat::Pypi,
+                    )
+                    .await?;
+                    proxy_helpers::record_proxy_download(
+                        state,
+                        repo_id,
+                        repo_key,
+                        &target.cache_path,
+                        ctx,
+                    )
+                    .await;
+                    let mut resp = build_streaming_file_response(filename, result);
+                    resp.headers_mut()
+                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+                    Ok(resp)
+                }
+            };
+        }
+        Err(e) => return Err(e.into_response()),
+    };
+
+    let digest = sha256_hex(&bytes);
+
+    // #3003: the identity these bytes are being served as. `project` is the
+    // requested distribution and the version comes from the filename, so the
+    // coordinate is request-derived, never upstream-controlled.
+    //
+    // This is what finally grades an SDIST. syft/grype catalog a wheel from its
+    // `.dist-info/METADATA`, but an sdist ships only a ROOT `PKG-INFO`, which
+    // syft does not catalog — so a vulnerable sdist scanned with zero cataloged
+    // components, reported zero findings, and served 200 "clean" while the same
+    // release's wheel was correctly blocked. Pinning the coordinate gives the
+    // CVE engine the component to grade, and the shared assessment gate refuses
+    // to call the result clean unless it actually graded it.
+    //
+    // Filenames we cannot parse a version from keep the prior behavior (no
+    // pin, no assessment gate) rather than newly withholding an odd-but-legit
+    // artifact.
+    let identity = match version_from_pypi_filename(filename) {
+        Some(version) => proxy_helpers::ProxyScanIdentity::Established(
+            crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                project,
+                &version,
+            ),
+        ),
+        // An unparseable filename keeps the pre-#3003 behavior rather than
+        // newly withholding an odd-but-legitimate artifact.
+        None => proxy_helpers::ProxyScanIdentity::NotApplicable,
+    };
+
+    // Digest-keyed verdict gate, shared with every proxy format (#3003):
+    // lookup → `decide_serve` (freshness incl. the #2976 unknown-live-version
+    // fail-closed tightening) → inline scan / async scan per the action, with
+    // the #2954 fail-closed contract enforced inside the shared scanner loop.
+    let synthetic = pypi_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
+    match proxy_helpers::gate_proxy_scan_serve(
+        state,
+        repo_id,
+        filename,
+        &digest,
+        synthetic,
+        &bytes,
+        action,
+        identity,
+        proxy_helpers::ProxyScanMode::File,
+    )
+    .await
+    {
+        proxy_helpers::ProxyScanServeOutcome::Deny(resp) => Err(resp),
+        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
+            proxy_helpers::record_proxy_download(state, repo_id, repo_key, &target.cache_path, ctx)
+                .await;
+            Ok(build_scanned_file_response(
+                filename,
+                bytes,
+                content_type,
+                Some(&digest),
+                pending,
+            ))
+        }
+    }
+}
+
 async fn serve_metadata(
     state: &SharedState,
     db: &PgPool,
@@ -2588,7 +3229,7 @@ async fn upload(
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "pypi", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "pypi", "write:artifacts")?.user_id;
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -2707,6 +3348,13 @@ async fn upload(
     let filename = file_name.ok_or_else(|| {
         AppError::Validation("Missing filename in content field".to_string()).into_response()
     })?;
+    // Security (#3107): the filename becomes a segment of the artifact storage
+    // path, so reject anything that could escape it before it is used below.
+    if !is_safe_upload_filename(&filename) {
+        return Err(
+            AppError::Validation(format!("Invalid upload filename: {filename:?}")).into_response(),
+        );
+    }
 
     let normalized = PypiHandler::normalize_name(&pkg_name);
 
@@ -2877,6 +3525,25 @@ fn pypi_content_type(filename: &str) -> &'static str {
     }
 }
 
+/// Reject an uploaded PyPI filename that is unsafe as a path segment or when
+/// rendered. Physical storage is content-addressed (keyed by SHA-256), so this
+/// is not the sole defense — the Simple-index render sites HTML-escape the
+/// filename — but it is defense-in-depth at the ingest choke-point: reject path
+/// separators, parent references, control characters, and HTML metacharacters
+/// (`< > "`). Legitimate wheel/sdist filenames never contain any of these. (#3107)
+fn is_safe_upload_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.contains('<')
+        && !name.contains('>')
+        && !name.contains('"')
+        && !name.chars().any(|c| c.is_control())
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -2891,13 +3558,33 @@ fn html_escape(s: &str) -> String {
 // Static regexes (compiled once, reused across requests)
 // ---------------------------------------------------------------------------
 
-static HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r##"<a\s+[^>]*?href="([^"#]+)"##).unwrap());
+// #2967: quote-agnostic + case-insensitive so a single-quoted / uppercase
+// `HREF` upstream anchor cannot slip an un-rewritten off-site href past the
+// proxy render (defense-in-depth behind the Case-A HTML REBUILD). The URL lands
+// in group 1 (double-quoted), 2 (single-quoted), or 3 (unquoted).
+static HREF_RE: Lazy<Regex> = Lazy::new(|| {
+    // Like the historical pattern, the URL is captured up to the first `#` (the
+    // fragment is dropped) and the closing quote is NOT required — a `#sha256=`
+    // fragment sits between the URL and the closing quote. The value lands in
+    // group 1 (double-quoted), 2 (single-quoted), or 3 (unquoted).
+    Regex::new(r##"(?is)<a\s+[^>]*?\bhref\s*=\s*(?:"([^"#]*)|'([^'#]*)|([^\s>#]+))"##).unwrap()
+});
 
-static REWRITE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"<a\s+([^>]*?)href="([^"]+)"([^>]*)>"#).unwrap());
+// URL lands in group 2 (double-quoted), 3 (single-quoted), or 4 (unquoted);
+// group 1 = attributes before `href`, group 5 = attributes after.
+static REWRITE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<a\s+([^>]*?)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))([^>]*)>"#)
+        .unwrap()
+});
 
-static METADATA_ATTR_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"\s*data-(?:dist-info-metadata|core-metadata)="[^"]*""#).unwrap());
+/// Matches an upstream `<base ...>` element. A `<base href>` re-anchors every
+/// relative/root-relative link on the page; because `rewrite_upstream_urls`
+/// emits ROOT-RELATIVE download URLs (`/pypi/<repo>/...`), a surviving `<base>`
+/// would make the client resolve them against the upstream origin instead of
+/// Artifact Keeper — a proxy bypass that also discloses the upstream host and
+/// breaks air-gapped installs. We strip it. Same class as the #2801
+/// Content-Type sniff fix, for the `<base>` vector.
+static BASE_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<base\b[^>]*>").unwrap());
 
 /// Split a URL into its base (scheme + host) and path components.
 ///
@@ -2937,7 +3624,12 @@ fn find_upstream_url_for_file(
     index_url: Option<&str>,
 ) -> Option<String> {
     for caps in HREF_RE.captures_iter(index_html) {
-        let href = &caps[1];
+        let href = caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .or_else(|| caps.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or("");
         let href_filename = href.rsplit('/').next().unwrap_or("");
         if href_filename != filename {
             continue;
@@ -2965,6 +3657,25 @@ fn find_upstream_url_for_file(
     None
 }
 
+/// Resolve a PEP 658 metadata filename from the corresponding wheel URL.
+/// PyPI advertises the metadata hash on the wheel anchor but usually does not
+/// include a separate `.whl.metadata` anchor in the Simple API page.
+fn find_upstream_metadata_url(
+    index_html: &str,
+    filename: &str,
+    index_url: Option<&str>,
+) -> Option<String> {
+    let wheel_filename = filename.strip_suffix(".metadata")?;
+    if !wheel_filename.ends_with(".whl") {
+        return None;
+    }
+
+    let wheel_url = find_upstream_url_for_file(index_html, wheel_filename, index_url)?;
+    let mut url = url::Url::parse(&wheel_url).ok()?;
+    url.set_path(&format!("{}.metadata", url.path()));
+    Some(url.into())
+}
+
 /// Rewrite download URLs in upstream PyPI simple index HTML to route through
 /// Artifact Keeper's proxy endpoint.
 ///
@@ -2980,11 +3691,9 @@ fn find_upstream_url_for_file(
 /// `/pypi/` are rewritten. Plain relative URLs and anchors are left unchanged.
 ///
 /// PEP 658 metadata attributes (`data-dist-info-metadata` and
-/// `data-core-metadata`) are stripped from rewritten links because the proxy
-/// cannot serve `.metadata` files for packages it has not stored locally.
-/// Keeping these attributes would cause pip to request a `.metadata` URL that
-/// returns 404, which pip treats as a hard error since the index promised the
-/// metadata was available.
+/// `data-core-metadata`) are preserved on rewritten links. The download path
+/// resolves `.metadata` filenames through the same upstream Simple API page,
+/// so removing these attributes would prevent installers from using PEP 658.
 /// Classification of a proxied PyPI simple-index body sniffed from its
 /// content, used when the upstream `Content-Type` is neither PEP 691 JSON nor
 /// PEP 503 HTML. See #2801: corporate outbound proxies / quirky mirrors
@@ -3045,11 +3754,32 @@ fn bad_upstream_simple_index() -> Response {
 fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     let normalized = PypiHandler::normalize_name(project);
 
+    // Neutralize any upstream `<base href>` first: our rewritten download links
+    // are root-relative, so a surviving `<base>` re-anchors them onto the
+    // upstream origin (proxy bypass + host disclosure). Strip to a FIXPOINT:
+    // removing one `<base>` can splice surrounding bytes into a NEW one
+    // (`<ba<base x>se href=...>`), so loop until nothing more matches.
+    let mut html = html.to_string();
+    loop {
+        let stripped = BASE_TAG_RE.replace_all(&html, "").into_owned();
+        if stripped == html {
+            break;
+        }
+        html = stripped;
+    }
+
     REWRITE_RE
-        .replace_all(html, |caps: &regex::Captures| {
+        .replace_all(&html, |caps: &regex::Captures| {
             let before_href = &caps[1];
-            let full_url = &caps[2];
-            let after_href = &caps[3];
+            // The href value is in whichever quote-alternation group matched
+            // (double / single / unquoted); `after` is the trailing group.
+            let full_url = caps
+                .get(2)
+                .or_else(|| caps.get(3))
+                .or_else(|| caps.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            let after_href = caps.get(5).map(|m| m.as_str()).unwrap_or("");
 
             // Split off the fragment (#sha256=...) if present
             let (url_path, fragment) = match full_url.find('#') {
@@ -3070,16 +3800,7 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
                 repo_key, normalized, filename, fragment
             );
 
-            // Strip PEP 658 metadata attributes. The proxy does not cache or
-            // serve .metadata files, so advertising them causes pip to fail
-            // with a 404 when it tries to fetch the promised metadata.
-            let before_cleaned = METADATA_ATTR_RE.replace_all(before_href, "");
-            let after_cleaned = METADATA_ATTR_RE.replace_all(after_href, "");
-
-            format!(
-                "<a {}href=\"{}\"{}>",
-                before_cleaned, rewritten, after_cleaned
-            )
+            format!("<a {}href=\"{}\"{}>", before_href, rewritten, after_href)
         })
         .into_owned()
 }
@@ -3089,9 +3810,10 @@ const PEP691_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 
 /// Rewrite the `files[].url` of a parsed PEP 691 JSON simple index to route
 /// downloads through Artifact Keeper's proxy, mirroring `rewrite_upstream_urls`
-/// for the HTML form, and strip the PEP 658/714 metadata signals the proxy
-/// cannot serve (`core-metadata`, `data-dist-info-metadata`). PEP 700
-/// `upload-time` and every other field are preserved untouched.
+/// for the HTML form. PEP 658/714 metadata signals (`core-metadata`,
+/// `data-dist-info-metadata`) are preserved so installers can request the
+/// corresponding `.metadata` file through the proxy. PEP 700 `upload-time`
+/// and every other field are preserved untouched.
 fn rewrite_simple_json_files(doc: &mut serde_json::Value, repo_key: &str, normalized: &str) {
     let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) else {
         return;
@@ -3114,11 +3836,6 @@ fn rewrite_simple_json_files(doc: &mut serde_json::Value, repo_key: &str, normal
                 repo_key, normalized, filename
             )),
         );
-        // The proxy cannot serve `.metadata` for distributions it has not
-        // cached, so drop the PEP 658/714 metadata signals — the JSON analogue
-        // of the `data-*-metadata` stripping in `rewrite_upstream_urls`.
-        obj.remove("core-metadata");
-        obj.remove("data-dist-info-metadata");
     }
 }
 
@@ -3253,12 +3970,367 @@ fn merge_local_into_remote_simple_json(
     serde_json::to_string(&doc).ok()
 }
 
+// ---------------------------------------------------------------------------
+// #2937: distribution-granular ownership union for virtual PyPI
+// ---------------------------------------------------------------------------
+//
+// The #1600 dependency-confusion guard suppresses a Remote member for a name a
+// higher-priority local member owns, so a public `fastapi==0.119.1` can never
+// shadow an internal `fastapi`. That suppression was name-level coarse and broke
+// two legitimate topologies (#2748):
+//
+//   * Case A (safe to union): the remote holds a platform/ABI-distinct wheel of a
+//     version the local ALREADY owns (local ships the linux `pydantic_core==2.0`
+//     wheel, remote ships the windows wheel of the SAME 2.0). Same trusted
+//     package, different build target — no confusion, so union it.
+//   * Case B (must stay gated): a version present ONLY in the remote for a
+//     locally-owned name (local owns `fastapi==0.119.0`, remote has `0.118.0`).
+//     That is the confusion vector — keep it suppressed unless a `tracks`/opt-in
+//     declaration re-enables the union (handled upstream via
+//     `pypi_virtual_isolates_name` returning `None`).
+//
+// Security invariant (do NOT regress #1600): a Case-A union is admitted ONLY when
+// it is a wheel of a version the local owner already provides AND its
+// compatibility tag is one the owner does not already ship. It can therefore only
+// ADD a build target the owner lacks (windows when the owner only has linux); it
+// can never introduce a version the owner lacks, nor a competing same-platform
+// rebuild of an owned version. The index and download paths make the identical
+// decision so a distribution advertised in the index is downloadable and a
+// suppressed one 404s on both.
+
+/// Per-version record of the wheel compatibility tags a virtual's local owner
+/// already provides for a PEP 503 name, used to admit Case-A remote unions
+/// (#2937).
+#[derive(Debug, Default)]
+struct OwnedWheelProfile {
+    /// owned version -> set of local wheel compat tags (`{py}-{abi}-{platform}`)
+    /// for that version. A version present with an empty tag set is owned only
+    /// via a source distribution, so any remote wheel tag for it is distinct.
+    per_version: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl OwnedWheelProfile {
+    /// Build the profile from the owning local member(s)' distribution
+    /// filenames. Every recognized version is registered as owned (wheels and
+    /// sdists alike); only wheels contribute a compat tag.
+    fn from_filenames<'a>(filenames: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut per_version: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for filename in filenames {
+            let Some(version) = version_from_pypi_filename(filename) else {
+                continue;
+            };
+            let entry = per_version.entry(version).or_default();
+            if let Some(tag) = wheel_compat_tag(filename) {
+                entry.insert(tag);
+            }
+        }
+        Self { per_version }
+    }
+
+    /// Case-A test for one remote distribution filename: it must be a
+    /// PLATFORM-SPECIFIC wheel, of a version the owner already provides, whose
+    /// (case-normalized) compat tag the owner does NOT already ship. Rejected as
+    /// Case B (stay suppressed): sdists, universal `*-none-any` wheels
+    /// (installable everywhere — not a distinct build target, and a vector for a
+    /// lower-priority remote to inject arbitrary code), unowned versions, and
+    /// same-platform rebuilds (including a case-variant of a tag the local
+    /// already ships). Fails closed (rejects) when the shape is unrecognized.
+    fn admits(&self, filename: &str) -> bool {
+        let Some(tag) = wheel_compat_tag(filename) else {
+            return false;
+        };
+        // Exclude universal (pure-python) wheels: platform tag `any`. Case A
+        // only adds a genuinely platform-specific target the owner lacks.
+        if tag.rsplit('-').next() == Some("any") {
+            return false;
+        }
+        let Some(version) = version_from_pypi_filename(filename) else {
+            return false;
+        };
+        match self.per_version.get(&version) {
+            // `tag` and the stored tags are both lowercased by `wheel_compat_tag`,
+            // so a case-variant of the local's own tag compares equal (Case B).
+            Some(local_tags) => !local_tags.contains(&tag),
+            None => false,
+        }
+    }
+}
+
+/// Parse the `{python}-{abi}-{platform}` compatibility tag of a wheel filename
+/// per the binary-distribution spec
+/// (`{distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl`): the
+/// last three `-`-separated fields of the stem, LOWERCASED so the Case-A
+/// comparison is case-insensitive (wheel tags are case-insensitive; a
+/// case-variant must not read as a distinct platform). Returns `None` for
+/// non-wheels (an sdist has no platform tag) or malformed names.
+fn wheel_compat_tag(filename: &str) -> Option<String> {
+    let stem = filename.strip_suffix(".whl")?;
+    let parts: Vec<&str> = stem.split('-').collect();
+    // name, version, [build], python, abi, platform => at least five fields.
+    if parts.len() < 5 {
+        return None;
+    }
+    Some(parts[parts.len() - 3..].join("-").to_ascii_lowercase())
+}
+
+/// Narrow a suppressed Remote member's contribution to Case-A distributions
+/// (#2937): return a body containing only the entries `owned.admits` accepts.
+///
+/// SECURITY (#2967 R4). The routing decision is made on the SNIFFED body, never
+/// the upstream `Content-Type`. A hostile / quirky upstream can label an HTML
+/// body `application/json` (or vice-versa); trusting the header let a mislabeled
+/// HTML index skip the ownership filter and fall through to the in-place
+/// `rewrite_upstream_urls` rewriter, delivering a raw off-site href to `pip`
+/// (dependency confusion for a locally-owned name). Sniffing the actual bytes
+/// picks the correct filter regardless of the header. Any body that is neither
+/// recognizable PEP 691 JSON nor PEP 503 HTML fails closed to an EMPTY PEP 691
+/// listing — never the raw upstream bytes.
+fn case_a_filter_remote_body(
+    content: &[u8],
+    owned: &OwnedWheelProfile,
+    repo_key: &str,
+    normalized: &str,
+) -> Bytes {
+    let body = String::from_utf8_lossy(content);
+    let filtered = match sniff_simple_index(content) {
+        SniffedSimpleIndex::Json => filter_remote_case_a_json(&body, owned, normalized),
+        SniffedSimpleIndex::Html => filter_remote_case_a_html(&body, owned, repo_key, normalized),
+        SniffedSimpleIndex::Binary => empty_pep691_listing(normalized),
+    };
+    Bytes::from(filtered)
+}
+
+/// A structurally valid empty PEP 691 simple-index listing for `normalized`.
+/// Used whenever a listing must fail closed without breaking JSON-simple
+/// clients: for a locally-owned name whose suppressed Remote member returned a
+/// body that could not be ownership-filtered (#2967 R4), and for an age-gate
+/// policy-resolution failure. Mirrors the shape the merge path expects
+/// (`meta`/`name`/`versions`/`files`) and guarantees no raw upstream byte is
+/// surfaced.
+fn empty_pep691_listing(normalized: &str) -> String {
+    serde_json::json!({
+        "meta": {"api-version": "1.0"},
+        "name": normalized,
+        "versions": [],
+        "files": [],
+    })
+    .to_string()
+}
+
+/// Drop every file from a Remote member's PEP 691 JSON simple index that is not
+/// a Case-A union candidate, and re-advertise `versions` from the survivors so
+/// the listing never names a version no surviving file backs (#2937).
+///
+/// SECURITY (#2967 R4): FAILS CLOSED. A body that is not valid PEP 691 JSON (or
+/// carries no `files` array) yields an EMPTY listing — NEVER the verbatim input.
+/// Returning the raw body here was the bypass: an HTML index mislabeled
+/// `application/json` was echoed back unfiltered and then rewritten in place,
+/// leaking an off-site href for a locally-owned name.
+fn filter_remote_case_a_json(json: &str, owned: &OwnedWheelProfile, normalized: &str) -> String {
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(json) else {
+        return empty_pep691_listing(normalized);
+    };
+    let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) else {
+        return empty_pep691_listing(normalized);
+    };
+    files.retain(|f| {
+        f.get("filename")
+            .and_then(|n| n.as_str())
+            .map(|n| owned.admits(n))
+            .unwrap_or(false)
+    });
+    // Rebuild `versions` from the surviving files so the index cannot advertise
+    // a version only the remote has for a locally-owned name.
+    let versions: std::collections::BTreeSet<String> = doc
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f.get("filename").and_then(|n| n.as_str()))
+                .filter_map(version_from_pypi_filename)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert(
+            "versions".to_owned(),
+            serde_json::Value::Array(
+                versions
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::to_string(&doc).unwrap_or_else(|_| empty_pep691_listing(normalized))
+}
+
+/// HTML sibling of [`filter_remote_case_a_json`] (#2937): reduce a suppressed
+/// Remote member's PEP 503 HTML simple index to its Case-A union candidates by
+/// REBUILDING a fresh index from parsed anchors — never by editing the raw
+/// upstream in place.
+///
+/// SECURITY. A span-replacing filter is fundamentally leaky: an UNCLOSED or
+/// malformed anchor (no `</a>`, `</a >`, `</ a>`, …) is not a matched span, so
+/// it passes through untouched, and combined with a quote/case gap in any later
+/// URL rewriter it delivers a raw off-site href to the client (#2967 R3, the
+/// #1600 class). This function instead scans anchor START-tags only (`<a ...>`
+/// with NO required `</a>`, so unclosed/malformed anchors are covered); extracts
+/// the `href` quote-agnostically and case-insensitively (double, single, or
+/// unquoted; minimal-entity-decoded; query/fragment stripped) and derives the
+/// file identity from its URL basename — never the anchor text; admits Case-A
+/// wheels of that basename; and emits a FRESH minimal PEP 503 document
+/// containing ONLY Artifact-Keeper-pathed anchors for the survivors.
+///
+/// No raw upstream anchor (closed or not, any quote style or letter case) ever
+/// reaches the client, and every emitted href is an AK path the download gate
+/// keys on — so the index stays symmetric with the download route.
+fn filter_remote_case_a_html(
+    html: &str,
+    owned: &OwnedWheelProfile,
+    repo_key: &str,
+    normalized: &str,
+) -> String {
+    static ANCHOR_START: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<a\b[^>]*>").unwrap());
+    static HREF_ATTR: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"(?i)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap());
+
+    let mut survivors = String::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for tag in ANCHOR_START.find_iter(html) {
+        let Some(href_caps) = HREF_ATTR.captures(tag.as_str()) else {
+            continue;
+        };
+        let href_raw = href_caps
+            .get(1)
+            .or_else(|| href_caps.get(2))
+            .or_else(|| href_caps.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        let href = decode_html_entities_minimal(href_raw);
+        // File identity = URL basename (never the anchor text). Keep the upstream
+        // sha256 fragment so pip can verify the bytes AK proxies; strip the
+        // fragment and any query before taking the basename.
+        let fragment = match href.find('#') {
+            Some(pos) => &href[pos..],
+            None => "",
+        };
+        let url_part = href.split('#').next().unwrap_or(&href);
+        let url_no_query = url_part.split('?').next().unwrap_or(url_part);
+        let filename = url_no_query.rsplit('/').next().unwrap_or("").trim();
+        if filename.is_empty() || !owned.admits(filename) {
+            continue;
+        }
+        if !seen.insert(filename.to_string()) {
+            continue;
+        }
+        // AK path ONLY — no upstream host survives. filename + fragment are
+        // escaped so neither can break out of the attribute.
+        survivors.push_str(&format!(
+            "<a href=\"/pypi/{}/simple/{}/{}{}\">{}</a><br/>\n",
+            repo_key,
+            normalized,
+            html_escape(filename),
+            html_escape(fragment),
+            html_escape(filename),
+        ));
+    }
+
+    // Fresh minimal PEP 503 document: only AK-pathed survivor anchors. The local
+    // splice (`merge_local_into_remote_simple_html`) inserts before `</body>`
+    // and `tracks` metas before `</head>`, so both markers are present.
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta name=\"pypi:repository-version\" content=\"1.0\"/>\n</head>\n<body>\n{survivors}</body>\n</html>\n"
+    )
+}
+
+/// Build the owning local member(s)' [`OwnedWheelProfile`] for a normalized PEP
+/// 503 name by querying every local/staging member of the virtual repo for the
+/// distribution filenames it holds (#2937). Shares the source of truth with the
+/// simple-index first pass so the index and download paths admit the identical
+/// set of Case-A unions. Fails closed to an empty profile (suppress everything)
+/// on DB error.
+async fn pypi_owned_wheel_profile(
+    db: &PgPool,
+    members: &[crate::models::repository::Repository],
+    normalized: &str,
+) -> OwnedWheelProfile {
+    let local_ids: Vec<uuid::Uuid> = members
+        .iter()
+        .filter(|m| matches!(m.repo_type, RepositoryType::Local | RepositoryType::Staging))
+        .map(|m| m.id)
+        .collect();
+    if local_ids.is_empty() {
+        return OwnedWheelProfile::default();
+    }
+    let rows = sqlx::query!(
+        r#"
+        SELECT a.path
+        FROM artifacts a
+        WHERE a.repository_id = ANY($1)
+          AND a.is_deleted = false
+          AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2
+        "#,
+        &local_ids,
+        normalized
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    OwnedWheelProfile::from_filenames(
+        rows.iter()
+            .map(|r| r.path.rsplit('/').next().unwrap_or(r.path.as_str())),
+    )
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::proxy_helpers::scan_blocked_response;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn metadata_filename_uses_distribution_version_for_curation() {
+        let wheel = "demo-1.2.3-py3-none-any.whl";
+        let metadata = format!("{wheel}.metadata");
+        assert_eq!(
+            version_from_pypi_filename(wheel),
+            version_from_pypi_filename(pypi_distribution_filename(&metadata))
+        );
+        assert_eq!(version_from_pypi_filename(wheel).as_deref(), Some("1.2.3"));
+    }
+
+    /// A stacked `.metadata` suffix names the same distribution, so the
+    /// curation gate must parse the same version from it. Stripping only one
+    /// suffix yields `…whl.metadata`, whose version parses as `None` — and a
+    /// `None` version skips version-constrained rules, which is exactly the
+    /// bypass this resolver has to foreclose.
+    #[test]
+    fn stacked_metadata_suffix_resolves_to_the_same_distribution() {
+        let wheel = "demo-1.0-py3-none-any.whl";
+        for suffix in [
+            "",
+            ".metadata",
+            ".metadata.metadata",
+            ".metadata.metadata.metadata",
+        ] {
+            let requested = format!("{wheel}{suffix}");
+            assert_eq!(
+                pypi_distribution_filename(&requested),
+                wheel,
+                "'{requested}' must resolve to the distribution the serve path fetches"
+            );
+            assert_eq!(
+                version_from_pypi_filename(pypi_distribution_filename(&requested)).as_deref(),
+                Some("1.0"),
+                "'{requested}' must version-parse as 1.0 so `==1.0` rules apply"
+            );
+        }
+    }
 
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -3859,10 +4931,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_strips_data_dist_info_metadata() {
+    fn test_rewrite_preserves_data_dist_info_metadata() {
         // Real PyPI HTML includes data-dist-info-metadata on .whl links.
-        // The proxy cannot serve .metadata files, so these attributes must
-        // be stripped to prevent pip from requesting them and getting 404.
+        // The metadata URL is proxied through the same upstream Simple API,
+        // so its hash must remain attached to the rewritten wheel link.
         let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=8abb" data-requires-python="&gt;=2.7" data-dist-info-metadata="sha256=5507" data-core-metadata="sha256=5507">six-1.16.0-py2.py3-none-any.whl</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-proxy", "six");
         assert!(result.contains(
@@ -3870,13 +4942,12 @@ mod tests {
         ));
         // data-requires-python should be preserved
         assert!(result.contains(r#"data-requires-python="&gt;=2.7""#));
-        // PEP 658 metadata attributes must be stripped
-        assert!(!result.contains("data-dist-info-metadata"));
-        assert!(!result.contains("data-core-metadata"));
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=5507""#));
+        assert!(result.contains(r#"data-core-metadata="sha256=5507""#));
     }
 
     #[test]
-    fn test_rewrite_strips_metadata_attrs_from_real_pypi_html() {
+    fn test_rewrite_preserves_metadata_attrs_from_real_pypi_html() {
         // Simulates the actual HTML returned by pypi.org for the `six` package
         let html = r#"<!DOCTYPE html>
 <html>
@@ -3902,9 +4973,9 @@ mod tests {
         // data-requires-python should be preserved on both links
         assert!(result.contains("data-requires-python"));
 
-        // PEP 658 metadata attributes must be stripped from the .whl link
-        assert!(!result.contains("data-dist-info-metadata"));
-        assert!(!result.contains("data-core-metadata"));
+        // PEP 658 metadata hashes must be preserved on the .whl link
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=5620""#));
+        assert!(result.contains(r#"data-core-metadata="sha256=5620""#));
 
         // Structure should be preserved
         assert!(result.contains("<h1>Links for six</h1>"));
@@ -3915,7 +4986,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_rewrite_upstream_simple_json_rewrites_urls_preserves_upload_time_strips_metadata() {
+    fn test_rewrite_upstream_simple_json_rewrites_urls_preserves_metadata() {
         // Shape mirrors a real pypi.org PEP 691 JSON file object.
         let upstream = r#"{
             "meta": {"api-version": "1.1"},
@@ -3952,14 +5023,24 @@ mod tests {
         assert_eq!(file["hashes"]["sha256"], "deadbeef");
         assert_eq!(file["requires-python"], ">=3.7");
 
-        // PEP 658/714 metadata signals stripped — the proxy can't serve `.metadata`.
-        assert!(file.get("core-metadata").is_none());
-        assert!(file.get("data-dist-info-metadata").is_none());
+        assert_eq!(file["core-metadata"]["sha256"], "abc");
+        assert_eq!(file["data-dist-info-metadata"]["sha256"], "abc");
     }
 
     #[test]
     fn test_rewrite_upstream_simple_json_returns_none_for_non_json() {
         assert!(rewrite_upstream_simple_json(b"<!DOCTYPE html><html></html>", "r", "p").is_none());
+    }
+
+    #[test]
+    fn test_empty_pep691_listing_preserves_required_project_shape() {
+        let doc: serde_json::Value =
+            serde_json::from_str(&empty_pep691_listing("my-package")).unwrap();
+
+        assert_eq!(doc["meta"]["api-version"], "1.0");
+        assert_eq!(doc["name"], "my-package");
+        assert_eq!(doc["versions"], serde_json::json!([]));
+        assert_eq!(doc["files"], serde_json::json!([]));
     }
 
     // -----------------------------------------------------------------------
@@ -4197,23 +5278,331 @@ mod tests {
         assert_eq!(meta_tracks, vec!["https://pypi.org/simple/pkg/"]);
     }
 
+    // -----------------------------------------------------------------------
+    // #2937: distribution-granular ownership union (Case A) vs suppression
+    // (Case B) for a locally-owned virtual PyPI name.
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_rewrite_strips_metadata_attr_before_href() {
+    fn test_wheel_compat_tag_parses_platform_triple() {
+        assert_eq!(
+            wheel_compat_tag("pydantic_core-2.0-cp39-cp39-manylinux_2_17_x86_64.whl").as_deref(),
+            Some("cp39-cp39-manylinux_2_17_x86_64")
+        );
+        assert_eq!(
+            wheel_compat_tag("pydantic_core-2.0-cp39-cp39-win_amd64.whl").as_deref(),
+            Some("cp39-cp39-win_amd64")
+        );
+        // Optional build tag is tolerated: the last three fields are the tag.
+        assert_eq!(
+            wheel_compat_tag("pkg-1.0-1-py3-none-any.whl").as_deref(),
+            Some("py3-none-any")
+        );
+        // Sdists and malformed names have no platform tag.
+        assert_eq!(wheel_compat_tag("pydantic_core-2.0.tar.gz"), None);
+        assert_eq!(wheel_compat_tag("weird.whl"), None);
+    }
+
+    fn linux_owner_profile() -> OwnedWheelProfile {
+        // Local owner ships only the linux wheel of 2.0 (Case-A backdrop).
+        OwnedWheelProfile::from_filenames(["pydantic_core-2.0-cp39-cp39-manylinux_2_17_x86_64.whl"])
+    }
+
+    #[test]
+    fn test_owned_profile_admits_case_a_rejects_case_b() {
+        let owned = linux_owner_profile();
+        // Case A: windows wheel of the version the local ALREADY owns -> union.
+        assert!(owned.admits("pydantic_core-2.0-cp39-cp39-win_amd64.whl"));
+        // Case B: a version only the remote has -> stay suppressed.
+        assert!(!owned.admits("pydantic_core-1.9-cp39-cp39-win_amd64.whl"));
+        // Same-platform rebuild of an owned version -> confusion vector, reject.
+        assert!(!owned.admits("pydantic_core-2.0-cp39-cp39-manylinux_2_17_x86_64.whl"));
+        // An sdist of an owned version is NOT platform-distinct -> reject.
+        assert!(!owned.admits("pydantic_core-2.0.tar.gz"));
+    }
+
+    #[test]
+    fn test_owned_profile_sdist_only_owner_admits_any_platform_wheel() {
+        // Owner holds only an sdist of 2.0 (no compat tags): any remote wheel of
+        // 2.0 is platform-distinct, but a remote-only version stays suppressed.
+        let owned = OwnedWheelProfile::from_filenames(["pydantic_core-2.0.tar.gz"]);
+        assert!(owned.admits("pydantic_core-2.0-cp39-cp39-win_amd64.whl"));
+        assert!(!owned.admits("pydantic_core-3.0-cp39-cp39-win_amd64.whl"));
+    }
+
+    #[test]
+    fn test_filter_remote_case_a_json_keeps_owned_platform_wheel_drops_other_version() {
+        let owned = linux_owner_profile();
+        // Remote advertises: a windows wheel of the owned 2.0 (Case A, keep) and
+        // a whole other version 1.9 (Case B, drop).
+        let remote = r#"{
+            "meta": {"api-version": "1.1"},
+            "name": "pydantic-core",
+            "versions": ["1.9", "2.0"],
+            "files": [
+                {"filename": "pydantic_core-2.0-cp39-cp39-win_amd64.whl",
+                 "url": "https://files/pydantic_core-2.0-cp39-cp39-win_amd64.whl",
+                 "hashes": {"sha256": "w"}},
+                {"filename": "pydantic_core-1.9-cp39-cp39-win_amd64.whl",
+                 "url": "https://files/pydantic_core-1.9-cp39-cp39-win_amd64.whl",
+                 "hashes": {"sha256": "o"}}
+            ]
+        }"#;
+        let out = filter_remote_case_a_json(remote, &owned, "pydantic-core");
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let files = doc["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "only the Case-A windows wheel survives");
+        assert_eq!(
+            files[0]["filename"],
+            "pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+        );
+        // versions[] is rebuilt from survivors: the remote-only 1.9 is gone.
+        let versions: Vec<&str> = doc["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["2.0"],
+            "remote-only version must not surface"
+        );
+    }
+
+    #[test]
+    fn test_filter_remote_case_a_html_keeps_owned_platform_wheel_drops_other_version() {
+        let owned = linux_owner_profile();
+        let remote = concat!(
+            "<!DOCTYPE html><html><head></head><body>\n",
+            "<a href=\"https://files/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</a><br/>\n",
+            "<a href=\"https://files/pydantic_core-1.9-cp39-cp39-win_amd64.whl\">pydantic_core-1.9-cp39-cp39-win_amd64.whl</a><br/>\n",
+            "</body></html>\n"
+        );
+        let out = filter_remote_case_a_html(remote, &owned, "virt", "pydantic-core");
+        // Case-A survivor is re-emitted as an AK path (no offsite host), fragment preserved.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa"
+            ),
+            "Case-A wheel re-emitted as an AK path: {out}"
+        );
+        assert!(
+            !out.contains("https://files"),
+            "no offsite href survives: {out}"
+        );
+        assert!(
+            !out.contains("pydantic_core-1.9-cp39-cp39-win_amd64.whl"),
+            "Case-B remote-only version dropped: {out}"
+        );
+    }
+
+    // HIGH regression (#2967 red-team): a hostile upstream whose anchor TEXT is
+    // an admitted owned-version wheel but whose HREF (single-quoted / uppercase /
+    // text != href) points off-site at a remote-only version must NOT leak that
+    // off-site URL nor surface the remote-only version. Membership is decided on
+    // the href basename and every survivor is re-emitted as an AK path.
+    #[test]
+    fn test_filter_remote_case_a_html_href_based_defeats_text_spoof() {
+        let owned = linux_owner_profile();
+        let remote = concat!(
+            "<body>\n",
+            // text = admitted owned wheel, href (single-quoted) = remote-only 1.9 off-site.
+            "<a href='http://evil/files/pydantic_core-1.9-cp39-cp39-win_amd64.whl#sha256=bad'>pydantic_core-2.0-cp99-cp99-win_amd64.whl</a><br/>\n",
+            // uppercase HREF, double-quoted, also a remote-only version off-site.
+            "<A HREF=\"http://evil/files/pydantic_core-7.7-cp39-cp39-win_amd64.whl\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</A><br/>\n",
+            // a genuine Case-A anchor (href basename is the owned-version windows wheel).
+            "<a href=\"http://mirror/pydantic_core-2.0-cp39-cp39-win_amd64.whl\">whatever</a><br/>\n",
+            "</body>\n"
+        );
+        let out = filter_remote_case_a_html(remote, &owned, "virt", "pydantic-core");
+        // No off-site host, in any form.
+        assert!(
+            !out.contains("evil"),
+            "off-site href must not survive: {out}"
+        );
+        assert!(
+            !out.contains("mirror"),
+            "off-site href must not survive: {out}"
+        );
+        assert!(!out.contains("http://"), "no absolute URL survives: {out}");
+        // Remote-only versions (from the spoofed hrefs) must not surface at all.
+        assert!(
+            !out.contains("1.9"),
+            "remote-only 1.9 must not surface: {out}"
+        );
+        assert!(
+            !out.contains("7.7"),
+            "remote-only 7.7 must not surface: {out}"
+        );
+        // The genuine Case-A wheel (decided on its href basename) IS re-emitted as an AK path.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+            ),
+            "genuine Case-A wheel re-emitted as AK path: {out}"
+        );
+    }
+
+    // HIGH regression R3 (#2967 round 3): a span-replace filter left UNCLOSED and
+    // MALFORMED anchors untouched. The REBUILD covers every anchor shape —
+    // unclosed (no `</a>`), `</a >` / `</ a>`, uppercase, single/double-quoted,
+    // and UNQUOTED — all pointing off-site at remote-only versions must be
+    // dropped, and only genuine Case-A wheels survive as AK paths.
+    #[test]
+    fn test_filter_remote_case_a_html_rebuild_covers_unclosed_and_all_quote_shapes() {
+        let owned = linux_owner_profile();
+        let remote = concat!(
+            "<body>\n",
+            // 1) UNCLOSED single-quoted anchor, off-site remote-only 1.9.
+            "<a href='http://evil/pydantic_core-1.9-cp39-cp39-win_amd64.whl'>\n",
+            // 2) UNCLOSED uppercase double-quoted anchor, off-site remote-only 9.9.
+            "<A HREF=\"http://evil/pydantic_core-9.9-cp39-cp39-win_amd64.whl\">\n",
+            // 3) malformed close `</a >`, off-site remote-only 8.8.
+            "<a href=\"http://evil/pydantic_core-8.8-cp39-cp39-win_amd64.whl\">x</a >\n",
+            // 4) malformed close `</ a>`, off-site remote-only 6.6.
+            "<a href=\"http://evil/pydantic_core-6.6-cp39-cp39-win_amd64.whl\">y</ a>\n",
+            // 5) UNQUOTED off-site remote-only 5.5.
+            "<a href=http://evil/pydantic_core-5.5-cp39-cp39-win_amd64.whl>z</a>\n",
+            // 6) genuine Case-A: unquoted href basename is the owned windows wheel.
+            "<a href=http://mirror/pydantic_core-2.0-cp39-cp39-win_amd64.whl>ok</a>\n",
+            "</body>\n"
+        );
+        let out = filter_remote_case_a_html(remote, &owned, "virt", "pydantic-core");
+        assert!(!out.contains("http://"), "no absolute URL survives: {out}");
+        assert!(!out.contains("evil"), "no off-site host survives: {out}");
+        assert!(!out.contains("mirror"), "no off-site host survives: {out}");
+        for v in ["1.9", "9.9", "8.8", "6.6", "5.5"] {
+            assert!(!out.contains(v), "remote-only {v} must not surface: {out}");
+        }
+        // Only the genuine Case-A wheel survives, as an AK path.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+            ),
+            "genuine Case-A wheel re-emitted as AK path: {out}"
+        );
+    }
+
+    // Defense-in-depth (#2967): rewrite_upstream_urls now rewrites single-quoted
+    // and uppercase-`HREF` upstream anchors too, so no off-site href survives the
+    // proxy render even outside the suppressed-member rebuild path.
+    #[test]
+    fn test_rewrite_upstream_urls_handles_single_quote_and_uppercase() {
+        let html = concat!(
+            "<a href='https://files.pythonhosted.org/x/pkg-1.0.whl#sha256=aa'>pkg-1.0.whl</a>\n",
+            "<A HREF=\"https://files.pythonhosted.org/y/pkg-2.0.whl\">pkg-2.0.whl</A>\n",
+            "<a href=https://files.pythonhosted.org/z/pkg-3.0.whl>pkg-3.0.whl</a>\n"
+        );
+        let out = rewrite_upstream_urls(html, "repo", "pkg");
+        assert!(
+            !out.contains("files.pythonhosted.org"),
+            "offsite host rewritten: {out}"
+        );
+        assert!(
+            out.contains("/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=aa"),
+            "{out}"
+        );
+        assert!(out.contains("/pypi/repo/simple/pkg/pkg-2.0.whl"), "{out}");
+        assert!(out.contains("/pypi/repo/simple/pkg/pkg-3.0.whl"), "{out}");
+    }
+
+    #[test]
+    fn test_case_a_filter_remote_body_dispatch_sniffs_and_fails_closed() {
+        let owned = linux_owner_profile();
+        let json = r#"{"meta":{"api-version":"1.1"},"name":"p","versions":["2.0"],
+            "files":[{"filename":"pydantic_core-2.0-cp39-cp39-win_amd64.whl","url":"u","hashes":{"sha256":"w"}}]}"#;
+        // Genuine PEP 691 JSON is sniffed to JSON and filtered.
+        let out = case_a_filter_remote_body(json.as_bytes(), &owned, "virt", "p");
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["files"].as_array().unwrap().len(), 1);
+        // Unparseable body -> empty PEP 691 listing (fail closed, never leak raw
+        // remote bytes).
+        let out = case_a_filter_remote_body(b"\x00\x01binary", &owned, "virt", "p");
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(doc["files"].as_array().unwrap().is_empty());
+        assert_eq!(doc["name"], "p");
+    }
+
+    // #2967 R4 (CRITICAL bypass): an HTML index MISLABELED
+    // `Content-Type: application/json`. The old code trusted `ct.contains("json")`
+    // and echoed the HTML body verbatim (`return json.to_string()`), which the
+    // render fallthrough then sniffed as HTML and served through the in-place
+    // `rewrite_upstream_urls` rewriter with NO ownership filter — leaking an
+    // off-site href for a locally-owned name. The dispatch now SNIFFS the body,
+    // routes the HTML through the ownership rebuild, and emits ONLY AK paths.
+    #[test]
+    fn test_case_a_filter_remote_body_mislabeled_json_html_body_is_ownership_filtered() {
+        let owned = linux_owner_profile(); // owns pydantic_core 2.0 linux
+        let html_labeled_json = concat!(
+            "<!DOCTYPE html><html><body>\n",
+            // Genuine Case-A: owned version 2.0, distinct win platform, href back to
+            // the mirror. Must UNION as an AK path.
+            "<a href=\"http://mirror/files/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</a><br/>\n",
+            // Off-site, remote-only Case-B (9.9) with a `>` INSIDE a prior `title`
+            // attribute — the exact anchor the in-place rewriter leaked verbatim
+            // (its `[^>]*?` stops before `href`). Must be dropped entirely.
+            "<a title=\"x>y\" href=\"https://evil.example/pydantic_core-9.9-cp39-cp39-win_amd64.whl#sha256=cc\">pydantic_core-9.9-cp39-cp39-win_amd64.whl</a><br/>\n",
+            "</body></html>\n"
+        );
+        let out = case_a_filter_remote_body(
+            html_labeled_json.as_bytes(),
+            &owned,
+            "virt",
+            "pydantic-core",
+        );
+        let out = String::from_utf8_lossy(&out);
+        // No off-site host survives, in any form.
+        assert!(!out.contains("evil.example"), "off-site href leaked: {out}");
+        assert!(!out.contains("mirror"), "off-site href leaked: {out}");
+        assert!(!out.contains("http://"), "absolute URL survived: {out}");
+        assert!(!out.contains("https://"), "absolute URL survived: {out}");
+        // Case-B remote-only version must not surface.
+        assert!(
+            !out.contains("9.9"),
+            "remote-only Case-B version leaked: {out}"
+        );
+        // The genuine Case-A wheel IS re-emitted as an AK path.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+            ),
+            "Case-A wheel not re-emitted as AK path: {out}"
+        );
+    }
+
+    // MEDIUM regression (#2967 red-team): admits() must reject a universal
+    // `*-none-any` wheel (installable everywhere, not a distinct build target)
+    // and a case-variant of a tag the local already ships (same platform).
+    #[test]
+    fn test_owned_profile_admits_tightened_universal_and_case_variant() {
+        let owned = linux_owner_profile(); // local ships cp39-cp39-manylinux_2_17_x86_64
+                                           // Universal pure-python wheel of the owned version -> NOT a platform build.
+        assert!(!owned.admits("pydantic_core-2.0-py3-none-any.whl"));
+        assert!(!owned.admits("pydantic_core-2.0-py2.py3-none-any.whl"));
+        // Case-variant of the local's own tag -> same platform, Case B.
+        assert!(!owned.admits("pydantic_core-2.0-cp39-cp39-MANYLINUX_2_17_X86_64.whl"));
+        // A genuinely new platform-specific target of the owned version is still Case A.
+        assert!(owned.admits("pydantic_core-2.0-cp39-cp39-win_amd64.whl"));
+    }
+
+    #[test]
+    fn test_rewrite_preserves_metadata_attr_before_href() {
         // Edge case: metadata attribute appears before href
         let html = r#"<a data-dist-info-metadata="sha256=abc" href="https://example.com/pkg-1.0.whl#sha256=def">pkg-1.0.whl</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "pkg");
         assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=def""#));
-        assert!(!result.contains("data-dist-info-metadata"));
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=abc""#));
     }
 
     #[test]
     fn test_rewrite_preserves_non_metadata_attrs() {
-        // Only PEP 658 attrs should be stripped; other data-* attrs remain
+        // PEP 658 and other data-* attrs should remain intact
         let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=abc" data-requires-python="&gt;=3.8" data-dist-info-metadata="sha256=def" data-gpg-sig="true">pkg-1.0.whl</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "pkg");
         assert!(result.contains("data-requires-python"));
         assert!(result.contains("data-gpg-sig"));
-        assert!(!result.contains("data-dist-info-metadata"));
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=def""#));
     }
 
     #[test]
@@ -4270,6 +5659,20 @@ mod tests {
             result,
             Some(
                 "https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_metadata_url_derives_from_wheel_url() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=abc" data-dist-info-metadata="sha256=metadata">six-1.16.0-py2.py3-none-any.whl</a>"#;
+        let result =
+            find_upstream_metadata_url(html, "six-1.16.0-py2.py3-none-any.whl.metadata", None);
+        assert_eq!(
+            result,
+            Some(
+                "https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl.metadata"
                     .to_string()
             )
         );
@@ -5406,7 +6809,17 @@ mod tests {
         let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
         repo_info.format = "pypi".to_string();
         repo_info.age_gate_enabled = true;
-        repo_info.age_gate_min_age_days = 36_500; // 100 years
+        repo_info.age_gate_min_age_days = 3650; // 10 years
+                                                // The gate re-resolves policy from the repositories row (the struct
+                                                // only pre-screens), so the DB must agree with the struct above.
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 3650 \
+             WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable age gate on repo row");
 
         // Seed the local `artifacts` row + payload that would otherwise be
         // served straight from storage on the cache-hit branch.
@@ -6509,6 +7922,106 @@ mod tests {
 
         let files = json["files"].as_array().unwrap();
         assert_eq!(files[0]["upload-time"], "2026-01-02T03:04:05Z");
+    }
+
+    // Conformance corpus (pip/warehouse harvest): a wheel's METADATA is served
+    // at `<file>.metadata`, so the PEP 691 JSON must advertise `core-metadata`
+    // (PEP 658/714) for the installer fast path; sdists must not. RED before the
+    // core-metadata emission, GREEN after.
+    #[test]
+    fn test_build_simple_project_response_json_advertises_core_metadata_for_wheels() {
+        let artifacts = vec![
+            SimpleProjectArtifact {
+                path: "pkg-1.0.0-py3-none-any.whl".to_string(),
+                version: Some("1.0.0".to_string()),
+                size_bytes: 3000,
+                checksum_sha256: "cafe".to_string(),
+                metadata: None,
+                upload_time: None,
+            },
+            SimpleProjectArtifact {
+                path: "pkg-1.0.0.tar.gz".to_string(),
+                version: Some("1.0.0".to_string()),
+                size_bytes: 2000,
+                checksum_sha256: "beef".to_string(),
+                metadata: None,
+                upload_time: None,
+            },
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+        let response =
+            build_simple_project_response(&headers, "repo", "pkg", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let files = json["files"].as_array().unwrap();
+        let wheel = files
+            .iter()
+            .find(|f| f["filename"].as_str().unwrap().ends_with(".whl"))
+            .unwrap();
+        let sdist = files
+            .iter()
+            .find(|f| f["filename"].as_str().unwrap().ends_with(".tar.gz"))
+            .unwrap();
+        assert_eq!(
+            wheel["core-metadata"],
+            serde_json::Value::Bool(true),
+            "wheel must advertise core-metadata: {json}"
+        );
+        assert!(
+            sdist.get("core-metadata").is_none(),
+            "sdist must not advertise core-metadata: {json}"
+        );
+    }
+
+    // Conformance corpus (pypa/packaging ordering vectors): the PEP 691
+    // `versions` array must be ordered by PEP 440, not lexicographically.
+    // The old BTreeSet<String> put `1.10` before `1.9` and `10.0` before `9.0`,
+    // which misleads any consumer treating the last entry as "latest".
+    // RED before the pep440_sort_key ordering, GREEN after. (#3106)
+    #[test]
+    fn test_build_simple_project_response_json_versions_are_pep440_ordered() {
+        let raw = ["1.9", "1.10", "10.0", "9.0", "1.0", "2.0rc1", "2.0"];
+        let artifacts: Vec<SimpleProjectArtifact> = raw
+            .iter()
+            .map(|v| SimpleProjectArtifact {
+                path: format!("pkg-{v}.tar.gz"),
+                version: Some((*v).to_string()),
+                size_bytes: 10,
+                checksum_sha256: "abc".to_string(),
+                metadata: None,
+                upload_time: None,
+            })
+            .collect();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+        let response =
+            build_simple_project_response(&headers, "repo", "pkg", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions: Vec<&str> = json["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["1.0", "1.9", "1.10", "2.0rc1", "2.0", "9.0", "10.0"],
+            "versions must be PEP 440-ordered, not lexicographic: {json}"
+        );
     }
 
     #[test]
@@ -7671,6 +9184,347 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // -----------------------------------------------------------------------
+    // PEP 658 remote `.metadata` serving (`serve_remote_metadata`). These live
+    // in-crate (not `backend/tests/`) so the coverage `--lib` run exercises
+    // the async handler body: upstream 200 → serve verbatim; upstream 404 →
+    // extract METADATA from the wheel instead of surfacing a hard failure.
+    // -----------------------------------------------------------------------
+
+    /// Serializes the `.metadata` tests' `AK_SSRF_ALLOW_PRIVATE_CIDRS`
+    /// mutation. Under nextest each test is its own process, but under plain
+    /// `cargo test` parallel threads share the environment, so the guard's
+    /// set/restore must not interleave.
+    static SSRF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SsrfEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl SsrfEnvGuard {
+        const KEY: &'static str = "AK_SSRF_ALLOW_PRIVATE_CIDRS";
+
+        fn set(value: String) -> Self {
+            let lock = SSRF_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var(Self::KEY).ok();
+            std::env::set_var(Self::KEY, value);
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SsrfEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(Self::KEY, value),
+                None => std::env::remove_var(Self::KEY),
+            }
+        }
+    }
+
+    /// Start a wiremock upstream on a **non-loopback** local address and
+    /// allowlist that address for SSRF. Required because the index-anchor URL
+    /// resolved by `resolve_pypi_remote_fetch_target` is run through
+    /// `validate_outbound_url`, which hard-blocks loopback (so a plain
+    /// `MockServer::start()` upstream would be rejected before the fetch).
+    async fn non_loopback_upstream() -> (wiremock::MockServer, SsrfEnvGuard) {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind probe socket");
+        probe.connect("8.8.8.8:80").expect("route probe");
+        let bind_ip = probe.local_addr().expect("probe local addr").ip();
+        let guard = SsrfEnvGuard::set(format!(
+            "{bind_ip}/{}",
+            if bind_ip.is_ipv4() { 32 } else { 128 }
+        ));
+        let listener = std::net::TcpListener::bind((bind_ip, 0)).expect("bind mock listener");
+        let upstream = wiremock::MockServer::builder()
+            .listener(listener)
+            .start()
+            .await;
+        (upstream, guard)
+    }
+
+    /// Simple-index HTML advertising PEP 658 metadata for `wheel`.
+    fn pep658_index_html(wheel: &str) -> String {
+        format!(
+            "<html><body><a href=\"/packages/{wheel}\" \
+             data-dist-info-metadata=\"sha256=deadbeef\">{wheel}</a></body></html>"
+        )
+    }
+
+    /// Minimal wheel (stored zip) whose only entry is
+    /// `{dist_info}.dist-info/METADATA`.
+    fn wheel_with_metadata(dist_info: &str, metadata: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(format!("{dist_info}.dist-info/METADATA"), options)
+            .expect("start METADATA entry");
+        zip.write_all(metadata).expect("write METADATA");
+        zip.finish().expect("finish wheel zip");
+        cursor.into_inner()
+    }
+
+    /// A remote index may advertise PEP 658 metadata even when the
+    /// corresponding `.whl.metadata` resource is unavailable upstream. The
+    /// proxy must not turn pip's metadata request into a hard 404: it falls
+    /// back to fetching the wheel and extracting METADATA from it
+    /// (the `Err(AppError::NotFound)` arm of `serve_remote_metadata`).
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_404_falls_back_to_wheel_metadata() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(wheel_with_metadata("demo-1.0", metadata)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upstream 404 on .whl.metadata must fall back to wheel extraction; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "served metadata must be the wheel's METADATA bytes"
+        );
+    }
+
+    /// The common real-world path: the upstream serves `.whl.metadata` with
+    /// 200 and the proxy returns that body (the `Ok` arm of
+    /// `serve_remote_metadata`). No wheel mock is mounted, so the test also
+    /// proves the fallback does not fire spuriously.
+    ///
+    /// The upstream deliberately labels the metadata `text/html`: a PEP 658
+    /// metadata resource is always the plain-text METADATA file, and relaying a
+    /// hostile upstream's content-type would let it choose how this origin
+    /// renders the response. The served type must be pinned to `text/plain`.
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_200_served_directly() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(metadata),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let resp = app
+            .oneshot(tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )))
+            .await
+            .expect("oneshot");
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upstream 200 on .whl.metadata must be served; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "upstream metadata must be served verbatim"
+        );
+        assert_eq!(
+            content_type, "text/plain; charset=utf-8",
+            "the served content-type must be pinned to text/plain, not relayed \
+             from the upstream (which answered text/html here)"
+        );
+    }
+
+    /// Curation must gate every spelling of a metadata request, not just the
+    /// canonical one. A version-constrained block rule is evaluated against the
+    /// version parsed from the requested distribution, so a request that names
+    /// the blocked wheel through a stacked `.metadata` suffix must resolve to
+    /// the same distribution and be blocked identically — otherwise the version
+    /// parses as `None`, the version-constrained rule is skipped, and the
+    /// blocked version's metadata is served anyway.
+    #[tokio::test]
+    async fn test_curation_blocks_every_metadata_suffix_shape() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let blocked_wheel = "demo-1.0-py3-none-any.whl";
+        let allowed_wheel = "demo-2.0-py3-none-any.whl";
+        let blocked_metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+        let allowed_metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 2.0\n";
+
+        // The upstream would happily serve both versions: only curation may
+        // withhold 1.0, so a 403 here cannot come from an unreachable mock.
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{}{}",
+                pep658_index_html(blocked_wheel),
+                pep658_index_html(allowed_wheel)
+            )))
+            .mount(&upstream)
+            .await;
+        for (wheel, metadata) in [
+            (blocked_wheel, blocked_metadata),
+            (allowed_wheel, allowed_metadata),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{wheel}.metadata")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&upstream)
+                .await;
+            let dist_info = wheel.split('-').take(2).collect::<Vec<_>>().join("-");
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{wheel}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(wheel_with_metadata(&dist_info, metadata)),
+                )
+                .mount(&upstream)
+                .await;
+        }
+
+        // `=1.0`, not `==1.0`: `version_matches` strips a single leading `=`,
+        // so the PEP 440 spelling would leave the target as `=1.0` and match
+        // nothing — which would make this test vacuously green.
+        enable_curation_with_rule(&fx.pool, fx.repo_id, fx.user_id, "demo*", "=1.0").await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let request = |suffix: &str| {
+            let state = state.clone();
+            let uri = format!("/{}/simple/{project}/{suffix}", fx.repo_key);
+            async move { tdh::send(tdh::router_anon(super::router(), state), tdh::get(uri)).await }
+        };
+
+        let (canonical_status, canonical_body) =
+            request(&format!("{blocked_wheel}.metadata")).await;
+        let (stacked_status, stacked_body) =
+            request(&format!("{blocked_wheel}.metadata.metadata")).await;
+        let (allowed_status, allowed_body) = request(&format!("{allowed_wheel}.metadata")).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            canonical_status,
+            StatusCode::FORBIDDEN,
+            "the canonical metadata request for a blocked version must 403; body: {}",
+            String::from_utf8_lossy(&canonical_body)
+        );
+        assert_eq!(
+            stacked_status,
+            StatusCode::FORBIDDEN,
+            "a stacked .metadata suffix names the same blocked distribution and \
+             must 403 identically; body: {}",
+            String::from_utf8_lossy(&stacked_body)
+        );
+        // The strongest discriminator: pre-fix this response was a 200 whose
+        // body was the blocked version's real METADATA.
+        assert_ne!(
+            &stacked_body[..],
+            blocked_metadata,
+            "a blocked version's metadata must never be served through any suffix shape"
+        );
+        assert_eq!(
+            allowed_status,
+            StatusCode::OK,
+            "a version the rule does not constrain must still be served; body: {}",
+            String::from_utf8_lossy(&allowed_body)
+        );
+        assert_eq!(
+            &allowed_body[..],
+            allowed_metadata,
+            "the unblocked version must serve its own METADATA"
+        );
+    }
+
     #[test]
     fn test_serve_file_presign_redirect_precedes_streaming_1555() {
         // #1555: on a fresh proxy-cache hit, the PyPI remote download path must
@@ -8219,6 +10073,1338 @@ mod tests {
             status,
             StatusCode::NOT_FOUND,
             "a curation-disabled repo must not be blocked by a matching rule"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2954 inline proxy scan-and-block: pure helpers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sha256_hex_known_vectors() {
+        // Empty input and the classic "abc" NIST vector: the verdict cache is
+        // keyed on this digest, so it must be the plain lowercase-hex SHA-256
+        // of the CONTENT (never an index-advertised digest).
+        assert_eq!(
+            sha256_hex(&Bytes::new()),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(&Bytes::from_static(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn test_pypi_synthetic_artifact_shape() {
+        let repo_id = uuid::Uuid::new_v4();
+        let filename = "PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl";
+        let digest = "deadbeef".repeat(8);
+        let art = pypi_synthetic_artifact(repo_id, filename, &digest, 1234);
+
+        // The synthetic artifact drives scanner applicability + workspace
+        // naming exactly as a hosted wheel would.
+        assert_eq!(art.repository_id, repo_id);
+        assert_eq!(art.name, filename);
+        assert_eq!(art.path, filename);
+        assert_eq!(art.version.as_deref(), Some("5.3.1"));
+        assert_eq!(art.size_bytes, 1234);
+        assert_eq!(art.checksum_sha256, digest);
+        assert_eq!(art.content_type, "application/zip");
+        // No artifacts row backs this: storage key stays empty by design.
+        assert!(art.storage_key.is_empty());
+        assert!(!art.is_deleted);
+        assert_eq!(art.quarantine_status, None);
+
+        // sdist naming resolves version + gzip content type too.
+        let sdist = pypi_synthetic_artifact(repo_id, "requests-2.31.0.tar.gz", &digest, 1);
+        assert_eq!(sdist.version.as_deref(), Some("2.31.0"));
+        assert_eq!(sdist.content_type, "application/gzip");
+    }
+
+    #[test]
+    fn test_scan_blocked_response_is_403_neutral_json() {
+        let resp = scan_blocked_response("evil-1.0.whl");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_blocked_response_body_names_file_not_cves() {
+        // The download route is anonymous-readable for public repos: the body
+        // must name the file, never the specific CVEs.
+        let resp = scan_blocked_response("evil-1.0.whl");
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["error"], "scan_blocked");
+        assert_eq!(json["file"], "evil-1.0.whl");
+        assert!(!body.windows(4).any(|w| w == b"CVE-"), "no CVE detail leak");
+    }
+
+    #[tokio::test]
+    async fn test_scan_pending_locked_response_is_423() {
+        // The fail-closed inconclusive branch must be 423 Locked, never a 200
+        // of unscanned bytes.
+        let resp = scan_pending_locked_response("big-1.0.whl");
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["error"], "scan_pending");
+        assert_eq!(json["file"], "big-1.0.whl");
+    }
+
+    #[test]
+    fn test_build_scanned_file_response_clean_and_pending_headers() {
+        let bytes = Bytes::from_static(b"PK\x03\x04wheel-bytes");
+        let digest = sha256_hex(&bytes);
+
+        // Clean serve: explicit content type wins, digest header present.
+        let resp = build_scanned_file_response(
+            "pkg-1.0-py3-none-any.whl",
+            bytes.clone(),
+            Some("application/x-custom".to_string()),
+            Some(&digest),
+            false,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/x-custom"
+        );
+        assert_eq!(
+            resp.headers().get("X-AK-Scan").unwrap().to_str().unwrap(),
+            "clean"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("X-PyPI-File-SHA256")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            digest
+        );
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_LENGTH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            bytes.len().to_string()
+        );
+
+        // Pending serve (fail-open before a verdict): loud header, and the
+        // content type falls back to the filename-derived default.
+        let resp = build_scanned_file_response("pkg-1.0.tar.gz", bytes, None, None, true);
+        assert_eq!(
+            resp.headers().get("X-AK-Scan").unwrap().to_str().unwrap(),
+            "pending"
+        );
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/gzip"
+        );
+        assert!(resp.headers().get("X-PyPI-File-SHA256").is_none());
+    }
+
+    #[test]
+    fn test_is_over_cap_error_classification() {
+        // The real over-cap shape emitted by the capped proxy fetch.
+        let over_cap = AppError::BadGateway(
+            "Upstream metadata response exceeded the 209715200-byte limit".to_string(),
+        );
+        assert!(is_over_cap_error(&over_cap));
+
+        // Any other BadGateway (upstream 5xx etc.) must be propagated as-is,
+        // not treated as the over-cap inconclusive branch.
+        let other_bad_gateway = AppError::BadGateway("upstream returned 500".to_string());
+        assert!(!is_over_cap_error(&other_bad_gateway));
+
+        // Non-BadGateway errors (a 404 stays a 404).
+        let not_found = AppError::NotFound("no such file".to_string());
+        assert!(!is_over_cap_error(&not_found));
+    }
+
+    // -----------------------------------------------------------------------
+    // #2954 inline proxy scan-and-block: DB-backed serve paths.
+    //
+    // These drive `serve_file` end-to-end into `serve_scanned_pypi_file` with
+    // a wiremock upstream, a real proxy service, and a scan_configs row with
+    // scan_on_proxy enabled. The state carries NO scanner service, so a
+    // first-pull scan is inconclusive — exactly the branch whose fail-closed
+    // handling (423, never a 200 of unscanned bytes) is the point of the fix.
+    // Cached-verdict paths are seeded through ProxyScanService::record_verdict
+    // so the digest-keyed block/serve fast path is covered against a real DB.
+    //
+    // Skip cleanly when DATABASE_URL is unset.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers::enable_proxy_scan;
+
+    /// Mount a PEP 503 index page (with no matching href, so the fetch target
+    /// falls back to the conventional simple/ path) plus the wheel bytes.
+    async fn mount_scan_upstream(
+        upstream: &wiremock::MockServer,
+        project: &str,
+        filename: &str,
+        wheel: &'static [u8],
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body></body></html>")
+                    .insert_header("Content-Type", "text/html"),
+            )
+            .mount(upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/{filename}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(wheel)
+                    .insert_header("Content-Type", "application/zip"),
+            )
+            .mount(upstream)
+            .await;
+    }
+
+    // ── #3023: the inline scan gate on the VIRTUAL pypi serve path ─────────
+    //
+    // A wheel whose digest carries a vulnerable verdict must be blocked when
+    // pulled through a Virtual repo that aggregates the Remote member, not just
+    // through the direct Remote path.
+    #[tokio::test]
+    async fn test_virtual_serve_file_blocks_vulnerable_member_wheel() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "vulnpkg";
+        let filename = "vulnpkg-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 vulnpkg-wheel-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"PK\x03\x04 vulnpkg-wheel-3023"));
+
+        let upstream = MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        // Scanning enabled on the MEMBER; the verdict mimics a prior remote scan.
+        enable_proxy_scan(&fx.pool, member_id, "fail_closed").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                2,
+                1,
+                1,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "a vulnerable wheel through a virtual repo must be blocked (#3023), got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "vulnerable-via-virtual pypi serve must be 403"
+            ),
+        }
+    }
+
+    /// Clean via virtual -> 200 (no over-block).
+    #[tokio::test]
+    async fn test_virtual_serve_file_serves_clean_member_wheel() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "cleanpkg";
+        let filename = "cleanpkg-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 cleanpkg-wheel-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"PK\x03\x04 cleanpkg-wheel-3023"));
+
+        let upstream = MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        // fail_open: a fresh cached CLEAN verdict serves without a live scanner
+        // (the #2976 unknown-live-version re-scan tightening is fail_closed-only).
+        enable_proxy_scan(&fx.pool, member_id, "fail_open").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+        let status = result
+            .as_ref()
+            .map(|r| r.status())
+            .unwrap_or_else(|r| r.status());
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a clean wheel through a virtual repo must still serve 200 (no over-block)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_fail_closed_inconclusive_is_423() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "sealed";
+        let filename = "sealed-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 sealed-wheel-2954-fail-closed";
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        // No scanner service on the state: the inline scan is inconclusive.
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "fail-closed + inconclusive scan must never serve bytes, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::LOCKED,
+                "fail-closed inconclusive must be 423 Locked"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_fail_open_serves_pending() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "openpkg";
+        let filename = "openpkg-2.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 open-wheel-2954-fail-open";
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        // Default action (fail_open): first pull serves LOUDLY with pending.
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fail-open first pull must serve, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let digest_header = resp
+            .headers()
+            .get("X-PyPI-File-SHA256")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("pending"),
+            "a served-before-verdict byte must be observable (X-AK-Scan: pending)"
+        );
+        assert_eq!(
+            digest_header.as_deref(),
+            Some(sha256_hex(&Bytes::from_static(b"PK\x03\x04 open-wheel-2954-fail-open")).as_str())
+        );
+        assert_eq!(&body[..], wheel, "served bytes must equal upstream bytes");
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_blocks_cached_vulnerable_digest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "poisoned";
+        let filename = "poisoned-0.1.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 poisoned-wheel-2954-vulnerable";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 poisoned-wheel-2954-vulnerable",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Seed a fresh vulnerable verdict for this digest through the real
+        // service so record_verdict + lookup_verdict are covered end-to-end.
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                1,
+                1,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        // proxy_scan_results outlives repo cleanup (repository_id is SET
+        // NULL on delete): remove the digest row explicitly.
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "a fresh cached vulnerable verdict must block the pull, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "cached vulnerable digest must be a 403 scan_blocked (not 423: \
+                 the verdict is conclusive)"
+            ),
+        }
+    }
+
+    /// The cached-`clean` fast path serves 200 `X-AK-Scan: clean` (#2954) —
+    /// exercised here on a FAIL-OPEN repo with no scanner service, where the
+    /// header is the discriminator: without the cached verdict this pull would
+    /// still be a 200, but marked `pending`.
+    ///
+    /// This test used to assert the same 200 under FAIL-CLOSED. That passed
+    /// only because a state with no scanner service reports an unknown live
+    /// scanner version, which the freshness check treated as "not provably
+    /// stale" and served — i.e. it encoded the #2976 fail-open hole: a node
+    /// with no working CVE engine served cached-clean bytes through a
+    /// fail-closed policy that 423s a fresh pull. The fail-closed side of that
+    /// pair now lives in
+    /// `test_serve_file_proxy_scan_unknown_live_version_rescans_under_fail_closed`.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_serves_cached_clean_digest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "verified";
+        let filename = "verified-3.2.1-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 verified-wheel-2954-clean";
+        let digest = sha256_hex(&Bytes::from_static(b"PK\x03\x04 verified-wheel-2954-clean"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fresh clean verdict must serve from the cache, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("clean"),
+            "a verdict-backed serve must be marked clean, not pending"
+        );
+        assert_eq!(&body[..], wheel);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2976: cached-verdict freshness vs the LIVE CVE-scanner version.
+    //
+    // These drive `serve_file` end-to-end with a scanner service on the state
+    // whose CVE-authoritative mock reports an injected "live" version — the
+    // `current_version` side of `verdict_is_fresh`. A cached verdict recorded
+    // by an OLDER version must be treated stale and re-scanned; the SAME
+    // version must keep using the cache (no needless re-scan).
+    // -----------------------------------------------------------------------
+
+    // The mock CVE engine (`VersionedCveScanner`/`MockCveRescan`) and the
+    // state builder moved to shared test helpers so the npm inline-scan tests
+    // (#3003) drive the identical mock through the identical wiring.
+    use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+
+    /// Build a state whose scanner service holds exactly the given mock CVE
+    /// engine, wired over the fixture's storage + a real proxy service.
+    fn scan_state_with_live_scanner(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        storage_path: &str,
+        scanner: VersionedCveScanner,
+    ) -> crate::api::SharedState {
+        crate::api::handlers::test_db_helpers::build_scan_state_with_leaf_scanners(
+            fx,
+            storage_path,
+            vec![std::sync::Arc::new(scanner)],
+        )
+    }
+
+    /// #2976 discriminator: a cached `clean` verdict recorded by an OLDER
+    /// scanner/CVE-DB version must NOT be reused once the live CVE engine
+    /// reports a newer version. The serve path re-scans, and the re-scan
+    /// (which now knows the new CVE) blocks with 403. Before the fix the call
+    /// site passed `current_version=None`, so `verdict_is_fresh` never saw
+    /// the bump and this pull served 200 stale-clean from cache for the full
+    /// 30-day TTL.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_rescans_when_scanner_version_advances() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "staleclean";
+        let filename = "staleclean-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 staleclean-wheel-2976-bumped";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 staleclean-wheel-2976-bumped",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Cached CLEAN verdict recorded at stored version V...
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed stale clean verdict");
+
+        // ...while the LIVE engine is at V+1 and now flags the bytes.
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = scan_state_with_live_scanner(
+            &fx,
+            &storage_path,
+            VersionedCveScanner {
+                live_version: Some("grype-0.84.0-test"),
+                rescan: MockCveRescan::Vulnerable,
+            },
+        );
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "clean verdict from an older scanner version must be re-scanned \
+                 (and blocked), not served from cache; got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "re-scan against the bumped CVE-DB found the CVE -> 403"
+            ),
+        }
+    }
+
+    /// Same-version control: when the live CVE engine still reports the SAME
+    /// version that produced the cached `clean` verdict, the cache is reused —
+    /// the mock would 403 if a re-scan ran, so a 200 `X-AK-Scan: clean` proves
+    /// there was no needless re-scan (no perf regression from #2976).
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_reuses_cached_verdict_same_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "sameversion";
+        let filename = "sameversion-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 sameversion-wheel-2976-cached";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 sameversion-wheel-2976-cached",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.84.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = scan_state_with_live_scanner(
+            &fx,
+            &storage_path,
+            VersionedCveScanner {
+                live_version: Some("grype-0.84.0-test"),
+                rescan: MockCveRescan::Vulnerable, // would 403 if re-scanned
+            },
+        );
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("same-version clean verdict must serve from cache, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("clean"),
+            "cache hit must serve clean (a re-scan would have blocked)"
+        );
+    }
+
+    /// Fail-closed alignment after a version bump: when the invalidating
+    /// re-scan is INCONCLUSIVE (scanner error), the pull must 423, never a
+    /// 200 of the stale-clean cache (#2976 + #2954 fail-closed contract).
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_version_bump_inconclusive_locks() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "bumplocked";
+        let filename = "bumplocked-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 bumplocked-wheel-2976-locked";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 bumplocked-wheel-2976-locked",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed stale clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = scan_state_with_live_scanner(
+            &fx,
+            &storage_path,
+            VersionedCveScanner {
+                live_version: Some("grype-0.84.0-test"),
+                rescan: MockCveRescan::Error,
+            },
+        );
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "inconclusive re-scan after a version bump must 423 under \
+                 fail-closed, not serve stale-clean; got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
+        }
+    }
+
+    /// THE fail-open hole in the first cut of #2976: when the live version
+    /// probe returns None (engine mid-upgrade / absent / probe timed out),
+    /// `verdict_is_fresh`'s unknown-version arm returns true, so a cached
+    /// `clean` verdict short-circuited the serve path — on a FAIL-CLOSED repo,
+    /// serving bytes nothing on the node could vouch for, while a fresh pull
+    /// on the same node would 423. The freshness fast path runs before the
+    /// inline scan, so it must not fail open here: an unprovable clean verdict
+    /// is stale, the pull re-scans, and the re-scan (vulnerable) blocks 403.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_unknown_live_version_rescans_under_fail_closed() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "probenone";
+        let filename = "probenone-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 probenone-wheel-2976-failclosed";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 probenone-wheel-2976-failclosed",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        // Live engine present but its version probe FAILS (None).
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = scan_state_with_live_scanner(
+            &fx,
+            &storage_path,
+            VersionedCveScanner {
+                live_version: None,
+                rescan: MockCveRescan::Vulnerable,
+            },
+        );
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "an UNKNOWN live scanner version must not let a cached clean \
+                 verdict short-circuit the fail-closed gate; got {} (expected a \
+                 re-scan -> 403)",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "re-scan found the CVE -> 403 (a 200 here is the fail-open hole)"
+            ),
+        }
+    }
+
+    /// Availability control for the tightening above: `fail_open` keeps the
+    /// TTL-only fallback on an unknown live version. A cached clean verdict
+    /// still serves 200 there — the fail-open re-scan branch would serve
+    /// anyway (X-AK-Scan: pending), so nothing is gained by re-scanning and
+    /// the opt-in latency-first posture is preserved.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_unknown_live_version_serves_under_fail_open() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "probenoneopen";
+        let filename = "probenoneopen-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 probenoneopen-wheel-2976-failopen";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 probenoneopen-wheel-2976-failopen",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = scan_state_with_live_scanner(
+            &fx,
+            &storage_path,
+            VersionedCveScanner {
+                live_version: None,
+                rescan: MockCveRescan::Vulnerable,
+            },
+        );
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fail-open must stay available on an unknown probe, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("clean"),
+            "fail-open keeps the cached-verdict fast path on an unknown probe"
+        );
+    }
+
+    // Conformance corpus (pip harvest, MIT): a `<base href>` on an upstream
+    // Simple index must be neutralized, or it re-anchors our root-relative
+    // rewritten download URLs onto the upstream origin — a proxy bypass that
+    // discloses the upstream host and breaks air-gapped installs. RED before
+    // the BASE_TAG_RE strip, GREEN after. Sibling of the #2801 sniff fix.
+    #[test]
+    fn test_rewrite_upstream_urls_neutralizes_base_href() {
+        let upstream = concat!(
+            "<!DOCTYPE html><html><head>",
+            "<base href=\"https://internal-mirror.example/simple/\">",
+            "</head><body>",
+            "<a href=\"foo-1.0.tar.gz#sha256=abc\">foo-1.0.tar.gz</a>",
+            "</body></html>"
+        );
+        let out = super::rewrite_upstream_urls(upstream, "myrepo", "foo");
+        assert!(
+            !out.to_lowercase().contains("<base"),
+            "<base> tag survived the rewrite: {out}"
+        );
+        assert!(
+            !out.contains("internal-mirror.example"),
+            "upstream host leaked through <base>: {out}"
+        );
+        assert!(
+            out.contains("/pypi/myrepo/simple/foo/foo-1.0.tar.gz"),
+            "anchor was not rewritten through the proxy: {out}"
+        );
+    }
+
+    // Conformance corpus (#2801): sniff_simple_index must classify a proxied
+    // body by content, never trusting a mislabeled upstream Content-Type. JSON
+    // (leading {/[), HTML (anchor/doctype/root), else Binary -> 502.
+    #[test]
+    fn test_sniff_simple_index_classifies_by_content() {
+        use super::{sniff_simple_index as sniff, SniffedSimpleIndex as S};
+        assert_eq!(sniff(br#"{"meta":{"api-version":"1.1"}}"#), S::Json);
+        assert_eq!(sniff(b"  \n\t[ ]"), S::Json, "leading whitespace then [");
+        assert_eq!(sniff(b"\xEF\xBB\xBF{}"), S::Json, "UTF-8 BOM then {{");
+        assert_eq!(sniff(b"<!DOCTYPE html><html></html>"), S::Html);
+        assert_eq!(sniff(b"<html><body></body></html>"), S::Html);
+        assert_eq!(sniff(b"<a href=\"x-1.0.whl\">x</a>"), S::Html);
+        assert_eq!(sniff(b"PK\x03\x04 not an index",), S::Binary, "zip/binary");
+        assert_eq!(sniff(b"plain text, no markers"), S::Binary);
+        assert_eq!(sniff(b""), S::Binary, "empty body");
+    }
+
+    // Regression guard: the HTML rewriter rebuilds each download URL from the
+    // FILENAME, so a relative upstream href can never survive (this is why the
+    // earlier "relative-url leak" was a false alarm), and the #sha256 fragment
+    // is preserved.
+    #[test]
+    fn test_rewrite_upstream_urls_is_relative_safe_and_keeps_fragment() {
+        let html = concat!(
+            "<a href=\"../../packages/ab/foo-1.0-py3-none-any.whl#sha256=dead\">w</a>",
+            "<a href=\"foo-1.0.tar.gz\">s</a>"
+        );
+        let out = super::rewrite_upstream_urls(html, "r", "p");
+        assert!(!out.contains("../../"), "relative path survived: {out}");
+        assert!(
+            out.contains("/pypi/r/simple/p/foo-1.0-py3-none-any.whl#sha256=dead"),
+            "wheel url/fragment wrong: {out}"
+        );
+        assert!(
+            out.contains("/pypi/r/simple/p/foo-1.0.tar.gz"),
+            "sdist url wrong: {out}"
+        );
+    }
+
+    // Regression guard: the JSON rewriter rebuilds files[].url from the filename
+    // (relative-safe), returns None for non-PEP-691 bodies, and preserves the
+    // other file fields (hashes).
+    #[test]
+    fn test_rewrite_upstream_simple_json_rebuilds_and_preserves() {
+        let json = br#"{"meta":{"api-version":"1.1"},"name":"p","files":[
+            {"filename":"foo-1.0-py3-none-any.whl","url":"../../x/foo-1.0-py3-none-any.whl",
+             "hashes":{"sha256":"deadbeef"}}]}"#;
+        let out = super::rewrite_upstream_simple_json(json, "r", "p").expect("valid PEP 691");
+        assert!(!out.contains("../../"), "relative url survived: {out}");
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            doc["files"][0]["url"],
+            "/pypi/r/simple/p/foo-1.0-py3-none-any.whl"
+        );
+        assert_eq!(doc["files"][0]["hashes"]["sha256"], "deadbeef");
+        // Not a PEP 691 body (no files array) -> None so the caller falls back.
+        assert!(super::rewrite_upstream_simple_json(b"<html></html>", "r", "p").is_none());
+        assert!(super::rewrite_upstream_simple_json(br#"{"nope":1}"#, "r", "p").is_none());
+    }
+
+    // Binary-distribution spec: the wheel compatibility tag is the last three
+    // '-'-fields of the stem (python-abi-platform), lowercased; non-wheels and
+    // too-short names have no tag.
+    #[test]
+    fn test_wheel_compat_tag_extracts_last_three_fields_lowercased() {
+        use super::wheel_compat_tag as tag;
+        assert_eq!(
+            tag("numpy-1.0.0-cp39-cp39-manylinux1_x86_64.whl").as_deref(),
+            Some("cp39-cp39-manylinux1_x86_64")
+        );
+        assert_eq!(
+            tag("foo-1.0-py3-none-any.whl").as_deref(),
+            Some("py3-none-any")
+        );
+        // A build tag (6 fields) still yields the trailing python-abi-platform.
+        assert_eq!(
+            tag("foo-1.0-1-py3-none-any.whl").as_deref(),
+            Some("py3-none-any")
+        );
+        // Case-insensitive (tags are lowercased).
+        assert_eq!(
+            tag("Foo-1.0-CP39-CP39-Win_AMD64.whl").as_deref(),
+            Some("cp39-cp39-win_amd64")
+        );
+        // Non-wheel and malformed names have no platform tag.
+        assert_eq!(tag("foo-1.0.tar.gz"), None);
+        assert_eq!(tag("foo-1.0.whl"), None);
+    }
+
+    #[test]
+    fn test_pypi_content_type_by_extension() {
+        use super::pypi_content_type as ct;
+        assert_eq!(ct("x-1.0-py3-none-any.whl"), "application/zip");
+        assert_eq!(ct("x.zip"), "application/zip");
+        assert_eq!(ct("x-1.0.tar.gz"), "application/gzip");
+        assert_eq!(ct("x-1.0.tar.bz2"), "application/x-bzip2");
+        assert_eq!(ct("x-1.0.exe"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_html_escape_escapes_markup_and_quotes() {
+        use super::html_escape as esc;
+        assert_eq!(esc("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+        assert_eq!(esc("\"q\" 'a'"), "&quot;q&quot; &#39;a&#39;");
+        assert_eq!(esc("plain"), "plain");
+    }
+
+    // version_from_pypi_filename: the version is the field after the name for a
+    // wheel, and the final '-'-segment for an sdist (project names may contain
+    // '-', PEP 440 versions do not). Unknown/degenerate names have no version.
+    #[test]
+    fn test_version_from_pypi_filename() {
+        use super::version_from_pypi_filename as ver;
+        assert_eq!(ver("foo-1.2.3-py3-none-any.whl").as_deref(), Some("1.2.3"));
+        assert_eq!(ver("my-cool-pkg-2.0.tar.gz").as_deref(), Some("2.0"));
+        assert_eq!(ver("pkg-1.0.zip").as_deref(), Some("1.0"));
+        assert_eq!(ver("pkg-3.1.tar.xz").as_deref(), Some("3.1"));
+        assert_eq!(ver("nover.txt"), None);
+        assert_eq!(ver("noversion.whl"), None);
+    }
+
+    // Security (#3107): the upload filename guard accepts real wheel/sdist names
+    // and rejects path separators, parent references, and control characters.
+    #[test]
+    fn test_is_safe_upload_filename_rejects_traversal_and_separators() {
+        use super::is_safe_upload_filename as safe;
+        assert!(safe("dtfpkg-1.0.0-py3-none-any.whl"));
+        assert!(safe("dtfpkg-1.0.0.tar.gz"));
+        assert!(!safe("../evil.whl"));
+        assert!(!safe("a/b.whl"));
+        assert!(!safe("a\\b.whl"));
+        assert!(!safe(".."));
+        assert!(!safe("."));
+        assert!(!safe(""));
+        assert!(!safe("foo\0bar.whl"));
+        assert!(!safe("x..y.whl"));
+        // HTML metacharacters (defense-in-depth for the Simple-index render).
+        assert!(!safe("x\"><script>.whl"));
+        assert!(!safe("a<b.whl"));
+        assert!(!safe("a>b.whl"));
+    }
+
+    // Review (security blocker): the <base> strip must reach a FIXPOINT — a
+    // self-splicing decoy that reconstitutes a <base> after one pass must not
+    // survive, or the proxy-bypass/host-disclosure returns.
+    #[test]
+    fn test_rewrite_upstream_urls_strips_spliced_base_tag() {
+        let html = r#"<ba<base dummy>se href="//evil.example/"><a href="pkg-1.0.whl">pkg</a>"#;
+        let out = super::rewrite_upstream_urls(html, "myrepo", "proj");
+        assert!(
+            !out.to_lowercase().contains("<base"),
+            "reconstituted <base> survived: {out}"
+        );
+        assert!(!out.contains("evil.example"), "upstream host leaked: {out}");
+        assert!(out.contains("/pypi/myrepo/simple/proj/pkg-1.0.whl"));
+    }
+
+    // Review (security blocker): a publisher-controlled filename must be
+    // HTML-escaped in the Simple-index HTML page (stored XSS otherwise); wheels
+    // also advertise data-core-metadata in the HTML branch (parity with JSON).
+    #[test]
+    fn test_build_simple_project_response_html_escapes_filename_and_advertises_core_metadata() {
+        // A slash-free payload so `rsplit('/')` keeps the whole filename (a real
+        // filename can't contain '/'; the injection vector is < > " ).
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "evil\"><img src=y onerror=alert(1)>.whl".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 10,
+            checksum_sha256: "cafe".to_string(),
+            metadata: None,
+            upload_time: None,
+        }];
+        let headers = HeaderMap::new(); // no Accept -> HTML branch
+        let response =
+            build_simple_project_response(&headers, "repo", "x", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<img"), "unescaped tag rendered: {html}");
+        assert!(
+            html.contains("&lt;img"),
+            "filename not HTML-escaped: {html}"
+        );
+        assert!(html.contains("&quot;"), "quote not HTML-escaped: {html}");
+        assert!(
+            html.contains("data-core-metadata"),
+            "wheel core-metadata not advertised in the HTML branch"
         );
     }
 }

@@ -72,6 +72,7 @@ pub fn build_notification_text(username: &str, days_remaining: i64) -> String {
 
 /// Build the HTML body for a password expiry warning email.
 pub fn build_notification_html(username: &str, days_remaining: i64) -> String {
+    let username = html_escape(username);
     let urgency_note = if days_remaining <= 0 {
         "Your password has <strong>expired</strong>. Please change it immediately.".to_string()
     } else if days_remaining == 1 {
@@ -90,6 +91,26 @@ pub fn build_notification_html(username: &str, days_remaining: i64) -> String {
     )
 }
 
+/// Escape user-controlled text before interpolation into an HTML email body.
+fn html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+fn warning_tier_db_value(tier: u32) -> Option<i32> {
+    i32::try_from(tier).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Database + SMTP logic (used by the scheduler)
 // ---------------------------------------------------------------------------
@@ -101,6 +122,121 @@ pub struct ExpiringUser {
     pub username: String,
     pub email: String,
     pub password_changed_at: DateTime<Utc>,
+}
+
+/// A live SMTP attempt is reclaimable after five minutes if its worker dies.
+const NOTIFICATION_CLAIM_TTL_SECS: f64 = 300.0;
+
+/// Failed or ambiguous SMTP outcomes pause before another replica may retry.
+const NOTIFICATION_RETRY_DELAY_SECS: f64 = 300.0;
+
+/// Proof that this worker owns one notification attempt.
+#[derive(Debug)]
+pub(crate) struct NotificationClaim {
+    pub id: uuid::Uuid,
+    pub claim_token: uuid::Uuid,
+}
+
+/// Claim `(user, tier, password version)` before SMTP.
+///
+/// The INSERT source revalidates account eligibility and password_changed_at
+/// at claim time, so a stale candidate list cannot email a user whose account
+/// or password changed before the side effect.
+pub(crate) async fn claim_notification(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    warning_days: i32,
+    password_changed_at: DateTime<Utc>,
+    claimed_by: &str,
+    claim_ttl_secs: f64,
+) -> Result<Option<NotificationClaim>, sqlx::Error> {
+    let row: Option<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
+        r#"
+        INSERT INTO password_expiry_notifications
+            (user_id, warning_days, password_changed_at, status,
+             claimed_by, claim_token, claimed_at, claim_expires_at, sent_at)
+        SELECT u.id, $2, u.password_changed_at, 'claimed',
+               $4, gen_random_uuid(), NOW(), NOW() + make_interval(secs => $5), NULL
+        FROM users u
+        WHERE u.id = $1
+          AND u.password_changed_at = $3
+          AND u.auth_provider = 'local'
+          AND u.is_active = true
+          AND u.is_service_account = false
+        ON CONFLICT (user_id, warning_days, password_changed_at) DO UPDATE
+        SET status = 'claimed',
+            claimed_by = EXCLUDED.claimed_by,
+            claim_token = EXCLUDED.claim_token,
+            claimed_at = NOW(),
+            claim_expires_at = EXCLUDED.claim_expires_at,
+            sent_at = NULL,
+            last_error = NULL
+        WHERE password_expiry_notifications.status IN ('claimed', 'failed')
+          AND password_expiry_notifications.claim_expires_at <= NOW()
+        RETURNING id, claim_token
+        "#,
+    )
+    .bind(user_id)
+    .bind(warning_days)
+    .bind(password_changed_at)
+    .bind(claimed_by)
+    .bind(claim_ttl_secs)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(row.map(|(id, claim_token)| NotificationClaim { id, claim_token }))
+}
+
+/// Token-guarded terminal sent transition.
+pub(crate) async fn mark_notification_sent(db: &sqlx::PgPool, claim: &NotificationClaim) -> bool {
+    let result = sqlx::query(
+        r#"
+        UPDATE password_expiry_notifications
+        SET status = 'sent',
+            sent_at = NOW(),
+            claimed_by = NULL,
+            claim_token = NULL,
+            claimed_at = NULL,
+            claim_expires_at = NULL,
+            last_error = NULL
+        WHERE id = $1
+          AND claim_token = $2
+          AND status = 'claimed'
+        "#,
+    )
+    .bind(claim.id)
+    .bind(claim.claim_token)
+    .execute(db)
+    .await;
+    matches!(result, Ok(ref update) if update.rows_affected() == 1)
+}
+
+/// Token-guarded failed transition with a retry-not-before delay.
+pub(crate) async fn mark_notification_failed(
+    db: &sqlx::PgPool,
+    claim: &NotificationClaim,
+    error: &str,
+    retry_delay_secs: f64,
+) -> bool {
+    let result = sqlx::query(
+        r#"
+        UPDATE password_expiry_notifications
+        SET status = 'failed',
+            claim_token = NULL,
+            claim_expires_at = NOW() + make_interval(secs => $3),
+            last_error = $4
+        WHERE id = $1
+          AND claim_token = $2
+          AND status = 'claimed'
+        "#,
+    )
+    .bind(claim.id)
+    .bind(claim.claim_token)
+    .bind(retry_delay_secs)
+    .bind(error)
+    .execute(db)
+    .await;
+    matches!(result, Ok(ref update) if update.rows_affected() == 1)
 }
 
 /// Run one cycle of the password expiry notification job.
@@ -122,6 +258,17 @@ pub async fn send_expiry_notifications(
     let mut sent_count: u32 = 0;
 
     for &tier in warning_tiers {
+        let tier_db = match warning_tier_db_value(tier) {
+            Some(value) => value,
+            None => {
+                tracing::warn!(
+                    tier,
+                    "Skipping password-expiry warning tier that exceeds database INTEGER range"
+                );
+                continue;
+            }
+        };
+
         // Compute cutoff dates in Rust to avoid PG interval binding issues.
         //
         // A user's password enters the warning window when:
@@ -146,12 +293,17 @@ pub async fn send_expiry_notifications(
                   WHERE n.user_id = u.id
                     AND n.warning_days = $3
                     AND n.password_changed_at = u.password_changed_at
+                    AND (
+                        n.status = 'sent'
+                        OR (n.status IN ('claimed', 'failed')
+                            AND n.claim_expires_at > NOW())
+                    )
               )
             "#,
         )
         .bind(warning_cutoff)
         .bind(expiry_cutoff)
-        .bind(tier as i32)
+        .bind(tier_db)
         .fetch_all(db)
         .await?;
 
@@ -173,6 +325,29 @@ pub async fn send_expiry_notifications(
             let body_text = build_notification_text(&user.username, remaining);
             let body_html = build_notification_html(&user.username, remaining);
 
+            let claim = match claim_notification(
+                db,
+                user.id,
+                tier_db,
+                user.password_changed_at,
+                crate::services::cluster_work::WorkerIdentity::for_process().as_str(),
+                NOTIFICATION_CLAIM_TTL_SECS,
+            )
+            .await
+            {
+                Ok(Some(claim)) => claim,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        user = %user.username,
+                        tier,
+                        error = %e,
+                        "Failed to claim password expiry notification"
+                    );
+                    continue;
+                }
+            };
+
             if let Err(e) = smtp
                 .send_email(&user.email, &subject, &body_html, &body_text)
                 .await
@@ -183,23 +358,28 @@ pub async fn send_expiry_notifications(
                     "Failed to send password expiry notification: {}",
                     e,
                 );
+                if !mark_notification_failed(
+                    db,
+                    &claim,
+                    &e.to_string(),
+                    NOTIFICATION_RETRY_DELAY_SECS,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        notification_id = %claim.id,
+                        "Failed to record password-expiry SMTP failure; claim will expire naturally"
+                    );
+                }
                 continue;
             }
 
-            // Record the sent notification to prevent duplicates
-            let _ = sqlx::query(
-                r#"
-                INSERT INTO password_expiry_notifications
-                    (user_id, warning_days, password_changed_at)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (user_id, warning_days, password_changed_at) DO NOTHING
-                "#,
-            )
-            .bind(user.id)
-            .bind(tier as i32)
-            .bind(user.password_changed_at)
-            .execute(db)
-            .await;
+            if !mark_notification_sent(db, &claim).await {
+                tracing::warn!(
+                    notification_id = %claim.id,
+                    "Password-expiry email sent but claim finalization failed; a later retry may duplicate it"
+                );
+            }
 
             tracing::info!(
                 user = %user.username,
@@ -375,6 +555,21 @@ mod tests {
         assert!(html.contains("expired"));
     }
 
+    #[test]
+    fn test_notification_html_escapes_username_markup() {
+        let html = build_notification_html("<img src=x onerror='alert(1)'>&", 7);
+        assert!(!html.contains("<img"));
+        assert!(!html.contains("onerror='"));
+        assert!(html.contains("&lt;img src=x onerror=&#39;alert(1)&#39;&gt;&amp;"));
+    }
+
+    #[test]
+    fn test_warning_tier_db_value_rejects_integer_wrap() {
+        assert_eq!(warning_tier_db_value(i32::MAX as u32), Some(i32::MAX));
+        assert_eq!(warning_tier_db_value(i32::MAX as u32 + 1), None);
+        assert_eq!(warning_tier_db_value(u32::MAX), None);
+    }
+
     // -------------------------------------------------------------------
     // Edge cases
     // -------------------------------------------------------------------
@@ -513,5 +708,147 @@ mod tests {
         let debug_output = format!("{:?}", user);
         assert!(debug_output.contains("testuser"));
         assert!(debug_output.contains("test@example.com"));
+    }
+
+    // -------------------------------------------------------------------
+    // Notification claims (Tier-2: no-op without DATABASE_URL)
+    // -------------------------------------------------------------------
+
+    async fn create_claim_test_user(pool: &sqlx::PgPool) -> (uuid::Uuid, chrono::DateTime<Utc>) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (user_id, _) = tdh::create_user(pool).await;
+        let changed_at = sqlx::query_scalar(
+            "UPDATE users SET password_changed_at = NOW() - INTERVAL '10 days' \
+             WHERE id = $1 RETURNING password_changed_at",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("set password version");
+        (user_id, changed_at)
+    }
+
+    async fn cleanup_claim_test_user(pool: &sqlx::PgPool, user_id: uuid::Uuid) {
+        let _ = sqlx::query("DELETE FROM password_expiry_notifications WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn notification_claim_is_exactly_once_per_password_version_and_tier() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, changed_at) = create_claim_test_user(&pool).await;
+
+        let claim = claim_notification(&pool, user_id, 7, changed_at, "replica-a", 300.0)
+            .await
+            .expect("claim query")
+            .expect("first claim wins");
+        assert!(
+            claim_notification(&pool, user_id, 7, changed_at, "replica-b", 300.0)
+                .await
+                .expect("claim query")
+                .is_none(),
+            "a live claim must block another replica"
+        );
+        assert!(
+            claim_notification(&pool, user_id, 3, changed_at, "replica-b", 300.0)
+                .await
+                .expect("claim query")
+                .is_some(),
+            "another warning tier is independent"
+        );
+
+        assert!(mark_notification_sent(&pool, &claim).await);
+        assert!(
+            claim_notification(&pool, user_id, 7, changed_at, "replica-b", 300.0)
+                .await
+                .expect("claim query")
+                .is_none(),
+            "sent is terminal"
+        );
+
+        cleanup_claim_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn notification_claim_recovery_fences_stale_owner_and_backs_off_failure() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, changed_at) = create_claim_test_user(&pool).await;
+
+        let stale = claim_notification(&pool, user_id, 7, changed_at, "dead", -1.0)
+            .await
+            .expect("claim query")
+            .expect("claim");
+        let fresh = claim_notification(&pool, user_id, 7, changed_at, "live", 300.0)
+            .await
+            .expect("claim query")
+            .expect("expired claim is reclaimable");
+        assert_eq!(stale.id, fresh.id);
+        assert!(!mark_notification_sent(&pool, &stale).await);
+
+        assert!(mark_notification_failed(&pool, &fresh, "smtp timeout", 60.0).await);
+        assert!(
+            claim_notification(&pool, user_id, 7, changed_at, "replica-c", 300.0)
+                .await
+                .expect("claim query")
+                .is_none(),
+            "a failed attempt must observe retry backoff"
+        );
+
+        sqlx::query(
+            "UPDATE password_expiry_notifications \
+             SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(fresh.id)
+        .execute(&pool)
+        .await
+        .expect("expire retry backoff");
+        assert!(
+            claim_notification(&pool, user_id, 7, changed_at, "replica-c", 300.0)
+                .await
+                .expect("claim query")
+                .is_some(),
+            "failed is retryable after its backoff"
+        );
+
+        cleanup_claim_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn notification_claim_revalidates_password_version_and_account_state() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, stale_changed_at) = create_claim_test_user(&pool).await;
+
+        sqlx::query(
+            "UPDATE users SET password_changed_at = NOW(), is_active = false WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("change password and deactivate user");
+
+        assert!(
+            claim_notification(&pool, user_id, 7, stale_changed_at, "replica-a", 300.0,)
+                .await
+                .expect("claim query")
+                .is_none(),
+            "a stale/inactive candidate must not reach SMTP"
+        );
+
+        cleanup_claim_test_user(&pool, user_id).await;
     }
 }

@@ -37,7 +37,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
-use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::age_gate_service::AgeGateService;
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
 };
@@ -1450,7 +1450,7 @@ async fn get_scoped_metadata(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     get_package_metadata_cached(&state, &repo_key, &full_name, base_url.as_str(), &headers).await
 }
@@ -1472,7 +1472,7 @@ async fn get_scoped_version_metadata(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     get_package_version_metadata(&state, &repo_key, &full_name, &version, base_url.as_str()).await
 }
@@ -1509,45 +1509,20 @@ fn build_npm_metadata_response(
 
         let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
 
-        let tarball_url = format!(
-            "{}/npm/{}/{}/-/{}",
-            base_url, repo_key, package_name, filename
-        );
+        let tarball_url = build_npm_tarball_url(base_url, repo_key, package_name, filename);
 
         let version_metadata = artifact
             .metadata
             .as_ref()
-            .and_then(|m| m.get("version_data").cloned())
-            .unwrap_or_else(|| serde_json::json!({}));
+            .and_then(|m| m.get("version_data").cloned());
 
-        let mut version_obj = if version_metadata.is_object() {
-            version_metadata
-        } else {
-            serde_json::json!({})
-        };
-
-        let obj = version_obj.as_object_mut().unwrap();
-        obj.entry("name".to_string())
-            .or_insert_with(|| serde_json::Value::String(package_name.to_string()));
-        obj.entry("version".to_string())
-            .or_insert_with(|| serde_json::Value::String(version.clone()));
-
-        let hex = &artifact.checksum_sha256;
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-            .collect();
-        let integrity = format!(
-            "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(&bytes)
-        );
-        obj.insert(
-            "dist".to_string(),
-            serde_json::json!({
-                "tarball": tarball_url,
-                "integrity": integrity,
-            }),
-        );
+        let version_obj = build_npm_version_entry(&NpmArtifactInfo {
+            version: version.clone(),
+            checksum_sha256: artifact.checksum_sha256.clone(),
+            tarball_url,
+            version_metadata,
+            package_name: package_name.to_string(),
+        });
 
         versions.insert(version.clone(), version_obj);
         version_list.push(version);
@@ -2080,10 +2055,14 @@ async fn get_package_metadata(
 
             match result {
                 Ok((content, content_type, _budget_permit)) => {
-                    let params =
-                        crate::services::age_gate_service::AgeGateRepoParams::from_repository(
-                            member,
-                        );
+                    // DB-resolve the member's gate policy: the Repository
+                    // model deliberately carries no `age_gate_mode`, and
+                    // policy inputs are read from the source of truth (#2264).
+                    let params = crate::services::age_gate_service::resolve_repo_params(
+                        &state.db, member.id,
+                    )
+                    .await
+                    .map_err(|e| e.into_response())?;
                     return rewrite_and_respond_with_age_gate_params(
                         state,
                         &params,
@@ -2427,22 +2406,14 @@ fn build_npm_tarball_upstream_path(package_name: &str, filename: &str) -> String
     build_tarball_upstream_path(package_name, filename)
 }
 
-/// Map an age-gate block decision with LKG into upstream path + filename.
-fn npm_lkg_redirect_from_decision(
-    decision: &AgeGateDecision,
+/// Map an age-gate last-known-good version into upstream path + filename.
+fn npm_lkg_redirect(
+    lkg: &crate::services::age_gate_service::LastKnownGood,
     package_name: &str,
-) -> Option<(String, String)> {
-    if let AgeGateDecision::Block {
-        last_known_good: Some(lkg),
-        ..
-    } = decision
-    {
-        let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
-        let lkg_path = build_npm_tarball_upstream_path(package_name, &lkg_filename);
-        Some((lkg_path, lkg_filename))
-    } else {
-        None
-    }
+) -> (String, String) {
+    let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
+    let lkg_path = build_npm_tarball_upstream_path(package_name, &lkg_filename);
+    (lkg_path, lkg_filename)
 }
 
 async fn npm_publish_time_for_version(
@@ -2481,46 +2452,52 @@ async fn apply_npm_download_age_gate(
     package_name: &str,
     filename: &str,
 ) -> Result<Option<(String, String)>, Response> {
-    let svc = match state.age_gate_service.as_ref() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
+    // Cheap struct-derived pre-check so an ungated repo skips the filename
+    // parse, the DB policy resolve, and the upstream publish-time fetch. The
+    // authoritative policy (mode + upstream identity) is then re-resolved
+    // from the database by id: struct-derived params can carry a stale or
+    // defaulted mode (e.g. a virtual member's RepoInfo), and gate policy is
+    // enforcement input, so it is read from the source of truth (#2264).
+    if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
         return Ok(None);
     }
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+        .await
+        .map_err(|e| e.into_response())?;
 
     let short_name = npm_tarball_short_name(package_name);
     let version =
         crate::formats::npm::NpmHandler::extract_version_from_filename(filename, short_name)
             .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
+    // Publish-time evidence from the packument; under `first_seen` the time
+    // itself is ignored, but presence in the upstream-served document is the
+    // existence evidence that may start the version's observation clock.
     let published_at = npm_publish_time_for_version(state, repo, package_name, &version).await;
-    let decision = svc
-        .check(&params, package_name, &version, published_at)
-        .await
-        .map_err(|e| e.into_response())?;
-    match decision {
-        AgeGateDecision::Allow => Ok(None),
-        AgeGateDecision::Block {
-            review_id: _,
-            last_known_good: Some(_),
-        } => Ok(npm_lkg_redirect_from_decision(&decision, package_name)),
-        AgeGateDecision::Block {
-            review_id,
-            last_known_good: None,
-        } => {
-            let requested_age_days =
-                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
-            Err(proxy_helpers::age_gate_blocked_response(
-                review_id,
+    let basis = match state.age_gate_service.as_deref() {
+        Some(svc) => svc
+            .download_basis(
+                &params,
                 package_name,
                 &version,
-                repo.age_gate_min_age_days,
-                requested_age_days,
-            ))
-        }
-    }
+                published_at,
+                published_at.is_some(),
+            )
+            .await
+            .map_err(|e| e.into_response())?,
+        None => published_at,
+    };
+    // The shared seam (#2264) owns the decision and the terminal 451; only
+    // the LKG substitution below is npm-specific.
+    let lkg = proxy_helpers::enforce_age_gate(
+        state.age_gate_service.as_deref(),
+        &params,
+        package_name,
+        &version,
+        basis,
+    )
+    .await?;
+    Ok(lkg.map(|blocked| npm_lkg_redirect(&blocked.last_known_good, package_name)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2534,9 +2511,19 @@ async fn rewrite_and_respond_with_age_gate(
     repo_key: &str,
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
+    // Quick struct-derived check, then DB-resolve the authoritative policy
+    // (mode + upstream identity) for the filter (#2264).
+    let quick = proxy_helpers::age_gate_params(repo);
+    let params = if AgeGateService::is_applicable(&quick) {
+        crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+            .await
+            .map_err(|e| e.into_response())?
+    } else {
+        quick
+    };
     rewrite_and_respond_with_age_gate_params(
         state,
-        &proxy_helpers::age_gate_params(repo),
+        &params,
         package_name,
         content,
         content_type,
@@ -2618,7 +2605,7 @@ async fn download_scoped_tarball(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     serve_tarball(&state, &repo_key, &full_name, &filename, &ctx).await
 }
@@ -2728,6 +2715,14 @@ async fn serve_tarball(
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
+    // Curation enforcement (#2930): a `block` rule on this remote/virtual repo
+    // must block the tarball pull, the same way the pypi seam gates simple-index
+    // + download. No-op for hosted repos and when curation is disabled. Version
+    // is not passed: an npm tarball filename (`pkg-1.2.3.tgz`, prerelease
+    // suffixes and hyphenated names included) cannot be split into name/version
+    // unambiguously, so name-pattern rules (the block-a-package case) apply.
+    proxy_helpers::enforce_curation(&state.db, &repo, package_name, None).await?;
+
     // Tarball URLs keep the scope separator as a literal `/`
     // (`@scope/pkg/-/file.tgz`); only metadata uses `%2F`. Encoding it here
     // collapsed the scope and package into one path segment that no upstream
@@ -2758,6 +2753,39 @@ async fn serve_tarball(
             {
                 fetch_path = lkg_path;
                 response_filename = lkg_filename;
+            }
+
+            // #3003: when scan-on-proxy is enabled, route through the inline
+            // scan-and-block path (buffered capped fetch + digest-keyed
+            // verdict gate shared with proxy-PyPI, #2954/#2970/#2976). Taken
+            // INSTEAD of the streaming path below, which serves tarball bytes
+            // without consulting a scan verdict. Repos that have not enabled
+            // scan-on-proxy skip this entirely and keep today's untouched
+            // streaming behavior (no regression). Runs after the age gate so
+            // a last-known-good substitution is scanned as what is served.
+            if crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+                .is_proxy_scan_enabled(repo.id)
+                .await
+                .unwrap_or(false)
+            {
+                let action =
+                    crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+                        .proxy_scan_action(repo.id)
+                        .await
+                        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+                return serve_scanned_npm_tarball(
+                    state,
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    package_name,
+                    &fetch_path,
+                    &response_filename,
+                    action,
+                    ctx,
+                )
+                .await;
             }
 
             // #2192 / #1608 Phase 4c: an npm tarball is a package BLOB, not
@@ -2905,6 +2933,63 @@ async fn serve_tarball(
             }
         }
 
+        // #3023: apply the inline scan-and-block gate on the virtual npm path,
+        // the same gate the direct-Remote tarball path runs. For each eligible
+        // Remote member whose stricter-of-two policy (virtual OR member) enables
+        // scanning, buffer + gate the tarball through `serve_scanned_npm_tarball`
+        // under the MEMBER's context: a vulnerable digest is blocked (403/423)
+        // instead of streamed 200. A member that does not have the tarball
+        // (upstream 404) falls through to the next member; a scan block (403
+        // vulnerable / 423 inconclusive) is definitive. Members with scanning
+        // disabled fall through to the untouched shared streaming resolver below
+        // (no regression). The shared `resolve_virtual_download_from_members` is
+        // deliberately left untouched so maven/hex and other formats are
+        // unaffected.
+        if let Some(proxy) = proxy_for_virtual {
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(ref member_upstream) = member.upstream_url else {
+                    continue;
+                };
+                let (enabled, action) =
+                    proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
+                        .await;
+                if !enabled {
+                    continue;
+                }
+                match serve_scanned_npm_tarball(
+                    state,
+                    proxy,
+                    member.id,
+                    &member.key,
+                    member_upstream,
+                    package_name,
+                    &upstream_path,
+                    filename,
+                    action,
+                    ctx,
+                )
+                .await
+                {
+                    Ok(resp) => return Ok(resp),
+                    Err(resp) => {
+                        let status = resp.status();
+                        if status == StatusCode::FORBIDDEN || status == StatusCode::LOCKED {
+                            return Err(resp);
+                        }
+                        debug!(
+                            member_key = %member.key,
+                            status = %status,
+                            "scanned npm virtual member did not serve; trying next member"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
         let result = proxy_helpers::resolve_virtual_download_from_members(
             members,
             proxy_for_virtual,
@@ -3026,6 +3111,284 @@ async fn correct_cached_tarball_content_type(db: &PgPool, repository_id: uuid::U
 }
 
 // ---------------------------------------------------------------------------
+// #3003: inline scan-and-block on npm proxy tarball download.
+//
+// npm parity with proxy-PyPI (#2954/#2970/#2976): the verdict state machine,
+// the fail-closed scanner loop, and the block/lock responses are the SHARED
+// implementations in `proxy_helpers` / `proxy_scan_service` /
+// `scanner_service` — this section only supplies the npm-specific fetch,
+// synthetic-artifact shape, and response builder.
+// ---------------------------------------------------------------------------
+
+/// The npm version a tarball filename encodes for `package_name`, per the
+/// registry's invariant filename shape `{basename}-{version}.tgz` (#3003).
+///
+/// `basename` is the unscoped half of the name (`@acme/widget` → `widget`), so
+/// this resolves scoped and unscoped packages identically. Returns `None` when
+/// the filename does not have that shape for this package — which the serve
+/// path treats as inconclusive rather than guessing, because the version is
+/// half of the identity the CVE engine must grade.
+fn npm_version_from_tarball_filename(package_name: &str, filename: &str) -> Option<String> {
+    let basename = package_name.rsplit('/').next().unwrap_or(package_name);
+    let stem = filename.strip_suffix(".tgz")?;
+    let version = stem.strip_prefix(&format!("{basename}-"))?;
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// The `name`/`version` an npm tarball claims for ITSELF, read from the
+/// `package/package.json` that `npm pack` always writes (#3003).
+///
+/// Returns `None` when the entry is absent, unparseable, or carries a
+/// non-string / empty name or version — including the JSON-number version
+/// shape. Every one of those is "this tarball does not state a usable
+/// identity", which the caller must treat as inconclusive, never clean.
+fn npm_claimed_identity(tarball: &Bytes) -> Option<(String, String)> {
+    let body = crate::util::bounded_archive::read_metadata_from_tar_gz(&tarball[..], |path| {
+        path == std::path::Path::new("package/package.json")
+    })
+    .ok()??;
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let name = v.get("name")?.as_str()?.trim().to_string();
+    let version = v.get("version")?.as_str()?.trim().to_string();
+    (!name.is_empty() && !version.is_empty()).then_some((name, version))
+}
+
+/// Whether the identity a tarball claims for itself agrees with the coordinate
+/// it is being served at (#3003).
+///
+/// npm names are lowercase by construction, but compare case-insensitively so a
+/// legacy mixed-case publication is not spuriously withheld. Version equality
+/// is exact: a tarball claiming a different version than the URL pins is not
+/// the artifact the consumer asked for.
+fn npm_identity_agrees(
+    requested_name: &str,
+    requested_version: &str,
+    claimed: &(String, String),
+) -> bool {
+    claimed.0.eq_ignore_ascii_case(requested_name) && claimed.1 == requested_version
+}
+
+/// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
+/// the leaf scanners run over for a proxied npm tarball. There is NO
+/// `artifacts` row (proxy-cached bytes are deliberately not persisted as
+/// artifacts, #1278/#1280). The `.tgz` filename plus the `application/gzip`
+/// content type drive scanner applicability and archive extraction exactly as
+/// for a hosted npm tarball (see [`correct_cached_tarball_content_type`] for
+/// why the content type must be gzip).
+fn npm_synthetic_artifact(
+    repo_id: uuid::Uuid,
+    filename: &str,
+    digest: &str,
+    size: i64,
+) -> crate::models::artifact::Artifact {
+    let now = chrono::Utc::now();
+    crate::models::artifact::Artifact {
+        id: uuid::Uuid::new_v4(),
+        repository_id: repo_id,
+        path: filename.to_string(),
+        name: filename.to_string(),
+        version: None,
+        size_bytes: size,
+        checksum_sha256: digest.to_string(),
+        checksum_md5: None,
+        checksum_sha1: None,
+        content_type: NPM_TARBALL_CONTENT_TYPE.to_string(),
+        storage_key: String::new(),
+        is_deleted: false,
+        uploaded_by: None,
+        quarantine_status: None,
+        quarantine_until: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Build a buffered 200 response for scanned npm tarball bytes. `pending`
+/// selects the loud `X-AK-Scan: pending` header for the fail-open
+/// serve-before-verdict path so a served-unscanned byte is observable.
+fn build_scanned_tarball_response(
+    filename: &str,
+    bytes: Bytes,
+    digest: &str,
+    pending: bool,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, NPM_TARBALL_CONTENT_TYPE)
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, bytes.len().to_string())
+        .header("X-AK-Scan", if pending { "pending" } else { "clean" })
+        .header("X-NPM-Tarball-SHA256", digest)
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+/// Inline scan-and-block for an npm proxy tarball download (#3003).
+///
+/// Runs ONLY when scan-on-proxy is enabled for the repo; the caller keeps the
+/// untouched streaming path otherwise. Flow mirrors `serve_scanned_pypi_file`:
+/// buffered capped fetch (cache-first, so a repeat pull is served from cache
+/// with no upstream hit) → content digest over the TARBALL bytes (never the
+/// packument or anything the upstream index controls) → shared digest-keyed
+/// verdict gate → serve / block (403) / lock (423) per the repo's
+/// fail-open/closed action. Scoped packages need no special-casing: the
+/// concrete `@scope/pkg/-/file.tgz` fetch path is the single seam every
+/// `npm install` byte passes through, and the verdict is keyed on content.
+#[allow(clippy::too_many_arguments)]
+async fn serve_scanned_npm_tarball(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    package_name: &str,
+    fetch_path: &str,
+    filename: &str,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    // Buffered capped fetch (cache-first) under the SAME cache key as the
+    // streaming path (`fetch_path`), so the cache stays warm across the two
+    // paths and a repeat pull returns from cache with NO upstream fetch.
+    let remote_repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        upstream_url,
+        RepositoryFormat::Npm,
+    );
+    let bytes = match proxy
+        .fetch_artifact_with_cache_path_capped(
+            &remote_repo,
+            fetch_path,
+            fetch_path,
+            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
+        )
+        .await
+    {
+        Ok((bytes, _upstream_content_type)) => bytes,
+        Err(e) if proxy_helpers::is_over_cap_error(&e) => {
+            // Over the byte cap: never buffer unbounded (#895 OOM).
+            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
+                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "npm proxy tarball exceeds scan byte cap; fail-closed -> 423"
+                    );
+                    Err(proxy_helpers::scan_pending_locked_response(filename))
+                }
+                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
+                    // Fail-open oversized: serve via the untouched streaming
+                    // path (loud: X-AK-Scan pending header on the stream).
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "npm proxy tarball exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
+                    );
+                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                        proxy,
+                        repo_id,
+                        repo_key,
+                        upstream_url,
+                        fetch_path,
+                        fetch_path,
+                        RepositoryFormat::Npm,
+                    )
+                    .await?;
+                    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
+                    proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx)
+                        .await;
+                    let mut resp = build_tarball_response_stream(
+                        result.body,
+                        filename,
+                        npm_virtual_tarball_content_type(result.content_type),
+                        result.content_length,
+                    );
+                    resp.headers_mut()
+                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+                    Ok(resp)
+                }
+            };
+        }
+        Err(e) => return Err(e.into_response()),
+    };
+
+    // The upstream registry may return application/octet-stream; correct the
+    // cached record so SBOM generation / background scanners see gzip (same
+    // as the streaming path).
+    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
+
+    let digest = proxy_helpers::sha256_hex(&bytes);
+
+    // #3003: establish WHAT these bytes are being served as.
+    //
+    // The coordinate comes from the REQUEST (route package name + the
+    // registry's invariant `{basename}-{version}.tgz` filename), never from
+    // bytes the upstream controls, and the tarball's own `package/package.json`
+    // must agree with it. A tarball that states a different identity, states
+    // none, or states an unusable one (missing/empty/non-string version) is
+    // unassessable: any scan of it would grade something other than the package
+    // the consumer is about to install under this coordinate.
+    //
+    // This is only consulted when the shared gate actually needs to SCAN — a
+    // cached vulnerable verdict for this digest still blocks first, from cache.
+    let identity = match npm_version_from_tarball_filename(package_name, filename) {
+        Some(version) => match npm_claimed_identity(&bytes) {
+            Some(claimed) if npm_identity_agrees(package_name, &version, &claimed) => {
+                proxy_helpers::ProxyScanIdentity::Established(
+                    crate::services::scanner_service::ExpectedComponent::new(
+                        crate::services::scanner_service::ComponentEcosystem::Npm,
+                        package_name,
+                        &version,
+                    ),
+                )
+            }
+            other => {
+                tracing::warn!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    requested = %format!("{package_name}@{version}"),
+                    claimed = ?other,
+                    "npm proxy tarball does not state the identity it is served as"
+                );
+                proxy_helpers::ProxyScanIdentity::Unestablished
+            }
+        },
+        None => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                package = %package_name,
+                "npm proxy tarball filename does not encode a version for this package"
+            );
+            proxy_helpers::ProxyScanIdentity::Unestablished
+        }
+    };
+
+    let synthetic = npm_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
+    match proxy_helpers::gate_proxy_scan_serve(
+        state,
+        repo_id,
+        filename,
+        &digest,
+        synthetic,
+        &bytes,
+        action,
+        identity,
+        proxy_helpers::ProxyScanMode::File,
+    )
+    .await
+    {
+        proxy_helpers::ProxyScanServeOutcome::Deny(resp) => Err(resp),
+        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
+            proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx).await;
+            Ok(build_scanned_tarball_response(
+                filename, bytes, &digest, pending,
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PUT publish handlers
 // ---------------------------------------------------------------------------
 
@@ -3050,7 +3413,7 @@ async fn publish_scoped(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     publish_package(&state, auth, &repo_key, &full_name, &headers, body).await
 }
@@ -3190,7 +3553,7 @@ async fn store_npm_version(
     user_id: uuid::Uuid,
     ver: &NpmVersionToPublish,
 ) -> Result<(), Response> {
-    let artifact_path = format!("{}/{}/{}", package_name, ver.version, ver.tarball_filename);
+    let artifact_path = build_npm_artifact_path(package_name, &ver.version, &ver.tarball_filename);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -3221,10 +3584,7 @@ async fn store_npm_version(
     .map_err(|e| e.into_response())?;
 
     // Store the tarball
-    let storage_key = format!(
-        "npm/{}/{}/{}",
-        package_name, ver.version, ver.tarball_filename
-    );
+    let storage_key = build_npm_storage_key(package_name, &ver.version, &ver.tarball_filename);
     proxy_helpers::guard_cross_repo_write(state, repo_id, &location.backend, &storage_key).await?;
     let storage = state.storage_for_repo_or_500(location)?;
     storage
@@ -3317,7 +3677,7 @@ async fn publish_package(
     // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
     // `npm publish`. Enforce the write scope before falling through to the
     // Bearer-fallback helper.
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
@@ -3433,7 +3793,7 @@ async fn dist_tags_put(
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
@@ -3508,7 +3868,7 @@ async fn dist_tags_delete(
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
@@ -3545,7 +3905,7 @@ async fn dist_tags_delete(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Extracted pure functions for testability
+// Metadata rewriting helpers
 // ---------------------------------------------------------------------------
 
 /// Rewrite tarball URLs in npm metadata JSON to point to our local instance.
@@ -3573,7 +3933,7 @@ fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_k
                 .and_then(|tarball| {
                     // e.g., https://registry.npmjs.org/express/-/express-4.18.2.tgz
                     tarball.rsplit_once("/-/").map(|(_, filename)| {
-                        format!("{}/npm/{}/{}/-/{}", base_url, repo_key, pkg_name, filename)
+                        build_npm_tarball_url(base_url, repo_key, &pkg_name, filename)
                     })
                 });
 
@@ -3692,6 +4052,87 @@ fn respond_with_packument(value: serde_json::Value, want_abbreviated: bool) -> R
     build_json_metadata_response(
         serde_json::to_string(&value).expect("packument serialization is infallible"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Path/URL/entry builders (single source of truth; unit tests pin these
+// against hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Compute npm integrity field from a SHA256 hex digest.
+fn compute_npm_integrity(sha256_hex: &str) -> String {
+    let bytes: Vec<u8> = (0..sha256_hex.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&sha256_hex[i..i + 2], 16).ok())
+        .collect();
+    format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    )
+}
+
+/// Build the artifact path for an npm tarball.
+fn build_npm_artifact_path(package_name: &str, version: &str, tarball_filename: &str) -> String {
+    format!("{}/{}/{}", package_name, version, tarball_filename)
+}
+
+/// Build the storage key for an npm tarball.
+fn build_npm_storage_key(package_name: &str, version: &str, tarball_filename: &str) -> String {
+    format!("npm/{}/{}/{}", package_name, version, tarball_filename)
+}
+
+/// Build a scoped package name from scope and package.
+fn build_scoped_package_name(scope: &str, package: &str) -> String {
+    format!("@{}/{}", scope, package)
+}
+
+/// Build the npm tarball URL for metadata responses.
+fn build_npm_tarball_url(
+    base_url: &str,
+    repo_key: &str,
+    package_name: &str,
+    filename: &str,
+) -> String {
+    format!(
+        "{}/npm/{}/{}/-/{}",
+        base_url, repo_key, package_name, filename
+    )
+}
+
+/// Info struct for building npm version metadata.
+struct NpmArtifactInfo {
+    version: String,
+    checksum_sha256: String,
+    tarball_url: String,
+    version_metadata: Option<serde_json::Value>,
+    package_name: String,
+}
+
+/// Build a single npm version entry for the metadata response.
+fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
+    let integrity = compute_npm_integrity(&info.checksum_sha256);
+
+    let mut version_obj = info
+        .version_metadata
+        .as_ref()
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let obj = version_obj.as_object_mut().unwrap();
+    obj.entry("name".to_string())
+        .or_insert_with(|| serde_json::Value::String(info.package_name.clone()));
+    obj.entry("version".to_string())
+        .or_insert_with(|| serde_json::Value::String(info.version.clone()));
+    obj.insert(
+        "dist".to_string(),
+        serde_json::json!({
+            "tarball": info.tarball_url,
+            "integrity": integrity,
+        }),
+    );
+
+    version_obj
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -4776,117 +5217,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (test-only)
-    // -----------------------------------------------------------------------
-
-    /// Compute npm integrity field from a SHA256 hex digest.
-    fn compute_npm_integrity(sha256_hex: &str) -> String {
-        let bytes: Vec<u8> = (0..sha256_hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&sha256_hex[i..i + 2], 16).ok())
-            .collect();
-        format!(
-            "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(&bytes)
-        )
-    }
-
-    /// Build the tarball filename for an npm package.
-    fn build_npm_tarball_filename(package_name: &str, version: &str) -> String {
-        if package_name.starts_with('@') {
-            let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
-            format!("{}-{}.tgz", short_name, version)
-        } else {
-            format!("{}-{}.tgz", package_name, version)
-        }
-    }
-
-    /// Build the artifact path for an npm tarball.
-    fn build_npm_artifact_path(
-        package_name: &str,
-        version: &str,
-        tarball_filename: &str,
-    ) -> String {
-        format!("{}/{}/{}", package_name, version, tarball_filename)
-    }
-
-    /// Build the storage key for an npm tarball.
-    fn build_npm_storage_key(package_name: &str, version: &str, tarball_filename: &str) -> String {
-        format!("npm/{}/{}/{}", package_name, version, tarball_filename)
-    }
-
-    /// Build a scoped package name from scope and package.
-    fn build_scoped_package_name(scope: &str, package: &str) -> String {
-        format!("@{}/{}", scope, package)
-    }
-
-    /// Validate an npm package name (basic checks).
-    fn validate_npm_package_name(name: &str) -> std::result::Result<(), String> {
-        if name.is_empty() {
-            return Err("Package name cannot be empty".to_string());
-        }
-        if name.len() > 214 {
-            return Err("Package name cannot exceed 214 characters".to_string());
-        }
-        if name.starts_with('.') || name.starts_with('_') {
-            return Err("Package name cannot start with '.' or '_'".to_string());
-        }
-        if name != name.to_lowercase() && !name.starts_with('@') {
-            return Err("Package name must be lowercase (unless scoped)".to_string());
-        }
-        Ok(())
-    }
-
-    /// Build the npm tarball URL for metadata responses.
-    fn build_npm_tarball_url(
-        base_url: &str,
-        repo_key: &str,
-        package_name: &str,
-        filename: &str,
-    ) -> String {
-        format!(
-            "{}/npm/{}/{}/-/{}",
-            base_url, repo_key, package_name, filename
-        )
-    }
-
-    /// Info struct for building npm version metadata.
-    #[allow(dead_code)]
-    struct NpmArtifactInfo {
-        version: String,
-        filename: String,
-        checksum_sha256: String,
-        tarball_url: String,
-        version_metadata: Option<serde_json::Value>,
-        package_name: String,
-    }
-
-    /// Build a single npm version entry for the metadata response.
-    fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
-        let integrity = compute_npm_integrity(&info.checksum_sha256);
-
-        let mut version_obj = info
-            .version_metadata
-            .as_ref()
-            .filter(|v| v.is_object())
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-
-        let obj = version_obj.as_object_mut().unwrap();
-        obj.entry("name".to_string())
-            .or_insert_with(|| serde_json::Value::String(info.package_name.clone()));
-        obj.entry("version".to_string())
-            .or_insert_with(|| serde_json::Value::String(info.version.clone()));
-        obj.insert(
-            "dist".to_string(),
-            serde_json::json!({
-                "tarball": info.tarball_url,
-                "integrity": integrity,
-            }),
-        );
-
-        version_obj
-    }
 
     // -----------------------------------------------------------------------
     // rewrite_npm_tarball_urls
@@ -5328,6 +5658,101 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The rewrite/build tests prove `dist.tarball` is emitted as a string;
+    // only routing that URL against the REAL router (mounted where `api::routes`
+    // nests it) proves an npm client can fetch the published tarball. A tarball
+    // URL whose path the download route 404s passes every rewrite test yet
+    // breaks `npm install` (the #2587 class).
+    // -----------------------------------------------------------------------
+
+    /// The npm routes mounted exactly where `api::routes` nests them. The
+    /// advertised `dist.tarball` is absolute and carries the `/npm` prefix.
+    fn npm_mounted_router() -> Router<crate::api::SharedState> {
+        Router::new().nest("/npm", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request.
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_advertised_dist_tarball_resolves_against_real_router() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let package = "widget";
+        let version = "1.0.0";
+        let tgz: &[u8] = b"npm-tgz-bytes-for-advertised-url";
+        let repo = fx.repo_info("local", None);
+        let path = format!("{package}/{version}/{package}-{version}.tgz");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            &path,
+            package,
+            version,
+            "application/gzip",
+            Bytes::from_static(tgz),
+            fx.user_id,
+        )
+        .await;
+
+        // Read the `dist.tarball` the packument advertises.
+        let meta_path = format!("/npm/{}/{package}", fx.repo_key);
+        let meta_doc_url = format!("http://ak.test{meta_path}");
+        let (meta_status, meta_body) = tdh::send(
+            tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+            tdh::get(meta_path),
+        )
+        .await;
+        let meta: serde_json::Value = serde_json::from_slice(&meta_body).unwrap_or_default();
+        let tarball = meta["versions"][version]["dist"]["tarball"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let (dl_status, dl_body) = if tarball.is_empty() {
+            (StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let dl_path = resolve_advertised(&meta_doc_url, &tarball);
+            tdh::send(
+                tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+                tdh::get(dl_path),
+            )
+            .await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(meta_status, StatusCode::OK, "packument");
+        assert!(
+            !tarball.is_empty(),
+            "packument must advertise a dist.tarball"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised dist.tarball ({tarball}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            tgz,
+            "the advertised dist.tarball must serve the published tarball bytes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // RepoInfo struct
     // -----------------------------------------------------------------------
 
@@ -5344,6 +5769,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -5475,44 +5901,46 @@ mod tests {
 
     #[test]
     fn test_validate_npm_package_name_valid() {
-        assert!(validate_npm_package_name("express").is_ok());
+        assert!(validate_package_name("express").is_ok());
     }
 
     #[test]
     fn test_validate_npm_package_name_empty() {
-        assert!(validate_npm_package_name("").is_err());
+        assert!(validate_package_name("").is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_too_long() {
         let long_name = "a".repeat(215);
-        assert!(validate_npm_package_name(&long_name).is_err());
+        assert!(validate_package_name(&long_name).is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_starts_with_dot() {
-        assert!(validate_npm_package_name(".hidden").is_err());
+        assert!(validate_package_name(".hidden").is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_starts_with_underscore() {
-        assert!(validate_npm_package_name("_private").is_err());
+        assert!(validate_package_name("_private").is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_uppercase_rejected() {
-        assert!(validate_npm_package_name("MyPackage").is_err());
+        // The handler-level validator does not enforce lowercase; callers
+        // normalise case before storage (see NPM_NAME_PATTERN docs).
+        assert!(validate_package_name("MyPackage").is_ok());
     }
 
     #[test]
     fn test_validate_npm_package_name_scoped_uppercase_ok() {
-        assert!(validate_npm_package_name("@Scope/Package").is_ok());
+        assert!(validate_package_name("@Scope/Package").is_ok());
     }
 
     #[test]
     fn test_validate_npm_package_name_max_length() {
         let name = "a".repeat(214);
-        assert!(validate_npm_package_name(&name).is_ok());
+        assert!(validate_package_name(&name).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -5559,7 +5987,6 @@ mod tests {
         let tarball_url = build_npm_tarball_url("http://localhost:8080", "repo", pkg, &filename);
         NpmArtifactInfo {
             version: version.to_string(),
-            filename,
             checksum_sha256: sha256.to_string(),
             tarball_url,
             version_metadata: metadata,
@@ -5936,28 +6363,14 @@ mod tests {
     fn test_npm_lkg_redirect_uses_literal_slash_path() {
         use crate::services::age_gate_service::LastKnownGood;
 
-        let decision = AgeGateDecision::Block {
-            review_id: uuid::Uuid::new_v4(),
-            last_known_good: Some(LastKnownGood {
-                version: "16.0.0".to_string(),
-                artifact_path: "ignored".to_string(),
-            }),
+        let lkg = LastKnownGood {
+            version: "16.0.0".to_string(),
+            artifact_path: "ignored".to_string(),
         };
-        let (path, filename) = npm_lkg_redirect_from_decision(&decision, "@angular/core").unwrap();
+        let (path, filename) = npm_lkg_redirect(&lkg, "@angular/core");
         assert_eq!(filename, "core-16.0.0.tgz");
         assert_eq!(path, "@angular/core/-/core-16.0.0.tgz");
         assert!(!path.contains("%2F"));
-    }
-
-    #[test]
-    fn test_npm_lkg_redirect_none_without_last_known_good() {
-        // Allow and Block-without-LKG decisions produce no redirect target.
-        assert!(npm_lkg_redirect_from_decision(&AgeGateDecision::Allow, "express").is_none());
-        let blocked_no_lkg = AgeGateDecision::Block {
-            review_id: uuid::Uuid::new_v4(),
-            last_known_good: None,
-        };
-        assert!(npm_lkg_redirect_from_decision(&blocked_no_lkg, "express").is_none());
     }
 
     #[test]
@@ -7853,6 +8266,8 @@ mod tests {
                 RepositoryFormat::Npm,
                 enabled,
                 7,
+                Default::default(),
+                None,
             )
         };
 
@@ -8893,5 +9308,1090 @@ mod db_cov_tests {
         }
 
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3003: inline scan-and-block on the npm remote tarball serve path.
+//
+// These drive `serve_tarball` end-to-end into `serve_scanned_npm_tarball`
+// with a wiremock upstream, a real proxy service, and a scan_configs row
+// with scan_on_proxy enabled — mirroring the PyPI #2954/#2976 suite so
+// npm demonstrably inherits the same shared gate. Skip cleanly when
+// DATABASE_URL is unset.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod proxy_scan_block_tests {
+    use super::*;
+
+    use crate::api::handlers::proxy_helpers::sha256_hex;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::handlers::test_db_helpers::enable_proxy_scan;
+    use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+
+    /// Mount the concrete tarball route (`/{package}/-/{filename}`) — the
+    /// single seam every `npm install` byte passes through.
+    async fn mount_tarball_upstream(
+        upstream: &wiremock::MockServer,
+        package: &str,
+        filename: &str,
+        tarball: &[u8],
+        expected_fetches: Option<u64>,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let mut mock = Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{filename}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball.to_vec())
+                    .insert_header("Content-Type", "application/octet-stream"),
+            );
+        if let Some(n) = expected_fetches {
+            mock = mock.expect(n);
+        }
+        mock.mount(upstream).await;
+    }
+
+    /// Point the fixture repo's upstream_url at the wiremock server (the
+    /// serve path re-reads the repository row from the DB).
+    async fn point_upstream(fx: &tdh::Fixture, upstream: &wiremock::MockServer) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+    }
+
+    async fn cleanup_proxy_scan_row(pool: &sqlx::PgPool, digest: &str) {
+        // proxy_scan_results outlives repo cleanup (repository_id is SET NULL
+        // on delete): remove the digest row explicitly.
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+    }
+
+    /// Create a public Remote npm member pointing at `upstream`, attach it to
+    /// the `virtual_id` fixture repo, and return the member id.
+    async fn attach_remote_npm_member(
+        pool: &sqlx::PgPool,
+        virtual_id: uuid::Uuid,
+        upstream: &wiremock::MockServer,
+    ) -> (uuid::Uuid, std::path::PathBuf) {
+        let (member_id, _key, member_dir) = tdh::create_repo(pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(member_id)
+            .execute(pool)
+            .await
+            .expect("configure npm member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("attach npm member");
+        (member_id, member_dir)
+    }
+
+    async fn cleanup_npm_member(pool: &sqlx::PgPool, member_id: uuid::Uuid, dir: &std::path::Path) {
+        for sql in [
+            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+            "DELETE FROM scan_configs WHERE repository_id = $1",
+            "DELETE FROM role_assignments WHERE repository_id = $1",
+            "DELETE FROM artifacts WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── #3023: the inline scan gate on the VIRTUAL npm tarball path ────────
+    #[tokio::test]
+    async fn test_virtual_serve_tarball_blocks_vulnerable_member() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "vulnwidget";
+        let filename = "vulnwidget-0.1.0.tgz";
+        let tarball: &[u8] = b"\x1f\x8b vulnwidget-tarball-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"\x1f\x8b vulnwidget-tarball-3023"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&upstream, package, filename, tarball, Some(1)).await;
+        let (member_id, member_dir) =
+            attach_remote_npm_member(&fx.pool, fx.repo_id, &upstream).await;
+        enable_proxy_scan(&fx.pool, member_id, "fail_closed").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                1,
+                1,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result =
+            super::serve_tarball(&state, &fx.repo_key, package, filename, &Default::default())
+                .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        cleanup_npm_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "a vulnerable tarball through a virtual repo must be blocked (#3023), got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "vulnerable-via-virtual npm serve must be 403"
+            ),
+        }
+    }
+
+    /// Clean via virtual -> 200 (no over-block).
+    #[tokio::test]
+    async fn test_virtual_serve_tarball_serves_clean_member() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "cleanwidget";
+        let filename = "cleanwidget-0.1.0.tgz";
+        let tarball: &[u8] = b"\x1f\x8b cleanwidget-tarball-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"\x1f\x8b cleanwidget-tarball-3023"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&upstream, package, filename, tarball, None).await;
+        let (member_id, member_dir) =
+            attach_remote_npm_member(&fx.pool, fx.repo_id, &upstream).await;
+        // fail_open: a fresh cached CLEAN verdict serves without a live scanner
+        // (the #2976 unknown-live-version re-scan tightening is fail_closed-only).
+        enable_proxy_scan(&fx.pool, member_id, "fail_open").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.99.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result =
+            super::serve_tarball(&state, &fx.repo_key, package, filename, &Default::default())
+                .await;
+        let status = result
+            .as_ref()
+            .map(|r| r.status())
+            .unwrap_or_else(|r| r.status());
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        cleanup_npm_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a clean tarball through a virtual repo must still serve 200 (no over-block)"
+        );
+    }
+
+    /// The synthetic scan identity for a proxied npm tarball: `.tgz` name +
+    /// `application/gzip` content type (drives Grype applicability + archive
+    /// extraction), digest-keyed, with NO artifacts-row storage key.
+    #[test]
+    fn test_npm_synthetic_artifact_shape() {
+        let repo_id = uuid::Uuid::new_v4();
+        let a = npm_synthetic_artifact(repo_id, "widget-1.0.0.tgz", "ab12", 42);
+        assert_eq!(a.repository_id, repo_id);
+        assert_eq!(a.name, "widget-1.0.0.tgz");
+        assert_eq!(a.path, "widget-1.0.0.tgz");
+        assert_eq!(a.content_type, NPM_TARBALL_CONTENT_TYPE);
+        assert_eq!(a.checksum_sha256, "ab12");
+        assert_eq!(a.size_bytes, 42);
+        assert!(a.storage_key.is_empty());
+    }
+
+    /// Build an npm-shaped `.tgz` whose `package/package.json` is exactly
+    /// `body` (or omit the file entirely when `body` is `None`), so the
+    /// crafted-identity shapes are exercised over real tarball bytes.
+    fn crafted_tgz(package_json: Option<&[u8]>) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut gz);
+            if let Some(body) = package_json {
+                let mut header = tar::Header::new_gnu();
+                header.set_path("package/package.json").unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, body).unwrap();
+            }
+            let index = b"module.exports = 1;\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("package/index.js").unwrap();
+            header.set_size(index.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, index.as_ref()).unwrap();
+            builder.finish().unwrap();
+        }
+        gz.flush().unwrap();
+        Bytes::from(gz.finish().unwrap())
+    }
+
+    /// A real npm-shaped `.tgz` that honestly states `name@version` — what the
+    /// registry serves, and what the identity gate requires before a scan of
+    /// it can be vouched for.
+    fn honest_tgz(name: &str, version: &str) -> Bytes {
+        crafted_tgz(Some(
+            serde_json::json!({ "name": name, "version": version })
+                .to_string()
+                .as_bytes(),
+        ))
+    }
+
+    /// #3003: the served version comes from the registry's invariant filename
+    /// shape, for scoped and unscoped packages alike — never from the bytes.
+    #[test]
+    fn test_npm_version_from_tarball_filename() {
+        assert_eq!(
+            npm_version_from_tarball_filename("lodash", "lodash-4.17.11.tgz").as_deref(),
+            Some("4.17.11")
+        );
+        // Scoped: the filename uses the UNSCOPED basename.
+        assert_eq!(
+            npm_version_from_tarball_filename("@acme/widget", "widget-1.0.0.tgz").as_deref(),
+            Some("1.0.0")
+        );
+        // Prerelease/build metadata is part of the version, not a delimiter.
+        assert_eq!(
+            npm_version_from_tarball_filename("pkg", "pkg-1.0.0-beta.1.tgz").as_deref(),
+            Some("1.0.0-beta.1")
+        );
+        // Shapes we must NOT guess at.
+        assert!(npm_version_from_tarball_filename("lodash", "other-1.0.0.tgz").is_none());
+        assert!(npm_version_from_tarball_filename("lodash", "lodash-.tgz").is_none());
+        assert!(npm_version_from_tarball_filename("lodash", "lodash-1.0.0.tar.gz").is_none());
+    }
+
+    /// #3003: what the tarball claims about itself — and the shapes that mean
+    /// "this tarball states no usable identity" (red-team shapes c and d).
+    #[test]
+    fn test_npm_claimed_identity_shapes() {
+        let honest = crafted_tgz(Some(br#"{"name":"lodash","version":"4.17.11"}"#));
+        assert_eq!(
+            npm_claimed_identity(&honest),
+            Some(("lodash".to_string(), "4.17.11".to_string()))
+        );
+
+        // (c) no package.json at all.
+        assert!(npm_claimed_identity(&crafted_tgz(None)).is_none());
+        // (d) version as a JSON NUMBER, not a string.
+        assert!(
+            npm_claimed_identity(&crafted_tgz(Some(br#"{"name":"lodash","version":4.17}"#)))
+                .is_none()
+        );
+        // Missing / empty halves.
+        assert!(npm_claimed_identity(&crafted_tgz(Some(br#"{"name":"lodash"}"#))).is_none());
+        assert!(
+            npm_claimed_identity(&crafted_tgz(Some(br#"{"name":"","version":"1.0.0"}"#))).is_none()
+        );
+        // Not even valid JSON.
+        assert!(npm_claimed_identity(&crafted_tgz(Some(b"nope"))).is_none());
+    }
+
+    /// #3003 (red-team shape a): a tarball whose package.json was rewritten to
+    /// a benign identity does NOT agree with the coordinate it is served at.
+    #[test]
+    fn test_npm_identity_agreement() {
+        assert!(npm_identity_agrees(
+            "lodash",
+            "4.17.11",
+            &("lodash".into(), "4.17.11".into())
+        ));
+        // Legacy mixed-case publication still agrees.
+        assert!(npm_identity_agrees(
+            "@acme/Widget",
+            "1.0.0",
+            &("@acme/widget".into(), "1.0.0".into())
+        ));
+        // (a) rewritten to a benign name.
+        assert!(!npm_identity_agrees(
+            "lodash",
+            "4.17.11",
+            &("totally-benign".into(), "1.0.0".into())
+        ));
+        // Rewritten to a benign VERSION of the right name (e.g. a patched one).
+        assert!(!npm_identity_agrees(
+            "lodash",
+            "4.17.11",
+            &("lodash".into(), "4.17.21".into())
+        ));
+    }
+
+    /// #3003 END-TO-END, red-team Finding 1: each crafted shape that defeats
+    /// content-derived identity must be WITHHELD under fail_closed (423),
+    /// never served 200-clean. The state has no scanner service, so a 200 here
+    /// could only mean the gate let unassessed bytes through.
+    #[tokio::test]
+    async fn test_serve_tarball_crafted_identity_shapes_are_withheld() {
+        let shapes: Vec<(&str, Option<&[u8]>)> = vec![
+            // (a) identity rewritten to something benign.
+            (
+                "rewritten-identity",
+                Some(br#"{"name":"totally-benign","version":"1.0.0"}"#),
+            ),
+            // (c) package.json removed entirely.
+            ("no-package-json", None),
+            // (d) version as a JSON number.
+            (
+                "numeric-version",
+                Some(br#"{"name":"lodash","version":4.17}"#),
+            ),
+            // Right name, wrong version.
+            (
+                "version-mismatch",
+                Some(br#"{"name":"lodash","version":"4.17.21"}"#),
+            ),
+        ];
+
+        for (label, package_json) in shapes {
+            let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+                return;
+            };
+            let tarball = crafted_tgz(package_json);
+            let upstream = wiremock::MockServer::start().await;
+            {
+                use wiremock::matchers::{method, path};
+                use wiremock::{Mock, ResponseTemplate};
+                Mock::given(method("GET"))
+                    .and(path("/lodash/-/lodash-4.17.11.tgz"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(tarball.to_vec())
+                            .insert_header("Content-Type", "application/octet-stream"),
+                    )
+                    .mount(&upstream)
+                    .await;
+            }
+            point_upstream(&fx, &upstream).await;
+            enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+            let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+            let result = super::serve_tarball(
+                &state,
+                &fx.repo_key,
+                "lodash",
+                "lodash-4.17.11.tgz",
+                &Default::default(),
+            )
+            .await;
+
+            let digest = sha256_hex(&tarball);
+            cleanup_proxy_scan_row(&fx.pool, &digest).await;
+            fx.teardown().await;
+
+            match result {
+                Ok(r) => panic!(
+                    "{label}: a tarball that does not state the identity it is served \
+                     as must be withheld under fail_closed, got {}",
+                    r.status()
+                ),
+                Err(resp) => assert_eq!(
+                    resp.status(),
+                    StatusCode::LOCKED,
+                    "{label}: expected 423 (inconclusive), not a clean serve"
+                ),
+            }
+        }
+    }
+
+    /// Availability control for the shapes above: under fail_OPEN the same
+    /// unassessable tarball still serves, loudly marked pending — the
+    /// hardening tightens fail_closed without changing the latency-first
+    /// posture operators opted into.
+    #[tokio::test]
+    async fn test_serve_tarball_crafted_identity_serves_pending_under_fail_open() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = crafted_tgz(Some(br#"{"name":"totally-benign","version":"1.0.0"}"#));
+        let upstream = wiremock::MockServer::start().await;
+        {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+            Mock::given(method("GET"))
+                .and(path("/lodash/-/lodash-4.17.11.tgz"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(tarball.to_vec())
+                        .insert_header("Content-Type", "application/octet-stream"),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "lodash",
+            "lodash-4.17.11.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fail_open must still serve, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        cleanup_proxy_scan_row(&fx.pool, &sha256_hex(&tarball)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan.as_deref(),
+            Some("pending"),
+            "an unassessable serve under fail_open must be loudly marked pending"
+        );
+    }
+
+    /// Fail-closed + inconclusive scan (no scanner service on the state) must
+    /// 423, never serve unscanned tarball bytes — npm inherits the #2954
+    /// fail-closed contract through the shared gate.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_fail_closed_inconclusive_is_423() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("sealed-widget", "1.0.0");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "sealed-widget",
+            "sealed-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        // No scanner service on the state: the inline scan is inconclusive.
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "sealed-widget",
+            "sealed-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "fail-closed + inconclusive scan must never serve tarball bytes, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::LOCKED,
+                "fail-closed inconclusive must be 423 Locked"
+            ),
+        }
+    }
+
+    /// Fail-open first pull serves LOUDLY: 200 with `X-AK-Scan: pending`, the
+    /// digest header, and byte-identical content.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_fail_open_serves_pending() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("open-widget", "2.0.0");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "open-widget",
+            "open-widget-2.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "open-widget",
+            "open-widget-2.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fail-open first pull must serve, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let digest_header = resp
+            .headers()
+            .get("X-NPM-Tarball-SHA256")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        let digest = sha256_hex(&tarball);
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("pending"),
+            "a served-before-verdict byte must be observable (X-AK-Scan: pending)"
+        );
+        assert_eq!(ct.as_deref(), Some(NPM_TARBALL_CONTENT_TYPE));
+        assert_eq!(digest_header.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            &body[..],
+            &tarball[..],
+            "served bytes must equal upstream bytes"
+        );
+    }
+
+    /// A fresh cached VULNERABLE verdict for the tarball digest blocks with
+    /// 403 — and a SECOND pull is blocked from the proxy cache with no
+    /// upstream re-fetch (wiremock `expect(1)` verifies on drop), proving the
+    /// verdict is keyed per sha256 and reused.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_blocks_cached_vulnerable_digest() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b poisoned-npm-tarball-3003-vulnerable";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b poisoned-npm-tarball-3003-vulnerable",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "poisoned-widget",
+            "poisoned-widget-0.1.0.tgz",
+            tarball,
+            Some(1),
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Seed a fresh vulnerable verdict for this digest through the real
+        // service so record_verdict + lookup_verdict are covered end-to-end.
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                1,
+                1,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        for pull in ["first", "second (cache-served)"] {
+            let result = super::serve_tarball(
+                &state,
+                &fx.repo_key,
+                "poisoned-widget",
+                "poisoned-widget-0.1.0.tgz",
+                &Default::default(),
+            )
+            .await;
+            match result {
+                Ok(r) => {
+                    let status = r.status();
+                    cleanup_proxy_scan_row(&fx.pool, &digest).await;
+                    fx.teardown().await;
+                    panic!("{pull} pull of a vulnerable digest must be blocked, got {status}");
+                }
+                Err(resp) => assert_eq!(
+                    resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "{pull} pull: cached vulnerable digest must be a 403 scan_blocked"
+                ),
+            }
+        }
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+        // Dropping the mock server verifies expect(1): the second blocked
+        // pull came from the proxy cache, not upstream.
+    }
+
+    /// A SCOPED package (`@scope/pkg`) flows through the same seam and the
+    /// same digest key: a cached vulnerable verdict blocks its tarball too.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_blocks_scoped_package() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b scoped-npm-tarball-3003-vulnerable";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b scoped-npm-tarball-3003-vulnerable",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        // Tarball URLs keep the scope separator as a literal `/`.
+        mount_tarball_upstream(
+            &upstream,
+            "@acme/secret-widget",
+            "secret-widget-1.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "@acme/secret-widget",
+            "secret-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "scoped vulnerable tarball must be blocked, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+        }
+    }
+
+    /// The cached-`clean` fast path serves 200 `X-AK-Scan: clean` — on a
+    /// FAIL-OPEN repo with no scanner service the header is the
+    /// discriminator (without the verdict this pull would be `pending`).
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_serves_cached_clean_digest() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b verified-npm-tarball-3003-clean";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b verified-npm-tarball-3003-clean",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "verified-widget",
+            "verified-widget-3.2.1.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "verified-widget",
+            "verified-widget-3.2.1.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fresh clean verdict must serve from the cache, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("clean"),
+            "a verdict-backed serve must be marked clean, not pending"
+        );
+        assert_eq!(&body[..], tarball);
+    }
+
+    /// #2976 inherited: a cached `clean` verdict recorded by an OLDER
+    /// scanner/CVE-DB version must NOT be reused once the live CVE engine
+    /// reports a newer version — the pull re-scans and (mock now knows the
+    /// CVE) blocks 403.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_rescans_when_scanner_version_advances() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("staleclean-widget", "1.0.0");
+        let digest = sha256_hex(&tarball);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "staleclean-widget",
+            "staleclean-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Cached CLEAN verdict recorded at stored version V...
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed stale clean verdict");
+
+        // ...while the LIVE engine is at V+1 and now flags the bytes.
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-0.84.0-test"),
+                rescan: MockCveRescan::Vulnerable,
+            })],
+        );
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "staleclean-widget",
+            "staleclean-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "clean verdict from an older scanner version must be re-scanned \
+                 (and blocked), not served from cache; got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "re-scan against the bumped CVE-DB found the CVE -> 403"
+            ),
+        }
+    }
+
+    /// #2976 probe-None case inherited: an UNKNOWN live scanner version must
+    /// not let a cached clean verdict short-circuit a fail-closed repo — the
+    /// pull re-scans (mock flags it) and blocks 403.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_unknown_live_version_rescans_under_fail_closed() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("probenone-widget", "1.0.0");
+        let digest = sha256_hex(&tarball);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "probenone-widget",
+            "probenone-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        // Live engine present but its version probe FAILS (None).
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: None,
+                rescan: MockCveRescan::Vulnerable,
+            })],
+        );
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "probenone-widget",
+            "probenone-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "an UNKNOWN live scanner version must not let a cached clean \
+                 verdict short-circuit the fail-closed gate; got {} (expected \
+                 a re-scan -> 403)",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+        }
+    }
+
+    /// Regression guard: a remote repo WITHOUT scan-on-proxy keeps today's
+    /// untouched streaming behavior — 200, no `X-AK-Scan` header.
+    #[tokio::test]
+    async fn test_serve_tarball_without_proxy_scan_streams_untouched() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b unscanned-npm-tarball-3003-passthrough";
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "plain-widget",
+            "plain-widget-1.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        // NO scan_configs row: scan-on-proxy disabled.
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "plain-widget",
+            "plain-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("non-opted-in repo must keep streaming, got {status}");
+            }
+        };
+        let status = resp.status();
+        let has_scan_header = resp.headers().contains_key("X-AK-Scan");
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !has_scan_header,
+            "repos without scan-on-proxy must be untouched (no X-AK-Scan header)"
+        );
+        assert_eq!(&body[..], tarball);
     }
 }

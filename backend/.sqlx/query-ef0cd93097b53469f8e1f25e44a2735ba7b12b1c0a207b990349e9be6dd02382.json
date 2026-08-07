@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE signing_keys SET key_type = 'gpg' WHERE repository_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ef0cd93097b53469f8e1f25e44a2735ba7b12b1c0a207b990349e9be6dd02382"
+}

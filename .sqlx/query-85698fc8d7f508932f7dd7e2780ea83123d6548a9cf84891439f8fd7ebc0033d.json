@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT hosted_bytes, proxy_bytes, oci_bytes FROM repository_usage_ledger WHERE repository_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hosted_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "proxy_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "oci_bytes",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "85698fc8d7f508932f7dd7e2780ea83123d6548a9cf84891439f8fd7ebc0033d"
+}

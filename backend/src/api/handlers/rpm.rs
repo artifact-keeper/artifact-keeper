@@ -85,6 +85,146 @@ async fn resolve_rpm_repo(db: &sqlx::PgPool, repo_key: &str) -> Result<RepoInfo,
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["rpm", "yum"], "an RPM").await
 }
 
+// ---------------------------------------------------------------------------
+// Curated snapshot (`@N`) publication serving (#2358 — RPM Phase-3)
+// ---------------------------------------------------------------------------
+
+/// If `path` begins with a `@<digits>` segment, split it into
+/// `(version_number, remaining_sub_path)`.
+///   `@3/repodata/repomd.xml` -> `Some((3, "repodata/repomd.xml"))`
+///   `@3`                     -> `Some((3, ""))`
+/// Returns `None` when there is no leading `@N` segment (or the digits do not
+/// parse), so the normal proxy path is used.
+fn split_publication_prefix(path: &str) -> Option<(i64, String)> {
+    let rest = path.strip_prefix('@')?;
+    let (num_str, sub) = rest.split_once('/').unwrap_or((rest, ""));
+    if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let version_number: i64 = num_str.parse().ok()?;
+    Some((version_number, sub.to_string()))
+}
+
+/// Validate a `@N` sub-path before it is joined onto a storage prefix.
+///
+/// Rejects path traversal (`..`), absolute paths, empty/dot segments, `//` and
+/// backslashes so a crafted `@N/../../foo` (or `@N//etc/passwd`) can never
+/// escape the per-publication storage prefix. Returns the verified sub-path
+/// unchanged, or a `404` response.
+#[allow(clippy::result_large_err)]
+fn sanitize_publication_subpath(sub: &str) -> Result<String, Response> {
+    let rejected = sub.is_empty()
+        || sub.starts_with('/')
+        || sub.contains('\\')
+        || sub.contains("//")
+        || sub
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..");
+    if rejected {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+    Ok(sub.to_string())
+}
+
+/// Content type for a stored publication blob, keyed off its extension.
+fn publication_content_type(path: &str) -> &'static str {
+    if path.ends_with(".gz") {
+        "application/gzip"
+    } else if path.ends_with(".asc") {
+        "application/pgp-signature"
+    } else if path.ends_with(".key") {
+        "application/pgp-keys"
+    } else if path.ends_with(".xml") {
+        "application/xml"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// The `storage_prefix` of a specific PUBLISHED version, or `None` when the
+/// version is absent or not yet published (both surface to the client as 404).
+async fn fetch_published_version_prefix(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    version_number: i64,
+) -> Result<Option<String>, Response> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT storage_prefix FROM repository_versions \
+         WHERE repository_id = $1 AND version_number = $2 AND published_at IS NOT NULL",
+    )
+    .bind(repo_id)
+    .bind(version_number)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    Ok(row.and_then(|(p,)| p))
+}
+
+/// The `storage_prefix` of the repo's ACTIVE publication, or `None` when the
+/// repo has no active publication (keeps today's live-generation path).
+async fn fetch_active_publication_prefix(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<Option<String>, Response> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT rv.storage_prefix FROM repositories r \
+         JOIN repository_versions rv ON rv.id = r.active_publication_id \
+         WHERE r.id = $1 AND rv.published_at IS NOT NULL",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    Ok(row.and_then(|(p,)| p))
+}
+
+/// Serve `{prefix}/{sub_path}` from the repo's storage. `Ok(Some)` on a hit,
+/// `Ok(None)` when the blob is absent (caller falls through / keeps its live
+/// path), `Err` on a real storage failure. Metadata blobs are frozen at publish
+/// time, so this never proxies upstream.
+async fn serve_stored_publication_blob(
+    state: &SharedState,
+    repo: &RepoInfo,
+    prefix: &str,
+    sub_path: &str,
+) -> Result<Option<Response>, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let key = format!("{prefix}/{sub_path}");
+    match storage.get(&key).await {
+        Ok(bytes) => Ok(Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, publication_content_type(sub_path))
+                .header(CONTENT_LENGTH, bytes.len().to_string())
+                .body(Body::from(bytes))
+                .unwrap(),
+        )),
+        Err(crate::error::AppError::NotFound(_)) => Ok(None),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {e}"),
+        )
+            .into_response()),
+    }
+}
+
+/// Active-publication passthrough for the no-`@N` repodata routes: if the repo
+/// has an active publication, serve the frozen blob for `sub_path`; otherwise
+/// (`Ok(None)`) the caller keeps its unchanged live-generation / proxy path.
+async fn try_serve_active_publication(
+    state: &SharedState,
+    repo: &RepoInfo,
+    sub_path: &str,
+) -> Result<Option<Response>, Response> {
+    let prefix = match fetch_active_publication_prefix(&state.db, repo.id).await? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    serve_stored_publication_blob(state, repo, &prefix, sub_path).await
+}
+
 /// Reject RPM uploads to non-hosted (Remote/Virtual) repositories.
 ///
 /// `dnf`/`yum` only ever PUT/POST RPMs into hosted repos. Both Remote (proxy)
@@ -243,6 +383,178 @@ fn build_rpm_package_response(
         .unwrap()
 }
 
+/// Is `p` a safe RELATIVE upstream path to append to a curation-config
+/// upstream base?
+///
+/// The stored `upstream_path` comes from the upstream `<location href>`, which
+/// is attacker-influenced. `ProxyService::build_upstream_url` concatenates
+/// (`{base}/{path}`), so an absolute href cannot currently override the host —
+/// but this guard makes that safety explicit and local rather than an implicit
+/// dependency on a helper elsewhere: an absolute URL, an absolute path, a
+/// traversal, or a backslash is rejected so the `@N` fetch can only ever target
+/// a path UNDER the configured curation upstream (defense in depth, #2358).
+fn is_safe_upstream_rel_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.contains("://")
+        && !p.starts_with('/')
+        && !p.contains('\\')
+        && !p.split('/').any(|seg| seg == "..")
+}
+
+/// Stream an already-verified, frozen `@N` package from the immutable store
+/// (cache hit). Chunked (no `Content-Length`) so the whole `.rpm` is never
+/// buffered in memory when re-serving. Advertises the FROZEN checksum, so what a
+/// client validates against is what `@N`'s signed metadata attests.
+fn stream_rpm_response(body: Body, filename: &str, checksum_sha256: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-rpm")
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header("X-Checksum-SHA256", checksum_sha256.trim())
+        .body(body)
+        .unwrap()
+}
+
+/// Checksum-verified serving of a package under a published, immutable `@N`
+/// (#2358 A-hardened).
+///
+/// Everything this path trusts comes from the **frozen** snapshot membership
+/// (`repository_version_packages.frozen_*`), never from the live
+/// `curation_packages` row. That distinction is the whole security property:
+/// `curation_packages` is mutable (a routine re-sync upserts the same row), so
+/// resolving the checksum/location live would let a post-publish sync — or a
+/// compromised upstream — change what an already-published, SIGNED `@N` serves,
+/// handing out bytes that contradict `@N`'s own signed `primary.xml`. The frozen
+/// checksum is snapshotted from the same state the signed metadata is generated
+/// from, so verified bytes always match what `@N` attests.
+///
+/// The package BYTES are resolved and served fail-closed:
+///   1. Cache hit — a previously verified+stored copy in the version's immutable
+///      per-version store streams straight back (never re-fetched), advertising
+///      the FROZEN checksum.
+///   2. Otherwise fetch from the CURATION-CONFIG upstream (the curation source
+///      repo's `upstream_url` plus the FROZEN `upstream_path`) — NEVER from
+///      `repo.upstream_url` and NEVER from any metadata blob — VERIFY
+///      `sha256 == frozen_checksum_sha256`, and only on a match cache the bytes
+///      into the frozen store and stream them. A missing member, missing
+///      upstream, or a checksum MISMATCH fails closed (404 / 502): neither a
+///      tampered upstream body nor a post-publish live mutation is ever served.
+async fn serve_version_package(
+    state: &SharedState,
+    repo: &RepoInfo,
+    version_prefix: &str,
+    version_number: i64,
+    filename: &str,
+) -> Result<Response, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let cache_key = format!("{version_prefix}/packages/{filename}");
+
+    // 1. Resolve the member from the FROZEN snapshot membership. The upstream
+    //    URL still comes from the curation source repo (that is config, not
+    //    package identity); the checksum and the relative path are frozen.
+    let member = sqlx::query_as::<_, (String, String, Option<String>, uuid::Uuid, String)>(
+        "SELECT rvp.frozen_checksum_sha256, rvp.frozen_upstream_path, \
+                r.upstream_url, r.id, r.key \
+         FROM repository_version_packages rvp \
+         JOIN repository_versions rv ON rv.id = rvp.version_id \
+         JOIN curation_packages cp ON cp.id = rvp.curation_package_id \
+         JOIN repositories r ON r.id = cp.remote_repo_id \
+         WHERE rv.repository_id = $1 AND rv.version_number = $2 \
+           AND rv.published_at IS NOT NULL \
+           AND rvp.frozen_filename = $3",
+    )
+    .bind(repo.id)
+    .bind(version_number)
+    .bind(filename)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(super::db_err)?;
+
+    let (expected, upstream_path, upstream_url, remote_id, remote_key) = match member {
+        Some((ck, up, Some(url), rid, rkey)) if !ck.trim().is_empty() => (ck, up, url, rid, rkey),
+        // No such member, or nothing to fetch against -> fail closed.
+        _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
+    };
+
+    // 2. Cache-first: stream the already-verified copy from the immutable
+    //    per-version store, advertising the FROZEN checksum.
+    if let Ok(stream) = storage.get_stream(&cache_key).await {
+        return Ok(stream_rpm_response(
+            Body::from_stream(stream),
+            filename,
+            expected.trim(),
+        ));
+    }
+
+    // The stored href is attacker-influenced: refuse to fetch anything that is
+    // not a plain relative path under the curation upstream.
+    if !is_safe_upstream_rel_path(&upstream_path) {
+        tracing::warn!(
+            "@{} package {} has an unsafe upstream path {:?}; refusing to fetch",
+            version_number,
+            filename,
+            upstream_path
+        );
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
+    let proxy = state
+        .proxy_service
+        .as_ref()
+        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "Upstream proxy unavailable").into_response())?;
+
+    // Fetch UNCACHED from the curation-config upstream so an unverified body is
+    // never persisted to the shared proxy cache.
+    let (bytes, _ct, _url) = proxy_helpers::proxy_fetch_uncached(
+        proxy,
+        remote_id,
+        &remote_key,
+        &upstream_url,
+        &upstream_path,
+    )
+    .await?;
+
+    // VERIFY sha256 == the FROZEN checksum. FAIL CLOSED on mismatch. This is what
+    // catches an upstream mirror that changed the bytes behind an already-
+    // published NEVRA, and a post-publish re-sync that rewrote the live curation
+    // row: neither can make `@N` serve bytes its signed metadata does not attest.
+    if !sha256_hex(&bytes).eq_ignore_ascii_case(expected.trim()) {
+        tracing::warn!(
+            "@{} package {} failed verification against the FROZEN snapshot checksum; \
+             refusing to serve",
+            version_number,
+            filename
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Upstream package failed checksum verification",
+        )
+            .into_response());
+    }
+
+    // Cache into the immutable frozen store, then stream the verified bytes.
+    let size = bytes.len() as i64;
+    storage.put(&cache_key, bytes.clone()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {e}"),
+        )
+            .into_response()
+    })?;
+
+    Ok(build_rpm_package_response(
+        Body::from(bytes),
+        filename,
+        size,
+        expected.trim(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // RPM filename parsing
 // ---------------------------------------------------------------------------
@@ -340,18 +652,18 @@ pub(crate) fn build_rpm_artifact_metadata(
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-struct RpmArtifact {
-    id: uuid::Uuid,
-    path: String,
-    name: String,
-    version: Option<String>,
-    size_bytes: i64,
-    checksum_sha256: String,
-    storage_key: String,
-    metadata: Option<serde_json::Value>,
+pub(crate) struct RpmArtifact {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) version: Option<String>,
+    pub(crate) size_bytes: i64,
+    pub(crate) checksum_sha256: String,
+    pub(crate) storage_key: String,
+    pub(crate) metadata: Option<serde_json::Value>,
     /// Drives the repodata metadata epoch (`<revision>`/`<timestamp>`) so the
     /// render stays a pure function of repository state (#2636).
-    updated_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// List a repository's RPM artifacts in a **deterministic total order**.
@@ -632,6 +944,12 @@ async fn repomd_xml(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    // #2358: if this repo has an active curated publication, serve its frozen,
+    // signed repomd.xml instead of live-generating / proxying.
+    if let Some(resp) = try_serve_active_publication(&state, &repo, "repodata/repomd.xml").await? {
+        return Ok(resp);
+    }
+
     // #1447: for Remote repos proxy the upstream repomd.xml instead of
     // synthesizing an empty index from local artifacts.
     if let Some(resp) =
@@ -658,6 +976,14 @@ async fn repomd_xml_asc(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    // #2358: an active publication's detached signature is the one that matches
+    // its frozen repomd.xml — serve the stored .asc, not a freshly-signed one.
+    if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/repomd.xml.asc").await?
+    {
+        return Ok(resp);
+    }
 
     // #1447: proxy the upstream detached signature for Remote repos.
     if let Some(resp) = try_proxy_repodata(
@@ -741,6 +1067,14 @@ async fn repomd_xml_key(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    // #2358: serve the active publication's frozen public key so a later signing
+    // key rotation never invalidates an already-published @N.
+    if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/repomd.xml.key").await?
+    {
+        return Ok(resp);
+    }
+
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     // #2636: `dnf`'s `gpgkey=` and `rpm --import` both require an OpenPGP
     // public key. The active key's stored `public_key_pem` is that armored
@@ -814,6 +1148,12 @@ async fn primary_xml_gz(
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
     if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/primary.xml.gz").await?
+    {
+        return Ok(resp);
+    }
+
+    if let Some(resp) =
         try_proxy_repodata(&state, &repo, "repodata/primary.xml.gz", "application/gzip").await?
     {
         return Ok(resp);
@@ -839,6 +1179,12 @@ async fn filelists_xml_gz(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/filelists.xml.gz").await?
+    {
+        return Ok(resp);
+    }
 
     if let Some(resp) = try_proxy_repodata(
         &state,
@@ -872,6 +1218,11 @@ async fn other_xml_gz(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    if let Some(resp) = try_serve_active_publication(&state, &repo, "repodata/other.xml.gz").await?
+    {
+        return Ok(resp);
+    }
+
     if let Some(resp) =
         try_proxy_repodata(&state, &repo, "repodata/other.xml.gz", "application/gzip").await?
     {
@@ -903,6 +1254,19 @@ async fn repodata_proxy(
     Path((repo_key, path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    // #2358: an active publication serves its frozen repodata blobs (dnf also
+    // fetches the checksum-prefixed payloads through this catch-all). Route the
+    // catch-all subpath through the same traversal guard `upstream_proxy` uses
+    // before it is joined onto a storage prefix, so this path can never
+    // `storage.get` outside the publication prefix. On a reject we skip the
+    // frozen-blob serve and fall through to the unchanged proxy path.
+    let active_sub = format!("repodata/{}", path);
+    if let Ok(safe_sub) = sanitize_publication_subpath(&active_sub) {
+        if let Some(resp) = try_serve_active_publication(&state, &repo, &safe_sub).await? {
+            return Ok(resp);
+        }
+    }
 
     let upstream_path = format!("repodata/{}", path);
     let default_ct = if path.ends_with(".gz") {
@@ -939,6 +1303,46 @@ async fn upstream_proxy(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    // #2358: a leading `@<digits>` segment selects a published, immutable
+    // snapshot. Serve the frozen, AK-signed metadata blob for the sub-path from
+    // storage; a `packages/{nevra}.rpm` sub-path is served CHECKSUM-VERIFIED
+    // from the curation-config upstream. Nothing else is resolvable under an
+    // immutable `@N`, and upstream is NEVER proxied verbatim from here.
+    if let Some((version_number, sub)) = split_publication_prefix(&upstream_path) {
+        let prefix = fetch_published_version_prefix(&state.db, repo.id, version_number)
+            .await?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response())?;
+        let sub_path = sanitize_publication_subpath(&sub)?;
+
+        // A `packages/{filename}.rpm` request under a published @N: resolve the
+        // member from the FROZEN membership, serve the cached copy or fetch from
+        // the curation-config upstream, VERIFY sha256 against the FROZEN
+        // checksum, and stream — fail-closed on any mismatch.
+        //
+        // This is checked BEFORE the generic stored-blob serve on purpose: the
+        // verified bytes are cached under `{prefix}/packages/{filename}`, which
+        // the generic blob path would otherwise happily return as an opaque
+        // `application/octet-stream` with no `X-Checksum-SHA256` — bypassing the
+        // package response contract (content type, disposition, and the frozen
+        // checksum a client validates against).
+        if let Some(filename) = sub_path.strip_prefix("packages/") {
+            if !filename.is_empty() && !filename.contains('/') {
+                return serve_version_package(&state, &repo, &prefix, version_number, filename)
+                    .await;
+            }
+        }
+
+        // Frozen, AK-signed repodata blob?
+        if let Some(resp) = serve_stored_publication_blob(&state, &repo, &prefix, &sub_path).await?
+        {
+            return Ok(resp);
+        }
+
+        // Nothing else is served from an immutable @N.
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
+    // A normal (non-`@N`) request only serves from Remote repos.
     if repo.repo_type != RepositoryType::Remote {
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
@@ -1098,7 +1502,7 @@ async fn upload_package_put(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rpm", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
@@ -1123,29 +1527,12 @@ async fn upload_package_post(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rpm", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
     // Try to get filename from Content-Disposition header, fall back to a hash-based name
-    let filename = headers
-        .get("Content-Disposition")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split("filename=")
-                .nth(1)
-                .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
-        })
-        .or_else(|| {
-            headers
-                .get("X-Package-Filename")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| {
-            let hash = sha256_hex(&body);
-            format!("{}.rpm", &hash[..16])
-        });
+    let filename = extract_rpm_filename(&headers, &body);
 
     if !filename.ends_with(".rpm") {
         return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
@@ -1179,8 +1566,8 @@ async fn store_rpm(
             .into_response()
     })?;
 
-    let full_version = format!("{}-{}", pkg_version, release);
-    let artifact_path = format!("packages/{}", filename);
+    let full_version = build_rpm_full_version(&pkg_version, &release);
+    let artifact_path = build_rpm_artifact_path(filename);
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
@@ -1190,7 +1577,7 @@ async fn store_rpm(
     )
     .await?;
 
-    let storage_key = format!("rpm/{}/{}", repo.id, filename);
+    let storage_key = build_rpm_storage_key(&repo.id, filename);
     proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
 
     let size_bytes = content.len() as i64;
@@ -1216,15 +1603,8 @@ async fn store_rpm(
     // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
     // describe the package fully (#2588). The filename already parsed above,
     // so the builder always yields metadata here.
-    let rpm_metadata = build_rpm_artifact_metadata(filename, &content).unwrap_or_else(|| {
-        serde_json::json!({
-            "name": pkg_name,
-            "version": pkg_version,
-            "release": release,
-            "arch": arch,
-            "filename": filename,
-        })
-    });
+    let rpm_metadata = build_rpm_artifact_metadata(filename, &content)
+        .unwrap_or_else(|| build_rpm_metadata(&pkg_name, &pkg_version, &release, &arch, filename));
 
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
         .await;
@@ -1238,17 +1618,97 @@ async fn store_rpm(
         .status(StatusCode::CREATED)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({
-                "name": pkg_name,
-                "version": pkg_version,
-                "release": release,
-                "arch": arch,
-                "sha256": computed_sha256,
-                "size": size_bytes,
-            })
+            build_rpm_upload_response(
+                &pkg_name,
+                &pkg_version,
+                &release,
+                &arch,
+                &computed_sha256,
+                size_bytes,
+            )
             .to_string(),
         ))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Path/key builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the artifact path for an RPM package.
+fn build_rpm_artifact_path(filename: &str) -> String {
+    format!("packages/{}", filename)
+}
+
+/// Build the storage key for an RPM package.
+fn build_rpm_storage_key(repo_id: &uuid::Uuid, filename: &str) -> String {
+    format!("rpm/{}/{}", repo_id, filename)
+}
+
+/// Build the full version string from version and release.
+fn build_rpm_full_version(version: &str, release: &str) -> String {
+    format!("{}-{}", version, release)
+}
+
+/// Build the filename-derived RPM metadata JSON (fallback when the RPM header
+/// cannot be parsed).
+fn build_rpm_metadata(
+    name: &str,
+    version: &str,
+    release: &str,
+    arch: &str,
+    filename: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "filename": filename,
+    })
+}
+
+/// Build the upload response JSON.
+fn build_rpm_upload_response(
+    name: &str,
+    version: &str,
+    release: &str,
+    arch: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "sha256": sha256,
+        "size": size,
+    })
+}
+
+/// Extract RPM filename from headers, falling back to a hash-based name
+/// derived from the body (hashed only when no header names the file).
+fn extract_rpm_filename(headers: &HeaderMap, body: &[u8]) -> String {
+    headers
+        .get("Content-Disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split("filename=")
+                .nth(1)
+                .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
+        })
+        .or_else(|| {
+            headers
+                .get("X-Package-Filename")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            let hash = sha256_hex(body);
+            format!("{}.rpm", &hash[..16])
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,7 +1786,7 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
         let location = if artifact.path.starts_with("packages/") {
             artifact.path.clone()
         } else {
-            format!("packages/{filename}")
+            build_rpm_artifact_path(filename)
         };
 
         xml.push_str(&format!(
@@ -1365,7 +1825,7 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
     xml
 }
 
-fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
+pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="{}">
@@ -1429,7 +1889,7 @@ fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
     xml
 }
 
-fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
+pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <otherdata xmlns="http://linux.duke.edu/metadata/other" packages="{}">
@@ -1507,19 +1967,19 @@ fn generate_updateinfo_xml() -> String {
 // Utility helpers
 // ---------------------------------------------------------------------------
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
 }
 
-fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+pub(crate) fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data).expect("gzip write failed");
     encoder.finish().expect("gzip finish failed")
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -1596,78 +2056,94 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (test-only)
-    // -----------------------------------------------------------------------
+    // -- #2358 @N publication-serving pure helpers ---------------------------
 
-    /// Build the artifact path for an RPM package.
-    fn build_rpm_artifact_path(filename: &str) -> String {
-        format!("packages/{}", filename)
+    // The stored upstream href is attacker-influenced. Only a plain relative
+    // path under the curation upstream may ever be fetched.
+    #[test]
+    fn test_is_safe_upstream_rel_path_rejects_hostile_hrefs() {
+        // Legit relative upstream paths.
+        assert!(is_safe_upstream_rel_path(
+            "Packages/nginx-1.24.0-1.el9.x86_64.rpm"
+        ));
+        assert!(is_safe_upstream_rel_path("nginx.rpm"));
+        assert!(is_safe_upstream_rel_path("el/9/x86_64/n/nginx.rpm"));
+
+        // The injection vectors: absolute attacker URL, absolute path,
+        // traversal, backslash, empty.
+        assert!(!is_safe_upstream_rel_path(
+            "https://evil.example.com/backdoor.rpm"
+        ));
+        assert!(!is_safe_upstream_rel_path("http://evil/backdoor.rpm"));
+        assert!(!is_safe_upstream_rel_path("//evil/backdoor.rpm"));
+        assert!(!is_safe_upstream_rel_path("/etc/passwd"));
+        assert!(!is_safe_upstream_rel_path("../../etc/passwd"));
+        assert!(!is_safe_upstream_rel_path("Packages/../../../etc/passwd"));
+        assert!(!is_safe_upstream_rel_path("Packages\\evil.rpm"));
+        assert!(!is_safe_upstream_rel_path(""));
     }
 
-    /// Build the storage key for an RPM package.
-    fn build_rpm_storage_key(repo_id: &uuid::Uuid, filename: &str) -> String {
-        format!("rpm/{}/{}", repo_id, filename)
+    #[test]
+    fn test_split_publication_prefix() {
+        assert_eq!(
+            split_publication_prefix("@3/repodata/repomd.xml"),
+            Some((3, "repodata/repomd.xml".to_string()))
+        );
+        assert_eq!(split_publication_prefix("@42"), Some((42, String::new())));
+        // No leading @N -> None (normal proxy path).
+        assert_eq!(split_publication_prefix("repodata/repomd.xml"), None);
+        assert_eq!(split_publication_prefix("Packages/foo.rpm"), None);
+        // `@` not followed by digits -> None.
+        assert_eq!(split_publication_prefix("@latest/x"), None);
+        assert_eq!(split_publication_prefix("@/x"), None);
+        // An email-like package name is not mistaken for a version.
+        assert_eq!(split_publication_prefix("@1.2/x"), None);
     }
 
-    /// Build the full version string from version and release.
-    fn build_rpm_full_version(version: &str, release: &str) -> String {
-        format!("{}-{}", version, release)
+    #[test]
+    fn test_sanitize_publication_subpath_rejects_traversal() {
+        assert!(sanitize_publication_subpath("repodata/repomd.xml").is_ok());
+        assert!(sanitize_publication_subpath("Packages/tree.rpm").is_ok());
+        // Traversal / absolute / empty / dot / backslash / double-slash all 404.
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../secret",
+            "repodata/../../etc/passwd",
+            "a//b",
+            "a/./b",
+            "a\\b",
+            "..",
+        ] {
+            assert!(
+                sanitize_publication_subpath(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
     }
 
-    /// Build RPM-specific metadata JSON.
-    fn build_rpm_metadata(
-        name: &str,
-        version: &str,
-        release: &str,
-        arch: &str,
-        filename: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "release": release,
-            "arch": arch,
-            "filename": filename,
-        })
-    }
-
-    /// Build the upload response JSON.
-    fn build_rpm_upload_response(
-        name: &str,
-        version: &str,
-        release: &str,
-        arch: &str,
-        sha256: &str,
-        size: i64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "release": release,
-            "arch": arch,
-            "sha256": sha256,
-            "size": size,
-        })
-    }
-
-    /// Extract RPM filename from headers, falling back to a hash-based name.
-    fn extract_rpm_filename(headers: &HeaderMap, body_hash: &str) -> String {
-        headers
-            .get("Content-Disposition")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                v.split("filename=")
-                    .nth(1)
-                    .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
-            })
-            .or_else(|| {
-                headers
-                    .get("X-Package-Filename")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| format!("{}.rpm", &body_hash[..16]))
+    #[test]
+    fn test_publication_content_type() {
+        assert_eq!(
+            publication_content_type("repodata/primary.xml.gz"),
+            "application/gzip"
+        );
+        assert_eq!(
+            publication_content_type("repodata/repomd.xml.asc"),
+            "application/pgp-signature"
+        );
+        assert_eq!(
+            publication_content_type("repodata/repomd.xml.key"),
+            "application/pgp-keys"
+        );
+        assert_eq!(
+            publication_content_type("repodata/repomd.xml"),
+            "application/xml"
+        );
+        assert_eq!(
+            publication_content_type("Packages/tree.rpm"),
+            "application/octet-stream"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1988,7 +2464,7 @@ mod tests {
             HeaderValue::from_static("attachment; filename=my-pkg-1.0-1.x86_64.rpm"),
         );
         assert_eq!(
-            extract_rpm_filename(&headers, "somehash1234567890"),
+            extract_rpm_filename(&headers, b""),
             "my-pkg-1.0-1.x86_64.rpm"
         );
     }
@@ -2000,17 +2476,16 @@ mod tests {
             "X-Package-Filename",
             HeaderValue::from_static("custom-name.rpm"),
         );
-        assert_eq!(
-            extract_rpm_filename(&headers, "somehash1234567890"),
-            "custom-name.rpm"
-        );
+        assert_eq!(extract_rpm_filename(&headers, b""), "custom-name.rpm");
     }
 
     #[test]
     fn test_extract_rpm_filename_fallback_to_hash() {
         let headers = HeaderMap::new();
-        let result = extract_rpm_filename(&headers, "abcdef1234567890abcdef");
-        assert_eq!(result, "abcdef1234567890.rpm");
+        // sha256("") = e3b0c44298fc1c14...; the fallback name is the first 16 hex
+        // chars of the body hash.
+        let result = extract_rpm_filename(&headers, b"");
+        assert_eq!(result, "e3b0c44298fc1c14.rpm");
     }
 
     #[test]
@@ -2025,7 +2500,7 @@ mod tests {
             HeaderValue::from_static("from-header.rpm"),
         );
         // Content-Disposition has priority
-        assert_eq!(extract_rpm_filename(&headers, "hash"), "from-cd.rpm");
+        assert_eq!(extract_rpm_filename(&headers, b""), "from-cd.rpm");
     }
 
     #[test]
@@ -2035,10 +2510,7 @@ mod tests {
             "Content-Disposition",
             HeaderValue::from_static("attachment; filename=\"quoted.rpm\""),
         );
-        assert_eq!(
-            extract_rpm_filename(&headers, "hash1234567890123456"),
-            "quoted.rpm"
-        );
+        assert_eq!(extract_rpm_filename(&headers, b""), "quoted.rpm");
     }
 
     // -----------------------------------------------------------------------
@@ -3360,6 +3832,106 @@ mod tests {
                 "non-package object {junk} leaked into primary.xml: {primary}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The `generate_primary_xml` unit tests prove `<location href>` is emitted
+    // as a string; only resolving that href the way dnf/yum does — against the
+    // repository base URL (the directory that holds `repodata/`), NOT against
+    // the primary.xml document itself — and routing it against the REAL router
+    // proves a package the index advertises is actually downloadable. A href
+    // that 404s at the download route passes every generator test yet breaks
+    // `dnf install`.
+    // -----------------------------------------------------------------------
+
+    /// The rpm routes mounted exactly where `api::routes` nests them, so the
+    /// repo-base-relative `<location href>` resolves with the `/rpm` prefix.
+    fn rpm_mounted_router() -> Router<SharedState> {
+        Router::new().nest("/rpm", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path to request.
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_advertised_primary_location_resolves_against_real_router() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+
+        // Publish a package's bytes under the exact `packages/<file>` path the
+        // native RPM PUT stores, so both the index location and the download
+        // route agree on it.
+        let filename = "realpkg-1.0-1.x86_64.rpm";
+        let rpm_bytes: &[u8] = b"fake-rpm-package-bytes-for-advertised-url";
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("packages/{filename}"),
+            &format!("packages/{filename}"),
+            "realpkg",
+            "1.0-1",
+            "application/x-rpm",
+            bytes::Bytes::from_static(rpm_bytes),
+            f.user_id,
+        )
+        .await;
+
+        // Read the `<location href>` primary.xml advertises for the package.
+        let (status, body) = tdh::send(
+            f.router_anon(rpm_mounted_router()),
+            tdh::get(format!("/rpm/{}/repodata/primary.xml.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "primary.xml.gz");
+        let mut primary = String::new();
+        GzDecoder::new(&body[..])
+            .read_to_string(&mut primary)
+            .expect("decompress primary.xml.gz");
+        let href = primary
+            .split_once("<location href=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_default();
+
+        // dnf resolves `<location href>` against the repository base URL — the
+        // directory that CONTAINS `repodata/`, not the primary.xml document.
+        let repo_base = format!("http://ak.test/rpm/{}/", f.repo_key);
+        let (dl_status, dl_body) = if href.is_empty() {
+            (StatusCode::NOT_FOUND, bytes::Bytes::new())
+        } else {
+            let path = resolve_advertised(&repo_base, &href);
+            tdh::send(f.router_anon(rpm_mounted_router()), tdh::get(path)).await
+        };
+
+        f.teardown().await;
+
+        assert!(
+            !href.is_empty(),
+            "primary.xml must advertise a <location href>, got: {primary}"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised <location href> ({href}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            rpm_bytes,
+            "the advertised location must serve the published .rpm bytes"
+        );
     }
 
     // -----------------------------------------------------------------------

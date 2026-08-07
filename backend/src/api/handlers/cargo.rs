@@ -724,7 +724,7 @@ async fn publish(
     // GHSA-vvc3-h39c-mrq5: a read-scoped service-account token must not be
     // accepted for `cargo publish`. Enforce the write scope on the token
     // before falling back to the Bearer-as-base64 credential path.
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "cargo")
             .await?;
@@ -826,6 +826,20 @@ async fn download(
 ) -> Result<Response, Response> {
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let name_lower = name.to_lowercase();
+
+    // Curation enforcement (#2930): block a curated crate before it is resolved
+    // locally or proxied from upstream. The cargo handler's private `RepoInfo`
+    // does not carry the curation columns, so use the by-id lookup variant
+    // (no-op / no query for hosted repos and when curation is off).
+    proxy_helpers::enforce_curation_lookup(
+        &state.db,
+        repo.id,
+        &repo_key,
+        &repo.repo_type,
+        &name_lower,
+        Some(&version),
+    )
+    .await?;
 
     let artifact = sqlx::query!(
         r#"

@@ -44,13 +44,9 @@ use artifact_keeper_backend::config::Config;
 /// Connect to the test database. Returns `None` when `DATABASE_URL` is unset or
 /// unreachable so the suite no-ops gracefully instead of flaking.
 async fn try_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(3)
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&url)
-        .await
-        .ok()
+    // Skip only when no DB is configured/reachable AND not required; a connect
+    // failure under AK_TESTS_REQUIRE_DB panics (no fiction-green, #2924).
+    artifact_keeper_backend::testing::try_pool_with(3).await
 }
 
 fn test_config(storage_path: &str) -> Config {

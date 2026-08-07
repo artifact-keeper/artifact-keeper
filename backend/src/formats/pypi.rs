@@ -224,106 +224,78 @@ impl PypiHandler {
     /// form. Returns `None` for input that is not recognisably PEP 440; callers
     /// fall back to exact matching in that case.
     pub fn canonical_version(version: &str) -> Option<String> {
-        let v = version.trim().trim_start_matches(['v', 'V']);
-        if v.is_empty() {
-            return None;
-        }
+        let parts = parse_pep440(version)?;
 
-        // Local segment (everything after the first `+`). A PEP 427 wheel
-        // filename escapes `+` and `.` runs in the local part to `_`, so treat
-        // `_` as a local separator alongside `.`/`-`.
-        let (public, local) = match v.split_once('+') {
-            Some((p, l)) => (p, Some(l)),
-            None => (v, None),
-        };
-
-        let lower = public.to_ascii_lowercase();
-
-        // Epoch: `N!`.
-        let (epoch, rest) = match lower.split_once('!') {
-            Some((e, r)) => {
-                if e.is_empty() || !e.chars().all(|c| c.is_ascii_digit()) {
-                    return None;
-                }
-                (e.trim_start_matches('0'), r)
-            }
-            None => ("", lower.as_str()),
-        };
-        let epoch: &str = if epoch.is_empty() { "0" } else { epoch };
-
-        // Greedily take the leading release: `digits(.digits)*`. The remainder
-        // holds the optional pre / post / dev / implicit-post qualifiers.
-        let (release_str, suffix) = split_release(rest)?;
-        let release = canon_release(&release_str);
-
-        // Tokenize the qualifier suffix into alternating digit / alpha runs,
-        // treating `.`/`-`/`_` purely as separators (PEP 440 normalisation).
-        let tokens = tokenize_version(suffix)?;
-
-        let mut pre: Option<(&'static str, u64)> = None;
-        let mut post: Option<u64> = None;
-        let mut dev: Option<u64> = None;
-        let mut i = 0;
-        while i < tokens.len() {
-            let tok = &tokens[i];
-            // A bare number directly after the release is an implicit post
-            // release (`1.0-1`).
-            if tok.chars().all(|c| c.is_ascii_digit())
-                && pre.is_none()
-                && post.is_none()
-                && dev.is_none()
-            {
-                post = Some(tok.parse().ok()?);
-                i += 1;
-                continue;
-            }
-            let label = match tok.as_str() {
-                "a" | "alpha" => Some(("pre", "a")),
-                "b" | "beta" => Some(("pre", "b")),
-                "c" | "rc" | "pre" | "preview" => Some(("pre", "rc")),
-                "post" | "rev" | "r" => Some(("post", "")),
-                "dev" => Some(("dev", "")),
-                _ => None,
-            };
-            let (kind, prelabel) = label?;
-            // Optional trailing number for this qualifier.
-            let n = if i + 1 < tokens.len() && tokens[i + 1].chars().all(|c| c.is_ascii_digit()) {
-                let parsed = tokens[i + 1].parse().ok()?;
-                i += 2;
-                parsed
-            } else {
-                i += 1;
-                0
-            };
-            match kind {
-                "pre" => pre = Some((prelabel, n)),
-                "post" => post = Some(n),
-                "dev" => dev = Some(n),
-                _ => unreachable!(),
-            }
-        }
-
-        let mut out = format!("{}!{}", epoch, release);
-        if let Some((label, n)) = pre {
+        let release = parts
+            .release
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(".");
+        let mut out = format!("{}!{}", parts.epoch, release);
+        if let Some((label, n)) = parts.pre {
             out.push_str(&format!("{}{}", label, n));
         }
-        if let Some(n) = post {
+        if let Some(n) = parts.post {
             out.push_str(&format!(".post{}", n));
         }
-        if let Some(n) = dev {
+        if let Some(n) = parts.dev {
             out.push_str(&format!(".dev{}", n));
         }
-        if let Some(local) = local {
-            let parts: Vec<&str> = local
-                .split(['.', '-', '_'])
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !parts.is_empty() {
-                out.push('+');
-                out.push_str(&parts.join(".").to_ascii_lowercase());
-            }
+        if let Some(local) = parts.local {
+            out.push('+');
+            out.push_str(&local.join("."));
         }
         Some(out)
+    }
+
+    /// Ordering key for a PEP 440 version, for sorting version lists.
+    ///
+    /// `canonical_version` answers "are these the same version?"; this answers
+    /// "which is newer?". Both are built from the same [`parse_pep440`] output,
+    /// so they cannot disagree about how a version decomposes.
+    ///
+    /// Ordering follows PEP 440: epoch, then release compared component-wise
+    /// (trailing zeros stripped, so `1.0 == 1.0.0`), then
+    /// `dev < pre < final < post`, with local versions sorting after the
+    /// public version they qualify. Returns `None` for input that is not
+    /// recognisably PEP 440 — callers decide how to order unparseable values.
+    pub fn pep440_sort_key(version: &str) -> Option<Pep440Key> {
+        let parts = parse_pep440(version)?;
+
+        // Mirrors the sort key in pypa/packaging (`Version._cmpkey`).
+        let pre = match (parts.pre, parts.post, parts.dev) {
+            // A `.devN` with no pre/post sorts before every other spelling of
+            // the same release, including its own pre-releases.
+            (None, None, Some(_)) => Pep440Pre::DevOnly,
+            // A final release sorts after all of its pre-releases.
+            (None, _, _) => Pep440Pre::Final,
+            (Some((label, n)), _, _) => {
+                let rank = match label {
+                    "a" => 0,
+                    "b" => 1,
+                    _ => 2,
+                };
+                Pep440Pre::Pre(rank, n)
+            }
+        };
+
+        Some(Pep440Key {
+            epoch: parts.epoch,
+            release: parts.release,
+            pre,
+            post: parts.post.map_or(Pep440Post::NoPost, Pep440Post::Post),
+            dev: parts.dev.map_or(Pep440Dev::NoDev, Pep440Dev::Dev),
+            local: parts
+                .local
+                .unwrap_or_default()
+                .into_iter()
+                .map(|seg| match seg.parse::<u64>() {
+                    Ok(n) => Pep440LocalSeg::Num(n),
+                    Err(_) => Pep440LocalSeg::Alpha(seg),
+                })
+                .collect(),
+        })
     }
 
     /// Extract metadata from PKG-INFO or METADATA file in sdist
@@ -508,21 +480,200 @@ impl PypiHandler {
     }
 }
 
-/// Canonicalize a numeric PEP 440 release segment: drop leading zeros from
-/// each component and trailing zero components so `1.0` and `1.0.0` agree.
-fn canon_release(release: &str) -> String {
-    let parts: Vec<&str> = release.split('.').collect();
-    let mut nums: Vec<u64> = parts
-        .iter()
+/// Canonicalize a numeric PEP 440 release segment into its components: drop
+/// leading zeros from each component and trailing zero components so `1.0` and
+/// `1.0.0` agree.
+fn release_components(release: &str) -> Vec<u64> {
+    let mut nums: Vec<u64> = release
+        .split('.')
         .map(|p| p.parse::<u64>().unwrap_or(0))
         .collect();
     while nums.len() > 1 && *nums.last().unwrap() == 0 {
         nums.pop();
     }
-    nums.iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(".")
+    nums
+}
+
+/// The pre-release position of a version, ordered `dev < pre < final`.
+///
+/// Variant order is the sort order — `derive(Ord)` on an enum compares by
+/// declaration order, so these must not be reordered.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Pep440Pre {
+    /// A `.devN` with no pre/post qualifier: sorts before everything.
+    DevOnly,
+    /// `aN` / `bN` / `rcN`, ranked 0/1/2.
+    Pre(u8, u64),
+    /// No pre-release: a final release sorts after its pre-releases.
+    Final,
+}
+
+/// Post-release position: absent sorts before any `.postN`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Pep440Post {
+    NoPost,
+    Post(u64),
+}
+
+/// Dev-release position: a `.devN` sorts before the same version without one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Pep440Dev {
+    Dev(u64),
+    NoDev,
+}
+
+/// One local-version segment. Alphabetic segments sort before numeric ones,
+/// matching pypa/packaging.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Pep440LocalSeg {
+    Alpha(String),
+    Num(u64),
+}
+
+/// Total ordering key for a PEP 440 version. Field order is the comparison
+/// order, so these must not be reordered. Built by
+/// [`PypiHandler::pep440_sort_key`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pep440Key {
+    epoch: u64,
+    release: Vec<u64>,
+    pre: Pep440Pre,
+    post: Pep440Post,
+    dev: Pep440Dev,
+    /// Empty when the version has no local part, which sorts first.
+    local: Vec<Pep440LocalSeg>,
+}
+
+/// The decomposed parts of a PEP 440 version.
+///
+/// Single source of truth for how a version string is read. Both
+/// `canonical_version` (the equality key) and `pep440_sort_key` (the ordering
+/// key) are derived from this, so the two can never drift apart.
+struct Pep440Parts {
+    epoch: u64,
+    /// Trailing-zero-stripped release components.
+    release: Vec<u64>,
+    /// Normalised pre-release label (`a`/`b`/`rc`) and its number.
+    pre: Option<(&'static str, u64)>,
+    post: Option<u64>,
+    dev: Option<u64>,
+    /// Validated, lowercased local-version segments.
+    local: Option<Vec<String>>,
+}
+
+/// Parse a PEP 440 version into its components, or `None` if the input is not
+/// recognisably PEP 440.
+fn parse_pep440(version: &str) -> Option<Pep440Parts> {
+    let v = version.trim().trim_start_matches(['v', 'V']);
+    if v.is_empty() {
+        return None;
+    }
+
+    // Local segment (everything after the first `+`). A PEP 427 wheel filename
+    // escapes `+` and `.` runs in the local part to `_`, so treat `_` as a
+    // local separator alongside `.`/`-`.
+    let (public, local) = match v.split_once('+') {
+        Some((p, l)) => (p, Some(l)),
+        None => (v, None),
+    };
+
+    let lower = public.to_ascii_lowercase();
+
+    // Epoch: `N!`.
+    let (epoch_str, rest) = match lower.split_once('!') {
+        Some((e, r)) => {
+            if e.is_empty() || !e.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            (e, r)
+        }
+        None => ("0", lower.as_str()),
+    };
+    let epoch: u64 = epoch_str.parse().ok()?;
+
+    // Greedily take the leading release: `digits(.digits)*`. The remainder
+    // holds the optional pre / post / dev / implicit-post qualifiers.
+    let (release_str, suffix) = split_release(rest)?;
+    let release = release_components(&release_str);
+
+    // Tokenize the qualifier suffix into alternating digit / alpha runs,
+    // treating `.`/`-`/`_` purely as separators (PEP 440 normalisation).
+    let tokens = tokenize_version(suffix)?;
+
+    let mut pre: Option<(&'static str, u64)> = None;
+    let mut post: Option<u64> = None;
+    let mut dev: Option<u64> = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        // A bare number directly after the release is an implicit post
+        // release (`1.0-1`).
+        if tok.chars().all(|c| c.is_ascii_digit())
+            && pre.is_none()
+            && post.is_none()
+            && dev.is_none()
+        {
+            post = Some(tok.parse().ok()?);
+            i += 1;
+            continue;
+        }
+        let label = match tok.as_str() {
+            "a" | "alpha" => Some(("pre", "a")),
+            "b" | "beta" => Some(("pre", "b")),
+            "c" | "rc" | "pre" | "preview" => Some(("pre", "rc")),
+            "post" | "rev" | "r" => Some(("post", "")),
+            "dev" => Some(("dev", "")),
+            _ => None,
+        };
+        let (kind, prelabel) = label?;
+        // Optional trailing number for this qualifier.
+        let n = if i + 1 < tokens.len() && tokens[i + 1].chars().all(|c| c.is_ascii_digit()) {
+            let parsed = tokens[i + 1].parse().ok()?;
+            i += 2;
+            parsed
+        } else {
+            i += 1;
+            0
+        };
+        match kind {
+            "pre" => pre = Some((prelabel, n)),
+            "post" => post = Some(n),
+            "dev" => dev = Some(n),
+            _ => unreachable!(),
+        }
+    }
+
+    // PEP 440 local version: one or more `[a-zA-Z0-9]+` segments joined by a
+    // single `.`/`-`/`_`. A present-but-empty local (`1.0+`), an empty segment
+    // from a leading/trailing/doubled separator (`1.0+_foo`, `1.0+a..b`), or a
+    // non-alphanumeric segment (`1.0++`) is INVALID — reject it rather than
+    // silently mangling it, so the canonical key can't false-equate two
+    // distinct/invalid inputs. (#3111)
+    let local = match local {
+        None => None,
+        Some(l) => {
+            if l.is_empty() {
+                return None;
+            }
+            let segs: Vec<&str> = l.split(['.', '-', '_']).collect();
+            if segs
+                .iter()
+                .any(|s| s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric()))
+            {
+                return None;
+            }
+            Some(segs.iter().map(|s| s.to_ascii_lowercase()).collect())
+        }
+    };
+
+    Some(Pep440Parts {
+        epoch,
+        release,
+        pre,
+        post,
+        dev,
+        local,
+    })
 }
 
 /// Split the leading `digits(.digits)*` release off a PEP 440 public-version
@@ -1489,5 +1640,102 @@ Project-URL: Documentation, https://docs.example.com
         assert_eq!(PypiHandler::canonical_version(""), None);
         assert_eq!(PypiHandler::canonical_version("not a version"), None);
         assert_eq!(PypiHandler::canonical_version("1.0!@#"), None);
+    }
+
+    // ========================================================================
+    // pep440_sort_key tests (#3106): ordering, as distinct from equality. The
+    // vectors come from the PEP 440 spec's own ordering examples via the
+    // conformance corpus (pypa/packaging).
+    // ========================================================================
+
+    fn key(v: &str) -> Pep440Key {
+        PypiHandler::pep440_sort_key(v).unwrap_or_else(|| panic!("unparseable: {v}"))
+    }
+
+    /// Assert that `versions` is given in strictly ascending PEP 440 order.
+    fn assert_ascending(versions: &[&str]) {
+        for pair in versions.windows(2) {
+            let (lo, hi) = (pair[0], pair[1]);
+            assert!(
+                key(lo) < key(hi),
+                "expected {lo} < {hi}, but sort keys ordered them otherwise"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pep440_sort_key_numeric_release_not_lexicographic() {
+        // The #3106 bug in one line: lexicographically "1.10" < "1.9".
+        assert!(key("1.9") < key("1.10"));
+        assert_ascending(&["1.0", "1.9", "1.10", "1.11", "2.0", "10.0"]);
+    }
+
+    #[test]
+    fn test_pep440_sort_key_release_padding_is_equal() {
+        assert_eq!(key("1.0"), key("1.0.0"));
+        assert_eq!(key("1"), key("1.0.0.0"));
+    }
+
+    #[test]
+    fn test_pep440_sort_key_pre_post_dev_ordering() {
+        // PEP 440: dev < alpha < beta < rc < final < post.
+        assert_ascending(&[
+            "1.0.dev1",
+            "1.0a1",
+            "1.0a2",
+            "1.0b1",
+            "1.0rc1",
+            "1.0",
+            "1.0.post1",
+            "1.0.post2",
+        ]);
+    }
+
+    #[test]
+    fn test_pep440_sort_key_dev_of_prerelease_sorts_before_it() {
+        // `1.0a1.dev1` is a dev build *of* the alpha, so it precedes it, but
+        // still follows the plain `1.0.dev1` of the release itself.
+        assert_ascending(&["1.0.dev1", "1.0a1.dev1", "1.0a1", "1.0"]);
+    }
+
+    #[test]
+    fn test_pep440_sort_key_epoch_dominates_release() {
+        // An epoch bump outranks any release number.
+        assert!(key("1!1.0") > key("999.0"));
+        assert_ascending(&["1.0", "2.0", "1!0.1", "2!0.1"]);
+    }
+
+    #[test]
+    fn test_pep440_sort_key_local_sorts_after_public() {
+        // A local version qualifies — and sorts after — its public version.
+        assert_ascending(&["1.0", "1.0+abc", "1.0+abc.1", "1.0+abc.2"]);
+        // Alphabetic local segments sort before numeric ones.
+        assert!(key("1.0+abc") < key("1.0+1"));
+    }
+
+    #[test]
+    fn test_pep440_sort_key_unparseable_returns_none() {
+        assert_eq!(PypiHandler::pep440_sort_key(""), None);
+        assert_eq!(PypiHandler::pep440_sort_key("not a version"), None);
+        // Invalid locals are rejected by the shared parser (#3111), so they
+        // have no ordering position either.
+        assert_eq!(PypiHandler::pep440_sort_key("1.0+"), None);
+    }
+
+    #[test]
+    fn test_pep440_sort_key_agrees_with_canonical_version_on_equality() {
+        // The two keys are derived from one parse, so versions PEP 440 calls
+        // equal must be equal under BOTH. This is the invariant that stops the
+        // equality key and the ordering key from drifting apart.
+        for (a, b) in [
+            ("1.0", "1.0.0"),
+            ("1.0a1", "1.0-alpha-1"),
+            ("1.0.post1", "1.0-1"),
+            ("v1.0", "1.0"),
+            ("1.0+abc.def", "1.0+abc-def"),
+        ] {
+            assert_eq!(canon(a), canon(b), "canonical_version disagreed on {a}/{b}");
+            assert_eq!(key(a), key(b), "pep440_sort_key disagreed on {a}/{b}");
+        }
     }
 }

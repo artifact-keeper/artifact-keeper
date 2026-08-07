@@ -53,6 +53,7 @@ pub fn admin_router() -> Router<SharedState> {
         .route("/reviews/:id", get(get_review))
         .route("/reviews/:id/approve", post(approve_review))
         .route("/reviews/:id/reject", post(reject_review))
+        .route("/reviews/:id/reopen", post(reopen_review))
 }
 
 pub fn repo_config_routes() -> Router<SharedState> {
@@ -102,12 +103,18 @@ pub struct AgeGateConfigResponse {
     pub repository_key: String,
     pub enabled: bool,
     pub min_age_days: i32,
+    /// Age-source mode: `upstream_publish_time` or `first_seen` (#2264).
+    pub mode: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateAgeGateConfigRequest {
     pub enabled: bool,
     pub min_age_days: i32,
+    /// Age-source mode. Omitted = keep the repository's current mode, so
+    /// pre-mode clients that PUT `{enabled, min_age_days}` stay valid.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 fn review_to_response(review: AgeGateReview) -> AgeGateReviewResponse {
@@ -137,14 +144,49 @@ fn age_gate_service(
 }
 
 /// Build the audit-log details for an approve/reject action.
-fn build_review_audit_details(
-    review: &AgeGateReviewResponse,
+fn build_review_audit_details(review: &AgeGateReview, reason: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "review_id": review.id,
+        "package": review.package_name,
+        "version": review.package_version,
+        "reason": reason,
+    })
+}
+
+/// Emit the audit entry for a review state change and return the JSON response.
+/// Shared by approve/reject/reopen so the audit-logging tail lives in one place.
+async fn log_review_action(
+    state: &SharedState,
+    actor: Uuid,
+    action: AuditAction,
+    review: AgeGateReview,
+    details: serde_json::Value,
+) -> Json<AgeGateReviewResponse> {
+    let repository_id = review.repository_id;
+    let resp = review_to_response(review);
+    let audit = AuditService::new(state.db.clone());
+    let _ = audit
+        .log(
+            AuditEntry::new(action, ResourceType::Repository)
+                .user(actor)
+                .resource(repository_id)
+                .details(details),
+        )
+        .await;
+    Json(resp)
+}
+
+/// Build the audit-log details for a reopen action, capturing the prior state.
+fn build_reopen_audit_details(
+    review: &AgeGateReview,
+    previous_status: &str,
     reason: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "review_id": review.id,
         "package": review.package_name,
         "version": review.package_version,
+        "previous_status": previous_status,
         "reason": reason,
     })
 }
@@ -250,19 +292,15 @@ pub async fn approve_review(
         .approve(id, auth.user_id, body.reason.as_deref())
         .await?;
 
-    let repository_id = review.repository_id;
-    let resp = review_to_response(review);
-    let audit = AuditService::new(state.db.clone());
-    let _ = audit
-        .log(
-            AuditEntry::new(AuditAction::AgeGateApproved, ResourceType::Repository)
-                .user(auth.user_id)
-                .resource(repository_id)
-                .details(build_review_audit_details(&resp, body.reason.as_deref())),
-        )
-        .await;
-
-    Ok(Json(resp))
+    let details = build_review_audit_details(&review, body.reason.as_deref());
+    Ok(log_review_action(
+        &state,
+        auth.user_id,
+        AuditAction::AgeGateApproved,
+        review,
+        details,
+    )
+    .await)
 }
 
 #[utoipa::path(
@@ -284,19 +322,45 @@ pub async fn reject_review(
     let svc = age_gate_service(&state)?;
     let review = svc.reject(id, auth.user_id, body.reason.as_deref()).await?;
 
-    let repository_id = review.repository_id;
-    let resp = review_to_response(review);
-    let audit = AuditService::new(state.db.clone());
-    let _ = audit
-        .log(
-            AuditEntry::new(AuditAction::AgeGateRejected, ResourceType::Repository)
-                .user(auth.user_id)
-                .resource(repository_id)
-                .details(build_review_audit_details(&resp, body.reason.as_deref())),
-        )
-        .await;
+    let details = build_review_audit_details(&review, body.reason.as_deref());
+    Ok(log_review_action(
+        &state,
+        auth.user_id,
+        AuditAction::AgeGateRejected,
+        review,
+        details,
+    )
+    .await)
+}
 
-    Ok(Json(resp))
+#[utoipa::path(
+    post,
+    path = "/age-gate/reviews/{id}/reopen",
+    context_path = "/api/v1/admin",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    request_body = ReviewActionRequest,
+    responses((status = 200, body = AgeGateReviewResponse))
+)]
+pub async fn reopen_review(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReviewActionRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    auth.require_admin()?;
+    let svc = age_gate_service(&state)?;
+    let (previous_status, review) = svc.reopen(id, auth.user_id, body.reason.as_deref()).await?;
+
+    let details = build_reopen_audit_details(&review, &previous_status, body.reason.as_deref());
+    Ok(log_review_action(
+        &state,
+        auth.user_id,
+        AuditAction::AgeGateReopened,
+        review,
+        details,
+    )
+    .await)
 }
 
 #[utoipa::path(
@@ -313,14 +377,23 @@ pub async fn get_repo_age_gate(
     Path(key): Path<String>,
 ) -> Result<Json<AgeGateConfigResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    // Admin-only, for parity with the PUT below and the /admin review routes:
+    // gate posture (enabled + threshold) is operator configuration, not
+    // package metadata (#2264). Blocked download callers still learn
+    // `min_age_days` from the structured 451 body, which is intended.
+    auth.require_admin()?;
     let service = RepoSvc::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
 
+    // `age_gate_mode` is deliberately not on the Repository model; read the
+    // full policy from the source of truth.
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id).await?;
+
     Ok(Json(AgeGateConfigResponse {
         repository_key: key,
-        enabled: repo.age_gate_enabled,
-        min_age_days: repo.age_gate_min_age_days,
+        enabled: params.age_gate_enabled,
+        min_age_days: params.age_gate_min_age_days,
+        mode: params.age_gate_mode.as_str().to_string(),
     }))
 }
 
@@ -342,6 +415,8 @@ pub async fn update_repo_age_gate(
     let auth = require_auth(auth)?;
     auth.require_admin()?;
 
+    use crate::services::age_gate_service::{self as ags, AgeGateMode, AgeGateService};
+
     crate::services::age_gate_service::validate_min_age_days(body.min_age_days)?;
 
     let service = RepoSvc::new(state.db.clone());
@@ -349,8 +424,35 @@ pub async fn update_repo_age_gate(
 
     require_remote_repo_for_age_gate(&repo.repo_type)?;
 
+    // Omitted mode keeps the repository's current one (pre-mode client
+    // compatibility); a supplied mode must parse.
+    let mode = match &body.mode {
+        Some(raw) => AgeGateMode::parse(raw)?,
+        None => {
+            ags::resolve_repo_params(&state.db, repo.id)
+                .await?
+                .age_gate_mode
+        }
+    };
+
+    // Reject ENABLING the gate on a (format, mode) pair this server cannot
+    // enforce: a 200 here would record an operator's intent that every
+    // download seam then fails closed on (or silently ignores) — the
+    // false-assurance gap flagged on #2930. Disabling is always allowed.
+    if body.enabled {
+        let format = AgeGateService::normalize_format(repo.format.clone());
+        if !AgeGateService::supports_format_mode(&format, mode) {
+            return Err(AppError::Validation(format!(
+                "The age gate cannot be enforced for format {:?} in '{}' mode; \
+                 supported today: npm and pypi (both modes), go (first_seen)",
+                repo.format,
+                mode.as_str()
+            )));
+        }
+    }
+
     let svc = age_gate_service(&state)?;
-    svc.update_repo_config(repo.id, body.enabled, body.min_age_days)
+    svc.update_repo_config(repo.id, body.enabled, body.min_age_days, mode)
         .await?;
 
     let audit = AuditService::new(state.db.clone());
@@ -371,6 +473,7 @@ pub async fn update_repo_age_gate(
                     visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
                     age_gate_enabled: Some(body.enabled),
                     age_gate_min_age_days: Some(body.min_age_days),
+                    age_gate_mode: Some(mode.as_str().to_string()),
                 }),
         )
         .await;
@@ -379,12 +482,13 @@ pub async fn update_repo_age_gate(
         repository_key: key,
         enabled: body.enabled,
         min_age_days: body.min_age_days,
+        mode: mode.as_str().to_string(),
     }))
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(list_reviews, get_review, approve_review, reject_review, get_repo_age_gate, update_repo_age_gate),
+    paths(list_reviews, get_review, approve_review, reject_review, reopen_review, get_repo_age_gate, update_repo_age_gate),
     components(schemas(
         AgeGateReviewResponse,
         AgeGateReviewListResponse,
@@ -476,39 +580,16 @@ mod tests {
         assert!(require_remote_repo_for_age_gate(&RepositoryType::Remote).is_ok());
     }
 
-    #[test]
-    fn build_review_audit_details_includes_fields() {
+    /// Build an `AgeGateReview` fixture for the pure detail/mapping tests.
+    fn sample_review(name: &str, version: &str, status: &str) -> AgeGateReview {
         let now = Utc::now();
-        let resp = AgeGateReviewResponse {
-            id: Uuid::new_v4(),
-            repository_key: "npm-remote".to_string(),
-            package_name: "react".to_string(),
-            package_version: "18.0.0".to_string(),
-            upstream_published_at: None,
-            status: "pending".to_string(),
-            requested_at: now,
-            reviewed_by: None,
-            reviewed_at: None,
-            review_reason: None,
-            request_count: 1,
-            last_requested_at: now,
-        };
-        let details = build_review_audit_details(&resp, Some("looks safe"));
-        assert_eq!(details["package"], "react");
-        assert_eq!(details["version"], "18.0.0");
-        assert_eq!(details["reason"], "looks safe");
-    }
-
-    #[test]
-    fn review_to_response_maps_fields_and_default_key() {
-        let now = Utc::now();
-        let review = crate::services::age_gate_service::AgeGateReview {
+        AgeGateReview {
             id: Uuid::new_v4(),
             repository_id: Uuid::new_v4(),
-            package_name: "lodash".to_string(),
-            package_version: "4.0.0".to_string(),
+            package_name: name.to_string(),
+            package_version: version.to_string(),
             upstream_published_at: None,
-            status: "pending".to_string(),
+            status: status.to_string(),
             requested_at: now,
             reviewed_by: None,
             reviewed_at: None,
@@ -516,10 +597,188 @@ mod tests {
             request_count: 1,
             last_requested_at: now,
             repository_key: None,
-        };
-        let resp = review_to_response(review);
+            basis_mode: None,
+            basis_upstream_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn build_review_audit_details_includes_fields() {
+        let review = sample_review("react", "18.0.0", "pending");
+        let details = build_review_audit_details(&review, Some("looks safe"));
+        assert_eq!(details["package"], "react");
+        assert_eq!(details["version"], "18.0.0");
+        assert_eq!(details["reason"], "looks safe");
+    }
+
+    #[test]
+    fn build_reopen_audit_details_includes_previous_status() {
+        let review = sample_review("left-pad", "1.3.0", "pending");
+        let details = build_reopen_audit_details(&review, "approved", Some("turned out bad"));
+        assert_eq!(details["package"], "left-pad");
+        assert_eq!(details["version"], "1.3.0");
+        assert_eq!(details["previous_status"], "approved");
+        assert_eq!(details["reason"], "turned out bad");
+    }
+
+    #[test]
+    fn review_to_response_maps_fields_and_default_key() {
+        let resp = review_to_response(sample_review("lodash", "4.0.0", "pending"));
         assert_eq!(resp.repository_key, "");
         assert_eq!(resp.package_name, "lodash");
         assert_eq!(resp.status, "pending");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2264 low-sev disclosure: GET /repositories/{key}/age-gate is admin-only
+    // (parity with the PUT and the /admin review routes). Previously any
+    // authenticated caller with the "read" scope could read gate posture for
+    // any repository. DB-backed: skips without DATABASE_URL; the CI coverage
+    // job runs these against Postgres. The external-vantage twin lives in
+    // tests/security_regression_tests.rs.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn config_app(state: SharedState, caller: AuthExtension) -> axum::Router {
+        tdh::router_with_auth(repo_config_routes(), state, caller)
+    }
+
+    /// The exact pre-fix caller: an authenticated API token carrying only the
+    /// "read" scope, which passed the old `require_scope("read")` gate.
+    fn read_scope_token() -> AuthExtension {
+        AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["read".to_string()]),
+            ..auth(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn get_repo_age_gate_read_scope_token_forbidden_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let caller = read_scope_token();
+        let caller_id = caller.user_id;
+        let (status, body) = tdh::send(
+            config_app(state, caller),
+            tdh::get(format!("/{key}/age-gate")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            !body.contains("min_age_days") && !body.contains("enabled"),
+            "403 body must not leak gate config: {body}"
+        );
+        tdh::cleanup(&pool, repo_id, caller_id).await;
+    }
+
+    #[tokio::test]
+    async fn get_repo_age_gate_non_admin_user_forbidden_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Non-admin session user with unrestricted repo access: repo-access
+        // bits must not grant config reads either.
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let caller = auth(false);
+        let caller_id = caller.user_id;
+        let (status, _body) = tdh::send(
+            config_app(state, caller),
+            tdh::get(format!("/{key}/age-gate")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        tdh::cleanup(&pool, repo_id, caller_id).await;
+    }
+
+    #[tokio::test]
+    async fn get_repo_age_gate_admin_ok_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let caller = auth(true);
+        let caller_id = caller.user_id;
+        let (status, body) = tdh::send(
+            config_app(state, caller),
+            tdh::get(format!("/{key}/age-gate")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let cfg: AgeGateConfigResponse = serde_json::from_slice(&body).expect("valid config body");
+        assert_eq!(cfg.repository_key, key);
+        // Column defaults from migration 146: disabled, 7-day threshold.
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.min_age_days, 7);
+        tdh::cleanup(&pool, repo_id, caller_id).await;
+    }
+
+    /// Enabling the gate on a (format, mode) pair the server cannot enforce
+    /// is rejected up front — recording an operator's intent every seam then
+    /// fails closed on (or silently ignores) is the #2930 false-assurance
+    /// gap. Go has no trustworthy publish-time resolver, so only `first_seen`
+    /// is accepted; disabling is always allowed.
+    #[tokio::test]
+    async fn put_repo_age_gate_rejects_unenforceable_format_mode_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "go").await;
+        let storage = dir.to_string_lossy().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy_and_age_gate(pool.clone(), &storage, proxy);
+        let caller = auth(true);
+        let caller_id = caller.user_id;
+
+        let put = |body: serde_json::Value| {
+            tdh::put_json(
+                format!("/{key}/age-gate"),
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+        };
+
+        let (status, _body) = tdh::send(
+            config_app(state.clone(), caller.clone()),
+            put(serde_json::json!({
+                "enabled": true, "min_age_days": 30, "mode": "upstream_publish_time"
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "go has no publish-time resolver: enabling that mode must be rejected"
+        );
+
+        let (status, body) = tdh::send(
+            config_app(state.clone(), caller.clone()),
+            put(serde_json::json!({
+                "enabled": true, "min_age_days": 30, "mode": "first_seen"
+            })),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let cfg: AgeGateConfigResponse = serde_json::from_slice(&body).expect("valid config body");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.mode, "first_seen");
+
+        // Disabling is always allowed, whatever mode rides along.
+        let (status, _body) = tdh::send(
+            config_app(state, caller),
+            put(serde_json::json!({
+                "enabled": false, "min_age_days": 30, "mode": "upstream_publish_time"
+            })),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        tdh::cleanup(&pool, repo_id, caller_id).await;
     }
 }

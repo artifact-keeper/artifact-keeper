@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE artifacts SET quarantine_status = 'flagged' WHERE id = $1 AND (quarantine_status IS NULL OR quarantine_status IN ('clean', 'flagged', 'unscanned'))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cbc076c37b2d0b759135c940951092ba5a83886dc0c14582769f743c240411dd"
+}

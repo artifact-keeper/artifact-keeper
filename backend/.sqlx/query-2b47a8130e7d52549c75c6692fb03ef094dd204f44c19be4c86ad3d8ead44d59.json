@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(*) as \"count!\",\n            COALESCE(SUM(size_bytes), 0)::BIGINT as \"size!\"\n        FROM proxy_cache_artifacts\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "size!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "2b47a8130e7d52549c75c6692fb03ef094dd204f44c19be4c86ad3d8ead44d59"
+}

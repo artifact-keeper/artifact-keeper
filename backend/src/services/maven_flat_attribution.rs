@@ -10,9 +10,9 @@
 //! closed.
 //!
 //! This module resolves the single owning repository of a flat key from the
-//! catalog (live artifact rows, parent-artifact metadata `files[]`, and the
-//! `maven_flat_object_owner` attribution table backfilled by migration 163 and
-//! qualified by storage backend in migration 168), and uses that to:
+//! catalog (live artifact rows, the `maven_flat_object_owner` attribution
+//! table backfilled by migration 163 and qualified by storage backend in
+//! migration 168, and parent-artifact metadata `files[]`), and uses that to:
 //!
 //! * gate reads -- serve a legacy flat object only to its genuine owner
 //!   ([`flat_key_readable`]); and
@@ -63,20 +63,23 @@ const OWNER_BY_ARTIFACT_ROW_SQL: &str = "SELECT DISTINCT a.repository_id FROM ar
 /// for the same ambiguity test.
 ///
 /// The GAV-grouped upload handler has always serialized `files[]` entries with
-/// camelCase keys (`"storageKey"`, since #418) -- matching on snake_case
-/// `storage_key` alone never hits real data, which silently disabled this
-/// whole layer (and migration 163's `metadata_files` backfill). COALESCE
-/// accepts both spellings so any hand-repaired snake_case rows keep working.
+/// camelCase keys (`"storageKey"`, since #418); snake_case `storage_key` is
+/// accepted as a fallback spelling for hand-repaired rows (#2706). Both
+/// spellings are matched with jsonb containment (`@>`) rather than a per-row
+/// `EXISTS` over `jsonb_array_elements` so the lookup is served by the GIN
+/// index from migration 179 -- the EXISTS predicate cannot use any index and
+/// forced a sequential scan of all of `artifact_metadata` on every row-less
+/// read (#2942). Containment against an array operand is false when `files`
+/// is not an array, so the explicit `jsonb_typeof` guard the EXISTS form
+/// needed is implicit here.
 const OWNER_BY_METADATA_FILES_SQL: &str = "SELECT DISTINCT a.repository_id \
      FROM artifact_metadata am \
      JOIN artifacts a ON a.id = am.artifact_id \
      JOIN repositories r ON r.id = a.repository_id \
      WHERE a.is_deleted = false \
        AND r.storage_backend = $2 \
-       AND jsonb_typeof(am.metadata->'files') = 'array' \
-       AND EXISTS ( \
-         SELECT 1 FROM jsonb_array_elements(am.metadata->'files') f \
-         WHERE COALESCE(f->>'storageKey', f->>'storage_key') = $1) \
+       AND (am.metadata->'files' @> jsonb_build_array(jsonb_build_object('storageKey', $1::text)) \
+         OR am.metadata->'files' @> jsonb_build_array(jsonb_build_object('storage_key', $1::text))) \
      LIMIT 2";
 
 /// The attribution table (backfilled legacy keys + write-time claims). The
@@ -117,11 +120,25 @@ async fn query_layer(
 }
 
 /// Resolve the owner of a flat key on `storage_backend` directly (without
-/// checksum-suffix stripping): (a) a live `artifacts` row, then (b) a live
-/// parent artifact whose metadata `files[]` references the key, then (c) the
-/// `maven_flat_object_owner` table -- each restricted to the same backend. A
-/// layer that names two or more repositories is ambiguous and resolves to
-/// `None` (no tenant may read it) rather than arbitrarily picking one owner.
+/// checksum-suffix stripping): (a) a live `artifacts` row, then (b) the
+/// `maven_flat_object_owner` table, then (c) a live parent artifact whose
+/// metadata `files[]` references the key -- each restricted to the same
+/// backend. A layer that names two or more repositories is ambiguous and
+/// resolves to `None` (no tenant may read it) rather than arbitrarily picking
+/// one owner.
+///
+/// The attribution table is consulted *before* the metadata-files derivation
+/// (#2942), for two reasons:
+///
+/// * Correctness: the table is the claims ledger -- write-time
+///   first-writer-wins claims ([`claim_flat_key_on_write`]), the 163/170
+///   backfills, and operator repairs all record ownership there, and
+///   [`guard_flat_key_writable`] enforces against it. An explicit claim must
+///   outrank an attribution *derived* from another repository's metadata, or
+///   the read path could disagree with the write guard about who owns a key.
+/// * Cost: the table lookup is a primary-key probe, while the metadata
+///   derivation scans `artifact_metadata`; on deployments with a populated
+///   ledger the derivation now runs only for keys the table has never seen.
 async fn resolve_direct(
     db: &PgPool,
     storage_backend: &str,
@@ -129,8 +146,8 @@ async fn resolve_direct(
 ) -> Result<Option<Uuid>> {
     for sql in [
         OWNER_BY_ARTIFACT_ROW_SQL,
-        OWNER_BY_METADATA_FILES_SQL,
         OWNER_BY_ATTRIBUTION_TABLE_SQL,
+        OWNER_BY_METADATA_FILES_SQL,
     ] {
         match query_layer(db, sql, storage_backend, storage_key).await? {
             LayerResult::Absent => continue,
@@ -146,8 +163,8 @@ async fn resolve_direct(
 /// (unowned, or ambiguous across repositories on that backend). The backend is
 /// part of the object's physical identity: the same flat key on two different
 /// backends names two distinct objects with independent owners (#2671).
-/// Resolution order: (a) live `artifacts` row, (b) live parent artifact metadata
-/// `files[]`, (c) `maven_flat_object_owner` table, and if the key is a
+/// Resolution order: (a) live `artifacts` row, (b) `maven_flat_object_owner`
+/// table, (c) live parent artifact metadata `files[]`, and if the key is a
 /// checksum/signature sidecar, (d) strip the suffix and resolve the base key the
 /// same way.
 pub async fn attributed_owner(
@@ -1035,5 +1052,69 @@ mod tests {
             "snake_case files[] entry must keep attributing after the fix"
         );
         tdh::cleanup(&pool, repo, Uuid::nil()).await;
+    }
+
+    /// The attribution table is the claims ledger: an explicit claim (write-time
+    /// first-writer-wins, backfill, or operator repair) must outrank an
+    /// attribution *derived* from another repository's metadata `files[]`, so
+    /// the read path always agrees with `guard_flat_key_writable`, which
+    /// enforces against the recorded claim (#2942).
+    ///
+    /// This test FAILS under the pre-fix layer order (metadata derivation
+    /// consulted first would attribute the key to the parent's repository) and
+    /// PASSES with the table consulted first.
+    #[tokio::test]
+    async fn test_attribution_table_claim_outranks_metadata_derivation() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (claimant, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (deriver, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, claimant, "s3").await;
+        set_repo_backend(&pool, deriver, "s3").await;
+        let gav = Uuid::new_v4();
+        let parent_key = format!("maven/com/acme/prec/{gav}/prec-1.0.jar");
+        let contested_key = format!("maven/com/acme/prec/{gav}/prec-1.0.pom");
+        // `deriver`'s parent metadata lists the contested key...
+        seed_parent_with_files_entry(
+            &pool,
+            deriver,
+            "com/acme/prec/1.0/prec-1.0.jar",
+            &parent_key,
+            "storageKey",
+            &contested_key,
+        )
+        .await;
+        // ...but `claimant` holds the recorded claim.
+        sqlx::query(
+            "INSERT INTO maven_flat_object_owner \
+             (storage_backend, storage_key, repository_id, source) \
+             VALUES ('s3', $1, $2, 'write_claim')",
+        )
+        .bind(&contested_key)
+        .bind(claimant)
+        .execute(&pool)
+        .await
+        .expect("seed claim");
+
+        assert_eq!(
+            attributed_owner(&pool, "s3", &contested_key)
+                .await
+                .expect("query"),
+            Some(claimant),
+            "a recorded claim must outrank metadata-derived attribution"
+        );
+        assert!(
+            flat_key_readable(&pool, claimant, "s3", &contested_key).await,
+            "the claimant reads its claimed key"
+        );
+        assert!(
+            !flat_key_readable(&pool, deriver, "s3", &contested_key).await,
+            "the deriving repository must not read a key claimed by another"
+        );
+
+        clear_claims(&pool, &[claimant, deriver]).await;
+        tdh::cleanup(&pool, deriver, Uuid::nil()).await;
+        tdh::cleanup(&pool, claimant, Uuid::nil()).await;
     }
 }

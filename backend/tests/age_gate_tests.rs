@@ -52,6 +52,8 @@ fn npm_repo_params(id: Uuid, min_age_days: i32) -> AgeGateRepoParams {
         RepositoryFormat::Npm,
         true,
         min_age_days,
+        Default::default(),
+        None,
     )
 }
 
@@ -374,6 +376,8 @@ fn pypi_repo_params(id: Uuid, min_age_days: i32) -> AgeGateRepoParams {
         RepositoryFormat::Pypi,
         true,
         min_age_days,
+        Default::default(),
+        None,
     )
 }
 
@@ -454,6 +458,86 @@ async fn pypi_simple_index_withholds_young_version_via_real_anchors() {
         review_status(&pool, repo_id, pkg, "9.9.9").await,
         "pending",
         "the withheld young version must be queued for review"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn approve_stamps_live_basis_identity() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+    let repo_id = create_remote_npm_repo(&pool, "approve-basis", 7).await;
+    let reviewer = create_reviewer(&pool).await;
+
+    insert_pending_review(&pool, repo_id, "testpkg", "1.0.0", None).await;
+
+    let review_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM age_gate_reviews WHERE repository_id = $1 AND package_name = 'testpkg'",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("get review id");
+
+    let approved = svc
+        .approve(review_id, reviewer, Some("test approve"))
+        .await
+        .expect("approve review");
+
+    assert_eq!(approved.status, "approved");
+    assert_eq!(
+        approved.basis_mode.as_deref(),
+        Some("upstream_publish_time")
+    );
+    assert!(
+        approved.basis_upstream_fingerprint.is_some(),
+        "approve must stamp the upstream fingerprint"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn concurrent_review_transition_has_one_winner() {
+    let pool = connect_db().await;
+    let svc = Arc::new(AgeGateService::new(
+        pool.clone(),
+        Arc::new(EventBus::new(32)),
+    ));
+    let repo_id = create_remote_npm_repo(&pool, "approve-race", 7).await;
+    let reviewer = create_reviewer(&pool).await;
+    insert_pending_review(&pool, repo_id, "racepkg", "1.0.0", None).await;
+    let review_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM age_gate_reviews
+         WHERE repository_id = $1 AND package_name = 'racepkg'",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("get review id");
+
+    const CONTENDERS: usize = 16;
+    let barrier = Arc::new(tokio::sync::Barrier::new(CONTENDERS));
+    let mut tasks = Vec::with_capacity(CONTENDERS);
+    for _ in 0..CONTENDERS {
+        let svc = Arc::clone(&svc);
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            svc.approve(review_id, reviewer, Some("concurrent approve"))
+                .await
+        }));
+    }
+
+    let mut successes = 0;
+    for task in tasks {
+        if task.await.expect("join approve task").is_ok() {
+            successes += 1;
+        }
+    }
+    assert_eq!(
+        successes, 1,
+        "exactly one compare-and-swap transition may succeed"
     );
 }
 

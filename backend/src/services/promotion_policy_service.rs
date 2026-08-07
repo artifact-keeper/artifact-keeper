@@ -58,13 +58,39 @@ struct ScanRow {
     findings_count: i32,
 }
 
-/// SQL for the latest completed scan's severity counts for an artifact.
+/// SQL for an artifact's severity counts, taken across the latest completed scan
+/// of EVERY scanner rather than the single most recently completed row.
+///
+/// The old form was `ORDER BY created_at DESC LIMIT 1` over all completed rows
+/// regardless of `scan_type`, so whichever engine happened to finish last
+/// supplied the entire CVE verdict and every other engine's findings were
+/// invisible to the gate. With more than one scanner enabled that is a silent
+/// fail-open: a clean-but-later scan hides an earlier scan's criticals.
+///
+/// Counts are combined with a per-severity `MAX`, not `SUM`: the per-scanner
+/// aggregates describe overlapping finding sets, so summing would double-count a
+/// CVE that two engines both report. `MAX` cannot weaken the gate — the
+/// thresholds in [`evaluate_cve_thresholds`] only test "greater than the allowed
+/// number", and a severity is non-zero here whenever any engine reported it.
+///
+/// `HAVING COUNT(*) > 0` preserves the caller's "no completed scan at all"
+/// signal: an aggregate with no `GROUP BY` would otherwise always return one
+/// all-zeros row, turning "never scanned" into "scanned and clean".
 const LATEST_SCAN_COUNTS_SQL: &str = r#"
-    SELECT critical_count, high_count, medium_count, low_count, findings_count
-    FROM scan_results
-    WHERE artifact_id = $1 AND status = 'completed'
-    ORDER BY created_at DESC
-    LIMIT 1
+    WITH latest_per_type AS (
+        SELECT DISTINCT ON (scan_type)
+               critical_count, high_count, medium_count, low_count, findings_count
+        FROM scan_results
+        WHERE artifact_id = $1 AND status = 'completed'
+        ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
+    )
+    SELECT COALESCE(MAX(critical_count), 0)::int AS critical_count,
+           COALESCE(MAX(high_count), 0)::int     AS high_count,
+           COALESCE(MAX(medium_count), 0)::int   AS medium_count,
+           COALESCE(MAX(low_count), 0)::int      AS low_count,
+           COALESCE(MAX(findings_count), 0)::int AS findings_count
+    FROM latest_per_type
+    HAVING COUNT(*) > 0
 "#;
 
 /// SQL for an artifact's open CVEs, sourced from `scan_findings` (the populated
@@ -73,17 +99,21 @@ const LATEST_SCAN_COUNTS_SQL: &str = r#"
 /// scan -- the same `scan_findings` shape the SBOM read path uses. The old
 /// `cve_history` read was always empty, so a "block on open CVEs" gate silently
 /// passed (#1620; data source also addresses #1561).
+///
+/// Scoped to the latest completed scan of EVERY scanner, for the same reason as
+/// [`LATEST_SCAN_COUNTS_SQL`]: joining findings to one single latest row hid the
+/// open CVEs of every other engine. `SELECT DISTINCT` already collapses a CVE
+/// that several engines report, so widening the join cannot produce duplicates.
 const OPEN_CVES_SQL: &str = r#"
-    WITH latest_scan AS (
-        SELECT id
+    WITH latest_scans AS (
+        SELECT DISTINCT ON (scan_type) id
         FROM scan_results
         WHERE artifact_id = $1 AND status = 'completed'
-        ORDER BY created_at DESC
-        LIMIT 1
+        ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
     )
     SELECT DISTINCT sf.cve_id
     FROM scan_findings sf
-    JOIN latest_scan ls ON sf.scan_result_id = ls.id
+    JOIN latest_scans ls ON sf.scan_result_id = ls.id
     WHERE sf.cve_id IS NOT NULL
       AND NOT sf.is_acknowledged
 "#;
@@ -770,6 +800,49 @@ mod tests {
         assert!(OPEN_CVES_SQL.contains("sf.cve_id IS NOT NULL"));
         assert!(OPEN_CVES_SQL.contains("status = 'completed'"));
         assert!(!OPEN_CVES_SQL.contains("cve_history"));
+    }
+
+    #[test]
+    fn test_cve_sql_spans_every_scanner_not_just_the_last_to_finish() {
+        // Regression: both queries used to pick ONE latest completed row with
+        // `ORDER BY created_at DESC LIMIT 1`, ignoring scan_type. With two or more
+        // engines enabled, whichever finished last supplied the entire CVE verdict
+        // and the others' findings never reached the gate — so a clean scan that
+        // completed after a critical-bearing one silently unblocked promotion.
+        for sql in [LATEST_SCAN_COUNTS_SQL, OPEN_CVES_SQL] {
+            assert!(
+                sql.contains("DISTINCT ON (scan_type)"),
+                "query must window per scanner, not take one global latest row"
+            );
+            assert!(
+                !sql.contains("LIMIT 1"),
+                "a global LIMIT 1 is what hid other scanners' findings"
+            );
+        }
+        // The counts query must not turn "never scanned" into "scanned, all zeros":
+        // an unfiltered aggregate always returns a row, which the caller would read
+        // as a clean scan instead of `None`.
+        assert!(
+            LATEST_SCAN_COUNTS_SQL.contains("HAVING COUNT(*) > 0"),
+            "no completed scan must still yield zero rows"
+        );
+        // MAX, not SUM: per-scanner aggregates cover overlapping finding sets, so
+        // summing would double-count a CVE that two engines both report. Pin
+        // every count column -- leaving one un-aggregated would silently narrow
+        // the verdict back to a single scanner for that severity.
+        for col in [
+            "critical_count",
+            "high_count",
+            "medium_count",
+            "low_count",
+            "findings_count",
+        ] {
+            assert!(
+                LATEST_SCAN_COUNTS_SQL.contains(&format!("MAX({col})")),
+                "{col} must be aggregated across scanners"
+            );
+        }
+        assert!(!LATEST_SCAN_COUNTS_SQL.contains("SUM("));
 
         // The counts query feeds the same latest-completed-scan contract.
         assert!(LATEST_SCAN_COUNTS_SQL.contains("FROM scan_results"));
@@ -2169,6 +2242,128 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("failed to create test artifact")
+    }
+
+    /// Insert one scan row for `artifact`, optionally carrying an
+    /// unacknowledged finding with `cve`. `age_seconds` orders the rows.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_scan_with_counts(
+        pool: &PgPool,
+        artifact: Uuid,
+        repo: Uuid,
+        scan_type: &str,
+        critical: i32,
+        high: i32,
+        cve: Option<&str>,
+        age_seconds: i64,
+    ) -> Uuid {
+        let scan_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO scan_results (
+                artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                started_at, completed_at, created_at
+            )
+            VALUES ($1, $2, $3, 'completed', $4 + $5, $4, $5, 0, 0, 0,
+                    NOW() - make_interval(secs => $6::double precision),
+                    NOW() - make_interval(secs => $6::double precision),
+                    NOW() - make_interval(secs => $6::double precision))
+            RETURNING id
+            "#,
+        )
+        .bind(artifact)
+        .bind(repo)
+        .bind(scan_type)
+        .bind(critical)
+        .bind(high)
+        .bind(age_seconds as f64)
+        .fetch_one(pool)
+        .await
+        .expect("failed to insert scan_result");
+
+        if let Some(cve) = cve {
+            sqlx::query(
+                "INSERT INTO scan_findings \
+                 (scan_result_id, artifact_id, severity, title, cve_id, source, is_acknowledged) \
+                 VALUES ($1, $2, 'critical', 'seeded', $3, 'test', false)",
+            )
+            .bind(scan_id)
+            .bind(artifact)
+            .bind(cve)
+            .execute(pool)
+            .await
+            .expect("failed to insert scan_finding");
+        }
+        scan_id
+    }
+
+    /// Executes the rewritten `LATEST_SCAN_COUNTS_SQL` and `OPEN_CVES_SQL`
+    /// against a real database with TWO scanners.
+    ///
+    /// The sibling test in this module pins the SQL *strings*, which guards
+    /// against a revert but proves nothing about what Postgres actually
+    /// returns — and these are runtime-checked `query_as` calls, so a broken
+    /// query ships and fails at request time. This test is the behavioural
+    /// half: a clean scan that completed AFTER a critical-bearing one from a
+    /// different engine must not hide that engine's findings.
+    #[tokio::test]
+    async fn cve_summary_spans_every_scanner_not_just_the_last_to_finish() {
+        let Some(pool) = sig_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let svc = PromotionPolicyService::new(pool.clone());
+        let repo = seed_repo(&pool).await;
+
+        let artifact = seed_artifact(&pool, repo).await;
+        // Older engine found a critical + 2 highs...
+        seed_scan_with_counts(
+            &pool,
+            artifact,
+            repo,
+            "grype",
+            1,
+            2,
+            Some("CVE-3138-1111"),
+            3600,
+        )
+        .await;
+        // ...a different engine then finished clean, more recently.
+        seed_scan_with_counts(&pool, artifact, repo, "dependency", 0, 0, None, 60).await;
+
+        let summary = svc
+            .get_cve_summary(artifact)
+            .await
+            .expect("cve summary query failed")
+            .expect("an artifact with completed scans must have a summary");
+
+        assert_eq!(
+            summary.critical_count, 1,
+            "a later clean scan from a second engine must not hide the first engine's critical"
+        );
+        assert_eq!(summary.high_count, 2, "high counts must span scanners too");
+        assert!(
+            summary.open_cves.contains(&"CVE-3138-1111".to_string()),
+            "the older engine's open CVE must still reach the gate, got {:?}",
+            summary.open_cves
+        );
+
+        // "Never scanned" must stay distinguishable from "scanned and clean":
+        // an ungrouped aggregate without `HAVING COUNT(*) > 0` would return one
+        // all-zeros row here and read as a clean scan.
+        let unscanned = seed_artifact(&pool, repo).await;
+        assert!(
+            svc.get_cve_summary(unscanned)
+                .await
+                .expect("cve summary query failed")
+                .is_none(),
+            "an artifact with no completed scan must yield None, not a zeroed summary"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
     }
 
     /// Insert a minimal signing_keys row (no real key material is needed: the

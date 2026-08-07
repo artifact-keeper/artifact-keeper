@@ -211,7 +211,7 @@ async fn upload_artifact(
     Path((repo_key, artifact_path)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "ivy", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "ivy", "write:artifacts")?.user_id;
     let repo = resolve_sbt_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos

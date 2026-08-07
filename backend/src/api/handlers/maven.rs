@@ -103,6 +103,82 @@ pub async fn invalidate_maven_metadata_cache(repo_id: Uuid, group_id: &str, arti
         .await;
 }
 
+/// Storage path (relative to the `maven/` format prefix) of the group/artifact
+/// `maven-metadata.xml` for one GAV, e.g.
+/// `com/example/my-lib/maven-metadata.xml`.
+fn maven_metadata_object_path(group_id: &str, artifact_id: &str) -> String {
+    format!(
+        "{}/{}/maven-metadata.xml",
+        group_id.replace('.', "/"),
+        artifact_id
+    )
+}
+
+/// Drop the *stored* `maven-metadata.xml` document (and its checksum sidecars)
+/// for a `(repo, group, artifact)` GAV, then invalidate the in-memory
+/// generation cache.
+///
+/// `mvn deploy` uploads a verbatim `maven-metadata.xml` alongside each artifact,
+/// and the download path serves that stored document in preference to dynamic
+/// generation (a deliberately-uploaded document is authoritative for its owner —
+/// see `fetch_maven_metadata_bytes`). When a version is deleted, that stored
+/// document is stale: it still advertises the removed version in
+/// `<versions>`/`<latest>`/`<release>`, so a client resolves a version that now
+/// 404s (#2845). Removing the stored object lets the dynamic generator — which
+/// reads only non-deleted `artifacts` rows — take over on the next GET, and also
+/// produce a correct (or absent) document when the last version is deleted.
+///
+/// Best-effort: a missing object or a storage error is ignored (the document may
+/// never have been uploaded, e.g. some Gradle publish flows), and clearing it is
+/// never allowed to fail the delete. Both the repo-scoped (#2624) and legacy flat
+/// key candidates are removed so the fix holds under either
+/// [`StorageKeyScheme`](crate::storage::StorageKeyScheme).
+pub async fn clear_stored_maven_metadata(
+    state: &SharedState,
+    repo_id: Uuid,
+    storage_backend: &str,
+    storage_location: &crate::storage::StorageLocation,
+    group_id: &str,
+    artifact_id: &str,
+) {
+    // Always drop the generation cache, even if there is no stored object.
+    invalidate_maven_metadata_cache(repo_id, group_id, artifact_id).await;
+
+    let storage = match state.storage_for_repo(storage_location) {
+        Ok(storage) => storage,
+        Err(e) => {
+            warn!(error = %e, "clear_stored_maven_metadata: storage unavailable");
+            return;
+        }
+    };
+
+    let meta_path = maven_metadata_object_path(group_id, artifact_id);
+    let scheme = crate::storage::StorageKeyScheme::from_env();
+
+    // Base keys: repo-scoped candidate (cloud RepoScoped) first, then legacy flat.
+    let mut base_keys = Vec::with_capacity(2);
+    if let Some(scoped) = scheme.scoped_read_key(storage_backend, "maven", repo_id, &meta_path) {
+        base_keys.push(scoped);
+    }
+    base_keys.push(format!("maven/{}", meta_path));
+
+    // Remove the document itself plus the checksum sidecars Maven stores beside it.
+    for base in &base_keys {
+        for key in [
+            base.clone(),
+            format!("{}.md5", base),
+            format!("{}.sha1", base),
+            format!("{}.sha256", base),
+        ] {
+            if let Err(e) = storage.delete(&key).await {
+                // A missing object is the common case (never uploaded); log at
+                // debug so it doesn't look like a failure.
+                tracing::debug!(error = %e, key = %key, "clear_stored_maven_metadata: delete miss");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Virtual-repo GA-level metadata merge cache (#2302)
 // ---------------------------------------------------------------------------
@@ -897,6 +973,19 @@ async fn download(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+
+    // Curation enforcement (#2930): block a curated artifact pull on a
+    // remote/virtual repo. The package identity is `groupId:artifactId`
+    // (`maven_proxy_package_name`, the same shape the proxy-sync catalog uses),
+    // so a rule authored for the curation catalog matches here. Metadata and
+    // checksum/signature sidecars derive no package identity (the helper returns
+    // `None`) and pass through untouched; hosted repos / curation-off are no-ops.
+    if let Some(pkg) = crate::services::proxy_service::maven_proxy_package_name(&path) {
+        let version = crate::formats::maven::MavenHandler::parse_coordinates(&path)
+            .ok()
+            .map(|c| c.version);
+        proxy_helpers::enforce_curation(&state.db, &repo, &pkg, version.as_deref()).await?;
+    }
 
     // 1. Check if this is a checksum request for metadata.
     //    Always compute the checksum from the actual metadata XML bytes
@@ -2192,7 +2281,7 @@ async fn upload(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
     // this push endpoint. Require the write scope before doing any work.
-    let auth = require_auth_basic_scope(auth, "maven", "write")?;
+    let auth = require_auth_basic_scope(auth, "maven", "write:artifacts")?;
     let user_id = auth.user_id;
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
 
@@ -3038,6 +3127,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -3058,6 +3148,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -5707,6 +5798,185 @@ mod maven_prefix_reserved_tests {
             !fx.storage_dir.join("maven").exists(),
             "remote proxy checksum probe must not create anything under maven/ (#1547)"
         );
+        fx.teardown().await;
+    }
+
+    #[test]
+    fn test_maven_metadata_object_path_maps_group_dots_to_slashes() {
+        assert_eq!(
+            super::maven_metadata_object_path("com.example.del", "demo-lib"),
+            "com/example/del/demo-lib/maven-metadata.xml"
+        );
+        // Single-segment group id.
+        assert_eq!(
+            super::maven_metadata_object_path("acme", "widget"),
+            "acme/widget/maven-metadata.xml"
+        );
+    }
+
+    /// #2845 regression. `mvn deploy` uploads a verbatim `maven-metadata.xml`
+    /// which the download path serves in preference to dynamic generation. When
+    /// a version is deleted, that stored document is stale and keeps advertising
+    /// the removed version; clearing it (the delete handler now does) makes the
+    /// next GET regenerate the version list from the live (non-deleted) rows.
+    #[tokio::test]
+    async fn test_delete_clears_stored_metadata_so_version_disappears() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let router = fx.router_with_auth(super::router());
+        let pom = |v: &str| {
+            bytes::Bytes::from(format!(
+                r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example.del</groupId>
+  <artifactId>demo</artifactId>
+  <version>{v}</version>
+</project>"#
+            ))
+        };
+
+        // Publish two release versions (each creates an artifacts row).
+        for v in ["1.0.0", "2.0.0"] {
+            let path = format!("com/example/del/demo/{v}/demo-{v}.pom");
+            let (status, body) = tdh::send(
+                router.clone(),
+                tdh::put(format!("/{}/{}", fx.repo_key, path), pom(v)),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "publish {v} must succeed; body={}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // Publish the verbatim group/artifact maven-metadata.xml listing both,
+        // exactly as the Maven deploy plugin does.
+        let meta_path = "com/example/del/demo/maven-metadata.xml";
+        let stored_meta = bytes::Bytes::from_static(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.example.del</groupId>
+  <artifactId>demo</artifactId>
+  <versioning>
+    <latest>2.0.0</latest>
+    <release>2.0.0</release>
+    <versions>
+      <version>1.0.0</version>
+      <version>2.0.0</version>
+    </versions>
+    <lastUpdated>20260101000000</lastUpdated>
+  </versioning>
+</metadata>"#,
+        );
+        let (status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{}/{}", fx.repo_key, meta_path), stored_meta),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "metadata upload must succeed");
+
+        let meta_url = format!("/{}/{}", fx.repo_key, meta_path);
+        let get_meta = |r: axum::Router, url: String| async move {
+            let (status, body) = tdh::send(r, tdh::get(url)).await;
+            (status, String::from_utf8(body.to_vec()).expect("utf-8"))
+        };
+
+        // Baseline: the stored document is served and lists both versions.
+        let (status, xml) = get_meta(router.clone(), meta_url.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            xml.contains("<version>1.0.0</version>"),
+            "baseline lists 1.0.0"
+        );
+        assert!(
+            xml.contains("<version>2.0.0</version>"),
+            "baseline lists 2.0.0"
+        );
+
+        // Soft-delete version 2.0.0 (the DB effect of the web-UI delete).
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(fx.repo_id)
+        .bind("2.0.0")
+        .execute(&fx.pool)
+        .await
+        .expect("soft-delete 2.0.0");
+
+        // Pre-fix behaviour anchor: with the stored document still in place, the
+        // GET keeps advertising the just-deleted 2.0.0 — this is exactly #2845.
+        let (_, xml_stale) = get_meta(router.clone(), meta_url.clone()).await;
+        assert!(
+            xml_stale.contains("<version>2.0.0</version>"),
+            "stored document shadows dynamic generation until it is cleared (#2845)"
+        );
+
+        // The fix: clear the stored document (as the delete handler now does).
+        let repo_info = fx.repo_info("local", None);
+        super::clear_stored_maven_metadata(
+            &fx.state,
+            fx.repo_id,
+            &repo_info.storage_backend,
+            &repo_info.storage_location(),
+            "com.example.del",
+            "demo",
+        )
+        .await;
+
+        // Now the served metadata is regenerated from the live rows: 2.0.0 is
+        // gone and latest/release fall back to 1.0.0.
+        let (status, xml_fixed) = get_meta(router.clone(), meta_url.clone()).await;
+        assert_eq!(status, StatusCode::OK, "metadata still served after delete");
+        assert!(
+            xml_fixed.contains("<version>1.0.0</version>"),
+            "surviving version 1.0.0 still listed"
+        );
+        assert!(
+            !xml_fixed.contains("<version>2.0.0</version>"),
+            "deleted version 2.0.0 must no longer be advertised (#2845); got: {xml_fixed}"
+        );
+        assert!(
+            xml_fixed.contains("<latest>1.0.0</latest>"),
+            "latest updated to surviving version"
+        );
+        assert!(
+            xml_fixed.contains("<release>1.0.0</release>"),
+            "release updated to surviving version"
+        );
+
+        // Delete the last remaining version too: metadata now has no versions
+        // and 404s (empty-metadata handling), instead of serving a stale list.
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(fx.repo_id)
+        .bind("1.0.0")
+        .execute(&fx.pool)
+        .await
+        .expect("soft-delete 1.0.0");
+        super::clear_stored_maven_metadata(
+            &fx.state,
+            fx.repo_id,
+            &repo_info.storage_backend,
+            &repo_info.storage_location(),
+            "com.example.del",
+            "demo",
+        )
+        .await;
+        let (status, _) = get_meta(router.clone(), meta_url.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "with every version deleted the metadata must not resurrect a stale list"
+        );
+
         fx.teardown().await;
     }
 }

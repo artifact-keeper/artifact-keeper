@@ -1425,10 +1425,8 @@ async fn channeldata_json(
         .into_iter()
         .map(|(name, entry)| {
             let version = latest_versions.get(&name).cloned().unwrap_or_default();
-            let mut val = serde_json::json!({
-                "subdirs": entry.subdirs.into_iter().collect::<Vec<_>>(),
-                "version": version,
-            });
+            let subdirs: Vec<String> = entry.subdirs.into_iter().collect();
+            let mut val = build_channeldata_package_entry(&subdirs, &version);
             // Include optional fields when available
             if !entry.license.is_empty() {
                 val["license"] = serde_json::Value::String(entry.license);
@@ -1458,11 +1456,7 @@ async fn channeldata_json(
         })
         .collect();
 
-    let channeldata = serde_json::json!({
-        "channeldata_version": 1,
-        "packages": packages_json,
-        "subdirs": KNOWN_SUBDIRS,
-    });
+    let channeldata = build_channeldata_json(&packages_json);
 
     let body = serde_json::to_string_pretty(&channeldata)
         .unwrap()
@@ -2375,16 +2369,13 @@ async fn build_repodata(
     // from the registry itself.
     let base_url = format!("/conda/{}/{}/", repo_key, subdir);
 
-    Ok(serde_json::json!({
-        "info": {
-            "subdir": subdir,
-            "base_url": base_url,
-        },
-        "packages": packages,
-        "packages.conda": packages_conda,
-        "removed": removed,
-        "repodata_version": 1,
-    }))
+    Ok(build_repodata_envelope(
+        subdir,
+        &base_url,
+        &packages,
+        &packages_conda,
+        &serde_json::json!(removed),
+    ))
 }
 
 /// Merge package maps from a source into an accumulator using first-writer-wins.
@@ -2519,16 +2510,13 @@ async fn build_virtual_repodata(
 
     let base_url = format!("/conda/{}/{}/", virtual_repo_key, subdir);
 
-    Ok(serde_json::json!({
-        "info": {
-            "subdir": subdir,
-            "base_url": base_url,
-        },
-        "packages": merged_packages,
-        "packages.conda": merged_packages_conda,
-        "removed": [],
-        "repodata_version": 1,
-    }))
+    Ok(build_repodata_envelope(
+        subdir,
+        &base_url,
+        &merged_packages,
+        &merged_packages_conda,
+        &serde_json::json!([]),
+    ))
 }
 
 /// Build merged channeldata.json for a virtual repository.
@@ -2622,7 +2610,7 @@ async fn download_package(
     check_read_access(&state.db, auth.clone(), &repo).await?;
 
     // Look up artifact by path
-    let artifact_path = format!("{}/{}", subdir, filename);
+    let artifact_path = build_conda_artifact_path(&subdir, &filename);
 
     let artifact = sqlx::query!(
         r#"
@@ -2767,7 +2755,7 @@ async fn upload_package_put(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -2795,7 +2783,7 @@ async fn upload_post(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -2834,7 +2822,7 @@ async fn upload_package_put_with_token(
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = if auth.is_some() {
-        require_auth_basic_scope(auth, "conda", "write")?.user_id
+        require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -2865,7 +2853,7 @@ async fn upload_post_with_token(
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = if auth.is_some() {
-        require_auth_basic_scope(auth, "conda", "write")?.user_id
+        require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -3180,7 +3168,7 @@ async fn store_attestation(
     }
 
     // Look up the target package
-    let artifact_path = format!("{}/{}", subdir, filename);
+    let artifact_path = build_conda_artifact_path(subdir, filename);
     let artifact: (uuid::Uuid, String) = sqlx::query_as(
         "SELECT id, checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false LIMIT 1",
     )
@@ -3248,7 +3236,7 @@ async fn fetch_attestation(
     subdir: &str,
     filename: &str,
 ) -> Result<Response, Response> {
-    let artifact_path = format!("{}/{}", subdir, filename);
+    let artifact_path = build_conda_artifact_path(subdir, filename);
     let row: Option<(serde_json::Value,)> = sqlx::query_as(
         r#"
         SELECT am.metadata
@@ -3297,7 +3285,7 @@ async fn put_attestation(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
 }
@@ -3327,7 +3315,7 @@ async fn put_attestation_with_token(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = if auth.is_some() {
-        require_auth_basic_scope(auth, "conda", "write")?.user_id
+        require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -3363,7 +3351,7 @@ async fn store_conda_package(
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
     // Parse the filename using the existing conda_native handler
-    let conda_path = format!("{}/{}", subdir, filename);
+    let conda_path = build_conda_artifact_path(subdir, filename);
     let path_info = CondaNativeHandler::parse_path(&conda_path).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -3411,7 +3399,7 @@ async fn store_conda_package(
         format!("{:x}", md5::Digest::finalize(hasher))
     };
 
-    let artifact_path = format!("{}/{}", subdir, filename);
+    let artifact_path = build_conda_artifact_path(subdir, filename);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -3441,7 +3429,7 @@ async fn store_conda_package(
     .map_err(|e| e.into_response())?;
 
     // Store the file
-    let storage_key = format!("conda/{}/{}/{}", repo.id, subdir, filename);
+    let storage_key = build_conda_storage_key(&repo.id, subdir, filename);
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -3557,7 +3545,7 @@ async fn store_conda_package(
         "build": build_string,
         "build_number": build_number,
         "subdir": subdir,
-        "package_format": if filename.ends_with(".conda") { "v2" } else { "v1" },
+        "package_format": conda_package_format(filename),
         "depends": depends,
         "constrains": constrains,
         "license": license,
@@ -3608,14 +3596,14 @@ async fn store_conda_package(
         .status(StatusCode::CREATED)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({
-                "name": pkg_name,
-                "version": pkg_version,
-                "build": build_string,
-                "subdir": subdir,
-                "sha256": computed_sha256,
-                "size": size_bytes,
-            })
+            build_conda_upload_response(
+                &pkg_name,
+                &pkg_version,
+                &build_string,
+                subdir,
+                &computed_sha256,
+                size_bytes,
+            )
             .to_string(),
         ))
         .unwrap())
@@ -3655,79 +3643,96 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Path/JSON builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the artifact path for a conda package.
+fn build_conda_artifact_path(subdir: &str, filename: &str) -> String {
+    format!("{}/{}", subdir, filename)
+}
+
+/// Build the storage key for a conda package.
+fn build_conda_storage_key(repo_id: &uuid::Uuid, subdir: &str, filename: &str) -> String {
+    format!("conda/{}/{}/{}", repo_id, subdir, filename)
+}
+
+/// The `package_format` metadata value for a conda package filename.
+fn conda_package_format(filename: &str) -> &'static str {
+    if filename.ends_with(".conda") {
+        "v2"
+    } else {
+        "v1"
+    }
+}
+
+/// Build the upload response JSON.
+fn build_conda_upload_response(
+    name: &str,
+    version: &str,
+    build_string: &str,
+    subdir: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "build": build_string,
+        "subdir": subdir,
+        "sha256": sha256,
+        "size": size,
+    })
+}
+
+/// Build the base channeldata package entry (callers append optional fields).
+fn build_channeldata_package_entry(subdirs: &[String], version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "subdirs": subdirs,
+        "version": version,
+    })
+}
+
+/// Build the full channeldata.json envelope for a hosted repo.
+fn build_channeldata_json(
+    packages: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "channeldata_version": 1,
+        "packages": packages,
+        "subdirs": KNOWN_SUBDIRS,
+    })
+}
+
+/// Build the repodata.json envelope (CEP-15 `base_url` + `removed`).
+fn build_repodata_envelope(
+    subdir: &str,
+    base_url: &str,
+    packages: &serde_json::Map<String, serde_json::Value>,
+    packages_conda: &serde_json::Map<String, serde_json::Value>,
+    removed: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "info": {
+            "subdir": subdir,
+            "base_url": base_url,
+        },
+        "packages": packages,
+        "packages.conda": packages_conda,
+        "removed": removed,
+        "repodata_version": 1,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::header::IF_NONE_MATCH;
 
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Build the artifact path for a conda package.
-    fn build_conda_artifact_path(subdir: &str, filename: &str) -> String {
-        format!("{}/{}", subdir, filename)
-    }
-
-    /// Build the storage key for a conda package.
-    fn build_conda_storage_key(repo_id: &uuid::Uuid, subdir: &str, filename: &str) -> String {
-        format!("conda/{}/{}/{}", repo_id, subdir, filename)
-    }
-
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Return the appropriate content type for a conda package filename.
-    fn conda_content_type(filename: &str) -> &'static str {
-        if filename.ends_with(".conda") {
-            "application/octet-stream"
-        } else if filename.ends_with(".tar.bz2") {
-            "application/x-tar"
-        } else {
-            "application/octet-stream"
-        }
-    }
-
-    /// Build conda-specific metadata JSON.
-    fn build_conda_metadata(
-        name: &str,
-        version: &str,
-        build_string: &str,
-        subdir: &str,
-        filename: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "build": build_string,
-            "build_number": 0,
-            "subdir": subdir,
-            "package_format": if filename.ends_with(".conda") { "v2" } else { "v1" },
-            "depends": [],
-        })
-    }
-
-    /// Build the upload response JSON.
-    fn build_conda_upload_response(
-        name: &str,
-        version: &str,
-        build_string: &str,
-        subdir: &str,
-        sha256: &str,
-        size: i64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "build": build_string,
-            "subdir": subdir,
-            "sha256": sha256,
-            "size": size,
-        })
-    }
-
-    /// Build a single repodata entry for a package.
+    /// TEST FIXTURE: build a minimal repodata entry used as *input* to
+    /// merge/filter tests. The production entry builder is
+    /// `super::build_artifact_entry`.
     #[allow(clippy::too_many_arguments)]
     fn build_repodata_entry(
         name: &str,
@@ -3753,144 +3758,10 @@ mod tests {
         })
     }
 
-    /// Build a channeldata package entry.
-    fn build_channeldata_package_entry(subdirs: &[String], version: &str) -> serde_json::Value {
-        serde_json::json!({
-            "subdirs": subdirs,
-            "version": version,
-        })
-    }
-
-    /// Build the full channeldata.json response.
-    fn build_channeldata_json(
-        packages: &serde_json::Map<String, serde_json::Value>,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "channeldata_version": 1,
-            "packages": packages,
-            "subdirs": KNOWN_SUBDIRS,
-        })
-    }
-
-    /// Build repodata entries from CondaArtifacts (mirrors build_repodata logic).
-    fn build_repodata_entries(
-        artifacts: &[&CondaArtifact],
-        subdir: &str,
-        packages: &mut serde_json::Map<String, serde_json::Value>,
-        packages_conda: &mut serde_json::Map<String, serde_json::Value>,
-    ) {
-        for artifact in artifacts {
-            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-            if !is_conda_package(filename) {
-                continue;
-            }
-            let pkg_name = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("name").and_then(|v| v.as_str()))
-                .unwrap_or(&artifact.name);
-            let version = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("version").and_then(|v| v.as_str()))
-                .or(artifact.version.as_deref())
-                .unwrap_or("0");
-            let build = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("build").and_then(|v| v.as_str()))
-                .unwrap_or("0");
-            let build_number = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("build_number").and_then(|v| v.as_u64()))
-                .unwrap_or(0);
-            let depends = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("depends"))
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]));
-            let constrains = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("constrains"))
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]));
-            let license = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("license").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let license_family = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("license_family").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let timestamp = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("timestamp").and_then(|v| v.as_u64()));
-            let features = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("features").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let track_features = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("track_features").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let noarch = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("noarch").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let md5 = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("md5").and_then(|v| v.as_str()))
-                .unwrap_or("");
-
-            let mut entry = serde_json::json!({
-                "build": build,
-                "build_number": build_number,
-                "constrains": constrains,
-                "depends": depends,
-                "fn": filename,
-                "license": license,
-                "md5": md5,
-                "name": pkg_name,
-                "sha256": artifact.checksum_sha256,
-                "size": artifact.size_bytes,
-                "subdir": subdir,
-                "version": version,
-            });
-            if !license_family.is_empty() {
-                entry["license_family"] = serde_json::Value::String(license_family.to_string());
-            }
-            if let Some(ts) = timestamp {
-                entry["timestamp"] = serde_json::json!(ts);
-            }
-            if !features.is_empty() {
-                entry["features"] = serde_json::Value::String(features.to_string());
-            }
-            if !track_features.is_empty() {
-                entry["track_features"] = serde_json::Value::String(track_features.to_string());
-            }
-            if !noarch.is_empty() {
-                entry["noarch"] = serde_json::Value::String(noarch.to_string());
-            }
-
-            if is_conda_v2(filename) {
-                packages_conda.insert(filename.to_string(), entry);
-            } else {
-                packages.insert(filename.to_string(), entry);
-            }
-        }
-    }
-
-    /// Build the full repodata.json response for a subdir.
+    /// TEST FIXTURE: build an (old-shape) repodata document used as *input* to
+    /// merge/patch/filter tests. The production envelope (with CEP-15
+    /// `base_url` and `removed`) is `super::build_repodata_envelope`, which has
+    /// its own literal-pinned tests.
     fn build_repodata_json(
         subdir: &str,
         packages: &serde_json::Map<String, serde_json::Value>,
@@ -4061,12 +3932,18 @@ mod tests {
     #[test]
     fn test_conda_content_type() {
         assert_eq!(
-            conda_content_type("numpy.conda"),
+            conda_package_content_type("numpy.conda"),
             "application/octet-stream"
         );
-        assert_eq!(conda_content_type("numpy.tar.bz2"), "application/x-tar");
-        assert_eq!(conda_content_type("file.zip"), "application/octet-stream");
-        assert_eq!(conda_content_type(""), "application/octet-stream");
+        assert_eq!(
+            conda_package_content_type("numpy.tar.bz2"),
+            "application/x-tar"
+        );
+        assert_eq!(
+            conda_package_content_type("file.zip"),
+            "application/octet-stream"
+        );
+        assert_eq!(conda_package_content_type(""), "application/octet-stream");
     }
 
     // -----------------------------------------------------------------------
@@ -4074,39 +3951,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_conda_metadata_v2() {
-        let meta = build_conda_metadata(
-            "numpy",
-            "1.26.4",
-            "py312h02b7e37_0",
-            "linux-64",
-            "numpy-1.26.4-py312h02b7e37_0.conda",
+    fn test_conda_package_format_v2() {
+        assert_eq!(
+            conda_package_format("numpy-1.26.4-py312h02b7e37_0.conda"),
+            "v2"
         );
-        assert_eq!(meta["name"], "numpy");
-        assert_eq!(meta["version"], "1.26.4");
-        assert_eq!(meta["build"], "py312h02b7e37_0");
-        assert_eq!(meta["build_number"], 0);
-        assert_eq!(meta["subdir"], "linux-64");
-        assert_eq!(meta["package_format"], "v2");
     }
 
     #[test]
-    fn test_build_conda_metadata_v1() {
-        let meta = build_conda_metadata(
-            "requests",
-            "2.31.0",
-            "pyhd8ed1ab_0",
-            "noarch",
-            "requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+    fn test_conda_package_format_v1() {
+        assert_eq!(
+            conda_package_format("requests-2.31.0-pyhd8ed1ab_0.tar.bz2"),
+            "v1"
         );
-        assert_eq!(meta["package_format"], "v1");
-        assert_eq!(meta["subdir"], "noarch");
-    }
-
-    #[test]
-    fn test_build_conda_metadata_has_depends() {
-        let meta = build_conda_metadata("pkg", "1.0", "0", "noarch", "pkg.conda");
-        assert!(meta["depends"].as_array().unwrap().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -4142,50 +3999,6 @@ mod tests {
     fn test_build_conda_upload_response_zero_size() {
         let resp = build_conda_upload_response("pkg", "1.0", "0", "noarch", "hash", 0);
         assert_eq!(resp["size"], 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // build_repodata_entry
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_repodata_entry_all_fields() {
-        let depends = serde_json::json!(["python >=3.12", "libcblas >=3.9"]);
-        let entry = build_repodata_entry(
-            "numpy",
-            "1.26.4",
-            "py312h02b7e37_0",
-            0,
-            &depends,
-            "md5hash",
-            "sha256hash",
-            8192,
-            "linux-64",
-        );
-        assert_eq!(entry["name"], "numpy");
-        assert_eq!(entry["version"], "1.26.4");
-        assert_eq!(entry["build"], "py312h02b7e37_0");
-        assert_eq!(entry["build_number"], 0);
-        assert_eq!(entry["md5"], "md5hash");
-        assert_eq!(entry["sha256"], "sha256hash");
-        assert_eq!(entry["size"], 8192);
-        assert_eq!(entry["subdir"], "linux-64");
-        let deps = entry["depends"].as_array().unwrap();
-        assert_eq!(deps.len(), 2);
-    }
-
-    #[test]
-    fn test_build_repodata_entry_no_depends() {
-        let depends = serde_json::json!([]);
-        let entry = build_repodata_entry("pkg", "1.0", "0", 0, &depends, "", "sha", 100, "noarch");
-        assert!(entry["depends"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_build_repodata_entry_with_build_number() {
-        let depends = serde_json::json!([]);
-        let entry = build_repodata_entry("pkg", "1.0", "0", 5, &depends, "", "sha", 100, "noarch");
-        assert_eq!(entry["build_number"], 5);
     }
 
     // -----------------------------------------------------------------------
@@ -4252,21 +4065,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_repodata_json
+    // build_repodata_envelope (production envelope; CEP-15 base_url + removed)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_repodata_json_empty() {
+    fn test_build_repodata_envelope_empty() {
         let packages = serde_json::Map::new();
         let packages_conda = serde_json::Map::new();
-        let rd = build_repodata_json("linux-64", &packages, &packages_conda);
+        let rd = build_repodata_envelope(
+            "linux-64",
+            "/conda/my-conda/linux-64/",
+            &packages,
+            &packages_conda,
+            &serde_json::json!([]),
+        );
         assert_eq!(rd["info"]["subdir"], "linux-64");
+        assert_eq!(rd["info"]["base_url"], "/conda/my-conda/linux-64/");
         assert!(rd["packages"].as_object().unwrap().is_empty());
         assert!(rd["packages.conda"].as_object().unwrap().is_empty());
+        assert!(rd["removed"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn test_build_repodata_json_with_packages() {
+    fn test_build_repodata_envelope_with_packages() {
         let mut packages = serde_json::Map::new();
         packages.insert(
             "old.tar.bz2".to_string(),
@@ -4274,24 +4095,43 @@ mod tests {
         );
         let mut packages_conda = serde_json::Map::new();
         packages_conda.insert("new.conda".to_string(), serde_json::json!({"name": "new"}));
-        let rd = build_repodata_json("noarch", &packages, &packages_conda);
+        let rd = build_repodata_envelope(
+            "noarch",
+            "/conda/my-conda/noarch/",
+            &packages,
+            &packages_conda,
+            &serde_json::json!([]),
+        );
         assert_eq!(rd["packages"]["old.tar.bz2"]["name"], "old");
         assert_eq!(rd["packages.conda"]["new.conda"]["name"], "new");
     }
 
     #[test]
-    fn test_build_repodata_json_subdir() {
+    fn test_build_repodata_envelope_subdir_and_removed() {
         let packages = serde_json::Map::new();
         let packages_conda = serde_json::Map::new();
-        let rd = build_repodata_json("osx-arm64", &packages, &packages_conda);
+        let rd = build_repodata_envelope(
+            "osx-arm64",
+            "/conda/c/osx-arm64/",
+            &packages,
+            &packages_conda,
+            &serde_json::json!(["gone-1.0-0.conda"]),
+        );
         assert_eq!(rd["info"]["subdir"], "osx-arm64");
+        assert_eq!(rd["removed"][0], "gone-1.0-0.conda");
     }
 
     #[test]
-    fn test_repodata_json_has_repodata_version() {
+    fn test_build_repodata_envelope_has_repodata_version() {
         let packages = serde_json::Map::new();
         let packages_conda = serde_json::Map::new();
-        let rd = build_repodata_json("linux-64", &packages, &packages_conda);
+        let rd = build_repodata_envelope(
+            "linux-64",
+            "/conda/c/linux-64/",
+            &packages,
+            &packages_conda,
+            &serde_json::json!([]),
+        );
         assert_eq!(rd["repodata_version"], 1);
     }
 
@@ -4318,10 +4158,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "linux-64", &mut packages, &mut packages_conda);
-        let entry = &packages_conda["numpy-1.26.4-py312h02b7e37_0.conda"];
+        let shard = build_shard("linux-64", &artifacts);
+        let entry = &shard["packages.conda"]["numpy-1.26.4-py312h02b7e37_0.conda"];
         assert_eq!(entry["fn"], "numpy-1.26.4-py312h02b7e37_0.conda");
     }
 
@@ -4342,10 +4180,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "noarch", &mut packages, &mut packages_conda);
-        let entry = &packages["requests-2.31.0-pyhd8ed1ab_0.tar.bz2"];
+        let shard = build_shard("noarch", &artifacts);
+        let entry = &shard["packages"]["requests-2.31.0-pyhd8ed1ab_0.tar.bz2"];
         assert_eq!(entry["fn"], "requests-2.31.0-pyhd8ed1ab_0.tar.bz2");
     }
 
@@ -4367,10 +4203,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "noarch", &mut packages, &mut packages_conda);
-        let entry = &packages_conda["six-1.16.0-pyh6c4a22f_0.conda"];
+        let shard = build_shard("noarch", &artifacts);
+        let entry = &shard["packages.conda"]["six-1.16.0-pyh6c4a22f_0.conda"];
         assert_eq!(entry["noarch"], "python");
     }
 
@@ -4392,10 +4226,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "noarch", &mut packages, &mut packages_conda);
-        let entry = &packages_conda["font-ttf-1.0-0.conda"];
+        let shard = build_shard("noarch", &artifacts);
+        let entry = &shard["packages.conda"]["font-ttf-1.0-0.conda"];
         assert_eq!(entry["noarch"], "generic");
     }
 
@@ -4417,10 +4249,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "linux-64", &mut packages, &mut packages_conda);
-        let entry = &packages_conda["numpy-1.26.4-py312h_0.conda"];
+        let shard = build_shard("linux-64", &artifacts);
+        let entry = &shard["packages.conda"]["numpy-1.26.4-py312h_0.conda"];
         assert!(
             entry.get("noarch").is_none(),
             "arch-specific package should not have noarch field"
@@ -5175,168 +5005,98 @@ mod tests {
     // -----------------------------------------------------------------------
     // Repodata metadata fidelity (bead: artifact-keeper-09t)
     //
-    // Verify that build_repodata_entry (and by extension build_repodata)
-    // preserves all fields that conda clients need.
+    // Verify that the production entry builder (`build_artifact_entry`, used by
+    // both `build_repodata` and `build_shard`) preserves all fields that conda
+    // clients need. Expected values are hardcoded literals (#2657).
     // -----------------------------------------------------------------------
 
-    /// Enhanced repodata entry builder that includes all conda-spec fields.
-    #[allow(clippy::too_many_arguments)]
-    fn build_repodata_entry_full(
-        name: &str,
-        version: &str,
-        build: &str,
-        build_number: u64,
-        depends: &serde_json::Value,
-        constrains: &serde_json::Value,
-        license: &str,
-        md5: &str,
-        sha256: &str,
-        size: i64,
-        subdir: &str,
-        timestamp: Option<u64>,
-        features: &str,
-        track_features: &str,
-        license_family: &str,
-    ) -> serde_json::Value {
-        let mut entry = serde_json::json!({
-            "name": name,
-            "version": version,
-            "build": build,
-            "build_number": build_number,
-            "depends": depends,
-            "constrains": constrains,
-            "license": license,
-            "md5": md5,
-            "sha256": sha256,
-            "size": size,
-            "subdir": subdir,
-        });
-        if !license_family.is_empty() {
-            entry["license_family"] = serde_json::Value::String(license_family.to_string());
-        }
-        if let Some(ts) = timestamp {
-            entry["timestamp"] = serde_json::json!(ts);
-        }
-        if !features.is_empty() {
-            entry["features"] = serde_json::Value::String(features.to_string());
-        }
-        if !track_features.is_empty() {
-            entry["track_features"] = serde_json::Value::String(track_features.to_string());
-        }
-        entry
+    fn artifact_with_meta(name: &str, path: &str, meta: serde_json::Value) -> CondaArtifact {
+        make_conda_artifact(name, path, Some(meta))
     }
 
     #[test]
     fn test_repodata_entry_includes_constrains() {
-        let constrains = serde_json::json!(["numpy-base <0a0"]);
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "numpy",
-            "1.26.4",
-            "py312h02b7e37_0",
-            0,
-            &serde_json::json!(["python >=3.12"]),
-            &constrains,
-            "BSD-3-Clause",
-            "md5",
-            "sha256",
-            8192,
-            "linux-64",
-            None,
-            "",
-            "",
-            "",
+            "linux-64/numpy-1.26.4-py312h02b7e37_0.conda",
+            serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "build": "py312h02b7e37_0",
+                "depends": ["python >=3.12"],
+                "constrains": ["numpy-base <0a0"],
+            }),
         );
+        let entry = build_artifact_entry(&a, "numpy-1.26.4-py312h02b7e37_0.conda", "linux-64");
         assert_eq!(entry["constrains"].as_array().unwrap().len(), 1);
         assert_eq!(entry["constrains"][0], "numpy-base <0a0");
     }
 
     #[test]
     fn test_repodata_entry_includes_license() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "openssl",
-            "3.2.0",
-            "h0d3ecfb_1",
-            1,
-            &serde_json::json!(["ca-certificates"]),
-            &serde_json::json!([]),
-            "Apache-2.0",
-            "",
-            "",
-            0,
-            "linux-64",
-            None,
-            "",
-            "",
-            "Apache",
+            "linux-64/openssl-3.2.0-h0d3ecfb_1.conda",
+            serde_json::json!({
+                "name": "openssl",
+                "version": "3.2.0",
+                "build": "h0d3ecfb_1",
+                "license": "Apache-2.0",
+                "license_family": "Apache",
+            }),
         );
+        let entry = build_artifact_entry(&a, "openssl-3.2.0-h0d3ecfb_1.conda", "linux-64");
         assert_eq!(entry["license"], "Apache-2.0");
         assert_eq!(entry["license_family"], "Apache");
     }
 
     #[test]
     fn test_repodata_entry_includes_timestamp() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "pkg",
-            "1.0",
-            "0",
-            0,
-            &serde_json::json!([]),
-            &serde_json::json!([]),
-            "MIT",
-            "",
-            "",
-            0,
-            "noarch",
-            Some(1709000000000),
-            "",
-            "",
-            "",
+            "noarch/pkg-1.0-0.conda",
+            serde_json::json!({
+                "name": "pkg",
+                "version": "1.0",
+                "build": "0",
+                "timestamp": 1709000000000_u64,
+            }),
         );
+        let entry = build_artifact_entry(&a, "pkg-1.0-0.conda", "noarch");
         assert_eq!(entry["timestamp"], 1709000000000_u64);
     }
 
     #[test]
     fn test_repodata_entry_includes_features() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "mkl",
-            "2024.0",
-            "h5e30980_0",
-            0,
-            &serde_json::json!([]),
-            &serde_json::json!([]),
-            "Intel License",
-            "",
-            "",
-            0,
-            "linux-64",
-            None,
-            "mkl",
-            "mkl",
-            "",
+            "linux-64/mkl-2024.0-h5e30980_0.conda",
+            serde_json::json!({
+                "name": "mkl",
+                "version": "2024.0",
+                "build": "h5e30980_0",
+                "features": "mkl",
+                "track_features": "mkl",
+            }),
         );
+        let entry = build_artifact_entry(&a, "mkl-2024.0-h5e30980_0.conda", "linux-64");
         assert_eq!(entry["features"], "mkl");
         assert_eq!(entry["track_features"], "mkl");
     }
 
     #[test]
     fn test_repodata_entry_omits_empty_optional_fields() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "simple",
-            "1.0",
-            "0",
-            0,
-            &serde_json::json!([]),
-            &serde_json::json!([]),
-            "MIT",
-            "",
-            "",
-            0,
-            "noarch",
-            None,
-            "",
-            "",
-            "",
+            "noarch/simple-1.0-0.conda",
+            serde_json::json!({
+                "name": "simple",
+                "version": "1.0",
+                "build": "0",
+                "license": "MIT",
+            }),
         );
+        let entry = build_artifact_entry(&a, "simple-1.0-0.conda", "noarch");
         // Optional fields should be absent, not empty strings
         assert!(entry.get("timestamp").is_none());
         assert!(entry.get("features").is_none());
@@ -5346,54 +5106,43 @@ mod tests {
 
     #[test]
     fn test_repodata_entry_preserves_empty_depends() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "pkg",
-            "1.0",
-            "0",
-            0,
-            &serde_json::json!([]),
-            &serde_json::json!([]),
-            "",
-            "",
-            "",
-            0,
-            "noarch",
-            None,
-            "",
-            "",
-            "",
+            "noarch/pkg-1.0-0.conda",
+            serde_json::json!({
+                "name": "pkg",
+                "version": "1.0",
+                "build": "0",
+                "depends": [],
+                "constrains": [],
+            }),
         );
+        let entry = build_artifact_entry(&a, "pkg-1.0-0.conda", "noarch");
         assert!(entry["depends"].as_array().unwrap().is_empty());
         assert!(entry["constrains"].as_array().unwrap().is_empty());
     }
 
     #[test]
     fn test_repodata_entry_preserves_complex_depends() {
-        let depends = serde_json::json!([
-            "python >=3.8,<3.13",
-            "numpy >=1.21",
-            "scipy >=1.7",
-            "pandas >=1.3",
-            "libgcc-ng >=12"
-        ]);
-        let constrains = serde_json::json!(["scikit-learn-intelex >=2024.0", "daal4py >=2024.0"]);
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "scikit-learn",
-            "1.4.0",
-            "py312h7e6f82a_0",
-            0,
-            &depends,
-            &constrains,
-            "BSD-3-Clause",
-            "",
-            "",
-            0,
-            "linux-64",
-            Some(1706000000000),
-            "",
-            "",
-            "BSD",
+            "linux-64/scikit-learn-1.4.0-py312h7e6f82a_0.conda",
+            serde_json::json!({
+                "name": "scikit-learn",
+                "version": "1.4.0",
+                "build": "py312h7e6f82a_0",
+                "depends": [
+                    "python >=3.8,<3.13",
+                    "numpy >=1.21",
+                    "scipy >=1.7",
+                    "pandas >=1.3",
+                    "libgcc-ng >=12"
+                ],
+                "constrains": ["scikit-learn-intelex >=2024.0", "daal4py >=2024.0"],
+            }),
         );
+        let entry =
+            build_artifact_entry(&a, "scikit-learn-1.4.0-py312h7e6f82a_0.conda", "linux-64");
         assert_eq!(entry["depends"].as_array().unwrap().len(), 5);
         assert_eq!(entry["constrains"].as_array().unwrap().len(), 2);
     }
@@ -5464,16 +5213,16 @@ mod tests {
     }
 
     #[test]
-    fn test_noarch_package_metadata_has_noarch_field() {
-        // Verify that metadata for noarch packages includes the subdir field
-        let meta = build_conda_metadata(
+    fn test_noarch_package_entry_has_subdir_field() {
+        // Verify a noarch artifact's repodata entry carries the subdir field.
+        let artifact = make_conda_artifact(
             "requests",
-            "2.31.0",
-            "pyhd8ed1ab_0",
-            "noarch",
-            "requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+            "noarch/requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+            Some(serde_json::json!({"subdir": "noarch"})),
         );
-        assert_eq!(meta["subdir"], "noarch");
+        let entry =
+            build_artifact_entry(&artifact, "requests-2.31.0-pyhd8ed1ab_0.tar.bz2", "noarch");
+        assert_eq!(entry["subdir"], "noarch");
     }
 
     // -----------------------------------------------------------------------
@@ -5692,15 +5441,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_conda_metadata_includes_package_format_v2() {
-        let meta = build_conda_metadata("pkg", "1.0", "0", "linux-64", "pkg-1.0-0.conda");
-        assert_eq!(meta["package_format"], "v2");
+    fn test_conda_package_format_pin_v2() {
+        assert_eq!(conda_package_format("pkg-1.0-0.conda"), "v2");
     }
 
     #[test]
-    fn test_build_conda_metadata_includes_package_format_v1() {
-        let meta = build_conda_metadata("pkg", "1.0", "0", "linux-64", "pkg-1.0-0.tar.bz2");
-        assert_eq!(meta["package_format"], "v1");
+    fn test_conda_package_format_pin_v1() {
+        assert_eq!(conda_package_format("pkg-1.0-0.tar.bz2"), "v1");
     }
 
     // -----------------------------------------------------------------------
@@ -6884,10 +6631,13 @@ mod tests {
     fn test_proxy_content_type_for_formats() {
         // Proxy should use correct content type for each format
         assert_eq!(
-            conda_content_type("numpy.conda"),
+            conda_package_content_type("numpy.conda"),
             "application/octet-stream"
         );
-        assert_eq!(conda_content_type("requests.tar.bz2"), "application/x-tar");
+        assert_eq!(
+            conda_package_content_type("requests.tar.bz2"),
+            "application/x-tar"
+        );
     }
 
     // =======================================================================

@@ -103,6 +103,58 @@ pub(crate) fn dependency_track_probe_url(config: &Config) -> Option<&str> {
     config.dependency_track_url.as_deref()
 }
 
+/// Resolve optional HTTP Basic credentials for a probe, matching
+/// `OpenSearchService::new`: auth is applied only when **both** username
+/// and password are present. A single-sided credential must not partially
+/// authenticate (issue #2944).
+pub(crate) fn optional_basic_auth<'a>(
+    username: Option<&'a str>,
+    password: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    match (username, password) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    }
+}
+
+/// OpenSearch monitor credentials from app config (same Basic rule as
+/// the search client). Free function so unit tests can pin the matrix
+/// without a database or live cluster.
+pub(crate) fn opensearch_probe_basic_auth(config: &Config) -> Option<(&str, &str)> {
+    optional_basic_auth(
+        config.opensearch_username.as_deref(),
+        config.opensearch_password.as_deref(),
+    )
+}
+
+/// Issue a GET probe and map the outcome to monitor status strings.
+///
+/// When `basic` is `Some((user, pass))`, send HTTP Basic auth — required
+/// for secured OpenSearch (e.g. AWS managed + FGAC) so monitoring does
+/// not false-red with HTTP 401 while search still works (issue #2944).
+pub(crate) async fn probe_http_endpoint(
+    client: &Client,
+    full_url: &str,
+    basic: Option<(&str, &str)>,
+) -> (String, Option<String>) {
+    let mut req = client.get(full_url);
+    if let Some((user, pass)) = basic {
+        req = req.basic_auth(user, Some(pass));
+    }
+
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => ("healthy".to_string(), None),
+        Ok(resp) => (
+            "unhealthy".to_string(),
+            Some(format!("HTTP {}", resp.status())),
+        ),
+        Err(e) => (
+            "unavailable".to_string(),
+            Some(format!("Connection failed: {}", e)),
+        ),
+    }
+}
+
 impl HealthMonitorService {
     pub fn new(db: PgPool, config: MonitorConfig) -> Self {
         let http_client = crate::services::http_client::internal_service_client_builder()
@@ -118,26 +170,22 @@ impl HealthMonitorService {
     }
 
     /// Check a single service's health and record the result.
+    ///
+    /// `basic_auth` is optional HTTP Basic credentials. OpenSearch probes
+    /// pass `OPENSEARCH_USERNAME`/`OPENSEARCH_PASSWORD` when both are set
+    /// so secured clusters are not false-red (issue #2944). Other services
+    /// pass `None`.
     pub async fn check_service(
         &self,
         service_name: &str,
         url: &str,
         health_path: &str,
+        basic_auth: Option<(&str, &str)>,
     ) -> Result<ServiceHealthEntry> {
         let full_url = format!("{}{}", url.trim_end_matches('/'), health_path);
         let start = std::time::Instant::now();
 
-        let (status, message) = match self.http_client.get(&full_url).send().await {
-            Ok(resp) if resp.status().is_success() => ("healthy".to_string(), None),
-            Ok(resp) => (
-                "unhealthy".to_string(),
-                Some(format!("HTTP {}", resp.status())),
-            ),
-            Err(e) => (
-                "unavailable".to_string(),
-                Some(format!("Connection failed: {}", e)),
-            ),
-        };
+        let (status, message) = probe_http_endpoint(&self.http_client, &full_url, basic_auth).await;
 
         let response_time_ms = start.elapsed().as_millis() as i32;
 
@@ -244,20 +292,27 @@ impl HealthMonitorService {
 
         // Trivy
         if let Some(url) = &app_config.trivy_url {
-            results.push(self.check_service("trivy", url, "/healthz").await?);
+            results.push(self.check_service("trivy", url, "/healthz", None).await?);
         }
 
-        // OpenSearch
+        // OpenSearch — apply Basic when both username and password are set
+        // (same rule as OpenSearchService). Without credentials the probe
+        // stays anonymous for DISABLE_SECURITY_PLUGIN / local compose.
         if let Some(url) = &app_config.opensearch_url {
             results.push(
-                self.check_service("opensearch", url, "/_cluster/health")
-                    .await?,
+                self.check_service(
+                    "opensearch",
+                    url,
+                    "/_cluster/health",
+                    opensearch_probe_basic_auth(app_config),
+                )
+                .await?,
             );
         }
 
         // OpenSCAP
         if let Some(url) = &app_config.openscap_url {
-            results.push(self.check_service("openscap", url, "/health").await?);
+            results.push(self.check_service("openscap", url, "/health", None).await?);
         }
 
         // Dependency-Track
@@ -275,7 +330,7 @@ impl HealthMonitorService {
         // no probes, no log entries, and no alert-state churn.
         if let Some(url) = dependency_track_probe_url(app_config) {
             results.push(
-                self.check_service("dependency-track", url, "/api/version")
+                self.check_service("dependency-track", url, "/api/version", None)
                     .await?,
             );
         }
@@ -855,5 +910,129 @@ mod tests {
         let cfg = Config::default();
         assert!(!cfg.dependency_track_enabled);
         assert!(dependency_track_probe_url(&cfg).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // OpenSearch Basic auth for HealthMonitor probes (issue #2944)
+    //
+    // Must match OpenSearchService::new: Basic only when both username and
+    // password are present. Single-sided credentials must not partially
+    // authenticate. probe_http_endpoint must attach Authorization when
+    // credentials are provided so secured clusters are not false-red.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_optional_basic_auth_both_present() {
+        assert_eq!(
+            optional_basic_auth(Some("admin"), Some("s3cret")),
+            Some(("admin", "s3cret"))
+        );
+    }
+
+    #[test]
+    fn test_optional_basic_auth_only_username() {
+        assert!(optional_basic_auth(Some("admin"), None).is_none());
+    }
+
+    #[test]
+    fn test_optional_basic_auth_only_password() {
+        assert!(optional_basic_auth(None, Some("s3cret")).is_none());
+    }
+
+    #[test]
+    fn test_optional_basic_auth_neither() {
+        assert!(optional_basic_auth(None, None).is_none());
+    }
+
+    #[test]
+    fn test_opensearch_probe_basic_auth_from_config() {
+        let with_both = Config {
+            opensearch_username: Some("os-user".into()),
+            opensearch_password: Some("os-pass".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            opensearch_probe_basic_auth(&with_both),
+            Some(("os-user", "os-pass"))
+        );
+
+        let username_only = Config {
+            opensearch_username: Some("os-user".into()),
+            opensearch_password: None,
+            ..Config::default()
+        };
+        assert!(opensearch_probe_basic_auth(&username_only).is_none());
+
+        let neither = Config::default();
+        assert!(opensearch_probe_basic_auth(&neither).is_none());
+    }
+
+    /// Regression for #2944: without Basic, a secured endpoint returns 401
+    /// (false unhealthy). With matching Basic, the same endpoint returns 200.
+    ///
+    /// Uses a plain reqwest client and a loopback TCP listener (not the
+    /// SSRF-guarded monitor client) so the test only pins Authorization
+    /// header behavior.
+    #[tokio::test]
+    async fn test_probe_http_endpoint_basic_auth_required() {
+        use base64::Engine;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("admin:s3cret")
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_header = expected.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let authorized = req.lines().any(|line| {
+                        line.eq_ignore_ascii_case(&format!("Authorization: {expected_header}"))
+                    });
+                    let body = if authorized {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            as &[u8]
+                    } else {
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = sock.write_all(body).await;
+                }
+            }
+        });
+
+        // Plain client: no SSRF resolver. Only testing header attachment.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/_cluster/health");
+
+        let (status_no_auth, msg_no_auth) = probe_http_endpoint(&client, &url, None).await;
+        assert_eq!(
+            status_no_auth, "unhealthy",
+            "anonymous probe against secured endpoint must be unhealthy: {msg_no_auth:?}"
+        );
+        assert!(
+            msg_no_auth.as_deref().is_some_and(|m| m.contains("401")),
+            "expected HTTP 401 message, got {msg_no_auth:?}"
+        );
+
+        let (status_auth, msg_auth) =
+            probe_http_endpoint(&client, &url, Some(("admin", "s3cret"))).await;
+        assert_eq!(
+            status_auth, "healthy",
+            "Basic-authenticated probe must be healthy: {msg_auth:?}"
+        );
+        assert!(msg_auth.is_none());
+
+        let _ = server.await;
     }
 }

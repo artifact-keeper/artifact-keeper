@@ -182,6 +182,12 @@ lettre.workspace = true
 
 # Allocators
 mimalloc = { version = "0.1", optional = true }
+
+# Unicode confusable (UTS #39 skeleton) + mixed-script detection for
+# typo-squat curation rules (#2956)
+unicode-security = "0.1.2"
+unicode-normalization = "0.1.25"
+
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }

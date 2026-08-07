@@ -102,41 +102,47 @@ fn build_composer_proxy_response(content: Bytes, content_type: Option<String>) -
         .unwrap()
 }
 
-/// Keys from composer.json that should be merged into version entries.
-const COMPOSER_METADATA_KEYS: &[&str] = &[
-    "description",
-    "type",
-    "license",
-    "require",
-    "require-dev",
-    "autoload",
-    "authors",
-    "keywords",
-    "homepage",
-];
+/// Keys of a composer version entry that are OWNED by the metadata builder and
+/// must never be overwritten by values merged from the stored composer.json.
+/// `name`/`version` carry the authoritative artifact identity, `dist`/`source`
+/// the download coordinates the download route matches on, and `uid` the
+/// Composer-required inline identifier — an uploaded composer.json must not be
+/// able to spoof any of them. Every OTHER property is copied through verbatim
+/// (#2846).
+const COMPOSER_RESERVED_ENTRY_KEYS: &[&str] = &["name", "version", "dist", "source", "uid"];
 
 /// Merge composer.json metadata fields into a version entry JSON object.
+///
+/// Every property from the stored `composer` document is preserved EXCEPT the
+/// builder-owned keys in [`COMPOSER_RESERVED_ENTRY_KEYS`]. Previously only a
+/// fixed nine-key allowlist was copied, which silently dropped valid Composer
+/// schema properties such as `bin` and `extra`; that broke `vendor/bin`
+/// symlinks and made composer-plugin installs fail ("composer-plugin packages
+/// should have a class defined in their extra key") (#2846).
 fn merge_composer_metadata(
     version_entry: &mut serde_json::Value,
     metadata: Option<&serde_json::Value>,
 ) {
-    let composer = metadata.and_then(|m| m.get("composer"));
-
-    let Some(composer) = composer else {
+    let Some(composer) = metadata.and_then(|m| m.get("composer")) else {
+        return;
+    };
+    let Some(composer_obj) = composer.as_object() else {
         return;
     };
 
-    for key in COMPOSER_METADATA_KEYS {
-        if let Some(val) = composer.get(*key) {
-            // Skip JSON null so absent optional fields are omitted from the
-            // version entry rather than serialized as `"field": null`. This
-            // matters for records stored before ComposerJson gained
-            // `skip_serializing_if`, whose metadata still carries null fields
-            // (#1781).
-            if !val.is_null() {
-                version_entry[*key] = val.clone();
-            }
+    for (key, val) in composer_obj {
+        if COMPOSER_RESERVED_ENTRY_KEYS.contains(&key.as_str()) {
+            continue;
         }
+        // Skip JSON null so absent optional fields are omitted from the
+        // version entry rather than serialized as `"field": null`. This
+        // matters for records stored before ComposerJson gained
+        // `skip_serializing_if`, whose metadata still carries null fields
+        // (#1781).
+        if val.is_null() {
+            continue;
+        }
+        version_entry[key.as_str()] = val.clone();
     }
 }
 
@@ -257,8 +263,8 @@ fn build_packages_index(
         // Composer's `ComposerRepository` requires a `uid` on every inline
         // ("partial") version object embedded in the root packages.json; inject
         // it here (only the inline root-doc path) so the v2 `p2`/v1 wire shapes
-        // stay untouched. `COMPOSER_METADATA_KEYS` has no `uid`, so the metadata
-        // merge inside `build_version_entry` cannot clobber it (#2250).
+        // stay untouched. `uid` is in `COMPOSER_RESERVED_ENTRY_KEYS`, so the
+        // metadata merge inside `build_version_entry` cannot clobber it (#2250).
         if let Some(obj) = entry.as_object_mut() {
             obj.insert(
                 "uid".to_string(),
@@ -1563,7 +1569,7 @@ async fn upload(
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "composer", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "composer", "write:artifacts")?.user_id;
     let repo = resolve_composer_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -2146,6 +2152,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -2611,25 +2618,88 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // COMPOSER_METADATA_KEYS
+    // COMPOSER_RESERVED_ENTRY_KEYS
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_composer_metadata_keys_count() {
-        assert_eq!(COMPOSER_METADATA_KEYS.len(), 9);
+    fn test_composer_reserved_entry_keys() {
+        // The builder-owned keys that a merged composer.json must never spoof.
+        for k in ["name", "version", "dist", "source", "uid"] {
+            assert!(
+                COMPOSER_RESERVED_ENTRY_KEYS.contains(&k),
+                "`{}` must be a reserved entry key",
+                k
+            );
+        }
+        // Real composer schema properties must NOT be reserved (they flow
+        // through the merge).
+        for k in ["bin", "extra", "scripts", "require", "type", "autoload"] {
+            assert!(
+                !COMPOSER_RESERVED_ENTRY_KEYS.contains(&k),
+                "`{}` must NOT be reserved — it has to pass through",
+                k
+            );
+        }
     }
 
+    // #2846: every valid composer.json property (not just the old nine-key
+    // allowlist) must survive into the served version entry. `bin` and `extra`
+    // are the fields the reporter needed for composer-plugin installs.
     #[test]
-    fn test_composer_metadata_keys_contains_required() {
-        assert!(COMPOSER_METADATA_KEYS.contains(&"description"));
-        assert!(COMPOSER_METADATA_KEYS.contains(&"type"));
-        assert!(COMPOSER_METADATA_KEYS.contains(&"license"));
-        assert!(COMPOSER_METADATA_KEYS.contains(&"require"));
-        assert!(COMPOSER_METADATA_KEYS.contains(&"require-dev"));
-        assert!(COMPOSER_METADATA_KEYS.contains(&"autoload"));
-        assert!(COMPOSER_METADATA_KEYS.contains(&"authors"));
-        assert!(COMPOSER_METADATA_KEYS.contains(&"keywords"));
-        assert!(COMPOSER_METADATA_KEYS.contains(&"homepage"));
+    fn test_merge_composer_metadata_preserves_bin_and_extra() {
+        let mut entry = serde_json::json!({"name": "vendor/pkg", "version": "1.0.0"});
+        let metadata = serde_json::json!({
+            "composer": {
+                "type": "composer-plugin",
+                "bin": ["bin/dummy"],
+                "extra": {"class": "SNSConsulting\\DummyPackage\\Plugin"},
+                "scripts": {"post-install-cmd": "echo hi"},
+                "minimum-stability": "dev",
+                "prefer-stable": true
+            }
+        });
+        merge_composer_metadata(&mut entry, Some(&metadata));
+
+        assert_eq!(entry["type"], "composer-plugin");
+        assert_eq!(entry["bin"], serde_json::json!(["bin/dummy"]));
+        assert_eq!(
+            entry["extra"]["class"],
+            "SNSConsulting\\DummyPackage\\Plugin"
+        );
+        assert_eq!(entry["scripts"]["post-install-cmd"], "echo hi");
+        assert_eq!(entry["minimum-stability"], "dev");
+        assert_eq!(entry["prefer-stable"], true);
+    }
+
+    // #2846: an uploaded composer.json must not be able to overwrite the
+    // builder-owned identity/download keys via the merge.
+    #[test]
+    fn test_merge_composer_metadata_does_not_clobber_reserved_keys() {
+        let mut entry = serde_json::json!({
+            "name": "vendor/pkg",
+            "version": "1.0.0",
+            "dist": {"type": "zip", "url": "https://ak/real.zip", "reference": "abc"},
+        });
+        let metadata = serde_json::json!({
+            "composer": {
+                "name": "attacker/evil",
+                "version": "9.9.9",
+                "dist": {"type": "zip", "url": "https://evil/x.zip"},
+                "source": {"url": "https://evil/src"},
+                "uid": 1,
+                "extra": {"class": "Legit\\Plugin"}
+            }
+        });
+        merge_composer_metadata(&mut entry, Some(&metadata));
+
+        // Reserved keys keep their builder-provided values.
+        assert_eq!(entry["name"], "vendor/pkg");
+        assert_eq!(entry["version"], "1.0.0");
+        assert_eq!(entry["dist"]["url"], "https://ak/real.zip");
+        assert!(entry.get("source").is_none());
+        assert!(entry.get("uid").is_none());
+        // Non-reserved property still flows through.
+        assert_eq!(entry["extra"]["class"], "Legit\\Plugin");
     }
 
     // -----------------------------------------------------------------------

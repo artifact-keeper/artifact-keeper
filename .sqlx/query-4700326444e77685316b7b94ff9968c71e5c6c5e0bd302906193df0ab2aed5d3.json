@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy,\n                                      block_on_policy_violation, severity_threshold)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            ON CONFLICT (repository_id)\n            DO UPDATE SET\n                scan_enabled = EXCLUDED.scan_enabled,\n                scan_on_upload = EXCLUDED.scan_on_upload,\n                scan_on_proxy = EXCLUDED.scan_on_proxy,\n                block_on_policy_violation = EXCLUDED.block_on_policy_violation,\n                severity_threshold = EXCLUDED.severity_threshold,\n                updated_at = NOW()\n            RETURNING id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,\n                      block_on_policy_violation, severity_threshold, created_at, updated_at\n            ",
+  "query": "\n            SELECT id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,\n                   block_on_policy_violation, severity_threshold, proxy_scan_action,\n                   created_at, updated_at\n            FROM scan_configs\n            WHERE repository_id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -40,23 +40,23 @@
       },
       {
         "ordinal": 7,
+        "name": "proxy_scan_action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Bool",
-        "Bool",
-        "Bool",
-        "Bool",
-        "Varchar"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -68,8 +68,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "b20930c60991998742298cdbd679688356deac260e84dc5738ec400bee583224"
+  "hash": "4700326444e77685316b7b94ff9968c71e5c6c5e0bd302906193df0ab2aed5d3"
 }
