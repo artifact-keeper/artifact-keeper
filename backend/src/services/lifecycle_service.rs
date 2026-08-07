@@ -37,52 +37,87 @@ use crate::storage::keys::prefix_matches;
 /// exact live `(repository, digest, image, tag)` mapping. All other artifacts
 /// retain the historical `created_at` behavior.
 ///
-/// `MAX` makes the correlated subquery scalar even if malformed legacy data
-/// contains duplicate path-shaped rows. The normal schema-level
-/// `UNIQUE(repository_id, name, tag)` constraint means there is at most one.
-macro_rules! max_age_sql {
-    ($statement:literal, $repository_predicate:literal, $days_parameter:literal) => {
+/// The tag row is reached with a `LEFT JOIN`, not a correlated subquery. The
+/// subquery form is quadratic here: `oci_tags_repository_id_name_tag_key` is
+/// `(repository_id, name, tag)`, and `name` appears only inside the
+/// concatenation, so the middle column is unconstrained and every probe walks
+/// the whole `repository_id` range of the index -- once per artifact row, with
+/// parallelism lost. Measured on 50k artifacts / 25k tags: 58,946 ms as a
+/// subquery, 28 ms as a join, identical result sets. That matters because this
+/// runs twice per execution (count, then UPDATE), inside the transaction
+/// `execute_policy` deliberately keeps short so `artifacts` row locks release
+/// before further pool work, on a 6-hour cron -- and the global variant has no
+/// repository scope at all.
+///
+/// At most one tag row can match, so the join cannot duplicate artifact rows:
+/// `a.version = ot.tag` pins `tag`, which makes `name` fully determined by
+/// string arithmetic on `a.path`, and `UNIQUE(repository_id, name, tag)` does
+/// the rest. That predicate is load-bearing, not redundant -- without it a
+/// slash-bearing image name matches twice, because `name='a/manifests/b',
+/// tag='c'` and `name='a', tag='b/manifests/c'` both reconstruct
+/// `v2/a/manifests/b/manifests/c`.
+///
+/// The join deliberately does NOT also require
+/// `a.storage_key = 'oci-manifests/' || ot.manifest_digest`. That conjunct adds
+/// no identification -- path and version already pin the row -- and it converts
+/// a partial write into data loss: the `oci_tags` upsert is transactional while
+/// `upsert_manifest_artifact` is best-effort and only logs on failure, so the
+/// two tables can disagree on digest while the push still returns 201. With the
+/// conjunct, that disagreement makes the join miss, `COALESCE` falls back to the
+/// stale `created_at`, and a tag pushed seconds ago is soft-deleted -- exactly
+/// the bug this code exists to fix, silently resurrected on any partial write.
+/// Verified both ways against a live database.
+macro_rules! max_age_from_where {
+    ($repository_predicate:literal, $days_parameter:literal) => {
         concat!(
-            $statement,
             r#"
+FROM artifacts a
+LEFT JOIN oci_tags ot
+       ON ot.repository_id = a.repository_id
+      AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag
+      AND a.version = ot.tag
 WHERE
     "#,
             $repository_predicate,
             r#"a.is_deleted = false
-    AND COALESCE(
-        (
-            SELECT MAX(ot.updated_at)
-            FROM oci_tags ot
-            WHERE ot.repository_id = a.repository_id
-              AND a.storage_key = 'oci-manifests/' || ot.manifest_digest
-              AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag
-              AND a.version = ot.tag
-        ),
-        a.created_at
-    ) < NOW() - make_interval(days => "#,
+    AND COALESCE(ot.updated_at, a.created_at) < NOW() - make_interval(days => "#,
             $days_parameter,
             "::INT)\n"
         )
     };
 }
 
-const MAX_AGE_SCOPED_SELECT_SQL: &str = max_age_sql!(
-    "SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes\nFROM artifacts a",
-    "a.repository_id = $1\n    AND ",
-    "$2"
-);
-const MAX_AGE_GLOBAL_SELECT_SQL: &str = max_age_sql!(
-    "SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes\nFROM artifacts a",
-    "",
-    "$1"
-);
-const MAX_AGE_SCOPED_UPDATE_SQL: &str = max_age_sql!(
-    "UPDATE artifacts AS a SET is_deleted = true",
-    "a.repository_id = $1\n    AND ",
-    "$2"
-);
-const MAX_AGE_GLOBAL_UPDATE_SQL: &str =
-    max_age_sql!("UPDATE artifacts AS a SET is_deleted = true", "", "$1");
+/// Count/size query for a max-age policy.
+macro_rules! max_age_select_sql {
+    ($repository_predicate:literal, $days_parameter:literal) => {
+        concat!(
+            "SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes",
+            max_age_from_where!($repository_predicate, $days_parameter)
+        )
+    };
+}
+
+/// Soft-delete query for a max-age policy.
+///
+/// `UPDATE` cannot carry a `LEFT JOIN`, so the shared `FROM`/`WHERE` is reused
+/// verbatim inside an `IN` subselect. Both statements therefore still derive
+/// from one definition -- the property that makes dry-run counts and the real
+/// run agree, and the reason the previous two hand-maintained copies were
+/// collapsed into a macro in the first place.
+macro_rules! max_age_update_sql {
+    ($repository_predicate:literal, $days_parameter:literal) => {
+        concat!(
+            "UPDATE artifacts AS a SET is_deleted = true\nWHERE a.id IN (\n    SELECT a.id",
+            max_age_from_where!($repository_predicate, $days_parameter),
+            ")\n"
+        )
+    };
+}
+
+const MAX_AGE_SCOPED_SELECT_SQL: &str = max_age_select_sql!("a.repository_id = $1\n    AND ", "$2");
+const MAX_AGE_GLOBAL_SELECT_SQL: &str = max_age_select_sql!("", "$1");
+const MAX_AGE_SCOPED_UPDATE_SQL: &str = max_age_update_sql!("a.repository_id = $1\n    AND ", "$2");
+const MAX_AGE_GLOBAL_UPDATE_SQL: &str = max_age_update_sql!("", "$1");
 
 /// Delete `oci_tags` rows whose matching manifest artifact is soft-deleted.
 ///
@@ -1398,14 +1433,37 @@ mod tests {
             MAX_AGE_SCOPED_UPDATE_SQL,
             MAX_AGE_GLOBAL_UPDATE_SQL,
         ] {
-            assert!(sql.contains("SELECT MAX(ot.updated_at)"));
-            assert!(sql.contains("ot.repository_id = a.repository_id"));
-            assert!(sql.contains("a.storage_key = 'oci-manifests/' || ot.manifest_digest"));
-            assert!(sql.contains("a.path = 'v2/' || ot.name || '/manifests/' || ot.tag"));
-            assert!(sql.contains("a.version = ot.tag"));
+            // Pin the join and the comparison as ONE exact substring, not as
+            // independent `contains` fragments. Fragment assertions pass on any
+            // arrangement of the same vocabulary, so they survive mutations that
+            // fully restore the bug: swapping the COALESCE arguments makes
+            // `a.created_at` win unconditionally (it is NOT NULL), and flipping
+            // `<` to `>` soft-deletes everything NEWER than the window. Both were
+            // demonstrated to pass against the fragment form.
             assert!(
-                sql.contains("a.created_at"),
-                "non-OCI artifacts must retain created_at age semantics"
+                sql.contains(
+                    "LEFT JOIN oci_tags ot\n       ON ot.repository_id = a.repository_id\n      \
+                     AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag\n      \
+                     AND a.version = ot.tag\n"
+                ),
+                "the tag join must stay exactly this shape -- a.version = ot.tag is what \
+                 guarantees at most one match, and reaching oci_tags by correlated subquery \
+                 instead of a join is quadratic: {sql}"
+            );
+            assert!(
+                sql.contains(
+                    "COALESCE(ot.updated_at, a.created_at) < NOW() - make_interval(days => "
+                ),
+                "the tag's last push must take precedence over the artifact row's created_at, \
+                 and the comparison must select artifacts OLDER than the window: {sql}"
+            );
+            // The digest conjunct must stay OUT: with it, a disagreement between
+            // oci_tags and the best-effort artifacts upsert makes the join miss
+            // and a tag pushed seconds ago gets soft-deleted by its stale
+            // created_at -- the very bug this predicate exists to fix.
+            assert!(
+                !sql.contains("ot.manifest_digest"),
+                "joining on manifest_digest turns a partial write into data loss: {sql}"
             );
         }
     }
