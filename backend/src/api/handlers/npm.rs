@@ -2559,11 +2559,21 @@ async fn fetch_virtual_packument(
 const NPM_TARBALL_CONTENT_TYPE: &str = "application/gzip";
 
 /// Build a streaming tarball response from a storage stream.
+///
+/// `content_encoding` carries the upstream `Content-Encoding` for proxied
+/// serves (#3149). Since #2915 the proxy pins `Accept-Encoding: identity` and
+/// disables transparent decoding, so a content-coded upstream body reaches us
+/// still coded; serving it without the header makes npm write undecodable
+/// bytes and fail the integrity check. It is sourced from the same
+/// `StreamingFetchResult` as `content_length` — which is the CODED length —
+/// so the two always describe the same bytes. Local/hosted serves read their
+/// own uncoded storage bytes and pass `None`.
 fn build_tarball_response_stream(
     stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
     filename: &str,
     content_type: Option<String>,
     content_length: Option<u64>,
+    content_encoding: Option<String>,
 ) -> Response {
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -2577,6 +2587,9 @@ fn build_tarball_response_stream(
         );
     if let Some(len) = content_length {
         builder = builder.header(CONTENT_LENGTH, len.to_string());
+    }
+    if let Some(ref encoding) = content_encoding {
+        builder = builder.header(CONTENT_ENCODING, encoding);
     }
     builder.body(Body::from_stream(stream)).unwrap()
 }
@@ -3045,6 +3058,7 @@ async fn serve_tarball(
                 &response_filename,
                 npm_virtual_tarball_content_type(result.content_type),
                 result.content_length,
+                result.content_encoding,
             ));
         }
         return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
@@ -3152,6 +3166,7 @@ async fn serve_tarball(
                             &lkg_filename,
                             npm_virtual_tarball_content_type(lkg.content_type),
                             lkg.content_length,
+                            lkg.content_encoding,
                         ));
                     }
                 }
@@ -3240,6 +3255,7 @@ async fn serve_tarball(
             filename,
             npm_virtual_tarball_content_type(result.content_type),
             result.content_length,
+            result.content_encoding,
         ));
     }
 
@@ -3300,6 +3316,10 @@ async fn serve_tarball(
         filename,
         None,
         Some(artifact.size_bytes as u64),
+        // Hosted serve: these bytes come from our own storage exactly as they
+        // were uploaded, with no upstream transfer coding applied, so there is
+        // no coding to declare.
+        None,
     ))
 }
 
@@ -3529,6 +3549,7 @@ async fn serve_scanned_npm_tarball(
                         filename,
                         npm_virtual_tarball_content_type(result.content_type),
                         result.content_length,
+                        result.content_encoding,
                     );
                     resp.headers_mut()
                         .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
@@ -7139,7 +7160,7 @@ mod tests {
             Box::pin(futures::stream::once(async {
                 Ok(Bytes::from_static(b"tgz-bytes"))
             }));
-        let resp = build_tarball_response_stream(body, "pkg-1.0.0.tgz", None, Some(9));
+        let resp = build_tarball_response_stream(body, "pkg-1.0.0.tgz", None, Some(9), None);
         assert_eq!(resp.status(), StatusCode::OK);
         let h = resp.headers();
         assert_eq!(
@@ -7176,6 +7197,7 @@ mod tests {
             body,
             "x.tgz",
             Some("application/x-custom".to_string()),
+            None,
             None,
         );
         let h = resp.headers();
@@ -7220,7 +7242,7 @@ mod tests {
                 Ok(Bytes::from_static(b"tgz"))
             }));
         let ct = npm_virtual_tarball_content_type(Some("application/octet-stream".to_string()));
-        let resp = build_tarball_response_stream(body, "is-array-1.0.1.tgz", ct, Some(3));
+        let resp = build_tarball_response_stream(body, "is-array-1.0.1.tgz", ct, Some(3), None);
         assert_eq!(
             resp.headers()
                 .get(CONTENT_TYPE)
@@ -11346,5 +11368,269 @@ mod proxy_scan_block_tests {
             "repos without scan-on-proxy must be untouched (no X-AK-Scan header)"
         );
         assert_eq!(&body[..], tarball);
+    }
+}
+
+/// #3149 — upstream `Content-Encoding` forwarding on npm tarball serves.
+///
+/// Since #2915 the proxy pins `Accept-Encoding: identity` and disables
+/// transparent decoding, so a coded upstream body reaches us still coded.
+/// `build_tarball_response_stream` read `content_length` off the
+/// `StreamingFetchResult` and had no `content_encoding` parameter at all, so
+/// every proxied arm served coded bytes advertised as a plain gzip tarball --
+/// npm then writes what it cannot inflate and fails the integrity check.
+#[cfg(test)]
+mod content_encoding_forwarding_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    /// Builder-level guard: the shared response builder must emit the coding.
+    #[tokio::test]
+    async fn test_build_tarball_response_stream_forwards_content_encoding() {
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"coded"))
+            }));
+        let resp = build_tarball_response_stream(
+            body,
+            "pkg-1.0.0.tgz",
+            None,
+            Some(5),
+            Some("gzip".to_string()),
+        );
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_ENCODING).as_deref(),
+            Some("gzip"),
+        );
+        // The coded length and the coding must travel together.
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_LENGTH).as_deref(),
+            Some("5"),
+        );
+    }
+
+    /// Negative control for the builder: no coding in, no coding out. Without
+    /// this, an unconditional `content-encoding: gzip` would satisfy the
+    /// positive test above while corrupting every hosted serve.
+    #[tokio::test]
+    async fn test_build_tarball_response_stream_omits_absent_content_encoding() {
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"plain"))
+            }));
+        let resp = build_tarball_response_stream(body, "pkg-1.0.0.tgz", None, Some(5), None);
+        assert!(
+            resp.headers().get(CONTENT_ENCODING).is_none(),
+            "an uncoded serve must not have a coding manufactured for it",
+        );
+    }
+
+    /// REMOTE arm (`serve_tarball` -> direct-remote streaming fetch).
+    #[tokio::test]
+    async fn test_remote_npm_tarball_forwards_upstream_content_encoding() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let (plain, coded) = tdh::gzip_fixture(b"\x1f\x8b npm remote tarball payload. ");
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coded-pkg/-/coded-pkg-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(coded.clone()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let result = super::download_tarball(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "coded-pkg".to_string(),
+                "coded-pkg-1.0.0.tgz".to_string(),
+            )),
+            Default::default(),
+        )
+        .await;
+        fx.teardown().await;
+
+        let resp = result.unwrap_or_else(|e| panic!("remote tarball serve failed: {}", e.status()));
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tdh::header_str(&headers, CONTENT_ENCODING).as_deref(),
+            Some("gzip"),
+            "upstream Content-Encoding must be forwarded on the Remote arm, or \
+             npm writes undecodable bytes and fails the integrity check (#3149)",
+        );
+        assert_eq!(
+            &body[..],
+            &coded[..],
+            "the coded bytes must pass through untouched",
+        );
+        assert_ne!(
+            &body[..],
+            &plain[..],
+            "body must still be compressed -- the proxy must not have decoded it",
+        );
+    }
+
+    /// Negative control for the REMOTE arm: an uncoded upstream must not gain
+    /// a manufactured coding, and its body must be byte-identical.
+    #[tokio::test]
+    async fn test_remote_npm_tarball_without_upstream_coding_has_no_encoding_header() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let plain: &[u8] = b"\x1f\x8b\x08 plain npm tarball bytes";
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plain-pkg/-/plain-pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(plain))
+            .mount(&upstream)
+            .await;
+
+        let (state, _dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let result = super::download_tarball(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "plain-pkg".to_string(),
+                "plain-pkg-1.0.0.tgz".to_string(),
+            )),
+            Default::default(),
+        )
+        .await;
+        fx.teardown().await;
+
+        let resp = result.unwrap_or_else(|e| panic!("remote tarball serve failed: {}", e.status()));
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers.get(CONTENT_ENCODING).is_none(),
+            "no upstream coding must mean no Content-Encoding header",
+        );
+        assert_eq!(&body[..], plain, "uncoded body must be byte-identical");
+    }
+
+    /// VIRTUAL arm (`serve_tarball` -> `resolve_virtual_download` over a
+    /// Remote member). A separate call site from the Remote arm, so it needs
+    /// its own guard -- the #2922 lesson this issue explicitly cites.
+    #[tokio::test]
+    async fn test_virtual_npm_tarball_forwards_upstream_content_encoding() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let (plain, coded) = tdh::gzip_fixture(b"\x1f\x8b npm virtual tarball payload. ");
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/vcoded-pkg/-/vcoded-pkg-2.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(coded.clone()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _mkey, _mdir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
+
+        let result = super::download_tarball(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "vcoded-pkg".to_string(),
+                "vcoded-pkg-2.0.0.tgz".to_string(),
+            )),
+            Default::default(),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        let resp =
+            result.unwrap_or_else(|e| panic!("virtual tarball serve failed: {}", e.status()));
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tdh::header_str(&headers, CONTENT_ENCODING).as_deref(),
+            Some("gzip"),
+            "the Virtual arm must forward the member's upstream coding (#3149)",
+        );
+        assert_eq!(&body[..], &coded[..]);
+        assert_ne!(&body[..], &plain[..]);
+    }
+
+    /// Call-site guard for the arms that are impractical to drive end to end
+    /// (the virtual last-known-good replay and the scan-pending serve).
+    ///
+    /// #2920 was fixed in two arms but tested in one, which is exactly how a
+    /// call site silently reverts. `build_tarball_response_stream` is the
+    /// single choke point for every npm tarball serve, so pin the shape of its
+    /// call sites: every PROXIED arm forwards a `.content_encoding` off the
+    /// fetch result, and only the hosted arm (which reads our own uncoded
+    /// storage bytes) passes a literal `None`.
+    #[test]
+    fn test_every_proxied_tarball_call_site_forwards_content_encoding() {
+        let src = include_str!("npm.rs");
+        let body = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+
+        let call_sites = body.matches("build_tarball_response_stream(").count();
+        // 5 serves + the `fn` definition itself.
+        assert_eq!(
+            call_sites, 6,
+            "npm tarball call-site count changed; re-check each new arm \
+             forwards content_encoding (#3149)",
+        );
+        let forwarding = body.matches(".content_encoding,").count();
+        assert_eq!(
+            forwarding, 4,
+            "every proxied npm tarball arm (remote, virtual, virtual-LKG, \
+             scan-pending) must pass the fetch result's content_encoding; \
+             only the hosted arm passes None (#3149)",
+        );
     }
 }
