@@ -407,7 +407,10 @@ impl MigrationWorker {
         let mut plan = resolve_repos_for_provisioning(&repos, &source_repos);
         // Honor any source -> target repo renames before provisioning destinations,
         // so the conflict pre-pass below reuses the renamed repo instead of the source.
-        apply_repo_mappings(&mut plan.resolved, &config.repo_mappings);
+        if let Err(why) = apply_repo_mappings(&mut plan.resolved, &config.repo_mappings) {
+            tracing::error!(job_id = %job_id, error = %why, "Invalid repo_mappings; aborting job");
+            return Err(MigrationError::ConfigError(why));
+        }
         for missing_key in &plan.missing {
             tracing::error!(
                 job_id = %job_id, repo = %missing_key,
@@ -442,10 +445,27 @@ impl MigrationWorker {
             if migration_config.repo_type == RepositoryType::Virtual
                 && !migration_config.members.is_empty()
             {
-                virtual_members_to_wire.push((
-                    migration_config.target_key.clone(),
-                    migration_config.members.clone(),
-                ));
+                // `members` are SOURCE-side names. `correlate_virtual_repo_members`
+                // resolves each one with `SELECT id FROM repositories WHERE key
+                // = $1`, which only works while target_key == source_key. Once a
+                // member is renamed, that lookup misses and the member is dropped
+                // with a warning -- the migrated group ends up empty, which is
+                // exactly the failure #2783 fixed. Worse, if an unrelated repo
+                // already occupies the source key, the lookup resolves to IT and
+                // the group aggregates a repository that was never part of it.
+                // Translate to target names here, where the mapping is known.
+                let mapped_members: Vec<String> = migration_config
+                    .members
+                    .iter()
+                    .map(|m| {
+                        config
+                            .repo_mappings
+                            .get(m)
+                            .cloned()
+                            .unwrap_or_else(|| m.clone())
+                    })
+                    .collect();
+                virtual_members_to_wire.push((migration_config.target_key.clone(), mapped_members));
             }
             // Skip if a repo with the same key already exists with a
             // compatible type+format; recreate would be ambiguous and
@@ -2509,18 +2529,90 @@ pub(crate) fn resolve_repos_for_provisioning(
 /// Point each mapped repo's `target_key` at its new name (e.g.
 /// network-team-python -> network-pypi) so it migrates under that key.
 /// Unmapped repos are left alone.
+/// Reject a mapped target key that a hand-created repository would never be
+/// allowed to have.
+///
+/// `repo_mappings` is the first place an operator supplies a repository key to
+/// the import path directly, and the import path does NOT go through
+/// `validate_repository_key` — the only two call sites of that validator are
+/// repository create and repository rename. So without this check a mapping
+/// reaches `create_repository` verbatim and is written to `repositories.key`
+/// (no CHECK constraint) and, for filesystem backends, concatenated into
+/// `repositories.storage_path` as `{storage_base}/{target_key}`. A `..`
+/// segment therefore escapes the configured storage root and migrated bytes
+/// land outside it. `FilesystemStorage` sanitizes the object key but never the
+/// base path, so it cannot catch this downstream.
+///
+/// The rules are deliberately identical to `validate_repository_key`: an
+/// imported repository must be indistinguishable from one created by hand.
+fn validate_mapped_target_key(target: &str) -> Result<(), String> {
+    if target.is_empty() || target.len() > 128 {
+        return Err("must be 1-128 characters".to_string());
+    }
+    if !target
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        // Rejects `/`, whitespace, NUL and non-ASCII. The last matters on its
+        // own: a Cyrillic `а` renders identically to ASCII `a`, so a homoglyph
+        // target is indistinguishable from a real repository in the UI.
+        return Err("may only contain ASCII letters, digits, '-', '_' and '.'".to_string());
+    }
+    if target.starts_with('.') || target.starts_with('-') {
+        return Err("may not start with '.' or '-'".to_string());
+    }
+    if target.contains("..") {
+        return Err("may not contain '..'".to_string());
+    }
+    Ok(())
+}
+
+/// Apply operator-supplied source -> target repository renames.
+///
+/// Fails the whole job on a bad mapping rather than skipping the offending
+/// repository: a migration that silently lands under a different name than the
+/// operator asked for is worse than one that refuses to start.
 pub(crate) fn apply_repo_mappings(
     resolved: &mut [crate::services::migration_service::RepositoryMigrationConfig],
     mappings: &std::collections::HashMap<String, String>,
-) {
+) -> Result<(), String> {
     if mappings.is_empty() {
-        return;
+        return Ok(());
     }
+
+    // Two sources mapped onto one target would transfer both repositories'
+    // artifacts into the same destination, colliding by artifact path.
+    let mut seen_targets: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (source, target) in mappings {
+        validate_mapped_target_key(target)
+            .map_err(|why| format!("repo_mappings target '{target}' is invalid: {why}"))?;
+        if let Some(other) = seen_targets.insert(target.as_str(), source.as_str()) {
+            return Err(format!(
+                "repo_mappings maps both '{other}' and '{source}' onto '{target}';                  two source repositories cannot share one destination"
+            ));
+        }
+    }
+
     for cfg in resolved.iter_mut() {
         if let Some(target) = mappings.get(&cfg.source_key) {
             cfg.target_key = target.clone();
         }
     }
+
+    // A mapping that matched nothing is a typo, an excluded repo, or a repo the
+    // source never reported. Staying silent means the operator gets a
+    // "successful" migration under the original names.
+    let unapplied: Vec<&String> = mappings
+        .keys()
+        .filter(|k| !resolved.iter().any(|c| &c.source_key == *k))
+        .collect();
+    if !unapplied.is_empty() {
+        tracing::warn!(
+            unapplied = ?unapplied,
+            "repo_mappings entries matched no repository in this job and were ignored",
+        );
+    }
+    Ok(())
 }
 
 /// Determine the final job status based on completed and failed counts.
@@ -4769,6 +4861,71 @@ mod tests {
     }
 
     #[test]
+    /// A mapped target must clear the same bar a hand-created repository key
+    /// does. Without this, `..` reaches `build_storage_path`, which for a
+    /// filesystem backend concatenates `{storage_base}/{target_key}` -- so the
+    /// repository's storage root escapes the configured base and migrated bytes
+    /// are written outside it as the server process user.
+    #[test]
+    fn test_apply_repo_mappings_rejects_invalid_target_keys() {
+        let source = vec![mk_source_repo("src-repo", "LOCAL", "Generic")];
+        let requested = vec!["src-repo".to_string()];
+
+        for bad in [
+            "../../../../tmp/ak-escape", // path traversal out of storage_base
+            "slash/in/key",              // nested path
+            "-leading-hyphen",
+            ".leading-dot",
+            "has space",
+            "\u{0430}dmin-cyrillic", // homoglyph: renders as "admin-cyrillic"
+            "",
+        ] {
+            let mut plan = resolve_repos_for_provisioning(&requested, &source);
+            let mut mappings = std::collections::HashMap::new();
+            mappings.insert("src-repo".to_string(), bad.to_string());
+            let err = apply_repo_mappings(&mut plan.resolved, &mappings)
+                .expect_err(&format!("target {bad:?} must be rejected"));
+            assert!(
+                err.contains("invalid"),
+                "error should name the offending target: {err}"
+            );
+            // And the rename must not have been applied on the way out.
+            assert_eq!(plan.resolved[0].target_key, "src-repo");
+        }
+
+        // An over-long key is rejected too (repositories.key is VARCHAR(255)
+        // with no CHECK, so nothing downstream would catch it).
+        let mut plan = resolve_repos_for_provisioning(&requested, &source);
+        let mut mappings = std::collections::HashMap::new();
+        mappings.insert("src-repo".to_string(), "x".repeat(129));
+        assert!(apply_repo_mappings(&mut plan.resolved, &mappings).is_err());
+
+        // Control: a well-formed target still applies.
+        let mut plan = resolve_repos_for_provisioning(&requested, &source);
+        let mut mappings = std::collections::HashMap::new();
+        mappings.insert("src-repo".to_string(), "good-target_1.0".to_string());
+        apply_repo_mappings(&mut plan.resolved, &mappings).expect("valid target");
+        assert_eq!(plan.resolved[0].target_key, "good-target_1.0");
+    }
+
+    /// Two sources mapped onto one target would transfer both repositories'
+    /// artifacts into the same destination, colliding by artifact path.
+    #[test]
+    fn test_apply_repo_mappings_rejects_duplicate_targets() {
+        let source = vec![
+            mk_source_repo("repo-a", "LOCAL", "Generic"),
+            mk_source_repo("repo-b", "LOCAL", "Generic"),
+        ];
+        let requested = vec!["repo-a".to_string(), "repo-b".to_string()];
+        let mut plan = resolve_repos_for_provisioning(&requested, &source);
+        let mut mappings = std::collections::HashMap::new();
+        mappings.insert("repo-a".to_string(), "merged".to_string());
+        mappings.insert("repo-b".to_string(), "merged".to_string());
+        let err = apply_repo_mappings(&mut plan.resolved, &mappings)
+            .expect_err("two sources onto one target must be rejected");
+        assert!(err.contains("cannot share one destination"), "{err}");
+    }
+
     fn test_apply_repo_mappings_overrides_only_mapped_target_key() {
         // Only the mapped repo's target_key changes; source_key and the rest stay put.
         let source = vec![
@@ -4785,7 +4942,7 @@ mod tests {
             "network-team-python".to_string(),
             "network-pypi".to_string(),
         );
-        apply_repo_mappings(&mut plan.resolved, &mappings);
+        apply_repo_mappings(&mut plan.resolved, &mappings).expect("valid mappings");
 
         let renamed = plan
             .resolved
@@ -4808,7 +4965,8 @@ mod tests {
         let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
         let requested = vec!["maven-releases".to_string()];
         let mut plan = resolve_repos_for_provisioning(&requested, &source);
-        apply_repo_mappings(&mut plan.resolved, &std::collections::HashMap::new());
+        apply_repo_mappings(&mut plan.resolved, &std::collections::HashMap::new())
+            .expect("empty mappings are always valid");
         let cfg = plan.resolved.first().unwrap();
         assert_eq!(cfg.target_key, cfg.source_key);
         assert_eq!(cfg.target_key, "maven-releases");
