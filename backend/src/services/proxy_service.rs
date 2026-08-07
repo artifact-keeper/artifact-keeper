@@ -311,14 +311,25 @@ const TEE_CHANNEL_DEPTH: usize = 64;
 /// docstring above. Smaller upstream chunks pass through unchanged.
 const TEE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Suffix `CachePersister::tee_stream` appends to a content key to derive
-/// its private staging key. Shared with `ProxyService::check_cache_key_length`
-/// so the two can't drift apart.
-const TEE_STAGING_KEY_SUFFIX: &str = ".tee-staging.";
-
-/// Byte length of a hyphenated UUID v4 string (`Uuid::new_v4().to_string()`),
-/// e.g. "550e8400-e29b-41d4-a716-446655440000". Always exactly 36.
-const UUID_STRING_LEN: usize = 36;
+/// Dedicated key prefix for `CachePersister::tee_stream`'s per-write staging
+/// objects. Deliberately NOT under `proxy-cache/`: staging keys therefore
+/// (a) never appear in any `proxy-cache/`-scoped listing (the PyPI index,
+/// `list_cached_paths`, `purge_repo_cache`'s per-repo sweep), (b) are
+/// independently sweepable by an S3 lifecycle rule scoped to this prefix
+/// without touching real cache content, and (c) never factor into
+/// `check_cache_key_length`'s budget for `cache_key` — their own length is
+/// constant, never derived from a content path.
+///
+/// Nothing in-process reaps a staging object if the writer task is killed
+/// before it runs (a pod eviction, a crash), so this prefix is the only
+/// backstop against an unbounded orphan leak. On S3/GCS/Azure, configure a
+/// lifecycle rule expiring objects under this prefix after a day (the
+/// minimum expiration granularity is a day, not hours; a rule expiring a
+/// rare still-in-flight object is safe — the `copy()` in `tee_stream` would
+/// just fail and degrade like a rejected write). Filesystem-backed
+/// deployments have no equivalent lifecycle mechanism and need a cron/
+/// tmpwatch-style sweep instead.
+const TEE_STAGING_KEY_PREFIX: &str = "proxy-cache-staging/";
 
 /// Default TTL for APT InRelease/Release index files (5 minutes).
 /// Controls how often the proxy re-checks upstream for changes.
@@ -1561,11 +1572,11 @@ impl CachePersister {
         // writes the metadata sidecar with the observed SHA-256 + byte count.
         let storage_clone = storage.clone();
         let cache_key_for_writer = cache_key.clone();
-        // Unique per write so concurrent writers for the same hot key never share one.
-        let staging_key = format!(
-            "{cache_key_for_writer}{TEE_STAGING_KEY_SUFFIX}{}",
-            Uuid::new_v4()
-        );
+        // Unique per write, under a dedicated prefix unrelated to cache_key
+        // (see TEE_STAGING_KEY_PREFIX) — so concurrent writers for the same
+        // hot key never share one, and no content-path length ever factors
+        // into this key's own length.
+        let staging_key = format!("{TEE_STAGING_KEY_PREFIX}{}", Uuid::new_v4());
         tokio::spawn(async move {
             // Adapter: receiver -> futures::Stream<Result<Bytes>>.
             let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -4322,9 +4333,6 @@ impl ProxyService {
             let Some((name, tail)) = rest.split_once('/') else {
                 continue;
             };
-            // Require an exact suffix, not just "non-empty", so a leftover
-            // tee_stream staging object can't make a failed write look cached.
-            //
             // Match the LAST segment, not the whole tail: PyPI caches
             // distribution files one level deeper than the index.
             // `build_pypi_proxy_cache_path` produces `simple/<name>/<filename>`,
@@ -4333,9 +4341,12 @@ impl ProxyService {
             // and its tail is `requests-2.31.0.tar.gz/__content__`. Comparing the
             // whole tail dropped every project represented only by cached
             // distributions -- and since proxy-cached items have no `artifacts`
-            // rows (#1278), this listing is their only local record. Matching the
-            // last segment still excludes staging objects, whose final segment is
-            // `__content__.tee-staging.<uuid>`.
+            // rows (#1278), this listing is their only local record. Requiring
+            // an exact suffix (not just "non-empty") on the last segment also
+            // means this stays correct if any future non-content key ever
+            // lands under this prefix — `tee_stream`'s own staging objects
+            // live entirely under `TEE_STAGING_KEY_PREFIX` and can never reach
+            // here in the first place.
             let last = tail.rsplit('/').next().unwrap_or(tail);
             if name.is_empty() || !matches!(last, "__content__" | "__cache_meta__.json") {
                 continue;
@@ -4650,19 +4661,22 @@ impl ProxyService {
     /// Reject cache paths whose final formatted key would exceed
     /// [`Self::MAX_STORAGE_KEY_BYTES`].
     ///
-    /// Checked against the largest of the three derived suffixes
-    /// (`__content__`, `__cache_meta__.json`, and `tee_stream`'s staging key,
-    /// `__content__` + [`TEE_STAGING_KEY_SUFFIX`] + a UUID) so a path can't
-    /// pass one derivation and silently fail — with no cache ever forming —
-    /// on another. Returning `Validation` early keeps the failure local
-    /// instead of surfacing as an opaque 400/500 mid-fetch (#1044).
+    /// Both `cache_storage_key` (`__content__` suffix, 11 chars) and
+    /// `cache_metadata_key` (`__cache_meta__.json` suffix, 19 chars) are
+    /// checked against the *larger* suffix so a path can't slip through
+    /// `cache_storage_key` only to fail when the matching metadata key is
+    /// later derived. `tee_stream`'s staging key (`TEE_STAGING_KEY_PREFIX`)
+    /// deliberately does NOT factor in here — it lives under its own prefix,
+    /// unrelated to `cache_key`, so its length never depends on `trimmed_path`.
+    /// Returning `Validation` early keeps the failure local to the helper
+    /// instead of surfacing as an opaque 400/500 from the object-store SDK
+    /// mid-fetch (#1044).
     fn check_cache_key_length(repo_key: &str, trimmed_path: &str) -> Result<()> {
         const PREFIX: &str = "proxy-cache/";
-        const WORST_SUFFIX_LEN: usize =
-            "__content__".len() + TEE_STAGING_KEY_SUFFIX.len() + UUID_STRING_LEN;
+        const WORST_SUFFIX: &str = "__cache_meta__.json";
         // Two interior '/' separators are added by the format!() calls.
         let worst_len =
-            PREFIX.len() + repo_key.len() + 1 + trimmed_path.len() + 1 + WORST_SUFFIX_LEN;
+            PREFIX.len() + repo_key.len() + 1 + trimmed_path.len() + 1 + WORST_SUFFIX.len();
         if worst_len > Self::MAX_STORAGE_KEY_BYTES {
             return Err(AppError::Validation(format!(
                 "Proxy cache key exceeds {}-byte object-store limit (would be {} bytes)",
@@ -6225,11 +6239,12 @@ mod tests {
 
     #[test]
     fn test_cache_storage_key_just_under_limit_succeeds() {
-        // Lands the staging key's worst case exactly at the limit; the
-        // metadata key's own 19-byte suffix comes in well under it.
-        let worst_suffix_len = "__content__".len() + TEE_STAGING_KEY_SUFFIX.len() + UUID_STRING_LEN;
+        // Pick a path length that lands the metadata key (worst case)
+        // exactly at MAX_STORAGE_KEY_BYTES. Both helpers should accept it.
+        // metadata key = "proxy-cache/" (12) + repo + "/" (1) + path + "/" (1)
+        //               + "__cache_meta__.json" (19)
         let repo = "r";
-        let fixed = 12 + repo.len() + 1 + 1 + worst_suffix_len;
+        let fixed = 12 + repo.len() + 1 + 1 + 19;
         let path_len = ProxyService::MAX_STORAGE_KEY_BYTES - fixed;
         let path = "a".repeat(path_len);
 
@@ -6238,14 +6253,8 @@ mod tests {
         let metadata_key = ProxyService::cache_metadata_key(repo, &path)
             .expect("metadata key just under limit should succeed");
 
+        assert_eq!(metadata_key.len(), ProxyService::MAX_STORAGE_KEY_BYTES);
         assert!(storage_key.len() <= ProxyService::MAX_STORAGE_KEY_BYTES);
-        assert!(metadata_key.len() <= ProxyService::MAX_STORAGE_KEY_BYTES);
-        // A hypothetical staging key for this content key lands exactly at
-        // the limit — the actual boundary this test is pinned to.
-        assert_eq!(
-            storage_key.len() + TEE_STAGING_KEY_SUFFIX.len() + UUID_STRING_LEN,
-            ProxyService::MAX_STORAGE_KEY_BYTES
-        );
     }
 
     #[test]
@@ -6267,10 +6276,18 @@ mod tests {
 
     #[test]
     fn test_cache_storage_key_rejects_when_only_metadata_overflows() {
-        // The __content__ key (11-byte suffix) fits at 1024 on its own, but
-        // the staging key (60-byte suffix) would overflow. Both must reject.
+        // Construct a path where the storage-suffix key (`__content__`,
+        // 11 bytes) would fit in 1024 but the metadata-suffix key
+        // (`__cache_meta__.json`, 19 bytes) would not. Both helpers must
+        // reject so callers cannot enter a state where storage is
+        // writable but metadata is not.
         let repo = "r";
+        // storage-only fixed bytes: 12 + repo + "/" + "/" + 11 (__content__) = 26
         let storage_fixed = 12 + repo.len() + 1 + 1 + 11;
+        // Pick a path length that fits the storage variant but is 1 byte
+        // too long for the metadata variant (which has an 8-byte longer
+        // suffix). Any value in [MAX-storage_fixed-7, MAX-storage_fixed]
+        // works; pick the largest legal storage length.
         let path_len = ProxyService::MAX_STORAGE_KEY_BYTES - storage_fixed;
         let path = "a".repeat(path_len);
 
@@ -6278,6 +6295,9 @@ mod tests {
         let direct_storage_len = storage_fixed + path.len();
         assert_eq!(direct_storage_len, ProxyService::MAX_STORAGE_KEY_BYTES);
 
+        // But the metadata variant overflows by 8 bytes (suffix delta),
+        // and the helper rejects both because we measure against the
+        // worst-case suffix.
         let storage_result = ProxyService::cache_storage_key(repo, &path);
         let metadata_result = ProxyService::cache_metadata_key(repo, &path);
 
@@ -8837,7 +8857,7 @@ mod tests {
         let deletes = backend.deletes.lock().await;
         assert_eq!(deletes.len(), 1);
         assert!(
-            deletes[0].starts_with("cache-key.tee-staging."),
+            deletes[0].starts_with(TEE_STAGING_KEY_PREFIX),
             "delete must target the staging key, never cache-key: got {:?}",
             deletes[0]
         );
@@ -8924,7 +8944,7 @@ mod tests {
         let deletes = backend.deletes.lock().await;
         assert_eq!(deletes.len(), 1);
         assert!(
-            deletes[0].starts_with("cache-key.tee-staging."),
+            deletes[0].starts_with(TEE_STAGING_KEY_PREFIX),
             "delete must target the staging key, never cache-key: got {:?}",
             deletes[0]
         );
@@ -9029,10 +9049,10 @@ mod tests {
         // Publishes via copy(), then cleans up the now-redundant staging object.
         let deletes = backend.deletes.lock().await;
         assert_eq!(deletes.len(), 1);
-        assert!(deletes[0].starts_with("cache-key.tee-staging."));
+        assert!(deletes[0].starts_with(TEE_STAGING_KEY_PREFIX));
         let copies = backend.copies.lock().await;
         assert_eq!(copies.len(), 1);
-        assert!(copies[0].0.starts_with("cache-key.tee-staging."));
+        assert!(copies[0].0.starts_with(TEE_STAGING_KEY_PREFIX));
         assert_eq!(copies[0].1, "cache-key");
     }
 
@@ -9059,11 +9079,11 @@ mod tests {
         assert!(backend.metadata_writes.lock().await.is_empty());
         let copies = backend.copies.lock().await;
         assert_eq!(copies.len(), 1);
-        assert!(copies[0].0.starts_with("cache-key.tee-staging."));
+        assert!(copies[0].0.starts_with(TEE_STAGING_KEY_PREFIX));
         assert_eq!(copies[0].1, "cache-key");
         let deletes = backend.deletes.lock().await;
         assert_eq!(deletes.len(), 1, "the staging object must be discarded");
-        assert!(deletes[0].starts_with("cache-key.tee-staging."));
+        assert!(deletes[0].starts_with(TEE_STAGING_KEY_PREFIX));
     }
 
     /// Two concurrent tee_stream calls for the same cache key — one reject,
@@ -9117,7 +9137,7 @@ mod tests {
         assert!(
             put_stream_keys
                 .iter()
-                .all(|k| k != "cache-key" && k.starts_with("cache-key.tee-staging.")),
+                .all(|k| k != "cache-key" && k.starts_with(TEE_STAGING_KEY_PREFIX)),
             "neither writer may put_stream to the live cache-key: got {:?}",
             *put_stream_keys
         );
@@ -9186,7 +9206,7 @@ mod tests {
         let deletes = backend.deletes.lock().await;
         assert_eq!(deletes.len(), 1, "the staging object must be discarded");
         assert!(
-            deletes[0].starts_with("cache-key.tee-staging."),
+            deletes[0].starts_with(TEE_STAGING_KEY_PREFIX),
             "the discard must target the staging key, never the live \
              cache-key: got {:?}",
             deletes[0]
@@ -9920,13 +9940,17 @@ mod tests {
         );
     }
 
-    /// The staging suffix must stay excluded now that matching is per-segment:
-    /// a rejected tee_stream write must not make a project look cached.
+    /// Defensive coverage of the parsing function itself: any leftover
+    /// object whose last segment isn't exactly `__content__` or
+    /// `__cache_meta__.json` must not make a project look cached, regardless
+    /// of what produced it. In practice `tee_stream`'s own staging objects
+    /// can no longer reach this listing at all — they live entirely under
+    /// `TEE_STAGING_KEY_PREFIX`, never under `proxy-cache/<repo>/simple/`.
     #[test]
     fn test_pypi_package_names_from_cache_keys_skips_staging_objects() {
         let keys = vec![
-            "proxy-cache/pypi-remote/simple/ghost/__content__.tee-staging.             0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
-            "proxy-cache/pypi-remote/simple/ghost/ghost-1.0.tar.gz/__content__.tee-staging.             0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            "proxy-cache/pypi-remote/simple/ghost/__content__.tee-staging.0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            "proxy-cache/pypi-remote/simple/ghost/ghost-1.0.tar.gz/__content__.tee-staging.0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
         ];
         let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
         assert!(
