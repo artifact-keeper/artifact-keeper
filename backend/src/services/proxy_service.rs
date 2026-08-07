@@ -4645,26 +4645,45 @@ impl ProxyService {
     /// Returns `None` when no quota is configured or the lookup fails, which
     /// preserves today's unbounded behaviour rather than failing a fetch on a
     /// transient DB error.
+    ///
+    /// A non-positive `quota_bytes` (`0` or negative) is normalized to `None`,
+    /// because platform-wide that is the documented "unlimited" sentinel, not
+    /// "allow nothing" — see [`RepositoryService::quota_allows`], which reads
+    /// `Some(quota) if quota > 0` and treats everything else as unbounded
+    /// (CHANGELOG 1.2.2, #1970). Normalizing HERE rather than at each consumer
+    /// is deliberate: this function is what first makes the real column
+    /// reachable on the proxy paths, so without it, activating the guard would
+    /// silently invert the sentinel and disable proxy caching entirely for
+    /// every repo explicitly configured as unlimited.
     async fn resolve_quota_bytes(&self, repo: &Repository) -> Option<i64> {
-        if repo.quota_bytes.is_some() {
-            return repo.quota_bytes;
-        }
-        sqlx::query_scalar::<_, Option<i64>>("SELECT quota_bytes FROM repositories WHERE id = $1")
+        let raw = if repo.quota_bytes.is_some() {
+            repo.quota_bytes
+        } else {
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT quota_bytes FROM repositories WHERE id = $1",
+            )
             .bind(repo.id)
             .fetch_optional(&self.db)
             .await
             .ok()
             .flatten()
             .flatten()
+        };
+        raw.filter(|q| *q > 0)
     }
 
     /// The configured quota expressed as the per-object cache ceiling used by
-    /// the streaming write path, matching
-    /// [`cache_classifier::exceeds_single_object_quota`]'s semantics: the quota
-    /// is an inclusive ceiling, and a (nonsensical) negative quota rejects
-    /// every object rather than silently disabling the guard.
+    /// the streaming write path: the quota is an inclusive ceiling.
+    ///
+    /// Non-positive quotas mean "unlimited" and are expected to have been
+    /// normalized to `None` by [`Self::resolve_quota_bytes`] before they get
+    /// here. The `filter` below repeats that rather than trusting the caller,
+    /// because mapping a `0` sentinel to `Some(0)` would turn "unlimited" into
+    /// "cache nothing" — the inversion this helper existed to introduce.
     fn quota_to_cache_ceiling(quota_bytes: Option<i64>) -> Option<u64> {
-        quota_bytes.map(|q| u64::try_from(q).unwrap_or(0))
+        quota_bytes
+            .filter(|q| *q > 0)
+            .and_then(|q| u64::try_from(q).ok())
     }
 
     /// Read the optional repo-level `cache_ttl_secs` override. Returns `None`
@@ -9335,16 +9354,38 @@ mod tests {
             "no configured quota means no ceiling"
         );
         assert_eq!(ProxyService::quota_to_cache_ceiling(Some(100)), Some(100));
+        // 0 and negative are the platform's "unlimited" sentinel
+        // (`RepositoryService::quota_allows` reads `Some(q) if q > 0`,
+        // CHANGELOG 1.2.2 / #1970). Mapping them to `Some(0)` would invert
+        // the sentinel and disable proxy caching for every repo explicitly
+        // configured as unlimited.
         assert_eq!(
             ProxyService::quota_to_cache_ceiling(Some(0)),
-            Some(0),
-            "a zero quota caches nothing, matching exceeds_single_object_quota"
+            None,
+            "a zero quota is the unlimited sentinel, not a zero-byte ceiling"
         );
         assert_eq!(
             ProxyService::quota_to_cache_ceiling(Some(-1)),
-            Some(0),
-            "a negative quota must reject every object, not silently disable the guard"
+            None,
+            "a negative quota is the unlimited sentinel, matching quota_allows"
         );
+        // Cross-check the two helpers agree on the sentinel, so this cannot
+        // drift back apart silently.
+        for sentinel in [0i64, -1, i64::MIN] {
+            assert!(
+                crate::services::repository_service::RepositoryService::quota_allows(
+                    Some(sentinel),
+                    i64::MAX / 2,
+                    1
+                ),
+                "quota_allows treats {sentinel} as unlimited"
+            );
+            assert_eq!(
+                ProxyService::quota_to_cache_ceiling(Some(sentinel)),
+                None,
+                "so quota_to_cache_ceiling must too"
+            );
+        }
     }
 
     /// A `Repository` that already carries a real quota is used as-is, with no
