@@ -482,6 +482,17 @@ impl MigrationWorker {
             if conflict.has_conflict {
                 match conflict.conflict_type {
                     Some(ConflictType::SameKey) => {
+                        // A rename lands in a repo the operator didn't name, so
+                        // say whose artifacts are about to join it.
+                        if migration_config.target_key != migration_config.source_key {
+                            tracing::warn!(
+                                job_id = %job_id,
+                                repo = %migration_config.source_key,
+                                target = %migration_config.target_key,
+                                "repo_mappings target already exists; merging this \
+                                 repository's artifacts into it",
+                            );
+                        }
                         provisioned_repos += 1;
                         tracing::info!(
                             job_id = %job_id, repo = %migration_config.target_key,
@@ -512,6 +523,18 @@ impl MigrationWorker {
                         continue;
                     }
                 }
+            } else if self.config.dry_run {
+                // dry_run only gated the storage put, so previewing a rename
+                // left the renamed repo behind, typo and all.
+                provisioned_repos += 1;
+                tracing::info!(
+                    job_id = %job_id,
+                    repo = %migration_config.target_key,
+                    source = %migration_config.source_key,
+                    format = %migration_config.package_type,
+                    repo_type = ?migration_config.repo_type,
+                    "Dry run: would provision destination repository",
+                );
             } else {
                 // Auto-provisioned repos inherit the server's default storage
                 // backend; without this they fall back to the column default
@@ -566,6 +589,13 @@ impl MigrationWorker {
         // dangling references). Without this the migrated virtual repo has zero
         // members and both the API and the UI error out over it (issue #2783).
         for (virtual_key, member_names) in &virtual_members_to_wire {
+            if self.config.dry_run {
+                tracing::info!(
+                    job_id = %job_id, repo = %virtual_key, members = ?member_names,
+                    "Dry run: would correlate virtual repository members",
+                );
+                continue;
+            }
             match self
                 .migration_service
                 .correlate_virtual_repo_members(virtual_key, member_names)
@@ -633,6 +663,17 @@ impl MigrationWorker {
             if include_artifacts {
                 // Storage is resolved for the destination (target) repo.
                 let repo_storage = match self.storage_for_repo(keys.target.as_str()).await {
+                    // A dry run doesn't create the destination, so there is no
+                    // row to resolve. The handle is a placeholder: the artifact
+                    // loop counts and moves on before reading or writing
+                    // anything through it.
+                    Err(_) if self.config.dry_run => self
+                        .storage_registry
+                        .backend_for(&StorageLocation {
+                            backend: self.storage_registry.default_backend().to_string(),
+                            path: self.config.staging_path.clone(),
+                        })
+                        .map_err(|e| MigrationError::StorageError(e.to_string()))?,
                     Ok(storage) => storage,
                     Err(e) => {
                         tracing::error!(repo = %keys.target, error = %e, "Failed to resolve repository storage");
@@ -703,6 +744,9 @@ impl MigrationWorker {
             completed = total_completed,
             failed = total_failed,
             skipped = total_skipped,
+            transferred_bytes = total_transferred,
+            dry_run = self.config.dry_run,
+            // `completed` is "would transfer" on a dry run; nothing was written.
             "Migration job completed"
         );
 
@@ -770,6 +814,16 @@ impl MigrationWorker {
 
                 let source_path = build_source_path(repo_key, &artifact_path);
                 let size = artifact.size.unwrap_or(0);
+
+                // Dry run: report what would move and stop here. First branch
+                // in the body on purpose, ahead of every DB read/write, the
+                // download, and the storage put.
+                if self.config.dry_run {
+                    *completed += 1;
+                    *transferred += size;
+                    continue;
+                }
+
                 // Keep sha256 and sha1 separate so verification can compare
                 // each digest against the corresponding locally computed
                 // value. Picking a single "checksum" field and computing
@@ -2526,9 +2580,6 @@ pub(crate) fn resolve_repos_for_provisioning(
     plan
 }
 
-/// Point each mapped repo's `target_key` at its new name (e.g.
-/// network-team-python -> network-pypi) so it migrates under that key.
-/// Unmapped repos are left alone.
 /// Reject a mapped target key that a hand-created repository would never be
 /// allowed to have.
 ///
@@ -2567,7 +2618,9 @@ fn validate_mapped_target_key(target: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Apply operator-supplied source -> target repository renames.
+/// Point each mapped repo's `target_key` at its new name (e.g.
+/// network-team-python -> network-pypi) so it migrates under that key.
+/// Unmapped repos are left alone.
 ///
 /// Fails the whole job on a bad mapping rather than skipping the offending
 /// repository: a migration that silently lands under a different name than the
@@ -2588,7 +2641,8 @@ pub(crate) fn apply_repo_mappings(
             .map_err(|why| format!("repo_mappings target '{target}' is invalid: {why}"))?;
         if let Some(other) = seen_targets.insert(target.as_str(), source.as_str()) {
             return Err(format!(
-                "repo_mappings maps both '{other}' and '{source}' onto '{target}';                  two source repositories cannot share one destination"
+                "repo_mappings maps both '{other}' and '{source}' onto '{target}'; \
+                 two source repositories cannot share one destination"
             ));
         }
     }
@@ -2596,6 +2650,22 @@ pub(crate) fn apply_repo_mappings(
     for cfg in resolved.iter_mut() {
         if let Some(target) = mappings.get(&cfg.source_key) {
             cfg.target_key = target.clone();
+        }
+    }
+
+    // Same collision against an unmapped repo in this job: the check above only
+    // sees the mappings, so `a -> b` with `b` also migrating slips past it.
+    let mut taken: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for cfg in resolved.iter() {
+        match taken.insert(cfg.target_key.as_str(), cfg.source_key.as_str()) {
+            Some(other) if other != cfg.source_key => {
+                return Err(format!(
+                    "'{other}' and '{}' both migrate to '{}'; two source repositories cannot \
+                     share one destination",
+                    cfg.source_key, cfg.target_key
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -4860,7 +4930,6 @@ mod tests {
         assert_eq!(cfg.target_key, "maven-releases");
     }
 
-    #[test]
     /// A mapped target must clear the same bar a hand-created repository key
     /// does. Without this, `..` reaches `build_storage_path`, which for a
     /// filesystem backend concatenates `{storage_base}/{target_key}` -- so the
@@ -4926,6 +4995,34 @@ mod tests {
         assert!(err.contains("cannot share one destination"), "{err}");
     }
 
+    /// `repo-a -> repo-b` while `repo-b` also migrates under its own key.
+    #[test]
+    fn test_apply_repo_mappings_rejects_target_taken_by_unmapped_repo() {
+        let source = vec![
+            mk_source_repo("repo-a", "LOCAL", "Generic"),
+            mk_source_repo("repo-b", "LOCAL", "Generic"),
+        ];
+        let requested = vec!["repo-a".to_string(), "repo-b".to_string()];
+        let mut plan = resolve_repos_for_provisioning(&requested, &source);
+        let mut mappings = std::collections::HashMap::new();
+        mappings.insert("repo-a".to_string(), "repo-b".to_string());
+        let err = apply_repo_mappings(&mut plan.resolved, &mappings)
+            .expect_err("mapping onto another migrating repo must be rejected");
+        assert!(err.contains("cannot share one destination"), "{err}");
+    }
+
+    #[test]
+    fn test_apply_repo_mappings_allows_duplicate_request_of_one_repo() {
+        let source = vec![mk_source_repo("repo-a", "LOCAL", "Generic")];
+        let requested = vec!["repo-a".to_string(), "repo-a".to_string()];
+        let mut plan = resolve_repos_for_provisioning(&requested, &source);
+        let mut mappings = std::collections::HashMap::new();
+        mappings.insert("repo-a".to_string(), "renamed".to_string());
+        apply_repo_mappings(&mut plan.resolved, &mappings).expect("self is not a collision");
+        assert!(plan.resolved.iter().all(|c| c.target_key == "renamed"));
+    }
+
+    #[test]
     fn test_apply_repo_mappings_overrides_only_mapped_target_key() {
         // Only the mapped repo's target_key changes; source_key and the rest stay put.
         let source = vec![
@@ -4970,6 +5067,197 @@ mod tests {
         let cfg = plan.resolved.first().unwrap();
         assert_eq!(cfg.target_key, cfg.source_key);
         assert_eq!(cfg.target_key, "maven-releases");
+    }
+
+    /// A dry run reports what would move and writes nothing: no destination
+    /// repository, no `artifacts` row, no `migration_items`. The mock panics on
+    /// download, so entering the transfer path at all fails the test.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_process_job_dry_run_reports_counts_and_writes_nothing() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::artifactory_client::{
+            AqlRange, AqlResponse, AqlResult, ArtifactoryError, PropertiesResponse,
+        };
+        use crate::services::source_registry::SourceRegistry;
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        const ARTIFACT_SIZE: i64 = 4242;
+
+        struct DryRunSource;
+
+        #[async_trait]
+        impl SourceRegistry for DryRunSource {
+            async fn ping(&self) -> Result<bool, ArtifactoryError> {
+                Ok(true)
+            }
+            async fn get_version(
+                &self,
+            ) -> Result<crate::services::artifactory_client::SystemVersionResponse, ArtifactoryError>
+            {
+                unimplemented!("not called by process_job")
+            }
+            async fn list_repositories(
+                &self,
+            ) -> Result<
+                Vec<crate::services::artifactory_client::RepositoryListItem>,
+                ArtifactoryError,
+            > {
+                // A group over the renamed repo too, so the dry run also has
+                // membership it would have to correlate.
+                let mut group = mk_source_repo("dry-group", "GROUP", "Generic");
+                group.members = vec!["dry-src".to_string()];
+                Ok(vec![mk_source_repo("dry-src", "LOCAL", "Generic"), group])
+            }
+            async fn list_artifacts(
+                &self,
+                repo_key: &str,
+                offset: i64,
+                limit: i64,
+            ) -> Result<AqlResponse, ArtifactoryError> {
+                // One short page ends pagination; reads must use the SOURCE key.
+                assert_eq!(repo_key, "dry-src", "source must be read by source key");
+                Ok(AqlResponse {
+                    results: vec![AqlResult {
+                        repo: repo_key.to_string(),
+                        path: "pkg/1.0".into(),
+                        name: "thing.tar.gz".into(),
+                        size: Some(ARTIFACT_SIZE),
+                        created: None,
+                        modified: None,
+                        sha256: None,
+                        actual_sha1: None,
+                    }],
+                    range: AqlRange {
+                        start_pos: offset,
+                        end_pos: offset + limit,
+                        total: 1,
+                    },
+                })
+            }
+            async fn download_artifact(
+                &self,
+                _repo_key: &str,
+                _path: &str,
+            ) -> Result<bytes::Bytes, ArtifactoryError> {
+                panic!("a dry run must not download anything");
+            }
+            async fn get_properties(
+                &self,
+                _repo_key: &str,
+                _path: &str,
+            ) -> Result<PropertiesResponse, ArtifactoryError> {
+                panic!("a dry run must not read artifact properties");
+            }
+            fn source_type(&self) -> &'static str {
+                "dry-run-mock"
+            }
+        }
+
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("dry-run-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed source connection");
+
+        // Rename on import, so the dry run also exercises the mapped target.
+        let target_key = format!("dry-dst-{}", Uuid::new_v4().simple());
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
+             VALUES ($1, 'full', $2) RETURNING id",
+        )
+        .bind(conn_id)
+        .bind(serde_json::json!({
+            "include_repos": ["dry-src", "dry-group"],
+            "repo_mappings": { "dry-src": target_key },
+            "dry_run": true,
+        }))
+        .fetch_one(&pool)
+        .await
+        .expect("seed migration job");
+
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig {
+                dry_run: true,
+                ..WorkerConfig::default()
+            },
+            CancellationToken::new(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(8);
+        worker
+            .process_job(
+                job_id,
+                Arc::new(DryRunSource),
+                ConflictResolution::Skip,
+                Some(tx),
+            )
+            .await
+            .expect("dry run must not fail the job");
+
+        let mut last: Option<ProgressUpdate> = None;
+        while let Ok(update) = rx.try_recv() {
+            last = Some(update);
+        }
+        let final_update = last.expect("final progress update");
+        assert_eq!(
+            final_update.completed, 1,
+            "dry run must report the artifact it would transfer"
+        );
+        assert_eq!(final_update.transferred_bytes, ARTIFACT_SIZE);
+        assert_eq!(final_update.failed, 0);
+
+        let repo_created: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM repositories WHERE key = $1)")
+                .bind(&target_key)
+                .fetch_one(&pool)
+                .await
+                .expect("repo existence check");
+        assert!(
+            !repo_created,
+            "dry run created the destination repository '{target_key}'"
+        );
+
+        let group_created: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM repositories WHERE key = 'dry-group')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("group existence check");
+        assert!(!group_created, "dry run created the virtual repository");
+
+        let items: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM migration_items WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("item count");
+        assert_eq!(items, 0, "dry run wrote migration_items");
+
+        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await;
     }
 
     #[test]

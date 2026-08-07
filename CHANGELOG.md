@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Migration jobs can rename repositories on import** (#3035): `MigrationConfig.repo_mappings` maps a source repository key to the key it lands under (e.g. `network-team-python` -> `network-pypi`); unmapped repositories keep their source name, and a renamed member of a migrated virtual repository keeps its membership. Targets are validated like a hand-created repository key and two sources may not share one destination; either fails the job rather than migrating under the original name. A target that already exists is reused and the source's artifacts are merged into it, logged as a warning naming both repositories.
+
 ### Changed
+
+- **`MigrationConfig.dry_run` no longer writes** (#3035): it gated only the artifact upload, so a preview created every destination repository and wrote `artifacts` plus OCI index rows pointing at bytes it never uploaded. A dry run now logs the destination plan (create or reuse, under which key), skips provisioning and virtual member correlation, and enumerates the source without downloading or writing, so it still reports the artifact count and byte total it would transfer.
 
 - **BREAKING API SEMANTICS: `PUT /api/v1/repositories/{key}/members` (virtual repository members) is a full-set replace** (#2795, ratified in #2899): as of #2795 the request body is the *complete* desired member list, not a partial update. Any existing member whose key is absent from the body is **removed**; members present in the body are inserted if missing, or have their priority updated if already present; an empty `members` array removes every member. Previously the endpoint only reordered members that already existed and returned 404 for a member that was not already present, which made it impossible to add or remove a member when editing a virtual repository after creation. **API clients that send a partial member list in order to reorder priorities will now delete the members they omit** and must be updated to always send the complete member list. The web UI (`virtual-members-panel.tsx` move-up/move-down) and the CLI (`members reorder`, documented as a bulk full-set operation) already send the full list and are unaffected. The behavior is now stated in the OpenAPI operation description and pinned by a regression test.
 
