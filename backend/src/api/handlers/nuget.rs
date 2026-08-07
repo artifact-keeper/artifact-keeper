@@ -1364,6 +1364,11 @@ async fn flatcontainer_download(
                     artifact.id,
                     storage.as_ref(),
                     &artifact.storage_key,
+                    // #2929: enforce the row's own recorded digest against the
+                    // repaired bytes. `check_artifact_download` above authorised
+                    // on this row, so the hash an admin reviewed at quarantine
+                    // release must be the hash the client actually gets.
+                    Some(artifact.checksum_sha256.as_str()),
                     || {
                         let package_id_lower = package_id_lower.clone();
                         let version = version.clone();
