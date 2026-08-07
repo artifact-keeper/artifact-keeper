@@ -54,6 +54,11 @@ use std::path::{Path, PathBuf};
 ///   * npm.rs 5 -> 6: the packument stale-while-revalidate cache (#2166) added a
 ///     bounded `axum::body::to_bytes` read of a computed packument JSON, capped
 ///     at `NPM_PACKUMENT_BUFFER_CAP`. A legitimate new metadata buffer site.
+/// #3052: npm.rs 6 -> 7. Packument HTTP caching needs the identity body in hand
+/// to compute the ETag the client revalidates against, so the per-request
+/// (uncached) path buffers it once, bounded by `NPM_PACKUMENT_BUFFER_CAP`. A
+/// legitimate new metadata buffer site, same shape as the #2166 row above.
+///
 ///   * pypi.rs 1 -> removed: the shared content-addressed upload primitive
 ///     (#2199) streamed the pypi upload to storage, deleting the last `.bytes()`
 ///     multipart-field read. Phase progress — the row is gone.
@@ -75,7 +80,7 @@ use std::path::{Path, PathBuf};
 /// total is 28 + 1 = 29.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/goproxy.rs", 1),
-    ("src/api/handlers/npm.rs", 6),
+    ("src/api/handlers/npm.rs", 7),
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/plugins.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 2),
@@ -437,10 +442,11 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 29,
-        "expected 29 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+        total, 30,
+        "expected 30 exempt sites after #1608 Phase 4b + #2491 reconciliation \
          + PF-005 (#2517) generic multipart streaming (repositories.rs -2) \
-         + RPM curation-sync reconciliation (scheduler_service.rs +1); got {total}"
+         + RPM curation-sync reconciliation (scheduler_service.rs +1) \
+         + packument HTTP caching (#3052, npm.rs +1); got {total}"
     );
 }
 

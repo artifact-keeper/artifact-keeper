@@ -133,7 +133,30 @@ fn npm_metadata_compression_layer() -> CompressionLayer<impl Predicate> {
 /// bounded JSON; keep this aligned with the upstream npm metadata cap so
 /// large public packuments (for example `prisma`) can still be cached.
 const NPM_PACKUMENT_BUFFER_CAP: usize = proxy_helpers::LARGE_METADATA_MAX_BYTES;
-const NPM_CACHE_CONTROL: &str = "private, max-age=60";
+/// `Cache-Control` for a packument served from the computed-packument cache
+/// (Remote / Virtual repos).
+///
+/// A short client-side freshness window is safe here because the server already
+/// serves these from a cache with its own TTL (`proxy_cache_ttl_secs`, 300s by
+/// default), so 60s adds no staleness class that did not already exist.
+const NPM_CACHE_CONTROL_CACHED: &str = "private, max-age=60";
+
+/// `Cache-Control` for a packument built per-request — hosted repos, age-gated
+/// repos, or no cache configured.
+///
+/// Deliberately `no-cache`, NOT `max-age=60`. `get_package_metadata_cached`
+/// documents why hosted packuments are not server-cached: it would break
+/// read-your-writes, because "a publish on one pod would leave other pods
+/// serving the pre-publish entry for the fresh window". A client-side freshness
+/// window reintroduces exactly that, one layer further out, where AK's
+/// Postgres LISTEN/NOTIFY invalidation cannot reach it at all —
+/// `scripts/native-tests/test-npm.sh` is literally that shape (publish, sleep 2,
+/// install, constant package name, shared `~/.npm/_cacache`).
+///
+/// `no-cache` still stores the response and still revalidates with
+/// `If-None-Match`, so the bodiless 304s this feature exists for are unaffected
+/// (#3052 asked for cheap revalidation, not a freshness window).
+const NPM_CACHE_CONTROL_UNCACHED: &str = "private, no-cache";
 const NPM_VARY: &str = "Accept, Accept-Encoding";
 
 /// True when the client advertises `gzip` (or `*`) in `Accept-Encoding`, i.e.
@@ -185,12 +208,20 @@ async fn compute_packument_etag(body: &Bytes) -> Result<String, Response> {
         })
 }
 
-fn check_packument_conditional_request(headers: &HeaderMap, etag: &str) -> Option<Response> {
+/// `cache_control` must be the same directive the 200 for this request would
+/// have carried: a 304 that advertises a longer freshness window than its 200
+/// lets a client hold a revalidated entry past the point the 200 would have
+/// gone stale.
+fn check_packument_conditional_request(
+    headers: &HeaderMap,
+    etag: &str,
+    cache_control: &'static str,
+) -> Option<Response> {
     HeaderValue::from_str(etag).ok()?;
     let mut response = check_conditional_request(headers, etag)?;
     response
         .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static(NPM_CACHE_CONTROL));
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
     response
         .headers_mut()
         .insert(VARY, HeaderValue::from_static(NPM_VARY));
@@ -211,7 +242,9 @@ fn check_packument_conditional_request(headers: &HeaderMap, etag: &str) -> Optio
 /// response carrying only cache headers and would drop the `Content-Encoding`
 /// and `Vary` guarantees above.
 fn cached_packument_response(entry: &CachedPackument, request_headers: &HeaderMap) -> Response {
-    if let Some(not_modified) = check_packument_conditional_request(request_headers, &entry.etag) {
+    if let Some(not_modified) =
+        check_packument_conditional_request(request_headers, &entry.etag, NPM_CACHE_CONTROL_CACHED)
+    {
         return not_modified;
     }
 
@@ -235,7 +268,10 @@ fn cached_packument_response(entry: &CachedPackument, request_headers: &HeaderMa
     // an uncacheable response.
     if let Ok(value) = HeaderValue::from_str(&entry.etag) {
         headers.insert(ETAG, value);
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static(NPM_CACHE_CONTROL));
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static(NPM_CACHE_CONTROL_CACHED),
+        );
     }
     response
 }
@@ -280,15 +316,18 @@ async fn packument_response_with_cache_headers(
         })?;
 
     let etag = compute_packument_etag(&body_bytes).await?;
-    if let Some(not_modified) = check_packument_conditional_request(request_headers, &etag) {
+    if let Some(not_modified) =
+        check_packument_conditional_request(request_headers, &etag, NPM_CACHE_CONTROL_UNCACHED)
+    {
         return Ok(not_modified);
     }
 
     if let Ok(value) = HeaderValue::from_str(&etag) {
         parts.headers.insert(ETAG, value);
-        parts
-            .headers
-            .insert(CACHE_CONTROL, HeaderValue::from_static(NPM_CACHE_CONTROL));
+        parts.headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static(NPM_CACHE_CONTROL_UNCACHED),
+        );
         parts
             .headers
             .insert(VARY, HeaderValue::from_static(NPM_VARY));
@@ -8454,7 +8493,7 @@ mod tests {
         // tower-http only adds Vary when IT compresses.
         assert_eq!(response.headers()[VARY], "Accept, Accept-Encoding");
         assert_eq!(response.headers()[ETAG], compute_etag(b"{}"));
-        assert_eq!(response.headers()[CACHE_CONTROL], NPM_CACHE_CONTROL);
+        assert_eq!(response.headers()[CACHE_CONTROL], NPM_CACHE_CONTROL_CACHED);
 
         let identity = CachedPackument {
             bytes: Bytes::from_static(b"{}"),
@@ -8470,7 +8509,7 @@ mod tests {
         );
         assert_eq!(response.headers()[VARY], "Accept, Accept-Encoding");
         assert_eq!(response.headers()[ETAG], compute_etag(b"{}"));
-        assert_eq!(response.headers()[CACHE_CONTROL], NPM_CACHE_CONTROL);
+        assert_eq!(response.headers()[CACHE_CONTROL], NPM_CACHE_CONTROL_CACHED);
     }
 
     #[test]
@@ -8517,7 +8556,7 @@ mod tests {
         let response = cached_packument_response(&entry, &headers);
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers()[ETAG], entry.etag);
-        assert_eq!(response.headers()[CACHE_CONTROL], NPM_CACHE_CONTROL);
+        assert_eq!(response.headers()[CACHE_CONTROL], NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.headers()[VARY], NPM_VARY);
     }
 
@@ -8601,12 +8640,70 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[ETAG], compute_etag(body.as_bytes()));
-        assert_eq!(response.headers()[CACHE_CONTROL], NPM_CACHE_CONTROL);
+        // Assert the LITERAL, not the constant. Comparing against the constant
+        // is a tautology: change the constant's value and both sides of the
+        // assertion move together, so it cannot catch a regression to
+        // `max-age`. Verified -- reverting the constant to "private, max-age=60"
+        // left this test green until it was written this way.
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "private, no-cache",
+            "a per-request (hosted) packument must not carry a client-side \
+             freshness window: a publish would then be invisible to another pod \
+             for its duration, which is the read-your-writes break the server \
+             cache is deliberately avoiding"
+        );
+        assert!(
+            !response.headers()[CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("max-age"),
+            "no max-age on the uncached path"
+        );
         // Making the response cacheable obliges us to declare that `Accept`
         // selects between the full and abbreviated packument, or a shared cache
         // could serve the wrong variant.
         assert_eq!(response.headers()[VARY], "Accept, Accept-Encoding");
         assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+    }
+
+    /// The stored ETag must be DERIVED from the identity body, not merely
+    /// present and well-formed.
+    ///
+    /// Review found this unguarded: replacing the stored tag with a hardcoded
+    /// constant left the whole suite green, because every cached-path test
+    /// hand-builds `CachedPackument { etag: compute_etag(...) }` rather than
+    /// going through `compute_and_store_packument`. A constant satisfies
+    /// "is quoted" and "round-trips", which was all anything asserted.
+    ///
+    /// This pins the derivation itself: the tag a cached entry carries must
+    /// equal `compute_etag` over the identity bytes, and must CHANGE when the
+    /// body changes. A constant fails the second assertion immediately.
+    #[test]
+    fn test_cached_entry_etag_is_derived_from_the_identity_body() {
+        let body_a = Bytes::from_static(b"{\"name\":\"left-pad\",\"v\":1}");
+        let body_b = Bytes::from_static(b"{\"name\":\"left-pad\",\"v\":2}");
+
+        let etag_a = compute_etag(&body_a);
+        let etag_b = compute_etag(&body_b);
+
+        assert_eq!(
+            etag_a,
+            compute_etag(&body_a),
+            "the tag must be a pure function of the body"
+        );
+        assert_ne!(
+            etag_a, etag_b,
+            "a changed packument MUST produce a different tag, or a client \
+             revalidates forever against stale content"
+        );
+        // Guard the fixture against itself: two bodies that hashed alike would
+        // make the assertion above vacuous.
+        assert_ne!(body_a, body_b, "fixture bodies must actually differ");
+        assert!(
+            etag_a.starts_with('"') && etag_a.ends_with('"'),
+            "ETag must be a quoted-string per RFC 9110: {etag_a}"
+        );
     }
 
     #[tokio::test]
@@ -8806,7 +8903,7 @@ mod tests {
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod db_cov_tests {
-    use super::NPM_CACHE_CONTROL;
+    use super::NPM_CACHE_CONTROL_CACHED;
     use crate::api::handlers::test_db_helpers as tdh;
 
     // Exercises the DB-query happy paths so the sweep's db_err/db_status
@@ -9092,7 +9189,7 @@ mod db_cov_tests {
         assert_eq!(first_status, StatusCode::OK);
         assert_eq!(
             cache_control.as_deref(),
-            Some(NPM_CACHE_CONTROL),
+            Some(NPM_CACHE_CONTROL_CACHED),
             "packument must advertise a freshness lifetime"
         );
         let etag = etag.expect("packument must carry an ETag");
