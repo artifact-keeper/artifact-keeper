@@ -37,6 +37,7 @@ use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
+use crate::services::repository_service::{format_handler_key, parse_format_str};
 use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 
 // ---------------------------------------------------------------------------
@@ -2334,6 +2335,32 @@ struct OciRepoInfo {
     image: String,
 }
 
+/// Reject repository formats that are not backed by the OCI handler.
+///
+/// Repository keys share a namespace across all package formats, so resolving
+/// a key alone is not enough to authorize use of the Distribution API. Without
+/// this gate, an OCI client can push manifests into a classic `helm` repository
+/// and those rows later leak into its `index.yaml` (#3150).
+#[allow(clippy::result_large_err)]
+fn validate_oci_repository_format(repo_key: &str, format: &str) -> Result<(), Response> {
+    let is_oci = parse_format_str(format)
+        .map(|format| format_handler_key(&format) == "oci")
+        .unwrap_or(false);
+
+    if is_oci {
+        return Ok(());
+    }
+
+    Err(oci_error(
+        StatusCode::BAD_REQUEST,
+        "UNSUPPORTED",
+        &format!(
+            "repository '{}' does not support the OCI Distribution API (format: {})",
+            repo_key, format
+        ),
+    ))
+}
+
 /// Build an [`OciRepoInfo`] for a virtual repo's resolving MEMBER so the scan
 /// gate runs in the member's context (its id/key/upstream/storage), while the
 /// `image` path stays the pull's image name (#3023). Used only on the virtual
@@ -2399,8 +2426,9 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
 
     let select_repo_by_key = |key: String| async move {
         sqlx::query(
-            "SELECT id, key, storage_backend, storage_path, repo_type::text as repo_type, \
-             upstream_url, is_public FROM repositories WHERE key = $1",
+            "SELECT id, key, storage_backend, storage_path, format::text as format, \
+             repo_type::text as repo_type, upstream_url, is_public \
+             FROM repositories WHERE key = $1",
         )
         .bind(key)
         .fetch_optional(db)
@@ -2447,6 +2475,10 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
         )
     })?;
 
+    let resolved_key: String = repo.try_get("key").map_err(map_db_err)?;
+    let format: String = repo.try_get("format").map_err(map_db_err)?;
+    validate_oci_repository_format(&resolved_key, &format)?;
+
     let location = crate::storage::StorageLocation {
         backend: repo.try_get("storage_backend").map_err(map_db_err)?,
         path: repo.try_get("storage_path").map_err(map_db_err)?,
@@ -2454,7 +2486,7 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
 
     Ok(OciRepoInfo {
         id: repo.try_get("id").map_err(map_db_err)?,
-        key: repo.try_get("key").map_err(map_db_err)?,
+        key: resolved_key,
         location,
         repo_type: repo.try_get("repo_type").map_err(map_db_err)?,
         upstream_url: repo.try_get("upstream_url").map_err(map_db_err)?,
@@ -11921,6 +11953,66 @@ mod tests {
         assert!(info.upstream_url.is_none());
     }
 
+    #[test]
+    fn test_validate_oci_repository_format_accepts_oci_handler_formats() {
+        for format in ["docker", "podman", "buildx", "oras", "wasm_oci", "helm_oci"] {
+            assert!(
+                validate_oci_repository_format("packages", format).is_ok(),
+                "{format} must be served by the OCI Distribution API"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_oci_repository_format_rejects_classic_helm() {
+        let response = validate_oci_repository_format("helm-local", "helm")
+            .expect_err("a classic Helm repository must reject OCI requests");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("OCI error body");
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("OCI error JSON");
+        assert_eq!(error["errors"][0]["code"], "UNSUPPORTED");
+        assert!(error["errors"][0]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("format: helm"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_repo_rejects_classic_helm_repository() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let image_name = format!("{}/keycloak", f.repo_key);
+        let response = match resolve_repo(&f.pool, &image_name).await {
+            Ok(_) => panic!("classic Helm repository resolved through the OCI API"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_resolve_repo_accepts_helm_oci_repository() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(f) = tdh::Fixture::setup("local", "helm_oci").await else {
+            return;
+        };
+        let image_name = format!("{}/keycloak", f.repo_key);
+        let repo = match resolve_repo(&f.pool, &image_name).await {
+            Ok(repo) => repo,
+            Err(_) => panic!("helm_oci repository must resolve through the OCI API"),
+        };
+        assert_eq!(repo.id, f.repo_id);
+        assert_eq!(repo.image, "keycloak");
+        f.teardown().await;
+    }
+
     // --- Docker Hub library/ prefix tests ---
 
     #[test]
@@ -15092,6 +15184,57 @@ mod manifest_digest_db_tests {
                 .await;
         }
         fx.teardown().await;
+    }
+
+    /// Regression guard for #3150: a manifest PUT must fail before it can
+    /// write OCI rows into a classic Helm repository.
+    #[tokio::test]
+    async fn manifest_put_rejects_classic_helm_repository_before_writes() {
+        if std::env::var("DATABASE_URL").is_err() {
+            if require_db_under_coverage() {
+                panic!("DATABASE_URL must be set for OCI manifest digest tests");
+            }
+            return;
+        }
+        let fx = tdh::Fixture::setup("local", "helm")
+            .await
+            .expect("fixture setup");
+        let auth = bearer(&fx).await;
+        let manifest = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.cncf.helm.config.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":1},"layers":[]}"#,
+        );
+
+        let (status, _, body) = send(
+            router().with_state(fx.state.clone()),
+            req(
+                Method::PUT,
+                format!("/{}/keycloak/manifests/26.7.0", fx.repo_key),
+                &auth,
+                Some("application/vnd.oci.image.manifest.v1+json"),
+                manifest,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("OCI error JSON");
+        assert_eq!(error["errors"][0]["code"], "UNSUPPORTED");
+        let artifact_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("artifact count");
+        let tag_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("OCI tag count");
+        assert_eq!(artifact_count, 0);
+        assert_eq!(tag_count, 0);
+
+        cleanup(&fx).await;
     }
 
     /// The core #1681 scenario end to end: a manifest pushed under a tag stays
