@@ -9,14 +9,17 @@ on:
       - '.beads/**'
       - 'LICENSE'
       - 'CLAUDE.md'
+  # No `paths-ignore` on pull_request: this workflow is the single owner of
+  # the branch-protection required contexts ("🦀 Check Rust", "🧪 Backend
+  # Unit Tests", "✅ CI Complete"), so it must trigger on every PR. The
+  # `changes` job below decides whether the change is docs-only; heavy jobs
+  # then skip via job-level `if`, which GitHub reports as success for
+  # required checks ("Handling skipped but required checks"). This replaces
+  # the docs-required-shim.yml workflow, which posted duplicate check runs
+  # under the same required context names on PRs touching both docs and
+  # code (#2923).
   pull_request:
     branches: [main, master, develop, 'release/**']
-    paths-ignore:
-      - 'site/**'
-      - '**/*.md'
-      - '.beads/**'
-      - 'LICENSE'
-      - 'CLAUDE.md'
   workflow_dispatch:
 
 permissions:
@@ -37,6 +40,204 @@ env:
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
+  # DOCS-ONLY GATE
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Decides whether a PR touches anything beyond the docs paths that used to
+  # live in this workflow's `paths-ignore` (and in docs-required-shim.yml's
+  # `paths`). Replaces the shim: `paths` / `paths-ignore` cannot express
+  # "fire only when the other workflow does not" (paths-ignore skips only if
+  # ALL files match, paths fires if ANY file matches), so a PR touching a
+  # `.md` file plus code triggered both workflows and got every required
+  # context posted twice (#2923). Computing the decision here makes the two
+  # outcomes mutually exclusive by construction.
+  #
+  # Fails open: on push / workflow_dispatch, or if the PR file listing
+  # errors, `code` is "true" and full CI runs. Downstream jobs gate on
+  # `code != 'false'` so an empty output also runs full CI. The file list
+  # comes from the pulls/files API (server-side, same source GitHub's own
+  # path filtering uses) — not from attacker-influenced checkout content.
+  changes:
+    name: 🔍 Docs-Only Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Determine whether non-docs files changed
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename'); then
+            echo "PR file listing failed — failing open to full CI" >&2
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            # Keep in sync with the `push` trigger's paths-ignore list above
+            # (CLAUDE.md is already covered by *.md).
+            case "$f" in
+              site/*|*.md|.beads/*|LICENSE) ;;
+              *) code=true ;;
+            esac
+          done <<< "$files"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "non-docs changes: $code"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RELEASE-BUMP GATE
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Decides whether a PR is a version-bump-only release PR (#3045). Such PRs
+  # touch only the release-bump file set (Cargo.toml, Cargo.lock,
+  # backend/src/api/openapi.rs, .trivyignore, CHANGELOG.md) and, for the
+  # files that feed the compile, change nothing but version-string lines —
+  # so they cannot alter unit-test, clippy, or coverage outcomes. The heavy
+  # ak-ci-runners jobs (check-rust, test-backend-unit, coverage) skip via
+  # job-level `if`, which GitHub reports as success for required checks —
+  # the same mechanics as the Docs-Only Gate above. shell-tests and
+  # security-audit still run: they are cheap ubuntu-latest jobs, and
+  # security-audit genuinely reads the Cargo.lock this PR touches.
+  #
+  # Fails CLOSED: on push / workflow_dispatch, on any API error, on any file
+  # outside the allowed set, on any rename/add/delete, on a missing inline
+  # patch (GitHub omits `patch` for very large diffs), or on any +/- diff
+  # line that is not provably a version-string line, `bump_only` is "false"
+  # and full CI runs. Downstream jobs gate on `bump_only != 'true'` so an
+  # empty output also runs full CI. The file list and per-file patches come
+  # from the pulls/files API (server-side, the PR's diff against its merge
+  # base) — not from attacker-influenced checkout content.
+  release-bump:
+    name: 🔍 Release-Bump Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      bump_only: ${{ steps.filter.outputs.bump_only }}
+    steps:
+      - name: Determine whether the PR is a version-bump-only release PR
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "bump_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/files" \
+              --paginate --slurp > /tmp/pr-files.json; then
+            echo "PR file listing failed — failing closed to full CI" >&2
+            echo "bump_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bump_only=$(python3 - /tmp/pr-files.json <<'PY'
+          import json
+          import re
+          import sys
+
+          # --slurp wraps each paginated response page in an outer array.
+          pages = json.load(open(sys.argv[1]))
+          files = [f for page in pages for f in page]
+
+          SEMVER = r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?'
+          # Allowed file -> regex every +/- diff line must match, or None if
+          # any content change in that file is acceptable on the fast path.
+          #
+          # Cargo.toml: only the workspace `version = "X.Y.Z"` line (column 0)
+          # may change; dependency edits use `name = { version = ... }` inline
+          # tables, add/remove non-matching lines, or live in other files, so
+          # they fall back to full CI.
+          # Cargo.lock: a workspace version bump only rewrites the bare
+          # `version = "..."` lines of workspace member [[package]] blocks. Any
+          # real dependency change also touches `checksum =` / `source =` /
+          # `name =` / `dependencies =` lines, which fail the pattern.
+          # openapi.rs: only the `version = "X.Y.Z",` utoipa info line.
+          ALLOWED = {
+              'Cargo.toml': re.compile(r'^[+-]version = "' + SEMVER + r'"$'),
+              'Cargo.lock': re.compile(r'^[+-]version = "' + SEMVER + r'"$'),
+              'backend/src/api/openapi.rs': re.compile(r'^[+-]\s*version = "' + SEMVER + r'",$'),
+              '.trivyignore': None,
+              'CHANGELOG.md': None,
+          }
+
+          def full_ci(reason):
+              print(f'full CI: {reason}', file=sys.stderr)
+              print('false')
+              sys.exit(0)
+
+          if not files:
+              full_ci('empty PR file listing')
+
+          for f in files:
+              name = f.get('filename')
+              if name not in ALLOWED:
+                  full_ci(f'{name!r} is outside the release-bump file set')
+              if f.get('status') != 'modified':
+                  full_ci(f'{name!r} has status {f.get("status")!r}, not a plain modification')
+              line_re = ALLOWED[name]
+              if line_re is None:
+                  continue
+              patch = f.get('patch')
+              if not patch:
+                  full_ci(f'{name!r} has no inline patch to validate (diff too large)')
+              # Split on '\n' ONLY. str.splitlines() also breaks on the
+              # vertical tab, form feed, file/group/record separators, NEL and
+              # the Unicode line/paragraph separators -- none of which git or
+              # the GitHub patch field treat as a line terminator. Every one of
+              # them is also valid Rust/TOML whitespace, so splitlines() turned
+              # a single physical diff line into two Python "lines" and the
+              # trailing fragment -- which does not start with +/- -- was
+              # skipped entirely, letting arbitrary code ride into openapi.rs
+              # on a line whose prefix matched the version regex. The gate then
+              # skipped Check Rust, Backend Unit Tests and Code Coverage while
+              # CI Complete reported success. Belt and braces: reject outright
+              # any patch containing one of those separators.
+              SPLIT_ONLY_IN_PYTHON = (
+                  '\x0b', '\x0c', '\x1c', '\x1d', '\x1e',
+                  '\x85', '\u2028', '\u2029',
+              )
+              if any(sep in patch for sep in SPLIT_ONLY_IN_PYTHON):
+                  full_ci(f'{name!r} patch contains a non-newline line separator')
+              lines = [ln.rstrip('\r') for ln in patch.split('\n')]
+              # Cargo.toml: the regex alone is position-blind. A section table
+              # ([dependencies.foo], [patch.crates-io.foo], ...) also puts
+              # `version = "X.Y.Z"` at column 0, so a dependency edit would
+              # match. Require that the only TOML section the hunk touches is
+              # [workspace.package]; anything else falls back to full CI.
+              if name == 'Cargo.toml':
+                  sections = {
+                      ln[1:].strip() for ln in lines
+                      if ln[1:2] == '[' and ln[:1] in (' ', '+', '-')
+                  }
+                  if sections - {'[workspace.package]'}:
+                      full_ci(f'Cargo.toml hunk touches sections {sorted(sections)}')
+              for line in lines:
+                  if line.startswith(('+', '-')) and not line_re.match(line):
+                      full_ci(f'{name!r} changes a non-version line: {line!r}')
+
+          print('true')
+          PY
+          ) || bump_only=false
+          case "$bump_only" in
+            true|false) ;;
+            *) bump_only=false ;;
+          esac
+          echo "bump_only=$bump_only" >> "$GITHUB_OUTPUT"
+          echo "version-bump-only release PR: $bump_only"
+
+  # ════════════════════════════════════════════════════════════════════════════
   # TIER 1: FAST CI (Every Push/PR) - Target: < 5 minutes
   # ════════════════════════════════════════════════════════════════════════════
 
@@ -44,6 +245,11 @@ jobs:
     name: 🦀 Check Rust
     runs-on: ak-ci-runners
     timeout-minutes: 20
+    needs: [changes, release-bump]
+    # Skip (reported as success for required checks) on docs-only PRs and on
+    # version-bump-only release PRs; `!cancelled()` + `!= 'false'` /
+    # `!= 'true'` fail open if either gate itself failed.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     # Disable debuginfo to cut peak compile memory on the ARC runner. The
     # lib-test target compile was OOMing ("sccache: Compile terminated by
     # signal 9", #1515) even with CARGO_BUILD_JOBS capped; debuginfo is the
@@ -129,6 +335,9 @@ jobs:
     name: 🧪 Backend Unit Tests
     runs-on: ak-ci-runners
     timeout-minutes: 25
+    needs: [changes, release-bump]
+    # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     # Same memory guard as check-rust: drop debuginfo and cap parallel rustc
     # so the lib-test compile does not OOM the runner (#1515). This step
     # previously had no CARGO_BUILD_JOBS cap and could spawn one rustc per
@@ -228,6 +437,12 @@ jobs:
           # Postgres service above instead of no-op'ing.
           SQLX_OFFLINE: true
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          # A database is provisioned for this job, so the DB-backed tests are
+          # REQUIRED to actually run. This makes `try_pool` treat a connect
+          # failure as a hard failure instead of a silent skip, so an
+          # unreachable/misconfigured Postgres can no longer "fiction-green" the
+          # suite (#2924).
+          AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         # nextest runs each test in its own process and applies the repo's
         # .config/nextest.toml db-serial test groups, which serialize the
@@ -245,6 +460,9 @@ jobs:
   shell-tests:
     name: 🐚 Shell Tests
     runs-on: ubuntu-latest
+    needs: changes
+    # Skip on docs-only PRs — see check-rust.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Self-contained bash + python3 regression tests for docker/ init scripts.
     # Runs in seconds and uses only the dependencies pre-installed on the
     # ubuntu-latest image (bash, python3, jq, curl). Kept off the Rust
@@ -263,6 +481,9 @@ jobs:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
     timeout-minutes: 35
+    needs: [changes, release-bump]
+    # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     # Memory guards for the instrumented lib-test compile (#1679/#1680,
     # extended here to the coverage job). This job builds the same lib-test
     # crate that OOM-killed check-rust, but under `-C instrument-coverage`
@@ -353,6 +574,11 @@ jobs:
         if: steps.detect.outputs.rust_changed == 'true'
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          # A database is provisioned for this job, so the DB-backed tests are
+          # REQUIRED to run. A connect failure now fails the suite loudly instead
+          # of silently skipping (which would also silently drop coverage). See
+          # issue #2924.
+          AK_TESTS_REQUIRE_DB: "1"
           SQLX_OFFLINE: true
           RUSTC_WRAPPER: ""
           # SSO credential encryption tests in auth_config_service rely on at
@@ -827,9 +1053,13 @@ jobs:
 
   smoke-e2e:
     name: 🔥 Smoke E2E Tests
-    runs-on: ak-e2e-runners
-    needs: [test-backend-unit, build-backend-image]
-    if: needs.build-backend-image.result == 'success'
+    runs-on: ubuntu-24.04
+    # Depend on the required fast-CI gates as well as the image build so a
+    # known-red Check Rust or unit-test run never launches smoke. Smoke only
+    # runs when all three succeeded; if the backend image was skipped (no
+    # backend changes) or an upstream gate failed, smoke is skipped.
+    needs: [check-rust, test-backend-unit, build-backend-image]
+    if: needs.check-rust.result == 'success' && needs.test-backend-unit.result == 'success' && needs.build-backend-image.result == 'success'
     permissions:
       contents: read
       packages: read
@@ -936,7 +1166,7 @@ jobs:
 
   detect-changes:
     name: 🔍 Detect Changes
-    runs-on: ak-ci-runners
+    runs-on: ubuntu-latest
     timeout-minutes: 8
     permissions:
       contents: read
@@ -947,7 +1177,7 @@ jobs:
       openscap: ${{ steps.filter.outputs.openscap }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4
         id: filter
         with:
           filters: |
@@ -971,7 +1201,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Build backend image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -1026,7 +1256,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Build openscap image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -1063,6 +1293,11 @@ jobs:
     name: 🔒 Security Audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    needs: changes
+    # Skip on docs-only PRs — see check-rust. (Docs-only PRs never change
+    # Cargo.lock, and previously did not run this job either: ci.yml did not
+    # trigger at all.)
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -1082,90 +1317,114 @@ jobs:
 
   ci-complete:
     name: ✅ CI Complete
-    runs-on: ak-ci-runners
+    runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
+        # Results are passed through the environment rather than interpolated
+        # directly into the script body so a job result string can never alter
+        # the shell control flow.
+        env:
+          RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
+          RESULT_UNIT: ${{ needs.test-backend-unit.result }}
+          RESULT_SHELL: ${{ needs.shell-tests.result }}
+          RESULT_COVERAGE: ${{ needs.coverage.result }}
+          RESULT_INTEGRATION: ${{ needs.test-backend-integration.result }}
+          RESULT_SMOKE: ${{ needs.smoke-e2e.result }}
+          RESULT_BUILD_BACKEND: ${{ needs.build-backend-image.result }}
+          RESULT_BUILD_OPENSCAP: ${{ needs.build-openscap-image.result }}
+          RESULT_SECURITY: ${{ needs.security-audit.result }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
         run: |
-          echo "## CI Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          echo "## CI Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          tier1_pass=true
+          failed=false
 
-          # Tier 1 jobs (required)
-          for job in check-rust test-backend-unit shell-tests; do
-            result="${{ needs.check-rust.result }}"
-            [ "$job" = "test-backend-unit" ] && result="${{ needs.test-backend-unit.result }}"
-            [ "$job" = "shell-tests" ] && result="${{ needs.shell-tests.result }}"
+          # Docs-only PRs legitimately skip the Tier 1 jobs (see the
+          # `changes` job). Version-bump-only release PRs legitimately skip
+          # the heavy Rust jobs — check-rust and test-backend-unit, but NOT
+          # shell-tests, which still runs on that path (see the
+          # `release-bump` job). Any other skip/failure of a Tier 1 job is
+          # fatal.
+          docs_only=false
+          if [[ "$CODE_CHANGED" == "false" ]]; then
+            docs_only=true
+            echo "📝 docs-only change — Tier 1 jobs skipped by design" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          bump_only=false
+          if [[ "$BUMP_ONLY" == "true" ]]; then
+            bump_only=true
+            echo "🔖 version-bump-only release PR — heavy Rust jobs skipped by design" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Required jobs run on every event. Anything other than success,
+          # including a skip or a cancellation, is a hard failure so an
+          # unexpected non-run can never be reported as green — except on a
+          # docs-only change, where these jobs are skipped by design.
+          require_success() {
+            local name="$1" result="$2"
             if [[ "$result" == "success" ]]; then
-              echo "✅ $job" >> $GITHUB_STEP_SUMMARY
+              echo "✅ $name" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$result" == "skipped" && "$docs_only" == "true" ]]; then
+              echo "⏭️ $name (docs-only)" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$result" == "skipped" && "$bump_only" == "true" \
+                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
+              # Only the two heavy Rust jobs are skippable on the bump path.
+              # shell-tests and security-audit still run and must succeed.
+              echo "⏭️ $name (version-bump-only release PR)" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "❌ $job: $result" >> $GITHUB_STEP_SUMMARY
-              tier1_pass=false
+              echo "❌ $name: ${result:-missing}" >> "$GITHUB_STEP_SUMMARY"
+              failed=true
             fi
-          done
+          }
 
-          # Smoke E2E (skipped when backend image build is skipped due to no changes)
-          smoke_result="${{ needs.smoke-e2e.result }}"
-          if [[ "$smoke_result" == "success" ]]; then
-            echo "✅ smoke-e2e" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$smoke_result" == "skipped" ]]; then
-            echo "⏭️ smoke-e2e (no backend changes)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ smoke-e2e: $smoke_result" >> $GITHUB_STEP_SUMMARY
-            tier1_pass=false
-          fi
-
-          # Integration tests (main push only, skip check on PRs)
-          integ_result="${{ needs.test-backend-integration.result }}"
-          if [[ "$integ_result" == "success" ]]; then
-            echo "✅ integration-tests" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$integ_result" == "skipped" ]]; then
-            echo "⏭️ integration-tests (PR — skipped)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ integration-tests: $integ_result" >> $GITHUB_STEP_SUMMARY
-            tier1_pass=false
-          fi
-
-          # Container builds (PR only, skipped on push or when files unchanged)
-          for img in backend openscap; do
-            result="${{ needs.build-backend-image.result }}"
-            [ "$img" = "openscap" ] && result="${{ needs.build-openscap-image.result }}"
+          # Conditionally-required jobs are legitimately skipped in some events
+          # (no backend changes, PR-only skips). A skip passes, but a failure or
+          # cancellation fails so an aborted upstream job is never masked.
+          allow_skip() {
+            local name="$1" result="$2"
             if [[ "$result" == "success" ]]; then
-              echo "✅ build-${img}-image" >> $GITHUB_STEP_SUMMARY
+              echo "✅ $name" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" ]]; then
-              echo "⏭️ build-${img}-image (no changes)" >> $GITHUB_STEP_SUMMARY
+              echo "⏭️ $name (skipped)" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "❌ build-${img}-image: $result" >> $GITHUB_STEP_SUMMARY
-              tier1_pass=false
+              echo "❌ $name: ${result:-missing}" >> "$GITHUB_STEP_SUMMARY"
+              failed=true
             fi
-          done
+          }
 
-          # Coverage (non-blocking)
-          if [[ "${{ needs.coverage.result }}" == "success" ]]; then
-            echo "✅ coverage" >> $GITHUB_STEP_SUMMARY
+          require_success "check-rust" "$RESULT_CHECK_RUST"
+          require_success "test-backend-unit" "$RESULT_UNIT"
+          require_success "shell-tests" "$RESULT_SHELL"
+          require_success "security-audit" "$RESULT_SECURITY"
+
+          allow_skip "smoke-e2e" "$RESULT_SMOKE"
+          allow_skip "integration-tests" "$RESULT_INTEGRATION"
+          allow_skip "build-backend-image" "$RESULT_BUILD_BACKEND"
+          allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
+
+          # Coverage is non-blocking.
+          if [[ "$RESULT_COVERAGE" == "success" ]]; then
+            echo "✅ coverage" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$RESULT_COVERAGE" == "skipped" && ( "$docs_only" == "true" || "$bump_only" == "true" ) ]]; then
+            echo "⏭️ coverage (skipped by gate)" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "⚠️ coverage: ${{ needs.coverage.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ coverage: ${RESULT_COVERAGE:-missing}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # Security audit (blocking)
-          if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
-            echo "✅ security-audit" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ security-audit: ${{ needs.security-audit.result }}" >> $GITHUB_STEP_SUMMARY
-            tier1_pass=false
-          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [[ "$tier1_pass" != "true" ]]; then
-            echo "❌ **CI Failed**" >> $GITHUB_STEP_SUMMARY
+          if [[ "$failed" == "true" ]]; then
+            echo "❌ **CI Failed**" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
-          echo "✅ **CI Passed**" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **CI Passed**" >> "$GITHUB_STEP_SUMMARY"
 
   # ════════════════════════════════════════════════════════════════════════════
   # WINDOWS DEV BUILD (main push only)

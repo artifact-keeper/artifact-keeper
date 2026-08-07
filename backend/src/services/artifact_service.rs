@@ -922,26 +922,36 @@ impl ArtifactService {
             // (replication / migration / generic push) to match instead of
             // persisting the bare artifactId or filename, which would split a
             // single component across multiple grouped rows.
-            let package_name = match self.repo_service.get_by_id(artifact.repository_id).await {
-                Ok(repo)
-                    if matches!(
-                        repo.format,
-                        RepositoryFormat::Maven | RepositoryFormat::Gradle
-                    ) =>
-                {
-                    crate::formats::maven::MavenHandler::grouped_package_name(
-                        &artifact.path,
-                        &artifact.name,
-                    )
-                }
-                _ => artifact.name.clone(),
-            };
+            //
+            // #3064: the catalog `package_versions.version` must come from the
+            // same GAV coordinates as the name. `artifact.version` on this path
+            // is a naive path segment (e.g. the first groupId component), which
+            // no grouped listing row ever matches.
+            let (package_name, package_version) =
+                match self.repo_service.get_by_id(artifact.repository_id).await {
+                    Ok(repo)
+                        if matches!(
+                            repo.format,
+                            RepositoryFormat::Maven | RepositoryFormat::Gradle
+                        ) =>
+                    {
+                        match crate::formats::maven::MavenHandler::parse_coordinates(&artifact.path)
+                        {
+                            Ok(coords) => (
+                                format!("{}:{}", coords.group_id, coords.artifact_id),
+                                coords.version,
+                            ),
+                            Err(_) => (artifact.name.clone(), ver.clone()),
+                        }
+                    }
+                    _ => (artifact.name.clone(), ver.clone()),
+                };
             let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
             pkg_svc
                 .try_create_or_update_from_artifact(
                     artifact.repository_id,
                     &package_name,
-                    ver,
+                    &package_version,
                     artifact.size_bytes,
                     &artifact.checksum_sha256,
                     None,
@@ -1469,13 +1479,17 @@ impl ArtifactService {
 
         // Best-effort audit trail (#2366). An `ARTIFACT_DOWNLOADED` event is the
         // per-access record auditors need to answer "who fetched this artifact,
-        // and when?". Fire-and-forget: a download must never fail because the
-        // audit table is unavailable, mirroring the download-statistics write
-        // above. The IP is parsed leniently; a malformed value is simply omitted.
+        // and when?". Routed through the bounded download-event dispatcher
+        // (#2522) rather than a per-request spawn: a download must never fail
+        // (or slow) because the audit table is unavailable, and a flood must
+        // never grow tasks/connections without bound — mirroring the
+        // download-statistics write above. Only this download hot-path emitter
+        // uses the dispatcher; the non-hot-path `audit_fire_and_forget` call
+        // sites (auth/user/token lifecycle) keep their existing spawn. The IP
+        // is parsed leniently; a malformed value is simply omitted.
         {
-            use crate::services::audit_service::{
-                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
-            };
+            use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
+            use crate::services::download_event_dispatch::{try_enqueue, DownloadEvent};
             let mut entry =
                 AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
                     .resource(artifact_id)
@@ -1495,7 +1509,7 @@ impl ArtifactService {
             if let Some(ip) = ip_address.and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
                 entry = entry.ip(ip);
             }
-            audit_fire_and_forget(self.db.clone(), entry).await;
+            let _ = try_enqueue(DownloadEvent::Audit(Box::new(entry)));
         }
 
         // Trigger AfterDownload hooks (non-blocking)
@@ -1955,6 +1969,12 @@ impl ArtifactService {
         self.trigger_hook(PluginEventType::BeforeDelete, &artifact_info)
             .await?;
 
+        // The soft-delete's usage-ledger decrement is applied by migration
+        // 182's row-level trigger in this statement's own transaction
+        // (is_deleted false -> true releases the bytes; re-flipping an
+        // already-deleted row is a zero-delta no-op), so freed space is
+        // admissible by the very next quota-checked upload with no manual
+        // ledger write here.
         let result = sqlx::query!(
             "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = $1",
             id
@@ -2313,7 +2333,12 @@ pub async fn guard_foreign_storage_key_for_backend(
 ///
 /// Call this only after a **local** artifact row has been resolved; remote
 /// pass-through proxy fetches are not our artifacts and stay unrecorded.
-pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
+///
+/// The pool parameter is retained (underscore-bound) purely for call-site
+/// stability: the ~45 format/generic/OCI call sites keep compiling unchanged
+/// while the bounded dispatcher's flush workers own the only side-effect DB
+/// connections (#2522).
+pub async fn record_download(_db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
     // A HEAD request serves no body — it must never write a download row
     // (#2260 §5). This is the single choke point every serving path funnels
     // through (hosted stream, presigned redirect, virtual-member local resolve,
@@ -2324,33 +2349,26 @@ pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadConte
     if ctx.is_head {
         return;
     }
-    // Move the statistics INSERT OFF the synchronous download hot path (#2522).
-    // Historically this awaited the write on the catalog pool before the byte
-    // stream could return, coupling byte-plane latency/availability to DB-pool
-    // pressure. Spawn a detached best-effort task instead: the caller returns
-    // immediately (no await on the write), the row is still eventually written,
-    // and a failure is logged at `warn` and swallowed exactly as before —
-    // statistics must never block or fail the download itself. The `is_head`
-    // "no body ⇒ no row" contract is preserved (checked synchronously above).
-    let db = db.clone();
-    let user_id = ctx.user_id;
-    let ip_address = ctx.client_ip.map(|ip| ip.to_string());
-    let user_agent = ctx.user_agent.clone();
-    tokio::spawn(async move {
-        if let Err(e) = sqlx::query(
-            "INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(artifact_id)
-        .bind(user_id)
-        .bind(ip_address)
-        .bind(user_agent)
-        .execute(&db)
-        .await
-        {
-            warn!(%artifact_id, error = %e, "failed to record download statistics");
-        }
-    });
+    // Route the statistics write through the BOUNDED download-event dispatcher
+    // (#2522). The first #2522 slice moved this INSERT off the byte plane with
+    // a per-request `tokio::spawn`, which left task + pool-connection growth
+    // unbounded under a download flood with a slow event store. `try_enqueue`
+    // never blocks, awaits, or spawns: the event is queued for a fixed pool of
+    // batch-flush workers, shed (dropped + counted) on overflow, and silently
+    // skipped when no dispatcher is installed (tests) — statistics must never
+    // block or fail the download itself. Attribution (trusted-proxy client IP,
+    // user, user-agent) is captured HERE, at request time, so it cannot drift
+    // across the async hop. The `is_head` "no body ⇒ no row" contract is
+    // preserved (checked synchronously above).
+    use crate::services::download_event_dispatch::{
+        try_enqueue, DownloadEvent, DownloadStatsEvent,
+    };
+    let _ = try_enqueue(DownloadEvent::Stats(DownloadStatsEvent {
+        artifact_id,
+        user_id: ctx.user_id,
+        ip_address: ctx.client_ip.map(|ip| ip.to_string()),
+        user_agent: ctx.user_agent.clone(),
+    }));
 }
 
 /// URL fields commonly found in package metadata across all formats.
@@ -2463,6 +2481,58 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed artifact");
+    }
+
+    /// #2940: `list_page` must keep selecting the quarantine columns so the
+    /// listing handler can surface per-artifact quarantine state. Guards
+    /// against a future refactor dropping them from the SELECT (which would
+    /// silently report every artifact as unquarantined again).
+    #[tokio::test]
+    async fn test_list_page_carries_quarantine_state() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let held_key = format!("generic/{}", Uuid::new_v4());
+        let clean_key = format!("generic/{}", Uuid::new_v4());
+        seed_artifact(&pool, repo_id, "held/pkg-1.0.0.bin", &held_key).await;
+        seed_artifact(&pool, repo_id, "clean/pkg-1.0.0.bin", &clean_key).await;
+
+        let until = chrono::Utc::now() + chrono::Duration::minutes(30);
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = $2 \
+             WHERE repository_id = $1 AND path = 'held/pkg-1.0.0.bin'",
+        )
+        .bind(repo_id)
+        .bind(until)
+        .execute(&pool)
+        .await
+        .expect("apply quarantine");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        let page = service
+            .list_page(repo_id, None, None, None, 0, 50)
+            .await
+            .expect("list page");
+
+        let held = page
+            .iter()
+            .find(|a| a.path == "held/pkg-1.0.0.bin")
+            .expect("held artifact listed");
+        assert_eq!(held.quarantine_status.as_deref(), Some("quarantined"));
+        assert!(held.quarantine_until.is_some());
+
+        let clean = page
+            .iter()
+            .find(|a| a.path == "clean/pkg-1.0.0.bin")
+            .expect("clean artifact listed");
+        assert!(clean.quarantine_status.is_none());
+        assert!(clean.quarantine_until.is_none());
     }
 
     #[tokio::test]
@@ -3561,6 +3631,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    // ---- #3064 catalog coordinates on the generic finalize path -----------
+
+    /// #3064: a generic push into a Maven-format repo must key the catalog
+    /// `packages`/`package_versions` rows on the GAV coordinates derived from
+    /// the artifact path (`com.example.demo:app` / `1.2.3`), not on the naive
+    /// path-segment name/version the generic handler computes. An unparseable
+    /// path keeps the bare-name fallback. Skips without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_generic_push_into_maven_repo_records_gav_catalog_entry() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+
+        // The generic PUT handler derives name/version as naive path segments
+        // (segments[0]/segments[1]); mirror that call shape here.
+        svc.upload(
+            repo_id,
+            "com/example/demo/app/1.2.3/app-1.2.3.jar",
+            "com",
+            Some("example"),
+            "application/java-archive",
+            Bytes::from_static(b"gav-jar"),
+            Some(user_id),
+        )
+        .await
+        .expect("gav upload succeeds");
+
+        let (name,): (String,) =
+            sqlx::query_as("SELECT name FROM packages WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("packages row");
+        assert_eq!(name, "com.example.demo:app");
+
+        let (version,): (String,) = sqlx::query_as(
+            "SELECT pv.version FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("package_versions row");
+        assert_eq!(version, "1.2.3");
+
+        // Unparseable Maven path (< 4 segments): bare name/version fallback.
+        svc.upload(
+            repo_id,
+            "misc/tools/tool.bin",
+            "misc",
+            Some("tools"),
+            "application/octet-stream",
+            Bytes::from_static(b"fallback-bin"),
+            Some(user_id),
+        )
+        .await
+        .expect("fallback upload succeeds");
+
+        let (fallback_version,): (String,) = sqlx::query_as(
+            "SELECT pv.version FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = 'misc'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fallback package_versions row");
+        assert_eq!(fallback_version, "tools");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
     // ---- #2367 first-class versioning: pure helpers ------------------------
 
     #[test]
@@ -4080,13 +4232,15 @@ mod tests {
             user_agent: Some("unit-test/1.0".to_string()),
             is_head: false,
         };
-        // Returns without awaiting the INSERT (spawned); the row lands shortly
-        // after. The count must still reach 1 — the eventual-write contract.
+        // Returns without awaiting the INSERT (enqueued to the bounded
+        // dispatcher `tdh::try_pool` installed); the batch flush lands the row
+        // shortly after. The count must still reach 1 — the eventual-write
+        // contract survives the spawn -> bounded-dispatch change (#2522).
         record_download(&pool, artifact_id, &ctx).await;
         let count = poll_dl_count(&pool, artifact_id, 1).await;
         assert_eq!(
             count, 1,
-            "spawned download_statistics write must eventually land"
+            "dispatched download_statistics write must eventually land"
         );
     }
 
@@ -4116,5 +4270,275 @@ mod tests {
         .await
         .expect("count download_statistics");
         assert_eq!(count, 0, "a HEAD serves no body and must never write a row");
+    }
+
+    /// #2516 S2: the service delete's soft-delete releases the artifact's
+    /// bytes from the usage ledger in the same transaction (migration 182's
+    /// trigger fires on the `is_deleted` flip), so freed space is admissible
+    /// by the very next upload — no reconciler pass needed. End-state
+    /// assertions only: the ledger must equal the live sum after each step.
+    #[tokio::test]
+    async fn test_delete_releases_ledger_bytes_immediately() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set quota");
+
+        // A 600-byte artifact; the insert trigger charges the ledger.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'rel/big.bin', 'big.bin', 600, repeat('a', 64), \
+                     'application/octet-stream', 'keys/rel/big.bin')",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed artifact");
+        let repo_service =
+            crate::services::repository_service::RepositoryService::new(pool.clone());
+
+        let artifact_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND path = 'rel/big.bin'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("artifact id");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        // Another 600 bytes cannot be admitted while the first artifact holds
+        // its quota share.
+        assert!(!repo_service
+            .check_quota(repo_id, 600)
+            .await
+            .expect("preflight"));
+
+        service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .expect("delete");
+
+        let hosted = sqlx::query_scalar::<_, i64>(
+            "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger row");
+        assert_eq!(
+            hosted, 0,
+            "delete must release the bytes in the same transaction"
+        );
+        assert!(
+            repo_service
+                .check_quota(repo_id, 600)
+                .await
+                .expect("preflight after delete"),
+            "freed space must be admissible by the very next upload"
+        );
+        // Idempotence: re-deleting maps to NotFound, and re-flipping an
+        // already-deleted row is a zero-delta no-op for the trigger — the
+        // same bytes are never released twice.
+        assert!(service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .is_err());
+        let hosted_after = sqlx::query_scalar::<_, i64>(
+            "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger row after re-delete");
+        assert_eq!(hosted_after, 0, "re-delete must not decrement again");
+    }
+
+    // ---- #3064 migration 192: seeded backfill behaviour ------------------
+
+    /// Migration 192 rewrites `package_versions.version` for Maven catalog
+    /// rows whose version does not match any on-disk version directory. It is
+    /// data-dependent, and CI only ever applies migrations to an EMPTY
+    /// database, so the risky arms are exercised here against seeded rows.
+    ///
+    /// The regression this pins: `package_versions` carries
+    /// UNIQUE(package_id, version). An earlier revision rewrote EVERY broken
+    /// row whose package had exactly one candidate version directory. With two
+    /// broken rows and one candidate, both were updated to the same version and
+    /// the statement raised 23505, aborting the migration transaction. Because
+    /// migrations run at boot, that turned into a startup crash loop that only
+    /// manual DB surgery could clear. The fix rewrites at most one row per
+    /// package and deletes the rest, so this shape must now resolve cleanly.
+    ///
+    /// Uses TEMP tables (ON COMMIT DROP) inside a rolled-back transaction so
+    /// the real catalog is never touched, mirroring
+    /// `test_repository_owner_migration_backfills_without_flag_day`.
+    /// Skips without `DATABASE_URL`.
+    #[tokio::test]
+    async fn migration_192_repairs_maven_catalog_versions_without_unique_violation() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut tx = pool.begin().await.expect("begin migration fixture");
+
+        sqlx::raw_sql(
+            r#"
+            CREATE TEMP TABLE repositories (
+                id UUID PRIMARY KEY,
+                format TEXT NOT NULL
+            ) ON COMMIT DROP;
+            CREATE TEMP TABLE packages (
+                id UUID PRIMARY KEY,
+                repository_id UUID NOT NULL,
+                name TEXT NOT NULL
+            ) ON COMMIT DROP;
+            CREATE TEMP TABLE package_versions (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                package_id UUID NOT NULL,
+                version VARCHAR(100) NOT NULL,
+                UNIQUE (package_id, version)
+            ) ON COMMIT DROP;
+            CREATE TEMP TABLE artifacts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                repository_id UUID NOT NULL,
+                path TEXT NOT NULL
+            ) ON COMMIT DROP;
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("create isolated migration tables");
+
+        let repo = Uuid::new_v4();
+        // p_two: TWO broken rows, ONE candidate -> the 23505 shape.
+        let p_two = Uuid::new_v4();
+        // p_one: ONE broken row, ONE candidate -> unambiguous rewrite.
+        let p_one = Uuid::new_v4();
+        // p_healthy: already correct -> must be left alone.
+        let p_healthy = Uuid::new_v4();
+        // p_multi: ONE broken row, TWO candidates -> ambiguous, delete.
+        let p_multi = Uuid::new_v4();
+
+        sqlx::query("INSERT INTO repositories (id, format) VALUES ($1, 'maven')")
+            .bind(repo)
+            .execute(&mut *tx)
+            .await
+            .expect("seed repository");
+
+        sqlx::query(
+            "INSERT INTO packages (id, repository_id, name) VALUES \
+             ($1, $5, 'com.example.two:app'), \
+             ($2, $5, 'com.example.one:app'), \
+             ($3, $5, 'com.example.ok:app'), \
+             ($4, $5, 'com.example.multi:app')",
+        )
+        .bind(p_two)
+        .bind(p_one)
+        .bind(p_healthy)
+        .bind(p_multi)
+        .bind(repo)
+        .execute(&mut *tx)
+        .await
+        .expect("seed packages");
+
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path) VALUES \
+             ($1, 'com/example/two/app/2.0.0/app-2.0.0.jar'), \
+             ($1, 'com/example/one/app/3.0.0/app-3.0.0.jar'), \
+             ($1, 'com/example/ok/app/4.0.0/app-4.0.0.jar'), \
+             ($1, 'com/example/multi/app/5.0.0/app-5.0.0.jar'), \
+             ($1, 'com/example/multi/app/6.0.0/app-6.0.0.jar')",
+        )
+        .bind(repo)
+        .execute(&mut *tx)
+        .await
+        .expect("seed artifacts");
+
+        sqlx::query(
+            "INSERT INTO package_versions (package_id, version) VALUES \
+             ($1, 'example'), ($1, '1.0.0-STALE'), \
+             ($2, 'example'), \
+             ($3, '4.0.0'), \
+             ($4, 'multi')",
+        )
+        .bind(p_two)
+        .bind(p_one)
+        .bind(p_healthy)
+        .bind(p_multi)
+        .execute(&mut *tx)
+        .await
+        .expect("seed catalog rows");
+
+        // Must not raise 23505. Before the fix this errored and aborted.
+        sqlx::raw_sql(include_str!(
+            "../../migrations/192_maven_package_versions_version_backfill.sql"
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("migration 192 must survive two broken rows sharing one candidate");
+
+        // Replay must be a no-op: the migration is forward-only and idempotent.
+        sqlx::raw_sql(include_str!(
+            "../../migrations/192_maven_package_versions_version_backfill.sql"
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("migration 192 replays cleanly");
+
+        async fn versions_for(
+            tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+            pkg: Uuid,
+        ) -> Vec<String> {
+            sqlx::query_scalar::<_, String>(
+                "SELECT version FROM package_versions WHERE package_id = $1 ORDER BY version",
+            )
+            .bind(pkg)
+            .fetch_all(&mut **tx)
+            .await
+            .expect("read catalog rows")
+        }
+
+        // The 23505 shape: ambiguous, so both rows are dropped rather than
+        // collapsed onto the same (package_id, version).
+        let two = versions_for(&mut tx, p_two).await;
+        assert!(
+            two.is_empty(),
+            "two broken rows sharing one candidate are deleted, not merged; got {two:?}"
+        );
+
+        // Unambiguous: repaired to the real on-disk version directory.
+        let one = versions_for(&mut tx, p_one).await;
+        assert_eq!(
+            one,
+            vec!["3.0.0".to_string()],
+            "single broken row with a single candidate is rewritten from the GAV path"
+        );
+
+        // Healthy rows are never touched.
+        let healthy = versions_for(&mut tx, p_healthy).await;
+        assert_eq!(
+            healthy,
+            vec!["4.0.0".to_string()],
+            "a row that already matches a version directory must be left alone"
+        );
+
+        // Ambiguous by candidate count: cannot attribute, so drop.
+        let multi = versions_for(&mut tx, p_multi).await;
+        assert!(
+            multi.is_empty(),
+            "a broken row with several candidate versions is deleted; got {multi:?}"
+        );
+
+        tx.rollback().await.expect("rollback migration fixture");
     }
 }

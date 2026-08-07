@@ -418,6 +418,7 @@ impl From<crate::models::security::ScanConfig> for ScanConfigResponse {
             scan_on_proxy: c.scan_on_proxy,
             block_on_policy_violation: c.block_on_policy_violation,
             severity_threshold: c.severity_threshold,
+            proxy_scan_action: c.proxy_scan_action,
             created_at: c.created_at,
             updated_at: c.updated_at,
         }
@@ -584,6 +585,9 @@ pub struct ScanConfigResponse {
     pub scan_on_proxy: bool,
     pub block_on_policy_violation: bool,
     pub severity_threshold: String,
+    /// #2954: fail-open (default) / fail-closed action for the inline proxy
+    /// scan-on-fetch.
+    pub proxy_scan_action: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2836,6 +2840,7 @@ mod tests {
                 scan_on_proxy: false,
                 block_on_policy_violation: true,
                 severity_threshold: "high".to_string(),
+                proxy_scan_action: "fail_open".to_string(),
                 created_at: now,
                 updated_at: now,
             }),
@@ -2876,6 +2881,7 @@ mod tests {
             scan_on_proxy: true,
             block_on_policy_violation: false,
             severity_threshold: "medium".to_string(),
+            proxy_scan_action: "fail_closed".to_string(),
             created_at: now,
             updated_at: now,
         };

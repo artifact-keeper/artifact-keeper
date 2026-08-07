@@ -89,6 +89,25 @@ pub(crate) struct UpstreamResponse {
     /// `Last-Modified` header from upstream, persisted into the cache sidecar
     /// so a later conditional revalidation can send `If-Modified-Since` (#1611).
     pub(crate) last_modified: Option<String>,
+    /// `Content-Encoding` from upstream, when it sent one.
+    ///
+    /// Since the base HTTP client disables reqwest's transparent decompression
+    /// (see `http_client::base_client_builder`), a content-coded body now
+    /// arrives here still coded — so the coding MUST be carried alongside the
+    /// bytes and re-emitted, or the client receives compressed data labelled as
+    /// identity. Object stores return a stored `Content-Encoding` regardless of
+    /// the request's `Accept-Encoding`, so this is reachable even though the
+    /// client advertises identity.
+    pub(crate) content_encoding: Option<String>,
+    /// Upstream's `X-Repo-Commit`, when it sent one.
+    ///
+    /// Hugging Face's resolve endpoint returns the commit the served bytes came
+    /// from, and `huggingface_hub` uses it to name the snapshot directory. It has
+    /// to travel *with* the bytes — persisted in the cache sidecar and replayed on
+    /// a hit — because deriving it from a separately-cached model-info document
+    /// lets the proxy serve commit A's bytes while asserting commit B, defeating
+    /// the client's own commit pinning.
+    pub(crate) commit_sha: Option<String>,
     pub(crate) effective_url: String,
     pub(crate) link: Option<String>,
 }
@@ -101,6 +120,10 @@ struct UpstreamStream {
     body: BoxStream<'static, Result<Bytes>>,
     content_type: Option<String>,
     etag: Option<String>,
+    /// `Content-Encoding` from upstream — see [`UpstreamResponse::content_encoding`].
+    content_encoding: Option<String>,
+    /// `X-Repo-Commit` from upstream — see [`UpstreamResponse::commit_sha`].
+    commit_sha: Option<String>,
     /// `Content-Length` from upstream, if it sent one. Lets the proxy
     /// decide whether to bypass the cache entirely for huge objects
     /// (a future enhancement; currently informational only).
@@ -127,6 +150,21 @@ pub struct StreamingFetchResult {
     /// recording keys off this field so a local-member serve is counted
     /// exactly once, at the shared local-serve choke point (#2260).
     pub artifact_id: Option<Uuid>,
+    /// Upstream `ETag` when known (fresh fetch, cache hit, or stale-if-error
+    /// serve). `None` for local artifact reads, which have no upstream ETag.
+    /// Forwarded verbatim on the outbound response so clients that require
+    /// an ETag on the resolve HEAD (e.g. `huggingface_hub`) get one.
+    pub etag: Option<String>,
+    /// Upstream `Content-Encoding` when the cached/streamed bytes are content
+    /// coded — see [`UpstreamResponse::content_encoding`]. Must be forwarded
+    /// with the body on every serve (fresh, cache hit, stale-if-error) or the
+    /// client cannot decode what it receives.
+    pub content_encoding: Option<String>,
+    /// Upstream `X-Repo-Commit` for the bytes being served — see
+    /// [`UpstreamResponse::commit_sha`]. Forwarded on fresh fetches and replayed
+    /// from the sidecar on cache hits, so the header always describes the body it
+    /// arrives with.
+    pub commit_sha: Option<String>,
 }
 
 impl From<StreamHandle> for StreamingFetchResult {
@@ -140,6 +178,9 @@ impl From<StreamHandle> for StreamingFetchResult {
             content_length: handle.headers.content_length,
             // Remote/cache stream: not a local artifact row, so unrecorded.
             artifact_id: None,
+            etag: handle.headers.etag,
+            content_encoding: handle.headers.content_encoding,
+            commit_sha: handle.headers.commit_sha,
         }
     }
 }
@@ -149,6 +190,7 @@ impl std::fmt::Debug for StreamingFetchResult {
         f.debug_struct("StreamingFetchResult")
             .field("content_type", &self.content_type)
             .field("content_length", &self.content_length)
+            .field("etag", &self.etag)
             .field("body", &"<stream>")
             .finish()
     }
@@ -178,6 +220,12 @@ impl StreamingFetchResult {
 struct CacheMetadataTemplate {
     content_type: Option<String>,
     etag: Option<String>,
+    /// `Content-Encoding` of the bytes being persisted, recorded so a later
+    /// cache hit re-emits it — see [`UpstreamResponse::content_encoding`].
+    content_encoding: Option<String>,
+    /// Upstream `X-Repo-Commit` for the bytes being persisted — see
+    /// [`UpstreamResponse::commit_sha`].
+    commit_sha: Option<String>,
     /// `Last-Modified` from upstream (#1611). `None` on the streaming path,
     /// which does not currently surface the header into the tee template.
     last_modified: Option<String>,
@@ -326,13 +374,28 @@ impl ReleaseEpochRead {
 
 /// Remove credential-bearing URL material before rendering an upstream target
 /// into logs or [`AppError`] messages.
+///
+/// Strips three sources of secrets so an upstream URL can be safely echoed to
+/// a client (e.g. a 502/error body) or a user-visible log:
+/// * `user:password@` userinfo — upstream repository credentials (#2926),
+/// * the query string — pre-signed URL signatures / tokens / keys, and
+/// * the fragment.
 fn redact_url_for_diagnostics(url: &str) -> String {
     if let Ok(mut parsed) = reqwest::Url::parse(url) {
+        // Drop userinfo first (password before username so the `@` is removed
+        // cleanly), then the query and fragment. `set_password`/`set_username`
+        // return `Err` for URLs that cannot carry userinfo (e.g. `mailto:`);
+        // there is nothing to strip in that case, so the error is ignored.
+        let _ = parsed.set_password(None);
+        let _ = parsed.set_username("");
         parsed.set_query(None);
         parsed.set_fragment(None);
         return parsed.to_string();
     }
 
+    // Fallback for inputs `reqwest::Url` cannot parse (e.g. relative paths).
+    // Trim the query/fragment, then strip any `userinfo@` still present in the
+    // leading authority so credentials never survive the redaction.
     let query_pos = url.find('?');
     let fragment_pos = url.find('#');
     let end = match (query_pos, fragment_pos) {
@@ -341,7 +404,32 @@ fn redact_url_for_diagnostics(url: &str) -> String {
         (None, Some(f)) => f,
         (None, None) => url.len(),
     };
-    url[..end].to_string()
+    strip_userinfo_fallback(&url[..end])
+}
+
+/// Best-effort userinfo removal for URL-ish strings that `reqwest::Url` could
+/// not parse. Removes a `userinfo@` segment from the authority (the part
+/// after an optional `scheme://` and before the first `/`), leaving the rest
+/// untouched.
+fn strip_userinfo_fallback(url: &str) -> String {
+    let (prefix, rest) = match url.find("://") {
+        Some(pos) => url.split_at(pos + 3),
+        None if url.starts_with("//") => url.split_at(2),
+        None => ("", url),
+    };
+    // The authority ends at the first path separator.
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some(at) = authority.rfind('@') {
+        format!(
+            "{}{}{}",
+            prefix,
+            &authority[at + 1..],
+            &rest[authority_end..]
+        )
+    } else {
+        url.to_string()
+    }
 }
 
 /// True when the SSRF DNS guard's "all resolved addresses blocked" marker
@@ -443,14 +531,44 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Extract `(content_type, etag, content_length)` from an upstream
-/// response's headers. Extracted from
+/// Whether a single path segment is a dot segment, in the same sense the WHATWG
+/// URL parser uses when it normalizes a path.
+///
+/// Covers the literal `.` and `..` plus every percent-encoded spelling the URL
+/// parser folds into them (`%2e`, `.%2e`, `%2e.`, `%2e%2e`), case-insensitively.
+/// Used by [`ProxyService::validate_cache_path`] so a doubly-encoded request
+/// cannot smuggle a dot segment past validation and have the URL parser decode it
+/// back into one afterwards.
+fn is_dot_segment(segment: &str) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    matches!(lower.as_str(), "." | "%2e")
+        || matches!(lower.as_str(), ".." | ".%2e" | "%2e." | "%2e%2e")
+}
+
+/// Upstream response header carrying the commit an artifact was resolved from.
+/// Hugging Face's resolve endpoint sets it; the proxy forwards it generically.
+pub(crate) const UPSTREAM_COMMIT_HEADER: &str = "x-repo-commit";
+
+/// The upstream response headers this proxy forwards or persists.
+///
+/// A named struct rather than a tuple because it has outgrown positional
+/// destructuring; every field is optional because upstreams vary.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct UpstreamHeaders {
+    pub(crate) content_type: Option<String>,
+    pub(crate) etag: Option<String>,
+    pub(crate) content_length: Option<u64>,
+    /// See [`UpstreamResponse::content_encoding`].
+    pub(crate) content_encoding: Option<String>,
+    /// See [`UpstreamResponse::commit_sha`].
+    pub(crate) commit_sha: Option<String>,
+}
+
+/// Extract the forwardable headers from an upstream response. Extracted from
 /// [`ProxyService::read_upstream_response_streaming`] so the header-
 /// parsing rules (in particular the `Content-Length` parse-and-coerce
 /// to `u64`) can be unit-tested without a real `reqwest::Response`.
-fn extract_streaming_headers(
-    headers: &reqwest::header::HeaderMap,
-) -> (Option<String>, Option<String>, Option<u64>) {
+fn extract_streaming_headers(headers: &reqwest::header::HeaderMap) -> UpstreamHeaders {
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -463,7 +581,21 @@ fn extract_streaming_headers(
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-    (content_type, etag, content_length)
+    let content_encoding = headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let commit_sha = headers
+        .get(UPSTREAM_COMMIT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    UpstreamHeaders {
+        content_type,
+        etag,
+        content_length,
+        content_encoding,
+        commit_sha,
+    }
 }
 
 /// Whether a freshly streamed proxy-cache write should be committed or
@@ -625,6 +757,27 @@ pub struct CacheMetadata {
     pub expires_at: DateTime<Utc>,
     /// Content type from upstream
     pub content_type: Option<String>,
+    /// `Content-Encoding` of the bytes stored under the body key, when they are
+    /// content coded.
+    ///
+    /// The proxy no longer decompresses upstream bodies (see
+    /// `http_client::base_client_builder`), so a coded body is cached coded and
+    /// the coding has to be replayed on every cache hit — otherwise a hit
+    /// serves compressed bytes labelled as identity. `size_bytes` and
+    /// `checksum_sha256` describe the stored (still coded) bytes.
+    ///
+    /// `None` means identity, which is also the right reading for sidecars
+    /// written before this field existed: on those entries reqwest had already
+    /// decompressed the body before it was stored. `#[serde(default)]`
+    /// preserves wire-compat with them.
+    #[serde(default)]
+    pub content_encoding: Option<String>,
+    /// Upstream `X-Repo-Commit` recorded with these bytes — see
+    /// [`UpstreamResponse::commit_sha`]. `None` for entries written before this
+    /// field existed (`#[serde(default)]` preserves wire-compat) or when upstream
+    /// sent no such header.
+    #[serde(default)]
+    pub upstream_commit_sha: Option<String>,
     /// Size of the cached content
     pub size_bytes: i64,
     /// SHA-256 checksum of cached content
@@ -680,8 +833,9 @@ fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
 /// the three actions the caller cares about: serve a body, return 404, or fetch
 /// upstream.
 enum CacheReadOutcome {
-    /// Serve this cached (or freshly revalidated) body + content type.
-    Hit(Bytes, Option<String>),
+    /// Serve this cached (or freshly revalidated) body, content type, and
+    /// content coding.
+    Hit(Bytes, Option<String>, Option<String>),
     /// A negative-cached upstream 404 is still within its TTL: respond 404.
     NegativeHit,
     /// No usable entry; the caller must fetch from upstream.
@@ -840,6 +994,13 @@ impl CacheKeys {
 /// Wraps the same `Arc<StorageService>` handle [`ProxyService`] already uses
 /// for these operations, so reads and writes target the global default
 /// backend exactly as before (#1278).
+/// A buffered cache read: `(body, content_type, content_encoding)`.
+///
+/// `content_encoding` rides along because the proxy no longer decodes upstream
+/// bodies, so a cached body may be content coded and the coding has to be
+/// replayed to the client — see [`UpstreamResponse::content_encoding`].
+pub(crate) type CachedBody = (Bytes, Option<String>, Option<String>);
+
 pub(crate) struct CacheStore {
     storage: Arc<StorageService>,
 }
@@ -887,7 +1048,7 @@ impl CacheStore {
         cache_key: &str,
         metadata_key: &str,
         allow_stale: bool,
-    ) -> Result<Option<(Bytes, Option<String>)>> {
+    ) -> Result<Option<CachedBody>> {
         // Per-branch proxy-cache observability (#1263 follow-up / PR #1284).
         // Only the FRESH lookup (`allow_stale == false`) is counted: that is
         // the single per-request cache-read decision the original PR
@@ -976,7 +1137,11 @@ impl CacheStore {
                     tracing::debug!(cache_key = %cache_key, "Proxy cache hit");
                     record_proxy_cache_lookup(repo_label, "hit");
                 }
-                Ok(Some((content, metadata.content_type)))
+                Ok(Some((
+                    content,
+                    metadata.content_type,
+                    metadata.content_encoding,
+                )))
             }
             Err(AppError::NotFound(_)) => {
                 if !allow_stale {
@@ -1173,6 +1338,10 @@ impl CachePersister {
         content_type: Option<String>,
         etag: Option<String>,
         last_modified: Option<String>,
+        // Coding the buffered bytes are in, recorded so a cache hit replays it.
+        content_encoding: Option<String>,
+        // Upstream X-Repo-Commit for these bytes, recorded for the same reason.
+        commit_sha: Option<String>,
         ttl_secs: i64,
         repository_id: Uuid,
         artifact_path: &str,
@@ -1216,6 +1385,8 @@ impl CachePersister {
             upstream_etag: etag,
             storage_etag,
             last_modified,
+            content_encoding,
+            upstream_commit_sha: commit_sha,
             negative_cached_until: None,
             // Package Age Policy hold resolved by the caller (#1770): recorded
             // on the sidecar (NOT the `artifacts` table, per #1278) so every
@@ -1380,6 +1551,24 @@ impl CachePersister {
                         // a mismatch exactly like the truncated/empty reject path:
                         // delete the object and skip the metadata sidecar so the
                         // next request refetches upstream (self-heal).
+                        //
+                        // The delete is load-bearing, NOT belt-and-braces: the
+                        // missing sidecar is not sufficient on its own, because
+                        // several read paths reach the content key without
+                        // consulting it. `handle_streaming_leader_upstream_error`
+                        // serves `get_stream(cache_key)` as an RFC 5861
+                        // stale-if-error response and only loads the sidecar
+                        // afterwards, best-effort, for headers; `is_fresh`
+                        // degrades to a bare `exists()` when either ETag is
+                        // multipart-shaped (#2120) or when a legacy sidecar has
+                        // no pinned ETag; and the presigned-redirect paths sign a
+                        // 302 straight to the object with no checksum check at
+                        // all. Leaving rejected bytes in place therefore makes
+                        // them servable. Deleting is also what self-heals on a
+                        // versioned bucket: nothing in this codebase ever reads a
+                        // non-current version (there is no version_id support in
+                        // the storage layer), so a delete marker simply reads as
+                        // NotFound and forces the refetch.
                         if let Some(expected) = template.expected_checksum.as_deref() {
                             if result.checksum_sha256 != expected {
                                 tracing::warn!(
@@ -1414,6 +1603,8 @@ impl CachePersister {
                             upstream_etag: template.etag,
                             storage_etag,
                             last_modified: template.last_modified,
+                            content_encoding: template.content_encoding,
+                            upstream_commit_sha: template.commit_sha,
                             negative_cached_until: None,
                             // The streaming leader refuses to open upstream at all
                             // while the repo's Package Age Policy is enabled
@@ -1494,7 +1685,28 @@ impl CachePersister {
                         // miss) and delete the bad object so a later GET
                         // refetches upstream (self-heal). The buffered sibling
                         // [`Self::write_buffered`] applies the empty-body guard
-                        // before the content write.
+                        // before the content write, so it can return early and
+                        // never needs the delete.
+                        //
+                        // Both halves are required. Skipping the sidecar is not
+                        // sufficient on its own, because several readers reach
+                        // the content key without consulting it:
+                        // `handle_streaming_leader_upstream_error` streams
+                        // `get_stream(cache_key)` as an RFC 5861 stale-if-error
+                        // response (sidecar loaded afterwards, best-effort, only
+                        // for headers), the PyPI Remote arm streams
+                        // `artifacts.storage_key` directly, and `is_fresh`
+                        // degrades to a bare `exists()` whenever an ETag is
+                        // multipart-shaped (#2120) or a legacy sidecar carries no
+                        // pinned ETag -- after which the presigned paths sign a
+                        // 302 to the object with no checksum check at all.
+                        //
+                        // The delete is also what self-heals on a versioned
+                        // bucket. Nothing in this codebase reads a non-current
+                        // version (the storage layer has no version_id concept),
+                        // so a delete marker simply reads as NotFound and forces
+                        // the refetch -- it cannot mask content that was already
+                        // unreachable.
                         match rejected {
                             StreamWriteOutcome::RejectTruncated { expected, actual } => {
                                 tracing::warn!(
@@ -1520,7 +1732,8 @@ impl CachePersister {
                                 cache_key = %cache_key_for_writer,
                                 error = %e,
                                 "best-effort delete of rejected proxy-cache object failed; \
-                                 the missing metadata sidecar still forces a refetch"
+                                 the missing metadata sidecar still forces a refetch on the \
+                                 sidecar-gated read paths"
                             );
                         }
                     }
@@ -1668,16 +1881,23 @@ impl UpstreamClient {
         repo_id: Uuid,
         accept: Option<&str>,
         max: usize,
+        auth_mode: crate::services::upstream_auth::UpstreamAuthMode,
     ) -> Result<UpstreamResponse> {
         let diagnostic_url = redact_url_for_diagnostics(url);
         tracing::info!(
-            "Fetching artifact from upstream: {} (accept={:?})",
+            "Fetching artifact from upstream: {} (accept={:?}, auth_mode={:?})",
             diagnostic_url,
-            accept
+            accept,
+            auth_mode
         );
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        // #3130: `Anonymous` short-circuits to `None` before the credential
+        // store is read, so neither the initial request nor the bearer retry
+        // below can attach the repo's configured upstream credentials.
+        let upstream_auth = crate::services::upstream_auth::load_upstream_auth_for_mode(
+            &self.db, repo_id, auth_mode,
+        )
+        .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self.http_client.get(url);
@@ -1774,6 +1994,18 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let content_encoding = response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let commit_sha = response
+            .headers()
+            .get(UPSTREAM_COMMIT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
         let link = response
             .headers()
             .get("link")
@@ -1820,6 +2052,8 @@ impl UpstreamClient {
             content_type,
             etag,
             last_modified,
+            content_encoding,
+            commit_sha,
             effective_url,
             link,
         })
@@ -1985,7 +2219,7 @@ impl UpstreamClient {
         url: &str,
     ) -> Result<UpstreamStream> {
         validate_upstream_status(response.status(), url)?;
-        let (content_type, etag, content_length) = extract_streaming_headers(response.headers());
+        let headers = extract_streaming_headers(response.headers());
 
         let body = response.bytes_stream().map(|r| {
             r.map_err(|e| {
@@ -1998,9 +2232,11 @@ impl UpstreamClient {
 
         Ok(UpstreamStream {
             body: Box::pin(body),
-            content_type,
-            etag,
-            content_length,
+            content_type: headers.content_type,
+            etag: headers.etag,
+            content_encoding: headers.content_encoding,
+            commit_sha: headers.commit_sha,
+            content_length: headers.content_length,
         })
     }
 
@@ -2330,12 +2566,32 @@ impl ProxyService {
 
     /// Byte-ceiling-aware sibling of [`Self::fetch_artifact`] (#1608 Phase 4b /
     /// #2181). Bounds the buffered upstream metadata read at `max` bytes.
+    /// As [`Self::fetch_artifact_capped_with_encoding`], but drops the upstream
+    /// `Content-Encoding`. Kept for the many callers that parse the body
+    /// themselves (index/packument/manifest parsers) rather than forwarding it,
+    /// so they are unaffected by the coding plumbing.
     pub async fn fetch_artifact_capped(
         &self,
         repo: &Repository,
         path: &str,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
+        let (content, content_type, _encoding) = self
+            .fetch_artifact_capped_with_encoding(repo, path, max)
+            .await?;
+        Ok((content, content_type))
+    }
+
+    /// Buffered capped fetch that also reports the upstream `Content-Encoding`,
+    /// for handlers that pass the buffered bytes through to the client and must
+    /// therefore declare the coding — see
+    /// [`UpstreamResponse::content_encoding`].
+    pub async fn fetch_artifact_capped_with_encoding(
+        &self,
+        repo: &Repository,
+        path: &str,
+        max: usize,
+    ) -> Result<CachedBody> {
         self.fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, None, max)
             .await
     }
@@ -2349,8 +2605,10 @@ impl ProxyService {
         accept: Option<&str>,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
-        self.fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, accept, max)
-            .await
+        let (content, content_type, _encoding) = self
+            .fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, accept, max)
+            .await?;
+        Ok((content, content_type))
     }
 
     /// Byte-ceiling-aware sibling of
@@ -2362,10 +2620,12 @@ impl ProxyService {
         cache_path: &str,
         max: usize,
     ) -> Result<(Bytes, Option<String>)> {
-        self.fetch_artifact_with_cache_path_and_accept_capped(
-            repo, fetch_path, cache_path, None, max,
-        )
-        .await
+        let (content, content_type, _encoding) = self
+            .fetch_artifact_with_cache_path_and_accept_capped(
+                repo, fetch_path, cache_path, None, max,
+            )
+            .await?;
+        Ok((content, content_type))
     }
 
     /// Variant of [`Self::fetch_artifact`] that forwards a client-supplied
@@ -2403,7 +2663,7 @@ impl ProxyService {
         &self,
         repo_key: &str,
         path: &str,
-    ) -> Result<Option<(Bytes, Option<String>)>> {
+    ) -> Result<Option<CachedBody>> {
         let cache_key = Self::cache_storage_key(repo_key, path)?;
         let metadata_key = Self::cache_metadata_key(repo_key, path)?;
         self.get_cached_artifact(&cache_key, &metadata_key).await
@@ -2545,14 +2805,16 @@ impl ProxyService {
         cache_path: &str,
         accept: Option<&str>,
     ) -> Result<(Bytes, Option<String>)> {
-        self.fetch_artifact_with_cache_path_and_accept_capped(
-            repo,
-            fetch_path,
-            cache_path,
-            accept,
-            DEFAULT_METADATA_MAX_BYTES,
-        )
-        .await
+        let (content, content_type, _encoding) = self
+            .fetch_artifact_with_cache_path_and_accept_capped(
+                repo,
+                fetch_path,
+                cache_path,
+                accept,
+                DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
+        Ok((content, content_type))
     }
 
     /// Byte-ceiling-aware sibling of
@@ -2562,6 +2824,11 @@ impl ProxyService {
     /// written to the proxy cache. Callers pass the per-format ceiling
     /// ([`DEFAULT_METADATA_MAX_BYTES`] or [`LARGE_METADATA_MAX_BYTES`]); the
     /// non-capped wrappers delegate here with the 8 MiB default.
+    ///
+    /// Returns `(body, content_type, content_encoding)`. The coding is part of the
+    /// result because reqwest no longer decodes upstream bodies, so a buffered
+    /// metadata document may itself be content coded and the handler has to
+    /// declare that when it serves the bytes on.
     pub async fn fetch_artifact_with_cache_path_and_accept_capped(
         &self,
         repo: &Repository,
@@ -2569,7 +2836,7 @@ impl ProxyService {
         cache_path: &str,
         accept: Option<&str>,
         max: usize,
-    ) -> Result<(Bytes, Option<String>)> {
+    ) -> Result<CachedBody> {
         let upstream_url = Self::remote_target(repo)?;
 
         // Cache keys use the caller-supplied cache_path
@@ -2586,7 +2853,9 @@ impl ProxyService {
             .read_cached_with_revalidation(repo, fetch_path, cache_path, &cache_key, &metadata_key)
             .await?
         {
-            CacheReadOutcome::Hit(content, content_type) => return Ok((content, content_type)),
+            CacheReadOutcome::Hit(content, content_type, content_encoding) => {
+                return Ok((content, content_type, content_encoding))
+            }
             CacheReadOutcome::NegativeHit => {
                 return Err(AppError::NotFound(format!(
                     "Upstream returned 404 (negative-cached) for {}",
@@ -2643,6 +2912,10 @@ impl ProxyService {
 
                 match upstream_result {
                     Ok(resp) => {
+                        // Captured before the cache write consumes `resp`, so the
+                        // coding can also be returned to the caller that serves
+                        // these freshly-fetched bytes.
+                        let upstream_encoding = resp.content_encoding.clone();
                         // #1611: mutability-aware TTL (immutable -> forever).
                         let cache_ttl = self.cache_ttl_for_path(repo, cache_path).await;
                         // Package Age Policy (#1770): resolve the hold window
@@ -2751,6 +3024,8 @@ impl ProxyService {
                                 resp.content_type.clone(),
                                 resp.etag,
                                 resp.last_modified,
+                                upstream_encoding.clone(),
+                                resp.commit_sha,
                                 cache_ttl,
                                 repo.id,
                                 cache_path,
@@ -2792,7 +3067,7 @@ impl ProxyService {
                         // the best-effort cache write above failed.
                         check_quarantine_until(quarantine_until)?;
 
-                        Ok((resp.content, resp.content_type))
+                        Ok((resp.content, resp.content_type, upstream_encoding))
                     }
                     Err(upstream_err) => {
                         // #1611 negative caching: a definitive upstream 404 is
@@ -2807,7 +3082,7 @@ impl ProxyService {
                         }
                         // Transient error (5xx / timeout / transport): RFC 5861
                         // stale-if-error — serve the stale body we already hold.
-                        if let Ok(Some((stale_content, stale_content_type))) = self
+                        if let Ok(Some((stale_content, stale_content_type, stale_content_encoding))) = self
                             .get_stale_cached_artifact(&cache_key, &metadata_key)
                             .await
                         {
@@ -2816,7 +3091,7 @@ impl ProxyService {
                                 full_url,
                                 upstream_err
                             );
-                            Ok((stale_content, stale_content_type))
+                            Ok((stale_content, stale_content_type, stale_content_encoding))
                         } else {
                             Err(upstream_err)
                         }
@@ -3180,6 +3455,11 @@ impl ProxyService {
                 content_length: Some(metadata.size_bytes as u64),
                 // Proxy-cache stream: not our artifact row (#1278), unrecorded.
                 artifact_id: None,
+                etag: metadata.upstream_etag.clone(),
+                // Replay the coding the bytes were stored under, or a hit serves
+                // compressed data labelled as identity.
+                content_encoding: metadata.content_encoding.clone(),
+                commit_sha: metadata.upstream_commit_sha.clone(),
             })),
             Err(AppError::NotFound(_)) => {
                 tracing::debug!(
@@ -3266,6 +3546,9 @@ impl ProxyService {
         let headers = StreamHeaders {
             content_type: upstream.content_type.clone(),
             content_length: upstream.content_length,
+            etag: upstream.etag.clone(),
+            content_encoding: upstream.content_encoding.clone(),
+            commit_sha: upstream.commit_sha.clone(),
         };
 
         let body = self.cache_persister.tee_stream(
@@ -3275,6 +3558,8 @@ impl ProxyService {
             CacheMetadataTemplate {
                 content_type: upstream.content_type,
                 etag: upstream.etag,
+                content_encoding: upstream.content_encoding,
+                commit_sha: upstream.commit_sha,
                 last_modified: None,
                 ttl_secs: cache_ttl,
                 expected_checksum,
@@ -3326,6 +3611,11 @@ impl ProxyService {
             let headers = StreamHeaders {
                 content_type: metadata.as_ref().and_then(|m| m.content_type.clone()),
                 content_length: metadata.as_ref().map(|m| m.size_bytes as u64),
+                etag: metadata.as_ref().and_then(|m| m.upstream_etag.clone()),
+                content_encoding: metadata.as_ref().and_then(|m| m.content_encoding.clone()),
+                commit_sha: metadata
+                    .as_ref()
+                    .and_then(|m| m.upstream_commit_sha.clone()),
             };
             return Ok(StreamHandle { body, headers });
         }
@@ -3675,6 +3965,8 @@ impl ProxyService {
                 resp.content_type.clone(),
                 resp.etag,
                 resp.last_modified,
+                resp.content_encoding,
+                resp.commit_sha,
                 dists_ttl_secs,
                 repo.id,
                 path,
@@ -3726,7 +4018,14 @@ impl ProxyService {
         }
 
         let response = request.send().await.map_err(|e| {
-            AppError::Storage(format!("Failed to fetch from upstream: {} - {}", url, e))
+            // Redact the target URL (may carry `user:pass@` upstream creds) and
+            // drop the URL reqwest embeds in its own error (#2926) before this
+            // surfaces to a client.
+            AppError::Storage(format!(
+                "Failed to fetch from upstream: {} - {}",
+                redact_url_for_diagnostics(url),
+                e.without_url()
+            ))
         })?;
 
         let status = response.status();
@@ -4388,11 +4687,23 @@ impl ProxyService {
             ));
         }
 
-        // Reject any path segment that is exactly `..` or `.`. Substrings
-        // like `..foo` or `foo..bar` are fine (they are just bytes inside a
+        // Reject any path segment that is a dot segment. Substrings like
+        // `..foo` or `foo..bar` are fine (they are just bytes inside a
         // filename) and reflect legitimate package names.
+        //
+        // The percent-encoded spellings have to be rejected too, and this is a
+        // real escape rather than a theoretical one. axum percent-decodes a
+        // captured path parameter exactly once, so a request carrying `%252e%252e`
+        // reaches a handler as the literal `%2e%2e` — which is not equal to `..`
+        // and so passed this check — and the `url` crate then collapses
+        // `%2e%2e` as a dot segment when the fetch URL is parsed (WHATWG URL
+        // §"double-dot path segment" treats `..`, `.%2e`, `%2e.` and `%2e%2e`
+        // case-insensitively as equivalent). The upstream request would then
+        // resolve above the repository's configured base path, carrying the
+        // operator's stored upstream credential with it. Match the same set the
+        // URL parser does.
         for segment in trimmed.split('/') {
-            if segment == ".." || segment == "." {
+            if is_dot_segment(segment) {
                 return Err(AppError::Validation(format!(
                     "Proxy cache path must not contain `{}` segment",
                     segment
@@ -4428,7 +4739,7 @@ impl ProxyService {
         &self,
         cache_key: &str,
         metadata_key: &str,
-    ) -> Result<Option<(Bytes, Option<String>)>> {
+    ) -> Result<Option<CachedBody>> {
         self.get_cached(cache_key, metadata_key, false).await
     }
 
@@ -4477,9 +4788,11 @@ impl ProxyService {
                 // upstream. `get_cached_artifact` re-verifies checksum + body
                 // presence; a missing/poisoned body degrades to Miss (B6).
                 match self.get_cached_artifact(cache_key, metadata_key).await? {
-                    Some((content, content_type)) => {
-                        Ok(CacheReadOutcome::Hit(content, content_type))
-                    }
+                    Some((content, content_type, content_encoding)) => Ok(CacheReadOutcome::Hit(
+                        content,
+                        content_type,
+                        content_encoding,
+                    )),
                     None => Ok(CacheReadOutcome::Miss),
                 }
             }
@@ -4521,7 +4834,7 @@ impl ProxyService {
         &self,
         repo: &Repository,
         cache_path: &str,
-    ) -> Result<Option<(Bytes, Option<String>)>> {
+    ) -> Result<Option<CachedBody>> {
         let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
         let mutability = cache_classifier::classify(&repo.format, cache_path);
@@ -4576,20 +4889,28 @@ impl ProxyService {
                     .get_stale_cached_artifact(cache_key, metadata_key)
                     .await
                 {
-                    Ok(Some((content, content_type))) => {
+                    Ok(Some((content, content_type, content_encoding))) => {
                         tracing::debug!(cache_key = %cache_key, "304 revalidation: extended TTL, serving cached body");
-                        Ok(CacheReadOutcome::Hit(content, content_type))
+                        Ok(CacheReadOutcome::Hit(
+                            content,
+                            content_type,
+                            content_encoding,
+                        ))
                     }
                     // Body vanished between probe and read: refill.
                     _ => Ok(CacheReadOutcome::Miss),
                 }
             }
             RevalidationVerdict::ServeStaleIfError => {
-                if let Ok(Some((content, content_type))) = self
+                if let Ok(Some((content, content_type, content_encoding))) = self
                     .get_stale_cached_artifact(cache_key, metadata_key)
                     .await
                 {
-                    return Ok(CacheReadOutcome::Hit(content, content_type));
+                    return Ok(CacheReadOutcome::Hit(
+                        content,
+                        content_type,
+                        content_encoding,
+                    ));
                 }
                 Ok(CacheReadOutcome::Miss)
             }
@@ -4693,12 +5014,25 @@ impl ProxyService {
     /// re-asks upstream.
     async fn write_negative_cache(&self, cache_key: &str, metadata_key: &str, cache_path: &str) {
         // Drop any stale positive body so a future read can never serve it
-        // alongside the negative marker.
-        let _ = self.storage.delete(cache_key).await;
+        // alongside the negative marker. Probe first (#1611 follow-up):
+        // every negative-cache *renewal* on an already-, or never-, cached
+        // path re-enters this function every TTL window, and on a versioned
+        // backend an unconditional delete() always writes a new
+        // delete-marker version even when there is nothing to delete --
+        // observed stacking to 9+ marker versions on repeatedly-missed
+        // paths (e.g. checksum-file probes for deps that never publish a
+        // .sha1) with zero real content ever written. Gate the delete on a
+        // real object being present so renewals of an existing negative (or
+        // a path that never had content) don't write a redundant marker.
+        if matches!(self.storage.exists(cache_key).await, Ok(true)) {
+            let _ = self.storage.delete(cache_key).await;
+        }
 
         let now = Utc::now();
         let neg_ttl = chrono::Duration::seconds(cache_classifier::NEGATIVE_CACHE_TTL_SECS);
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
@@ -4749,7 +5083,7 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
         allow_stale: bool,
-    ) -> Result<Option<(Bytes, Option<String>)>> {
+    ) -> Result<Option<CachedBody>> {
         self.cache_store
             .get(cache_key, metadata_key, allow_stale)
             .await
@@ -4811,8 +5145,49 @@ impl ProxyService {
         max: usize,
     ) -> Result<UpstreamResponse> {
         self.upstream_client
-            .fetch_buffered(url, repo_id, accept, max)
+            .fetch_buffered(
+                url,
+                repo_id,
+                accept,
+                max,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
             .await
+    }
+
+    /// Buffered, byte-capped upstream metadata fetch that NEVER attaches the
+    /// repository's configured upstream credentials (#3130 / #2925).
+    ///
+    /// For URLs a service index legitimately advertises on a host other than
+    /// the configured upstream (nuget.org's `SearchQueryService` lives on
+    /// `azuresearch-*.nuget.org` while its `index.json` is on
+    /// `api.nuget.org`). The request still goes through the shared proxy HTTP
+    /// client — so the connect-time SSRF DNS guard (`is_blocked_resolved_ip`,
+    /// #1832/#2570) and the `max`-byte body ceiling both apply — but auth
+    /// resolution is [`UpstreamAuthMode::Anonymous`], which short-circuits
+    /// before the credential store is read.
+    ///
+    /// Deliberately does NOT touch the proxy cache: every cached-entry code
+    /// path (single-flight refill, stale revalidation via `check_etag_changed`,
+    /// conditional refetch) loads the repo's credentials, so an uncached
+    /// direct fetch is the narrowest surface that provably cannot carry them.
+    pub async fn fetch_metadata_capped_anonymous(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        max: usize,
+    ) -> Result<(Bytes, Option<String>)> {
+        let resp = self
+            .upstream_client
+            .fetch_buffered(
+                url,
+                repo_id,
+                None,
+                max,
+                crate::services::upstream_auth::UpstreamAuthMode::Anonymous,
+            )
+            .await?;
+        Ok((resp.content, resp.content_type))
     }
 
     /// Streaming variant of [`Self::fetch_from_upstream`] used by the
@@ -4854,6 +5229,10 @@ impl ProxyService {
         content_type: Option<String>,
         etag: Option<String>,
         last_modified: Option<String>,
+        // Coding the buffered bytes are in, recorded so a cache hit replays it.
+        content_encoding: Option<String>,
+        // Upstream X-Repo-Commit for these bytes, recorded for the same reason.
+        commit_sha: Option<String>,
         ttl_secs: i64,
         repository_id: Uuid,
         artifact_path: &str,
@@ -4867,6 +5246,8 @@ impl ProxyService {
                 content_type,
                 etag,
                 last_modified,
+                content_encoding,
+                commit_sha,
                 ttl_secs,
                 repository_id,
                 artifact_path,
@@ -5028,7 +5409,7 @@ impl ProxyService {
         &self,
         cache_key: &str,
         metadata_key: &str,
-    ) -> Result<Option<(Bytes, Option<String>)>> {
+    ) -> Result<Option<CachedBody>> {
         self.get_cached(cache_key, metadata_key, true).await
     }
 
@@ -5387,6 +5768,8 @@ mod tests {
     fn test_sidecar_round_trips_quarantine_until() {
         let until = Utc::now() + chrono::Duration::minutes(120);
         let meta = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: Utc::now(),
             upstream_etag: None,
             storage_etag: None,
@@ -6070,6 +6453,8 @@ mod tests {
     #[test]
     fn test_cache_metadata_serialization() {
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: Utc::now(),
             upstream_etag: Some("\"abc123\"".to_string()),
             storage_etag: None,
@@ -6094,6 +6479,8 @@ mod tests {
     fn test_cache_metadata_serialization_no_etag() {
         let now = Utc::now();
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
@@ -6119,6 +6506,8 @@ mod tests {
         let now = Utc::now();
         let expires = now + chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS);
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: Some("\"etag-value\"".to_string()),
             storage_etag: Some("\"storage-etag\"".to_string()),
@@ -6141,6 +6530,8 @@ mod tests {
     #[test]
     fn test_cache_metadata_large_size() {
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: Utc::now(),
             upstream_etag: None,
             storage_etag: None,
@@ -6184,6 +6575,8 @@ mod tests {
 
         // Expired cache entry
         let expired_metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now - chrono::Duration::hours(25),
             upstream_etag: None,
             storage_etag: None,
@@ -6202,6 +6595,8 @@ mod tests {
 
         // Valid cache entry
         let valid_metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
@@ -6424,6 +6819,8 @@ mod tests {
     fn test_expired_metadata_is_stale() {
         let now = Utc::now();
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now - chrono::Duration::hours(25),
             upstream_etag: Some("\"old-etag\"".to_string()),
             storage_etag: None,
@@ -6448,6 +6845,8 @@ mod tests {
     fn test_valid_metadata_is_not_stale() {
         let now = Utc::now();
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
@@ -6468,6 +6867,8 @@ mod tests {
     fn test_just_expired_metadata_is_stale() {
         let now = Utc::now();
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now - chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS + 1),
             upstream_etag: None,
             storage_etag: None,
@@ -7186,6 +7587,8 @@ mod tests {
     /// behavior on the storage HEAD.
     fn fresh_metadata_bytes_with_storage_etag(storage_etag: Option<String>) -> Bytes {
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: Utc::now(),
             upstream_etag: None,
             storage_etag,
@@ -7202,6 +7605,8 @@ mod tests {
 
     fn expired_metadata_bytes() -> Bytes {
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: Utc::now() - chrono::Duration::hours(2),
             upstream_etag: None,
             storage_etag: None,
@@ -7221,6 +7626,8 @@ mod tests {
     /// through the held / elapsed / no-hold states.
     fn metadata_bytes_with_quarantine(quarantine_until: Option<DateTime<Utc>>) -> Bytes {
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: Utc::now(),
             upstream_etag: None,
             storage_etag: None,
@@ -8110,6 +8517,13 @@ mod tests {
         metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
         deletes: tokio::sync::Mutex<Vec<String>>,
         put_stream_fails: bool,
+        // #1611-style guard support: a successful put_stream (even a
+        // zero-byte one) creates a real object at the key, same as a real S3
+        // PutObject. exists() reflects that so the reject-arm delete tests
+        // below exercise the same exists()-before-delete guard as prod,
+        // rather than the guard vacuously short-circuiting on an
+        // always-absent mock.
+        object_written: std::sync::atomic::AtomicBool,
     }
 
     impl TeeRecordingBackend {
@@ -8119,6 +8533,7 @@ mod tests {
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: false,
+                object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
         fn failing() -> Arc<Self> {
@@ -8127,6 +8542,7 @@ mod tests {
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: true,
+                object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -8146,7 +8562,9 @@ mod tests {
             Err(AppError::NotFound("not relevant for tee tests".into()))
         }
         async fn exists(&self, _key: &str) -> Result<bool> {
-            Ok(false)
+            Ok(self
+                .object_written
+                .load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn delete(&self, key: &str) -> Result<()> {
             self.deletes.lock().await.push(key.to_string());
@@ -8180,6 +8598,8 @@ mod tests {
                 total += chunk.len() as u64;
                 chunks.push(chunk);
             }
+            self.object_written
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(ServicePutStreamResult {
                 checksum_sha256: format!("{:x}", hasher.finalize()),
                 bytes_written: total,
@@ -8226,6 +8646,8 @@ mod tests {
 
     fn template() -> CacheMetadataTemplate {
         CacheMetadataTemplate {
+            commit_sha: None,
+            content_encoding: None,
             content_type: Some("application/octet-stream".to_string()),
             etag: None,
             last_modified: None,
@@ -8324,12 +8746,19 @@ mod tests {
     /// #1365 regression: an empty upstream body (a 204, an empty 200, or a
     /// HEAD-style probe that reaches the streaming download path) must NOT
     /// be cached. The client still receives the empty body for this
-    /// request, but the writer must (a) skip the metadata sidecar so a
-    /// later GET is a cache miss, and (b) delete the zero-byte object it
-    /// wrote so the next request refetches the real body from upstream.
+    /// request, but the writer must skip the metadata sidecar so a later
+    /// GET is a cache miss and refetches the real body from upstream.
     /// Before the fix the writer persisted a `size_bytes: 0` sidecar,
     /// which a subsequent GET served as `Content-Length: 0`, breaking
     /// Gradle POM parsing ("Content is not allowed in prolog.").
+    ///
+    /// The writer must ALSO delete the zero-byte object it wrote. The sidecar
+    /// skip alone is not enough: `handle_streaming_leader_upstream_error`
+    /// streams the content key as a stale-if-error response without gating on
+    /// the sidecar, the PyPI Remote arm streams it directly, and `is_fresh`
+    /// degrades to a bare `exists()` on a multipart-ETag mismatch (#2120) --
+    /// after which a presigned 302 points straight at it. Leaving the object
+    /// behind therefore leaves it servable (#3068 review).
     #[tokio::test]
     async fn test_tee_empty_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
@@ -8359,7 +8788,8 @@ mod tests {
         assert_eq!(
             backend.deletes.lock().await.as_slice(),
             ["cache-key".to_string()],
-            "the empty cache object must be deleted so the next request refetches"
+            "the empty cache object must be deleted so the next request refetches; \
+             the sidecar skip alone does not protect the sidecar-less read paths"
         );
     }
 
@@ -8406,8 +8836,13 @@ mod tests {
     /// #1912 regression: a truncated upstream body (bytes written < the
     /// advertised `Content-Length`) must NOT be cached. Committing it would
     /// serve a short, SHA-mismatched archive on the next GET and clients hit
-    /// "unexpected BufError" extracting it. The writer must skip the metadata
-    /// sidecar and delete the partial object so the next request refetches.
+    /// "unexpected BufError" extracting it. The writer must skip the
+    /// metadata sidecar so the next request refetches.
+    ///
+    /// Same reasoning as the empty-body sibling above: the writer must ALSO
+    /// delete the partial object, because the sidecar skip does not protect
+    /// the read paths that reach the content key without consulting it
+    /// (#3068 review).
     #[tokio::test]
     async fn test_tee_truncated_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
@@ -8440,7 +8875,74 @@ mod tests {
         assert_eq!(
             backend.deletes.lock().await.as_slice(),
             ["cache-key".to_string()],
-            "the truncated cache object must be deleted so the next request refetches"
+            "the truncated cache object must be deleted so the next request refetches; \
+             the sidecar skip alone does not protect the sidecar-less read paths"
+        );
+    }
+
+    /// #1611 regression: `write_negative_cache`'s `exists()`-gated delete must
+    /// not fire when nothing real is present, on the FIRST negative-cache
+    /// write for a path AND on every renewal after it. Before the guard, an
+    /// unconditional delete() on a versioned backend stacked a redundant
+    /// marker version on every renewal (observed up to 9+ on a single key)
+    /// even though no real content was ever written there.
+    #[tokio::test]
+    async fn test_write_negative_cache_skips_delete_when_nothing_present() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let proxy = ProxyService::new(test_catalog_pool(), storage);
+
+        // Two consecutive negative-cache writes, simulating the initial
+        // write plus one TTL renewal against a path that never had real
+        // content -- exactly the "checksum-file probe for a dep that never
+        // publishes a .sha1" case from the #1611 investigation.
+        proxy
+            .write_negative_cache("cache-key", "meta-key", "some/path")
+            .await;
+        proxy
+            .write_negative_cache("cache-key", "meta-key", "some/path")
+            .await;
+
+        assert!(
+            backend.deletes.lock().await.is_empty(),
+            "write_negative_cache must not delete when exists() reports \
+             nothing present (#1611); doing so on every renewal stacks a \
+             redundant marker version with zero real content behind it"
+        );
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            2,
+            "each negative-cache renewal still writes its metadata sidecar \
+             regardless of the delete guard"
+        );
+    }
+
+    /// Positive control for the guard above. Without this, replacing the
+    /// `exists()` check with `if false` would still pass the whole suite --
+    /// the same criticism the #3068 author correctly applied to the
+    /// `local_fetch_or_redirect` test and did not apply here.
+    ///
+    /// When a real positive body IS present, `write_negative_cache` must still
+    /// drop it, so a future read can never serve stale content alongside the
+    /// negative marker.
+    #[tokio::test]
+    async fn test_write_negative_cache_deletes_an_existing_positive_body() {
+        let backend = TeeRecordingBackend::ok();
+        backend
+            .object_written
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let proxy = ProxyService::new(test_catalog_pool(), storage);
+
+        proxy
+            .write_negative_cache("cache-key", "meta-key", "some/path")
+            .await;
+
+        assert_eq!(
+            backend.deletes.lock().await.as_slice(),
+            ["cache-key".to_string()],
+            "a prior positive body MUST be dropped when the negative marker is \
+             written, otherwise a read can serve it alongside the marker"
         );
     }
 
@@ -8562,6 +9064,8 @@ mod tests {
 
         let upstream = upstream_chunks(vec![b"payload"]);
         let template = CacheMetadataTemplate {
+            commit_sha: None,
+            content_encoding: None,
             content_type: Some("application/x-deb".to_string()),
             etag: Some("\"abc123\"".to_string()),
             last_modified: None,
@@ -8790,6 +9294,8 @@ mod tests {
                 Some("application/octet-stream".to_string()),
                 etag,
                 None,
+                None,
+                None,
                 3600,
                 Uuid::nil(),
                 "repo/path",
@@ -8886,6 +9392,42 @@ mod tests {
 
         assert_eq!(
             redact_url_for_diagnostics("packages/pkg.zip?token=secret#frag"),
+            "packages/pkg.zip"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_for_diagnostics_strips_userinfo_credentials() {
+        // #2926: upstream `user:password@` credentials and any credential-bearing
+        // query params must never survive into a client-facing diagnostic.
+        let redacted =
+            redact_url_for_diagnostics("https://user:pass@host.example.com/path?token=abc");
+        assert!(!redacted.contains("user"), "username leaked: {redacted}");
+        assert!(!redacted.contains("pass"), "password leaked: {redacted}");
+        assert!(!redacted.contains("abc"), "token leaked: {redacted}");
+        assert!(!redacted.contains('@'), "userinfo `@` retained: {redacted}");
+        assert_eq!(redacted, "https://host.example.com/path");
+    }
+
+    #[test]
+    fn test_redact_url_for_diagnostics_strips_userinfo_username_only() {
+        // A username-only userinfo (no password) must also be removed.
+        assert_eq!(
+            redact_url_for_diagnostics("https://token@registry.example.com/v2/"),
+            "https://registry.example.com/v2/"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_for_diagnostics_strips_userinfo_unparseable_fallback() {
+        // The non-`reqwest::Url` fallback path must strip userinfo too.
+        assert_eq!(
+            redact_url_for_diagnostics("//user:pass@host/path?token=abc"),
+            "//host/path"
+        );
+        // No userinfo present: authority is left intact.
+        assert_eq!(
+            redact_url_for_diagnostics("packages/pkg.zip"),
             "packages/pkg.zip"
         );
     }
@@ -9258,6 +9800,8 @@ mod tests {
         cached_at: chrono::DateTime<chrono::Utc>,
     ) -> Bytes {
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at,
             upstream_etag: None,
             storage_etag: None,
@@ -9283,6 +9827,8 @@ mod tests {
     fn test_build_cached_entry_maps_fields_and_extracts_name() {
         let now = Utc::now();
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
@@ -9311,6 +9857,8 @@ mod tests {
     fn test_build_cached_entry_defaults_missing_content_type() {
         let now = Utc::now();
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
@@ -9636,6 +10184,73 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // validate_cache_path: dot-segment rejection, including the percent-encoded
+    // spellings the URL parser folds back into dot segments.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_cache_path_rejects_literal_dot_segments() {
+        for path in ["a/../b", "../etc/passwd", "a/./b", "..", "."] {
+            assert!(
+                ProxyService::validate_cache_path(path).is_err(),
+                "must reject {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_cache_path_rejects_encoded_dot_segments() {
+        // Regression: axum percent-decodes a captured path parameter exactly
+        // once, so a request carrying `%252e%252e` reaches the handler as the
+        // literal `%2e%2e`. That is not equal to `..`, so it used to pass this
+        // validator — and the `url` crate then collapsed it as a dot segment
+        // when the upstream URL was parsed, resolving the fetch above the
+        // repository's configured base path with the operator's upstream
+        // credential attached. Every spelling the URL parser folds must be
+        // rejected here, case-insensitively.
+        for path in [
+            "api/models/%2e%2e/x",
+            "api/models/%2E%2E/x",
+            "api/models/.%2e/x",
+            "api/models/%2e./x",
+            "api/models/%2e/x",
+            "a/%2E/b",
+        ] {
+            assert!(
+                ProxyService::validate_cache_path(path).is_err(),
+                "must reject {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_cache_path_allows_dots_inside_a_segment() {
+        // Real package filenames are full of dots and must not be caught.
+        for path in [
+            "simple/click/click-8.0.0-py3-none-any.whl",
+            "a/..foo/b",
+            "a/foo..bar/b",
+            "noarch/repodata.json.zst",
+            "a/%2ebar/b",
+        ] {
+            assert!(
+                ProxyService::validate_cache_path(path).is_ok(),
+                "must allow {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_dot_segment_matches_url_parser_set() {
+        for s in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2e", ".%2e", "%2e."] {
+            assert!(is_dot_segment(s), "{s} is a dot segment");
+        }
+        for s in ["", "a", "...", "%2ea", "a%2e", "..a", "foo.bar", "%252e"] {
+            assert!(!is_dot_segment(s), "{s} is not a dot segment");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // extract_streaming_headers: pure header parsing. Verifies the
     // Content-Length parse-or-skip behaviour and the etag/content-type
     // round-trip without a reqwest::Response. #895.
@@ -9644,12 +10259,75 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
+    fn test_extract_streaming_headers_captures_encoding_and_commit() {
+        // Both of these must survive header capture: with reqwest's transparent
+        // decompression disabled, a coded body is only decodable by the client if
+        // the coding is forwarded, and `X-Repo-Commit` has to travel with the
+        // bytes it describes rather than being looked up separately.
+        let mut h = HeaderMap::new();
+        h.insert(
+            reqwest::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        h.insert(UPSTREAM_COMMIT_HEADER, HeaderValue::from_static("abc123"));
+        let got = extract_streaming_headers(&h);
+        assert_eq!(got.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(got.commit_sha.as_deref(), Some("abc123"));
+
+        // Absent headers stay absent rather than defaulting to a coding.
+        let empty = extract_streaming_headers(&HeaderMap::new());
+        assert!(empty.content_encoding.is_none());
+        assert!(empty.commit_sha.is_none());
+    }
+
+    #[test]
+    fn test_cache_metadata_round_trips_encoding_and_commit() {
+        // A cache hit rebuilds the response from the sidecar, so both fields have
+        // to serialize; and pre-existing sidecars (written without them) must
+        // still deserialize, reading as "identity, no commit".
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now,
+            upstream_etag: Some("\"e\"".to_string()),
+            storage_etag: None,
+            last_modified: None,
+            content_encoding: Some("gzip".to_string()),
+            upstream_commit_sha: Some("deadbeef".to_string()),
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: now + chrono::Duration::seconds(60),
+            content_type: Some("application/json".to_string()),
+            size_bytes: 3,
+            checksum_sha256: "abc".to_string(),
+        };
+        let json = serde_json::to_string(&metadata).expect("serialize");
+        let back: CacheMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(back.upstream_commit_sha.as_deref(), Some("deadbeef"));
+
+        let legacy = serde_json::json!({
+            "cached_at": now,
+            "upstream_etag": null,
+            "expires_at": now + chrono::Duration::seconds(60),
+            "content_type": "application/json",
+            "size_bytes": 3,
+            "checksum_sha256": "abc",
+        });
+        let legacy: CacheMetadata =
+            serde_json::from_value(legacy).expect("pre-existing sidecar must still load");
+        assert!(legacy.content_encoding.is_none());
+        assert!(legacy.upstream_commit_sha.is_none());
+    }
+
+    #[test]
     fn test_extract_streaming_headers_full_set() {
         let mut h = HeaderMap::new();
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-deb"));
         h.insert(ETAG, HeaderValue::from_static("\"abc123\""));
         h.insert(CONTENT_LENGTH, HeaderValue::from_static("12345"));
-        let (ct, etag, len) = extract_streaming_headers(&h);
+        let h = extract_streaming_headers(&h);
+        let (ct, etag, len) = (h.content_type, h.etag, h.content_length);
+        let _ = (&ct, &etag, &len);
         assert_eq!(ct.as_deref(), Some("application/x-deb"));
         assert_eq!(etag.as_deref(), Some("\"abc123\""));
         assert_eq!(len, Some(12345));
@@ -9658,7 +10336,9 @@ mod tests {
     #[test]
     fn test_extract_streaming_headers_empty() {
         let h = HeaderMap::new();
-        let (ct, etag, len) = extract_streaming_headers(&h);
+        let h = extract_streaming_headers(&h);
+        let (ct, etag, len) = (h.content_type, h.etag, h.content_length);
+        let _ = (&ct, &etag, &len);
         assert!(ct.is_none());
         assert!(etag.is_none());
         assert!(len.is_none());
@@ -9672,7 +10352,9 @@ mod tests {
         // back to chunked transfer encoding.
         let mut h = HeaderMap::new();
         h.insert(CONTENT_LENGTH, HeaderValue::from_static("not-a-number"));
-        let (_, _, len) = extract_streaming_headers(&h);
+        let h = extract_streaming_headers(&h);
+        let (ct, etag, len) = (h.content_type, h.etag, h.content_length);
+        let _ = (&ct, &etag, &len);
         assert!(len.is_none());
     }
 
@@ -9684,7 +10366,9 @@ mod tests {
         let mut h = HeaderMap::new();
         let bad = HeaderValue::from_bytes(b"\xff\xfe").unwrap();
         h.insert(ETAG, bad);
-        let (_, etag, _) = extract_streaming_headers(&h);
+        let h = extract_streaming_headers(&h);
+        let (ct, etag, len) = (h.content_type, h.etag, h.content_length);
+        let _ = (&ct, &etag, &len);
         assert!(etag.is_none());
     }
 
@@ -9697,10 +10381,13 @@ mod tests {
     fn test_streaming_fetch_result_carries_content_length() {
         let dummy: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![]));
         let r = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: dummy,
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(12345),
             artifact_id: None,
+            etag: None,
         };
         assert_eq!(r.content_length, Some(12345));
         assert_eq!(r.content_type.as_deref(), Some("application/octet-stream"));
@@ -10176,7 +10863,7 @@ mod tests {
             .expect("prime cache from upstream");
         assert_eq!(&body[..], b"INDEX-BODY");
         match proxy.cached_metadata_if_servable(&repo, "index.json").await {
-            Ok(Some((bytes, _))) => assert_eq!(&bytes[..], b"INDEX-BODY"),
+            Ok(Some((bytes, _, _))) => assert_eq!(&bytes[..], b"INDEX-BODY"),
             other => panic!("fresh cached entry must be servable, got {other:?}"),
         }
 
@@ -10500,6 +11187,8 @@ mod tests {
                 Some("application/gzip".to_string()),
                 None,
                 None,
+                None,
+                None,
                 DEFAULT_CACHE_TTL_SECS,
                 Uuid::new_v4(),
                 cache_path,
@@ -10519,7 +11208,7 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let (got, got_ct) = lookup.expect(
+        let (got, got_ct, _got_enc) = lookup.expect(
             "cache_artifact MUST persist bytes that the very next call to \
              get_cached_artifact_by_path can read back. The reproducer in \
              #1445(A) (`cached artifacts should contain abbrev after npm \
@@ -10683,7 +11372,8 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let (cached_content, _) = cached.expect("a matching content-addressed body MUST be cached");
+        let (cached_content, _, _) =
+            cached.expect("a matching content-addressed body MUST be cached");
         assert_eq!(&cached_content[..], body.as_ref());
     }
 
@@ -11116,6 +11806,8 @@ mod tests {
             now + chrono::Duration::hours(1)
         };
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now - chrono::Duration::hours(2),
             upstream_etag: None,
             storage_etag: None,
@@ -11272,7 +11964,7 @@ mod tests {
             KeyResponse::Bytes(Bytes::from_static(body)),
         );
         let out = svc.get_cached(BODY_KEY, META_KEY, true).await.unwrap();
-        let (content, ct) = out.expect("stale read must serve an expired entry");
+        let (content, ct, _enc) = out.expect("stale read must serve an expired entry");
         assert_eq!(&content[..], body);
         assert_eq!(ct.as_deref(), Some("application/octet-stream"));
     }
@@ -12557,6 +13249,8 @@ mod tests {
     ) {
         let now = Utc::now();
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now - chrono::Duration::hours(2),
             upstream_etag: upstream_etag.map(String::from),
             storage_etag: None,
@@ -12828,6 +13522,8 @@ mod tests {
     ) {
         let now = Utc::now();
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
@@ -12848,6 +13544,8 @@ mod tests {
         let now = Utc::now();
         let neg_ttl = chrono::Duration::seconds(cache_classifier::NEGATIVE_CACHE_TTL_SECS);
         let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: None,
             storage_etag: None,
@@ -13997,6 +14695,8 @@ mod tests {
                 Some("text/plain".to_string()),
                 Some("\"etag-1\"".to_string()),
                 None,
+                None,
+                None,
                 3600,
                 Uuid::new_v4(),
                 "some/path",
@@ -14031,6 +14731,8 @@ mod tests {
     fn sample_cache_metadata(etag: &str) -> CacheMetadata {
         let now = Utc::now();
         CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
             cached_at: now,
             upstream_etag: Some(etag.to_string()),
             storage_etag: None,

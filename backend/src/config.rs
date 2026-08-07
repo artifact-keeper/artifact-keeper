@@ -1591,6 +1591,16 @@ mod tests {
     // We use a mutex to prevent parallel test interference.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    // The sentinel DATABASE_URL these tests export deliberately points at
+    // `127.0.0.1:1` (a port nothing listens on, so connects are REFUSED
+    // instantly) rather than `localhost:5432`. `std::env` is process-global
+    // and ENV_MUTEX only serializes THIS module, so while any of these tests
+    // runs, concurrently-starting DB-gated tests elsewhere in the suite can
+    // observe the sentinel via `testing::require_db_url()`. Pointing it at a
+    // real Postgres port meant those tests tried to speak to whatever squats
+    // on :5432 — and a listener that accepts but never answers turned each
+    // observation into a long (pre-#2986: unbounded) stall. An
+    // instantly-refused sentinel makes a window-sampled URL cost microseconds.
     /// Restore an env var to a previously captured value (or remove it if it
     /// was unset), so env-mutating tests do not leak state to other tests.
     fn restore_env(key: &str, saved: Option<String>) {
@@ -1647,10 +1657,19 @@ mod tests {
     #[test]
     fn test_config_rate_limit_enabled_by_default() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("RATE_LIMIT_ENABLED").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("RATE_LIMIT_ENABLED");
         let config = Config::from_env().expect("config should load");
+        // Restore BEFORE asserting: a leaked `DATABASE_URL` outlives this
+        // test and re-routes every later DB-gated test in the process from
+        // "skip cleanly" to "connect to a bogus localhost database" (#2986).
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("RATE_LIMIT_ENABLED", saved_flag);
         assert!(
             config.rate_limit_enabled,
             "rate limiting must be ON by default (#1602)"
@@ -1660,11 +1679,16 @@ mod tests {
     #[test]
     fn test_config_rate_limit_disabled_via_env() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("RATE_LIMIT_ENABLED").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_ENABLED", "false");
         let config = Config::from_env().expect("config should load");
-        env::remove_var("RATE_LIMIT_ENABLED");
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("RATE_LIMIT_ENABLED", saved_flag);
         assert!(
             !config.rate_limit_enabled,
             "RATE_LIMIT_ENABLED=false must disable rate limiting"
@@ -1674,11 +1698,15 @@ mod tests {
     #[test]
     fn test_config_login_rate_limit_env_override() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_LOGIN_PER_WINDOW", "3");
         env::set_var("RATE_LIMIT_LOGIN_WINDOW_SECS", "600");
         let config = Config::from_env().expect("config should load");
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
         env::remove_var("RATE_LIMIT_LOGIN_PER_WINDOW");
         env::remove_var("RATE_LIMIT_LOGIN_WINDOW_SECS");
         assert_eq!(
@@ -1698,7 +1726,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("BLOB_GC_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("BLOB_GC_ENABLED");
 
@@ -1798,7 +1826,7 @@ mod tests {
         let saved_conc = env::var("GLOBAL_MAX_CONCURRENCY").ok();
         let saved_to = env::var("GLOBAL_REQUEST_TIMEOUT_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("GLOBAL_MAX_CONCURRENCY", "0");
         env::set_var("GLOBAL_REQUEST_TIMEOUT_SECS", "0");
@@ -1835,7 +1863,7 @@ mod tests {
         let saved_conc = env::var("GLOBAL_MAX_CONCURRENCY").ok();
         let saved_to = env::var("GLOBAL_REQUEST_TIMEOUT_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("GLOBAL_MAX_CONCURRENCY", "1024");
         env::set_var("GLOBAL_REQUEST_TIMEOUT_SECS", "300");
@@ -2015,7 +2043,7 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let saved_db = env::var("DATABASE_URL").ok();
         let saved_jwt = env::var("JWT_SECRET").ok();
-        env::set_var("DATABASE_URL", "postgresql://localhost/test");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/test");
         env::remove_var("JWT_SECRET");
 
         let result = Config::from_env();
@@ -2046,7 +2074,7 @@ mod tests {
         let saved_demo = env::var("DEMO_MODE").ok();
 
         // Set only required vars
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Remove optional vars to test defaults
@@ -2063,7 +2091,7 @@ mod tests {
 
         let config = Config::from_env().expect("Config should load with required vars");
 
-        assert_eq!(config.database_url, "postgresql://localhost/testdb");
+        assert_eq!(config.database_url, "postgresql://127.0.0.1:1/testdb");
         assert_eq!(config.jwt_secret, STRONG_SECRET);
         assert_eq!(config.bind_address, "0.0.0.0:8080");
         assert_eq!(config.log_level, "info");
@@ -2150,7 +2178,7 @@ mod tests {
         let saved_idle = env::var("DATABASE_IDLE_TIMEOUT_SECS").ok();
         let saved_life = env::var("DATABASE_MAX_LIFETIME_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DATABASE_MAX_CONNECTIONS", "50");
         env::set_var("DATABASE_MIN_CONNECTIONS", "10");
@@ -2198,7 +2226,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_max = env::var("DATABASE_MAX_CONNECTIONS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DATABASE_MAX_CONNECTIONS", "not-a-number");
 
@@ -2232,7 +2260,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_demo = env::var("DEMO_MODE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DEMO_MODE", "true");
 
@@ -2277,7 +2305,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("AK_GUEST_ACCESS_ENABLED");
 
@@ -2312,7 +2340,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_hint = env::var("SETUP_PASSWORD_HINT").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Unset -> None (default behavior unchanged).
@@ -2362,7 +2390,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::set_var("AK_GUEST_ACCESS_ENABLED", "false");
@@ -2418,7 +2446,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("EXPOSE_DETAILED_HEALTH").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("EXPOSE_DETAILED_HEALTH");
 
@@ -2438,7 +2466,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("EXPOSE_DETAILED_HEALTH").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::set_var("EXPOSE_DETAILED_HEALTH", "true");
@@ -2468,7 +2496,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("GRPC_REFLECTION_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("GRPC_REFLECTION_ENABLED");
 
@@ -2487,7 +2515,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("GRPC_REFLECTION_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::set_var("GRPC_REFLECTION_ENABLED", "true");
@@ -2524,7 +2552,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("PLUGINS_REQUIRE_SIGNED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("PLUGINS_REQUIRE_SIGNED");
 
@@ -2544,7 +2572,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("PLUGINS_REQUIRE_SIGNED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::set_var("PLUGINS_REQUIRE_SIGNED", "false");
@@ -2578,7 +2606,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_key = env::var("PLUGINS_TRUSTED_PUBKEY").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::remove_var("PLUGINS_TRUSTED_PUBKEY");
@@ -2608,7 +2636,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("ALLOW_LOCAL_ADMIN_LOGIN").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Default is false
@@ -2656,7 +2684,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Default is false: the admin break-glass stays enabled (#2018).
@@ -2693,7 +2721,7 @@ mod tests {
         let saved_access = env::var("JWT_ACCESS_TOKEN_EXPIRY_MINUTES").ok();
         let saved_refresh = env::var("JWT_REFRESH_TOKEN_EXPIRY_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("JWT_EXPIRATION_SECS", "3600");
         env::set_var("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", "15");
@@ -2739,7 +2767,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_gc = env::var("GC_SCHEDULE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("GC_SCHEDULE");
 
@@ -2769,7 +2797,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_gc = env::var("GC_SCHEDULE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("GC_SCHEDULE", "0 30 2 * * *");
 
@@ -2801,7 +2829,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_lc = env::var("LIFECYCLE_CHECK_INTERVAL_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("LIFECYCLE_CHECK_INTERVAL_SECS");
 
@@ -2831,7 +2859,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_lc = env::var("LIFECYCLE_CHECK_INTERVAL_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("LIFECYCLE_CHECK_INTERVAL_SECS", "300");
 
@@ -2865,7 +2893,7 @@ mod tests {
         let saved_region = env::var("S3_REGION").ok();
         let saved_endpoint = env::var("S3_ENDPOINT").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("S3_BUCKET", "my-bucket");
         env::set_var("S3_REGION", "us-east-1");
@@ -2911,7 +2939,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_backup_bucket = env::var("BACKUP_S3_BUCKET").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Unset => None (default behavior, backups reuse the primary bucket).
@@ -2949,7 +2977,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_max = env::var("MAX_UPLOAD_SIZE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("MAX_UPLOAD_SIZE");
 
@@ -2979,7 +3007,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_max = env::var("MAX_UPLOAD_SIZE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("MAX_UPLOAD_SIZE", "1073741824"); // 1 GB
 
@@ -3011,7 +3039,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_port = env::var("METRICS_PORT").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("METRICS_PORT");
 
@@ -3041,7 +3069,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_port = env::var("METRICS_PORT").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("METRICS_PORT", "9091");
 
@@ -3073,7 +3101,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_port = env::var("METRICS_PORT").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("METRICS_PORT", "not-a-port");
 
@@ -3105,7 +3133,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_max = env::var("MAX_UPLOAD_SIZE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("MAX_UPLOAD_SIZE", "0");
 
@@ -3237,7 +3265,7 @@ mod tests {
     #[test]
     fn test_proxy_singleflight_advisory_locks_disabled_by_default() {
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
         env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
@@ -3251,7 +3279,7 @@ mod tests {
     #[test]
     fn test_proxy_singleflight_advisory_locks_opt_in() {
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED", "true");
         env::set_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS", "125");
@@ -3285,7 +3313,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("RATE_LIMIT_API_PER_MIN");
 
@@ -3319,7 +3347,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_API_PER_MIN", "25000");
 
@@ -3354,7 +3382,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "30,14,7,3,1");
 
@@ -3386,7 +3414,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "7,7,3,14,3");
 
@@ -3418,7 +3446,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "0,7,0,1");
 
@@ -3450,7 +3478,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "abc,7,,1,xyz");
 
@@ -3482,7 +3510,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_interval = env::var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS", "1800");
 
@@ -3517,7 +3545,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_search = env::var("RATE_LIMIT_SEARCH_PER_MIN").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_SEARCH_PER_MIN", "500");
 
@@ -3558,7 +3586,7 @@ mod tests {
         let saved_db = env::var("DATABASE_URL").ok();
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_dt = env::var("DEPENDENCY_TRACK_ENABLED").ok();
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         match value {
             Some(v) => env::set_var("DEPENDENCY_TRACK_ENABLED", v),
@@ -3664,7 +3692,7 @@ mod tests {
         let saved_dt = env::var("DEPENDENCY_TRACK_ENABLED").ok();
         let saved_url = env::var("DEPENDENCY_TRACK_URL").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DEPENDENCY_TRACK_URL", "http://dt.example.com:8081");
         env::remove_var("DEPENDENCY_TRACK_ENABLED");

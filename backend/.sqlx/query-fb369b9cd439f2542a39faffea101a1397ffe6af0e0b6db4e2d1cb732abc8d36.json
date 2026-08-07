@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repository_signing_config SET signing_key_id = $1 WHERE repository_id = $2 AND signing_key_id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fb369b9cd439f2542a39faffea101a1397ffe6af0e0b6db4e2d1cb732abc8d36"
+}

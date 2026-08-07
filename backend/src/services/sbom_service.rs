@@ -4325,13 +4325,10 @@ mod tests {
     /// Connect to the test database when `DATABASE_URL` is set; otherwise
     /// return `None` so the test skips cleanly.
     async fn try_pool() -> Option<PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(3)
-            .acquire_timeout(std::time::Duration::from_secs(30))
-            .connect(&url)
-            .await
-            .ok()
+        // Skip only when no DB is configured/reachable AND not required; a
+        // connect failure under AK_TESTS_REQUIRE_DB panics (no fiction-green,
+        // #2924).
+        crate::testing::try_pool_with(3).await
     }
 
     /// Seed a repository row with a unique key/storage path.

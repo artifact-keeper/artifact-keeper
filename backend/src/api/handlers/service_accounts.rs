@@ -2098,7 +2098,9 @@ mod audit_db_tests {
         service_account_id: Uuid,
         name: &str,
     ) -> Uuid {
-        let body = json!({ "name": name, "scopes": ["read"] }).to_string();
+        // Canonical vocabulary: bare `read` is rejected by the mint-primitive
+        // scope backstop (#2996).
+        let body = json!({ "name": name, "scopes": ["read:artifacts"] }).to_string();
         let req = Request::builder()
             .method(Method::POST)
             .uri(format!("/{service_account_id}/tokens"))
@@ -2212,7 +2214,9 @@ mod audit_db_tests {
             .await
             .expect("create service account");
 
-        let body = json!({ "name": "sa-audit", "scopes": ["read"] }).to_string();
+        // Canonical vocabulary: bare `read` is rejected by the mint-primitive
+        // scope backstop (#2996).
+        let body = json!({ "name": "sa-audit", "scopes": ["read:artifacts"] }).to_string();
         let req = Request::builder()
             .method(Method::POST)
             .uri(format!("/{}/tokens", sa.id))

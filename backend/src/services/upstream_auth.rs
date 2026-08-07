@@ -77,6 +77,45 @@ pub enum UpstreamAuthType {
     Bearer { token: String },
 }
 
+/// Whether an upstream fetch may carry the repository's configured upstream
+/// credentials (#2925 / #3130).
+///
+/// `Anonymous` exists for fetching a URL discovered on a host the operator did
+/// NOT configure. A NuGet upstream's service index may legitimately advertise
+/// its `SearchQueryService` on a sibling host (nuget.org's search lives on
+/// `azuresearch-*.nuget.org` while `index.json` is on `api.nuget.org`).
+/// #2925's invariant is "never send the repo's configured upstream credentials
+/// to a host the operator did not configure" — it is a credential-exfiltration
+/// guard, not a general egress ban — so such fetches are allowed, but only
+/// anonymously. SSRF is unaffected: the connect-time DNS guard
+/// (`is_blocked_resolved_ip`, #1832/#2570) applies to every request through
+/// the shared client regardless of auth mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpstreamAuthMode {
+    /// Load and apply the repository's configured upstream credentials
+    /// (the default for every fetch against the configured upstream origin).
+    #[default]
+    RepoConfigured,
+    /// Never attach the repository's configured upstream credentials.
+    Anonymous,
+}
+
+/// Mode-aware sibling of [`load_upstream_auth`]: the single choke point where
+/// credentials enter an upstream request. [`UpstreamAuthMode::Anonymous`]
+/// short-circuits to `Ok(None)` BEFORE the credential store is read, so an
+/// anonymous fetch cannot pick up credentials on any code path — there is
+/// nothing loaded for a later `apply_upstream_auth` or bearer retry to attach.
+pub async fn load_upstream_auth_for_mode(
+    db: &PgPool,
+    repo_id: Uuid,
+    mode: UpstreamAuthMode,
+) -> Result<Option<UpstreamAuthType>> {
+    match mode {
+        UpstreamAuthMode::Anonymous => Ok(None),
+        UpstreamAuthMode::RepoConfigured => load_upstream_auth(db, repo_id).await,
+    }
+}
+
 /// Load upstream auth credentials for a repository.
 /// Returns None if no auth is configured.
 pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<UpstreamAuthType>> {
@@ -581,6 +620,53 @@ mod tests {
         let hex = encrypt_credentials_hex(r#"{"token":"secret"}"#, "correct-key");
         let result = decrypt_credentials_hex(&hex, "wrong-key");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // load_upstream_auth_for_mode (#3130 anonymous off-origin fetches)
+    // -----------------------------------------------------------------------
+
+    /// A pool whose every acquire fails: any code path that touches the
+    /// credential store through it errors instead of returning data.
+    fn unreachable_pool() -> PgPool {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    /// Anonymous mode must resolve to "no credentials" WITHOUT consulting the
+    /// credential store at all: against a pool where any DB access errors, it
+    /// still returns `Ok(None)` while `RepoConfigured` surfaces the DB error.
+    /// This pins the stripping as structural (short-circuit before the load),
+    /// not incidental.
+    #[tokio::test]
+    async fn test_load_upstream_auth_for_mode_anonymous_never_reads_credential_store() {
+        let pool = unreachable_pool();
+        let repo_id = Uuid::new_v4();
+        // Ensure the negative cache cannot mask a would-be DB read.
+        invalidate_upstream_auth_cache(repo_id);
+
+        let anon = load_upstream_auth_for_mode(&pool, repo_id, UpstreamAuthMode::Anonymous)
+            .await
+            .expect("anonymous mode must not touch the DB");
+        assert_eq!(anon, None, "anonymous mode must never yield credentials");
+
+        let configured =
+            load_upstream_auth_for_mode(&pool, repo_id, UpstreamAuthMode::RepoConfigured).await;
+        assert!(
+            configured.is_err(),
+            "RepoConfigured against an unreachable pool must error, proving the \
+             anonymous Ok(None) above short-circuited before any credential read"
+        );
     }
 
     // -----------------------------------------------------------------------

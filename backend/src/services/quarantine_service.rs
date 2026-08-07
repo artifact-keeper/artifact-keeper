@@ -529,6 +529,34 @@ async fn fetch_quarantine_fields(
     Ok(row.map(|r| (r.quarantine_status, r.quarantine_until, r.quarantine_reason)))
 }
 
+/// Fetch the quarantine status/expiry AND the owning repository_id in one query
+/// (#2954). The download gate needs the repository_id to evaluate scan policy;
+/// folding it into the same SELECT the quarantine check already runs keeps the
+/// gate to a single read on the hot download path. Returns `Ok(None)` when no
+/// matching (non-deleted) row exists, so an absent artifact stays a no-op.
+async fn fetch_quarantine_fields_with_repo(
+    db: &PgPool,
+    artifact_id: Uuid,
+) -> Result<Option<(Option<String>, Option<DateTime<Utc>>, Uuid)>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        quarantine_status: Option<String>,
+        quarantine_until: Option<DateTime<Utc>>,
+        repository_id: Uuid,
+    }
+
+    let row = sqlx::query_as::<_, Row>(
+        "SELECT quarantine_status, quarantine_until, repository_id \
+         FROM artifacts WHERE id = $1 AND is_deleted = false",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row.map(|r| (r.quarantine_status, r.quarantine_until, r.repository_id)))
+}
+
 /// Fetch the current quarantine status and expiry for an artifact.
 pub async fn get_status(
     db: &PgPool,
@@ -587,12 +615,68 @@ pub async fn get_status_with_repo(db: &PgPool, artifact_id: Uuid) -> Result<Quar
 /// This is the common quarantine gate for all download paths. It queries the
 /// artifact's quarantine fields and returns an error if the artifact is
 /// quarantined (409 Conflict) or rejected (403 Forbidden).
+///
+/// As of #2954 this delegates to [`enforce_download_gate`], which additionally
+/// consults the repository's scan policy after the quarantine check. Repos with
+/// no enabled scan policy are unaffected: `PolicyService::evaluate_artifact`
+/// no-ops to `allowed` when no policy matches, so today's behavior is preserved
+/// for operators who have not opted in.
 pub async fn check_artifact_download(db: &PgPool, artifact_id: Uuid) -> Result<()> {
-    if let Some((status, until, _reason)) = fetch_quarantine_fields(db, artifact_id).await? {
-        check_download_allowed(status.as_deref(), until, Utc::now())?;
-    }
+    enforce_download_gate(db, artifact_id).await
+}
 
-    Ok(())
+/// The shared download choke point (#2954): enforce quarantine THEN scan policy.
+///
+/// This folds `PolicyService::evaluate_artifact` — which enforces
+/// `block_unscanned` / `block_on_fail` / `max_severity`
+/// (`block_on_policy_violation`) and previously only ran on the promotion gate —
+/// into the single function every ~30 per-format download handler already calls,
+/// so scan-policy blocking lights up on the raw download path for all formats at
+/// once (it was a false affordance before: a hosted artifact with CVE findings
+/// was downloadable unless a scan happened to auto-quarantine it).
+///
+/// Ordering is deliberate: the quarantine state is checked FIRST (a quarantined
+/// artifact is a 409 before any policy consideration), then the scan policy. A
+/// disallowed policy result maps to 403.
+///
+/// Guardrail: when the artifact row is absent (deleted / never existed) this is
+/// a no-op `Ok(())`, exactly as the pre-#2954 quarantine-only check was, and
+/// when no enabled scan policy matches the repo the policy evaluation returns
+/// `allowed` — so a repo without a scan policy sees NO change.
+pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()> {
+    let Some((status, until, repository_id)) =
+        fetch_quarantine_fields_with_repo(db, artifact_id).await?
+    else {
+        // Artifact absent: preserve the pre-#2954 no-op behavior.
+        return Ok(());
+    };
+
+    // Quarantine gate first (409 quarantined / 403 rejected).
+    check_download_allowed(status.as_deref(), until, Utc::now())?;
+
+    // Scan-policy gate. No-op (allowed) when no enabled policy matches the repo.
+    let policy_result = crate::services::policy_service::PolicyService::new(db.clone())
+        .evaluate_artifact(artifact_id, repository_id)
+        .await?;
+    policy_gate_result(policy_result.allowed)
+}
+
+/// Map a scan-policy `allowed` decision onto the download gate result (#2954).
+///
+/// Split out from [`enforce_download_gate`] so the "disallowed → 403 with a
+/// neutral, non-disclosing message" contract is pure and unit-testable. The
+/// message deliberately omits the violated policy names / per-artifact finding
+/// counts: the download route is anonymous-readable for public repos, so those
+/// details must not leak here (mirrors [`check_download_allowed`]). Authorized
+/// callers read specifics from the authenticated security endpoints.
+fn policy_gate_result(allowed: bool) -> Result<()> {
+    if allowed {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "Artifact download is blocked by the repository's scan policy".to_string(),
+        ))
+    }
 }
 
 /// Validate that a quarantine duration is at least 1 minute.
@@ -612,6 +696,38 @@ mod tests {
     // -----------------------------------------------------------------------
     // should_quarantine
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // policy_gate_result (#2954 hosted download gate)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_policy_gate_allowed_is_ok() {
+        // No-policy repos / clean-and-scanned artifacts evaluate to allowed:
+        // the gate must be a pass-through (the regression guardrail).
+        assert!(policy_gate_result(true).is_ok());
+    }
+
+    #[test]
+    fn test_policy_gate_disallowed_is_403() {
+        // A blocking policy maps to 403 Forbidden (AppError::Authorization) with
+        // a non-disclosing message.
+        let err = policy_gate_result(false).unwrap_err();
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "disallowed policy must be a 403 Authorization error"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scan policy"),
+            "message should name the scan policy generically: {msg}"
+        );
+        // Must NOT leak specific policy names or finding counts.
+        assert!(
+            !msg.contains("critical"),
+            "must not disclose finding detail"
+        );
+    }
 
     #[test]
     fn test_should_quarantine_enabled() {
@@ -1071,5 +1187,310 @@ mod tests {
         );
         assert_eq!(until, None);
         fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_download_gate (#2954): quarantine THEN scan policy at the shared
+    // download choke point. DB-backed; no-op without DATABASE_URL.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_enforce_download_gate_absent_artifact_is_noop() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        // A deleted / never-existing artifact preserves the pre-#2954 no-op.
+        let result = enforce_download_gate(&fx.pool, Uuid::new_v4()).await;
+        fx.teardown().await;
+        assert!(result.is_ok(), "absent artifact must stay a no-op Ok");
+    }
+
+    #[tokio::test]
+    async fn test_enforce_download_gate_no_policy_allows_then_quarantine_blocks() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let aid = seed_row(&fx, "local", "com/example/g/1.0/g-1.0.jar").await;
+
+        // Regression guardrail: no quarantine + no enabled scan policy => the
+        // gate is a pass-through (repos that never opted in see NO change).
+        let clean = enforce_download_gate(&fx.pool, aid).await;
+
+        // Quarantined (unexpired hold): 409 Conflict BEFORE any policy logic.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+                 quarantine_until = NOW() + INTERVAL '1 hour' WHERE id = $1",
+        )
+        .bind(aid)
+        .execute(&fx.pool)
+        .await
+        .expect("set quarantined");
+        let quarantined = enforce_download_gate(&fx.pool, aid).await;
+
+        // Rejected: 403.
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE id = $1")
+            .bind(aid)
+            .execute(&fx.pool)
+            .await
+            .expect("set rejected");
+        let rejected = enforce_download_gate(&fx.pool, aid).await;
+
+        fx.teardown().await;
+
+        assert!(clean.is_ok(), "no hold + no policy must allow: {clean:?}");
+        assert!(
+            matches!(quarantined, Err(AppError::Conflict(_))),
+            "active quarantine must be a 409 Conflict, got {quarantined:?}"
+        );
+        assert!(
+            matches!(rejected, Err(AppError::Authorization(_))),
+            "rejected artifact must be a 403, got {rejected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enforce_download_gate_blocks_unscanned_via_scan_policy() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let aid = seed_row(&fx, "local", "com/example/h/1.0/h-1.0.jar").await;
+
+        // A repo-scoped enabled policy with block_unscanned: the seeded
+        // artifact has no completed scan, so the policy evaluation disallows
+        // and the download gate must 403 — the exact false affordance #2954
+        // closes (scan policy previously only ran on the promotion gate).
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'high', true, true, true)",
+        )
+        .bind(format!("gate-2954-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert block_unscanned policy");
+
+        let result = enforce_download_gate(&fx.pool, aid).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Authorization(msg)) => {
+                assert!(
+                    msg.contains("scan policy"),
+                    "gate message names the scan policy generically: {msg}"
+                );
+                // Anonymous-readable route: no policy names / finding counts.
+                assert!(!msg.contains("gate-2954"), "must not leak policy names");
+            }
+            other => panic!("unscanned artifact under block_unscanned must 403, got {other:?}"),
+        }
+    }
+
+    /// Seed a scan row for `artifact_id` and return its id. `completed_at` is
+    /// set only for `completed` rows, mirroring the production writers.
+    #[cfg(test)]
+    async fn seed_scan(
+        pool: &PgPool,
+        artifact_id: Uuid,
+        repo_id: Uuid,
+        scan_type: &str,
+        status: &str,
+        critical_count: i32,
+        age_seconds: i64,
+    ) -> Uuid {
+        let scan_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (
+                id, artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                completed_at, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $6, 0, 0, 0, 0,
+                    CASE WHEN $5 = 'completed'
+                         THEN NOW() - make_interval(secs => $7::double precision)
+                    END,
+                    NOW() - make_interval(secs => $7::double precision))
+            "#,
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .bind(repo_id)
+        .bind(scan_type)
+        .bind(status)
+        .bind(critical_count)
+        .bind(age_seconds as f64)
+        .execute(pool)
+        .await
+        .expect("insert scan_result");
+        scan_id
+    }
+
+    /// End-to-end regression test for the download-gate fail-open.
+    ///
+    /// The three pure `post_scan_gates` unit tests in `policy_service` pin the
+    /// helper, but the bug never lived there — it lived in the wiring, so those
+    /// tests pass even with the fail-open restored. This one drives the real
+    /// `enforce_download_gate` against Postgres with the shape that actually
+    /// reproduces it, and fails if the gate inputs regress to a single
+    /// newest-row read.
+    ///
+    /// Fixture per iteration: an OLDER `grype` scan that completed with an
+    /// unacknowledged critical finding, then a NEWER row from a second engine
+    /// whose status is not `completed`. Pre-fix, that newer row switched the
+    /// `max_severity` check off entirely and the artifact was served 200.
+    #[tokio::test]
+    async fn test_enforce_download_gate_severity_survives_newer_non_completed_scan() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        // block_unscanned / block_on_fail are OFF so max_severity is provably
+        // the only gate that can produce the block.
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', false, false, true)",
+        )
+        .bind(format!("gate-3138-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert max_severity policy");
+
+        let mut outcomes = Vec::new();
+        for (i, newest) in ["pending", "running", "not_applicable", "failed"]
+            .iter()
+            .enumerate()
+        {
+            let aid = seed_row(&fx, "local", &format!("com/example/s{i}/1.0/s{i}-1.0.jar")).await;
+
+            // Older completed scan carrying a real, unacknowledged critical.
+            let scan_id = seed_scan(&fx.pool, aid, fx.repo_id, "grype", "completed", 1, 7200).await;
+            sqlx::query(
+                "INSERT INTO scan_findings \
+                 (scan_result_id, artifact_id, severity, title, cve_id, source, is_acknowledged) \
+                 VALUES ($1, $2, 'critical', 'seeded critical', 'CVE-3138-0001', 'test', false)",
+            )
+            .bind(scan_id)
+            .bind(aid)
+            .execute(&fx.pool)
+            .await
+            .expect("insert critical finding");
+
+            // Newer row from a second engine that never reaches `completed`.
+            seed_scan(&fx.pool, aid, fx.repo_id, "dependency", newest, 0, 60).await;
+
+            outcomes.push((*newest, enforce_download_gate(&fx.pool, aid).await));
+        }
+
+        // Negative control: identical shape, but zero findings on record. If
+        // this one blocks, the test above proves nothing (it would pass by
+        // blocking unconditionally).
+        let clean_aid = seed_row(&fx, "local", "com/example/clean/1.0/clean-1.0.jar").await;
+        seed_scan(
+            &fx.pool,
+            clean_aid,
+            fx.repo_id,
+            "grype",
+            "completed",
+            0,
+            7200,
+        )
+        .await;
+        seed_scan(
+            &fx.pool,
+            clean_aid,
+            fx.repo_id,
+            "dependency",
+            "pending",
+            0,
+            60,
+        )
+        .await;
+        let clean = enforce_download_gate(&fx.pool, clean_aid).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        for (newest, result) in outcomes {
+            match result {
+                Err(AppError::Authorization(_)) => {}
+                other => panic!(
+                    "a newer '{newest}' scan row must not disable the max_severity gate: an \
+                     unacknowledged critical is on record, expected 403, got {other:?}"
+                ),
+            }
+        }
+        assert!(
+            clean.is_ok(),
+            "an artifact with no findings must still download: {clean:?}"
+        );
+    }
+
+    /// The same fail-open one layer down: `scanner_service` writes findings
+    /// BEFORE flipping the row to `completed`, so a scanner that dies in
+    /// between leaves an unacknowledged critical on record with no completed
+    /// row anywhere. Keying the severity gate on "a completed scan exists"
+    /// alone would serve that artifact 200.
+    #[tokio::test]
+    async fn test_enforce_download_gate_grades_findings_from_a_crashed_scan() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', false, false, true)",
+        )
+        .bind(format!("gate-3138-crash-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert max_severity policy");
+
+        let aid = seed_row(&fx, "local", "com/example/crash/1.0/crash-1.0.jar").await;
+        // Findings landed, then the scanner died: the janitor reaped the row
+        // from `running` to `failed`. No completed row exists for this artifact.
+        let scan_id = seed_scan(&fx.pool, aid, fx.repo_id, "grype", "failed", 0, 3600).await;
+        sqlx::query(
+            "INSERT INTO scan_findings \
+             (scan_result_id, artifact_id, severity, title, cve_id, source, is_acknowledged) \
+             VALUES ($1, $2, 'critical', 'finding from crashed scan', 'CVE-3138-0002', 'test', false)",
+        )
+        .bind(scan_id)
+        .bind(aid)
+        .execute(&fx.pool)
+        .await
+        .expect("insert critical finding");
+
+        let result = enforce_download_gate(&fx.pool, aid).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!(
+                "an unacknowledged critical from a crashed scan must still be graded, \
+                 expected 403, got {other:?}"
+            ),
+        }
     }
 }

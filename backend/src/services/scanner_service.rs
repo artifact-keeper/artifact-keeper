@@ -81,6 +81,35 @@ pub(crate) const ZERO_FINDINGS_DEDUP_TTL_DAYS: i32 = 1;
 /// still capping a hostile or runaway upload.
 pub(crate) const MAX_SCAN_INPUT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+/// Hard byte ceiling for the inline proxy scan-on-fetch buffer (#2954).
+///
+/// The proxy download miss path deliberately STREAMS the upstream body so a
+/// multi-hundred-MiB wheel never sits in memory (#895 OOM). Buffering to scan
+/// reintroduces that risk, so the buffer is capped: an object larger than this
+/// is never buffered. Over-cap objects fall back to the streaming serve under
+/// the fail-open path, or return 423 under fail-closed — never an unbounded
+/// buffer. 200 MiB covers essentially every real wheel/sdist while bounding
+/// worst-case per-request memory.
+pub const PROXY_SCAN_MAX_BYTES: usize = 200 * 1024 * 1024;
+
+/// Wall-clock budget for a single inline proxy scan (#2954). A cold Grype scan
+/// of a fresh wheel is seconds; this bounds the added `pip install` latency so a
+/// slow or contended scan cannot stall the pull indefinitely. Budget exceeded
+/// is treated as inconclusive (fail-open serves-with-pending, fail-closed 423).
+pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
+
+/// Wall-clock budget for a single inline OCI image proxy scan (#3003 PR-2).
+///
+/// Wider than [`PROXY_SCAN_INLINE_BUDGET`] because the OCI manifest gate does
+/// strictly more inside the budget: on a cold proxy pull it eager-fetches the
+/// config + layer blobs from the upstream registry (bounded by
+/// [`PROXY_SCAN_MAX_BYTES`]) and reassembles an `oci-dir:` layout before Grype
+/// runs, whereas the file formats fetch their bytes BEFORE the gate. `docker
+/// pull` tolerates a slow manifest GET (no client-side per-request deadline by
+/// default), and budget-exceeded remains inconclusive (fail-open serves
+/// pending, fail-closed 423) — never an unscanned serve.
+pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
+
 /// Below this size we keep the scan input in heap (`Bytes`) and skip the
 /// tempfile + mmap machinery entirely. The mmap path exists to keep
 /// multi-GiB artifacts off anon heap so the cgroup OOM killer leaves the
@@ -206,19 +235,91 @@ const NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS: [&str; 6] = [
     "wasm",                        // WASM module payload (application/wasm, ...+wasm)
 ];
 
+/// True when `media_type` is a real container **rootfs layer** — the thing a
+/// runtime actually unpacks into the filesystem it runs, and therefore the
+/// only kind of layer that can carry vulnerable content.
+///
+/// Deliberately shaped as "is a tar stream AND is not a known non-image
+/// payload" rather than an allow-list of exact strings, so the OCI/Docker
+/// variants (`tar`, `tar+gzip`, `tar+zstd`, `nondistributable`, Docker's
+/// `rootfs.diff.tar.gzip` / `foreign.diff.tar.gzip`) are all covered without
+/// enumerating them. The marker exclusion is what keeps a Helm chart payload
+/// (`vnd.cncf.helm.chart.content.v1.tar+gzip` — a tar, but not a rootfs)
+/// from counting.
+fn is_container_rootfs_layer(media_type: &str) -> bool {
+    let mt = media_type.to_ascii_lowercase();
+    mt.contains("tar")
+        && !NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS
+            .iter()
+            .any(|marker| mt.contains(marker))
+}
+
+/// Would a container runtime RUN this manifest body as an image? (#3003 PR-2,
+/// round 2.)
+///
+/// This is the consumer-faithful predicate the inline proxy scan gate keys on.
+/// It answers exactly one question — "can these bytes become a running
+/// container?" — and it answers it from the two things a runtime actually
+/// requires:
+///
+///   1. an **image config** descriptor ([`CONTAINER_IMAGE_CONFIG_MEDIA_TYPES`]),
+///      and
+///   2. at least one **real rootfs layer** ([`is_container_rootfs_layer`]).
+///
+/// Everything else in the body is ignored ON PURPOSE, because everything else
+/// is attacker-controllable decoration that does not change what runs:
+///
+/// * A co-present `manifests` array does NOT make it an index. A body with a
+///   real config + real layers *and* a cosmetic `"manifests": []` is still a
+///   runnable image; a classifier that checked `manifests` first would call it
+///   an index and wave it through unscanned.
+/// * A decoy non-image layer (a lone `vnd.dev.cosign…` / `…+wasm` /
+///   `spdx` descriptor sitting next to the real `tar+gzip` layer) does NOT
+///   make it a signature or an SBOM. The runtime still unpacks the real layer.
+///   The decoy layer is simply not a catalog source — it is not an exemption.
+///
+/// Both of those were live bypasses of the first cut of this gate: the
+/// vulnerable image was served `200` unscanned because the classifier
+/// disagreed with what `docker pull` would actually run.
+///
+/// Returns `false` for a pure index (no config of its own — the platform child
+/// the client resolves next re-enters this gate and IS scanned), for genuine
+/// non-image OCI artifacts (Helm charts, cosign signatures, SBOM/attestation,
+/// WASM modules — no image config and/or no rootfs layer), for an image config
+/// with no layers (nothing to unpack, nothing to grade), and for an
+/// unparseable body (not a consumable image; the cache path already refuses to
+/// tag one).
+pub fn oci_manifest_is_runnable_image(body: &[u8]) -> bool {
+    let Ok(manifest) = crate::formats::oci::OciHandler::parse_manifest(body) else {
+        return false;
+    };
+    let has_image_config = manifest.config.as_ref().is_some_and(|config| {
+        CONTAINER_IMAGE_CONFIG_MEDIA_TYPES
+            .iter()
+            .any(|allowed| config.media_type == *allowed)
+    });
+    if !has_image_config {
+        return false;
+    }
+    manifest
+        .layers
+        .iter()
+        .any(|layer| is_container_rootfs_layer(&layer.media_type))
+}
+
 /// Decide whether an already-loaded OCI manifest `body` describes a real
 /// container image that the image-vuln scanners should run on.
 ///
 /// Default-DENY. Returns `true` only when:
-///   * the body is an image **index** / manifest list (top-level `manifests`
-///     array): indexes carry no config, and `resolve_scan_reference` (#1971,
-///     #1992, #2054) rewrites the reference to a concrete scannable child,
-///     so an index must NEVER be denied at the gate; OR
-///   * the body is a single manifest whose `config.mediaType` is a container
-///     image config ([`CONTAINER_IMAGE_CONFIG_MEDIA_TYPES`]) AND none of its
-///     `layers[].mediaType` is a known non-image marker
-///     ([`NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS`]) — the layer guard rejects
-///     cosign signatures, which reuse the standard image config.
+///   * the body is a **runnable image** ([`oci_manifest_is_runnable_image`]):
+///     an image config plus at least one real rootfs layer. A decoy
+///     non-image layer alongside a real one does NOT exempt it — the runtime
+///     still unpacks the real layer, so the scanners must still run (#3003
+///     round 2); OR
+///   * the body is a pure image **index** / manifest list (a `manifests` array
+///     and no image config of its own): indexes carry no rootfs, and
+///     `resolve_scan_reference` (#1971, #1992, #2054) rewrites the reference
+///     to a concrete scannable child, so an index must NEVER be denied here.
 ///
 /// Returns `false` for Helm OCI charts, WASM modules, SBOM/attestation/empty
 /// artifacts, and any manifest with an unknown or absent config — these are
@@ -232,7 +333,13 @@ pub fn oci_manifest_is_scannable_image(body: &[u8]) -> bool {
         // Anomalous body on an OCI route: do not flip the path-based decision.
         return true;
     };
-    // Index / manifest list: no config, resolved to a child downstream. Allow.
+    // A runnable image is always scannable — checked FIRST so a co-present
+    // `manifests` array cannot route a real image down the index branch.
+    if oci_manifest_is_runnable_image(body) {
+        return true;
+    }
+    // Pure index / manifest list: no rootfs of its own, resolved to a child
+    // downstream. Allow.
     if !manifest.manifests.is_empty() {
         return true;
     }
@@ -248,7 +355,9 @@ pub fn oci_manifest_is_scannable_image(body: &[u8]) -> bool {
         return false;
     }
     // Layer guard: reject cosign/in-toto/spdx/cyclonedx/helm/wasm payloads even
-    // when the config is the standard image config (cosign reuses it).
+    // when the config is the standard image config (cosign reuses it). Reached
+    // only when there is no real rootfs layer, so this can no longer be used to
+    // exempt a genuine image by bolting a decoy descriptor onto it.
     let has_non_image_layer = manifest.layers.iter().any(|layer| {
         let mt = layer.media_type.to_ascii_lowercase();
         NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS
@@ -829,14 +938,66 @@ impl ScanWorkspace {
         artifact: &Artifact,
         content: &Bytes,
     ) -> Result<PathBuf> {
+        Self::prepare_pinned(base, prefix, artifact, content, None).await
+    }
+
+    /// [`ScanWorkspace::prepare`] plus the inline-proxy component PIN (#3003).
+    ///
+    /// When `pin` is `Some`, a minimal ecosystem-native metadata file naming
+    /// exactly `pin.name@pin.version` is written into the workspace root so the
+    /// CVE engine has a gradeable component for the artifact being served.
+    /// This is required, not cosmetic: syft/grype do NOT catalog a bare npm
+    /// `package/package.json` or an sdist's root `PKG-INFO`, so without it the
+    /// engine catalogs zero components, reports zero findings, and a vulnerable
+    /// artifact reads as "clean".
+    ///
+    /// The pin is derived from the REQUEST coordinate (route package name +
+    /// filename version), never from bytes the upstream controls, and is
+    /// written AUTHORITATIVELY — it overwrites any same-named file shipped
+    /// inside the archive, so an attacker cannot suppress grading by packing a
+    /// benign/empty decoy lockfile. What the archive itself claims is
+    /// cross-checked separately by the serve path before the scan runs.
+    ///
+    /// `pin: None` (every hosted upload scan and legacy caller) behaves exactly
+    /// as before: no file is fabricated.
+    pub async fn prepare_pinned(
+        base: &str,
+        prefix: Option<&str>,
+        artifact: &Artifact,
+        content: &Bytes,
+        pin: Option<&ExpectedComponent>,
+    ) -> Result<PathBuf> {
         let workspace = Self::workspace_dir(base, prefix, artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
+        // NAMESPACE ISOLATION (#3004 follow-up 3). When this scan also writes
+        // control files, the archive is unpacked into a dedicated subdirectory
+        // instead of the workspace root, so the archive's namespace and ours
+        // are disjoint. Without that separation a crafted archive could ship an
+        // entry at a control path (e.g. a regular file named
+        // `.ak-scan-shrinkwrap/package`, or a DIRECTORY where a control file
+        // goes) and make the control write fail — silently degrading the scan
+        // to whatever survived. Extraction already rejects `..`/absolute
+        // entries, so confinement here is total.
+        //
+        // Unpinned scans (every hosted upload) write no control files, have no
+        // collision surface, and keep the original flat layout exactly.
+        let extract_root = match pin {
+            Some(_) => {
+                let dir = workspace.join(SCAN_ARCHIVE_SUBDIR);
+                tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+                    AppError::Internal(format!("Failed to create scan archive dir: {}", e))
+                })?;
+                dir
+            }
+            None => workspace.clone(),
+        };
+
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let safe_filename = sanitize_artifact_filename(original_filename);
-        let artifact_path = workspace.join(&safe_filename);
+        let artifact_path = extract_root.join(&safe_filename);
 
         tokio::fs::write(&artifact_path, content)
             .await
@@ -845,28 +1006,200 @@ impl ScanWorkspace {
             })?;
 
         if Self::is_archive(original_filename) {
-            if let Err(e) = Self::extract_archive(&artifact_path, &workspace).await {
+            if let Err(e) = Self::extract_archive(&artifact_path, &extract_root).await {
                 warn!(
                     "Failed to extract archive {}: {}. Cleaning partial output and scanning raw file instead.",
                     artifact.name, e
                 );
                 // A breached extraction may have written a partial (potentially
-                // large) tree before aborting. Reset the workspace to just the
-                // original archive so the raw-file fallback scan does not walk
-                // the partial tree (and a bomb cannot leave GiB on the PVC).
+                // large) tree before aborting. Reset the extraction dir to just
+                // the original archive so the raw-file fallback scan does not
+                // walk the partial tree (and a bomb cannot leave GiB on the
+                // PVC). Control files live outside it and are unaffected.
                 if let Err(reset_err) =
-                    Self::reset_workspace(&workspace, &artifact_path, content).await
+                    Self::reset_workspace(&extract_root, &artifact_path, content).await
                 {
                     warn!(
                         "Failed to reset scan workspace {} after extraction failure: {}",
-                        workspace.display(),
+                        extract_root.display(),
                         reset_err
                     );
                 }
             }
         }
 
+        if let Some(pin) = pin {
+            Self::write_component_pin(&workspace, &extract_root, pin).await?;
+        }
+
         Ok(workspace)
+    }
+
+    /// Write the ecosystem-native metadata file that makes the CVE engine
+    /// catalog — and therefore actually grade — `pin` (#3003).
+    ///
+    /// Authoritative for the TOP-LEVEL identity (the request coordinate always
+    /// wins over whatever the archive claims about itself) but NON-DESTRUCTIVE
+    /// for everything else: a lockfile the archive ships lists RESOLVED
+    /// transitive versions, which is real gradeable signal, so it is merged
+    /// into rather than clobbered. See [`merge_npm_lock_pin`].
+    ///
+    /// A write failure is a HARD error: silently skipping the pin would hand
+    /// the caller a zero-finding "clean" scan of nothing, which is the exact
+    /// failure this closes. (The caller's assessment gate would also catch it,
+    /// but failing here keeps the reason precise.)
+    async fn write_component_pin(
+        workspace: &Path,
+        extract_root: &Path,
+        pin: &ExpectedComponent,
+    ) -> Result<()> {
+        match pin.ecosystem {
+            ComponentEcosystem::Npm => Self::write_npm_lock_pin(workspace, extract_root, pin).await,
+            // Python: syft catalogs `*.dist-info/METADATA` and
+            // `*.egg-info/PKG-INFO`, but NOT the root `PKG-INFO` an sdist
+            // ships — which is why an ordinary vulnerable sdist graded clean
+            // while its wheel graded vulnerable. There is no lockfile-merge
+            // concept here: the pin lands at its own dist-info path and
+            // cannot collide with anything the sdist shipped.
+            ComponentEcosystem::Python => {
+                let rel_path = PathBuf::from(format!("{}-{}.dist-info", pin.name, pin.version))
+                    .join("METADATA");
+                Self::write_pin_file(
+                    workspace,
+                    &rel_path,
+                    python_metadata_pin(&pin.name, &pin.version),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Make the npm supply-chain signal gradeable WITHOUT rewriting anything
+    /// the archive shipped (#3004 follow-up 2).
+    ///
+    /// Earlier revisions tried to merge the pin into a shipped
+    /// `package-lock.json` and normalize its `lockfileVersion`. That was the
+    /// wrong shape: every rewrite is a chance to parse npm's lockfile formats
+    /// slightly differently from the scanner, and each mismatch is a silent
+    /// mask. Two real bypasses came out of it — bumping a v1 lockfile to v3
+    /// made the CVE engine read only `packages` and ignore the `dependencies`
+    /// tree where the vulnerable transitives actually were, and a dummy
+    /// `packages` map was enough to trigger that bump. So this no longer reads,
+    /// parses, merges, re-versions, or overwrites ANY shipped file.
+    ///
+    /// Instead every signal is presented to the engine as its own file, at a
+    /// path nothing else claims:
+    ///
+    /// * **Shipped `package-lock.json`** (root, `package/`, anywhere) — left
+    ///   exactly as shipped. The engine already grades both v1 `dependencies`
+    ///   and v2/v3 `packages` NATIVELY; it only failed to when we rewrote them.
+    /// * **Shipped `npm-shrinkwrap.json`** — the engine does not catalog this
+    ///   name at all, yet npm HONORS it over `package-lock.json`, so a
+    ///   vulnerable shrinkwrap was completely invisible. Copied VERBATIM (same
+    ///   JSON format, no parsing) to a `package-lock.json` under
+    ///   [`NPM_SHRINKWRAP_SUBDIR`], where the engine does catalog it.
+    /// * **Top-level identity pin** — always written to
+    ///   [`NPM_PIN_SUBDIR`], never at a path an archive can occupy, so a decoy
+    ///   can neither shadow nor suppress it.
+    ///
+    /// The engine globs `package-lock.json` at any depth and grades every one
+    /// it finds (verified: shipped lock + shrinkwrap copy + pin are all
+    /// cataloged in a single scan), so the union of these is what gets graded.
+    async fn write_npm_lock_pin(
+        workspace: &Path,
+        extract_root: &Path,
+        pin: &ExpectedComponent,
+    ) -> Result<()> {
+        Self::stage_shrinkwraps_for_grading(workspace, extract_root).await?;
+
+        // The pin lives in its own directory, so it never collides with a
+        // shipped lockfile and never has to displace one.
+        Self::write_pin_file(
+            workspace,
+            &PathBuf::from(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME),
+            npm_package_lock_pin_json(&pin.name, &pin.version),
+        )
+        .await
+    }
+
+    /// Copy any shipped `npm-shrinkwrap.json` to a `package-lock.json` the CVE
+    /// engine will actually catalog (#3004 follow-up 2).
+    ///
+    /// A shrinkwrap is the SAME JSON format as a lockfile and takes precedence
+    /// over one for `npm install`, but the engine's cataloger keys on the
+    /// `package-lock.json` filename, so a vulnerable shrinkwrap graded as
+    /// nothing at all. Copied byte-for-byte — no parse, no normalization, so
+    /// there is no format for us to get wrong — under a per-source
+    /// subdirectory at the workspace ROOT, because a tarball may ship both a
+    /// root and a `package/` shrinkwrap and they can legitimately differ.
+    ///
+    /// FAIL-CLOSED (#3004 follow-up 3): a staging failure is a HARD error. It
+    /// used to warn-and-continue on the reasoning that a failed copy leaves
+    /// "less signal, never wrong signal" — that reasoning is false. The signal
+    /// being dropped is exactly the vulnerable shrinkwrap, and the assessment
+    /// gate only requires the identity PIN to be cataloged, so the scan would
+    /// still come back "clean" and get cached. Erroring here propagates as an
+    /// inconclusive scan (fail-closed 423), which is the honest outcome for
+    /// "we could not grade something this artifact ships".
+    async fn stage_shrinkwraps_for_grading(workspace: &Path, extract_root: &Path) -> Result<()> {
+        // Generous vs any real lockfile; bounded so a hostile archive cannot
+        // make us duplicate an enormous file into the workspace.
+        const SHRINKWRAP_COPY_CAP: u64 = 64 * 1024 * 1024;
+        // The conventional locations: the archive root and the `package/`
+        // directory every npm tarball unpacks into.
+        const SOURCES: [(&str, &str); 2] = [("root", ""), ("package", "package")];
+
+        for (label, dir) in SOURCES {
+            let src = if dir.is_empty() {
+                extract_root.join(NPM_SHRINKWRAP_NAME)
+            } else {
+                extract_root.join(dir).join(NPM_SHRINKWRAP_NAME)
+            };
+            match tokio::fs::metadata(&src).await {
+                Ok(meta) if meta.is_file() && meta.len() <= SHRINKWRAP_COPY_CAP => {}
+                // Nothing shipped here (or something that is not a readable
+                // regular file, e.g. a directory of that name) — nothing to
+                // grade from this location.
+                _ => continue,
+            }
+            let dest_dir = workspace.join(NPM_SHRINKWRAP_SUBDIR).join(label);
+            tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to stage {} ({}) for grading: {}",
+                    NPM_SHRINKWRAP_NAME,
+                    dest_dir.display(),
+                    e
+                ))
+            })?;
+            let dest = dest_dir.join(NPM_LOCKFILE_NAME);
+            tokio::fs::copy(&src, &dest).await.map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to copy {} to {} for grading: {}",
+                    src.display(),
+                    dest.display(),
+                    e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Write one pin file (creating parents), mapping IO failure onto the
+    /// hard error described on [`ScanWorkspace::write_component_pin`].
+    async fn write_pin_file(workspace: &Path, rel_path: &Path, body: String) -> Result<()> {
+        let pin_path = workspace.join(rel_path);
+        if let Some(parent) = pin_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                AppError::Internal(format!("Failed to create scan pin directory: {}", e))
+            })?;
+        }
+        tokio::fs::write(&pin_path, body).await.map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to write scan component pin {}: {}",
+                rel_path.display(),
+                e
+            ))
+        })
     }
 
     /// Reset a scan workspace to just the original archive after an extraction
@@ -994,6 +1327,63 @@ impl ScanWorkspace {
             .await
             .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
     }
+}
+
+/// The lockfile name the npm component pin is written under. syft catalogs
+/// this name at any depth, which is what makes both the merged root pin and
+/// the preserve-fallback subdirectory pin gradeable.
+pub(crate) const NPM_LOCKFILE_NAME: &str = "package-lock.json";
+
+/// Where an archive's OWN bytes are unpacked when the scan also writes control
+/// files (#3004 follow-up 3).
+///
+/// Control files (the identity pin, staged shrinkwraps) live at the workspace
+/// ROOT; the archive is confined to this SIBLING subdirectory. Extraction
+/// already rejects `..`/absolute entries, so an archive can only ever create
+/// paths beneath here — it cannot pre-create, shadow, or collide with a
+/// control path. That containment is what makes the control writes reliable,
+/// rather than a list of names we hope no archive ships.
+pub(crate) const SCAN_ARCHIVE_SUBDIR: &str = "pkg";
+
+/// Where the top-level identity pin is written — its own subdirectory at the
+/// workspace ROOT, outside [`SCAN_ARCHIVE_SUBDIR`], so no shipped file can
+/// displace it.
+pub(crate) const NPM_PIN_SUBDIR: &str = ".ak-scan-pin";
+
+/// The lockfile npm HONORS over `package-lock.json` but the CVE engine does
+/// not catalog, so a vulnerable one was invisible until it is staged.
+pub(crate) const NPM_SHRINKWRAP_NAME: &str = "npm-shrinkwrap.json";
+
+/// Where shipped shrinkwraps are copied (verbatim) so they get graded. At the
+/// workspace ROOT, outside [`SCAN_ARCHIVE_SUBDIR`]. One subdirectory per source
+/// location, since a root and a `package/` shrinkwrap can legitimately differ.
+pub(crate) const NPM_SHRINKWRAP_SUBDIR: &str = ".ak-scan-shrinkwrap";
+
+/// The `package-lock.json` (lockfileVersion 3) body that pins exactly one
+/// installed npm package, so the CVE engine catalogs and grades it (#3003).
+///
+/// Pure and total: the identity comes from the request coordinate, which the
+/// serve path has already validated, so there is nothing to fail on here.
+pub(crate) fn npm_package_lock_pin_json(name: &str, version: &str) -> String {
+    let mut packages = serde_json::Map::new();
+    packages.insert(
+        format!("node_modules/{name}"),
+        serde_json::json!({ "version": version }),
+    );
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "lockfileVersion": 3,
+        "packages": packages,
+    })
+    .to_string()
+}
+
+/// The minimal PEP 566 `METADATA` body that pins one installed Python
+/// distribution. Written under `<name>-<version>.dist-info/` because syft
+/// catalogs that layout but not the root `PKG-INFO` an sdist ships (#3003).
+pub(crate) fn python_metadata_pin(name: &str, version: &str) -> String {
+    format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1868,6 +2258,17 @@ pub struct ScanOutput {
     pub findings: Vec<RawFinding>,
     pub packages: Vec<RawPackage>,
     pub scan_completeness: ScanCompleteness,
+    /// The components this scanner actually CATALOGED for the target — i.e.
+    /// what it was able to grade, independent of whether anything matched a
+    /// CVE (#3003).
+    ///
+    /// `None` means "this scanner does not report a catalog" and is the
+    /// default for every scanner that has not opted in; the inline proxy
+    /// assessment gate then falls back to its prior behavior rather than
+    /// inventing a signal. `Some(vec![])` is the load-bearing case: the
+    /// engine ran and cataloged NOTHING, so a zero-finding result means
+    /// "nothing was assessed", not "clean".
+    pub cataloged: Option<Vec<CatalogedComponent>>,
 }
 
 impl ScanOutput {
@@ -1879,6 +2280,7 @@ impl ScanOutput {
             findings,
             packages: Vec::new(),
             scan_completeness: ScanCompleteness::Complete,
+            cataloged: None,
         }
     }
 
@@ -1897,6 +2299,7 @@ impl ScanOutput {
             findings: convert_trivy_findings(report, source_label),
             packages: convert_trivy_packages(report),
             scan_completeness: ScanCompleteness::Complete,
+            cataloged: None,
         }
     }
 
@@ -1917,6 +2320,7 @@ impl ScanOutput {
             findings: convert_trivy_findings(report, source_label),
             packages: convert_trivy_packages(report),
             scan_completeness: classify_trivy_completeness(report, stderr, known_targets),
+            cataloged: None,
         }
     }
 
@@ -1957,6 +2361,407 @@ pub struct ScanTarget<'a> {
     /// that case the gate falls back to the path/content-type predicate and
     /// must never flip an artifact applicable→not-applicable (#1971).
     pub manifest_body: Option<&'a [u8]>,
+    /// The component identity the served bytes MUST be assessed as, supplied
+    /// by an inline proxy serve path from the REQUEST coordinate (#3003).
+    ///
+    /// `Some` turns on the "the CVE engine actually assessed this artifact"
+    /// gate in [`run_inline_proxy_scanners_target`]: the pin is materialized
+    /// into the scan workspace so the CVE engine catalogs it, and a verdict is
+    /// only allowed to be `clean` when the engine really cataloged that
+    /// identity. `None` (hosted upload scans, legacy callers, unit tests)
+    /// keeps the prior behavior exactly.
+    pub expected_component: Option<&'a ExpectedComponent>,
+    /// Require the CVE-authoritative engine to have CATALOGED at least one
+    /// gradeable component before a non-error verdict is trusted (#3003 PR-2,
+    /// the OCI image analogue of `expected_component`).
+    ///
+    /// A container image has no single `name@version` coordinate to pin, so
+    /// the file-format identity check does not apply — but the same blindness
+    /// does: an engine that ran over an image it could not unpack/grade
+    /// reports zero findings, indistinguishable from clean. When set,
+    /// [`run_inline_proxy_scanners_target`] treats "no catalog reported"
+    /// (`None`) and "cataloged nothing" (`Some(empty)`) both as INCONCLUSIVE,
+    /// so the caller's fail-closed branch withholds (423) instead of serving
+    /// a false clean. `false` (hosted upload scans, file formats, unit tests)
+    /// keeps prior behavior exactly.
+    pub require_nonempty_catalog: bool,
+}
+
+/// The package ecosystem an [`ExpectedComponent`] belongs to. Selects both the
+/// pin file written into the scan workspace and the name-normalization rules
+/// used to compare against what the CVE engine cataloged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentEcosystem {
+    /// npm registry tarball (`.tgz`): pinned via a `package-lock.json`.
+    Npm,
+    /// Python wheel/sdist: pinned via a `<name>-<version>.dist-info/METADATA`.
+    Python,
+}
+
+/// The identity a proxied artifact is being SERVED AS — derived from the
+/// request coordinate (route package name + filename version), never from
+/// bytes the upstream controls (#3003).
+///
+/// Two jobs, both required to close the "Grype ran but graded nothing"
+/// blindness that let a vulnerable tarball through with a 200:
+///
+/// 1. **Pin** — materialized into the scan workspace
+///    ([`ScanWorkspace::prepare_pinned`]) so the CVE engine has a gradeable
+///    component at all. syft/grype do not catalog a bare npm
+///    `package/package.json` or an sdist's root `PKG-INFO`, so without a pin
+///    the engine runs, catalogs zero components, reports zero findings, and
+///    "clean" means only "nothing was looked at".
+/// 2. **Assessment check** — the engine's catalog must actually contain this
+///    identity before a `clean` verdict is trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedComponent {
+    pub ecosystem: ComponentEcosystem,
+    pub name: String,
+    pub version: String,
+}
+
+/// One component the CVE-authoritative engine actually cataloged (and
+/// therefore actually graded) for a scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogedComponent {
+    pub name: String,
+    pub version: String,
+}
+
+impl ExpectedComponent {
+    pub fn new(ecosystem: ComponentEcosystem, name: &str, version: &str) -> Self {
+        Self {
+            ecosystem,
+            name: name.to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    /// Ecosystem-aware name normalization for comparing our coordinate against
+    /// the engine's catalog. Python follows PEP 503 (lowercase, runs of
+    /// `-_.` collapse to `-`) because syft reports `PyYAML` as `pyyaml`; npm
+    /// names are compared case-insensitively.
+    pub fn normalize_name(ecosystem: ComponentEcosystem, name: &str) -> String {
+        let lower = name.trim().to_lowercase();
+        match ecosystem {
+            ComponentEcosystem::Npm => lower,
+            ComponentEcosystem::Python => {
+                let mut out = String::with_capacity(lower.len());
+                let mut prev_sep = false;
+                for ch in lower.chars() {
+                    if matches!(ch, '-' | '_' | '.') {
+                        if !prev_sep {
+                            out.push('-');
+                        }
+                        prev_sep = true;
+                    } else {
+                        out.push(ch);
+                        prev_sep = false;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Whether a cataloged component is this expected component. Versions are
+    /// compared verbatim (a version the engine graded must be the version we
+    /// are serving); only the NAME is normalized.
+    pub fn matches(&self, cataloged: &CatalogedComponent) -> bool {
+        Self::normalize_name(self.ecosystem, &self.name)
+            == Self::normalize_name(self.ecosystem, &cataloged.name)
+            && self.version.trim() == cataloged.version.trim()
+    }
+}
+
+/// Aggregated verdict from an inline proxy scan over raw bytes (#2954).
+///
+/// Produced by [`ScannerService::scan_content`], which runs the leaf scanners
+/// over a synthetic in-memory [`Artifact`] + `Bytes` with NO `artifacts` row
+/// (proxy-cached bytes are intentionally not persisted as artifacts —
+/// #1278/#1280). The counts feed the digest-keyed `proxy_scan_results` store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyScanVerdict {
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    /// Highest severity observed across all findings, for policy comparison.
+    pub max_severity: Option<Severity>,
+    /// Scanner binary/DB version string (e.g. `grype-0.83.0`), for CVE-DB
+    /// freshness gating of a reused verdict.
+    pub scanner_version: Option<String>,
+}
+
+impl ProxyScanVerdict {
+    /// A vulnerable verdict is any non-zero finding count. Whether that BLOCKS a
+    /// pull is a policy decision made by the caller against the repo's action.
+    pub fn is_vulnerable(&self) -> bool {
+        self.findings_count > 0
+    }
+
+    /// The stored `proxy_scan_results.verdict` token for this result.
+    pub fn verdict_token(&self) -> &'static str {
+        if self.is_vulnerable() {
+            crate::services::proxy_scan_service::VERDICT_VULNERABLE
+        } else {
+            crate::services::proxy_scan_service::VERDICT_CLEAN
+        }
+    }
+
+    /// Lowercase token for the highest observed severity (schema-compatible).
+    pub fn max_severity_token(&self) -> Option<&'static str> {
+        self.max_severity.map(severity_token)
+    }
+}
+
+/// Stable lowercase token for a [`Severity`], matching the DB CHECK vocabulary.
+pub fn severity_token(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+        Severity::Medium => "medium",
+        Severity::Low => "low",
+        Severity::Info => "info",
+    }
+}
+
+/// Fold a flat list of [`RawFinding`]s (from one or more scanners run over the
+/// same bytes) into a [`ProxyScanVerdict`]. Pure: no DB, no I/O — the security-
+/// relevant verdict logic is unit-testable over a synthetic finding list.
+pub fn aggregate_proxy_verdict(
+    findings: &[RawFinding],
+    scanner_version: Option<String>,
+) -> ProxyScanVerdict {
+    let count = |sev: Severity| findings.iter().filter(|f| f.severity == sev).count() as i32;
+    // Severity is ordered Critical=0 .. Info=4, so `min` is the highest.
+    let max_severity = findings.iter().map(|f| f.severity).min();
+    ProxyScanVerdict {
+        findings_count: findings.len() as i32,
+        critical_count: count(Severity::Critical),
+        high_count: count(Severity::High),
+        medium_count: count(Severity::Medium),
+        low_count: count(Severity::Low),
+        max_severity,
+        scanner_version,
+    }
+}
+
+/// Run the applicable leaf scanners over raw proxy bytes and fold their output
+/// into a [`ProxyScanVerdict`], or return an error when the result is
+/// INCONCLUSIVE. THE single implementation of the inline-proxy scan contract
+/// for every format: file artifacts (PyPI wheels/sdists, npm tarballs) reach it
+/// through [`ScannerService::scan_content_expecting`] with a context-free
+/// [`ScanTarget`], and repository-context callers (the OCI manifest serve path)
+/// supply a full one. Extracted from `scan_content` (minus the fair-share
+/// permit) so the fail-closed correctness contract is unit-testable over mock
+/// scanners, with no `ScannerService`/DB/storage.
+///
+/// Three conditions must ALL hold before a non-error (`clean`/`vulnerable`)
+/// verdict is returned. Each one is a hole that shipped a vulnerable artifact
+/// with a 200:
+///
+/// 1. **The CVE engine completed `Ok`** (#2954). The always-on
+///    `DependencyScanner` returns `Ok(ScanOutput::default())` on a binary
+///    archive (non-UTF-8 → zero parsed deps), so "some scanner ran" is
+///    trivially true even when Grype hard-errored / timed out / OOM-died or the
+///    pre-seeded CVE-DB aged past its exit-1 time-bomb. A supplementary
+///    scanner failing (an optional Trivy adapter that is down) still must NOT
+///    abort the scan — only the CVE engine is load-bearing.
+/// 2. **The CVE engine cataloged something** (#3003), when the caller supplied
+///    an `expected_component`. `is_vulnerable()` is `findings_count > 0`, so an
+///    engine that ran but had nothing to grade reports "clean".
+/// 3. **What it cataloged is what we are serving** (#3003). A clean grade of
+///    some other identity says nothing about these bytes.
+///
+/// All three return the same inconclusive `Err`, which the caller maps onto the
+/// repo's action (fail-closed → 423, fail-open → serve + loud pending), and no
+/// `clean` verdict is ever persisted for the digest.
+async fn run_inline_proxy_scanners_target(
+    scanners: &[Arc<dyn Scanner>],
+    target: &ScanTarget<'_>,
+    content: &Bytes,
+) -> Result<ProxyScanVerdict> {
+    let synthetic = target.artifact;
+    let mut findings: Vec<RawFinding> = Vec::new();
+    let mut scanner_version: Option<String> = None;
+    // "did SOME applicable scanner run Ok" — necessary but NOT sufficient.
+    let mut any_ran = false;
+    // "was a CVE-authoritative scanner applicable" vs "did one complete Ok".
+    // Conflating these two questions is the #2954 fail-closed hole.
+    let mut cve_scanner_applicable = false;
+    let mut cve_scanner_ran = false;
+    // What the CVE-authoritative scanner actually cataloged (#3003). `None`
+    // until a CVE engine that reports a catalog completes.
+    let mut cve_cataloged: Option<Vec<CatalogedComponent>> = None;
+
+    for scanner in scanners {
+        // Applicability gates on the target artifact's path/content-type
+        // (plus repository/manifest context when the scanner uses it),
+        // exactly as the orchestrator gates a hosted artifact.
+        if !scanner.is_applicable_for_target(target) {
+            continue;
+        }
+        let is_cve_authoritative = scanner.is_cve_authoritative();
+        if is_cve_authoritative {
+            cve_scanner_applicable = true;
+        }
+        match scanner.scan_target(target, None, content).await {
+            Ok(output) => {
+                any_ran = true;
+                if is_cve_authoritative {
+                    cve_scanner_ran = true;
+                    if let Some(catalog) = output.cataloged {
+                        cve_cataloged.get_or_insert_with(Vec::new).extend(catalog);
+                    }
+                }
+                // Capture the first available scanner version as provenance
+                // for CVE-DB freshness (Grype reports one).
+                if scanner_version.is_none() {
+                    scanner_version = scanner.version().await;
+                }
+                findings.extend(output.findings);
+            }
+            Err(e) => {
+                warn!(
+                    "Inline proxy scan: scanner {} failed on {} ({}); skipping this scanner",
+                    scanner.name(),
+                    synthetic.name,
+                    e
+                );
+            }
+        }
+    }
+
+    // The CVE-authoritative scanner (Grype) is applicable to every proxied
+    // wheel/sdist and is always registered, so `cve_scanner_applicable` is
+    // normally true. If it was applicable but did NOT complete `Ok`, the scan
+    // is inconclusive — never `clean`. Returning an error here is what makes
+    // the caller's fail-closed branch 423 instead of serving unscanned bytes,
+    // and stops a poisoned `clean` row from being persisted.
+    if cve_scanner_applicable && !cve_scanner_ran {
+        return Err(AppError::Internal(
+            "CVE-authoritative scanner did not complete for inline proxy scan; \
+             verdict inconclusive (failing closed instead of reporting clean)"
+                .to_string(),
+        ));
+    }
+
+    if !any_ran {
+        return Err(AppError::Internal(
+            "no applicable scanner completed for inline proxy scan".to_string(),
+        ));
+    }
+
+    // #3003: "the CVE engine ran Ok" is still not enough. `is_vulnerable()` is
+    // `findings_count > 0`, so an engine that RUNS but catalogs nothing to
+    // grade reports zero findings — indistinguishable from a genuinely clean
+    // artifact. That is not a hypothetical: syft/grype do not catalog a bare
+    // npm `package/package.json` or an sdist's root `PKG-INFO`, so a real
+    // vulnerable npm tarball (identity stripped/rewritten, or a lockfile-shaped
+    // decoy added) and an ordinary vulnerable PyPI sdist both scanned "clean"
+    // and served 200 under a fail-closed policy.
+    //
+    // So when the serve path told us what these bytes are being served AS,
+    // require the engine to have actually assessed THAT identity before a
+    // non-error verdict is trusted. Both failure modes below return the same
+    // inconclusive error the #2954 gate uses, so the caller's existing
+    // fail-open/closed handling applies unchanged (fail-closed -> 423,
+    // fail-open -> serve + loud pending), and no `clean` row is persisted.
+    //
+    // Scoped deliberately narrowly: only when `expected_component` is set (the
+    // inline proxy serve paths) AND the engine reports a catalog at all
+    // (`Some`). Hosted upload scans, legacy callers, and scanners that do not
+    // report a catalog keep their prior behavior exactly.
+    if let (Some(expected), Some(cataloged)) = (target.expected_component, cve_cataloged.as_ref()) {
+        if cataloged.is_empty() {
+            warn!(
+                artifact = %synthetic.name,
+                expected = %format!("{}@{}", expected.name, expected.version),
+                "inline proxy scan: CVE engine cataloged NO components; \
+                 zero findings does not mean clean -> inconclusive"
+            );
+            return Err(AppError::Internal(
+                "CVE-authoritative scanner cataloged no gradeable component for inline \
+                 proxy scan; verdict inconclusive (a zero-finding scan of nothing is \
+                 not a clean verdict)"
+                    .to_string(),
+            ));
+        }
+        if !cataloged.iter().any(|c| expected.matches(c)) {
+            warn!(
+                artifact = %synthetic.name,
+                expected = %format!("{}@{}", expected.name, expected.version),
+                cataloged = ?cataloged
+                    .iter()
+                    .map(|c| format!("{}@{}", c.name, c.version))
+                    .collect::<Vec<_>>(),
+                "inline proxy scan: CVE engine graded a DIFFERENT identity than the \
+                 artifact being served -> inconclusive"
+            );
+            return Err(AppError::Internal(
+                "CVE-authoritative scanner did not assess the component identity being \
+                 served for inline proxy scan; verdict inconclusive (the clean result \
+                 does not pertain to these bytes)"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // #3003 PR-2 (OCI images): same blindness, different identity model. An
+    // image has no `name@version` coordinate to pin, so `expected_component`
+    // cannot apply — but a CVE engine that ran over an image it could not
+    // unpack/grade still reports zero findings, indistinguishable from clean.
+    // When the serve path demands it, require the engine to have actually
+    // cataloged SOMETHING for this image before a ZERO-FINDING result is
+    // trusted as clean. A verdict WITH findings is vulnerable regardless of
+    // the catalog side channel — blocking is never gated on it. Unlike the
+    // expected-component gate above, a `None` catalog is NOT "keep prior
+    // behavior" here: the OCI callers only set this flag on the inline proxy
+    // gate, where "the engine could not report what it graded" must fail
+    // closed, not serve clean.
+    if target.require_nonempty_catalog
+        && findings.is_empty()
+        && !cve_cataloged.as_ref().is_some_and(|c| !c.is_empty())
+    {
+        warn!(
+            artifact = %synthetic.name,
+            catalog_reported = cve_cataloged.is_some(),
+            "inline proxy scan: CVE engine cataloged no components for the served \
+             image; zero findings does not mean clean -> inconclusive"
+        );
+        return Err(AppError::Internal(
+            "CVE-authoritative scanner cataloged no gradeable component for the \
+             served image; verdict inconclusive (a zero-finding scan of nothing \
+             is not a clean verdict)"
+                .to_string(),
+        ));
+    }
+
+    Ok(aggregate_proxy_verdict(&findings, scanner_version))
+}
+
+/// Live version string of the CVE-authoritative scanner (Grype), e.g.
+/// `grype-0.83.0` — the SAME provenance string [`run_inline_proxy_scanners`]
+/// persists on a `proxy_scan_results` verdict. Serve paths pass it as
+/// `current_version` to
+/// [`crate::services::proxy_scan_service::verdict_is_fresh`] so a cached
+/// verdict recorded against an older scanner / CVE-DB is invalidated and
+/// re-scanned instead of being reused for the full TTL window (#2976).
+///
+/// Cheap by construction: [`Scanner::version`] implementations are
+/// [`VersionCache`]-backed ([`VERSION_CACHE_HIT_TTL`] on hit), so this never
+/// shells out per download. Returns `None` when no CVE-authoritative scanner
+/// is registered or its version probe failed — `verdict_is_fresh` then falls
+/// back to the TTL alone, exactly as before.
+async fn cve_authoritative_scanner_version(scanners: &[Arc<dyn Scanner>]) -> Option<String> {
+    for scanner in scanners {
+        if scanner.is_cve_authoritative() {
+            return scanner.version().await;
+        }
+    }
+    None
 }
 
 /// A pluggable vulnerability scanner.
@@ -1997,6 +2802,30 @@ pub trait Scanner: Send + Sync {
     /// routing context to override only this method.
     fn is_applicable_for_target(&self, target: &ScanTarget<'_>) -> bool {
         self.is_applicable(target.artifact)
+    }
+
+    /// Whether this scanner is the CVE-authoritative engine whose successful
+    /// completion is REQUIRED before an inline proxy scan may report a
+    /// non-error (`clean`/`vulnerable`) verdict.
+    ///
+    /// The inline proxy scan-and-block path ([`ScannerService::scan_content`])
+    /// runs every applicable leaf scanner, but only the CVE engine (Grype —
+    /// the always-bundled, fail-closed vulnerability scanner, #2167) actually
+    /// grades an artifact for known CVEs. The always-on [`DependencyScanner`]
+    /// returns `Ok(ScanOutput::default())` on a binary wheel (non-UTF-8
+    /// content parses to zero dependencies), so "a scanner ran successfully"
+    /// is trivially true even when Grype hard-errored or timed out. Letting
+    /// that trivial success aggregate to `clean` would defeat the fail-closed
+    /// guarantee and serve an UNSCANNED, possibly-vulnerable wheel with a 200.
+    ///
+    /// Returning `false` (the default) means the scanner is a supplementary
+    /// signal whose failure must NOT abort the scan and whose success must NOT
+    /// on its own satisfy the "the CVE scanner ran" condition. Only
+    /// `GrypeScanner` overrides this to `true`. Trivy's filesystem scanner is
+    /// deliberately NOT authoritative here: its engine is optional and, when
+    /// absent or down, must not fail-close the proxy path.
+    fn is_cve_authoritative(&self) -> bool {
+        false
     }
 
     /// Run the scan against artifact content and metadata. Returns both
@@ -3185,6 +4014,7 @@ impl Scanner for DependencyScanner {
             findings,
             packages,
             scan_completeness: ScanCompleteness::Complete,
+            cataloged: None,
         })
     }
 }
@@ -3479,6 +4309,115 @@ impl ScannerService {
             .await
     }
 
+    /// Run the leaf scanners over raw in-memory bytes with NO `artifacts` row
+    /// and NO `scan_results` persistence (#2954 inline proxy scan-on-fetch).
+    ///
+    /// This is the seam that makes proxy scan-on-fetch feasible: the scanner
+    /// CORE (`Scanner::scan` — e.g. `GrypeScanner` running `grype dir:<ws>` over
+    /// the bytes) never needs a DB row. `synthetic` is an [`Artifact`] the
+    /// caller fabricates from the proxied object's filename/digest so the
+    /// per-scanner applicability + workspace naming behave exactly as for a
+    /// hosted artifact; the returned [`ProxyScanVerdict`] is stored digest-keyed
+    /// in `proxy_scan_results` by the caller, never in `scan_results`.
+    ///
+    /// The scanner's per-tenant fair-share extraction permit is acquired for the
+    /// duration so a burst of inline pulls cannot starve upload scans (#2555).
+    /// Any scanner error is surfaced to the caller so the fail-open/closed
+    /// decision can treat it as inconclusive rather than silently "clean".
+    pub async fn scan_content(
+        &self,
+        synthetic: &Artifact,
+        content: &Bytes,
+    ) -> Result<ProxyScanVerdict> {
+        self.scan_content_expecting(synthetic, content, None).await
+    }
+
+    /// [`ScannerService::scan_content`] plus the #3003 assessment contract:
+    /// `expected` is the identity these bytes are being SERVED AS (derived
+    /// from the request coordinate). Supplying it both PINS that component
+    /// into the scan workspace so the CVE engine can grade it, and requires
+    /// the engine to have actually cataloged it before a non-error verdict is
+    /// returned — so "the engine ran and found nothing" can no longer be
+    /// mistaken for "the artifact is clean".
+    ///
+    /// `expected: None` is exactly today's behavior, for callers with no
+    /// coordinate in hand.
+    pub async fn scan_content_expecting(
+        &self,
+        synthetic: &Artifact,
+        content: &Bytes,
+        expected: Option<&ExpectedComponent>,
+    ) -> Result<ProxyScanVerdict> {
+        // Fair-share + global cap: inline scans queue behind the same semaphore
+        // as upload scans instead of contending for unbounded extraction slots.
+        let _extraction_permit = acquire_scan_extraction_permit(synthetic.repository_id).await;
+
+        let target = ScanTarget {
+            artifact: synthetic,
+            repository_key: "",
+            repository_type: "",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: expected,
+            require_nonempty_catalog: false,
+        };
+        run_inline_proxy_scanners_target(&self.scanners, &target, content).await
+    }
+
+    /// Context-aware sibling of [`ScannerService::scan_content`] for callers
+    /// that need repository routing context threaded to the leaf scanners
+    /// (the OCI proxy manifest gate; see [`ScanTarget`]). File formats (PyPI
+    /// wheels, npm tarballs) keep using `scan_content` — both funnel into the
+    /// single [`run_inline_proxy_scanners_target`] loop, so the #2954
+    /// fail-closed contract is enforced in exactly one place.
+    pub async fn scan_content_target(
+        &self,
+        target: &ScanTarget<'_>,
+        content: &Bytes,
+    ) -> Result<ProxyScanVerdict> {
+        let _extraction_permit =
+            acquire_scan_extraction_permit(target.artifact.repository_id).await;
+
+        run_inline_proxy_scanners_target(&self.scanners, target, content).await
+    }
+
+    /// Live version of the CVE-authoritative scanner for verdict-freshness
+    /// checks (#2976): see [`cve_authoritative_scanner_version`]. The PyPI
+    /// proxy serve path threads this into `verdict_is_fresh` as
+    /// `current_version` so a cached verdict from an older scanner / CVE-DB
+    /// forces a re-scan instead of serving stale-clean until the TTL expires.
+    pub async fn cve_scanner_version(&self) -> Option<String> {
+        cve_authoritative_scanner_version(&self.scanners).await
+    }
+
+    /// Test-only constructor with injected leaf scanners, for handler tests
+    /// that need a `ScannerService` on the shared state (e.g. the #2976
+    /// verdict-freshness wiring in the PyPI proxy serve path). Mirrors the
+    /// `scanner_for_fixture` struct literal in this module's tests, which
+    /// sibling modules cannot reach.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_scanners(
+        db: PgPool,
+        scanners: Vec<Arc<dyn Scanner>>,
+        storage: Arc<dyn StorageBackend>,
+        storage_registry: Arc<crate::storage::StorageRegistry>,
+        storage_base_path: String,
+        scan_workspace_path: String,
+    ) -> Self {
+        ScannerService {
+            db: db.clone(),
+            scanners,
+            scan_result_service: Arc::new(ScanResultService::new(db.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(db)),
+            storage,
+            storage_registry,
+            storage_base_path,
+            scan_workspace_path,
+            dependency_track: None,
+        }
+    }
+
     /// Scan a single artifact: run all applicable scanners, persist results,
     /// recalculate the repository security score.
     /// Scan a single artifact. When `force` is true, skip the repo scan-enabled check
@@ -3612,6 +4551,8 @@ impl ScannerService {
             // share the image manifest mediaType. Only meaningful for OCI
             // manifest artifacts; the gate ignores it for everything else.
             manifest_body: is_oci_image_artifact(&artifact).then(|| content.as_ref()),
+            expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         for scanner in &self.scanners {
@@ -3859,6 +4800,7 @@ impl ScannerService {
                     findings,
                     packages,
                     scan_completeness,
+                    cataloged: _,
                 }) => {
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
@@ -5032,6 +5974,68 @@ pub(crate) mod test_helpers {
             pool,
             std::sync::Arc::new(crate::config::Config::test_config()),
         ))
+    }
+
+    /// Outcome of the mock CVE engine when a proxy serve path re-scans.
+    /// Shared by the #2976 verdict-freshness handler tests (PyPI, npm).
+    pub enum MockCveRescan {
+        /// Re-scan against the bumped CVE-DB now flags the bytes.
+        Vulnerable,
+        /// Re-scan is inconclusive (scanner hard-error).
+        Error,
+    }
+
+    /// CVE-authoritative mock scanner reporting a fixed live version string.
+    /// `live_version: None` models a FAILED version probe — the engine is
+    /// mid-upgrade / absent / past its probe timeout — which is the
+    /// unknown-`current_version` case the fail-closed gate must not fail
+    /// open on (#2976).
+    pub struct VersionedCveScanner {
+        pub live_version: Option<&'static str>,
+        pub rescan: MockCveRescan,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for VersionedCveScanner {
+        fn name(&self) -> &str {
+            "versioned-cve-test-scanner"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+        async fn version(&self) -> Option<String> {
+            self.live_version.map(str::to_string)
+        }
+        async fn scan(
+            &self,
+            _: &Artifact,
+            _: Option<&crate::models::artifact::ArtifactMetadata>,
+            _: &bytes::Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            match self.rescan {
+                MockCveRescan::Error => Err(crate::error::AppError::Internal(
+                    "simulated grype failure on re-scan".to_string(),
+                )),
+                MockCveRescan::Vulnerable => {
+                    Ok(crate::services::scanner_service::ScanOutput::findings_only(
+                        vec![crate::models::security::RawFinding {
+                            severity: crate::models::security::Severity::Critical,
+                            title: "CVE-2026-0001 test".to_string(),
+                            description: None,
+                            cve_id: Some("CVE-2026-0001".to_string()),
+                            affected_component: Some("pyyaml".to_string()),
+                            affected_version: Some("5.3.1".to_string()),
+                            fixed_version: None,
+                            source: Some("grype".to_string()),
+                            source_url: None,
+                        }],
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -6336,6 +7340,8 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(oci_target_is_scannable_image(&target));
     }
@@ -6354,6 +7360,8 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: Some(HELM_OCI_MANIFEST_BODY),
+            expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(!oci_target_is_scannable_image(&target));
     }
@@ -6884,6 +7892,81 @@ mod tests {
         path
     }
 
+    /// npm-shaped `.tgz` plus one extra entry at an arbitrary archive path.
+    fn write_npm_tgz_with_entry(
+        dir: &Path,
+        name: &str,
+        entry_path: &str,
+        entry_body: &[u8],
+    ) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).expect("create tgz");
+        let gz = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let pkg_json = br#"{"name":"widget","version":"1.0.0"}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, pkg_json.as_ref()).unwrap();
+
+        let mut header = tar::Header::new_gnu();
+        header.set_path(entry_path).unwrap();
+        header.set_size(entry_body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, entry_body).unwrap();
+
+        let gz = builder.into_inner().unwrap();
+        gz.finish().unwrap().flush().unwrap();
+        path
+    }
+
+    /// npm-shaped `.tgz` plus an arbitrary set of extra archive entries.
+    fn write_npm_tgz_with_entries(dir: &Path, name: &str, entries: &[(&str, &[u8])]) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).expect("create tgz");
+        let gz = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let pkg_json = br#"{"name":"widget","version":"1.0.0"}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, pkg_json.as_ref()).unwrap();
+
+        for (entry_path, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(entry_path).unwrap();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, *body).unwrap();
+        }
+
+        let gz = builder.into_inner().unwrap();
+        gz.finish().unwrap().flush().unwrap();
+        path
+    }
+
+    /// npm-shaped `.tgz` that ships its own lockfile at the ARCHIVE ROOT —
+    /// the path the component pin also wants, i.e. the collision under test.
+    fn write_npm_tgz_with_root_lock(dir: &Path, name: &str, lock: &[u8]) -> PathBuf {
+        write_npm_tgz_with_entry(dir, name, "package-lock.json", lock)
+    }
+
     fn write_simple_zip(dir: &Path, name: &str) -> PathBuf {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
@@ -6922,6 +8005,561 @@ mod tests {
             body
         );
         assert!(dest.join("package").join("index.js").exists());
+    }
+
+    /// #3003: the pin bodies are the shapes syft/grype actually catalog —
+    /// a v3 lockfile pinning one installed package, and a PEP 566 METADATA.
+    #[test]
+    fn test_component_pin_bodies() {
+        let v: serde_json::Value =
+            serde_json::from_str(&npm_package_lock_pin_json("lodash", "4.17.11")).unwrap();
+        assert_eq!(v["lockfileVersion"], 3);
+        assert_eq!(v["packages"]["node_modules/lodash"]["version"], "4.17.11");
+        // Scoped names key the node_modules path with the full @scope/name.
+        let v: serde_json::Value =
+            serde_json::from_str(&npm_package_lock_pin_json("@acme/widget", "2.0.0")).unwrap();
+        assert_eq!(
+            v["packages"]["node_modules/@acme/widget"]["version"],
+            "2.0.0"
+        );
+
+        let meta = python_metadata_pin("PyYAML", "5.3.1");
+        assert!(meta.contains("Name: PyYAML"), "{meta}");
+        assert!(meta.contains("Version: 5.3.1"), "{meta}");
+        assert!(meta.starts_with("Metadata-Version:"), "{meta}");
+    }
+
+    /// #3003: identity comparison is ecosystem-aware. Python normalizes per
+    /// PEP 503 (syft reports `PyYAML` as `pyyaml`); npm is case-insensitive.
+    /// Versions are never normalized — grading 5.3.1 says nothing about 5.4.
+    #[test]
+    fn test_expected_component_matches() {
+        let py = ExpectedComponent::new(ComponentEcosystem::Python, "PyYAML", "5.3.1");
+        assert!(py.matches(&CatalogedComponent {
+            name: "pyyaml".into(),
+            version: "5.3.1".into()
+        }));
+        let dotted = ExpectedComponent::new(ComponentEcosystem::Python, "zope.interface", "5.4.0");
+        assert!(dotted.matches(&CatalogedComponent {
+            name: "zope-interface".into(),
+            version: "5.4.0".into()
+        }));
+        assert!(!py.matches(&CatalogedComponent {
+            name: "pyyaml".into(),
+            version: "5.4".into()
+        }));
+        assert!(!py.matches(&CatalogedComponent {
+            name: "requests".into(),
+            version: "5.3.1".into()
+        }));
+
+        let npm = ExpectedComponent::new(ComponentEcosystem::Npm, "@acme/Widget", "1.0.0");
+        assert!(npm.matches(&CatalogedComponent {
+            name: "@acme/widget".into(),
+            version: "1.0.0".into()
+        }));
+        // npm must NOT collapse separators the way PEP 503 does: `left-pad`
+        // and `left.pad` are genuinely different packages.
+        let lp = ExpectedComponent::new(ComponentEcosystem::Npm, "left-pad", "1.3.0");
+        assert!(!lp.matches(&CatalogedComponent {
+            name: "left.pad".into(),
+            version: "1.3.0".into()
+        }));
+    }
+
+    /// #3004 follow-up 2, HIGH-1 regression: a shipped lockfile is left
+    /// BYTE-FOR-BYTE alone. The previous revision merged the pin into it and
+    /// normalized `lockfileVersion` 1 -> 3, which made the CVE engine read only
+    /// `packages` and ignore the `dependencies` tree where the vulnerable
+    /// transitives were -- a dummy `packages` map was enough to trigger that
+    /// bump and mask them.
+    #[tokio::test]
+    async fn test_prepare_pinned_never_rewrites_a_shipped_lockfile() {
+        // The exact bypass shape: v1 `dependencies` carrying the vulnerable
+        // transitive, plus a dummy `packages` map to bait a merge.
+        let shipped = br#"{"name":"widget","version":"1.0.0","lockfileVersion":1,"dependencies":{"lodash":{"version":"4.17.11"}},"packages":{"node_modules/widget":{"version":"1.0.0"}}}"#;
+        for (label, path) in [
+            ("root", "package-lock.json"),
+            ("nested", "package/package-lock.json"),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let tgz = write_npm_tgz_with_entry(tmp.path(), "widget-1.0.0.tgz", path, shipped);
+            let content = Bytes::from(std::fs::read(&tgz).unwrap());
+            let artifact = test_helpers::make_test_artifact(
+                "widget-1.0.0.tgz",
+                "application/gzip",
+                "widget-1.0.0.tgz",
+            );
+            let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "widget", "1.0.0");
+
+            let base = tmp.path().join("ws-base");
+            let workspace = ScanWorkspace::prepare_pinned(
+                base.to_str().unwrap(),
+                None,
+                &artifact,
+                &content,
+                Some(&pin),
+            )
+            .await
+            .expect("prepare_pinned");
+
+            let kept = tokio::fs::read(workspace.join(SCAN_ARCHIVE_SUBDIR).join(path))
+                .await
+                .expect(path);
+            assert_eq!(
+                kept,
+                &shipped[..],
+                "{label}: a shipped lockfile must be graded natively, never rewritten"
+            );
+            assert!(
+                workspace_pins_component(&workspace, "widget", "1.0.0").await,
+                "{label}: the served identity must still be pinned"
+            );
+
+            ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+        }
+    }
+
+    /// #3004 follow-up 3: THE collision class. An archive used to unpack into
+    /// the same directory the control files are written to, so an entry named
+    /// after a control path could make the control write fail. Shrinkwrap
+    /// staging was best-effort, so the failure silently degraded the scan to
+    /// "pin only" and a vulnerable shrinkwrap graded clean.
+    ///
+    /// Namespace isolation removes the collision entirely: the archive can only
+    /// write under its own subdirectory, so these entries land harmlessly there
+    /// and staging still succeeds.
+    #[tokio::test]
+    async fn test_prepare_pinned_archive_cannot_collide_with_control_paths() {
+        let sw =
+            br#"{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.11"}}}"#;
+        // Collision A: a regular FILE where the staging directory goes.
+        // Collision B: a file UNDER the pin's directory path.
+        // Collision C: a benign decoy at the pin's exact path.
+        type Entries<'a> = Vec<(&'a str, &'a [u8])>;
+        let shapes: Vec<(&str, Entries<'_>)> = vec![
+            (
+                "file-at-staging-dir",
+                vec![
+                    ("package/npm-shrinkwrap.json", sw.as_ref()),
+                    (".ak-scan-shrinkwrap/package", b"collide".as_ref()),
+                ],
+            ),
+            (
+                "file-under-staging-path",
+                vec![
+                    ("package/npm-shrinkwrap.json", sw.as_ref()),
+                    (
+                        ".ak-scan-shrinkwrap/package/package-lock.json/x",
+                        b"collide".as_ref(),
+                    ),
+                ],
+            ),
+            (
+                "decoy-at-pin-path",
+                vec![
+                    ("package/npm-shrinkwrap.json", sw.as_ref()),
+                    (
+                        ".ak-scan-pin/package-lock.json",
+                        br#"{"lockfileVersion":3,"packages":{"node_modules/widget":{"version":"0.0.1"}}}"#
+                            .as_ref(),
+                    ),
+                ],
+            ),
+        ];
+
+        for (label, entries) in shapes {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let tgz = write_npm_tgz_with_entries(tmp.path(), "widget-1.0.0.tgz", &entries);
+            let content = Bytes::from(std::fs::read(&tgz).unwrap());
+            let artifact = test_helpers::make_test_artifact(
+                "widget-1.0.0.tgz",
+                "application/gzip",
+                "widget-1.0.0.tgz",
+            );
+            let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "widget", "1.0.0");
+
+            let base = tmp.path().join("ws-base");
+            let workspace = ScanWorkspace::prepare_pinned(
+                base.to_str().unwrap(),
+                None,
+                &artifact,
+                &content,
+                Some(&pin),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: prepare_pinned must succeed, got {e}"));
+
+            // The vulnerable shrinkwrap IS staged for grading...
+            let staged = tokio::fs::read(
+                workspace
+                    .join(NPM_SHRINKWRAP_SUBDIR)
+                    .join("package")
+                    .join(NPM_LOCKFILE_NAME),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: shrinkwrap must still be staged, got {e}"));
+            assert_eq!(staged, &sw[..], "{label}: staged verbatim");
+
+            // ...and the pin is OURS, at the authoritative version, not the
+            // decoy's.
+            let pinned =
+                tokio::fs::read_to_string(workspace.join(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: pin must exist, got {e}"));
+            let v: serde_json::Value = serde_json::from_str(&pinned).unwrap();
+            assert_eq!(
+                v["packages"]["node_modules/widget"]["version"], "1.0.0",
+                "{label}: the request coordinate must win over a shipped decoy"
+            );
+
+            // The colliding entries landed in the archive's own namespace.
+            assert!(
+                workspace.join(SCAN_ARCHIVE_SUBDIR).exists(),
+                "{label}: archive namespace"
+            );
+
+            ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+        }
+    }
+
+    /// Staging is FAIL-CLOSED: if a shipped shrinkwrap cannot be staged for
+    /// grading, `prepare_pinned` errors (-> inconclusive -> 423) instead of
+    /// returning a workspace whose scan would report a confident "clean".
+    /// Simulated by making the staging destination unwritable.
+    #[tokio::test]
+    async fn test_prepare_pinned_staging_failure_is_hard_error() {
+        let sw =
+            br#"{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.11"}}}"#;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz_with_entries(
+            tmp.path(),
+            "widget-1.0.0.tgz",
+            &[("npm-shrinkwrap.json", sw.as_ref())],
+        );
+        let content = Bytes::from(std::fs::read(&tgz).unwrap());
+        let artifact = test_helpers::make_test_artifact(
+            "widget-1.0.0.tgz",
+            "application/gzip",
+            "widget-1.0.0.tgz",
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "widget", "1.0.0");
+
+        // Pre-create the workspace with the staging path occupied by a file the
+        // copy cannot overwrite (a directory in the destination's place).
+        let base = tmp.path().join("ws-base");
+        let workspace = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact);
+        tokio::fs::create_dir_all(
+            workspace
+                .join(NPM_SHRINKWRAP_SUBDIR)
+                .join("root")
+                .join(NPM_LOCKFILE_NAME),
+        )
+        .await
+        .expect("occupy the staging destination with a directory");
+
+        let result = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            Some(&pin),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a shrinkwrap that cannot be staged must fail the scan closed, \
+             never yield a workspace that grades as clean"
+        );
+
+        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+    }
+
+    /// #3004 follow-up 2, HIGH-2 regression: the CVE engine does not catalog
+    /// `npm-shrinkwrap.json`, yet npm HONORS it over `package-lock.json` -- so a
+    /// vulnerable shrinkwrap was invisible. It is copied VERBATIM to a
+    /// `package-lock.json` the engine does catalog, from both conventional
+    /// locations, with the original untouched.
+    #[tokio::test]
+    async fn test_prepare_pinned_stages_shipped_shrinkwraps() {
+        let root_sw =
+            br#"{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.11"}}}"#;
+        let pkg_sw =
+            br#"{"lockfileVersion":3,"packages":{"node_modules/minimist":{"version":"1.2.0"}}}"#;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz_with_entries(
+            tmp.path(),
+            "widget-1.0.0.tgz",
+            &[
+                ("npm-shrinkwrap.json", root_sw.as_ref()),
+                ("package/npm-shrinkwrap.json", pkg_sw.as_ref()),
+            ],
+        );
+        let content = Bytes::from(std::fs::read(&tgz).unwrap());
+        let artifact = test_helpers::make_test_artifact(
+            "widget-1.0.0.tgz",
+            "application/gzip",
+            "widget-1.0.0.tgz",
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "widget", "1.0.0");
+
+        let base = tmp.path().join("ws-base");
+        let workspace = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            Some(&pin),
+        )
+        .await
+        .expect("prepare_pinned");
+
+        // Both sources are staged separately (they can legitimately differ)...
+        let staged_root = tokio::fs::read(
+            workspace
+                .join(NPM_SHRINKWRAP_SUBDIR)
+                .join("root")
+                .join(NPM_LOCKFILE_NAME),
+        )
+        .await
+        .expect("root shrinkwrap must be staged for grading");
+        assert_eq!(staged_root, &root_sw[..], "staged verbatim, not rewritten");
+        let staged_pkg = tokio::fs::read(
+            workspace
+                .join(NPM_SHRINKWRAP_SUBDIR)
+                .join("package")
+                .join(NPM_LOCKFILE_NAME),
+        )
+        .await
+        .expect("package/ shrinkwrap must be staged for grading");
+        assert_eq!(staged_pkg, &pkg_sw[..]);
+
+        // ...and the originals are untouched, inside the archive's own namespace.
+        assert_eq!(
+            tokio::fs::read(
+                workspace
+                    .join(SCAN_ARCHIVE_SUBDIR)
+                    .join(NPM_SHRINKWRAP_NAME)
+            )
+            .await
+            .unwrap(),
+            &root_sw[..]
+        );
+
+        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+    }
+
+    /// No shrinkwrap shipped => nothing staged. The staging step must not
+    /// fabricate a lockfile out of nowhere.
+    #[tokio::test]
+    async fn test_prepare_pinned_stages_nothing_without_a_shrinkwrap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz(tmp.path(), "left-pad-1.3.0.tgz");
+        let content = Bytes::from(std::fs::read(&tgz).unwrap());
+        let artifact = test_helpers::make_test_artifact(
+            "left-pad-1.3.0.tgz",
+            "application/gzip",
+            "left-pad-1.3.0.tgz",
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "left-pad", "1.3.0");
+
+        let base = tmp.path().join("ws-base");
+        let workspace = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            Some(&pin),
+        )
+        .await
+        .expect("prepare_pinned");
+
+        assert!(!workspace.join(NPM_SHRINKWRAP_SUBDIR).exists());
+        assert!(workspace_pins_component(&workspace, "left-pad", "1.3.0").await);
+
+        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+    }
+
+    /// #3003: the pin is written for an npm tarball so the CVE engine has a
+    /// component to grade — syft does not catalog a bare `package.json`.
+    #[tokio::test]
+    async fn test_prepare_pinned_writes_npm_lock_pin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz(tmp.path(), "left-pad-1.3.0.tgz");
+        let content = Bytes::from(std::fs::read(&tgz).unwrap());
+        let artifact = test_helpers::make_test_artifact(
+            "left-pad-1.3.0.tgz",
+            "application/gzip",
+            "left-pad-1.3.0.tgz",
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "left-pad", "1.3.0");
+
+        let base = tmp.path().join("ws-base");
+        let workspace = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            Some(&pin),
+        )
+        .await
+        .expect("prepare_pinned");
+
+        let body =
+            tokio::fs::read_to_string(workspace.join(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME))
+                .await
+                .expect("pin lockfile must exist in its own directory");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["packages"]["node_modules/left-pad"]["version"], "1.3.0");
+        assert!(
+            !workspace.join("package-lock.json").exists(),
+            "the pin must never occupy a path an archive could ship"
+        );
+        // The archive's own bytes live in their own namespace, disjoint from
+        // every control path.
+        assert!(workspace
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("package")
+            .join("package.json")
+            .exists());
+
+        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+    }
+
+    /// #3003 (red-team shape b): a decoy `package-lock.json` PACKED INSIDE the
+    /// archive must not suppress grading of the served package.
+    ///
+    /// The decoy is an EMPTY-`packages` lockfile: it catalogs nothing, and it
+    /// occupies the path the pin wants. It is no longer clobbered (#3004
+    /// follow-up: a shipped lockfile can carry real resolved transitives), so
+    /// the contract is the outcome, not the path — SOME lockfile in the
+    /// workspace must pin the served `name@version`, which is what makes the
+    /// CVE engine grade it.
+    #[tokio::test]
+    async fn test_prepare_pinned_decoy_lock_cannot_suppress_the_pin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let decoy = br#"{"lockfileVersion":3,"packages":{}}"#;
+        let tgz = write_npm_tgz_with_root_lock(tmp.path(), "lodash-4.17.11.tgz", decoy);
+        let content = Bytes::from(std::fs::read(&tgz).unwrap());
+        let artifact = test_helpers::make_test_artifact(
+            "lodash-4.17.11.tgz",
+            "application/gzip",
+            "lodash-4.17.11.tgz",
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11");
+
+        let base = tmp.path().join("ws-base");
+        let workspace = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            Some(&pin),
+        )
+        .await
+        .expect("prepare_pinned");
+
+        assert!(
+            workspace_pins_component(&workspace, "lodash", "4.17.11").await,
+            "a decoy lockfile must not prevent the served package from being pinned"
+        );
+
+        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+    }
+
+    /// True when ANY `package-lock.json` in the workspace tree pins
+    /// `name@version` — syft catalogs lockfiles at any depth, so this is the
+    /// property that actually decides whether the CVE engine grades it.
+    async fn workspace_pins_component(workspace: &Path, name: &str, version: &str) -> bool {
+        let mut dirs = vec![workspace.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.file_name().and_then(|f| f.to_str()) != Some(NPM_LOCKFILE_NAME) {
+                    continue;
+                }
+                let Ok(body) = tokio::fs::read_to_string(&path).await else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+                    continue;
+                };
+                if v["packages"][format!("node_modules/{name}")]["version"] == version {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// #3003: a python pin lands at `<name>-<version>.dist-info/METADATA` —
+    /// the layout syft catalogs. An sdist's root `PKG-INFO` is NOT cataloged,
+    /// which is why an ordinary vulnerable sdist previously graded clean.
+    #[tokio::test]
+    async fn test_prepare_pinned_writes_python_dist_info_pin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = Bytes::from_static(b"not-a-real-sdist");
+        let artifact = test_helpers::make_test_artifact(
+            "PyYAML-5.3.1.tar.gz",
+            "application/gzip",
+            "PyYAML-5.3.1.tar.gz",
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::Python, "PyYAML", "5.3.1");
+
+        let base = tmp.path().join("ws-base");
+        let workspace = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            Some(&pin),
+        )
+        .await
+        .expect("prepare_pinned");
+
+        let body =
+            tokio::fs::read_to_string(workspace.join("PyYAML-5.3.1.dist-info").join("METADATA"))
+                .await
+                .expect("dist-info METADATA pin must exist");
+        assert!(body.contains("Name: PyYAML"), "{body}");
+
+        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+    }
+
+    /// Blast-radius control: with NO pin (every hosted upload scan) the
+    /// workspace is exactly what it always was — nothing is fabricated.
+    #[tokio::test]
+    async fn test_prepare_without_pin_fabricates_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz(tmp.path(), "left-pad-1.3.0.tgz");
+        let content = Bytes::from(std::fs::read(&tgz).unwrap());
+        let artifact = test_helpers::make_test_artifact(
+            "left-pad-1.3.0.tgz",
+            "application/gzip",
+            "left-pad-1.3.0.tgz",
+        );
+
+        let base = tmp.path().join("ws-base");
+        let workspace = ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+            .await
+            .expect("prepare");
+
+        assert!(
+            !workspace.join("package-lock.json").exists(),
+            "an unpinned (upload-path) scan must not fabricate a lockfile"
+        );
+        assert!(workspace.join("package").join("package.json").exists());
+
+        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     #[tokio::test]
@@ -8950,6 +10588,63 @@ mod tests {
             source: None,
             source_url: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // aggregate_proxy_verdict / ProxyScanVerdict (#2954 inline proxy scan)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proxy_verdict_clean_when_no_findings() {
+        let verdict = aggregate_proxy_verdict(&[], Some("grype-0.83.0".to_string()));
+        assert_eq!(verdict.findings_count, 0);
+        assert!(!verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "clean");
+        assert_eq!(verdict.max_severity, None);
+        assert_eq!(verdict.max_severity_token(), None);
+        assert_eq!(verdict.scanner_version.as_deref(), Some("grype-0.83.0"));
+    }
+
+    #[test]
+    fn test_proxy_verdict_vulnerable_with_critical() {
+        // A single critical finding (the CVE-wheel case) => vulnerable verdict.
+        let findings = vec![make_finding(Severity::Critical)];
+        let verdict = aggregate_proxy_verdict(&findings, None);
+        assert_eq!(verdict.findings_count, 1);
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "vulnerable");
+        assert_eq!(verdict.critical_count, 1);
+        assert_eq!(verdict.max_severity, Some(Severity::Critical));
+        assert_eq!(verdict.max_severity_token(), Some("critical"));
+    }
+
+    #[test]
+    fn test_proxy_verdict_max_severity_is_highest() {
+        // Mixed findings: max_severity must be the HIGHEST (Critical < .. < Info
+        // in ordinal terms), and per-severity counts must tally.
+        let findings = vec![
+            make_finding(Severity::Low),
+            make_finding(Severity::High),
+            make_finding(Severity::Medium),
+            make_finding(Severity::High),
+        ];
+        let verdict = aggregate_proxy_verdict(&findings, None);
+        assert_eq!(verdict.findings_count, 4);
+        assert_eq!(verdict.high_count, 2);
+        assert_eq!(verdict.medium_count, 1);
+        assert_eq!(verdict.low_count, 1);
+        assert_eq!(verdict.critical_count, 0);
+        assert_eq!(verdict.max_severity, Some(Severity::High));
+        assert_eq!(verdict.max_severity_token(), Some("high"));
+    }
+
+    #[test]
+    fn test_severity_token_vocabulary() {
+        assert_eq!(severity_token(Severity::Critical), "critical");
+        assert_eq!(severity_token(Severity::High), "high");
+        assert_eq!(severity_token(Severity::Medium), "medium");
+        assert_eq!(severity_token(Severity::Low), "low");
+        assert_eq!(severity_token(Severity::Info), "info");
     }
 
     #[test]
@@ -13081,6 +14776,766 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Inline proxy scan fail-closed correctness (#2954)
+    //
+    // The security-critical contract of `run_inline_proxy_scanners` (the loop
+    // behind `ScannerService::scan_content`): a non-error verdict is only
+    // emitted when the CVE-AUTHORITATIVE scanner (Grype) completed `Ok`. A
+    // Grype error/timeout must NOT be masked by a supplementary scanner's
+    // trivial `Ok(ScanOutput::default())` and aggregate to `clean` — that is
+    // the hole that served an unscanned vulnerable wheel 200 under fail-closed.
+    // -----------------------------------------------------------------------
+    mod inline_proxy_scan_fixtures {
+        use super::*;
+
+        /// A CVE-authoritative scanner (mimics Grype) with a configurable
+        /// outcome: hard error, clean Ok, or Ok with a critical finding.
+        pub(super) enum CveOutcome {
+            /// Grype hard-errored / timed out / stale-DB exit-1 / OOM.
+            Error,
+            /// Grype ran and found nothing.
+            Clean,
+            /// Grype ran and found a critical CVE.
+            Critical,
+        }
+
+        pub(super) struct CveAuthoritativeScanner {
+            pub(super) outcome: CveOutcome,
+        }
+
+        #[async_trait::async_trait]
+        impl Scanner for CveAuthoritativeScanner {
+            fn name(&self) -> &str {
+                "cve-authoritative-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            fn is_cve_authoritative(&self) -> bool {
+                true
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                match self.outcome {
+                    CveOutcome::Error => Err(AppError::Internal(
+                        "simulated grype failure (exit 1, no stderr)".to_string(),
+                    )),
+                    CveOutcome::Clean => Ok(ScanOutput::default()),
+                    CveOutcome::Critical => Ok(ScanOutput::findings_only(vec![RawFinding {
+                        severity: Severity::Critical,
+                        title: "CVE-2020-0000 test".to_string(),
+                        description: None,
+                        cve_id: Some("CVE-2020-0000".to_string()),
+                        affected_component: Some("pyyaml".to_string()),
+                        affected_version: Some("5.3.1".to_string()),
+                        fixed_version: Some("5.4".to_string()),
+                        source: Some("grype".to_string()),
+                        source_url: None,
+                    }])),
+                }
+            }
+        }
+
+        /// A non-CVE supplementary scanner that always returns
+        /// `Ok(ScanOutput::default())` — exactly what `DependencyScanner` does
+        /// on a binary wheel (non-UTF-8 content -> zero parsed deps). It must
+        /// NOT, on its own, satisfy the "the CVE scanner ran" condition.
+        pub(super) struct TrivialDependencyScanner;
+
+        #[async_trait::async_trait]
+        impl Scanner for TrivialDependencyScanner {
+            fn name(&self) -> &str {
+                "trivial-dependency-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "dependency"
+            }
+            // Inherits is_cve_authoritative = false (default).
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
+            }
+        }
+    }
+
+    fn inline_scan_artifact() -> Artifact {
+        test_helpers::make_test_artifact(
+            "PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl",
+            "application/octet-stream",
+            "pypi/pyyaml/5.3.1/PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl",
+        )
+    }
+
+    /// THE #2954 discriminator: DependencyScanner (trivial Ok) + a Grype error
+    /// must yield an INCONCLUSIVE error, NOT a `clean` verdict. Before the fix
+    /// `any_ran` was true (DependencyScanner succeeded), so a Grype-only error
+    /// aggregated to `clean` and the fail-closed serve path returned 200 for an
+    /// unscanned, possibly-vulnerable wheel.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_grype_error_is_inconclusive_not_clean() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Error,
+            }),
+        ];
+        let artifact = inline_scan_artifact();
+        let result = run_inline_proxy_scanners_target(
+            &scanners,
+            &inline_scan_target(&artifact),
+            &Bytes::new(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a Grype error must be inconclusive (Err), never a clean verdict, \
+             even though DependencyScanner returned Ok(default) (#2954)"
+        );
+    }
+
+    /// Ordering must not matter: Grype error first, then a trivially-successful
+    /// supplementary scanner, is still inconclusive.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_grype_error_first_still_inconclusive() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Error,
+            }),
+            Arc::new(TrivialDependencyScanner),
+        ];
+        let artifact = inline_scan_artifact();
+        assert!(
+            run_inline_proxy_scanners_target(
+                &scanners,
+                &inline_scan_target(&artifact),
+                &Bytes::new()
+            )
+            .await
+            .is_err(),
+            "Grype error remains inconclusive regardless of scanner order (#2954)"
+        );
+    }
+
+    /// A genuinely-clean Grype run (Ok, no findings) alongside the trivial
+    /// dependency scanner still yields a `clean` verdict — the fix must not
+    /// over-correct and block legitimate clean pulls.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_grype_clean_is_clean() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Clean,
+            }),
+        ];
+        let artifact = inline_scan_artifact();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &inline_scan_target(&artifact),
+            &Bytes::new(),
+        )
+        .await
+        .expect("clean Grype run must produce a verdict");
+        assert!(!verdict.is_vulnerable(), "clean run -> not vulnerable");
+        assert_eq!(verdict.findings_count, 0);
+    }
+
+    /// A Grype run that finds a critical CVE yields a `vulnerable` verdict.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_grype_findings_are_vulnerable() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Critical,
+            }),
+        ];
+        let artifact = inline_scan_artifact();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &inline_scan_target(&artifact),
+            &Bytes::new(),
+        )
+        .await
+        .expect("Grype run with findings must produce a verdict");
+        assert!(verdict.is_vulnerable(), "findings -> vulnerable");
+        assert_eq!(verdict.critical_count, 1);
+    }
+
+    /// Defensive: with NO scanner registered at all the result is inconclusive
+    /// (no scanner ran), never a false clean.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_no_scanner_is_inconclusive() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![];
+        let artifact = inline_scan_artifact();
+        assert!(
+            run_inline_proxy_scanners_target(
+                &scanners,
+                &inline_scan_target(&artifact),
+                &Bytes::new()
+            )
+            .await
+            .is_err(),
+            "no scanner at all -> inconclusive, never clean"
+        );
+    }
+
+    fn inline_scan_target(artifact: &Artifact) -> ScanTarget<'_> {
+        ScanTarget {
+            artifact,
+            repository_key: "proxy-repo",
+            repository_type: "remote",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: false,
+        }
+    }
+
+    /// A CVE-authoritative mock that RAN successfully but reports a specific
+    /// catalog — the #3003 axis. `cataloged: Some(vec![])` is the engine that
+    /// ran and had nothing to grade; `None` models a scanner that reports no
+    /// catalog signal at all.
+    struct CatalogingCveScanner {
+        cataloged: Option<Vec<CatalogedComponent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Scanner for CatalogingCveScanner {
+        fn name(&self) -> &str {
+            "cataloging-cve-test-scanner"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+        async fn scan(
+            &self,
+            _: &Artifact,
+            _: Option<&ArtifactMetadata>,
+            _: &Bytes,
+        ) -> Result<ScanOutput> {
+            Ok(ScanOutput {
+                findings: Vec::new(),
+                packages: Vec::new(),
+                scan_completeness: ScanCompleteness::Complete,
+                cataloged: self.cataloged.clone(),
+            })
+        }
+    }
+
+    fn expecting_target<'a>(
+        artifact: &'a Artifact,
+        expected: &'a ExpectedComponent,
+    ) -> ScanTarget<'a> {
+        ScanTarget {
+            artifact,
+            repository_key: "proxy-repo",
+            repository_type: "remote",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: Some(expected),
+            require_nonempty_catalog: false,
+        }
+    }
+
+    fn lodash_expected() -> ExpectedComponent {
+        ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11")
+    }
+
+    /// THE #3003 discriminator, gap 1: the CVE engine RAN `Ok` with zero
+    /// findings but cataloged NOTHING. Zero findings from a scan of nothing is
+    /// not a clean verdict — it must be inconclusive, so the fail-closed serve
+    /// path 423s instead of serving a vulnerable artifact with a 200.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_zero_cataloged_is_inconclusive() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(Vec::new()),
+        })];
+        let artifact = inline_scan_artifact();
+        let expected = lodash_expected();
+        let target = expecting_target(&artifact, &expected);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "an engine that cataloged nothing must be inconclusive, never clean"
+        );
+    }
+
+    /// THE #3003 discriminator, gap 2: the engine cataloged a DIFFERENT
+    /// identity than the artifact being served (a rewritten package.json, a
+    /// stray lockfile). A clean grade of something else says nothing about
+    /// these bytes -> inconclusive.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_identity_mismatch_is_inconclusive() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(vec![CatalogedComponent {
+                name: "totally-benign".into(),
+                version: "1.0.0".into(),
+            }]),
+        })];
+        let artifact = inline_scan_artifact();
+        let expected = lodash_expected();
+        let target = expecting_target(&artifact, &expected);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "grading a different identity must be inconclusive, never clean"
+        );
+
+        // ...and the version half matters just as much as the name half.
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(vec![CatalogedComponent {
+                name: "lodash".into(),
+                version: "4.17.21".into(),
+            }]),
+        })];
+        let target = expecting_target(&artifact, &expected);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "grading a DIFFERENT VERSION of the right package is still not an \
+             assessment of these bytes"
+        );
+    }
+
+    /// THE control that keeps the gate honest: a genuinely clean package whose
+    /// identity WAS cataloged stays CLEAN (200). The hardening must not turn
+    /// every clean pull into a 423.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_cataloged_match_stays_clean() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(vec![
+                CatalogedComponent {
+                    name: "lodash".into(),
+                    version: "4.17.11".into(),
+                },
+                // Extra co-cataloged components are fine.
+                CatalogedComponent {
+                    name: "some-dep".into(),
+                    version: "1.0.0".into(),
+                },
+            ]),
+        })];
+        let artifact = inline_scan_artifact();
+        let expected = lodash_expected();
+        let target = expecting_target(&artifact, &expected);
+        let verdict = run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+            .await
+            .expect("an assessed, finding-free scan is a clean verdict");
+        assert!(!verdict.is_vulnerable());
+    }
+
+    /// Blast-radius control: a scanner that reports NO catalog signal
+    /// (`cataloged: None` — every non-Grype scanner, and Grype's OCI paths)
+    /// keeps the pre-#3003 behavior even when an identity is expected. The new
+    /// gate only fires on a real signal; it never invents one.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_absent_catalog_signal_keeps_prior_behavior() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> =
+            vec![Arc::new(CatalogingCveScanner { cataloged: None })];
+        let artifact = inline_scan_artifact();
+        let expected = lodash_expected();
+        let target = expecting_target(&artifact, &expected);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_ok(),
+            "no catalog signal must not be treated as an empty catalog"
+        );
+    }
+
+    /// And with no expected identity at all (hosted upload scans, legacy
+    /// callers) the assessment gate is entirely inert — an empty catalog is
+    /// still an ordinary clean scan.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_no_expectation_is_unaffected() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(Vec::new()),
+        })];
+        let artifact = inline_scan_artifact();
+        let target = inline_scan_target(&artifact);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_ok(),
+            "callers that supply no coordinate keep the prior behavior exactly"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3003 PR-2: the OCI image analogue of the assessment gate.
+    // An image has no name@version coordinate to pin, so the serve path sets
+    // `require_nonempty_catalog` instead: the CVE engine must have actually
+    // cataloged SOMETHING for the image before a non-error verdict is
+    // trusted, and — unlike the file-format gate — "no catalog signal at
+    // all" (`None`) is ALSO inconclusive, because Grype's registry-mode
+    // fallback reports no catalog and must not pass as a graded clean.
+    // -----------------------------------------------------------------------
+
+    fn oci_image_artifact() -> Artifact {
+        test_helpers::make_test_artifact(
+            "library/debian:buster",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/debian/manifests/buster",
+        )
+    }
+
+    fn require_catalog_target(artifact: &Artifact) -> ScanTarget<'_> {
+        ScanTarget {
+            artifact,
+            repository_key: "docker-proxy",
+            repository_type: "remote",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: true,
+        }
+    }
+
+    /// THE OCI discriminator, half 1: the engine RAN `Ok` with zero findings
+    /// but cataloged NOTHING for the image. Zero findings over an image the
+    /// engine could not unpack/grade is not clean -> inconclusive (423 under
+    /// fail-closed).
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_empty_catalog_is_inconclusive() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(Vec::new()),
+        })];
+        let artifact = oci_image_artifact();
+        let target = require_catalog_target(&artifact);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "an engine that cataloged nothing for the image must be inconclusive"
+        );
+    }
+
+    /// THE OCI discriminator, half 2: NO catalog signal (`None`) is ALSO
+    /// inconclusive when the catalog is required. This is what keeps a
+    /// registry-mode fallback (which reports no catalog) or a broken BOM side
+    /// channel from silently passing as a graded clean.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_absent_catalog_is_inconclusive() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> =
+            vec![Arc::new(CatalogingCveScanner { cataloged: None })];
+        let artifact = oci_image_artifact();
+        let target = require_catalog_target(&artifact);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "no catalog signal must be inconclusive when the caller requires a catalog"
+        );
+    }
+
+    /// The control that keeps the OCI gate honest: a genuinely clean image
+    /// the engine DID catalog stays clean — the hardening must not turn
+    /// every clean pull into a 423.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_cataloged_clean_stays_clean() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(vec![CatalogedComponent {
+                name: "base-files".into(),
+                version: "10.3+deb10u13".into(),
+            }]),
+        })];
+        let artifact = oci_image_artifact();
+        let target = require_catalog_target(&artifact);
+        let verdict = run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+            .await
+            .expect("a cataloged, finding-free image scan is a clean verdict");
+        assert!(!verdict.is_vulnerable());
+    }
+
+    /// A verdict WITH findings is vulnerable regardless of the catalog side
+    /// channel: blocking (403) must never be downgraded to inconclusive (423)
+    /// just because the BOM was unavailable. The catalog requirement guards
+    /// only the zero-findings/false-clean direction.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_findings_block_even_without_catalog() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CveAuthoritativeScanner {
+            outcome: CveOutcome::Critical,
+        })];
+        let artifact = oci_image_artifact();
+        let target = require_catalog_target(&artifact);
+        let verdict = run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+            .await
+            .expect("findings must yield a vulnerable verdict, not inconclusive");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.critical_count, 1);
+    }
+
+    /// Blast-radius control: with the flag OFF (hosted upload scans, file
+    /// formats), an absent/empty catalog keeps prior behavior exactly.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_flag_off_keeps_prior_behavior() {
+        use std::sync::Arc;
+
+        for cataloged in [None, Some(Vec::new())] {
+            let scanners: Vec<Arc<dyn Scanner>> =
+                vec![Arc::new(CatalogingCveScanner { cataloged })];
+            let artifact = oci_image_artifact();
+            let target = inline_scan_target(&artifact);
+            assert!(
+                run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                    .await
+                    .is_ok(),
+                "callers that do not require a catalog keep the prior behavior exactly"
+            );
+        }
+    }
+
+    /// The #2954 gate still outranks the #3003 one: a Grype ERROR is
+    /// inconclusive regardless of any catalog.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_error_outranks_catalog_check() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Error,
+            }),
+        ];
+        let artifact = inline_scan_artifact();
+        let expected = lodash_expected();
+        let target = expecting_target(&artifact, &expected);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err()
+        );
+    }
+
+    /// The #2954 discriminator through the CONTEXT-AWARE seam (#3003): the
+    /// `cve_scanner_applicable && !cve_scanner_ran` fail-closed gate is
+    /// single-sourced in `run_inline_proxy_scanners_target`, so a Grype error
+    /// masked by a supplementary scanner's trivial `Ok(default)` must be
+    /// inconclusive (Err) for target callers exactly as for file callers.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_target_grype_error_is_inconclusive_not_clean() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        // Reversed registration order vs the file-mode test above: the gate
+        // must be order-insensitive through the target seam as well.
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Error,
+            }),
+            Arc::new(TrivialDependencyScanner),
+        ];
+        let artifact = inline_scan_artifact();
+        let target = inline_scan_target(&artifact);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "a Grype error must be inconclusive through the target seam too, \
+             never a clean verdict (#2954 via #3003 shared core)"
+        );
+    }
+
+    /// Target-seam control cases: a genuinely-clean CVE run yields `clean`
+    /// and a CVE-bearing run yields `vulnerable` — the delegate refactor must
+    /// not change the file-mode verdicts.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_target_verdicts_match_file_mode() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let artifact = inline_scan_artifact();
+        let target = inline_scan_target(&artifact);
+
+        let clean: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Clean,
+            }),
+        ];
+        let verdict = run_inline_proxy_scanners_target(&clean, &target, &Bytes::new())
+            .await
+            .expect("clean CVE run must produce a verdict");
+        assert!(!verdict.is_vulnerable());
+
+        let vuln: Vec<Arc<dyn Scanner>> = vec![Arc::new(CveAuthoritativeScanner {
+            outcome: CveOutcome::Critical,
+        })];
+        let verdict = run_inline_proxy_scanners_target(&vuln, &target, &Bytes::new())
+            .await
+            .expect("CVE run with findings must produce a verdict");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.critical_count, 1);
+    }
+
+    /// The `Scanner::is_cve_authoritative` trait DEFAULT is false: a scanner
+    /// that does not opt in is a supplementary signal whose success must not
+    /// satisfy the "the CVE scanner ran" condition (only `GrypeScanner`
+    /// overrides to true — pinned in grype_scanner's own tests).
+    #[test]
+    fn test_scanner_trait_default_is_not_cve_authoritative() {
+        use inline_proxy_scan_fixtures::*;
+        // TrivialDependencyScanner inherits the trait default.
+        assert!(!TrivialDependencyScanner.is_cve_authoritative());
+        // The mock CVE scanner overrides it, mirroring GrypeScanner.
+        assert!(CveAuthoritativeScanner {
+            outcome: CveOutcome::Clean,
+        }
+        .is_cve_authoritative());
+    }
+
+    /// #2976: `cve_authoritative_scanner_version` returns the CVE engine's
+    /// (cached) version string — skipping non-authoritative scanners
+    /// regardless of registration order — and `None` when no CVE engine is
+    /// registered or its probe failed, so `verdict_is_fresh` falls back to
+    /// the TTL alone rather than inventing a comparison.
+    #[tokio::test]
+    async fn test_cve_authoritative_scanner_version_picks_cve_engine_only() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        struct VersionedCveScanner;
+        #[async_trait::async_trait]
+        impl Scanner for VersionedCveScanner {
+            fn name(&self) -> &str {
+                "versioned-cve-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            fn is_cve_authoritative(&self) -> bool {
+                true
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
+            }
+            async fn version(&self) -> Option<String> {
+                Some("grype-0.84.0-test".to_string())
+            }
+        }
+
+        // A non-authoritative scanner registered FIRST must not shadow the
+        // CVE engine's version (DependencyScanner precedes Grype in prod).
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(VersionedCveScanner),
+        ];
+        assert_eq!(
+            cve_authoritative_scanner_version(&scanners)
+                .await
+                .as_deref(),
+            Some("grype-0.84.0-test")
+        );
+
+        // No CVE engine at all: None (freshness falls back to TTL).
+        let none: Vec<Arc<dyn Scanner>> = vec![Arc::new(TrivialDependencyScanner)];
+        assert!(cve_authoritative_scanner_version(&none).await.is_none());
+        assert!(cve_authoritative_scanner_version(&[]).await.is_none());
+
+        // CVE engine whose version probe failed (trait default None): the
+        // accessor surfaces None rather than inventing a version.
+        let unprobed: Vec<Arc<dyn Scanner>> = vec![Arc::new(CveAuthoritativeScanner {
+            outcome: CveOutcome::Clean,
+        })];
+        assert!(cve_authoritative_scanner_version(&unprobed).await.is_none());
+    }
+
+    /// `ScannerService::scan_content` (#2954): the fair-share-permitted wrapper
+    /// over `run_inline_proxy_scanners`. DB-backed only for the fixture state;
+    /// the scanners are in-memory mocks. Covers the verdict path and the
+    /// no-scanner inconclusive path through the public seam the PyPI handler
+    /// calls. Skips cleanly when DATABASE_URL is unset.
+    #[tokio::test]
+    async fn test_scan_content_verdict_and_inconclusive_through_service() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("remote", "pypi").await
+        else {
+            return;
+        };
+        let mut svc = scanner_for_fixture(&fx);
+        svc.scanners = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Critical,
+            }),
+        ];
+        let artifact = inline_scan_artifact();
+        let verdict = svc.scan_content(&artifact, &Bytes::new()).await;
+
+        // Same service with NO scanners: inconclusive error, never clean.
+        svc.scanners = vec![];
+        let inconclusive = svc.scan_content(&artifact, &Bytes::new()).await;
+
+        fx.teardown().await;
+
+        let verdict = verdict.expect("critical Grype-mock run must yield a verdict");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.critical_count, 1);
+        assert_eq!(verdict.verdict_token(), "vulnerable");
+        assert!(
+            inconclusive.is_err(),
+            "scan_content with no scanner must surface the inconclusive error"
+        );
+    }
+
     /// Concrete regression for #994: the lodash fixture (generic tarball
     /// uploaded as `scan_type=image`) must trigger
     /// `ImageScanner::is_applicable=false`, so the orchestrator can skip
@@ -13469,6 +15924,7 @@ mod tests {
                 } else {
                     ScanCompleteness::Partial
                 },
+                cataloged: None,
             })
         }
     }
@@ -13488,6 +15944,8 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -13512,6 +15970,8 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -14670,6 +17130,7 @@ mod tests {
                         findings: findings.clone(),
                         packages: packages.clone(),
                         scan_completeness: ScanCompleteness::Complete,
+                        cataloged: None,
                     }),
                     // Displays as "Internal error: <reason>" so the reason is
                     // preserved in scan_results.error_message via fail_scan.
@@ -14925,7 +17386,8 @@ mod tests {
         fn dt_service_at(base_url: &str) -> Arc<DependencyTrackService> {
             let dt = DependencyTrackService::new(DependencyTrackConfig {
                 base_url: base_url.to_string(),
-                api_key: "matrix-test-key".to_string(),
+                api_key: Some("matrix-test-key".to_string()),
+                api_key_file: None,
                 enabled: true,
             })
             .expect("construct DT service");

@@ -418,7 +418,10 @@ impl IncusScanner {
         // (`--compression=zstd`) ship .tar.zst, so zstd must be handled
         // explicitly — `tar -xzf` (gzip) on a zstd archive
         // fails extraction. zstd support requires the `zstd` binary in the
-        // runtime image (installed in Dockerfile.backend).
+        // runtime image (installed in Dockerfile.backend). The xz path
+        // (`-xJf`) likewise forks the `xz` binary from the runtime image —
+        // `xz-libs` (liblzma, for the in-process xz2 crate) alone is not
+        // sufficient there.
         let is_xz = content.len() >= 5 && content[..5] == [0xFD, 0x37, 0x7A, 0x58, 0x5A];
         let is_zstd = content.len() >= 4 && content[..4] == [0x28, 0xB5, 0x2F, 0xFD];
 

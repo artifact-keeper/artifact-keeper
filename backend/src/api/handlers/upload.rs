@@ -21,7 +21,7 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers;
-use crate::api::handlers::repositories::require_repo_write_access;
+use crate::api::handlers::repositories::{require_repo_action, require_repo_write_access};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::services::package_service::PackageService;
@@ -128,46 +128,6 @@ pub struct CompleteResponse {
 // POST / -- Create upload session
 // ---------------------------------------------------------------------------
 
-/// Pure write-authorization decision for creating a chunked-upload session.
-///
-/// Mirrors the semantics `repo_visibility_middleware` enforces on every other
-/// repository write path, so the body-addressed `/uploads` flow is gated the
-/// same way the URL-addressed legacy artifact PUT is:
-///
-/// * **Token repo-scope (#504):** an API token restricted to a set of repos
-///   (`auth.can_access_repo`) may only target a repo in that set.
-/// * **Admin bypass:** admins skip the fine-grained checks entirely.
-/// * **No-rules fall-through:** a repo with no fine-grained permission rules
-///   keeps working under the default access model (`has_rules == false`).
-/// * **Fine-grained write (#817):** when rules exist, the caller must hold the
-///   `write` (or `admin`) action on the repo.
-///
-/// The permission-service lookups that produce `has_rules`/`has_write`/
-/// `has_admin` are done by the caller; keeping the decision pure makes it
-/// unit-testable without a database.
-fn session_write_authorized(
-    auth: &AuthExtension,
-    repo_id: Uuid,
-    has_rules: bool,
-    has_write: bool,
-    has_admin: bool,
-) -> bool {
-    // #504: token repository scope.
-    if !auth.can_access_repo(repo_id) {
-        return false;
-    }
-    // Admins bypass fine-grained permission checks.
-    if auth.is_admin {
-        return true;
-    }
-    // No fine-grained rules: fall through to the default access model.
-    if !has_rules {
-        return true;
-    }
-    // Rules exist: the caller must hold write (or admin) on this repo.
-    has_write || has_admin
-}
-
 #[utoipa::path(
     post,
     path = "/api/v1/uploads",
@@ -189,11 +149,12 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Response, Response> {
     // Token action-scope ceiling (GHSA-5f2q). Opening a chunked-upload session is
-    // a write, so it must require the `write` scope BEFORE the repo-RBAC gate
-    // below — matching the direct-write path (`repositories::upload_artifact`).
+    // an artifact write, so it must require `write:artifacts` BEFORE the repo-RBAC
+    // gate below — matching the direct-write path (`repositories::upload_artifact`).
+    // Bare `write` still satisfies via the parent rule (#2989).
     // Defense-in-depth: this is IN ADDITION to `require_repo_write_access`; a
     // read-scoped token whose owner holds repo write must still be rejected here.
-    auth.require_scope("write")
+    auth.require_scope("write:artifacts")
         .map_err(IntoResponse::into_response)?;
 
     let user_id = auth.user_id;
@@ -262,113 +223,22 @@ async fn create_session(
         return Err(rejection);
     }
 
-    // Repository write authorization (#817 parity).
-    //
-    // The chunked upload-session create path must enforce the same
-    // fine-grained RBAC write gate that `repo_visibility_middleware` applies to
-    // the rest of the artifact-write surface (see middleware/auth.rs): the
-    // /api/v1/uploads router is layered only with `auth_middleware`
-    // (authentication), so without this check any authenticated user could open
-    // a session against a release/promotion-only repository.
-    //
-    // Admins bypass the check. For a non-admin, if any permission rule exists
-    // for this repository the caller must hold the `write` action (or `admin`,
-    // which implies all actions); a repository with no rules falls through
-    // unchanged. A DB error on the rule lookup fails closed (503), mirroring the
-    // middleware. Authorized peer-replication identities hold write/admin on the
-    // target and continue to pass.
-    let has_rules = if auth.is_admin {
-        false
-    } else {
-        match state
-            .permission_service
-            .has_any_rules_for_target("repository", repo_id)
-            .await
-        {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::error!("permission check failed: database unreachable");
-                return Err(map_err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "permission service temporarily unavailable",
-                ));
-            }
-        }
-    };
-    let (has_write, has_admin) = if !auth.is_admin && has_rules {
-        (
-            state
-                .permission_service
-                .check_permission(user_id, "repository", repo_id, "write", false)
-                .await
-                .unwrap_or(false),
-            state
-                .permission_service
-                .check_permission(user_id, "repository", repo_id, "admin", false)
-                .await
-                .unwrap_or(false),
-        )
-    } else {
-        (false, false)
-    };
-    if !upload_write_decision(auth.is_admin, has_rules, has_write, has_admin) {
-        return Err(map_err(
-            StatusCode::FORBIDDEN,
-            "You do not have permission to perform this action on this repository",
-        ));
-    }
-
-    // Repository write authorization.
+    // Repository write authorization (#2603 G1).
     //
     // The `/uploads` routes are nested under `auth_middleware` only, not
     // `repo_visibility_middleware`, and the target repo is named in the JSON
-    // body rather than the URL path -- so the repo-scope (#504) and
-    // fine-grained permission (#817) gates that protect every other write
-    // path never see this request. Apply the same decision here, at the single
-    // point where the cross-tenant write would originate, right after the repo
-    // is resolved (the 404-for-unknown-repo behaviour above is unchanged).
-    //
-    // Only consult the permission service for a non-admin caller that is in
-    // token scope for the repo; admins bypass and out-of-scope tokens are
-    // denied without a DB round-trip. Fail closed (503) on a permission lookup
-    // error, matching `repo_visibility_middleware`.
-    let (has_rules, has_write, has_admin) = if auth.is_admin || !auth.can_access_repo(repo.0) {
-        (false, false, false)
-    } else {
-        let has_rules = state
-            .permission_service
-            .has_any_rules_for_target("repository", repo.0)
-            .await
-            .map_err(|_| {
-                tracing::error!("permission check failed: database unreachable");
-                map_err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "permission service temporarily unavailable",
-                )
-            })?;
-        if has_rules {
-            let has_write = state
-                .permission_service
-                .check_permission(auth.user_id, "repository", repo.0, "write", false)
-                .await
-                .unwrap_or(false);
-            let has_admin = state
-                .permission_service
-                .check_permission(auth.user_id, "repository", repo.0, "admin", false)
-                .await
-                .unwrap_or(false);
-            (true, has_write, has_admin)
-        } else {
-            (false, false, false)
-        }
-    };
-
-    if !session_write_authorized(&auth, repo.0, has_rules, has_write, has_admin) {
-        return Err(map_err(
-            StatusCode::FORBIDDEN,
-            "You do not have permission to perform this action on this repository",
-        ));
-    }
+    // body rather than the URL path -- so the repo-scope (#504) and per-action
+    // permission gates that protect every other write path never see this
+    // request. Route the `write` decision through the single canonical
+    // choke-point (`check_repository_action`), DENY-BY-DEFAULT: opening a
+    // session is a write, so `is_public` never satisfies it and a rules-less
+    // repository does not fall open — the caller must hold the `write` action
+    // (via role assignment, an allowing rule, or `admin`). Admins bypass inside
+    // the choke-point; the token repo-scope (#504) is enforced first. A DB
+    // error fails closed (503), matching `repo_visibility_middleware`.
+    require_repo_action(&auth, repo_id, "write", &state.permission_service)
+        .await
+        .map_err(IntoResponse::into_response)?;
 
     let is_replication = super::is_replication_request(&headers);
     let replication_metadata = replication_session_metadata_from_request(&headers, &req);
@@ -459,9 +329,9 @@ async fn upload_chunk(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
-    // Token action-scope ceiling (GHSA-5f2q). Appending a chunk is a write and
-    // must require the `write` scope, matching the direct-write path.
-    auth.require_scope("write")
+    // Token action-scope ceiling (GHSA-5f2q). Appending a chunk is an artifact
+    // write and must require `write:artifacts`, matching the direct-write path.
+    auth.require_scope("write:artifacts")
         .map_err(IntoResponse::into_response)?;
 
     let user_id = auth.user_id;
@@ -483,6 +353,20 @@ async fn upload_chunk(
     let session = UploadService::get_session(&state.db, session_id, Some(user_id))
         .await
         .map_err(map_upload_err)?;
+
+    // #2603 G1: re-check repository write authorization on every chunk. Session
+    // creation authorized the caller, but a role revocation (or a repo turning
+    // private) between `create_session` and the last chunk must stop further
+    // writes — the session owner cannot keep appending data it may no longer
+    // publish. Routed through the same canonical choke-point.
+    require_repo_action(
+        &auth,
+        session.repository_id,
+        "write",
+        &state.permission_service,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     let chunk_index = (start / session.chunk_size as i64) as i32;
 
@@ -614,18 +498,48 @@ async fn complete(
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
     // Token action-scope ceiling (GHSA-5f2q). Finalizing a session commits the
-    // artifact (a write) and must require the `write` scope, matching the
-    // direct-write path.
-    auth.require_scope("write")
+    // artifact (an artifact write) and must require `write:artifacts`, matching
+    // the direct-write path.
+    auth.require_scope("write:artifacts")
         .map_err(IntoResponse::into_response)?;
 
     let user_id = auth.user_id;
     let is_replication_request = super::is_replication_request(&headers);
 
-    // C3: Verify user owns this session
+    // C3: Verify user owns this session.
+    //
+    // complete_session takes the completion lease (pending/in_progress ->
+    // 'committing' with a state token) before verifying chunks/size/checksum,
+    // so a duplicate complete request — even one routed to another replica —
+    // gets a conflict here instead of a second storage copy + artifact
+    // upsert. Everything below runs under that lease and the terminal
+    // transition is token-guarded.
     let session = UploadService::complete_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
+    let commit_renewal = UploadService::spawn_commit_lease_renewal(state.db.clone(), &session);
+
+    // #2603 G1: re-check repository write authorization before committing the
+    // artifact. Finalizing a session is the actual write, so access revoked
+    // after the chunks were staged must still block the commit. Routed through
+    // the same canonical choke-point.
+    //
+    // A denial (or a transient permission-service error) here is a failure
+    // *after* the lease was taken, so it must release the lease like every
+    // other failure path below. Returning while the session is still
+    // `committing` would wedge it for the full lease TTL: retries get "already
+    // in progress" and cancel refuses to touch a live committer.
+    if let Err(e) = require_repo_action(
+        &auth,
+        session.repository_id,
+        "write",
+        &state.permission_service,
+    )
+    .await
+    {
+        UploadService::release_commit_lease(&state.db, &session).await;
+        return Err(e.into_response());
+    }
 
     // Resolve the *repo-scoped* storage backend and use a content-addressable
     // key, matching how non-chunked uploads work (issue #1168 part 3).
@@ -642,23 +556,36 @@ async fn complete(
         &session.checksum_sha256,
     );
 
-    let repo = crate::services::repository_service::RepositoryService::new(state.db.clone())
+    let repo = match crate::services::repository_service::RepositoryService::new(state.db.clone())
         .get_by_id(session.repository_id)
         .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    {
+        Ok(repo) => repo,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+    let storage = match state.storage_for_repo(&repo.storage_location()) {
+        Ok(storage) => storage,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
 
     let temp_path = std::path::PathBuf::from(&session.temp_file_path);
 
     // C1: Use put_file to stream from disk instead of reading the entire file
     // into memory. The default implementation still reads into memory, but
     // backends can override for true streaming (S3 multipart, etc.).
-    storage
-        .put_file(&storage_key, &temp_path)
-        .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    //
+    // A storage failure is retryable — the temp file is still on disk — so
+    // release the commit lease and let the client re-issue the complete.
+    if let Err(e) = storage.put_file(&storage_key, &temp_path).await {
+        UploadService::release_commit_lease(&state.db, &session).await;
+        return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
 
     // #2588: packages pushed through the generic chunked flow must still
     // surface format metadata (the native format routes parse it at upload
@@ -692,7 +619,76 @@ async fn complete(
     // repositories keep their existing behaviour (version may be NULL).
     let derived_version = completed_format_artifact_version(&session, &repo.format);
     let artifact_version = derived_version.as_deref();
-    let artifact_id: Uuid = sqlx::query_scalar(
+
+    // #2516 S2: atomic quota admission for the chunked path, in the same
+    // transaction as the artifact INSERT. The session-create quota check is
+    // an unlocked best-effort preflight, so two concurrent near-limit
+    // sessions could both pass it and both land here (#2523's over-admission
+    // race, which the direct-write path closed in `finalize_upload` but this
+    // handler never did). `check_quota_locked` serializes same-repo
+    // admissions on the usage-ledger row and decides off its O(1) counters;
+    // the artifact INSERT below runs in the same transaction while that lock
+    // is held, so migration 182's trigger charges the admitted bytes before
+    // commit. Replication sessions keep their documented exemption (artifacts
+    // that legitimately predate a quota change must still replicate; the
+    // background reconciler folds their bytes into the ledger).
+    //
+    // Every failure from here on is terminal for the commit lease: the temp
+    // file was already removed after the storage copy, so a retry could not
+    // re-verify the payload. Fail the session under its token rather than
+    // leaving it wedged in `committing` for the whole staleness window.
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("could not open the artifact transaction: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+    if !is_replication_request {
+        let admission =
+            match crate::services::repository_service::RepositoryService::new(state.db.clone())
+                .check_quota_locked(
+                    &mut tx,
+                    session.repository_id,
+                    &session.artifact_path,
+                    session.total_size,
+                )
+                .await
+            {
+                Ok(admission) => admission,
+                Err(e) => {
+                    drop(tx);
+                    UploadService::fail_committing(
+                        &state.db,
+                        &session,
+                        &format!("quota admission failed: {e}"),
+                    )
+                    .await;
+                    return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+                }
+            };
+        if !admission.allowed {
+            // Drop `tx` (rolls back). The stored blob is content-addressed;
+            // if this upload orphaned it, storage GC reclaims it.
+            drop(tx);
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                "repository storage quota exceeded",
+            )
+            .await;
+            return Err(map_err(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "Repository storage quota exceeded",
+            ));
+        }
+    }
+    let inserted_artifact_id = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
                                checksum_sha256, content_type, storage_key, uploaded_by)
@@ -713,9 +709,30 @@ async fn complete(
     .bind(&session.content_type)
     .bind(&storage_key)
     .bind(user_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .fetch_one(&mut *tx)
+    .await;
+    let artifact_id: Uuid = match inserted_artifact_id {
+        Ok(id) => id,
+        Err(e) => {
+            drop(tx);
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("artifact upsert failed: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+    if let Err(e) = tx.commit().await {
+        UploadService::fail_committing(
+            &state.db,
+            &session,
+            &format!("artifact commit failed: {e}"),
+        )
+        .await;
+        return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
 
     if let (Some(format), Some(metadata)) = (
         session.artifact_metadata_format.as_deref(),
@@ -726,10 +743,18 @@ async fn complete(
             .clone()
             .unwrap_or_else(|| serde_json::json!({}));
         let artifact_service = state.create_artifact_service(storage.clone());
-        artifact_service
+        if let Err(e) = artifact_service
             .set_metadata(artifact_id, format, metadata, properties)
             .await
-            .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        {
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("artifact metadata write failed: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
     } else if let Some(prefix) = &format_header_prefix {
         // #2588: extract RPM header metadata for generically-pushed packages,
         // mirroring what the native RPM upload route records. Best-effort:
@@ -755,7 +780,7 @@ async fn complete(
             .try_create_or_update_from_artifact(
                 session.repository_id,
                 &package_name,
-                package_version,
+                &package_version,
                 session.total_size,
                 &session.checksum_sha256,
                 completed_package_description(&session),
@@ -763,6 +788,16 @@ async fn complete(
             )
             .await;
     }
+
+    // Terminal transition, token-guarded. A lost lease here means the commit
+    // took longer than the 6h staleness window and a newer complete request
+    // reclaimed the session — the artifact upsert above is idempotent, so
+    // the only consequence is that the newer owner also finalizes.
+    let finalize_result = UploadService::finalize_completed(&state.db, &session).await;
+    settle_completed_session(&state.db, &session, finalize_result)
+        .await
+        .map_err(map_upload_err)?;
+    drop(commit_renewal);
 
     tracing::info!(
         "Finalized chunked upload {} -> artifact {} ({}B, sha256:{})",
@@ -882,6 +917,43 @@ fn map_upload_err(e: UploadError) -> Response {
     )
 }
 
+/// Finish the post-artifact session transition without reporting success while
+/// the session still appears active. A database failure here happens after the
+/// artifact transaction committed and the temp file was removed, so replay is
+/// no longer safe: token-fence the session to `failed`, matching the existing
+/// post-commit metadata-failure policy, and propagate the database error.
+async fn settle_completed_session(
+    db: &sqlx::PgPool,
+    session: &upload_service::UploadSession,
+    finalize_result: Result<bool, UploadError>,
+) -> Result<(), UploadError> {
+    match finalize_result {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::warn!(
+                session = %session.id,
+                "chunked upload finalized but its completion lease was lost; \
+                 a newer complete request owns the session"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(
+                session = %session.id,
+                error = %e,
+                "failed to mark upload session completed"
+            );
+            UploadService::fail_committing(
+                db,
+                session,
+                &format!("artifact committed but session completion update failed: {e}"),
+            )
+            .await;
+            Err(e)
+        }
+    }
+}
+
 /// Map any displayable error to an HTTP error response.
 fn map_err(status: StatusCode, e: impl std::fmt::Display) -> Response {
     (
@@ -889,28 +961,6 @@ fn map_err(status: StatusCode, e: impl std::fmt::Display) -> Response {
         axum::Json(serde_json::json!({"error": e.to_string()})),
     )
         .into_response()
-}
-
-/// Pure authorization decision for chunked upload-session creation, mirroring
-/// the non-admin RBAC write gate enforced by `repo_visibility_middleware`.
-///
-/// - Admins always pass (any rules state).
-/// - Non-admins on a repository with no permission rules fall through (allowed).
-/// - Non-admins on a rules-bearing repository must hold the `write` action or
-///   the `admin` action (which implies all actions).
-fn upload_write_decision(
-    is_admin: bool,
-    has_rules: bool,
-    has_write: bool,
-    has_admin: bool,
-) -> bool {
-    if is_admin {
-        return true;
-    }
-    if !has_rules {
-        return true;
-    }
-    has_write || has_admin
 }
 
 /// Build the rejection for a direct upload-session create against a
@@ -1093,17 +1143,40 @@ fn maven_package_metadata_from_artifact_metadata(
     Some(catalog)
 }
 
-fn completed_package_catalog_entry<'a>(
-    session: &'a upload_service::UploadSession,
+fn completed_package_catalog_entry(
+    session: &upload_service::UploadSession,
     format: &crate::models::repository::RepositoryFormat,
-) -> Option<(String, &'a str)> {
-    let version = completed_artifact_version(session)?;
+) -> Option<(String, String)> {
+    use crate::models::repository::RepositoryFormat;
     // #2723: Maven/Gradle grouped listings key the catalog `packages` row on
     // `groupId:artifactId`. Prefer the replicated POM metadata's coordinates;
     // otherwise, for a Maven/Gradle repo, derive the grouped name from the
     // artifact path so a generically-pushed asset joins the same component
     // instead of landing under a bare artifactId/filename.
-    let name = replicated_maven_artifact_metadata(session)
+    //
+    // #3064: for Maven/Gradle repos the catalog `package_versions.version`
+    // must come from the same GAV coordinates as the name — the replicated POM
+    // metadata's version when present, else the version segment of the
+    // artifact path. Requiring an explicit create-session version dropped
+    // chunked Maven uploads that carry their coordinates only in the path.
+    let metadata = replicated_maven_artifact_metadata(session);
+    let maven_layout = matches!(format, RepositoryFormat::Maven | RepositoryFormat::Gradle);
+    let version = if maven_layout {
+        metadata
+            .and_then(|m| m.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                crate::formats::maven::MavenHandler::parse_coordinates(&session.artifact_path)
+                    .ok()
+                    .map(|coords| coords.version)
+            })
+            .or_else(|| completed_artifact_version(session).map(str::to_string))
+    } else {
+        completed_artifact_version(session).map(str::to_string)
+    }?;
+    let name = metadata
         .and_then(maven_package_name_from_metadata)
         .or_else(|| maven_grouped_name_for_format(session, format))
         .unwrap_or_else(|| completed_artifact_name(session).to_string());
@@ -1255,12 +1328,13 @@ fn replication_session_metadata_from_request<'a>(
 mod tests {
     use super::*;
 
-    /// Cross-tenant authz guard (xtenant-write-authz-systemic). `session_write_authorized`
-    /// (and `upload_write_decision`) fall OPEN when the target repo has no
-    /// fine-grained permission rules (`!has_rules`), so `create_session` must
-    /// ALSO enforce the rule-independent tenant gate `require_repo_write_access`
-    /// (is_public + role_assignments membership). String-grep because the handler
-    /// needs a real DB to run.
+    /// Cross-tenant authz guard (xtenant-write-authz-systemic). `create_session`
+    /// must enforce the tenant/token gate `require_repo_write_access` (visibility
+    /// plus role-assignment membership plus the #504 token scope) in addition to
+    /// the deny-by-default `require_repo_action` (#2603 G1) action choke-point,
+    /// so a non-member non-admin can never open a session against another
+    /// tenant's repository regardless of fine-grained rule existence. String-grep
+    /// because the handler needs a real DB to run.
     #[test]
     fn test_create_session_enforces_tenant_gate() {
         let source = include_str!("upload.rs");
@@ -1335,7 +1409,7 @@ mod tests {
     // read-scoped token whose OWNER holds repo RBAC write could push artifacts
     // via /uploads/*, sidestepping the token's action ceiling. Each verb must
     // call `require_scope` with the same scope its direct-path twin uses:
-    //   create_session / upload_chunk / complete -> "write"
+    //   create_session / upload_chunk / complete -> "write:artifacts"
     //   cancel                                    -> "delete"
     // The handlers need a real DB to execute, so these are string-grep gates
     // (mirroring `test_create_session_enforces_tenant_gate`), plus a behavioral
@@ -1357,24 +1431,24 @@ mod tests {
     #[test]
     fn create_session_requires_write_scope() {
         assert!(
-            handler_body("create_session").contains("require_scope(\"write\")"),
-            "create_session must enforce the token `write` action-scope (GHSA-5f2q)"
+            handler_body("create_session").contains("require_scope(\"write:artifacts\")"),
+            "create_session must enforce the token `write:artifacts` action-scope (GHSA-5f2q, #2989)"
         );
     }
 
     #[test]
     fn upload_chunk_requires_write_scope() {
         assert!(
-            handler_body("upload_chunk").contains("require_scope(\"write\")"),
-            "upload_chunk must enforce the token `write` action-scope (GHSA-5f2q)"
+            handler_body("upload_chunk").contains("require_scope(\"write:artifacts\")"),
+            "upload_chunk must enforce the token `write:artifacts` action-scope (GHSA-5f2q, #2989)"
         );
     }
 
     #[test]
     fn complete_requires_write_scope() {
         assert!(
-            handler_body("complete").contains("require_scope(\"write\")"),
-            "complete must enforce the token `write` action-scope (GHSA-5f2q)"
+            handler_body("complete").contains("require_scope(\"write:artifacts\")"),
+            "complete must enforce the token `write:artifacts` action-scope (GHSA-5f2q, #2989)"
         );
     }
 
@@ -1409,136 +1483,56 @@ mod tests {
     fn read_scoped_token_denied_upload_write_and_delete() {
         // Read-scoped token (its owner may hold repo write) -> the upload verbs'
         // scope gate denies both write and delete -> 403.
-        let read = auth_with_scopes(vec!["read"]);
-        assert!(
-            read.require_scope("write").is_err(),
-            "read-scoped token must be denied the upload write scope"
-        );
-        assert!(
-            read.require_scope("delete").is_err(),
-            "read-scoped token must be denied the cancel delete scope"
-        );
-    }
-
-    #[test]
-    fn write_scoped_token_allowed_upload_write() {
-        // Properly write-scoped token -> the write verbs remain 2xx (unchanged).
-        let write = auth_with_scopes(vec!["write"]);
-        assert!(
-            write.require_scope("write").is_ok(),
-            "write-scoped token must retain upload access (no behavior change)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // session_write_authorized (pure write-authorization decision)
-    // -----------------------------------------------------------------------
-
-    /// Build an `AuthExtension` for the pure-helper tests. `allowed` is the
-    /// token repo-scope (`None` = unrestricted, matching a JWT login).
-    fn auth_for(is_admin: bool, allowed: Option<Vec<Uuid>>) -> AuthExtension {
-        AuthExtension {
-            user_id: Uuid::new_v4(),
-            username: "tester".to_string(),
-            email: "tester@example.test".to_string(),
-            is_admin,
-            is_api_token: allowed.is_some(),
-            is_service_account: false,
-            scopes: None,
-            allowed_repo_ids: crate::models::access_scope::AccessScope::from(allowed),
-            iat_ms: None,
+        for read in [
+            auth_with_scopes(vec!["read"]),
+            auth_with_scopes(vec!["read:artifacts"]),
+        ] {
+            assert!(
+                read.require_scope("write:artifacts").is_err(),
+                "read-scoped token must be denied the upload write scope"
+            );
+            assert!(
+                read.require_scope("delete").is_err(),
+                "read-scoped token must be denied the cancel delete scope"
+            );
         }
     }
 
     #[test]
-    fn session_write_authorized_denies_token_scoped_out() {
-        let repo = Uuid::new_v4();
-        let other = Uuid::new_v4();
-        // Token restricted to a different repo: denied before any rule check.
-        let auth = auth_for(false, Some(vec![other]));
-        assert!(!session_write_authorized(&auth, repo, false, false, false));
-        // Even an admin token is bound by its repo scope.
-        let admin = auth_for(true, Some(vec![other]));
-        assert!(!session_write_authorized(&admin, repo, false, false, false));
+    fn write_scoped_token_allowed_upload_write() {
+        // Global bare `write` still covers the artifact-specific requirement
+        // via the parent rule (#2989) -> the write verbs remain 2xx.
+        let write = auth_with_scopes(vec!["write"]);
+        assert!(
+            write.require_scope("write:artifacts").is_ok(),
+            "bare write-scoped token must retain upload access (no regression)"
+        );
     }
 
     #[test]
-    fn session_write_authorized_allows_admin() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(true, None);
-        // Admin bypasses fine-grained rules even when the user holds nothing.
-        assert!(session_write_authorized(&auth, repo, true, false, false));
-    }
-
-    #[test]
-    fn session_write_authorized_allows_when_no_rules() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(false, None);
-        // No fine-grained rules -> default access model (fall-through).
-        assert!(session_write_authorized(&auth, repo, false, false, false));
-    }
-
-    #[test]
-    fn session_write_authorized_allows_with_write_grant() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(false, None);
-        assert!(session_write_authorized(&auth, repo, true, true, false));
-    }
-
-    #[test]
-    fn session_write_authorized_allows_with_admin_action() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(false, None);
-        assert!(session_write_authorized(&auth, repo, true, false, true));
-    }
-
-    #[test]
-    fn session_write_authorized_denies_rules_without_grant() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(false, None);
-        // Rules exist but the user holds neither write nor admin: denied.
-        assert!(!session_write_authorized(&auth, repo, true, false, false));
+    fn artifact_write_scoped_token_allowed_upload_write() {
+        // #2989: a repo-scoped token minted with the colon-form
+        // `write:artifacts` must pass the upload verbs' scope gate...
+        let write = auth_with_scopes(vec!["write:artifacts"]);
+        assert!(
+            write.require_scope("write:artifacts").is_ok(),
+            "write:artifacts token must be able to upload"
+        );
+        // ...without gaining the bare `write` used by non-artifact
+        // (settings-class) handlers.
+        assert!(
+            write.require_scope("write").is_err(),
+            "write:artifacts token must not satisfy the bare write scope"
+        );
     }
 
     // -----------------------------------------------------------------------
-    // artifact_name_from_path
+    // Repository write authorization for the chunked-upload path is now the
+    // single canonical `require_repo_action` -> `check_repository_action`
+    // choke-point (#2603 G1). Its per-action decision is unit-tested with a DB
+    // in `services::permission_service`, and the handler wiring is covered by
+    // the DB-backed `create_session_*` tests below.
     // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // upload_write_decision (#817 parity with repo_visibility_middleware)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_upload_write_decision_admin_always_allowed() {
-        // Admins bypass the check regardless of rules/actions.
-        assert!(upload_write_decision(true, false, false, false));
-        assert!(upload_write_decision(true, true, false, false));
-        assert!(upload_write_decision(true, true, true, true));
-    }
-
-    #[test]
-    fn test_upload_write_decision_non_admin_no_rules_allowed() {
-        // A repository with no permission rules falls through unchanged.
-        assert!(upload_write_decision(false, false, false, false));
-    }
-
-    #[test]
-    fn test_upload_write_decision_non_admin_rules_with_write_allowed() {
-        assert!(upload_write_decision(false, true, true, false));
-    }
-
-    #[test]
-    fn test_upload_write_decision_non_admin_rules_with_admin_action_allowed() {
-        // The `admin` action implies all actions (including write).
-        assert!(upload_write_decision(false, true, false, true));
-    }
-
-    #[test]
-    fn test_upload_write_decision_non_admin_rules_neither_denied() {
-        // Release/promotion-only repo: rules exist but caller holds neither
-        // write nor admin -> denied.
-        assert!(!upload_write_decision(false, true, false, false));
-    }
 
     // -----------------------------------------------------------------------
     // reject_session_if_promotion_only (#817 parity with direct upload path)
@@ -1648,6 +1642,8 @@ mod tests {
             temp_file_path: "/tmp/upload-session".to_string(),
             status: "completed".to_string(),
             error_message: None,
+            state_token: None,
+            committing_expires_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
@@ -1687,7 +1683,7 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
-            Some(("large-check".to_string(), "20260603T082854Z"))
+            Some(("large-check".to_string(), "20260603T082854Z".to_string()))
         );
     }
 
@@ -1704,12 +1700,56 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
-            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+            Some((
+                "org.example.ak.maven:ak-core".to_string(),
+                "1.0.0".to_string()
+            ))
         );
         // A non-Maven repo keeps the bare artifact name.
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
-            Some(("ak-core-1.0.0.jar".to_string(), "1.0.0"))
+            Some(("ak-core-1.0.0.jar".to_string(), "1.0.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_derives_version_from_gav_path() {
+        // #3064: a chunked Maven upload without an explicit create-session
+        // version must still produce a catalog row — name AND version come
+        // from the GAV path.
+        let session = test_upload_session("com/example/demo/app/1.2.3/app-1.2.3.jar", None, None);
+
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
+            Some(("com.example.demo:app".to_string(), "1.2.3".to_string()))
+        );
+        // A Generic repo keeps the legacy behaviour: no explicit version, no
+        // catalog row.
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
+            None
+        );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_path_version_beats_explicit_for_maven() {
+        // #3064: for Maven/Gradle repos the GAV path is the authoritative
+        // coordinate; an explicit create-session version that disagrees with
+        // the path must not split the component across two version rows.
+        let session = test_upload_session(
+            "com/example/demo/app/1.2.3/app-1.2.3.jar",
+            Some("app"),
+            Some("example"),
+        );
+
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
+            Some(("com.example.demo:app".to_string(), "1.2.3".to_string()))
+        );
+        // Non-Maven formats keep the explicit version as-is.
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
+            Some(("app".to_string(), "example".to_string()))
         );
     }
 
@@ -1735,7 +1775,10 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
-            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+            Some((
+                "org.example.ak.maven:ak-core".to_string(),
+                "1.0.0".to_string()
+            ))
         );
         assert_eq!(
             completed_package_description(&session),
@@ -1767,7 +1810,10 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
-            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+            Some((
+                "org.example.ak.maven:ak-core".to_string(),
+                "1.0.0".to_string()
+            ))
         );
         assert_eq!(completed_package_description(&session), None);
         assert_eq!(completed_package_metadata(&session), None);
@@ -3164,12 +3210,22 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_denies_non_admin_without_grant_when_rules_exist() {
-        // (b) The exploit case: a non-admin whose target repo HAS fine-grained
-        // rules, but holds no grant for that user, is denied -> 403. (Mirrors a
-        // cross-tenant write attempt into a repo gated by permission rules.)
+        // (b) The exploit case: a NON-MEMBER (no role assignment, no rule for
+        // them) targeting a repo that has fine-grained rules for someone else is
+        // denied -> 403. Mirrors a cross-tenant write attempt. Under the
+        // deny-by-default `check_repository_action` choke-point (#2603 G1) a
+        // caller needs an action-granting role or an allowing rule; a rule for a
+        // different principal grants this caller nothing.
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
+        // Make the fixture user a pure non-member: drop the developer role
+        // assignment that `Fixture::setup` granted, so the only authz signal is
+        // the (absent) per-principal grant.
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
         // Rules exist for the repo, but they grant another principal, not the
         // caller.
         grant_repo_permission(&f.pool, f.repo_id, Uuid::new_v4(), &["read", "write"]).await;
@@ -3186,7 +3242,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "non-admin without a grant on a ruled repo must be denied"
+            "non-member on a ruled repo must be denied"
         );
         // No session must have been created for this repo.
         let count: i64 =
@@ -3358,6 +3414,192 @@ mod tests {
             .bind(session_id)
             .execute(&f.pool)
             .await;
+        f.teardown().await;
+    }
+
+    /// Stage a verifiable session directly in the database (temp file on disk,
+    /// size and checksum consistent) so `complete` gets past
+    /// `complete_session` — and therefore past the point where the commit
+    /// lease is taken — without needing an authorized create/PATCH first.
+    async fn stage_completable_session(
+        f: &tdh::Fixture,
+        payload: &[u8],
+    ) -> (Uuid, std::path::PathBuf) {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let checksum = hex::encode(hasher.finalize());
+
+        let dir = std::env::temp_dir().join("ak_upload_authz_release_test");
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let temp_path = dir.join(format!("staged-{}", Uuid::new_v4()));
+        tokio::fs::write(&temp_path, payload).await.expect("write");
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO upload_sessions \
+                 (user_id, repository_id, repository_key, artifact_path, \
+                  total_size, chunk_size, total_chunks, completed_chunks, \
+                  bytes_received, checksum_sha256, temp_file_path, status) \
+             VALUES ($1, $2, $3, 'authz/staged.bin', $4, 1048576, 1, 1, $4, $5, $6, \
+                     'in_progress') \
+             RETURNING id",
+        )
+        .bind(f.user_id)
+        .bind(f.repo_id)
+        .bind(&f.repo_key)
+        .bind(payload.len() as i64)
+        .bind(&checksum)
+        .bind(temp_path.to_string_lossy().as_ref())
+        .fetch_one(&f.pool)
+        .await
+        .expect("insert staged session");
+
+        (session_id, temp_path)
+    }
+
+    /// A database error from the final `committing -> completed` update happens
+    /// after the artifact is durable and the temp file is gone. It must produce
+    /// a non-success response and leave a terminal session instead of logging
+    /// the error and returning 200 with the row still `committing`.
+    #[tokio::test]
+    async fn finalize_database_error_marks_committing_session_failed() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"post-artifact-finalize-db-error";
+        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+        let session = UploadService::complete_session(&f.pool, session_id, f.user_id)
+            .await
+            .expect("claim completion lease");
+
+        // Synthesize the error result from finalize_completed while keeping the
+        // fixture pool healthy so the token-fenced failure transition itself is
+        // observable.
+        let err = settle_completed_session(
+            &f.pool,
+            &session,
+            Err(UploadError::Database(sqlx::Error::PoolClosed)),
+        )
+        .await
+        .expect_err("a failed terminal update must not report success");
+        assert_eq!(
+            map_upload_err(err).status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the handler must not return 200 after losing the terminal update"
+        );
+
+        let (status, token, deadline, message): (
+            String,
+            Option<Uuid>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, state_token, committing_expires_at, error_message \
+             FROM upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read terminal session state");
+        assert_eq!(status, "failed");
+        assert!(
+            token.is_none(),
+            "terminal failure must clear the lease token"
+        );
+        assert!(
+            deadline.is_none(),
+            "terminal failure must clear the lease deadline"
+        );
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("session completion update failed")),
+            "terminal failure must explain the post-artifact database error"
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    fn complete_req(session_id: Uuid) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/complete", session_id))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// Access revoked between staging the chunks and finalizing must deny the
+    /// commit *and* release the completion lease. Returning while the session
+    /// is still `committing` would wedge it for the full 6h lease TTL: retries
+    /// get "completion already in progress" and cancel refuses to touch a live
+    /// committer.
+    #[tokio::test]
+    async fn complete_releases_commit_lease_when_authorization_is_revoked() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"authz-revoked-mid-upload";
+        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+
+        // Revoke: drop the fixture's role assignment and leave only a rule
+        // that grants a different principal, so the caller is a non-member on
+        // a ruled repo (403 under the deny-by-default choke-point).
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
+        grant_repo_permission(&f.pool, f.repo_id, Uuid::new_v4(), &["read", "write"]).await;
+        f.state.permission_service.invalidate_cache();
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, _body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a revoked writer must not be able to commit a staged session"
+        );
+
+        let (session_status, token): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT status, state_token FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read session state");
+        assert_eq!(
+            session_status, "in_progress",
+            "a denied commit must release the lease, not wedge the session in 'committing'"
+        );
+        assert!(token.is_none(), "a released lease must clear its token");
+
+        // Not wedged: once access is restored the same session completes.
+        grant_repo_permission(&f.pool, f.repo_id, f.user_id, &["read", "write"]).await;
+        f.state.permission_service.invalidate_cache();
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the released session must still be completable; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        delete_repo_permissions(&f.pool, f.repo_id).await;
         f.teardown().await;
     }
 

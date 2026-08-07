@@ -406,9 +406,44 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
 }
 
 /// Build a cacheable response with ETag and Cache-Control headers.
-fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) -> Response {
+///
+/// Takes `impl Into<Bytes>` so a proxied upstream body (already a [`Bytes`])
+/// rides into the response without the extra whole-body `to_vec()` copy the
+/// remote branches used to make, while locally generated `Vec<u8>` documents
+/// convert for free (#2915).
+async fn cacheable_response(
+    body: impl Into<Bytes>,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Response {
+    cacheable_response_coded(body, content_type, None, headers).await
+}
+
+/// [`cacheable_response`] for a body that may ALREADY carry a content coding.
+///
+/// `upstream_content_encoding` is the `Content-Encoding` the body arrived with
+/// (proxied Remote metadata). Two things follow from it (#2915):
+///
+///  1. It must be forwarded verbatim. The proxy's HTTP client no longer lets
+///     reqwest decode upstream bodies (see `http_client::base_client_builder`),
+///     so an undeclared coded body would have the client write compressed bytes
+///     to disk as if they were JSON.
+///  2. Our own gzip pass below MUST be skipped. Re-gzipping a body that is
+///     already `Content-Encoding: gzip` (as some channel mirrors serve
+///     `repodata.json`) produces doubly-gzipped bytes declared as singly
+///     gzipped — a body no client can read.
+///
+/// `None` means "identity body, compress at will" and is what every locally
+/// generated document passes.
+async fn cacheable_response_coded(
+    body: impl Into<Bytes>,
+    content_type: &str,
+    upstream_content_encoding: Option<&str>,
+    headers: &HeaderMap,
+) -> Response {
     use crate::api::handlers::cache_headers;
 
+    let body: Bytes = body.into();
     let etag = compute_etag(&body);
 
     if let Some(not_modified) = check_conditional_request(headers, &etag) {
@@ -417,29 +452,55 @@ fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) ->
 
     // Conda-specific: serve gzip-compressed JSON responses when the client
     // advertises gzip (Conda clients commonly don't support zstd/bz2 for
-    // repodata, so gzip is a useful middle ground).
-    if content_type == "application/json" && accepts_gzip(headers) {
-        let compressed = gzip_compress(&body);
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, content_type)
-            .header(CONTENT_ENCODING, "gzip")
-            .header(CONTENT_LENGTH, compressed.len().to_string())
-            .header(ETAG, &etag)
-            .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
-            .header("Vary", "Accept-Encoding")
-            .body(Body::from(compressed))
-            .unwrap();
+    // repodata, so gzip is a useful middle ground). Never for an
+    // already-content-coded body — see the doc comment above.
+    if content_type == "application/json"
+        && upstream_content_encoding.is_none()
+        && accepts_gzip(headers)
+    {
+        // #2915: repodata documents reach tens of MiB (conda-forge's
+        // linux-64/noarch channels), and gzipping one is a CPU-bound
+        // multi-hundred-millisecond stall. Run it on the blocking pool so it
+        // cannot block the tokio worker (and with it every other request that
+        // worker is driving). `Bytes` clones are refcount bumps, so handing the
+        // body to the blocking task costs nothing.
+        let to_compress = body.clone();
+        match tokio::task::spawn_blocking(move || gzip_compress(&to_compress)).await {
+            Ok(compressed) => {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, content_type)
+                    .header(CONTENT_ENCODING, "gzip")
+                    .header(CONTENT_LENGTH, compressed.len().to_string())
+                    .header(ETAG, &etag)
+                    .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
+                    .header("Vary", "Accept-Encoding")
+                    .body(Body::from(compressed))
+                    .unwrap();
+            }
+            // A join error means the blocking task panicked or the runtime is
+            // shutting down. Compression is an optimization, not a correctness
+            // requirement: fall through and serve the identity body rather than
+            // failing a request that has all its bytes in hand.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "conda gzip offload failed; serving uncompressed body"
+                );
+            }
+        }
     }
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, body.len().to_string())
         .header(ETAG, &etag)
-        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
-        .body(Body::from(body))
-        .unwrap()
+        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL);
+    if let Some(encoding) = upstream_content_encoding {
+        builder = builder.header(CONTENT_ENCODING, encoding);
+    }
+    builder.body(Body::from(body)).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,29 +1249,52 @@ async fn channeldata_json(
         let body = serde_json::to_string_pretty(&channeldata)
             .unwrap()
             .into_bytes();
-        return Ok(cacheable_response(body, "application/json", &headers));
+        return Ok(cacheable_response(body, "application/json", &headers).await);
     }
 
-    // For remote repos, proxy channeldata from upstream
+    // For remote repos, proxy channeldata from upstream.
+    //
+    // #2915: two problems this branch used to have, both fixed the same way
+    // `serve_repodata` fixed them:
+    //
+    //  * The 8 MiB DEFAULT tier is far too small — conda-forge's
+    //    `channeldata.json` is a single document describing every package in
+    //    the channel and comfortably exceeds it — so the capped fetch ALWAYS
+    //    errored for the channel this endpoint matters most for.
+    //  * The error was then swallowed by `if let Ok(..)`, falling through to
+    //    the DB-only document below. For a freshly created Remote repo that is
+    //    an EMPTY channeldata served with 200, which a client reads as
+    //    authoritative ("this channel has no packages") instead of as the
+    //    upstream failure it actually is. Propagate with `?`.
+    //
+    // The LARGE tier is reserved against the process-wide buffered-metadata
+    // budget (#2684) because this endpoint is anonymously reachable on a public
+    // repo: the per-request cap bounds ONE buffer at 128 MiB, and only the
+    // budget bounds the SUM of concurrent buffers.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
-                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    "channeldata.json",
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                let (content, _ct, upstream_encoding, _budget_permit) =
+                    proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        upstream_url,
+                        "channeldata.json",
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    )
+                    .await?;
+                // `_budget_permit` is held until this function returns, i.e.
+                // across response construction (including the gzip pass), which
+                // is the window where the buffer is resident AND being copied.
+                // Same lifetime as the debian dists path (#2684).
+                return Ok(cacheable_response_coded(
+                    content,
+                    "application/json",
+                    upstream_encoding.as_deref(),
+                    &headers,
                 )
-                .await
-                {
-                    return Ok(cacheable_response(
-                        content.to_vec(),
-                        "application/json",
-                        &headers,
-                    ));
-                }
+                .await);
             }
         }
     }
@@ -1341,10 +1425,8 @@ async fn channeldata_json(
         .into_iter()
         .map(|(name, entry)| {
             let version = latest_versions.get(&name).cloned().unwrap_or_default();
-            let mut val = serde_json::json!({
-                "subdirs": entry.subdirs.into_iter().collect::<Vec<_>>(),
-                "version": version,
-            });
+            let subdirs: Vec<String> = entry.subdirs.into_iter().collect();
+            let mut val = build_channeldata_package_entry(&subdirs, &version);
             // Include optional fields when available
             if !entry.license.is_empty() {
                 val["license"] = serde_json::Value::String(entry.license);
@@ -1374,17 +1456,13 @@ async fn channeldata_json(
         })
         .collect();
 
-    let channeldata = serde_json::json!({
-        "channeldata_version": 1,
-        "packages": packages_json,
-        "subdirs": KNOWN_SUBDIRS,
-    });
+    let channeldata = build_channeldata_json(&packages_json);
 
     let body = serde_json::to_string_pretty(&channeldata)
         .unwrap()
         .into_bytes();
 
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,7 +1488,7 @@ async fn notices_json(
     });
 
     let body = serde_json::to_vec_pretty(&notices).unwrap();
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,7 +1538,7 @@ async fn run_exports_json(
     });
 
     let body = serde_json::to_vec_pretty(&response).unwrap();
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,7 +1569,7 @@ async fn patch_instructions_json(
     });
 
     let body = serde_json::to_vec_pretty(&response).unwrap();
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,33 +1642,61 @@ async fn serve_repodata(
         )
         .await?;
         let body = encoding.encode(&repodata)?;
-        return Ok(cacheable_response(body, ct, headers));
+        return Ok(cacheable_response(body, ct, headers).await);
     }
 
-    // For remote repos, proxy repodata from upstream
+    // For remote repos, proxy repodata from upstream. Real conda-forge
+    // repodata.json.zst commonly runs 20-30 MiB (e.g. noarch/osx-arm64), well
+    // past the 8 MiB DEFAULT_METADATA_MAX_BYTES ceiling used by most other
+    // formats' metadata proxying, so this uses the LARGE tier (128 MiB) the
+    // same way debian/npm/maven/pypi do for their oversized index documents.
+    //
+    // A fetch failure here must propagate to the client instead of silently
+    // falling through to `build_repodata` below: that fallback only reflects
+    // artifacts already cached in our own DB, so masking a real upstream
+    // failure (cap exceeded, upstream down, etc.) behind it would serve a
+    // valid-looking but empty/incomplete index and make the client believe
+    // there are no packages, rather than surfacing the actual problem.
+    //
+    // #2915: the 128 MiB buffer is reserved against the process-wide
+    // buffered-metadata budget (#2684) rather than taken unbudgeted. This
+    // endpoint is anonymously reachable on a public repo and re-buffers on every
+    // request (cache hits included), so the per-request cap alone bounds one
+    // buffer while N concurrent requests could still drive resident memory to
+    // N * 128 MiB; the budget bounds the sum. The buffered `Bytes` is then moved
+    // straight into the response instead of being copied via `to_vec()`.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
-                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    repo.id,
-                    repo_key,
-                    upstream_url,
-                    &upstream_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                let (content, _ct, upstream_encoding, _budget_permit) =
+                    proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    )
+                    .await?;
+                // `_budget_permit` is held until this function returns, i.e.
+                // across response construction (including the gzip pass) — the
+                // window where the buffer is both resident and being read.
+                // Matches the debian dists path (#2684).
+                return Ok(cacheable_response_coded(
+                    content,
+                    ct,
+                    upstream_encoding.as_deref(),
+                    headers,
                 )
-                .await
-                {
-                    return Ok(cacheable_response(content.to_vec(), ct, headers));
-                }
+                .await);
             }
         }
     }
 
     let repodata = build_repodata(&state.db, repo.id, repo_key, subdir, false).await?;
     let body = encoding.encode(&repodata)?;
-    Ok(cacheable_response(body, ct, headers))
+    Ok(cacheable_response(body, ct, headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,12 +1829,31 @@ async fn repodata_json_zst(
 ///
 /// Supports HTTP Range requests (`Accept-Ranges: bytes`) so clients can
 /// fetch only newly appended lines on subsequent requests.
+///
+/// Local repos only (#2915). The bootstrap JLAP's footer advertises `latest` =
+/// the BLAKE2b hash of the document [`build_repodata`] produces from our own DB
+/// rows, and that is only the document `repodata.json` actually serves for a
+/// Local repo. For a Remote repo `repodata.json` serves the UPSTREAM document,
+/// and for a Virtual repo the aggregation of its members' — so the advertised
+/// hash can never match what the client holds, the client concludes its cached
+/// index is stale on every single run, and it refetches the full
+/// `repodata.json` anyway (having paid for a JLAP round trip first). 404ing is
+/// the documented "no JLAP available" signal and sends the client straight to
+/// the full fetch, which is the outcome it would have reached regardless.
 async fn repodata_json_jlap(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    if repo.repo_type != RepositoryType::Local {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "JLAP incremental repodata is only available for local/hosted conda repositories; \
+             fetch repodata.json",
+        )
+            .into_response());
+    }
     let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
 
     // Serialize repodata identically to how repodata_json serves it
@@ -1864,7 +1989,7 @@ async fn current_repodata_json(
         .unwrap()
         .into_bytes();
 
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1894,11 +2019,52 @@ fn group_artifacts_by_name<'a>(
     by_name
 }
 
+/// CEP-16 sharded repodata is only built from artifacts already present in
+/// our own DB, scoped to *this* repository's id (see [`list_conda_artifacts`]) -
+/// it never proxies an upstream's real shard index and never aggregates
+/// members. For a Local repo that's exactly right: our DB is the source of
+/// truth. For anything else it isn't, and the failure mode is the same in every
+/// case - a syntactically valid but semantically empty (or incomplete) shard
+/// index served with 200, which a CEP-16-aware client treats as authoritative
+/// and will NOT fall back from, silently hiding every package:
+///
+///   * **Remote**: an upstream like conda-forge that has not yet been mirrored
+///     into our DB has no rows here at all.
+///   * **Virtual** (#2915): `list_conda_artifacts` is scoped to the virtual
+///     repo's own id, and a virtual repo owns no artifacts - its MEMBERS do. So
+///     a virtual conda repo always served an empty shard index, even though
+///     `repodata.json` for the same repo is correctly aggregated by
+///     [`build_virtual_repodata`].
+///   * **Staging / anything else**: a staging repo's own rows would in fact be
+///     authoritative, but 404ing is the conservative direction (the client
+///     falls back to `repodata.json`, which is complete for a hosted repo, so
+///     the only cost is the CEP-16 bandwidth saving). Failing closed also
+///     covers a `repo_type` this code does not know about — `RepoInfo::repo_type`
+///     is a raw string and `resolve_repo_by_key` yields an empty one when the
+///     column read fails.
+///
+/// Until sharded repodata is actually proxied/aggregated, only Local repos may
+/// answer here; everyone else 404s so clients (pixi, conda) take the documented
+/// fallback to `repodata.json`.
+#[allow(clippy::result_large_err)]
+fn reject_unsupported_sharding_repo_type(repo: &RepoInfo) -> Result<(), Response> {
+    if repo.repo_type != RepositoryType::Local {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Sharded repodata (CEP-16) is only available for local/hosted conda repositories; \
+             use repodata.json",
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
 async fn sharded_repodata_index(
     State(state): State<SharedState>,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    reject_unsupported_sharding_repo_type(&repo)?;
     let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
     let by_name = group_artifacts_by_name(&subdir_artifacts);
@@ -1950,6 +2116,7 @@ async fn sharded_repodata_shard(
     }
 
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    reject_unsupported_sharding_repo_type(&repo)?;
     let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
     let by_name = group_artifacts_by_name(&subdir_artifacts);
@@ -2202,16 +2369,13 @@ async fn build_repodata(
     // from the registry itself.
     let base_url = format!("/conda/{}/{}/", repo_key, subdir);
 
-    Ok(serde_json::json!({
-        "info": {
-            "subdir": subdir,
-            "base_url": base_url,
-        },
-        "packages": packages,
-        "packages.conda": packages_conda,
-        "removed": removed,
-        "repodata_version": 1,
-    }))
+    Ok(build_repodata_envelope(
+        subdir,
+        &base_url,
+        &packages,
+        &packages_conda,
+        &serde_json::json!(removed),
+    ))
 }
 
 /// Merge package maps from a source into an accumulator using first-writer-wins.
@@ -2346,16 +2510,13 @@ async fn build_virtual_repodata(
 
     let base_url = format!("/conda/{}/{}/", virtual_repo_key, subdir);
 
-    Ok(serde_json::json!({
-        "info": {
-            "subdir": subdir,
-            "base_url": base_url,
-        },
-        "packages": merged_packages,
-        "packages.conda": merged_packages_conda,
-        "removed": [],
-        "repodata_version": 1,
-    }))
+    Ok(build_repodata_envelope(
+        subdir,
+        &base_url,
+        &merged_packages,
+        &merged_packages_conda,
+        &serde_json::json!([]),
+    ))
 }
 
 /// Build merged channeldata.json for a virtual repository.
@@ -2423,6 +2584,21 @@ async fn build_virtual_channeldata(
 // GET /conda/{repo_key}/{subdir}/{filename} - Download package
 // ---------------------------------------------------------------------------
 
+/// `Content-Type` for a conda package download.
+///
+/// `.tar.bz2` is a tarball; `.conda` (a zip container) and anything else get the
+/// generic binary type. Shared by the hosted, Remote-proxied and Virtual arms of
+/// [`download_package`] so all three advertise the same type for the same
+/// filename — the Remote arm uses it as the fallback for when upstream omits a
+/// `Content-Type` of its own.
+fn conda_package_content_type(filename: &str) -> &'static str {
+    if filename.ends_with(".tar.bz2") {
+        "application/x-tar"
+    } else {
+        "application/octet-stream"
+    }
+}
+
 async fn download_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -2434,7 +2610,7 @@ async fn download_package(
     check_read_access(&state.db, auth.clone(), &repo).await?;
 
     // Look up artifact by path
-    let artifact_path = format!("{}/{}", subdir, filename);
+    let artifact_path = build_conda_artifact_path(&subdir, &filename);
 
     let artifact = sqlx::query!(
         r#"
@@ -2464,23 +2640,39 @@ async fn download_package(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("{}/{}", subdir, filename);
-                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                    // #2915 BLOCKER: this is the PACKAGE path, not a metadata
+                    // path, and it used to go through the buffered
+                    // `proxy_fetch_capped` at the 8 MiB metadata ceiling. Real
+                    // conda packages dwarf that (`python` ~30 MiB, `scipy`
+                    // ~17 MiB, `pytorch` far more), so the cap turned every
+                    // meaningful package download into a 502 — and the ones that
+                    // did fit were still buffered whole in memory, which is the
+                    // OOM pattern #895/#1608 removed from every other format's
+                    // package download.
+                    //
+                    // Stream instead, exactly as `try_remote_or_virtual_download`
+                    // does for rpm/hex/cran/huggingface and as debian's pool
+                    // handler does for `.deb`: the body is teed from upstream to
+                    // the client and into the proxy cache without ever being
+                    // fully resident. The quarantine gating is unchanged — it
+                    // lives inside `ProxyService` (`check_quarantine_until` on
+                    // both the fresh-fetch and cache-hit paths) and
+                    // `map_proxy_error` still turns a hold into 409 / a rejected
+                    // artifact into 403 for the streaming path too.
+                    //
+                    // `Content-Disposition` is now emitted (the buffered arm
+                    // omitted it) so a proxied package matches what the hosted
+                    // and Virtual arms below already serve.
+                    return proxy_helpers::proxy_fetch_streaming_with_disposition(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
-                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        conda_package_content_type(&filename),
+                        Some(&filename),
                     )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    .await;
                 }
             }
 
@@ -2508,14 +2700,11 @@ async fn download_package(
                 )
                 .await?;
 
-                let ct = if filename.ends_with(".conda") {
-                    "application/octet-stream"
-                } else if filename.ends_with(".tar.bz2") {
-                    "application/x-tar"
-                } else {
-                    "application/octet-stream"
-                };
-                return proxy_helpers::stream_fetch_result(result, ct, Some(&filename));
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    conda_package_content_type(&filename),
+                    Some(&filename),
+                );
             }
 
             return Err(not_found);
@@ -2542,17 +2731,9 @@ async fn download_package(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    let content_type = if filename.ends_with(".conda") {
-        "application/octet-stream"
-    } else if filename.ends_with(".tar.bz2") {
-        "application/x-tar"
-    } else {
-        "application/octet-stream"
-    };
-
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_TYPE, conda_package_content_type(&filename))
         .header(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
@@ -2574,7 +2755,7 @@ async fn upload_package_put(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -2602,7 +2783,7 @@ async fn upload_post(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -2641,7 +2822,7 @@ async fn upload_package_put_with_token(
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = if auth.is_some() {
-        require_auth_basic_scope(auth, "conda", "write")?.user_id
+        require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -2672,7 +2853,7 @@ async fn upload_post_with_token(
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = if auth.is_some() {
-        require_auth_basic_scope(auth, "conda", "write")?.user_id
+        require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -2987,7 +3168,7 @@ async fn store_attestation(
     }
 
     // Look up the target package
-    let artifact_path = format!("{}/{}", subdir, filename);
+    let artifact_path = build_conda_artifact_path(subdir, filename);
     let artifact: (uuid::Uuid, String) = sqlx::query_as(
         "SELECT id, checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false LIMIT 1",
     )
@@ -3055,7 +3236,7 @@ async fn fetch_attestation(
     subdir: &str,
     filename: &str,
 ) -> Result<Response, Response> {
-    let artifact_path = format!("{}/{}", subdir, filename);
+    let artifact_path = build_conda_artifact_path(subdir, filename);
     let row: Option<(serde_json::Value,)> = sqlx::query_as(
         r#"
         SELECT am.metadata
@@ -3104,7 +3285,7 @@ async fn put_attestation(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
 }
@@ -3134,7 +3315,7 @@ async fn put_attestation_with_token(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = if auth.is_some() {
-        require_auth_basic_scope(auth, "conda", "write")?.user_id
+        require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -3170,7 +3351,7 @@ async fn store_conda_package(
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
     // Parse the filename using the existing conda_native handler
-    let conda_path = format!("{}/{}", subdir, filename);
+    let conda_path = build_conda_artifact_path(subdir, filename);
     let path_info = CondaNativeHandler::parse_path(&conda_path).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -3218,7 +3399,7 @@ async fn store_conda_package(
         format!("{:x}", md5::Digest::finalize(hasher))
     };
 
-    let artifact_path = format!("{}/{}", subdir, filename);
+    let artifact_path = build_conda_artifact_path(subdir, filename);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -3248,7 +3429,7 @@ async fn store_conda_package(
     .map_err(|e| e.into_response())?;
 
     // Store the file
-    let storage_key = format!("conda/{}/{}/{}", repo.id, subdir, filename);
+    let storage_key = build_conda_storage_key(&repo.id, subdir, filename);
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -3364,7 +3545,7 @@ async fn store_conda_package(
         "build": build_string,
         "build_number": build_number,
         "subdir": subdir,
-        "package_format": if filename.ends_with(".conda") { "v2" } else { "v1" },
+        "package_format": conda_package_format(filename),
         "depends": depends,
         "constrains": constrains,
         "license": license,
@@ -3415,14 +3596,14 @@ async fn store_conda_package(
         .status(StatusCode::CREATED)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({
-                "name": pkg_name,
-                "version": pkg_version,
-                "build": build_string,
-                "subdir": subdir,
-                "sha256": computed_sha256,
-                "size": size_bytes,
-            })
+            build_conda_upload_response(
+                &pkg_name,
+                &pkg_version,
+                &build_string,
+                subdir,
+                &computed_sha256,
+                size_bytes,
+            )
             .to_string(),
         ))
         .unwrap())
@@ -3462,79 +3643,96 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Path/JSON builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the artifact path for a conda package.
+fn build_conda_artifact_path(subdir: &str, filename: &str) -> String {
+    format!("{}/{}", subdir, filename)
+}
+
+/// Build the storage key for a conda package.
+fn build_conda_storage_key(repo_id: &uuid::Uuid, subdir: &str, filename: &str) -> String {
+    format!("conda/{}/{}/{}", repo_id, subdir, filename)
+}
+
+/// The `package_format` metadata value for a conda package filename.
+fn conda_package_format(filename: &str) -> &'static str {
+    if filename.ends_with(".conda") {
+        "v2"
+    } else {
+        "v1"
+    }
+}
+
+/// Build the upload response JSON.
+fn build_conda_upload_response(
+    name: &str,
+    version: &str,
+    build_string: &str,
+    subdir: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "build": build_string,
+        "subdir": subdir,
+        "sha256": sha256,
+        "size": size,
+    })
+}
+
+/// Build the base channeldata package entry (callers append optional fields).
+fn build_channeldata_package_entry(subdirs: &[String], version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "subdirs": subdirs,
+        "version": version,
+    })
+}
+
+/// Build the full channeldata.json envelope for a hosted repo.
+fn build_channeldata_json(
+    packages: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "channeldata_version": 1,
+        "packages": packages,
+        "subdirs": KNOWN_SUBDIRS,
+    })
+}
+
+/// Build the repodata.json envelope (CEP-15 `base_url` + `removed`).
+fn build_repodata_envelope(
+    subdir: &str,
+    base_url: &str,
+    packages: &serde_json::Map<String, serde_json::Value>,
+    packages_conda: &serde_json::Map<String, serde_json::Value>,
+    removed: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "info": {
+            "subdir": subdir,
+            "base_url": base_url,
+        },
+        "packages": packages,
+        "packages.conda": packages_conda,
+        "removed": removed,
+        "repodata_version": 1,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::header::IF_NONE_MATCH;
 
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Build the artifact path for a conda package.
-    fn build_conda_artifact_path(subdir: &str, filename: &str) -> String {
-        format!("{}/{}", subdir, filename)
-    }
-
-    /// Build the storage key for a conda package.
-    fn build_conda_storage_key(repo_id: &uuid::Uuid, subdir: &str, filename: &str) -> String {
-        format!("conda/{}/{}/{}", repo_id, subdir, filename)
-    }
-
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Return the appropriate content type for a conda package filename.
-    fn conda_content_type(filename: &str) -> &'static str {
-        if filename.ends_with(".conda") {
-            "application/octet-stream"
-        } else if filename.ends_with(".tar.bz2") {
-            "application/x-tar"
-        } else {
-            "application/octet-stream"
-        }
-    }
-
-    /// Build conda-specific metadata JSON.
-    fn build_conda_metadata(
-        name: &str,
-        version: &str,
-        build_string: &str,
-        subdir: &str,
-        filename: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "build": build_string,
-            "build_number": 0,
-            "subdir": subdir,
-            "package_format": if filename.ends_with(".conda") { "v2" } else { "v1" },
-            "depends": [],
-        })
-    }
-
-    /// Build the upload response JSON.
-    fn build_conda_upload_response(
-        name: &str,
-        version: &str,
-        build_string: &str,
-        subdir: &str,
-        sha256: &str,
-        size: i64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "build": build_string,
-            "subdir": subdir,
-            "sha256": sha256,
-            "size": size,
-        })
-    }
-
-    /// Build a single repodata entry for a package.
+    /// TEST FIXTURE: build a minimal repodata entry used as *input* to
+    /// merge/filter tests. The production entry builder is
+    /// `super::build_artifact_entry`.
     #[allow(clippy::too_many_arguments)]
     fn build_repodata_entry(
         name: &str,
@@ -3560,144 +3758,10 @@ mod tests {
         })
     }
 
-    /// Build a channeldata package entry.
-    fn build_channeldata_package_entry(subdirs: &[String], version: &str) -> serde_json::Value {
-        serde_json::json!({
-            "subdirs": subdirs,
-            "version": version,
-        })
-    }
-
-    /// Build the full channeldata.json response.
-    fn build_channeldata_json(
-        packages: &serde_json::Map<String, serde_json::Value>,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "channeldata_version": 1,
-            "packages": packages,
-            "subdirs": KNOWN_SUBDIRS,
-        })
-    }
-
-    /// Build repodata entries from CondaArtifacts (mirrors build_repodata logic).
-    fn build_repodata_entries(
-        artifacts: &[&CondaArtifact],
-        subdir: &str,
-        packages: &mut serde_json::Map<String, serde_json::Value>,
-        packages_conda: &mut serde_json::Map<String, serde_json::Value>,
-    ) {
-        for artifact in artifacts {
-            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-            if !is_conda_package(filename) {
-                continue;
-            }
-            let pkg_name = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("name").and_then(|v| v.as_str()))
-                .unwrap_or(&artifact.name);
-            let version = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("version").and_then(|v| v.as_str()))
-                .or(artifact.version.as_deref())
-                .unwrap_or("0");
-            let build = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("build").and_then(|v| v.as_str()))
-                .unwrap_or("0");
-            let build_number = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("build_number").and_then(|v| v.as_u64()))
-                .unwrap_or(0);
-            let depends = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("depends"))
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]));
-            let constrains = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("constrains"))
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]));
-            let license = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("license").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let license_family = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("license_family").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let timestamp = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("timestamp").and_then(|v| v.as_u64()));
-            let features = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("features").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let track_features = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("track_features").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let noarch = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("noarch").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let md5 = artifact
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("md5").and_then(|v| v.as_str()))
-                .unwrap_or("");
-
-            let mut entry = serde_json::json!({
-                "build": build,
-                "build_number": build_number,
-                "constrains": constrains,
-                "depends": depends,
-                "fn": filename,
-                "license": license,
-                "md5": md5,
-                "name": pkg_name,
-                "sha256": artifact.checksum_sha256,
-                "size": artifact.size_bytes,
-                "subdir": subdir,
-                "version": version,
-            });
-            if !license_family.is_empty() {
-                entry["license_family"] = serde_json::Value::String(license_family.to_string());
-            }
-            if let Some(ts) = timestamp {
-                entry["timestamp"] = serde_json::json!(ts);
-            }
-            if !features.is_empty() {
-                entry["features"] = serde_json::Value::String(features.to_string());
-            }
-            if !track_features.is_empty() {
-                entry["track_features"] = serde_json::Value::String(track_features.to_string());
-            }
-            if !noarch.is_empty() {
-                entry["noarch"] = serde_json::Value::String(noarch.to_string());
-            }
-
-            if is_conda_v2(filename) {
-                packages_conda.insert(filename.to_string(), entry);
-            } else {
-                packages.insert(filename.to_string(), entry);
-            }
-        }
-    }
-
-    /// Build the full repodata.json response for a subdir.
+    /// TEST FIXTURE: build an (old-shape) repodata document used as *input* to
+    /// merge/patch/filter tests. The production envelope (with CEP-15
+    /// `base_url` and `removed`) is `super::build_repodata_envelope`, which has
+    /// its own literal-pinned tests.
     fn build_repodata_json(
         subdir: &str,
         packages: &serde_json::Map<String, serde_json::Value>,
@@ -3868,12 +3932,18 @@ mod tests {
     #[test]
     fn test_conda_content_type() {
         assert_eq!(
-            conda_content_type("numpy.conda"),
+            conda_package_content_type("numpy.conda"),
             "application/octet-stream"
         );
-        assert_eq!(conda_content_type("numpy.tar.bz2"), "application/x-tar");
-        assert_eq!(conda_content_type("file.zip"), "application/octet-stream");
-        assert_eq!(conda_content_type(""), "application/octet-stream");
+        assert_eq!(
+            conda_package_content_type("numpy.tar.bz2"),
+            "application/x-tar"
+        );
+        assert_eq!(
+            conda_package_content_type("file.zip"),
+            "application/octet-stream"
+        );
+        assert_eq!(conda_package_content_type(""), "application/octet-stream");
     }
 
     // -----------------------------------------------------------------------
@@ -3881,39 +3951,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_conda_metadata_v2() {
-        let meta = build_conda_metadata(
-            "numpy",
-            "1.26.4",
-            "py312h02b7e37_0",
-            "linux-64",
-            "numpy-1.26.4-py312h02b7e37_0.conda",
+    fn test_conda_package_format_v2() {
+        assert_eq!(
+            conda_package_format("numpy-1.26.4-py312h02b7e37_0.conda"),
+            "v2"
         );
-        assert_eq!(meta["name"], "numpy");
-        assert_eq!(meta["version"], "1.26.4");
-        assert_eq!(meta["build"], "py312h02b7e37_0");
-        assert_eq!(meta["build_number"], 0);
-        assert_eq!(meta["subdir"], "linux-64");
-        assert_eq!(meta["package_format"], "v2");
     }
 
     #[test]
-    fn test_build_conda_metadata_v1() {
-        let meta = build_conda_metadata(
-            "requests",
-            "2.31.0",
-            "pyhd8ed1ab_0",
-            "noarch",
-            "requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+    fn test_conda_package_format_v1() {
+        assert_eq!(
+            conda_package_format("requests-2.31.0-pyhd8ed1ab_0.tar.bz2"),
+            "v1"
         );
-        assert_eq!(meta["package_format"], "v1");
-        assert_eq!(meta["subdir"], "noarch");
-    }
-
-    #[test]
-    fn test_build_conda_metadata_has_depends() {
-        let meta = build_conda_metadata("pkg", "1.0", "0", "noarch", "pkg.conda");
-        assert!(meta["depends"].as_array().unwrap().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -3949,50 +3999,6 @@ mod tests {
     fn test_build_conda_upload_response_zero_size() {
         let resp = build_conda_upload_response("pkg", "1.0", "0", "noarch", "hash", 0);
         assert_eq!(resp["size"], 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // build_repodata_entry
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_repodata_entry_all_fields() {
-        let depends = serde_json::json!(["python >=3.12", "libcblas >=3.9"]);
-        let entry = build_repodata_entry(
-            "numpy",
-            "1.26.4",
-            "py312h02b7e37_0",
-            0,
-            &depends,
-            "md5hash",
-            "sha256hash",
-            8192,
-            "linux-64",
-        );
-        assert_eq!(entry["name"], "numpy");
-        assert_eq!(entry["version"], "1.26.4");
-        assert_eq!(entry["build"], "py312h02b7e37_0");
-        assert_eq!(entry["build_number"], 0);
-        assert_eq!(entry["md5"], "md5hash");
-        assert_eq!(entry["sha256"], "sha256hash");
-        assert_eq!(entry["size"], 8192);
-        assert_eq!(entry["subdir"], "linux-64");
-        let deps = entry["depends"].as_array().unwrap();
-        assert_eq!(deps.len(), 2);
-    }
-
-    #[test]
-    fn test_build_repodata_entry_no_depends() {
-        let depends = serde_json::json!([]);
-        let entry = build_repodata_entry("pkg", "1.0", "0", 0, &depends, "", "sha", 100, "noarch");
-        assert!(entry["depends"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_build_repodata_entry_with_build_number() {
-        let depends = serde_json::json!([]);
-        let entry = build_repodata_entry("pkg", "1.0", "0", 5, &depends, "", "sha", 100, "noarch");
-        assert_eq!(entry["build_number"], 5);
     }
 
     // -----------------------------------------------------------------------
@@ -4059,21 +4065,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_repodata_json
+    // build_repodata_envelope (production envelope; CEP-15 base_url + removed)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_repodata_json_empty() {
+    fn test_build_repodata_envelope_empty() {
         let packages = serde_json::Map::new();
         let packages_conda = serde_json::Map::new();
-        let rd = build_repodata_json("linux-64", &packages, &packages_conda);
+        let rd = build_repodata_envelope(
+            "linux-64",
+            "/conda/my-conda/linux-64/",
+            &packages,
+            &packages_conda,
+            &serde_json::json!([]),
+        );
         assert_eq!(rd["info"]["subdir"], "linux-64");
+        assert_eq!(rd["info"]["base_url"], "/conda/my-conda/linux-64/");
         assert!(rd["packages"].as_object().unwrap().is_empty());
         assert!(rd["packages.conda"].as_object().unwrap().is_empty());
+        assert!(rd["removed"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn test_build_repodata_json_with_packages() {
+    fn test_build_repodata_envelope_with_packages() {
         let mut packages = serde_json::Map::new();
         packages.insert(
             "old.tar.bz2".to_string(),
@@ -4081,24 +4095,43 @@ mod tests {
         );
         let mut packages_conda = serde_json::Map::new();
         packages_conda.insert("new.conda".to_string(), serde_json::json!({"name": "new"}));
-        let rd = build_repodata_json("noarch", &packages, &packages_conda);
+        let rd = build_repodata_envelope(
+            "noarch",
+            "/conda/my-conda/noarch/",
+            &packages,
+            &packages_conda,
+            &serde_json::json!([]),
+        );
         assert_eq!(rd["packages"]["old.tar.bz2"]["name"], "old");
         assert_eq!(rd["packages.conda"]["new.conda"]["name"], "new");
     }
 
     #[test]
-    fn test_build_repodata_json_subdir() {
+    fn test_build_repodata_envelope_subdir_and_removed() {
         let packages = serde_json::Map::new();
         let packages_conda = serde_json::Map::new();
-        let rd = build_repodata_json("osx-arm64", &packages, &packages_conda);
+        let rd = build_repodata_envelope(
+            "osx-arm64",
+            "/conda/c/osx-arm64/",
+            &packages,
+            &packages_conda,
+            &serde_json::json!(["gone-1.0-0.conda"]),
+        );
         assert_eq!(rd["info"]["subdir"], "osx-arm64");
+        assert_eq!(rd["removed"][0], "gone-1.0-0.conda");
     }
 
     #[test]
-    fn test_repodata_json_has_repodata_version() {
+    fn test_build_repodata_envelope_has_repodata_version() {
         let packages = serde_json::Map::new();
         let packages_conda = serde_json::Map::new();
-        let rd = build_repodata_json("linux-64", &packages, &packages_conda);
+        let rd = build_repodata_envelope(
+            "linux-64",
+            "/conda/c/linux-64/",
+            &packages,
+            &packages_conda,
+            &serde_json::json!([]),
+        );
         assert_eq!(rd["repodata_version"], 1);
     }
 
@@ -4125,10 +4158,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "linux-64", &mut packages, &mut packages_conda);
-        let entry = &packages_conda["numpy-1.26.4-py312h02b7e37_0.conda"];
+        let shard = build_shard("linux-64", &artifacts);
+        let entry = &shard["packages.conda"]["numpy-1.26.4-py312h02b7e37_0.conda"];
         assert_eq!(entry["fn"], "numpy-1.26.4-py312h02b7e37_0.conda");
     }
 
@@ -4149,10 +4180,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "noarch", &mut packages, &mut packages_conda);
-        let entry = &packages["requests-2.31.0-pyhd8ed1ab_0.tar.bz2"];
+        let shard = build_shard("noarch", &artifacts);
+        let entry = &shard["packages"]["requests-2.31.0-pyhd8ed1ab_0.tar.bz2"];
         assert_eq!(entry["fn"], "requests-2.31.0-pyhd8ed1ab_0.tar.bz2");
     }
 
@@ -4174,10 +4203,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "noarch", &mut packages, &mut packages_conda);
-        let entry = &packages_conda["six-1.16.0-pyh6c4a22f_0.conda"];
+        let shard = build_shard("noarch", &artifacts);
+        let entry = &shard["packages.conda"]["six-1.16.0-pyh6c4a22f_0.conda"];
         assert_eq!(entry["noarch"], "python");
     }
 
@@ -4199,10 +4226,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "noarch", &mut packages, &mut packages_conda);
-        let entry = &packages_conda["font-ttf-1.0-0.conda"];
+        let shard = build_shard("noarch", &artifacts);
+        let entry = &shard["packages.conda"]["font-ttf-1.0-0.conda"];
         assert_eq!(entry["noarch"], "generic");
     }
 
@@ -4224,10 +4249,8 @@ mod tests {
             })),
         );
         let artifacts = vec![&artifact];
-        let mut packages = serde_json::Map::new();
-        let mut packages_conda = serde_json::Map::new();
-        build_repodata_entries(&artifacts, "linux-64", &mut packages, &mut packages_conda);
-        let entry = &packages_conda["numpy-1.26.4-py312h_0.conda"];
+        let shard = build_shard("linux-64", &artifacts);
+        let entry = &shard["packages.conda"]["numpy-1.26.4-py312h_0.conda"];
         assert!(
             entry.get("noarch").is_none(),
             "arch-specific package should not have noarch field"
@@ -4982,168 +5005,98 @@ mod tests {
     // -----------------------------------------------------------------------
     // Repodata metadata fidelity (bead: artifact-keeper-09t)
     //
-    // Verify that build_repodata_entry (and by extension build_repodata)
-    // preserves all fields that conda clients need.
+    // Verify that the production entry builder (`build_artifact_entry`, used by
+    // both `build_repodata` and `build_shard`) preserves all fields that conda
+    // clients need. Expected values are hardcoded literals (#2657).
     // -----------------------------------------------------------------------
 
-    /// Enhanced repodata entry builder that includes all conda-spec fields.
-    #[allow(clippy::too_many_arguments)]
-    fn build_repodata_entry_full(
-        name: &str,
-        version: &str,
-        build: &str,
-        build_number: u64,
-        depends: &serde_json::Value,
-        constrains: &serde_json::Value,
-        license: &str,
-        md5: &str,
-        sha256: &str,
-        size: i64,
-        subdir: &str,
-        timestamp: Option<u64>,
-        features: &str,
-        track_features: &str,
-        license_family: &str,
-    ) -> serde_json::Value {
-        let mut entry = serde_json::json!({
-            "name": name,
-            "version": version,
-            "build": build,
-            "build_number": build_number,
-            "depends": depends,
-            "constrains": constrains,
-            "license": license,
-            "md5": md5,
-            "sha256": sha256,
-            "size": size,
-            "subdir": subdir,
-        });
-        if !license_family.is_empty() {
-            entry["license_family"] = serde_json::Value::String(license_family.to_string());
-        }
-        if let Some(ts) = timestamp {
-            entry["timestamp"] = serde_json::json!(ts);
-        }
-        if !features.is_empty() {
-            entry["features"] = serde_json::Value::String(features.to_string());
-        }
-        if !track_features.is_empty() {
-            entry["track_features"] = serde_json::Value::String(track_features.to_string());
-        }
-        entry
+    fn artifact_with_meta(name: &str, path: &str, meta: serde_json::Value) -> CondaArtifact {
+        make_conda_artifact(name, path, Some(meta))
     }
 
     #[test]
     fn test_repodata_entry_includes_constrains() {
-        let constrains = serde_json::json!(["numpy-base <0a0"]);
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "numpy",
-            "1.26.4",
-            "py312h02b7e37_0",
-            0,
-            &serde_json::json!(["python >=3.12"]),
-            &constrains,
-            "BSD-3-Clause",
-            "md5",
-            "sha256",
-            8192,
-            "linux-64",
-            None,
-            "",
-            "",
-            "",
+            "linux-64/numpy-1.26.4-py312h02b7e37_0.conda",
+            serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "build": "py312h02b7e37_0",
+                "depends": ["python >=3.12"],
+                "constrains": ["numpy-base <0a0"],
+            }),
         );
+        let entry = build_artifact_entry(&a, "numpy-1.26.4-py312h02b7e37_0.conda", "linux-64");
         assert_eq!(entry["constrains"].as_array().unwrap().len(), 1);
         assert_eq!(entry["constrains"][0], "numpy-base <0a0");
     }
 
     #[test]
     fn test_repodata_entry_includes_license() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "openssl",
-            "3.2.0",
-            "h0d3ecfb_1",
-            1,
-            &serde_json::json!(["ca-certificates"]),
-            &serde_json::json!([]),
-            "Apache-2.0",
-            "",
-            "",
-            0,
-            "linux-64",
-            None,
-            "",
-            "",
-            "Apache",
+            "linux-64/openssl-3.2.0-h0d3ecfb_1.conda",
+            serde_json::json!({
+                "name": "openssl",
+                "version": "3.2.0",
+                "build": "h0d3ecfb_1",
+                "license": "Apache-2.0",
+                "license_family": "Apache",
+            }),
         );
+        let entry = build_artifact_entry(&a, "openssl-3.2.0-h0d3ecfb_1.conda", "linux-64");
         assert_eq!(entry["license"], "Apache-2.0");
         assert_eq!(entry["license_family"], "Apache");
     }
 
     #[test]
     fn test_repodata_entry_includes_timestamp() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "pkg",
-            "1.0",
-            "0",
-            0,
-            &serde_json::json!([]),
-            &serde_json::json!([]),
-            "MIT",
-            "",
-            "",
-            0,
-            "noarch",
-            Some(1709000000000),
-            "",
-            "",
-            "",
+            "noarch/pkg-1.0-0.conda",
+            serde_json::json!({
+                "name": "pkg",
+                "version": "1.0",
+                "build": "0",
+                "timestamp": 1709000000000_u64,
+            }),
         );
+        let entry = build_artifact_entry(&a, "pkg-1.0-0.conda", "noarch");
         assert_eq!(entry["timestamp"], 1709000000000_u64);
     }
 
     #[test]
     fn test_repodata_entry_includes_features() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "mkl",
-            "2024.0",
-            "h5e30980_0",
-            0,
-            &serde_json::json!([]),
-            &serde_json::json!([]),
-            "Intel License",
-            "",
-            "",
-            0,
-            "linux-64",
-            None,
-            "mkl",
-            "mkl",
-            "",
+            "linux-64/mkl-2024.0-h5e30980_0.conda",
+            serde_json::json!({
+                "name": "mkl",
+                "version": "2024.0",
+                "build": "h5e30980_0",
+                "features": "mkl",
+                "track_features": "mkl",
+            }),
         );
+        let entry = build_artifact_entry(&a, "mkl-2024.0-h5e30980_0.conda", "linux-64");
         assert_eq!(entry["features"], "mkl");
         assert_eq!(entry["track_features"], "mkl");
     }
 
     #[test]
     fn test_repodata_entry_omits_empty_optional_fields() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "simple",
-            "1.0",
-            "0",
-            0,
-            &serde_json::json!([]),
-            &serde_json::json!([]),
-            "MIT",
-            "",
-            "",
-            0,
-            "noarch",
-            None,
-            "",
-            "",
-            "",
+            "noarch/simple-1.0-0.conda",
+            serde_json::json!({
+                "name": "simple",
+                "version": "1.0",
+                "build": "0",
+                "license": "MIT",
+            }),
         );
+        let entry = build_artifact_entry(&a, "simple-1.0-0.conda", "noarch");
         // Optional fields should be absent, not empty strings
         assert!(entry.get("timestamp").is_none());
         assert!(entry.get("features").is_none());
@@ -5153,54 +5106,43 @@ mod tests {
 
     #[test]
     fn test_repodata_entry_preserves_empty_depends() {
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "pkg",
-            "1.0",
-            "0",
-            0,
-            &serde_json::json!([]),
-            &serde_json::json!([]),
-            "",
-            "",
-            "",
-            0,
-            "noarch",
-            None,
-            "",
-            "",
-            "",
+            "noarch/pkg-1.0-0.conda",
+            serde_json::json!({
+                "name": "pkg",
+                "version": "1.0",
+                "build": "0",
+                "depends": [],
+                "constrains": [],
+            }),
         );
+        let entry = build_artifact_entry(&a, "pkg-1.0-0.conda", "noarch");
         assert!(entry["depends"].as_array().unwrap().is_empty());
         assert!(entry["constrains"].as_array().unwrap().is_empty());
     }
 
     #[test]
     fn test_repodata_entry_preserves_complex_depends() {
-        let depends = serde_json::json!([
-            "python >=3.8,<3.13",
-            "numpy >=1.21",
-            "scipy >=1.7",
-            "pandas >=1.3",
-            "libgcc-ng >=12"
-        ]);
-        let constrains = serde_json::json!(["scikit-learn-intelex >=2024.0", "daal4py >=2024.0"]);
-        let entry = build_repodata_entry_full(
+        let a = artifact_with_meta(
             "scikit-learn",
-            "1.4.0",
-            "py312h7e6f82a_0",
-            0,
-            &depends,
-            &constrains,
-            "BSD-3-Clause",
-            "",
-            "",
-            0,
-            "linux-64",
-            Some(1706000000000),
-            "",
-            "",
-            "BSD",
+            "linux-64/scikit-learn-1.4.0-py312h7e6f82a_0.conda",
+            serde_json::json!({
+                "name": "scikit-learn",
+                "version": "1.4.0",
+                "build": "py312h7e6f82a_0",
+                "depends": [
+                    "python >=3.8,<3.13",
+                    "numpy >=1.21",
+                    "scipy >=1.7",
+                    "pandas >=1.3",
+                    "libgcc-ng >=12"
+                ],
+                "constrains": ["scikit-learn-intelex >=2024.0", "daal4py >=2024.0"],
+            }),
         );
+        let entry =
+            build_artifact_entry(&a, "scikit-learn-1.4.0-py312h7e6f82a_0.conda", "linux-64");
         assert_eq!(entry["depends"].as_array().unwrap().len(), 5);
         assert_eq!(entry["constrains"].as_array().unwrap().len(), 2);
     }
@@ -5271,16 +5213,16 @@ mod tests {
     }
 
     #[test]
-    fn test_noarch_package_metadata_has_noarch_field() {
-        // Verify that metadata for noarch packages includes the subdir field
-        let meta = build_conda_metadata(
+    fn test_noarch_package_entry_has_subdir_field() {
+        // Verify a noarch artifact's repodata entry carries the subdir field.
+        let artifact = make_conda_artifact(
             "requests",
-            "2.31.0",
-            "pyhd8ed1ab_0",
-            "noarch",
-            "requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+            "noarch/requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+            Some(serde_json::json!({"subdir": "noarch"})),
         );
-        assert_eq!(meta["subdir"], "noarch");
+        let entry =
+            build_artifact_entry(&artifact, "requests-2.31.0-pyhd8ed1ab_0.tar.bz2", "noarch");
+        assert_eq!(entry["subdir"], "noarch");
     }
 
     // -----------------------------------------------------------------------
@@ -5499,15 +5441,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_conda_metadata_includes_package_format_v2() {
-        let meta = build_conda_metadata("pkg", "1.0", "0", "linux-64", "pkg-1.0-0.conda");
-        assert_eq!(meta["package_format"], "v2");
+    fn test_conda_package_format_pin_v2() {
+        assert_eq!(conda_package_format("pkg-1.0-0.conda"), "v2");
     }
 
     #[test]
-    fn test_build_conda_metadata_includes_package_format_v1() {
-        let meta = build_conda_metadata("pkg", "1.0", "0", "linux-64", "pkg-1.0-0.tar.bz2");
-        assert_eq!(meta["package_format"], "v1");
+    fn test_conda_package_format_pin_v1() {
+        assert_eq!(conda_package_format("pkg-1.0-0.tar.bz2"), "v1");
     }
 
     // -----------------------------------------------------------------------
@@ -5929,11 +5869,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cacheable_response_includes_etag() {
+    #[tokio::test]
+    async fn test_cacheable_response_includes_etag() {
         let body = b"repodata json content".to_vec();
         let headers = HeaderMap::new();
-        let resp = cacheable_response(body.clone(), "application/json", &headers);
+        let resp = cacheable_response(body.clone(), "application/json", &headers).await;
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
@@ -5950,24 +5890,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cacheable_response_304_on_matching_etag() {
+    #[tokio::test]
+    async fn test_cacheable_response_304_on_matching_etag() {
         let body = b"repodata json content".to_vec();
         let etag = compute_etag(&body);
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, etag.parse().unwrap());
 
-        let resp = cacheable_response(body, "application/json", &headers);
+        let resp = cacheable_response(body, "application/json", &headers).await;
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     }
 
-    #[test]
-    fn test_cacheable_response_200_on_stale_etag() {
+    #[tokio::test]
+    async fn test_cacheable_response_200_on_stale_etag() {
         let body = b"updated repodata json content".to_vec();
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, "W/\"stale_etag_value\"".parse().unwrap());
 
-        let resp = cacheable_response(body, "application/json", &headers);
+        let resp = cacheable_response(body, "application/json", &headers).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -6691,10 +6631,13 @@ mod tests {
     fn test_proxy_content_type_for_formats() {
         // Proxy should use correct content type for each format
         assert_eq!(
-            conda_content_type("numpy.conda"),
+            conda_package_content_type("numpy.conda"),
             "application/octet-stream"
         );
-        assert_eq!(conda_content_type("requests.tar.bz2"), "application/x-tar");
+        assert_eq!(
+            conda_package_content_type("requests.tar.bz2"),
+            "application/x-tar"
+        );
     }
 
     // =======================================================================
@@ -7689,13 +7632,13 @@ mod tests {
         assert_eq!(decompressed, original);
     }
 
-    #[test]
-    fn test_cacheable_response_gzip_when_accepted() {
+    #[tokio::test]
+    async fn test_cacheable_response_gzip_when_accepted() {
         let body = serde_json::to_vec(&serde_json::json!({"test": true})).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, "gzip, deflate".parse().unwrap());
 
-        let resp = cacheable_response(body, "application/json", &headers);
+        let resp = cacheable_response(body, "application/json", &headers).await;
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -7712,24 +7655,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cacheable_response_no_gzip_for_binary() {
+    #[tokio::test]
+    async fn test_cacheable_response_no_gzip_for_binary() {
         let body = vec![0u8; 100];
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, "gzip, deflate".parse().unwrap());
 
-        let resp = cacheable_response(body, "application/x-bzip2", &headers);
+        let resp = cacheable_response(body, "application/x-bzip2", &headers).await;
 
         // Binary content types should not be gzip-encoded
         assert!(resp.headers().get(CONTENT_ENCODING).is_none());
     }
 
-    #[test]
-    fn test_cacheable_response_no_gzip_without_accept() {
+    #[tokio::test]
+    async fn test_cacheable_response_no_gzip_without_accept() {
         let body = serde_json::to_vec(&serde_json::json!({"test": true})).unwrap();
         let headers = HeaderMap::new();
 
-        let resp = cacheable_response(body, "application/json", &headers);
+        let resp = cacheable_response(body, "application/json", &headers).await;
 
         // No Accept-Encoding means no gzip
         assert!(resp.headers().get(CONTENT_ENCODING).is_none());
@@ -8827,5 +8770,626 @@ mod tests {
 
         assertions.await;
         fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote conda-forge repodata proxy: cap ceiling + failure propagation,
+    // and CEP-16 sharded repodata scoping. A Remote conda repo's real
+    // repodata.json.zst (e.g. conda-forge's noarch/osx-arm64 channels)
+    // commonly runs 20-30 MiB, well past the 8 MiB DEFAULT_METADATA_MAX_BYTES
+    // tier most other formats' metadata proxying uses. The old code silently
+    // fell through to `build_repodata` (DB-only) whenever the capped fetch
+    // failed for ANY reason, serving a valid-looking but empty 200 instead of
+    // the real upstream index, or an error. These tests pin the fix: the
+    // LARGE tier makes the real-sized fetch succeed, and any other upstream
+    // failure now surfaces to the client instead of being masked.
+    // -----------------------------------------------------------------------
+
+    /// Insert a Remote conda repo pointing at `upstream_url`, marked public so
+    /// anonymous test requests pass `check_read_access`. Returns its id/key.
+    async fn insert_public_remote_conda_repo(
+        pool: &sqlx::PgPool,
+        upstream_url: &str,
+    ) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (repo_id, repo_key, storage_dir) =
+            crate::api::handlers::test_db_helpers::create_repo(pool, "remote", "conda").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream_url)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("point repo at upstream and make it public");
+        (repo_id, repo_key, storage_dir)
+    }
+
+    async fn cleanup_conda_repo(pool: &sqlx::PgPool, repo_id: uuid::Uuid) {
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    // A 9 MiB repodata.json.zst -- above the old 8 MiB DEFAULT ceiling that
+    // used to make the capped fetch fail and silently fall back to an empty
+    // `build_repodata` -- is now fetched and served in full (LARGE tier).
+    #[tokio::test]
+    async fn remote_repodata_above_default_cap_is_served_in_full() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = vec![0x5au8; 9 * 1024 * 1024];
+        assert!(
+            body.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES
+                && body.len() < proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            "fixture must straddle DEFAULT and LARGE so success implies the LARGE tier",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("conda-cap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, resp_body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/repodata.json.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a repodata.json.zst above the old 8 MiB cap must now succeed"
+        );
+        // Byte equality, not just length: a truncated-at-the-cap body and a
+        // correctly proxied one can only be told apart by content.
+        assert_eq!(
+            &resp_body[..],
+            &body[..],
+            "the full upstream body must be served verbatim (got {} bytes, want {})",
+            resp_body.len(),
+            body.len(),
+        );
+    }
+
+    // A genuine upstream failure (a 500, which `validate_upstream_status` folds
+    // to `ServiceUnavailable` and `map_proxy_error` renders as 503) must surface
+    // to the client instead of being swallowed into a silent fallback that
+    // serves an empty, DB-only repodata.json with 200 (the
+    // conda-forge-discovery-blocking bug this fixes).
+    #[tokio::test]
+    async fn remote_repodata_upstream_failure_surfaces_not_empty_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("conda-502-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, resp_body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/repodata.json.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // Concrete status, not merely "some 5xx": #1445 fixes upstream 5xx at
+        // 503 Service Unavailable (never a raw 502, never the masked 200).
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an upstream 5xx must surface as 503, got {status} with body {:?}",
+            String::from_utf8_lossy(&resp_body),
+        );
+        assert!(
+            !String::from_utf8_lossy(&resp_body).contains("repodata_version"),
+            "the failure response must not be a fabricated repodata document"
+        );
+    }
+
+    // CEP-16 sharded repodata is only ever built from artifacts already in our
+    // own DB (never proxied from upstream). For a Remote repo with nothing
+    // cached yet, the old code served a syntactically valid but semantically
+    // empty shard index with 200 -- which a CEP-16-aware client treats as
+    // authoritative and will NOT fall back from, hiding every upstream
+    // package. The endpoint must 404 for Remote repos instead, so clients
+    // take the documented fallback to repodata.json.
+    #[tokio::test]
+    async fn remote_repo_sharded_index_404s_instead_of_empty_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("conda-shard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (repo_id, repo_key, _dir) =
+            insert_public_remote_conda_repo(&pool, "https://upstream.example.test").await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/repodata_shards.msgpack.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "sharded repodata for a Remote conda repo must 404, not serve an empty 200"
+        );
+    }
+
+    // Preserve existing behavior for Local/hosted conda repos: the shard index
+    // is (and remains) built from the repo's own DB artifacts and returns 200.
+    #[tokio::test]
+    async fn local_repo_sharded_index_still_returns_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _storage_dir) = tdh::create_repo(&pool, "local", "conda").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo public");
+
+        let tmp = std::env::temp_dir().join(format!("conda-local-shard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+
+        let app = tdh::router_anon(router(), state);
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/repodata_shards.msgpack.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a Local/hosted conda repo's shard index must still serve 200"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2915 follow-ups to the #2914 proxy work above.
+    //
+    // 1. The PACKAGE download path for a Remote repo was routed through the
+    //    buffered 8 MiB *metadata* helper, so every real conda package 502'd.
+    // 2. `channeldata.json` kept the exact fail-open that was removed from
+    //    `serve_repodata`: an 8 MiB cap the real document exceeds, plus an
+    //    `if let Ok(..)` that turned the resulting error into an empty 200.
+    // 3. The CEP-16 / JLAP guards only covered Remote, so Virtual repos --
+    //    whose artifacts belong to their MEMBERS, never to the virtual repo id
+    //    `list_conda_artifacts` is scoped to -- still served empty 200s.
+    // -----------------------------------------------------------------------
+
+    /// Wire a `SharedState` whose proxy cache lives in a fresh temp dir. The
+    /// returned `TempDir` must outlive the request (dropping it deletes the
+    /// cache the proxy is writing through).
+    fn state_with_proxy_cache(pool: &sqlx::PgPool) -> (crate::api::SharedState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("proxy cache tempdir");
+        let root = dir.path().to_str().expect("utf8 tempdir path");
+        let proxy =
+            crate::api::handlers::test_db_helpers::build_proxy_service_with_fs(pool.clone(), root);
+        let state = crate::api::handlers::test_db_helpers::build_state_with_proxy(
+            pool.clone(),
+            root,
+            proxy,
+        );
+        (state, dir)
+    }
+
+    /// A 64-hex shard hash that matches no shard. Needed because
+    /// `sharded_repodata_shard` validates the hash FORMAT before it resolves the
+    /// repository, so a malformed hash 400s and never reaches the repo-type
+    /// guard under test.
+    fn well_formed_shard_hash() -> String {
+        "ab".repeat(32)
+    }
+
+    // #2915 BLOCKER regression: a Remote conda package download must stream the
+    // whole upstream body. The old code buffered it through
+    // `proxy_fetch_capped(.., DEFAULT_METADATA_MAX_BYTES)`, so anything past
+    // 8 MiB -- i.e. essentially every package anyone installs (python ~30 MiB,
+    // scipy ~17 MiB) -- came back 502. This fixture is deliberately larger than
+    // that ceiling, so it FAILS on the pre-fix code, and asserts byte equality
+    // so a truncated body cannot pass either.
+    #[tokio::test]
+    async fn remote_package_download_above_metadata_cap_is_served_in_full() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Non-uniform bytes so a byte-equality assertion is meaningful (a
+        // constant fill would match any equally sized garbage body).
+        let pkg: Vec<u8> = (0..(9 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
+        assert!(
+            pkg.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            "fixture must exceed the metadata cap the buffered path used"
+        );
+        let filename = "python-3.12.0-h30d4d87_0.conda";
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/osx-arm64/{filename}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(pkg.clone()))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, resp_body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/osx-arm64/{filename}"))).await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a >8 MiB remote conda package must download, not 502; body was {:?}",
+            String::from_utf8_lossy(&resp_body[..resp_body.len().min(200)]),
+        );
+        assert_eq!(
+            &resp_body[..],
+            &pkg[..],
+            "the streamed package must be byte-identical to upstream (got {} bytes, want {})",
+            resp_body.len(),
+            pkg.len(),
+        );
+    }
+
+    // #2915 (4): an upstream `channeldata.json` failure must surface. The old
+    // `if let Ok(..)` swallowed it and fell through to the DB-only document,
+    // which for a fresh Remote repo is an EMPTY channel description served 200 --
+    // indistinguishable, to a client, from "this channel really has no packages".
+    #[tokio::test]
+    async fn remote_channeldata_upstream_failure_surfaces_instead_of_empty_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/channeldata.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, resp_body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/channeldata.json"))).await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an upstream 5xx on channeldata.json must surface as 503, got {status}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&resp_body).contains("channeldata_version"),
+            "the failure response must not be a fabricated (empty) channeldata document"
+        );
+    }
+
+    // #2915 (4): conda-forge's `channeldata.json` is a single document covering
+    // every package in the channel and comfortably exceeds the 8 MiB DEFAULT
+    // tier the old code used, so the fetch ALWAYS failed for the channel this
+    // endpoint matters most for. It must now be fetched at the LARGE tier and
+    // served verbatim.
+    #[tokio::test]
+    async fn remote_channeldata_above_default_cap_is_served_in_full() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // A real (if degenerate) JSON document above the DEFAULT cap and below
+        // the LARGE one, so success implies the LARGE tier specifically.
+        let body = format!(
+            "{{\"channeldata_version\":1,\"packages\":{{}},\"_pad\":\"{}\"}}",
+            "p".repeat(9 * 1024 * 1024)
+        )
+        .into_bytes();
+        assert!(
+            body.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES
+                && body.len() < proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            "fixture must straddle DEFAULT and LARGE"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/channeldata.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.clone())
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        // No `Accept-Encoding`, so `cacheable_response` serves the identity body
+        // and the comparison below is against the upstream bytes directly.
+        let (status, resp_body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/channeldata.json"))).await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a channeldata.json above the old 8 MiB cap must now succeed"
+        );
+        assert_eq!(
+            &resp_body[..],
+            &body[..],
+            "the full upstream channeldata must be served verbatim (got {} bytes, want {})",
+            resp_body.len(),
+            body.len(),
+        );
+    }
+
+    // #2915 (5): the shard ENDPOINT needs the same repo-type guard the index
+    // endpoint got -- a Remote repo has no shard rows of its own, so without the
+    // guard it answers 404 "Shard not found" for a reason that has nothing to do
+    // with the repository being unsupported, and the index/shard pair disagree
+    // about whether CEP-16 exists here.
+    #[tokio::test]
+    async fn remote_repo_sharded_shard_404s() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) =
+            insert_public_remote_conda_repo(&pool, "https://upstream.example.test").await;
+
+        let app = tdh::router_anon(router(), state);
+        let hash = well_formed_shard_hash();
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/shards/{hash}.msgpack.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a CEP-16 shard fetch against a Remote conda repo must 404"
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("local/hosted"),
+            "the 404 must come from the repo-type guard, not the shard lookup; got {:?}",
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    // The Local counterpart: a hosted repo's own DB rows ARE authoritative, so a
+    // shard whose content hash the client asks for is still served with 200 and
+    // the exact shard bytes.
+    #[tokio::test]
+    async fn local_repo_sharded_shard_still_returns_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let pkg_path = "linux-64/zlib-1.3-h4ab18f5_1.conda";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            pkg_path,
+            pkg_path,
+            "zlib",
+            "1.3",
+            "application/octet-stream",
+            Bytes::from_static(b"conda package payload"),
+            fx.user_id,
+        )
+        .await;
+
+        let assertions = async {
+            // Recompute the content-addressed shard hash exactly as the index
+            // endpoint advertises it, so the request is one a real CEP-16 client
+            // would make after reading the index.
+            let all = list_conda_artifacts(&fx.pool, fx.repo_id)
+                .await
+                .expect("list conda artifacts");
+            let subdir_artifacts = artifacts_for_subdir(&all, "linux-64");
+            let by_name = group_artifacts_by_name(&subdir_artifacts);
+            let artifacts = by_name.get("zlib").expect("seeded package must shard");
+            let shard = build_shard("linux-64", artifacts);
+            let shard_compressed = serialize_msgpack_zst(&shard).expect("serialize shard");
+            let mut hasher = Sha256::new();
+            hasher.update(&shard_compressed);
+            let hash = format!("{:x}", hasher.finalize());
+
+            let app = fx.router_anon(router());
+            let (status, body) = tdh::send(
+                app,
+                tdh::get(format!(
+                    "/{key}/linux-64/shards/{hash}.msgpack.zst",
+                    key = fx.repo_key
+                )),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a Local conda repo must still serve its own CEP-16 shards"
+            );
+            assert_eq!(
+                &body[..],
+                &shard_compressed[..],
+                "the served shard must be the content-addressed bytes"
+            );
+        };
+
+        assertions.await;
+        fx.teardown().await;
+    }
+
+    // #2915 (5): a Virtual conda repo owns no artifacts -- its MEMBERS do -- and
+    // both sharded endpoints plus the JLAP endpoint are built from
+    // `list_conda_artifacts(repo.id)` / `build_repodata(repo.id)`, i.e. from the
+    // virtual repo's own (always empty) rows. `repodata.json` is correctly
+    // aggregated by `build_virtual_repodata`, so all three of these must 404 and
+    // send the client there instead of serving an authoritative-looking empty
+    // index (CEP-16) or an unmatchable `latest` hash (JLAP).
+    #[tokio::test]
+    async fn virtual_repo_404s_on_sharded_and_jlap_endpoints() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "virtual", "conda").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo public");
+        let (state, _cache) = state_with_proxy_cache(&pool);
+
+        let hash = well_formed_shard_hash();
+        let endpoints = [
+            format!("/{repo_key}/noarch/repodata_shards.msgpack.zst"),
+            format!("/{repo_key}/noarch/shards/{hash}.msgpack.zst"),
+            format!("/{repo_key}/noarch/repodata.json.jlap"),
+        ];
+        let mut results = Vec::new();
+        for uri in &endpoints {
+            let app = tdh::router_anon(router(), state.clone());
+            let (status, _body) = tdh::send(app, tdh::get(uri.clone())).await;
+            results.push((uri.clone(), status));
+        }
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        for (uri, status) in results {
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{uri} must 404 for a Virtual conda repo instead of serving an empty document"
+            );
+        }
+    }
+
+    // #2915 (3): `cacheable_response` must not add its own gzip on top of a body
+    // that already arrived content-coded, and must declare the coding it did
+    // arrive with. Double-gzipping while advertising `Content-Encoding: gzip`
+    // once produces a body no client can decode.
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test module exempt — buffering a 22-byte gzipped JSON
+    // body in an assertion is not an artifact path (#1608).
+    #[tokio::test]
+    async fn cacheable_response_does_not_recompress_already_coded_body() {
+        let already_gzipped = gzip_compress(br#"{"repodata_version":1}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip, deflate".parse().unwrap());
+
+        let resp = cacheable_response_coded(
+            already_gzipped.clone(),
+            "application/json",
+            Some("gzip"),
+            &headers,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the upstream coding must be forwarded verbatim, exactly once"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(already_gzipped.len().to_string().as_str()),
+            "the body must be passed through untouched, not gzipped a second time"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(
+            &body[..],
+            &already_gzipped[..],
+            "an already-coded body must be served byte-for-byte"
+        );
     }
 }

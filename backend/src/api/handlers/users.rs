@@ -993,6 +993,11 @@ async fn create_api_token_inner(
     crate::services::token_service::enforce_admin_only_scopes(&payload.scopes, auth.is_admin)
         .map_err(AppError::Authorization)?;
 
+    // Delegation ceiling (#2996): a scoped credential may not mint a token
+    // that exceeds its own scopes. Interactive sessions (`scopes: None`)
+    // are unaffected.
+    auth.enforce_mint_ceiling(&payload.scopes)?;
+
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (token, token_id) = auth_service
         .generate_api_token(id, &payload.name, payload.scopes, payload.expires_in_days)

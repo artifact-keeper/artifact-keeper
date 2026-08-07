@@ -56,6 +56,17 @@ pub struct NexusStatusResponse {
     pub version: Option<String>,
 }
 
+/// Nexus's OpenAPI doc — only `info.version` (the running version) is read.
+#[derive(Debug, Deserialize)]
+struct SwaggerDoc {
+    info: SwaggerInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwaggerInfo {
+    version: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct NexusRepository {
     pub name: String,
@@ -198,21 +209,39 @@ impl NexusClient {
         Ok(response.status().is_success())
     }
 
-    /// Get Nexus version — returns in the same format as Artifactory for compatibility
+    /// Nexus version: try the status endpoint, fall back to the OpenAPI doc, then "unknown".
     pub async fn get_version(&self) -> Result<SystemVersionResponse, ArtifactoryError> {
-        let status: NexusStatusResponse =
-            self.get("/service/rest/v1/status")
-                .await
-                .unwrap_or(NexusStatusResponse {
-                    edition: Some("Unknown".into()),
-                    version: Some("Unknown".into()),
+        if let Ok(status) = self
+            .get::<NexusStatusResponse>("/service/rest/v1/status")
+            .await
+        {
+            if let Some(version) = status.version {
+                return Ok(SystemVersionResponse {
+                    version,
+                    revision: None,
+                    addons: None,
+                    license: status.edition,
                 });
+            }
+        }
+
+        // status is often empty (OSS, or behind a proxy); the OpenAPI doc has the version.
+        if let Ok(doc) = self.get::<SwaggerDoc>("/service/rest/swagger.json").await {
+            if let Some(version) = doc.info.version {
+                return Ok(SystemVersionResponse {
+                    version,
+                    revision: None,
+                    addons: None,
+                    license: None,
+                });
+            }
+        }
 
         Ok(SystemVersionResponse {
-            version: status.version.unwrap_or_else(|| "unknown".into()),
+            version: "unknown".into(),
             revision: None,
             addons: None,
-            license: status.edition,
+            license: None,
         })
     }
 
@@ -846,6 +875,51 @@ mod tests {
         assert_eq!(checksum.sha256, Some("hash_only".to_string()));
         assert!(checksum.sha1.is_none());
         assert!(checksum.md5.is_none());
+    }
+
+    #[test]
+    fn test_swagger_doc_extracts_version() {
+        // The real swagger.json has hundreds of fields; only info.version matters.
+        let json = r#"{
+            "openapi": "3.0.1",
+            "info": { "title": "Nexus Repository Manager REST API", "version": "3.61.0-02" },
+            "paths": {}
+        }"#;
+        let doc: SwaggerDoc = serde_json::from_str(json).unwrap();
+        assert_eq!(doc.info.version, Some("3.61.0-02".to_string()));
+    }
+
+    // Regression: an empty /service/rest/v1/status body used to make every Nexus
+    // connection report version "Unknown". get_version now falls back to the
+    // OpenAPI doc, so this passes here but fails on main.
+    #[tokio::test]
+    async fn test_get_version_falls_back_to_swagger_when_status_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/status"))
+            .respond_with(ResponseTemplate::new(200)) // empty body, like real Nexus
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/swagger.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "info": { "version": "3.61.0-02" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            timeout_secs: 30,
+            throttle_delay_ms: 0,
+        })
+        .unwrap();
+
+        assert_eq!(client.get_version().await.unwrap().version, "3.61.0-02");
     }
 
     #[test]

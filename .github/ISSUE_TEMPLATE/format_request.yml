@@ -1,6 +1,6 @@
 name: Package Format Request
 description: Request support for a new package format
-labels: ["enhancement", "new-format", "needs-triage"]
+labels: ["type:enhancement", "new-format", "needs-triage"]
 body:
   - type: markdown
     attributes:

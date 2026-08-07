@@ -1758,7 +1758,7 @@ async fn resolve_pool_expected_checksum(
         if !is_matching_packages_index(&cache_path, component, &arch) {
             continue;
         }
-        let Ok(Some((bytes, _))) = proxy
+        let Ok(Some((bytes, _, _))) = proxy
             .get_cached_artifact_by_path(repo_key, &cache_path)
             .await
         else {
@@ -3136,7 +3136,7 @@ async fn pool_upload(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "debian", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "debian", "write:artifacts")?.user_id;
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -3179,7 +3179,7 @@ async fn upload_raw(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "debian", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "debian", "write:artifacts")?.user_id;
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;

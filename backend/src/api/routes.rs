@@ -500,6 +500,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             "/repositories",
             handlers::repositories::router()
                 .merge(handlers::age_gate::repo_config_routes())
+                // Per-repo storage GC (web #708): the UI's per-repo storage
+                // panel calls POST /repositories/{key}/storage-gc. Admin-gated
+                // inside the handler.
+                .merge(handlers::storage_gc::repo_router())
                 .merge(handlers::repositories::download_router().layer(
                     middleware::from_fn_with_state(
                         presign_rate_limit_state,
@@ -921,12 +925,32 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
-        // Migration routes with auth middleware
+        // Migration routes with admin middleware.
+        //
+        // Migration is an instance-provisioning operator workflow: a job imports
+        // whole repositories, users, groups and permissions from an external
+        // source and bulk-writes them into named target repositories (some of
+        // which the job itself creates). Under `auth_middleware` the handlers
+        // gated only on per-user ownership of the SOURCE connection, so ANY
+        // authenticated non-admin could register a source, point a job at
+        // arbitrary target repositories and bulk-populate/poison them — there was
+        // no target-repo write authorization and no admin gate (#2603 G2).
+        //
+        // Because a migration provisions instance-wide resources (and can create
+        // the very repos it writes to), the coherent authorization boundary is a
+        // global admin — the same tier as the other integration/provisioning
+        // surfaces (`/dependency-track`, `/plugins`, `/admin/*`). Gating the whole
+        // nest with `admin_middleware` also makes the authorization decision run
+        // BEFORE the handler body, so a non-admin is rejected before any source
+        // connection is SSRF-validated, encrypted, decrypted or dialed. A global
+        // admin can write every repository (admin bypass in
+        // `check_repository_action`), so the legitimate operator migration path
+        // into any target repo still succeeds.
         .nest(
             "/migrations",
             handlers::migration::router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
-                auth_middleware,
+                admin_middleware,
             )),
         )
         // Chunked/resumable upload routes with auth middleware
@@ -1062,6 +1086,39 @@ mod tests {
         assert!(
             ROUTES_RS_SRC.contains("\"/dependency-track\","),
             "/dependency-track nest registration missing"
+        );
+    }
+
+    #[test]
+    fn migration_nest_requires_admin() {
+        // #2603 G2: the `/migrations` handlers gated only on per-user ownership
+        // of the source connection, never on admin and never on target-repo
+        // write authz. A migration is an instance-provisioning operator workflow
+        // (imports repos/users/groups/permissions and bulk-writes named target
+        // repositories, some of which it creates), so the whole nest must be
+        // gated by `admin_middleware`, not `auth_middleware` — otherwise any
+        // authenticated non-admin could point a job at arbitrary repositories and
+        // populate/poison them. A runtime test would need full app state + a DB
+        // fixture, so pin the routing decision in source (mirrors
+        // `dependency_track_nest_requires_admin` / `plugin_install_and_lifecycle_require_admin`).
+        let mig_nest = ROUTES_RS_SRC
+            .split("handlers::migration::router()")
+            .nth(1)
+            .expect("migration::router() must be nested under /migrations");
+        let next_middleware = mig_nest
+            .split("from_fn_with_state")
+            .nth(1)
+            .expect("migration nest must attach a middleware layer");
+        assert!(
+            next_middleware.contains("admin_middleware"),
+            "migration source/job routes must be gated by admin_middleware, \
+             not auth_middleware (regression of #2603 G2)"
+        );
+        // Guard against the assertion going vacuously true if the nest is
+        // dropped: the prefix must still be registered.
+        assert!(
+            ROUTES_RS_SRC.contains("\"/migrations\","),
+            "/migrations nest registration missing"
         );
     }
 }

@@ -39,16 +39,28 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/scanner-adapter .
 
 # ---------- Stage 2: pull the matching trivy binary ----------
-# buildx selects this image's TARGETPLATFORM variant automatically, so the
-# arm64 build gets the arm64 trivy and the amd64 build gets amd64. Pinned to
-# 0.72.0, the latest release, which is rebuilt against a patched Go toolchain
-# and clears most of the bundled binary's Go-dependency CVEs (#2391; residuals
-# with no fixed trivy release yet are justified per-CVE in /.trivyignore).
+# Our own build of upstream trivy v0.73.0 (artifact-keeper/trivy): the same
+# upstream source tag, built with our pinned Go toolchain plus one documented
+# dependency override, oras-go v2.6.1 -> v2.6.2, which clears CVE-2026-50163.
+# Upstream merged that bump on main but has not released it, and 0.73.0 is
+# still the latest release, so no upstream tag carries the fix. Leaving this on
+# ghcr.io/aquasecurity/trivy:0.73.0 fails the Docker Publish security gate,
+# which skips every multi-arch manifest and blocks the release chain.
+#
+# Worth remembering: upstream 0.73.0 scanned clean when #3123 landed — the CVE
+# was published against its bundled oras-go afterwards. A clean scan at merge
+# time does not stay clean, which is why the source repo rebuilds and re-gates
+# on a schedule rather than trusting a one-time result.
+#
+# Pinned by DIGEST, not tag: that repo rebuilds weekly to pick up RPM errata,
+# so its tags are moving targets by design. buildx selects the TARGETPLATFORM
+# variant from the multi-arch index automatically, so the arm64 build gets the
+# arm64 trivy and the amd64 build gets amd64 — both are published.
+#
 # Nothing couples the backend to a specific trivy version: the 0.71.2 strings
 # in backend/scanner-adapter tests are mock/stub fixtures, and the adapter
-# probes the real version at startup (ProbeVersion). Aqua publishes both
-# linux/amd64 and linux/arm64 for this tag.
-FROM ghcr.io/aquasecurity/trivy:0.72.0 AS trivy
+# probes the real version at startup (ProbeVersion).
+FROM ghcr.io/artifact-keeper/trivy@sha256:202c9b4cbb16242cd9d8ee675efc23ba3491f919f4686a1dacaa7dd8605c74ad AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security
@@ -65,6 +77,12 @@ RUN apk add --no-cache ca-certificates git rpm \
     && chown -R scanner:scanner /home/scanner
 
 COPY --from=trivy /usr/local/bin/trivy /usr/local/bin/trivy
+# Apache-2.0 §4(a)/(b): the trivy binary we ship is built from upstream source
+# with a documented dependency override, so the licence, NOTICE, build info and
+# the modification record must travel with it. They are assembled in the
+# artifact-keeper/trivy image; copy them through rather than leaving a modified
+# Apache-2.0 binary in the runtime with no accompanying notice.
+COPY --from=trivy /licenses/trivy /licenses/trivy
 COPY --from=build /out/scanner-adapter /usr/local/bin/scanner-adapter
 
 # DB-download resilience (#2167): the trivy vuln-DB pull defaults to the

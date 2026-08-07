@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use artifact_keeper_backend::api::{AppState, SharedState};
 use artifact_keeper_backend::config::Config;
+use artifact_keeper_backend::services::audit_service::{AuditLogEntryWithActor, AuditService};
 
 /// `AuthConfigService` encrypts the stored OIDC client secret with a key read
 /// from `SSO_ENCRYPTION_KEY`/`JWT_SECRET` in the *process* environment (not the
@@ -43,13 +44,9 @@ pub fn ensure_sso_encryption_key() {
 /// Connect to the throwaway Postgres named by `DATABASE_URL`, or return `None`
 /// so the caller can skip cleanly (matching the repo `--ignored` convention).
 pub async fn try_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(3)
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&url)
-        .await
-        .ok()
+    // Skip only when no DB is configured/reachable AND not required; a connect
+    // failure under AK_TESTS_REQUIRE_DB panics (no fiction-green, #2924).
+    artifact_keeper_backend::testing::try_pool_with(3).await
 }
 
 /// Minimal `Config` for building `AppState` in the SSO e2e tests.
@@ -84,6 +81,43 @@ pub fn build_state(pool: PgPool) -> SharedState {
 /// pre-auth public endpoints).
 pub fn sso_app(state: SharedState) -> axum::Router {
     artifact_keeper_backend::api::handlers::sso::router().with_state(state)
+}
+
+/// Poll an audit query until some returned row satisfies `pred`, or a bounded
+/// ~2s budget is exhausted. Returns whether a match was observed.
+///
+/// Load-bearing since #2905: `audit_fire_and_forget` SPAWNS the audit INSERT
+/// rather than awaiting it, so the SSO callback handlers (OIDC callback, SAML
+/// ACS) return to the client *before* their LOGIN / LOGIN_FAILED row is
+/// durable. Reading the trail synchronously right after the callback therefore
+/// races the detached write and fails intermittently-to-always depending on
+/// scheduling.
+///
+/// This mirrors `audit_count_eventually` in
+/// `backend/src/api/handlers/test_db_helpers.rs`, which #2905 added to fix the
+/// same race for the in-crate assertions. That module lives in `src/` and so is
+/// unreachable from these separate integration-test binaries, which is exactly
+/// how these call sites were missed (#3120 fixed OIDC, #3128 SAML).
+pub async fn audit_row_eventually<F>(
+    audit: &AuditService,
+    user_id: Option<Uuid>,
+    action: &str,
+    pred: F,
+) -> bool
+where
+    F: Fn(&AuditLogEntryWithActor) -> bool,
+{
+    for _ in 0..100 {
+        let (rows, _) = audit
+            .query(user_id, Some(action), None, None, None, None, None, 0, 200)
+            .await
+            .expect("audit query");
+        if rows.iter().any(&pred) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
 }
 
 /// Discover a non-loopback local IP for binding the mock IdP.

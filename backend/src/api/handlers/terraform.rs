@@ -197,15 +197,20 @@ fn build_platform(os: &str, arch: &str) -> String {
     format!("{}_{}", os, arch)
 }
 
+/// Build the service discovery JSON for a Terraform registry.
+fn build_service_discovery_json(repo_key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "modules.v1": format!("{}/{}/v1/modules/", MOUNT_PREFIX, repo_key),
+        "providers.v1": format!("{}/{}/v1/providers/", MOUNT_PREFIX, repo_key),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // GET /{repo_key}/.well-known/terraform.json — Service Discovery
 // ---------------------------------------------------------------------------
 
 async fn service_discovery(Path(repo_key): Path<String>) -> Result<Response, Response> {
-    let json = serde_json::json!({
-        "modules.v1": format!("{}/{}/v1/modules/", MOUNT_PREFIX, repo_key),
-        "providers.v1": format!("{}/{}/v1/providers/", MOUNT_PREFIX, repo_key),
-    });
+    let json = build_service_discovery_json(&repo_key);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -223,7 +228,7 @@ async fn list_module_versions(
     Path((repo_key, namespace, name, provider)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
-    let module_name = format!("{}/{}/{}", namespace, name, provider);
+    let module_name = build_module_name(&namespace, &name, &provider);
 
     let versions: Vec<Option<String>> = sqlx::query_scalar!(
         r#"
@@ -242,13 +247,9 @@ async fn list_module_versions(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
-    let version_list: Vec<serde_json::Value> = versions
-        .into_iter()
-        .flatten()
-        .map(|v| serde_json::json!({ "version": v }))
-        .collect();
+    let versions: Vec<String> = versions.into_iter().flatten().collect();
 
-    if version_list.is_empty() {
+    if versions.is_empty() {
         return Err((
             StatusCode::NOT_FOUND,
             format!("Module {} not found", module_name),
@@ -256,11 +257,7 @@ async fn list_module_versions(
             .into_response());
     }
 
-    let json = serde_json::json!({
-        "modules": [{
-            "versions": version_list,
-        }]
-    });
+    let json = build_version_list_json(&versions);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -285,7 +282,7 @@ async fn download_module(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
-    let module_name = format!("{}/{}/{}", namespace, name, provider);
+    let module_name = build_module_name(&namespace, &name, &provider);
 
     let artifact = sqlx::query!(
         r#"
@@ -456,7 +453,7 @@ async fn latest_module_version(
     Path((repo_key, namespace, name, provider)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
-    let module_name = format!("{}/{}/{}", namespace, name, provider);
+    let module_name = build_module_name(&namespace, &name, &provider);
 
     let artifact = sqlx::query!(
         r#"
@@ -534,7 +531,7 @@ async fn search_modules(
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let query = params.q.unwrap_or_default();
-    let search_pattern = format!("%{}%", query);
+    let search_pattern = build_search_pattern(&query);
 
     let modules = sqlx::query!(
         r#"
@@ -559,11 +556,7 @@ async fn search_modules(
     let module_list: Vec<serde_json::Value> = modules
         .iter()
         .map(|m| {
-            let parts: Vec<&str> = m.name.splitn(3, '/').collect();
-            let (namespace, name, provider) = match parts.as_slice() {
-                [ns, n, p] => (ns.to_string(), n.to_string(), p.to_string()),
-                _ => (m.name.clone(), String::new(), String::new()),
-            };
+            let (namespace, name, provider) = parse_module_name(&m.name);
             let version = m.version.clone().unwrap_or_default();
             serde_json::json!({
                 "id": format!("{}/{}", m.name, version),
@@ -609,11 +602,11 @@ async fn upload_module(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "terraform", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "terraform", "write:artifacts")?.user_id;
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
-    let module_name = format!("{}/{}/{}", namespace, name, provider);
+    let module_name = build_module_name(&namespace, &name, &provider);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -645,10 +638,7 @@ async fn upload_module(
     let size_bytes = staged.size_bytes();
 
     let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
-    let storage_key = format!(
-        "terraform/modules/{}/{}/{}/{}.tar.gz",
-        namespace, name, provider, version
-    );
+    let storage_key = build_module_storage_key(&namespace, &name, &provider, &version);
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
@@ -685,13 +675,7 @@ async fn upload_module(
         .await;
 
     // Store metadata
-    let metadata = serde_json::json!({
-        "kind": "module",
-        "namespace": namespace,
-        "name": name,
-        "provider": provider,
-        "version": version,
-    });
+    let metadata = build_module_metadata(&namespace, &name, &provider, &version);
 
     let _ = sqlx::query!(
         r#"
@@ -744,7 +728,7 @@ async fn list_provider_versions(
     Path((repo_key, namespace, type_name)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
-    let provider_name = format!("{}/{}", namespace, type_name);
+    let provider_name = build_provider_name(&namespace, &type_name);
 
     // Get all stored packages with the inputs platform recovery needs.
     //
@@ -823,7 +807,7 @@ async fn download_provider(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
-    let provider_name = format!("{}/{}", namespace, type_name);
+    let provider_name = build_provider_name(&namespace, &type_name);
     let platform = build_platform(&os, &arch);
     // Resolve the package by the exact `artifacts.path` it is stored under —
     // the same coordinates the `binary` route this document advertises resolves
@@ -936,19 +920,13 @@ async fn download_provider(
     let download_url =
         build_provider_binary_url(&repo_key, &namespace, &type_name, &version, &os, &arch);
 
-    let json = serde_json::json!({
-        "protocols": ["5.0"],
-        "os": os,
-        "arch": arch,
-        "filename": filename,
-        "download_url": download_url,
-        "shasum": artifact.checksum_sha256,
-        "shasums_url": "",
-        "shasums_signature_url": "",
-        "signing_keys": {
-            "gpg_public_keys": []
-        },
-    });
+    let json = build_provider_download_json(
+        &os,
+        &arch,
+        &filename,
+        &download_url,
+        &artifact.checksum_sha256,
+    );
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1088,11 +1066,11 @@ async fn upload_provider(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "terraform", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "terraform", "write:artifacts")?.user_id;
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
-    let provider_name = format!("{}/{}", namespace, type_name);
+    let provider_name = build_provider_name(&namespace, &type_name);
     let platform = build_platform(&os, &arch);
 
     let artifact_path = build_provider_artifact_path(&namespace, &type_name, &version, &os, &arch);
@@ -1132,10 +1110,7 @@ async fn upload_provider(
     let checksum = digests.sha256.clone();
     let size_bytes = staged.size_bytes();
 
-    let storage_key = format!(
-        "terraform/providers/{}/{}/{}/terraform-provider-{}_{}.zip",
-        namespace, type_name, version, type_name, platform
-    );
+    let storage_key = build_provider_storage_key(&namespace, &type_name, &version, &platform);
 
     // Store the file, streamed from the staged scratch file.
     // `put_artifact_stream` runs the cross-repo write guard (#2584) before
@@ -1170,14 +1145,7 @@ async fn upload_provider(
         .await;
 
     // Store metadata
-    let metadata = serde_json::json!({
-        "kind": "provider",
-        "namespace": namespace,
-        "type": type_name,
-        "version": version,
-        "os": os,
-        "arch": arch,
-    });
+    let metadata = build_provider_metadata(&namespace, &type_name, &version, &os, &arch);
 
     let _ = sqlx::query!(
         r#"
@@ -1528,7 +1496,7 @@ async fn local_provider_versions(
     namespace: &str,
     type_name: &str,
 ) -> Result<Vec<String>, Response> {
-    let provider_name = format!("{}/{}", namespace, type_name);
+    let provider_name = build_provider_name(namespace, type_name);
     // Held packages are excluded (#2662): `mirror_download` refuses their
     // bytes, so `index.json` must not advertise the version. Same predicate as
     // `list_provider_versions` / `local_provider_packages`.
@@ -1570,7 +1538,7 @@ async fn local_provider_packages(
     type_name: &str,
     version: &str,
 ) -> Result<Vec<LocalProviderPackage>, Response> {
-    let provider_name = format!("{}/{}", namespace, type_name);
+    let provider_name = build_provider_name(namespace, type_name);
     // Held packages are excluded (#2662): `<version>.json` would otherwise
     // publish the exact `zh:` SHA-256 of a package whose bytes the mirror's
     // download route refuses. Same predicate as `local_provider_versions`.
@@ -1976,6 +1944,125 @@ async fn mirror_download(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Name/key/JSON builders (single source of truth; unit tests pin these
+// against hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build a fully-qualified module name.
+fn build_module_name(namespace: &str, name: &str, provider: &str) -> String {
+    format!("{}/{}/{}", namespace, name, provider)
+}
+
+/// Build a fully-qualified provider name.
+fn build_provider_name(namespace: &str, type_name: &str) -> String {
+    format!("{}/{}", namespace, type_name)
+}
+
+/// Build the storage key for a Terraform module.
+fn build_module_storage_key(namespace: &str, name: &str, provider: &str, version: &str) -> String {
+    format!(
+        "terraform/modules/{}/{}/{}/{}.tar.gz",
+        namespace, name, provider, version
+    )
+}
+
+/// Build the storage key for a Terraform provider.
+fn build_provider_storage_key(
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+    platform: &str,
+) -> String {
+    format!(
+        "terraform/providers/{}/{}/{}/terraform-provider-{}_{}.zip",
+        namespace, type_name, version, type_name, platform
+    )
+}
+
+/// Build module metadata JSON.
+fn build_module_metadata(
+    namespace: &str,
+    name: &str,
+    provider: &str,
+    version: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "module",
+        "namespace": namespace,
+        "name": name,
+        "provider": provider,
+        "version": version,
+    })
+}
+
+/// Build provider metadata JSON.
+fn build_provider_metadata(
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+    os: &str,
+    arch: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "provider",
+        "namespace": namespace,
+        "type": type_name,
+        "version": version,
+        "os": os,
+        "arch": arch,
+    })
+}
+
+/// Build the version list JSON for a module.
+fn build_version_list_json(versions: &[String]) -> serde_json::Value {
+    let version_list: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|v| serde_json::json!({ "version": v }))
+        .collect();
+    serde_json::json!({
+        "modules": [{
+            "versions": version_list,
+        }]
+    })
+}
+
+/// Build the provider download JSON response (the Provider Registry Protocol
+/// package *document*; `download_url` points at the separate binary route).
+fn build_provider_download_json(
+    os: &str,
+    arch: &str,
+    filename: &str,
+    download_url: &str,
+    shasum: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "protocols": ["5.0"],
+        "os": os,
+        "arch": arch,
+        "filename": filename,
+        "download_url": download_url,
+        "shasum": shasum,
+        "signing_keys": {
+            "gpg_public_keys": []
+        },
+    })
+}
+
+/// Parse a module name into (namespace, name, provider).
+fn parse_module_name(full_name: &str) -> (String, String, String) {
+    let parts: Vec<&str> = full_name.splitn(3, '/').collect();
+    match parts.as_slice() {
+        [ns, n, p] => (ns.to_string(), n.to_string(), p.to_string()),
+        _ => (full_name.to_string(), String::new(), String::new()),
+    }
+}
+
+/// Build a SQL LIKE search pattern from a query string.
+fn build_search_pattern(query: &str) -> String {
+    format!("%{}%", query)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2062,28 +2149,6 @@ mod tests {
     }
     use super::*;
 
-    /// Build the service discovery JSON for a Terraform registry.
-    fn build_service_discovery_json(repo_key: &str) -> serde_json::Value {
-        serde_json::json!({
-            "modules.v1": format!("/terraform/{}/v1/modules/", repo_key),
-            "providers.v1": format!("/terraform/{}/v1/providers/", repo_key),
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Build a fully-qualified module name.
-    fn build_module_name(namespace: &str, name: &str, provider: &str) -> String {
-        format!("{}/{}/{}", namespace, name, provider)
-    }
-
-    /// Build a fully-qualified provider name.
-    fn build_provider_name(namespace: &str, type_name: &str) -> String {
-        format!("{}/{}", namespace, type_name)
-    }
-
     // NOTE: `build_module_archive_url`, `build_provider_binary_url`,
     // `build_provider_filename` and `build_platform` are the production
     // functions (via `use super::*`). This module used to carry private copies
@@ -2092,116 +2157,6 @@ mod tests {
     // `download_url` went unnoticed. The copies are gone; the tests below
     // exercise the real builders, and `test_advertised_*` asserts the
     // resulting URLs against the real router.
-
-    /// Build the storage key for a Terraform module.
-    fn build_module_storage_key(
-        namespace: &str,
-        name: &str,
-        provider: &str,
-        version: &str,
-    ) -> String {
-        format!(
-            "terraform/modules/{}/{}/{}/{}.tar.gz",
-            namespace, name, provider, version
-        )
-    }
-
-    /// Build the storage key for a Terraform provider.
-    fn build_provider_storage_key(
-        namespace: &str,
-        type_name: &str,
-        version: &str,
-        platform: &str,
-    ) -> String {
-        format!(
-            "terraform/providers/{}/{}/{}/terraform-provider-{}_{}.zip",
-            namespace, type_name, version, type_name, platform
-        )
-    }
-
-    /// Build module metadata JSON.
-    fn build_module_metadata(
-        namespace: &str,
-        name: &str,
-        provider: &str,
-        version: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "kind": "module",
-            "namespace": namespace,
-            "name": name,
-            "provider": provider,
-            "version": version,
-        })
-    }
-
-    /// Build provider metadata JSON.
-    fn build_provider_metadata(
-        namespace: &str,
-        type_name: &str,
-        version: &str,
-        os: &str,
-        arch: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "kind": "provider",
-            "namespace": namespace,
-            "type": type_name,
-            "version": version,
-            "os": os,
-            "arch": arch,
-        })
-    }
-
-    /// Build the version list JSON for a module.
-    fn build_version_list_json(versions: &[String]) -> serde_json::Value {
-        let version_list: Vec<serde_json::Value> = versions
-            .iter()
-            .map(|v| serde_json::json!({ "version": v }))
-            .collect();
-        serde_json::json!({
-            "modules": [{
-                "versions": version_list,
-            }]
-        })
-    }
-
-    /// Build the provider download JSON response.
-    fn build_provider_download_json(
-        os: &str,
-        arch: &str,
-        filename: &str,
-        download_url: &str,
-        shasum: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "protocols": ["5.0"],
-            "os": os,
-            "arch": arch,
-            "filename": filename,
-            "download_url": download_url,
-            "shasum": shasum,
-            "shasums_url": "",
-            "shasums_signature_url": "",
-            "signing_keys": {
-                "gpg_public_keys": []
-            },
-        })
-    }
-
-    /// Parse a module name into (namespace, name, provider).
-    fn parse_module_name(full_name: &str) -> (String, String, String) {
-        let parts: Vec<&str> = full_name.splitn(3, '/').collect();
-        match parts.as_slice() {
-            [ns, n, p] => (ns.to_string(), n.to_string(), p.to_string()),
-            _ => (full_name.to_string(), String::new(), String::new()),
-        }
-    }
-
-    /// Build a SQL LIKE search pattern from a query string.
-    fn build_search_pattern(query: &str) -> String {
-        format!("%{}%", query)
-    }
 
     // -----------------------------------------------------------------------
     // default_offset / default_limit
@@ -2256,6 +2211,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -2281,6 +2237,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };

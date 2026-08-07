@@ -180,11 +180,14 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             let storage = state.storage_for_repo_or_500(location)?;
             if let Ok(stream) = storage.get_stream(&scoped_key).await {
                 return Ok(StreamingFetchResult {
+                    commit_sha: None,
+                    content_encoding: None,
                     body: stream,
                     content_type: None,
                     content_length: None,
                     // Row-less companion object: not anchored to an artifact row.
                     artifact_id: None,
+                    etag: None,
                 });
             }
         }
@@ -211,11 +214,14 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             }
         })?;
         return Ok(StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: stream,
             content_type: None,
             content_length: None,
             // Cloud flat-key legacy object: not anchored to our artifact row.
             artifact_id: None,
+            etag: None,
         });
     }
 
@@ -343,11 +349,14 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
         }
     })?;
     Ok(StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body: stream,
         content_type: None,
         content_length: None,
         // Remote proxy-cache stream: not our artifact row (#1278), unrecorded.
         artifact_id: None,
+        etag: None,
     })
 }
 
@@ -557,6 +566,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };

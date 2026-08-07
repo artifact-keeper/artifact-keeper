@@ -74,7 +74,13 @@ async fn create_access_token(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateAccessTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
-    let scopes = payload.scopes.unwrap_or_else(|| vec!["read".to_string()]);
+    // Default omitted scopes to the canonical read scope. Bare `read` is not
+    // in `ALLOWED_SCOPES` (it granted nothing under exact-match `has_scope`
+    // and is now rejected by the mint-primitive vocabulary backstop, #2996),
+    // so the default is the fully-qualified `read:artifacts`.
+    let scopes = payload
+        .scopes
+        .unwrap_or_else(|| vec!["read:artifacts".to_string()]);
 
     // Refuse admin-class scopes from non-admin callers. Without this
     // check, any logged-in user can mint a token with `*` or `admin`
@@ -85,6 +91,11 @@ async fn create_access_token(
     // `token_service::ADMIN_ONLY_SCOPES`.
     crate::services::token_service::enforce_admin_only_scopes(&scopes, auth.is_admin)
         .map_err(crate::error::AppError::Authorization)?;
+
+    // Delegation ceiling (#2996): a scoped credential may not mint a token
+    // that exceeds its own scopes. Interactive sessions (`scopes: None`)
+    // are unaffected.
+    auth.enforce_mint_ceiling(&scopes)?;
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (token, token_id) = auth_service
@@ -147,7 +158,7 @@ mod tests {
     fn test_create_access_token_request_full() {
         let json = r#"{
             "name": "ci-token",
-            "scopes": ["read", "write", "admin"],
+            "scopes": ["read:artifacts", "write:artifacts", "admin"],
             "expires_in_days": 90
         }"#;
         let req: CreateAccessTokenRequest = serde_json::from_str(json).unwrap();
@@ -155,8 +166,8 @@ mod tests {
         assert_eq!(
             req.scopes,
             Some(vec![
-                "read".to_string(),
-                "write".to_string(),
+                "read:artifacts".to_string(),
+                "write:artifacts".to_string(),
                 "admin".to_string()
             ])
         );
@@ -174,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_create_access_token_request_missing_name_fails() {
-        let json = r#"{"scopes": ["read"]}"#;
+        let json = r#"{"scopes": ["read:artifacts"]}"#;
         let result: std::result::Result<CreateAccessTokenRequest, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
@@ -211,24 +222,38 @@ mod tests {
 
     #[test]
     fn test_default_scopes_when_none() {
+        // Regression guard (#2996): the default for an omitted `scopes` field
+        // must be the canonical `read:artifacts` — bare `read` is not in
+        // `ALLOWED_SCOPES` and would be rejected at the mint primitive.
         let payload = CreateAccessTokenRequest {
             name: "test".to_string(),
             scopes: None,
             expires_in_days: None,
         };
-        let scopes = payload.scopes.unwrap_or_else(|| vec!["read".to_string()]);
-        assert_eq!(scopes, vec!["read".to_string()]);
+        let scopes = payload
+            .scopes
+            .unwrap_or_else(|| vec!["read:artifacts".to_string()]);
+        assert_eq!(scopes, vec!["read:artifacts".to_string()]);
+        assert!(crate::services::token_service::validate_scopes_pure(&scopes).is_ok());
     }
 
     #[test]
     fn test_provided_scopes_preserved() {
         let payload = CreateAccessTokenRequest {
             name: "test".to_string(),
-            scopes: Some(vec!["read".to_string(), "write".to_string()]),
+            scopes: Some(vec![
+                "read:artifacts".to_string(),
+                "write:artifacts".to_string(),
+            ]),
             expires_in_days: None,
         };
-        let scopes = payload.scopes.unwrap_or_else(|| vec!["read".to_string()]);
-        assert_eq!(scopes, vec!["read".to_string(), "write".to_string()]);
+        let scopes = payload
+            .scopes
+            .unwrap_or_else(|| vec!["read:artifacts".to_string()]);
+        assert_eq!(
+            scopes,
+            vec!["read:artifacts".to_string(), "write:artifacts".to_string()]
+        );
     }
 
     // ── AuthExtension construction tests ────────────────────────────
@@ -259,7 +284,7 @@ mod tests {
             is_admin: false,
             is_api_token: true,
             is_service_account: false,
-            scopes: Some(vec!["read".to_string()]),
+            scopes: Some(vec!["read:artifacts".to_string()]),
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
             iat_ms: None,
         };
@@ -277,7 +302,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "deploy-key".to_string(),
             token_prefix: "ak_".to_string(),
-            scopes: vec!["read".to_string(), "write".to_string()],
+            scopes: vec!["read:artifacts".to_string(), "write:artifacts".to_string()],
             expires_at: Some(now + chrono::Duration::days(30)),
             last_used_at: Some(now),
             created_at: now,
@@ -308,30 +333,28 @@ mod tests {
     }
 }
 
-/// DB-backed tests for the token-lifecycle audit trail (#1617 Phase 1).
+/// Shared plumbing for the DB-backed profile handler test modules
+/// (`audit_db_tests`, `mint_scope_validation_db_tests`).
 #[cfg(test)]
-mod audit_db_tests {
+mod db_test_support {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
-    use axum::body::Body;
-    use axum::http::{Method, Request, StatusCode};
     use axum::Extension as AxumExtension;
-    use serde_json::json;
 
-    fn build_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+    pub(super) fn build_app(state: SharedState, auth: AuthExtension) -> axum::Router {
         router()
             .with_state(state)
             .layer(AxumExtension::<AuthExtension>(auth))
     }
 
-    async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String)> {
+    pub(super) async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String)> {
         let pool = tdh::try_pool().await?;
         let (user_id, username) = tdh::create_user(&pool).await;
         let state = tdh::build_state(pool.clone(), "/tmp");
         Some((pool, state, user_id, username))
     }
 
-    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid) {
+    pub(super) async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid) {
         let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
             .bind(user_id)
             .execute(pool)
@@ -341,6 +364,17 @@ mod audit_db_tests {
             .execute(pool)
             .await;
     }
+}
+
+/// DB-backed tests for the token-lifecycle audit trail (#1617 Phase 1).
+#[cfg(test)]
+mod audit_db_tests {
+    use super::db_test_support::{build_app, cleanup, setup};
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use serde_json::json;
 
     /// `POST /profile/access-tokens` must emit `API_TOKEN_CREATED`, and the
     /// matching revoke must emit `API_TOKEN_REVOKED`.
@@ -351,7 +385,7 @@ mod audit_db_tests {
         };
         let auth = tdh::make_auth(user_id, &username);
 
-        let body = json!({ "name": "profile-audit", "scopes": ["read"] }).to_string();
+        let body = json!({ "name": "profile-audit", "scopes": ["read:artifacts"] }).to_string();
         let req = Request::builder()
             .method(Method::POST)
             .uri("/access-tokens")
@@ -390,6 +424,108 @@ mod audit_db_tests {
             tdh::audit_count_eventually(&pool, token_id, "API_TOKEN_REVOKED", 1).await,
             1,
             "profile revoke MUST write one API_TOKEN_REVOKED row"
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+}
+
+/// DB-backed tests for the #2996 mint-path controls on
+/// `POST /profile/access-tokens`: the changed omitted-scopes default and the
+/// delegation ceiling.
+#[cfg(test)]
+mod mint_scope_validation_db_tests {
+    use super::db_test_support::{build_app, cleanup, setup};
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use serde_json::json;
+
+    /// Regression guard (#2996): omitting `scopes` must still succeed (200)
+    /// and persist the canonical `read:artifacts` — not the legacy bare
+    /// `read`, which is outside `ALLOWED_SCOPES` and would be rejected by the
+    /// mint-primitive vocabulary backstop.
+    #[tokio::test]
+    async fn omitted_scopes_default_persists_read_artifacts() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username); // interactive, non-admin
+
+        let body = json!({ "name": "default-scopes" }).to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/access-tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(build_app(state, auth), req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "no-scopes profile mint MUST 200; body: {}",
+            String::from_utf8_lossy(&body_bytes),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
+
+        let persisted: Vec<String> =
+            sqlx::query_scalar("SELECT scopes FROM api_tokens WHERE id = $1")
+                .bind(token_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch persisted scopes");
+        assert_eq!(
+            persisted,
+            vec!["read:artifacts".to_string()],
+            "omitted scopes must default to the canonical read:artifacts",
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// The delegation ceiling applies on the profile route too: a read-scoped
+    /// presenting token cannot mint `write:artifacts` here (403), while an
+    /// interactive session can (200).
+    #[tokio::test]
+    async fn profile_route_enforces_mint_ceiling_for_scoped_credentials() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+
+        let mut scoped = tdh::make_auth(user_id, &username);
+        scoped.is_api_token = true;
+        scoped.scopes = Some(vec!["read:artifacts".to_string()]);
+        let body = json!({ "name": "ceiling-probe", "scopes": ["write:artifacts"] }).to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/access-tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(build_app(state.clone(), scoped), req).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "read-scoped token minting write:artifacts on /profile MUST 403; body: {}",
+            String::from_utf8_lossy(&body_bytes),
+        );
+
+        let interactive = tdh::make_auth(user_id, &username);
+        let body = json!({ "name": "legit", "scopes": ["write:artifacts"] }).to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/access-tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(build_app(state, interactive), req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "interactive non-admin minting write:artifacts MUST stay 200; body: {}",
+            String::from_utf8_lossy(&body_bytes),
         );
 
         cleanup(&pool, user_id).await;

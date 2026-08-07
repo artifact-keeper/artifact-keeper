@@ -441,7 +441,7 @@ async fn upload_collection(
     Path(repo_key): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "ansible", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "ansible", "write:artifacts")?.user_id;
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -686,6 +686,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };

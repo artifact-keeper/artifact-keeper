@@ -18,6 +18,11 @@ const ABANDONED_OCI_UPLOAD_TTL_SQL: &str = "INTERVAL '24 hours'";
 const ABANDONED_OCI_UPLOAD_SCAN_LIMIT: i64 = 1000;
 const OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT: i64 = 1000;
 
+/// TTL for one cleanup-key sweep claim. One storage delete takes seconds;
+/// 15 minutes comfortably covers a slow batch while bounding how long a
+/// crashed sweeper blocks retries of its claimed keys.
+const OCI_CLEANUP_KEY_CLAIM_TTL_SQL: &str = "INTERVAL '15 minutes'";
+
 /// SQL fragment expressing the orphan-storage-key predicate.
 ///
 /// A storage key is "orphaned" when:
@@ -370,6 +375,10 @@ struct OciUploadCleanupKey {
     id: i64,
     location: StorageLocation,
     storage_key: String,
+    /// Sweep-claim token (RowClaimedQueue): `Some` when the row was claimed
+    /// for a real (destructive) sweep, `None` for dry-run candidate scans.
+    /// The row DELETE and the failure release must present it.
+    claim_token: Option<Uuid>,
 }
 
 impl StorageGcService {
@@ -405,7 +414,40 @@ impl StorageGcService {
     /// transaction so the row lock prevents any racing writer from
     /// resurrecting the rows before they are hard-deleted.
     pub async fn run_gc(&self, dry_run: bool) -> Result<StorageGcResult> {
-        let orphans = self.select_orphans().await?;
+        self.run_gc_inner(None, dry_run).await
+    }
+
+    /// Repository-scoped variant of [`Self::run_gc`] (web #708).
+    ///
+    /// Every candidate scan is filtered to rows owned by `repository_id`:
+    /// soft-deleted artifacts in this repository (main sweep), this
+    /// repository's abandoned OCI upload sessions, its orphaned upload
+    /// cleanup keys, and its orphaned Maven flat-object attribution rows.
+    ///
+    /// The orphan *predicates* are deliberately NOT narrowed: a storage key
+    /// is only ever reclaimed when no live artifact, tag, blob, or manifest
+    /// reference exists for it anywhere on the instance. A dry run therefore
+    /// reports "bytes reclaimable now, attributable to this repository" —
+    /// honest under cross-repo dedup because a shared blob still referenced
+    /// by another repository never appears in the candidate set. On a shared
+    /// (cloud) backend a live (non-dry-run) run hard-deletes every
+    /// repository's soft-deleted rows for a reclaimed key — exactly what the
+    /// instance-wide pass would do for the same key — so per-repo scoping
+    /// can never strand or prematurely delete another tenant's data.
+    pub async fn run_gc_for_repository(
+        &self,
+        repository_id: Uuid,
+        dry_run: bool,
+    ) -> Result<StorageGcResult> {
+        self.run_gc_inner(Some(repository_id), dry_run).await
+    }
+
+    async fn run_gc_inner(
+        &self,
+        repo_scope: Option<Uuid>,
+        dry_run: bool,
+    ) -> Result<StorageGcResult> {
+        let orphans = self.select_orphans(repo_scope).await?;
 
         let mut result = empty_gc_result(dry_run);
 
@@ -578,7 +620,7 @@ impl StorageGcService {
         // own setup query (e.g. the candidate SELECT) the same way instead
         // of `?`-propagating out of run_gc and aborting later sweeps.
         if let Err(e) = self
-            .cleanup_abandoned_oci_uploads(dry_run, &mut result)
+            .cleanup_abandoned_oci_uploads(repo_scope, dry_run, &mut result)
             .await
         {
             let msg = format_gc_error(
@@ -590,7 +632,7 @@ impl StorageGcService {
             result.errors.push(msg);
         }
         if let Err(e) = self
-            .cleanup_unreferenced_oci_upload_keys(dry_run, &mut result)
+            .cleanup_unreferenced_oci_upload_keys(repo_scope, dry_run, &mut result)
             .await
         {
             let msg = format_gc_error(
@@ -602,7 +644,7 @@ impl StorageGcService {
             result.errors.push(msg);
         }
         if let Err(e) = self
-            .reap_pending_oci_upload_cleanup_keys(dry_run, &mut result)
+            .reap_pending_oci_upload_cleanup_keys(repo_scope, dry_run, &mut result)
             .await
         {
             let msg = format_gc_error(
@@ -614,7 +656,7 @@ impl StorageGcService {
             result.errors.push(msg);
         }
         if let Err(e) = self
-            .cleanup_orphan_maven_flat_objects(dry_run, &mut result)
+            .cleanup_orphan_maven_flat_objects(repo_scope, dry_run, &mut result)
             .await
         {
             let msg = format_gc_error(
@@ -1158,7 +1200,14 @@ impl StorageGcService {
     /// share the same Postgres database, and a peer test's in-flight
     /// orphan row would inflate that counter. Asserting per-key against
     /// this candidate list keeps each test isolated from its neighbors.
-    pub(crate) async fn select_orphans(&self) -> Result<Vec<sqlx::postgres::PgRow>> {
+    /// `repo_scope` (`Some(id)`) restricts the scan to soft-deleted artifacts
+    /// owned by that repository (web #708); the orphan predicate itself stays
+    /// instance-wide, so a scoped scan can only ever *narrow* the candidate
+    /// set, never admit a key the instance-wide scan would protect.
+    pub(crate) async fn select_orphans(
+        &self,
+        repo_scope: Option<Uuid>,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
         let sql = format!(
             r#"
             SELECT a.storage_key, r.storage_backend, r.storage_path,
@@ -1167,11 +1216,17 @@ impl StorageGcService {
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE {predicate}
+              {scope}
             GROUP BY a.storage_key, r.storage_backend, r.storage_path
             "#,
             predicate = ORPHAN_PREDICATE_SQL,
+            scope = repo_scope_clause("a.repository_id", 1, repo_scope),
         );
-        sqlx::query(&sql)
+        let mut query = sqlx::query(&sql);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        query
             .fetch_all(&self.db)
             .await
             .map_err(|e| crate::error::AppError::Database(e.to_string()))
@@ -1304,10 +1359,13 @@ impl StorageGcService {
 
     async fn cleanup_abandoned_oci_uploads(
         &self,
+        repo_scope: Option<Uuid>,
         dry_run: bool,
         result: &mut StorageGcResult,
     ) -> Result<()> {
-        let session_ids = self.select_abandoned_oci_upload_session_ids().await?;
+        let session_ids = self
+            .select_abandoned_oci_upload_session_ids(repo_scope)
+            .await?;
         let mut sessions_removed = 0_i64;
         let mut upload_keys_deleted = 0_i64;
 
@@ -1443,19 +1501,27 @@ impl StorageGcService {
         Ok(())
     }
 
-    async fn select_abandoned_oci_upload_session_ids(&self) -> Result<Vec<Uuid>> {
+    async fn select_abandoned_oci_upload_session_ids(
+        &self,
+        repo_scope: Option<Uuid>,
+    ) -> Result<Vec<Uuid>> {
         let sql = format!(
             r#"
             SELECT id
             FROM oci_upload_sessions
             WHERE updated_at < NOW() - {ttl}
+              {scope}
             ORDER BY updated_at ASC
             LIMIT $1
             "#,
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            scope = repo_scope_clause("repository_id", 2, repo_scope),
         );
-        let rows = sqlx::query(&sql)
-            .bind(ABANDONED_OCI_UPLOAD_SCAN_LIMIT)
+        let mut query = sqlx::query(&sql).bind(ABANDONED_OCI_UPLOAD_SCAN_LIMIT);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        let rows = query
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1470,10 +1536,21 @@ impl StorageGcService {
 
     async fn cleanup_unreferenced_oci_upload_keys(
         &self,
+        repo_scope: Option<Uuid>,
         dry_run: bool,
         result: &mut StorageGcResult,
     ) -> Result<()> {
-        let cleanup_keys = self.select_unreferenced_oci_upload_cleanup_keys().await?;
+        // Dry-run scans must not write claims; a real sweep claims rows
+        // (RowClaimedQueue) so concurrent replicas drain disjoint keys and
+        // the external storage delete only ever runs under a live claim. Both
+        // paths preserve the optional repository scope.
+        let cleanup_keys = if dry_run {
+            self.select_unreferenced_oci_upload_cleanup_keys(repo_scope)
+                .await?
+        } else {
+            self.claim_unreferenced_oci_upload_cleanup_keys(repo_scope)
+                .await?
+        };
         let mut cleanup_rows_removed = 0_i64;
 
         for cleanup_key in cleanup_keys {
@@ -1491,10 +1568,22 @@ impl StorageGcService {
                         &e.to_string(),
                     );
                     tracing::warn!("{}", msg);
+                    self.release_cleanup_key_claim(&cleanup_key, &msg).await;
                     result.errors.push(msg);
                     continue;
                 }
             };
+
+            // Re-assert ownership immediately before the destructive delete:
+            // earlier keys in this batch may have taken long enough that this
+            // row's claim lapsed and another replica's sweep now owns it.
+            if !self.renew_cleanup_key_claim(&cleanup_key).await {
+                tracing::info!(
+                    storage_key = %cleanup_key.storage_key,
+                    "cleanup-key claim lost mid-batch; skipping (new owner will delete)"
+                );
+                continue;
+            }
 
             match storage.delete(&cleanup_key.storage_key).await {
                 Ok(()) | Err(AppError::NotFound(_)) => {}
@@ -1505,6 +1594,9 @@ impl StorageGcService {
                         &e.to_string(),
                     );
                     tracing::warn!("{}", msg);
+                    // Release the claim with the error recorded so the next
+                    // sweep retries the storage delete.
+                    self.release_cleanup_key_claim(&cleanup_key, &msg).await;
                     result.errors.push(msg);
                     continue;
                 }
@@ -1514,6 +1606,7 @@ impl StorageGcService {
                 r#"
                 DELETE FROM oci_upload_cleanup_keys
                 WHERE id = $1
+                  AND claim_token = $2
                   AND storage_write_completed_at IS NOT NULL
                   -- Intentionally NOT guarded by `s.id = upload_session_id`
                   -- (unlike the pending reaper): a committed cleanup key is a
@@ -1547,6 +1640,7 @@ impl StorageGcService {
                 "#,
             )
             .bind(cleanup_key.id)
+            .bind(cleanup_key.claim_token)
             .execute(&self.db)
             .await
             {
@@ -1576,14 +1670,16 @@ impl StorageGcService {
 
     async fn select_unreferenced_oci_upload_cleanup_keys(
         &self,
+        repo_scope: Option<Uuid>,
     ) -> Result<Vec<OciUploadCleanupKey>> {
         let sql = format!(
             r#"
-            SELECT c.id, c.storage_key, r.storage_backend, r.storage_path
+            SELECT c.id, c.storage_key, c.claim_token, r.storage_backend, r.storage_path
             FROM oci_upload_cleanup_keys c
             JOIN repositories r ON r.id = c.repository_id
             WHERE c.storage_write_completed_at IS NOT NULL
               AND c.storage_write_completed_at < NOW() - {ttl}
+              {scope}
               -- See the matching DELETE: a committed key (part/final/completion
               -- temp) is intentionally reapable even while its session lives,
               -- so this is NOT guarded by `s.id = c.upload_session_id`.
@@ -1607,9 +1703,13 @@ impl StorageGcService {
             LIMIT $1
             "#,
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            scope = repo_scope_clause("c.repository_id", 2, repo_scope),
         );
-        let rows = sqlx::query(&sql)
-            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
+        let mut query = sqlx::query(&sql).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        let rows = query
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1617,6 +1717,127 @@ impl StorageGcService {
         rows.into_iter()
             .map(|row| decode_oci_cleanup_key_row(&row))
             .collect()
+    }
+
+    /// Claim a batch of unreferenced cleanup keys for a destructive sweep
+    /// (RowClaimedQueue, see [`crate::services::cluster_work`]).
+    ///
+    /// Same candidate predicates as
+    /// [`Self::select_unreferenced_oci_upload_cleanup_keys`], plus: rows with
+    /// a live claim are skipped (another replica's sweep owns them), and
+    /// selected rows are stamped with a fresh token under
+    /// FOR UPDATE SKIP LOCKED so concurrent sweeps drain disjoint keys. The
+    /// storage delete runs only for returned rows; the row DELETE and the
+    /// failure release must present the token.
+    async fn claim_unreferenced_oci_upload_cleanup_keys(
+        &self,
+        repo_scope: Option<Uuid>,
+    ) -> Result<Vec<OciUploadCleanupKey>> {
+        let sql = format!(
+            r#"
+            WITH candidate AS (
+                SELECT c.id
+                FROM oci_upload_cleanup_keys c
+                WHERE c.storage_write_completed_at IS NOT NULL
+                  AND c.storage_write_completed_at < NOW() - {ttl}
+                  AND (c.claim_expires_at IS NULL OR c.claim_expires_at <= NOW())
+                  {scope}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_upload_sessions s
+                    WHERE s.storage_temp_key = c.storage_key
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_upload_parts p
+                    WHERE p.storage_key = c.storage_key
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_blobs b
+                    WHERE b.storage_key = c.storage_key
+                  )
+                ORDER BY c.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF c SKIP LOCKED
+            )
+            UPDATE oci_upload_cleanup_keys u
+            SET claimed_by = $2,
+                claim_token = gen_random_uuid(),
+                claim_expires_at = NOW() + {claim_ttl}
+            FROM candidate, repositories r
+            WHERE u.id = candidate.id
+              AND r.id = u.repository_id
+            RETURNING u.id, u.storage_key, u.claim_token,
+                      r.storage_backend, r.storage_path
+            "#,
+            ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
+            scope = repo_scope_clause("c.repository_id", 3, repo_scope),
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
+            .bind(crate::services::cluster_work::WorkerIdentity::for_process().as_str());
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        let rows = query
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| decode_oci_cleanup_key_row(&row))
+            .collect()
+    }
+
+    /// Token-guarded claim release after a failed storage delete: records the
+    /// error and lapses the claim so the next sweep (on any replica) retries.
+    async fn release_cleanup_key_claim(&self, cleanup_key: &OciUploadCleanupKey, error: &str) {
+        let _ = sqlx::query(
+            r#"
+            UPDATE oci_upload_cleanup_keys
+            SET last_error = $2, claim_expires_at = NOW()
+            WHERE id = $1
+              AND claim_token = $3
+            "#,
+        )
+        .bind(cleanup_key.id)
+        .bind(error)
+        .bind(cleanup_key.claim_token)
+        .execute(&self.db)
+        .await;
+    }
+
+    /// Re-extend one cleanup-key claim immediately before its storage delete.
+    ///
+    /// A claimed batch (up to `OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT` rows) walks
+    /// its storage deletes sequentially, and slow object-store deletes can
+    /// outlive the fixed claim TTL — a lapsed tail claim may then be
+    /// re-claimed by another replica's sweep while this one is still walking
+    /// its list, letting both attempt the same destructive delete. Returns
+    /// `false` when the claim was lost (token superseded); the caller must
+    /// skip the delete because the new owner will perform it.
+    async fn renew_cleanup_key_claim(&self, cleanup_key: &OciUploadCleanupKey) -> bool {
+        let sql = format!(
+            "UPDATE oci_upload_cleanup_keys \
+             SET claim_expires_at = NOW() + {claim_ttl} \
+             WHERE id = $1 AND claim_token = $2",
+            claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
+        );
+        match sqlx::query(&sql)
+            .bind(cleanup_key.id)
+            .bind(cleanup_key.claim_token)
+            .execute(&self.db)
+            .await
+        {
+            Ok(r) => r.rows_affected() == 1,
+            Err(e) => {
+                tracing::warn!(
+                    storage_key = %cleanup_key.storage_key,
+                    error = %e,
+                    "failed to renew cleanup-key claim; skipping its storage delete"
+                );
+                false
+            }
+        }
     }
 
     /// Reconcile aged `oci_upload_cleanup_keys` rows whose storage write was
@@ -1640,10 +1861,21 @@ impl StorageGcService {
     /// that may be marking the row complete concurrently.
     async fn reap_pending_oci_upload_cleanup_keys(
         &self,
+        repo_scope: Option<Uuid>,
         dry_run: bool,
         result: &mut StorageGcResult,
     ) -> Result<()> {
-        let cleanup_keys = self.select_pending_oci_upload_cleanup_keys().await?;
+        // Dry-run scans must not write claims; a real sweep claims rows so
+        // concurrent replicas drain disjoint keys and the storage delete
+        // only ever runs under a live claim. Both paths preserve the optional
+        // repository scope.
+        let cleanup_keys = if dry_run {
+            self.select_pending_oci_upload_cleanup_keys(repo_scope)
+                .await?
+        } else {
+            self.claim_pending_oci_upload_cleanup_keys(repo_scope)
+                .await?
+        };
         let mut cleanup_rows_removed = 0_i64;
 
         for cleanup_key in cleanup_keys {
@@ -1661,10 +1893,23 @@ impl StorageGcService {
                         &e.to_string(),
                     );
                     tracing::warn!("{}", msg);
+                    self.release_cleanup_key_claim(&cleanup_key, &msg).await;
                     result.errors.push(msg);
                     continue;
                 }
             };
+
+            // Same tail-expiry window as the unreferenced sweep: re-assert
+            // ownership immediately before the destructive delete so a claim
+            // that lapsed while earlier keys in this batch were being deleted
+            // cannot have both owners attempt the same storage delete.
+            if !self.renew_cleanup_key_claim(&cleanup_key).await {
+                tracing::info!(
+                    storage_key = %cleanup_key.storage_key,
+                    "pending cleanup-key claim lost mid-batch; skipping (new owner will delete)"
+                );
+                continue;
+            }
 
             match storage.delete(&cleanup_key.storage_key).await {
                 Ok(()) | Err(AppError::NotFound(_)) => {}
@@ -1675,6 +1920,9 @@ impl StorageGcService {
                         &e.to_string(),
                     );
                     tracing::warn!("{}", msg);
+                    // Release the claim with the error recorded so the next
+                    // sweep retries the storage delete.
+                    self.release_cleanup_key_claim(&cleanup_key, &msg).await;
                     result.errors.push(msg);
                     continue;
                 }
@@ -1692,6 +1940,7 @@ impl StorageGcService {
                 r#"
                 DELETE FROM oci_upload_cleanup_keys
                 WHERE id = $1
+                  AND claim_token = $2
                   AND storage_write_completed_at IS NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM oci_upload_sessions s
@@ -1713,6 +1962,7 @@ impl StorageGcService {
                 "#,
             )
             .bind(cleanup_key.id)
+            .bind(cleanup_key.claim_token)
             .execute(&self.db)
             .await
             {
@@ -1740,14 +1990,18 @@ impl StorageGcService {
         Ok(())
     }
 
-    async fn select_pending_oci_upload_cleanup_keys(&self) -> Result<Vec<OciUploadCleanupKey>> {
+    async fn select_pending_oci_upload_cleanup_keys(
+        &self,
+        repo_scope: Option<Uuid>,
+    ) -> Result<Vec<OciUploadCleanupKey>> {
         let sql = format!(
             r#"
-            SELECT c.id, c.storage_key, r.storage_backend, r.storage_path
+            SELECT c.id, c.storage_key, c.claim_token, r.storage_backend, r.storage_path
             FROM oci_upload_cleanup_keys c
             JOIN repositories r ON r.id = c.repository_id
             WHERE c.storage_write_completed_at IS NULL
               AND c.created_at < NOW() - {ttl}
+              {scope}
               AND NOT EXISTS (
                 SELECT 1 FROM oci_upload_sessions s
                 WHERE s.id = c.upload_session_id
@@ -1769,9 +2023,13 @@ impl StorageGcService {
             LIMIT $1
             "#,
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            scope = repo_scope_clause("c.repository_id", 2, repo_scope),
         );
-        let rows = sqlx::query(&sql)
-            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
+        let mut query = sqlx::query(&sql).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        let rows = query
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1810,10 +2068,11 @@ impl StorageGcService {
     /// repository deletion.
     async fn cleanup_orphan_maven_flat_objects(
         &self,
+        repo_scope: Option<Uuid>,
         dry_run: bool,
         result: &mut StorageGcResult,
     ) -> Result<()> {
-        let candidates = self.select_orphan_maven_flat_objects().await?;
+        let candidates = self.select_orphan_maven_flat_objects(repo_scope).await?;
         let mut objects_removed = 0_i64;
 
         for row in candidates {
@@ -1946,6 +2205,7 @@ impl StorageGcService {
     /// (#1493 pattern).
     pub(crate) async fn select_orphan_maven_flat_objects(
         &self,
+        repo_scope: Option<Uuid>,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
         let sql = format!(
             r#"
@@ -1953,16 +2213,86 @@ impl StorageGcService {
             FROM maven_flat_object_owner o
             JOIN repositories r ON r.id = o.repository_id
             WHERE {predicate}
+              {scope}
             ORDER BY o.storage_key
             LIMIT $1
             "#,
             predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL,
+            scope = repo_scope_clause("o.repository_id", 2, repo_scope),
         );
-        sqlx::query(&sql)
-            .bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT)
+        let mut query = sqlx::query(&sql).bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        query
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Claim a batch of aged pending (never-marked-complete) cleanup keys
+    /// for a destructive sweep. Same candidate predicates as
+    /// [`Self::select_pending_oci_upload_cleanup_keys`], plus live-claim
+    /// exclusion and FOR UPDATE SKIP LOCKED, mirroring
+    /// [`Self::claim_unreferenced_oci_upload_cleanup_keys`].
+    async fn claim_pending_oci_upload_cleanup_keys(
+        &self,
+        repo_scope: Option<Uuid>,
+    ) -> Result<Vec<OciUploadCleanupKey>> {
+        let sql = format!(
+            r#"
+            WITH candidate AS (
+                SELECT c.id
+                FROM oci_upload_cleanup_keys c
+                WHERE c.storage_write_completed_at IS NULL
+                  AND c.created_at < NOW() - {ttl}
+                  AND (c.claim_expires_at IS NULL OR c.claim_expires_at <= NOW())
+                  {scope}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_upload_sessions s
+                    WHERE s.id = c.upload_session_id
+                       OR s.storage_temp_key = c.storage_key
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_upload_parts p
+                    WHERE p.storage_key = c.storage_key
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM oci_blobs b
+                    WHERE b.storage_key = c.storage_key
+                  )
+                ORDER BY c.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF c SKIP LOCKED
+            )
+            UPDATE oci_upload_cleanup_keys u
+            SET claimed_by = $2,
+                claim_token = gen_random_uuid(),
+                claim_expires_at = NOW() + {claim_ttl}
+            FROM candidate, repositories r
+            WHERE u.id = candidate.id
+              AND r.id = u.repository_id
+            RETURNING u.id, u.storage_key, u.claim_token,
+                      r.storage_backend, r.storage_path
+            "#,
+            ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
+            scope = repo_scope_clause("c.repository_id", 3, repo_scope),
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
+            .bind(crate::services::cluster_work::WorkerIdentity::for_process().as_str());
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        let rows = query
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| decode_oci_cleanup_key_row(&row))
+            .collect()
     }
 }
 
@@ -2114,6 +2444,9 @@ fn decode_oci_cleanup_key_row(row: &sqlx::postgres::PgRow) -> Result<OciUploadCl
                 .try_get::<String, _>("storage_path")
                 .map_err(|e| AppError::Database(e.to_string()))?,
         },
+        claim_token: row
+            .try_get::<Option<Uuid>, _>("claim_token")
+            .map_err(|e| AppError::Database(e.to_string()))?,
     })
 }
 
@@ -2354,6 +2687,21 @@ pub(crate) fn record_gc_success(result: &mut StorageGcResult, bytes: i64, count:
 /// Format a GC error message for a specific operation and storage key.
 pub(crate) fn format_gc_error(operation: &str, storage_key: &str, error: &str) -> String {
     format!("Failed to {} for key {}: {}", operation, storage_key, error)
+}
+
+/// SQL clause restricting a GC candidate scan to one repository (#708).
+///
+/// Returns `AND <column> = $<param>` when `repo_scope` is `Some`, or an empty
+/// string for the instance-wide scan. `param` is the 1-based placeholder
+/// index the clause should use — one past the number of binds the unscoped
+/// query already has — and the caller must bind the scoped id in that
+/// position. Extracted as a pure helper so the clause shape (and its bind
+/// arithmetic) is unit-testable without a database.
+fn repo_scope_clause(column: &str, param: usize, repo_scope: Option<Uuid>) -> String {
+    match repo_scope {
+        Some(_) => format!("AND {column} = ${param}"),
+        None => String::new(),
+    }
 }
 
 /// Decoded global aggregate values for the OCI blob footprint report.
@@ -3023,6 +3371,109 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // repo_scope_clause (web #708)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repo_scope_clause_unscoped_is_empty() {
+        assert_eq!(repo_scope_clause("a.repository_id", 1, None), "");
+    }
+
+    #[test]
+    fn test_repo_scope_clause_scoped_renders_and_predicate() {
+        assert_eq!(
+            repo_scope_clause("a.repository_id", 1, Some(Uuid::new_v4())),
+            "AND a.repository_id = $1"
+        );
+    }
+
+    #[test]
+    fn test_repo_scope_clause_uses_supplied_param_index() {
+        // Selects that already bind a LIMIT at $1 must place the scope bind
+        // at $2; the index is the caller's, not the helper's.
+        assert_eq!(
+            repo_scope_clause("c.repository_id", 2, Some(Uuid::new_v4())),
+            "AND c.repository_id = $2"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // run_gc_for_repository (web #708)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_gc_for_repository_returns_error_when_db_unreachable() {
+        let service = make_service("filesystem");
+        let result = service.run_gc_for_repository(Uuid::new_v4(), false).await;
+        assert!(
+            result.is_err(),
+            "repo-scoped run_gc should fail without a database"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_gc_for_repository_dry_run_returns_error_when_db_unreachable() {
+        let service = make_service("s3");
+        let result = service.run_gc_for_repository(Uuid::new_v4(), true).await;
+        assert!(
+            result.is_err(),
+            "repo-scoped dry run should also fail without a database"
+        );
+    }
+
+    /// A soft-deleted, unreferenced artifact is an orphan candidate for its
+    /// OWN repository's scoped scan, but must never appear in a scan scoped
+    /// to a different repository — per-key assertions keep this isolated
+    /// from concurrent tests sharing the database (#1493 pattern).
+    #[tokio::test]
+    async fn test_select_orphans_repo_scope_filters_to_target_repository() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let uid = Uuid::new_v4().simple().to_string();
+        let storage_key = format!("maven/com/acme/{uid}/gc-scope-1.0.jar");
+        insert_maven_artifact_row(
+            &fixture.pool,
+            fixture.repo_id,
+            fixture.user_id,
+            &storage_key,
+            true,
+        )
+        .await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let own_repo = service.select_orphans(Some(fixture.repo_id)).await;
+        let other_repo = service.select_orphans(Some(Uuid::new_v4())).await;
+
+        let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
+        fixture.teardown().await;
+
+        let key_present = |orphans: &[sqlx::postgres::PgRow]| {
+            orphans.iter().any(|row| {
+                let key: String = row.try_get("storage_key").unwrap_or_default();
+                let path: String = row.try_get("storage_path").unwrap_or_default();
+                key == storage_key && path == storage_path_str
+            })
+        };
+
+        let own_repo = own_repo.expect("own-repo scoped scan succeeds");
+        assert!(
+            key_present(&own_repo),
+            "scan scoped to the owning repository must include its orphan key"
+        );
+        let other_repo = other_repo.expect("other-repo scoped scan succeeds");
+        assert!(
+            !key_present(&other_repo),
+            "scan scoped to a different repository must not include the key"
+        );
+    }
+
     /// Reference kind for [`insert_referenced_soft_deleted_artifact`].
     enum RefKind {
         /// Insert an `oci_tags` row pointing at the digest.
@@ -3179,7 +3630,7 @@ mod tests {
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
-        let orphans = service.select_orphans().await;
+        let orphans = service.select_orphans(None).await;
 
         let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
         fixture.teardown().await;
@@ -3213,7 +3664,7 @@ mod tests {
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
-        let orphans = service.select_orphans().await;
+        let orphans = service.select_orphans(None).await;
 
         let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
         fixture.teardown().await;
@@ -4960,7 +5411,7 @@ mod tests {
 
             // Step 1: call the outer SELECT directly through the same
             // service instance so we can signal afterwards.
-            let orphans = service.select_orphans().await.expect("select orphans");
+            let orphans = service.select_orphans(None).await.expect("select orphans");
             assert!(
                 orphans.iter().any(|r| {
                     let key: String = r.try_get("storage_key").unwrap_or_default();
@@ -6526,5 +6977,264 @@ mod tests {
                 .execute(&pool)
                 .await;
         }
+    }
+
+    /// Cleanup-journal sweep claims (Tier-2: no-op without DATABASE_URL).
+    ///
+    /// The claim (not the row DELETE) is what stops two replicas from both
+    /// attempting the external storage delete for one key: while a claim is
+    /// live the key is invisible to other sweepers, and a failed storage
+    /// delete releases the claim with the error recorded for retry.
+    #[tokio::test]
+    async fn cleanup_key_sweep_claim_is_exclusive_and_releasable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        // Advisory (cross-process) lock: nextest runs each test in its own
+        // process, so the in-process storage_gc_test_guard cannot stop the
+        // OTHER cleanup-claim test from claiming this test's aged fixture
+        // rows out from under it.
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let storage_key = format!("oci-uploads/claim-test/{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys \
+                 (repository_id, storage_key, created_at, storage_write_completed_at) \
+             VALUES ($1, $2, NOW() - INTERVAL '48 hours', NOW() - INTERVAL '48 hours')",
+        )
+        .bind(fixture.repo_id)
+        .bind(&storage_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert cleanup key");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+
+        // First sweeper claims the key.
+        let batch = service
+            .claim_unreferenced_oci_upload_cleanup_keys(None)
+            .await
+            .expect("claim query ok");
+        let mine = batch
+            .into_iter()
+            .find(|k| k.storage_key == storage_key)
+            .expect("aged committed key must be claimable");
+        let first_token = mine.claim_token.expect("claim must carry a token");
+
+        // A concurrent sweeper must not see it while the claim is live.
+        let contended = service
+            .claim_unreferenced_oci_upload_cleanup_keys(None)
+            .await
+            .expect("claim query ok");
+        assert!(
+            contended.iter().all(|k| k.storage_key != storage_key),
+            "a claimed cleanup key must not be handed to a second sweeper"
+        );
+
+        // A failed storage delete releases the claim with the error recorded;
+        // the key becomes sweepable again under a fresh token.
+        service
+            .release_cleanup_key_claim(&mine, "storage boom")
+            .await;
+        let retried = service
+            .claim_unreferenced_oci_upload_cleanup_keys(None)
+            .await
+            .expect("claim query ok");
+        let mine_again = retried
+            .into_iter()
+            .find(|k| k.storage_key == storage_key)
+            .expect("released key must be claimable again");
+        assert_ne!(
+            mine_again.claim_token,
+            Some(first_token),
+            "reclaim must mint a fresh token"
+        );
+        let last_error: Option<String> = sqlx::query_scalar(
+            "SELECT last_error FROM oci_upload_cleanup_keys WHERE storage_key = $1",
+        )
+        .bind(&storage_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("fetch last_error");
+        assert_eq!(last_error.as_deref(), Some("storage boom"));
+
+        let _ = sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE storage_key = $1")
+            .bind(&storage_key)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+    }
+
+    /// The repository-scoped live GC path must apply its scope while claiming,
+    /// not only while dry-run selecting. Otherwise an admin collecting repo A
+    /// could claim and delete repo B's cleanup-journal keys.
+    #[tokio::test]
+    async fn repository_scoped_cleanup_claims_do_not_cross_repositories() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(repo_a) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let Some(repo_b) = tdh::Fixture::setup("local", "docker").await else {
+            repo_a.teardown().await;
+            return;
+        };
+
+        let committed_a = format!("oci-uploads/scoped-committed-a/{}", Uuid::new_v4());
+        let committed_b = format!("oci-uploads/scoped-committed-b/{}", Uuid::new_v4());
+        let pending_a = format!("oci-uploads/scoped-pending-a/{}", Uuid::new_v4());
+        let pending_b = format!("oci-uploads/scoped-pending-b/{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys \
+                 (repository_id, storage_key, created_at, storage_write_completed_at) \
+             VALUES \
+                 ($1, $2, NOW() - INTERVAL '48 hours', NOW() - INTERVAL '48 hours'), \
+                 ($1, $3, NOW() - INTERVAL '48 hours', NULL), \
+                 ($4, $5, NOW() - INTERVAL '48 hours', NOW() - INTERVAL '48 hours'), \
+                 ($4, $6, NOW() - INTERVAL '48 hours', NULL)",
+        )
+        .bind(repo_a.repo_id)
+        .bind(&committed_a)
+        .bind(&pending_a)
+        .bind(repo_b.repo_id)
+        .bind(&committed_b)
+        .bind(&pending_b)
+        .execute(&repo_a.pool)
+        .await
+        .expect("insert repository-scoped cleanup keys");
+
+        let service =
+            StorageGcService::new(repo_a.pool.clone(), repo_a.state.storage_registry.clone());
+        let committed = service
+            .claim_unreferenced_oci_upload_cleanup_keys(Some(repo_a.repo_id))
+            .await
+            .expect("claim scoped committed keys");
+        let pending = service
+            .claim_pending_oci_upload_cleanup_keys(Some(repo_a.repo_id))
+            .await
+            .expect("claim scoped pending keys");
+
+        assert!(committed.iter().any(|key| key.storage_key == committed_a));
+        assert!(committed.iter().all(|key| key.storage_key != committed_b));
+        assert!(pending.iter().any(|key| key.storage_key == pending_a));
+        assert!(pending.iter().all(|key| key.storage_key != pending_b));
+
+        let other_claims: (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+            "SELECT \
+                 (SELECT claim_token FROM oci_upload_cleanup_keys WHERE storage_key = $1), \
+                 (SELECT claim_token FROM oci_upload_cleanup_keys WHERE storage_key = $2)",
+        )
+        .bind(&committed_b)
+        .bind(&pending_b)
+        .fetch_one(&repo_a.pool)
+        .await
+        .expect("read other repository claim state");
+        assert_eq!(
+            other_claims,
+            (None, None),
+            "repo B keys must remain entirely unclaimed by repo A's live sweep"
+        );
+
+        let _ = sqlx::query(
+            "DELETE FROM oci_upload_cleanup_keys \
+             WHERE storage_key IN ($1, $2, $3, $4)",
+        )
+        .bind(&committed_a)
+        .bind(&pending_a)
+        .bind(&committed_b)
+        .bind(&pending_b)
+        .execute(&repo_a.pool)
+        .await;
+        repo_b.teardown().await;
+        repo_a.teardown().await;
+    }
+
+    /// A batch's tail claim can lapse mid-sweep (slow object-store deletes);
+    /// the pre-delete renewal keeps a still-owned key held for the full
+    /// batch, and fences a sweeper whose lapsed claim was already re-claimed
+    /// by another replica.
+    #[tokio::test]
+    async fn tail_claim_renewal_keeps_ownership_and_fences_reclaimed_sweeper() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        // Advisory (cross-process) lock — see
+        // cleanup_key_sweep_claim_is_exclusive_and_releasable.
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let storage_key = format!("oci-uploads/renew-test/{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys \
+                 (repository_id, storage_key, created_at, storage_write_completed_at) \
+             VALUES ($1, $2, NOW() - INTERVAL '48 hours', NOW() - INTERVAL '48 hours')",
+        )
+        .bind(fixture.repo_id)
+        .bind(&storage_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert cleanup key");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+
+        let claimed = service
+            .claim_unreferenced_oci_upload_cleanup_keys(None)
+            .await
+            .expect("claim query ok");
+        let mine = claimed
+            .into_iter()
+            .find(|k| k.storage_key == storage_key)
+            .expect("aged committed key must be claimable");
+
+        // A live owner renews: the deadline moves forward and the key stays
+        // invisible to concurrent sweepers.
+        assert!(
+            service.renew_cleanup_key_claim(&mine).await,
+            "the live owner must be able to renew its claim"
+        );
+        let contended = service
+            .claim_unreferenced_oci_upload_cleanup_keys(None)
+            .await
+            .expect("claim query ok");
+        assert!(
+            contended.iter().all(|k| k.storage_key != storage_key),
+            "a renewed claim must keep the key invisible to other sweepers"
+        );
+
+        // Tail-lapse scenario: the claim expires mid-batch and another
+        // replica re-claims the key. The original sweeper's pre-delete
+        // renewal must now fail, so it skips the destructive delete.
+        sqlx::query(
+            "UPDATE oci_upload_cleanup_keys SET claim_expires_at = NOW() - INTERVAL '1 minute' \
+             WHERE storage_key = $1",
+        )
+        .bind(&storage_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("lapse claim");
+        let reclaimed = service
+            .claim_unreferenced_oci_upload_cleanup_keys(None)
+            .await
+            .expect("claim query ok");
+        assert!(
+            reclaimed.iter().any(|k| k.storage_key == storage_key),
+            "a lapsed tail claim must be reclaimable by another sweeper"
+        );
+        assert!(
+            !service.renew_cleanup_key_claim(&mine).await,
+            "a superseded token must not renew (the delete is skipped)"
+        );
+
+        let _ = sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE storage_key = $1")
+            .bind(&storage_key)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
     }
 }

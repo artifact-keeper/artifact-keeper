@@ -363,10 +363,7 @@ async fn get_podspec(
     }
 
     // Fall back to reading the podspec file from storage
-    let podspec_key = format!(
-        "cocoapods/{}/{}/{}.podspec.json",
-        path_info.name, path_info.version, path_info.name
-    );
+    let podspec_key = build_cocoapods_podspec_key(&path_info.name, &path_info.version);
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -528,7 +525,7 @@ async fn push_pod(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "cocoapods", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "cocoapods", "write:artifacts")?.user_id;
     let repo = resolve_cocoapods_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -567,8 +564,8 @@ async fn push_pod(
     cocoapods::validate_pod_version(pod_version)
         .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
 
-    let filename = format!("{}-{}.tar.gz", pod_name, pod_version);
-    let artifact_path = format!("{}/{}/{}", pod_name, pod_version, filename);
+    let filename = build_cocoapods_filename(pod_name, pod_version);
+    let artifact_path = build_cocoapods_artifact_path(pod_name, pod_version);
 
     // Compute SHA256
     let mut hasher = Sha256::new();
@@ -592,7 +589,7 @@ async fn push_pod(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the pod archive
-    let storage_key = format!("cocoapods/{}/{}/{}", pod_name, pod_version, filename);
+    let storage_key = build_cocoapods_storage_key(pod_name, pod_version);
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state
@@ -607,10 +604,7 @@ async fn push_pod(
     })?;
 
     // Also store the podspec JSON separately for direct retrieval
-    let podspec_key = format!(
-        "cocoapods/{}/{}/{}.podspec.json",
-        pod_name, pod_version, pod_name
-    );
+    let podspec_key = build_cocoapods_podspec_key(pod_name, pod_version);
     let podspec_json = serde_json::to_vec(&podspec).unwrap_or_default();
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &podspec_key)
         .await?;
@@ -626,10 +620,7 @@ async fn push_pod(
         })?;
 
     // Build metadata JSON
-    let pod_metadata = serde_json::json!({
-        "podspec": serde_json::to_value(&podspec).unwrap_or_default(),
-        "filename": filename,
-    });
+    let pod_metadata = build_cocoapods_metadata(&podspec, &filename);
 
     let size_bytes = body.len() as i64;
 
@@ -775,6 +766,41 @@ fn extract_podspec_from_archive(data: &[u8]) -> Result<PodSpec, String> {
     Ok(podspec)
 }
 
+// ---------------------------------------------------------------------------
+// Path/key builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the filename for a CocoaPods archive.
+fn build_cocoapods_filename(name: &str, version: &str) -> String {
+    format!("{}-{}.tar.gz", name, version)
+}
+
+/// Build the artifact path for a CocoaPods package.
+fn build_cocoapods_artifact_path(name: &str, version: &str) -> String {
+    let filename = build_cocoapods_filename(name, version);
+    format!("{}/{}/{}", name, version, filename)
+}
+
+/// Build the storage key for a CocoaPods archive.
+fn build_cocoapods_storage_key(name: &str, version: &str) -> String {
+    let filename = build_cocoapods_filename(name, version);
+    format!("cocoapods/{}/{}/{}", name, version, filename)
+}
+
+/// Build the storage key for a CocoaPods podspec JSON file.
+fn build_cocoapods_podspec_key(name: &str, version: &str) -> String {
+    format!("cocoapods/{}/{}/{}.podspec.json", name, version, name)
+}
+
+/// Build the metadata JSON for a published pod.
+fn build_cocoapods_metadata(podspec: &PodSpec, filename: &str) -> serde_json::Value {
+    serde_json::json!({
+        "podspec": serde_json::to_value(podspec).unwrap_or_default(),
+        "filename": filename,
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -819,40 +845,6 @@ mod tests {
     }
     use super::*;
     use crate::formats::cocoapods::PodSpec;
-
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Build the filename for a CocoaPods archive.
-    fn build_cocoapods_filename(name: &str, version: &str) -> String {
-        format!("{}-{}.tar.gz", name, version)
-    }
-
-    /// Build the artifact path for a CocoaPods package.
-    fn build_cocoapods_artifact_path(name: &str, version: &str) -> String {
-        let filename = build_cocoapods_filename(name, version);
-        format!("{}/{}/{}", name, version, filename)
-    }
-
-    /// Build the storage key for a CocoaPods archive.
-    fn build_cocoapods_storage_key(name: &str, version: &str) -> String {
-        let filename = build_cocoapods_filename(name, version);
-        format!("cocoapods/{}/{}/{}", name, version, filename)
-    }
-
-    /// Build the storage key for a CocoaPods podspec JSON file.
-    fn build_cocoapods_podspec_key(name: &str, version: &str) -> String {
-        format!("cocoapods/{}/{}/{}.podspec.json", name, version, name)
-    }
-
-    /// Build the metadata JSON for a published pod.
-    fn build_cocoapods_metadata(podspec: &PodSpec, filename: &str) -> serde_json::Value {
-        serde_json::json!({
-            "podspec": serde_json::to_value(podspec).unwrap_or_default(),
-            "filename": filename,
-        })
-    }
 
     // -----------------------------------------------------------------------
     // CDN routing
@@ -1214,6 +1206,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -1234,6 +1227,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };

@@ -128,72 +128,46 @@ pub(crate) async fn require_repo_write_access(
     }
 }
 
-/// Pure fine-grained per-action decision, mirroring `upload_write_decision`
-/// (#817) in the chunked-upload path. Admins always pass; a repository with no
-/// permission rules falls through to the default access model; otherwise the
-/// caller must hold the requested action or `admin` (which implies all actions).
+/// Deny-by-default per-action authorization for a repository MUTATION, routed
+/// through the single canonical choke-point
+/// [`PermissionService::check_repository_action`].
 ///
-/// Factored out so both branches are unit-testable without a database.
-fn repo_fine_grained_action_allowed(
-    is_admin: bool,
-    has_rules: bool,
-    has_action: bool,
-    has_admin: bool,
-) -> bool {
-    if is_admin {
-        return true;
-    }
-    if !has_rules {
-        return true;
-    }
-    has_action || has_admin
-}
-
-/// Fine-grained per-action authorization, applied AFTER `require_repo_write_access`
-/// (the outer tenant gate) on the generic REST artifact write/delete handlers.
+/// This is the one source of truth for "may this caller perform `action`
+/// (`write`/`delete`) on this repository", shared by the generic REST artifact
+/// write/delete handlers and the chunked upload-session path (`upload.rs`), and
+/// mirrored by the native format middleware (`repo_visibility_middleware`) and
+/// the OCI `/v2` write handlers. Its posture is DENY-BY-DEFAULT:
 ///
-/// `require_repo_write_access` is only a tenant-membership gate: it treats a
-/// public repository or ANY role-assignment grantee (including a read-only one)
-/// as authorized, collapsing read/write/delete into a single "has access"
-/// predicate. That is the gap #2321 (G2) reports: on a rules-bearing repo a
-/// read-only grantee could still PUT/DELETE, and on a public repo any authed
-/// caller could write. This adds the SAME `has_rules -> check_permission(action)`
-/// block the chunked upload-session path (`upload.rs::create_session`, #817)
-/// already enforces, so the action actually maps to the granted permission.
+/// * a global admin bypasses (handled inside `check_repository_action`);
+/// * an applicable fine-grained `permissions` rule for the caller is
+///   authoritative — the action (or `admin`) must be granted;
+/// * otherwise the caller must hold a role assignment (repo-scoped or global)
+///   whose role carries the action (or `admin`).
 ///
-/// `action` is `"write"` for uploads and `"delete"` for deletes. Admins bypass;
-/// a repository with no permission rules falls through unchanged (the rules-less
-/// public-repo case is a separate global default-access decision, out of scope
-/// here). A permission-rule lookup error fails closed (503), mirroring
-/// `repo_visibility_middleware` and `create_session`.
-async fn require_repo_fine_grained_action(
+/// `is_public` confers a READ baseline only and NEVER satisfies `write`/`delete`;
+/// a repository with no permission rules does NOT fall through to "allow". This
+/// closes #2603 (G1): a public / rules-less repository must not grant write or
+/// delete to any authenticated caller, and a read-only `viewer` member must not
+/// be able to write or delete. The repository-scoped API-token scope (#504) is
+/// still enforced first via [`require_repo_access`]. A permission-lookup error
+/// fails closed (503), mirroring `repo_visibility_middleware`.
+pub(crate) async fn require_repo_action(
     auth: &AuthExtension,
     repo_id: Uuid,
     action: &str,
     permission_service: &crate::services::permission_service::PermissionService,
 ) -> Result<()> {
-    if auth.is_admin {
-        return Ok(());
-    }
-    let has_rules = permission_service
-        .has_any_rules_for_target("repository", repo_id)
+    // Repository-scoped API tokens must still allow this repo (#504) — enforced
+    // even for admins, matching `require_repo_write_access`.
+    require_repo_access(auth, repo_id)?;
+    let allowed = permission_service
+        .check_repository_action(auth.user_id, repo_id, action, auth.is_admin)
         .await
         .map_err(|_| {
             tracing::error!("permission check failed: database unreachable");
             AppError::ServiceUnavailable("permission service temporarily unavailable".to_string())
         })?;
-    if !has_rules {
-        return Ok(());
-    }
-    let has_action = permission_service
-        .check_permission(auth.user_id, "repository", repo_id, action, false)
-        .await
-        .unwrap_or(false);
-    let has_admin = permission_service
-        .check_permission(auth.user_id, "repository", repo_id, "admin", false)
-        .await
-        .unwrap_or(false);
-    if repo_fine_grained_action_allowed(auth.is_admin, has_rules, has_action, has_admin) {
+    if allowed {
         Ok(())
     } else {
         Err(AppError::Authorization(
@@ -215,8 +189,8 @@ async fn require_repo_fine_grained_action(
 /// behavior (#2603, area 3). Global admins bypass; every other caller must hold
 /// the `admin` action on the repository.
 ///
-/// Unlike [`require_repo_fine_grained_action`], there is deliberately no
-/// rules-less fallthrough: configuration is admin-only regardless of whether
+/// Unlike [`require_repo_action`], this requires the `admin` action
+/// specifically: configuration is admin-only regardless of whether
 /// fine-grained permission rules exist, matching the inline gate already used
 /// by `set_cache_ttl` / `set_npm_scope_policy` / `invalidate_cache`. Callers
 /// should invoke this AFTER [`require_repo_write_access`] (the tenant gate).
@@ -468,6 +442,8 @@ pub fn router() -> Router<SharedState> {
         )
         // Deduplicated storage accounting (logical/physical/unique/shared) (#2056)
         .route("/:key/storage", get(get_repository_storage))
+        // Per-prefix (folder tree) storage rollup (#2601)
+        .route("/:key/storage/tree", get(get_repository_storage_tree))
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
         // npm scope policy for Remote members of npm virtual repositories (#2327)
@@ -2242,35 +2218,28 @@ pub async fn list_repositories(
     let repo_ids: Vec<Uuid> = repos.iter().map(|r| r.id).collect();
     let storage_map: std::collections::HashMap<Uuid, i64> = if !repo_ids.is_empty() {
         sqlx::query_as::<_, (Uuid, i64)>(
-            // #2218: per-repo storage now UNIONs the persisted proxy-cache
-            // catalog so remote (proxy) repos count their cached bytes (was 0 —
-            // proxy objects carry no `artifacts` row since #1280). Legacy
-            // pre-#1280 `proxy-cache/%` leftovers in `artifacts` are excluded so
-            // an object that is also lazily backfilled into the catalog is not
-            // summed twice. Hosted repos have no `proxy-cache/%` keys and an
-            // empty catalog, so their totals are unchanged.
+            // #3078: read the trigger-maintained `repository_usage_ledger`
+            // (migrations 171/182) instead of recomputing the 3-way live SUM
+            // over `artifacts` + `proxy_cache_artifacts` + `oci_blobs` on
+            // every listing request — the live SUM's cost scales with total
+            // artifact count, not page size. The ledger is byte-for-byte
+            // equivalent to that SUM: 182's row-level AFTER triggers charge
+            // `hosted_bytes` under the identical predicate the old query used
+            // (`is_deleted = false AND storage_key NOT LIKE 'proxy-cache/%'`,
+            // the #2218 rules), `proxy_bytes`/`oci_bytes` count their tables
+            // whole, and the `pending_delete_at` mark-and-sweep marker is a
+            // deliberate zero-delta no-op. `RepositoryService::get_storage_usage`
+            // stays the live-SUM oracle (reconciler / quota fallback).
             //
-            // OCI layer/config blobs live in `oci_blobs` (`artifacts` only
-            // holds manifests), so docker repos need the third branch or the
-            // listing shows KiBs for repos holding GiBs of layers. Must stay
-            // in lockstep with `RepositoryService::get_storage_usage`.
+            // A repo with no ledger row (created after 182 with zero writes)
+            // is simply absent from this result set and renders 0 via the
+            // `unwrap_or(0)` below — triggers self-seed a row only on growth,
+            // so "no row" means "no counted bytes"; the reconciler re-seeds
+            // rows lost to manual surgery.
             r#"
-            SELECT repository_id, COALESCE(SUM(bytes), 0)::BIGINT
-            FROM (
-                SELECT repository_id, size_bytes AS bytes
-                  FROM artifacts
-                 WHERE repository_id = ANY($1) AND is_deleted = false
-                   AND storage_key NOT LIKE 'proxy-cache/%'
-                UNION ALL
-                SELECT repository_id, size_bytes AS bytes
-                  FROM proxy_cache_artifacts
-                 WHERE repository_id = ANY($1)
-                UNION ALL
-                SELECT repository_id, size_bytes AS bytes
-                  FROM oci_blobs
-                 WHERE repository_id = ANY($1)
-            ) t
-            GROUP BY repository_id
+            SELECT repository_id, (hosted_bytes + proxy_bytes + oci_bytes)::BIGINT
+              FROM repository_usage_ledger
+             WHERE repository_id = ANY($1)
             "#,
         )
         .bind(&repo_ids)
@@ -2283,17 +2252,31 @@ pub async fn list_repositories(
         std::collections::HashMap::new()
     };
 
-    // #2785: the batched per-repo SUM above keys off `repository_id`, which is
-    // (near) empty for a virtual repo — it owns no artifact rows, only member
-    // links. Overwrite each virtual repo's figure with the union of its
-    // resolvable members so the listing total matches the child repos. Virtual
-    // repos are rare, so this touches at most a handful of rows per page.
+    // #2785: the batched per-repo figure above keys off `repository_id`, which
+    // is (near) empty for a virtual repo — it owns no artifact rows, only
+    // member links. Overwrite each virtual repo's figure with the union of its
+    // resolvable members so the listing total matches the child repos.
+    //
+    // #3078: resolve every virtual on the page in ONE query (the old shape
+    // called `get_virtual_storage_usage` once per virtual — an N+1 that
+    // re-scanned every reachable member's artifact rows per call). Seeding 0
+    // first preserves the old always-overwrite semantics: a virtual with no
+    // resolvable members has no row in the batch result and must render 0.
     let mut storage_map = storage_map;
-    for r in &repos {
-        if r.repo_type == RepositoryType::Virtual {
-            let combined = service.get_virtual_storage_usage(r.id).await?;
-            storage_map.insert(r.id, combined);
+    let virtual_ids: Vec<Uuid> = repos
+        .iter()
+        .filter(|r| r.repo_type == RepositoryType::Virtual)
+        .map(|r| r.id)
+        .collect();
+    if !virtual_ids.is_empty() {
+        for id in &virtual_ids {
+            storage_map.insert(*id, 0);
         }
+        storage_map.extend(
+            service
+                .get_virtual_storage_usage_batch(&virtual_ids)
+                .await?,
+        );
     }
 
     // Batch fetch which repos have a trusted GPG key configured (#2568) so the
@@ -2738,6 +2721,7 @@ pub async fn create_repository(
                 visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
+                age_gate_mode: None,
             }),
     )
     .await;
@@ -3051,6 +3035,235 @@ pub async fn get_repository_storage(
     };
 
     Ok(Json(response))
+}
+
+/// Query parameters for the per-prefix storage tree (#2601).
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct StorageTreeQuery {
+    /// Folder prefix to root the listing at (`''`/absent = repository root).
+    /// Leading/trailing slashes are ignored.
+    pub prefix: Option<String>,
+    /// How many tree levels below `prefix` to return (default 1 = immediate
+    /// children, clamped to 1..=5).
+    pub depth: Option<i32>,
+    /// Maximum number of descendant nodes returned (default 200, clamped to
+    /// 1..=1000). `truncated` is set when the limit cut the listing.
+    pub limit: Option<i64>,
+}
+
+/// Levels below the requested prefix a single tree call may return.
+const STORAGE_TREE_MAX_QUERY_DEPTH: i32 = 5;
+/// Hard cap on descendant nodes per tree call (million-artifact guard, #2516).
+const STORAGE_TREE_MAX_LIMIT: i64 = 1000;
+const STORAGE_TREE_DEFAULT_LIMIT: i64 = 200;
+
+/// Clamp the requested levels-below-prefix to 1..=[`STORAGE_TREE_MAX_QUERY_DEPTH`].
+fn clamp_tree_depth(depth: Option<i32>) -> i32 {
+    depth.unwrap_or(1).clamp(1, STORAGE_TREE_MAX_QUERY_DEPTH)
+}
+
+/// Clamp the requested node limit to 1..=[`STORAGE_TREE_MAX_LIMIT`].
+fn clamp_tree_limit(limit: Option<i64>) -> i64 {
+    limit
+        .unwrap_or(STORAGE_TREE_DEFAULT_LIMIT)
+        .clamp(1, STORAGE_TREE_MAX_LIMIT)
+}
+
+/// One folder node in the per-prefix storage rollup (#2601).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StorageTreeNode {
+    /// Canonical prefix (no leading/trailing `/`; `''` = repository root).
+    pub prefix: String,
+    /// Number of path segments in `prefix` (0 = root).
+    pub depth: i32,
+    /// Sum over every artifact/proxy-cache reference under this prefix.
+    pub logical_bytes: i64,
+    /// Deduplicated within this repository: each distinct physical object
+    /// under the prefix counted once. Because an object shared by two sibling
+    /// subtrees counts once in each but once at their common ancestor, the sum
+    /// of children's `physical_bytes` can exceed the parent's — the difference
+    /// is the cross-subtree dedup saving.
+    pub physical_bytes: i64,
+    /// References (artifact/proxy-cache rows) under this prefix.
+    pub file_count: i64,
+    /// Distinct physical objects under this prefix.
+    pub blob_count: i64,
+}
+
+/// Per-prefix (folder tree) storage rollup response (#2601).
+///
+/// All figures are read from the materialized `repository_path_storage_stats`
+/// cache (refreshed on the storage-stats schedule + post-GC) — a tree call is
+/// an index scan over pre-aggregated rows, never a walk of the artifact table.
+///
+/// Every figure is within-repository only (references this repo holds), so
+/// unlike the repo-level endpoint's cross-tenant-derivable dedup breakdown
+/// (#2560) nothing here needs an admin restriction beyond repo visibility.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepositoryStorageTreeResponse {
+    pub repository_key: String,
+    /// The node the listing is rooted at (zeros when the prefix has no
+    /// materialized data — unknown folder or refresher not yet run).
+    pub node: StorageTreeNode,
+    /// Descendant folder nodes, up to `depth` levels below `node`, largest
+    /// `logical_bytes` first.
+    pub children: Vec<StorageTreeNode>,
+    /// True when `limit` cut the descendant listing.
+    pub truncated: bool,
+    /// Bytes referenced by this repository that carry no logical path and so
+    /// cannot be placed in the tree (today: OCI layer blobs; the blob→image
+    /// edge lives only in manifest content). Root-level figure; present only
+    /// when the request is rooted at `''`. `node.logical_bytes +
+    /// unattributed_bytes` reconciles with the repo-level logical total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unattributed_bytes: Option<i64>,
+    /// Folder levels below the root that are individually materialized;
+    /// deeper files roll up into their ancestor at this depth.
+    pub max_materialized_depth: i32,
+    /// When the rollup was last recomputed. `null` before the first refresh.
+    pub computed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Get the per-prefix (folder tree) storage rollup for a repository (#2601).
+///
+/// Returns the requested prefix's own rollup plus its descendant folder nodes
+/// (default: immediate children) from the materialized per-prefix cache. Same
+/// visibility rules as `get_repository`: public repos and repo members pass;
+/// everyone else gets an existence-hiding 404.
+#[utoipa::path(
+    get,
+    path = "/{key}/storage/tree",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        StorageTreeQuery,
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Per-prefix storage rollup", body = RepositoryStorageTreeResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_repository_storage_tree(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<StorageTreeQuery>,
+) -> Result<Json<RepositoryStorageTreeResponse>> {
+    use crate::services::storage_stats_service::{
+        normalize_prefix, prefix_depth, MAX_MATERIALIZED_PATH_DEPTH,
+    };
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_visible(&repo, &auth, &service).await?;
+
+    let prefix = normalize_prefix(query.prefix.as_deref().unwrap_or(""));
+    let root_depth = prefix_depth(&prefix);
+    let levels = clamp_tree_depth(query.depth);
+    let limit = clamp_tree_limit(query.limit);
+
+    // The rooted node's own rollup (with the root-only unattributed figure).
+    let node_row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)>(
+        r#"
+        SELECT logical_bytes, physical_bytes, file_count, blob_count,
+               unattributed_bytes, computed_at
+          FROM repository_path_storage_stats
+         WHERE repository_id = $1 AND prefix = $2
+        "#,
+    )
+    .bind(repo.id)
+    .bind(&prefix)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Descendants: depth-bounded range under the prefix. Fetch limit+1 to
+    // detect truncation without a second COUNT pass.
+    let like_pattern = if prefix.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{}/%",
+            crate::api::handlers::escape_like_literal(&prefix)
+        ))
+    };
+    let child_rows = sqlx::query_as::<_, (String, i32, i64, i64, i64, i64)>(
+        r#"
+        SELECT prefix, depth, logical_bytes, physical_bytes, file_count, blob_count
+          FROM repository_path_storage_stats
+         WHERE repository_id = $1
+           AND depth > $2 AND depth <= $3
+           AND ($4::text IS NULL OR prefix LIKE $4)
+         ORDER BY logical_bytes DESC, prefix ASC
+         LIMIT $5
+        "#,
+    )
+    .bind(repo.id)
+    .bind(root_depth)
+    .bind(root_depth.saturating_add(levels))
+    .bind(&like_pattern)
+    .bind(limit + 1)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let truncated = child_rows.len() as i64 > limit;
+    let children: Vec<StorageTreeNode> = child_rows
+        .into_iter()
+        .take(limit as usize)
+        .map(
+            |(prefix, depth, logical_bytes, physical_bytes, file_count, blob_count)| {
+                StorageTreeNode {
+                    prefix,
+                    depth,
+                    logical_bytes,
+                    physical_bytes,
+                    file_count,
+                    blob_count,
+                }
+            },
+        )
+        .collect();
+
+    let (node, unattributed_bytes, computed_at) = match node_row {
+        Some((logical, physical, files, blobs, unattributed, at)) => (
+            StorageTreeNode {
+                prefix: prefix.clone(),
+                depth: root_depth,
+                logical_bytes: logical,
+                physical_bytes: physical,
+                file_count: files,
+                blob_count: blobs,
+            },
+            (root_depth == 0).then_some(unattributed),
+            Some(at),
+        ),
+        // Unknown prefix or refresher not yet run: zeros, no freshness marker.
+        None => (
+            StorageTreeNode {
+                prefix: prefix.clone(),
+                depth: root_depth,
+                logical_bytes: 0,
+                physical_bytes: 0,
+                file_count: 0,
+                blob_count: 0,
+            },
+            (root_depth == 0).then_some(0),
+            None,
+        ),
+    };
+
+    Ok(Json(RepositoryStorageTreeResponse {
+        repository_key: repo.key,
+        node,
+        children,
+        truncated,
+        unattributed_bytes,
+        max_materialized_depth: MAX_MATERIALIZED_PATH_DEPTH,
+        computed_at,
+    }))
 }
 
 /// Update repository
@@ -3432,6 +3645,7 @@ pub async fn update_repository(
                 visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
+                age_gate_mode: None,
             }),
     )
     .await;
@@ -3970,6 +4184,7 @@ pub async fn delete_repository(
                 visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
+                age_gate_mode: None,
             }),
     )
     .await;
@@ -4095,6 +4310,28 @@ pub struct ArtifactResponse {
     /// `revision`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_label: Option<String>,
+    /// Per-artifact quarantine state so a client/operator can tell which
+    /// listed artifacts are held for security review (#2940). Always
+    /// serialized so the listing never hides the control:
+    /// - `"quarantined"` — held pending review; downloads return 409 (until
+    ///   any `quarantine_until` lapses),
+    /// - `"rejected"` — terminally blocked by an admin,
+    /// - a scan-lifecycle state (`"clean"`, `"flagged"`, `"unscanned"`,
+    ///   `"released"`),
+    /// - `"not_quarantined"` — the explicit default when the row carries no
+    ///   quarantine state, so clients never have to treat a missing value as
+    ///   a state.
+    ///
+    /// The human-readable *reason* is intentionally NOT surfaced here: it is
+    /// per-artifact security detail disclosed only by the authenticated,
+    /// repository-visibility-checked `GET /api/v1/quarantine/{id}` (#2912),
+    /// whereas this listing is reachable anonymously on public repositories.
+    pub quarantine_status: String,
+    /// When a timed quarantine hold lapses and the artifact becomes
+    /// downloadable again. `None` for a permanent (admin) quarantine and for
+    /// artifacts that are not quarantined. (#2940)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4694,6 +4931,10 @@ fn build_catalog_artifact_response(
         cache_expires_at: None,
         revision: None,
         version_label: None,
+        // Proxy-cached objects have no `artifacts` row and no quarantine
+        // state; the upload-hold workflow only applies to hosted artifacts.
+        quarantine_status: NOT_QUARANTINED.to_string(),
+        quarantine_until: None,
     }
 }
 
@@ -4803,6 +5044,10 @@ fn build_cached_artifact_response(
         // Proxy-cache entries carry no versioned history (#2367).
         revision: None,
         version_label: None,
+        // Proxy-cached objects have no `artifacts` row and no quarantine
+        // state; the upload-hold workflow only applies to hosted artifacts.
+        quarantine_status: NOT_QUARANTINED.to_string(),
+        quarantine_until: None,
     }
 }
 
@@ -4958,6 +5203,22 @@ fn apply_npm_tarball_url_path(item: &mut ArtifactResponse) {
     }
 }
 
+/// The [`ArtifactResponse::quarantine_status`] label for an artifact that
+/// carries no quarantine row state.
+pub(crate) const NOT_QUARANTINED: &str = "not_quarantined";
+
+/// Map the nullable `artifacts.quarantine_status` column to the always-present
+/// listing label (#2940). A missing or empty column value is reported as the
+/// explicit [`NOT_QUARANTINED`] state so clients never have to treat `null`
+/// as a state; any recorded status (`quarantined`, `rejected`, `clean`, …) is
+/// surfaced verbatim.
+pub(crate) fn quarantine_status_label(raw: Option<&str>) -> String {
+    match raw {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => NOT_QUARANTINED.to_string(),
+    }
+}
+
 fn build_artifact_response(
     artifact: &crate::models::artifact::Artifact,
     repo_key: &str,
@@ -4987,6 +5248,11 @@ fn build_artifact_response(
         // per-artifact metadata endpoint, not fanned out in listings (#2367).
         revision: None,
         version_label: None,
+        // Quarantine state is carried on the same `artifacts` row already
+        // selected by `list_page`/`list_for_repos_page`, so surfacing it here
+        // adds no extra query (no join, no N+1) (#2940).
+        quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
+        quarantine_until: artifact.quarantine_until,
     }
 }
 
@@ -5039,6 +5305,10 @@ fn expand_maven_secondary_files(
             cache_expires_at: None,
             revision: None,
             version_label: None,
+            // Companion files share the primary's `artifacts` row, so they
+            // inherit its quarantine state (#2940).
+            quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
+            quarantine_until: artifact.quarantine_until,
         });
     }
     out
@@ -6359,6 +6629,10 @@ pub async fn get_artifact_metadata(
             cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
             revision,
             version_label,
+            // Surface the resolved row's quarantine state, matching the
+            // listing (#2940).
+            quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
+            quarantine_until: artifact.quarantine_until,
         })
         .into_response());
     }
@@ -6476,6 +6750,11 @@ fn artifact_version_to_response(
         cache_expires_at: None,
         revision: Some(stored.revision),
         version_label: stored.version_label,
+        // A historical revision row (`artifact_versions`) carries no live
+        // quarantine state; quarantine is tracked on the HEAD `artifacts`
+        // row (#2940).
+        quarantine_status: NOT_QUARANTINED.to_string(),
+        quarantine_until: None,
     }
 }
 
@@ -6560,7 +6839,11 @@ pub async fn upload_artifact(
     body: Body,
 ) -> std::result::Result<Response, Response> {
     let auth = require_auth(auth).map_err(|e| e.into_response())?;
-    auth.require_scope("write").map_err(|e| e.into_response())?;
+    // Artifact write: the resource-specific `write:artifacts` (repo-scoped
+    // token vocabulary, #2989); bare `write` still satisfies via the
+    // parent rule in `scopes_grant_access`.
+    auth.require_scope("write:artifacts")
+        .map_err(|e| e.into_response())?;
 
     // Validate the composed artifact path against traversal, null bytes,
     // backslashes, percent-encoded traversal, absolute paths, etc. This
@@ -6610,11 +6893,12 @@ async fn authorize_generic_upload(
     require_repo_write_access(auth, &repo, &repo_service)
         .await
         .map_err(|e| e.into_response())?;
-    // Fine-grained write gate (#2321 G2): the tenant gate above admits any
-    // grantee (incl. a read-only one) and any authed caller on a public repo,
-    // collapsing read/write. Require the `write` action when rules exist, the
-    // same block `upload.rs::create_session` applies to the chunked path.
-    require_repo_fine_grained_action(auth, repo.id, "write", &state.permission_service)
+    // Action gate (#2603 G1): the tenant gate above admits any grantee (incl. a
+    // read-only one) and any authed caller on a public repo, collapsing
+    // read/write. Route the `write` decision through the canonical
+    // `check_repository_action` choke-point (deny-by-default): public
+    // visibility and rules-less repositories never confer write.
+    require_repo_action(auth, repo.id, "write", &state.permission_service)
         .await
         .map_err(|e| e.into_response())?;
 
@@ -6838,6 +7122,13 @@ async fn persist_generic_staged_upload(
             cache_expires_at: None,
             revision,
             version_label,
+            // The upload-time quarantine hold (`apply_upload_hold`) runs as a
+            // post-commit UPDATE after the INSERT's `RETURNING` built this
+            // struct, so the value here predates any hold. The authoritative
+            // per-artifact state is the listing / `GET /api/v1/quarantine/{id}`
+            // (#2940).
+            quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
+            quarantine_until: artifact.quarantine_until,
         }),
     )
         .into_response())
@@ -6880,7 +7171,8 @@ async fn upload_artifact_multipart_with_path(
     multipart: Multipart,
 ) -> std::result::Result<Response, Response> {
     let auth = require_auth(auth).map_err(|e| e.into_response())?;
-    auth.require_scope("write").map_err(|e| e.into_response())?;
+    auth.require_scope("write:artifacts")
+        .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
     let (staged, digests, filename) = stage_multipart_file(&state, multipart).await?;
@@ -6925,7 +7217,8 @@ async fn upload_artifact_multipart(
     multipart: Multipart,
 ) -> std::result::Result<Response, Response> {
     let auth = require_auth(auth).map_err(|e| e.into_response())?;
-    auth.require_scope("write").map_err(|e| e.into_response())?;
+    auth.require_scope("write:artifacts")
+        .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
     let (staged, digests, filename, custom_path) =
@@ -7788,11 +8081,12 @@ pub async fn delete_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
-    // Fine-grained delete gate (#2321 G2): the tenant gate above admits any
-    // grantee (incl. a write-only or read-only one), collapsing write/delete.
-    // Require the `delete` action when rules exist so a write-scoped grantee
-    // cannot destroy artifacts. Mirrors the upload path's `write` gate.
-    require_repo_fine_grained_action(&auth, repo.id, "delete", &state.permission_service).await?;
+    // Action gate (#2603 G1): the tenant gate above admits any grantee (incl. a
+    // write-only or read-only one), collapsing write/delete. Route the `delete`
+    // decision through the canonical `check_repository_action` choke-point
+    // (deny-by-default) so a write-only grantee cannot destroy artifacts and a
+    // rules-less/public repo confers no delete. Mirrors the upload `write` gate.
+    require_repo_action(&auth, repo.id, "delete", &state.permission_service).await?;
 
     // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
     // version-segmented path the tarball is actually stored under (#2269),
@@ -7860,13 +8154,19 @@ pub async fn delete_artifact(
         .delete_with_sync_options(artifact, !is_replication)
         .await?;
 
-    // Deleting a Maven artifact changes the version set for its GAV, so drop
-    // any cached maven-metadata.xml for it; otherwise a GET within the 60s TTL
-    // would keep listing the just-removed version.
+    // Deleting a Maven artifact changes the version set for its GAV. Drop both
+    // the in-memory generation cache AND the *stored* verbatim maven-metadata.xml
+    // that `mvn deploy` uploaded — the download path serves that stored document
+    // in preference to dynamic generation, so leaving it in place keeps
+    // advertising the just-removed version (#2845). Clearing it lets the next GET
+    // regenerate the version list from the live (non-deleted) artifact rows.
     if repo.format == RepositoryFormat::Maven {
         if let Ok(coords) = MavenHandler::parse_coordinates(&path) {
-            crate::api::handlers::maven::invalidate_maven_metadata_cache(
+            crate::api::handlers::maven::clear_stored_maven_metadata(
+                &state,
                 repo.id,
+                &repo.storage_backend,
+                &repo.storage_location(),
                 &coords.group_id,
                 &coords.artifact_id,
             )
@@ -7899,14 +8199,27 @@ pub struct AddVirtualMemberRequest {
     pub priority: Option<i32>,
 }
 
+/// Full-set replace of a virtual repository's members (PR #2795, issue #2785;
+/// ratified in issue #2899).
+///
+/// This body is the COMPLETE desired member list, not a partial patch. Any
+/// current member whose key is absent from `members` is removed; keys present
+/// are inserted or have their priority updated. An empty `members` array
+/// removes every member.
+///
+/// WARNING: sending a partial list to reorder priorities deletes the omitted
+/// members. Clients must always send the full member list.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateVirtualMembersRequest {
+    /// The complete desired member set. Members not listed here are removed.
     pub members: Vec<VirtualMemberPriority>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct VirtualMemberPriority {
+    /// Key of the member repository. Inserted if it is not already a member.
     pub member_key: String,
+    /// Resolution priority. Lower values are searched first.
     pub priority: i32,
 }
 
@@ -8154,17 +8467,38 @@ pub async fn remove_virtual_member(
 
 /// Replace the full member set of a virtual repository (add / remove / reorder).
 ///
-/// #2785: this is the "edit the members after creation" operation. The body is
-/// the complete desired member list; members not listed are removed, listed
-/// members that are not yet present are added, and priorities are refreshed.
-/// The prior implementation only reordered members that already existed and
-/// returned 404 for any member not already present, so adding a member through
-/// an edit form failed.
+/// This is a FULL-SET REPLACE, not a partial update. The request body is the
+/// complete desired member list:
+///
+///   * any existing member NOT present in the body is REMOVED;
+///   * a member present in the body that is not yet a member is INSERTED;
+///   * a member present in the body that already exists has its priority
+///     UPDATED to the supplied value;
+///   * an empty `members` array removes every member.
+///
+/// WARNING: sending a partial list to reorder priorities will DELETE the
+/// members you omitted. Always send the complete member list, including the
+/// members whose priority is unchanged.
+///
+/// PR #2795 (issue #2785) introduced these semantics so that the members of a
+/// virtual repository are editable after creation: the prior implementation only
+/// reordered members that already existed and returned 404 for any member not
+/// already present, so adding a member through an edit form failed. The change
+/// in request semantics was ratified in #2899.
 #[utoipa::path(
     put,
     path = "/{key}/members",
     context_path = "/api/v1/repositories",
     tag = "repositories",
+    description = "Replace the full member set of a virtual repository. \
+        This is a full-set replace, not a partial update: the request body is the \
+        complete desired member list. Any existing member that is not present in the \
+        body is removed. Members present in the body are inserted if missing, or have \
+        their priority updated if already present. An empty `members` array removes \
+        every member. Warning: sending a partial list in order to reorder priorities \
+        will delete the members omitted from that list, so clients must always send \
+        the complete member list. These semantics were introduced in PR #2795 \
+        (issue #2785) and ratified in issue #2899.",
     params(
         ("key" = String, Path, description = "Repository key"),
     ),
@@ -8639,6 +8973,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         create_repository,
         get_repository,
         get_repository_storage,
+        get_repository_storage_tree,
         update_repository,
         delete_repository,
         set_cache_ttl,
@@ -8672,6 +9007,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryResponse,
         RepositoryListResponse,
         RepositoryStorageStatsResponse,
+        StorageTreeQuery,
+        StorageTreeNode,
+        RepositoryStorageTreeResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
         SetNpmScopePolicyRequest,
@@ -8864,6 +9202,397 @@ mod tests {
         assert_eq!(json["logical_bytes"], 54033);
         assert_eq!(json["blob_count"], 4);
         assert_eq!(json["dedup_scope"], "instance");
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-prefix storage tree (#2601): query clamps + response serde.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn storage_tree_depth_clamps_to_bounds() {
+        assert_eq!(clamp_tree_depth(None), 1, "default is immediate children");
+        assert_eq!(clamp_tree_depth(Some(0)), 1);
+        assert_eq!(clamp_tree_depth(Some(-3)), 1);
+        assert_eq!(clamp_tree_depth(Some(3)), 3);
+        assert_eq!(clamp_tree_depth(Some(999)), STORAGE_TREE_MAX_QUERY_DEPTH);
+    }
+
+    #[test]
+    fn storage_tree_limit_clamps_to_bounds() {
+        assert_eq!(clamp_tree_limit(None), STORAGE_TREE_DEFAULT_LIMIT);
+        assert_eq!(clamp_tree_limit(Some(0)), 1);
+        assert_eq!(clamp_tree_limit(Some(-5)), 1);
+        assert_eq!(clamp_tree_limit(Some(50)), 50);
+        assert_eq!(clamp_tree_limit(Some(1_000_000)), STORAGE_TREE_MAX_LIMIT);
+    }
+
+    #[test]
+    fn storage_tree_response_omits_unattributed_off_root() {
+        // `unattributed_bytes` is a root-only figure: present (even when 0) at
+        // the root, absent entirely when the listing is rooted at a subfolder.
+        let node = |prefix: &str, depth: i32| StorageTreeNode {
+            prefix: prefix.into(),
+            depth,
+            logical_bytes: 100,
+            physical_bytes: 80,
+            file_count: 2,
+            blob_count: 1,
+        };
+        let root = RepositoryStorageTreeResponse {
+            repository_key: "demo".into(),
+            node: node("", 0),
+            children: vec![node("a", 1)],
+            truncated: false,
+            unattributed_bytes: Some(0),
+            max_materialized_depth:
+                crate::services::storage_stats_service::MAX_MATERIALIZED_PATH_DEPTH,
+            computed_at: None,
+        };
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["unattributed_bytes"], 0);
+        assert_eq!(json["children"][0]["prefix"], "a");
+
+        let sub = RepositoryStorageTreeResponse {
+            repository_key: "demo".into(),
+            node: node("a", 1),
+            children: vec![],
+            truncated: true,
+            unattributed_bytes: None,
+            max_materialized_depth:
+                crate::services::storage_stats_service::MAX_MATERIALIZED_PATH_DEPTH,
+            computed_at: None,
+        };
+        let json = serde_json::to_value(&sub).unwrap();
+        assert!(
+            json.get("unattributed_bytes").is_none(),
+            "root-only figure must be absent off-root, not null"
+        );
+        assert_eq!(json["truncated"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-prefix storage tree (#2601): DB-backed handler matrix. Each test
+    // seeds its own uniquely-keyed repository, rebuilds the materialized
+    // rollup, and drives `get_repository_storage_tree` directly. Skips
+    // cleanly with no DATABASE_URL (the `tdh::try_pool()` convention).
+    // -----------------------------------------------------------------------
+
+    /// Seed one path-bearing artifact row with a unique CAS storage key.
+    async fn seed_tree_artifact(pool: &sqlx::PgPool, repo_id: Uuid, path: &str, size: i64) {
+        sqlx::query(
+            "INSERT INTO artifacts \
+                 (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                  content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, $3, $3, $4, repeat('b', 64), \
+                     'application/octet-stream', $5, false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo_id)
+        .bind(path)
+        .bind(size)
+        .bind(format!("cas/tree/{}", Uuid::new_v4()))
+        .execute(pool)
+        .await
+        .expect("seed tree artifact");
+    }
+
+    /// Rebuild the materialized per-prefix rollup the handler reads.
+    async fn rebuild_tree_stats(pool: &sqlx::PgPool) {
+        crate::api::handlers::test_db_helpers::recompute_storage_stats_with_retry(pool, false)
+            .await;
+    }
+
+    /// Drive the tree handler directly, as the router would.
+    async fn call_tree(
+        state: &SharedState,
+        auth: Option<AuthExtension>,
+        key: &str,
+        prefix: Option<&str>,
+        depth: Option<i32>,
+        limit: Option<i64>,
+    ) -> Result<RepositoryStorageTreeResponse> {
+        get_repository_storage_tree(
+            State(state.clone()),
+            Extension(auth),
+            Path(key.to_string()),
+            Query(StorageTreeQuery {
+                prefix: prefix.map(str::to_string),
+                depth,
+                limit,
+            }),
+        )
+        .await
+        .map(|json| json.0)
+    }
+
+    /// Root + subfolder rollups reconcile with the seeded reality; the
+    /// root-only `unattributed_bytes` figure and prefix normalization behave;
+    /// an unknown prefix yields zeros with no freshness marker.
+    #[tokio::test]
+    async fn storage_tree_rollup_reconciles_with_seeded_reality_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        seed_tree_artifact(&pool, repo_id, "libs/app/a.jar", 100).await;
+        seed_tree_artifact(&pool, repo_id, "libs/app/b.jar", 50).await;
+        seed_tree_artifact(&pool, repo_id, "libs/core/c.jar", 25).await;
+        seed_tree_artifact(&pool, repo_id, "top.txt", 10).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let member = tdh::make_auth(user_id, &username);
+
+        // Root listing: totals reconcile, immediate children only (depth
+        // default 1), unattributed present (0 — no OCI layers) at root only.
+        let root = call_tree(&state, Some(member.clone()), &key, None, None, None)
+            .await
+            .expect("root tree");
+        assert_eq!(root.repository_key, key);
+        assert_eq!(root.node.prefix, "");
+        assert_eq!(root.node.depth, 0);
+        assert_eq!(root.node.logical_bytes, 185);
+        assert_eq!(root.node.file_count, 4);
+        assert_eq!(root.unattributed_bytes, Some(0));
+        assert!(
+            root.computed_at.is_some(),
+            "refreshed rollup carries a timestamp"
+        );
+        assert!(!root.truncated);
+        let names: Vec<&str> = root.children.iter().map(|c| c.prefix.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["libs"],
+            "depth=1 returns immediate children only"
+        );
+
+        // Two levels: descendants ordered by logical_bytes DESC.
+        let two = call_tree(&state, Some(member.clone()), &key, None, Some(2), None)
+            .await
+            .expect("depth-2 tree");
+        let names: Vec<&str> = two.children.iter().map(|c| c.prefix.as_str()).collect();
+        assert_eq!(names, vec!["libs", "libs/app", "libs/core"]);
+        assert_eq!(two.children[1].logical_bytes, 150);
+
+        // Subfolder rooting (with slashes to exercise normalization): the
+        // node is the subtree rollup and `unattributed_bytes` is absent.
+        let libs = call_tree(
+            &state,
+            Some(member.clone()),
+            &key,
+            Some("/libs/"),
+            None,
+            None,
+        )
+        .await
+        .expect("libs tree");
+        assert_eq!(libs.node.prefix, "libs");
+        assert_eq!(libs.node.depth, 1);
+        assert_eq!(libs.node.logical_bytes, 175);
+        assert_eq!(libs.node.file_count, 3);
+        assert_eq!(libs.unattributed_bytes, None, "root-only figure off-root");
+        let names: Vec<&str> = libs.children.iter().map(|c| c.prefix.as_str()).collect();
+        assert_eq!(names, vec!["libs/app", "libs/core"]);
+
+        // Unknown prefix: zeros, no freshness marker, nothing leaked.
+        let unknown = call_tree(&state, Some(member), &key, Some("nope"), None, None)
+            .await
+            .expect("unknown prefix");
+        assert_eq!(unknown.node.logical_bytes, 0);
+        assert_eq!(unknown.node.file_count, 0);
+        assert!(unknown.computed_at.is_none());
+        assert!(unknown.children.is_empty());
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// Soft-deleted artifacts drop out of the tree after delete + recompute
+    /// (the rebuild prunes their prefix rows rather than serving stale data).
+    #[tokio::test]
+    async fn storage_tree_soft_deleted_artifacts_drop_after_recompute_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        seed_tree_artifact(&pool, repo_id, "old/tree/file.bin", 100).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let member = tdh::make_auth(user_id, &username);
+
+        let before = call_tree(&state, Some(member.clone()), &key, None, Some(2), None)
+            .await
+            .expect("tree before delete");
+        assert_eq!(before.node.logical_bytes, 100);
+        assert!(before.children.iter().any(|c| c.prefix == "old/tree"));
+
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("soft-delete artifacts");
+        rebuild_tree_stats(&pool).await;
+
+        let after = call_tree(&state, Some(member), &key, None, Some(2), None)
+            .await
+            .expect("tree after delete");
+        assert_eq!(after.node.logical_bytes, 0, "deleted bytes must not linger");
+        assert!(after.children.is_empty(), "pruned prefixes must disappear");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// LIKE metacharacters in the requested prefix are escaped: `a_b` must
+    /// not wildcard-match a sibling `axb` subtree, and `%`/`../` prefixes
+    /// return only in-scope (i.e. zero) rows instead of acting as wildcards.
+    #[tokio::test]
+    async fn storage_tree_prefix_like_wildcards_are_escaped_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        seed_tree_artifact(&pool, repo_id, "a_b/sub/one.bin", 100).await;
+        seed_tree_artifact(&pool, repo_id, "axb/sub/two.bin", 40).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let member = tdh::make_auth(user_id, &username);
+
+        // Unescaped, LIKE 'a_b/%' would also match axb/sub. It must not.
+        let tree = call_tree(
+            &state,
+            Some(member.clone()),
+            &key,
+            Some("a_b"),
+            Some(2),
+            None,
+        )
+        .await
+        .expect("a_b tree");
+        assert_eq!(tree.node.logical_bytes, 100, "a_b subtree only");
+        let names: Vec<&str> = tree.children.iter().map(|c| c.prefix.as_str()).collect();
+        assert_eq!(names, vec!["a_b/sub"], "the `_` must match literally");
+
+        // A bare `%` prefix must not become a match-everything wildcard.
+        let pct = call_tree(&state, Some(member.clone()), &key, Some("%"), Some(5), None)
+            .await
+            .expect("% prefix");
+        assert_eq!(pct.node.logical_bytes, 0);
+        assert!(
+            pct.children.is_empty(),
+            "`%` must not wildcard-list the tree"
+        );
+
+        // Path-traversal-shaped prefixes are just unknown literal folders.
+        let dots = call_tree(&state, Some(member), &key, Some("../"), Some(5), None)
+            .await
+            .expect("../ prefix");
+        assert_eq!(dots.node.logical_bytes, 0);
+        assert!(dots.children.is_empty());
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// Out-of-range `depth` / `limit` are clamped at the query boundary:
+    /// depth 999 stops at 5 levels below the root and limit 0 returns one
+    /// node with `truncated` set.
+    #[tokio::test]
+    async fn storage_tree_depth_and_limit_are_clamped_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        // d1/…/d8/f.bin materializes prefix nodes at depths 1..=8.
+        let deep: Vec<String> = (1..=8).map(|i| format!("d{i}")).collect();
+        seed_tree_artifact(&pool, repo_id, &format!("{}/f.bin", deep.join("/")), 10).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let member = tdh::make_auth(user_id, &username);
+
+        let deep_req = call_tree(&state, Some(member.clone()), &key, None, Some(999), None)
+            .await
+            .expect("depth-clamped tree");
+        assert_eq!(
+            deep_req.children.len(),
+            STORAGE_TREE_MAX_QUERY_DEPTH as usize,
+            "depth clamps to {STORAGE_TREE_MAX_QUERY_DEPTH} levels below the root"
+        );
+        assert!(deep_req
+            .children
+            .iter()
+            .all(|c| c.depth <= STORAGE_TREE_MAX_QUERY_DEPTH));
+
+        let tight = call_tree(&state, Some(member), &key, None, Some(3), Some(0))
+            .await
+            .expect("limit-clamped tree");
+        assert_eq!(tight.children.len(), 1, "limit 0 clamps up to 1");
+        assert!(tight.truncated, "the cut listing must be flagged");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// Visibility matrix: anonymous and non-member callers get an
+    /// existence-hiding 404 on a private repo's tree; a granted member sees
+    /// it; flipping the repo public admits anonymous reads.
+    #[tokio::test]
+    async fn storage_tree_hidden_from_anonymous_and_nonmembers_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let (member_id, member_name) = tdh::create_user(&pool).await;
+        let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, member_id).await;
+        seed_tree_artifact(&pool, repo_id, "private/secret.bin", 100).await;
+        rebuild_tree_stats(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        let anon = call_tree(&state, None, &key, None, None, None).await;
+        assert!(
+            matches!(anon, Err(AppError::NotFound(_))),
+            "anonymous must get an existence-hiding 404: {anon:?}"
+        );
+
+        let outsider = tdh::make_auth(outsider_id, &outsider_name);
+        let denied = call_tree(&state, Some(outsider), &key, None, None, None).await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must get an existence-hiding 404: {denied:?}"
+        );
+
+        let member = tdh::make_auth(member_id, &member_name);
+        let seen = call_tree(&state, Some(member), &key, None, None, None)
+            .await
+            .expect("member sees the tree");
+        assert_eq!(seen.node.logical_bytes, 100);
+
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("flip public");
+        let public = call_tree(&state, None, &key, None, None, None)
+            .await
+            .expect("public repo tree is anonymously readable");
+        assert_eq!(public.node.logical_bytes, 100);
+
+        tdh::cleanup(&pool, repo_id, member_id).await;
+        tdh::cleanup_user(&pool, outsider_id).await;
     }
 
     #[test]
@@ -9061,12 +9790,11 @@ mod tests {
     }
 
     async fn test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .ok()
+        // Delegate to the shared harness pool: it also installs the bounded
+        // download-event dispatcher (#2522) that `record_redirect_download`'s
+        // stats write now flows through — a bare `PgPoolOptions` connect would
+        // leave the dispatcher uninstalled and the write a designed no-op.
+        crate::testing::try_pool_with(2).await
     }
 
     async fn seed_artifact(pool: &sqlx::PgPool) -> Uuid {
@@ -9747,6 +10475,49 @@ mod tests {
         assert_eq!(resp.download_count, 42);
         // Hosted artifacts have a real DB id, so SBOM/scan resolve: analyzable.
         assert!(resp.analyzable);
+        // A normal (un-held) artifact reports the explicit not-quarantined
+        // state, never a bare null (#2940).
+        assert_eq!(resp.quarantine_status, "not_quarantined");
+        assert!(resp.quarantine_until.is_none());
+    }
+
+    #[test]
+    fn test_quarantine_status_label_maps_missing_to_not_quarantined() {
+        // A null/empty column is the common (unquarantined) case and must
+        // report the explicit label so clients never treat null as a state.
+        assert_eq!(quarantine_status_label(None), "not_quarantined");
+        assert_eq!(quarantine_status_label(Some("")), "not_quarantined");
+        // Any recorded status is surfaced verbatim.
+        assert_eq!(quarantine_status_label(Some("quarantined")), "quarantined");
+        assert_eq!(quarantine_status_label(Some("rejected")), "rejected");
+        assert_eq!(quarantine_status_label(Some("clean")), "clean");
+    }
+
+    #[test]
+    fn test_build_artifact_response_surfaces_quarantined_state() {
+        // The listing must make a held artifact visible: a quarantined row
+        // surfaces `quarantine_status = "quarantined"` and its hold expiry,
+        // while an unquarantined row surfaces the not-quarantined default.
+        let until = chrono::Utc::now() + chrono::Duration::minutes(30);
+
+        let mut held = make_artifact_for_test("held/pkg-1.0.0.jar");
+        held.quarantine_status = Some("quarantined".to_string());
+        held.quarantine_until = Some(until);
+        let held_resp = build_artifact_response(&held, "generic-hosted", 0);
+        assert_eq!(held_resp.quarantine_status, "quarantined");
+        assert_eq!(held_resp.quarantine_until, Some(until));
+
+        let clean = make_artifact_for_test("clean/pkg-1.0.0.jar");
+        let clean_resp = build_artifact_response(&clean, "generic-hosted", 0);
+        assert_eq!(clean_resp.quarantine_status, "not_quarantined");
+        assert!(clean_resp.quarantine_until.is_none());
+
+        // The held item serializes the state (and the reason is NOT present
+        // here — it is only disclosed by the authenticated quarantine
+        // endpoint, #2912).
+        let json = serde_json::to_value(&held_resp).unwrap();
+        assert_eq!(json["quarantine_status"], "quarantined");
+        assert!(json.get("quarantine_reason").is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -10015,7 +10786,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions for testability
+    // Test-local pagination/path helpers.
+    //
+    // KNOWN RESIDUAL (#2657): compute_pagination / compute_total_pages /
+    // extract_name_from_path / content_disposition_attachment /
+    // extract_name_version_from_path duplicate inline production logic in this
+    // file and should be promoted into production and wired like the format
+    // handlers were.
     // -----------------------------------------------------------------------
 
     /// Compute pagination offset from page number and per_page size.
@@ -10034,11 +10811,6 @@ mod tests {
     /// Extract the filename from a slash-delimited path.
     fn extract_name_from_path(path: &str) -> String {
         path.split('/').next_back().unwrap_or(path).to_string()
-    }
-
-    /// Build a storage path from a base dir and repository key.
-    fn build_storage_path(storage_base: &str, repo_key: &str) -> String {
-        format!("{}/{}", storage_base, repo_key)
     }
 
     /// Build a Content-Disposition attachment header value.
@@ -11309,9 +12081,16 @@ mod tests {
             analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
+        // Unquarantined artifacts report the explicit default state (#2940).
+        assert!(json.contains("\"quarantine_status\":\"not_quarantined\""));
+        // `quarantine_until` is omitted when None so the wire shape stays
+        // minimal for the common (unquarantined) case.
+        assert!(!json.contains("quarantine_until"));
         assert!(json.contains("\"size_bytes\":1024"));
         // `analyzable` is always serialized (no serde skip) so clients can
         // gate the SBOM/Scan actions on it (#2227).
@@ -11392,6 +12171,8 @@ mod tests {
             analyzable: false,
             cache_cached_at: Some(cached),
             cache_expires_at: Some(expires),
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"cache_cached_at\":\"2026-06-01T10:00:00Z\""));
@@ -11708,26 +12489,6 @@ mod tests {
     #[test]
     fn test_extract_name_from_path_deep() {
         assert_eq!(extract_name_from_path("a/b/c/d/e/file.bin"), "file.bin");
-    }
-
-    // -----------------------------------------------------------------------
-    // build_storage_path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_storage_path_basic() {
-        assert_eq!(
-            build_storage_path("/var/data", "my-repo"),
-            "/var/data/my-repo"
-        );
-    }
-
-    #[test]
-    fn test_build_storage_path_relative() {
-        assert_eq!(
-            build_storage_path("./storage", "repo-1"),
-            "./storage/repo-1"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -12251,42 +13012,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #2321 G2: pure fine-grained per-action decision (write/delete) applied
-    // after the tenant gate on the generic REST + OCI artifact paths. Mirrors
-    // `upload.rs::upload_write_decision`.
+    // #2603 G1: `require_repo_action` is the single deny-by-default per-action
+    // mutation choke-point. It delegates the decision to
+    // `PermissionService::check_repository_action` (unit-tested with a DB in
+    // `services::permission_service`), so the coverage here is the DB-backed
+    // handler matrix below (`upload_artifact_fine_grained_write_gate_db`,
+    // `delete_artifact_fine_grained_delete_gate_db`,
+    // `require_repo_action_denies_public_and_rulesless_db`).
     // -----------------------------------------------------------------------
-    #[test]
-    fn test_repo_fine_grained_action_admin_always_allowed() {
-        // Admins bypass regardless of rules/actions state.
-        assert!(repo_fine_grained_action_allowed(true, false, false, false));
-        assert!(repo_fine_grained_action_allowed(true, true, false, false));
-    }
-
-    #[test]
-    fn test_repo_fine_grained_action_no_rules_falls_through() {
-        // A repo with no permission rules keeps the default access model.
-        assert!(repo_fine_grained_action_allowed(false, false, false, false));
-    }
-
-    #[test]
-    fn test_repo_fine_grained_action_rules_require_matching_action() {
-        // Rules exist but the caller holds neither the action nor admin -> deny.
-        // This is the read-only-grantee-cannot-write / write-only-cannot-delete
-        // collapse that #2321 G2 closes.
-        assert!(!repo_fine_grained_action_allowed(false, true, false, false));
-    }
-
-    #[test]
-    fn test_repo_fine_grained_action_rules_with_action_allowed() {
-        // Holding the requested action (write or delete) passes.
-        assert!(repo_fine_grained_action_allowed(false, true, true, false));
-    }
-
-    #[test]
-    fn test_repo_fine_grained_action_rules_with_admin_action_allowed() {
-        // `admin` implies all actions, so it passes any per-action gate.
-        assert!(repo_fine_grained_action_allowed(false, true, false, true));
-    }
 
     // -----------------------------------------------------------------------
     // xtenant-write-authz-systemic: behavioral coverage for the two shared
@@ -12430,6 +13163,10 @@ mod tests {
         let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
         tdh::grant_repo_access(&pool, repo_id, user_id).await;
         let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        // #2603 G1: the delete path now requires the `delete` action (developer
+        // no longer implies delete); grant explicit read/write/delete so this
+        // test exercises its own logic rather than the authz gate.
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
         let auth = Some(tdh::make_auth(user_id, &username));
         // {package}/{version}/{filename} -> a versioned release coordinate.
         let path = "app/1.0.0/app-1.0.0.bin".to_string();
@@ -12762,6 +13499,10 @@ mod tests {
         let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
         tdh::grant_repo_access(&pool, repo_id, user_id).await;
         let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        // #2603 G1: the delete path now requires the `delete` action (developer
+        // no longer implies delete); grant explicit read/write/delete so this
+        // test exercises its own logic rather than the authz gate.
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
         let auth = Some(tdh::make_auth(user_id, &username));
         let mut admin_ext = tdh::make_auth(user_id, &username);
         admin_ext.is_admin = true;
@@ -13672,13 +14413,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #2321 G2 binding test: the generic artifact write/delete handlers must
-    /// keep routing through `require_repo_fine_grained_action` after the tenant
-    /// gate. A handler that dropped the call would silently re-collapse
-    /// read/write/delete, so pin it structurally (the DB tests above cannot run
-    /// without a Postgres).
+    /// #2603 G1 core: `require_repo_action` is DENY-BY-DEFAULT. On a RULES-LESS
+    /// repository (no fine-grained rows) it must:
+    ///   * deny a bare authenticated non-member `write`/`delete` on a PUBLIC
+    ///     repo (public visibility is read-only — the headline gap);
+    ///   * deny a read-only `viewer`-role member `write`/`delete` on a PRIVATE
+    ///     repo;
+    ///   * allow a `developer`-role member `write` but still deny `delete`
+    ///     (developer no longer implies delete);
+    ///   * allow a global admin everything.
+    #[tokio::test]
+    async fn require_repo_action_deny_by_default_rulesless_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let perms = crate::services::permission_service::PermissionService::new(pool.clone());
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(user_id, &username);
+
+        // Bare non-member on a PRIVATE rules-less repo: no write, no delete.
+        assert!(
+            require_repo_action(&auth, repo_id, "write", &perms)
+                .await
+                .is_err(),
+            "bare non-member must be denied write on a rules-less private repo"
+        );
+
+        // Make it PUBLIC: still no write/delete (public = read baseline only).
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo public");
+        assert!(
+            require_repo_action(&auth, repo_id, "write", &perms)
+                .await
+                .is_err(),
+            "bare authed non-member must be denied write on a rules-less PUBLIC repo (G1a)"
+        );
+        assert!(
+            require_repo_action(&auth, repo_id, "delete", &perms)
+                .await
+                .is_err(),
+            "bare authed non-member must be denied delete on a rules-less public repo"
+        );
+
+        // Read-only `viewer` (reader role) member: still no write/delete.
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'reader' \
+             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("grant reader role");
+        assert!(
+            require_repo_action(&auth, repo_id, "write", &perms)
+                .await
+                .is_err(),
+            "read-only viewer must be denied write (G1b class)"
+        );
+        assert!(
+            require_repo_action(&auth, repo_id, "delete", &perms)
+                .await
+                .is_err(),
+            "read-only viewer must be denied delete (G1b)"
+        );
+
+        // Upgrade to `developer`: write allowed, delete still denied.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        assert!(
+            require_repo_action(&auth, repo_id, "write", &perms)
+                .await
+                .is_ok(),
+            "developer member must be allowed write (legit path)"
+        );
+        assert!(
+            require_repo_action(&auth, repo_id, "delete", &perms)
+                .await
+                .is_err(),
+            "developer must NOT imply delete"
+        );
+
+        // Global admin bypasses everything.
+        let admin = tdh::admin_auth(user_id, &username);
+        assert!(
+            require_repo_action(&admin, repo_id, "delete", &perms)
+                .await
+                .is_ok(),
+            "global admin must be allowed delete"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2603 G1 binding test: the generic artifact write/delete handlers must
+    /// keep routing through `require_repo_action` (the canonical
+    /// `check_repository_action` choke-point) after the tenant gate. A handler
+    /// that dropped the call would silently re-collapse read/write/delete and
+    /// re-open the public / rules-less write hole, so pin it structurally (the
+    /// DB tests above cannot run without a Postgres).
     #[test]
-    fn test_generic_artifact_handlers_call_fine_grained_gate() {
+    fn test_generic_artifact_handlers_call_action_gate() {
         let source = include_str!("repositories.rs");
         for (handler, action) in [
             ("upload_artifact", "\"write\""),
@@ -13692,8 +14533,8 @@ mod tests {
             let end = rest.find("\npub async fn ").unwrap_or(rest.len());
             let body = &rest[..end];
             assert!(
-                body.contains("require_repo_fine_grained_action(") && body.contains(action),
-                "handler `{}` must call require_repo_fine_grained_action with {} (#2321 G2)",
+                body.contains("require_repo_action(") && body.contains(action),
+                "handler `{}` must call require_repo_action with {} (#2603 G1)",
                 handler,
                 action
             );
@@ -18357,6 +19198,62 @@ mod tests {
         );
     }
 
+    // Regression: a built-in format that shares a core handler (docker -> oci)
+    // must gate on that handler, so disabling `oci` rejects a `docker` repo.
+    // Fails on main, where the gate looked up "docker" and missed the "oci" row.
+    #[tokio::test]
+    async fn test_create_docker_repo_rejected_when_oci_handler_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Disable the seeded `oci` handler (governs the whole OCI/Docker family).
+        sqlx::query("UPDATE format_handlers SET is_enabled = false WHERE format_key = 'oci'")
+            .execute(&pool)
+            .await
+            .expect("disable oci handler");
+
+        let key = format!("docker-repo-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(&key, "Docker repo", "docker", serde_json::json!({}));
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        sqlx::query("UPDATE format_handlers SET is_enabled = true WHERE format_key = 'oci'")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err =
+            result.expect_err("docker repo must be rejected when the oci handler is disabled");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("disabled")),
+            "expected a Validation error mentioning 'disabled', got {err:?}",
+        );
+    }
+
     // -----------------------------------------------------------------------
     // custom_user_agent: handler plumbing (create / update / get round-trips)
     // -----------------------------------------------------------------------
@@ -19702,6 +20599,10 @@ mod tests {
         let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "npm").await;
         tdh::grant_repo_access(&pool, repo_id, user_id).await;
         let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        // #2603 G1: the delete path now requires the `delete` action (developer
+        // no longer implies delete); grant explicit read/write/delete so this
+        // test exercises its own logic rather than the authz gate.
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
         let auth = Some(tdh::make_auth(user_id, &username));
 
         // Publish tarballs under the exact version-segmented layout
@@ -19943,5 +20844,238 @@ mod apt_validation_tests {
         let err = ensure_single_line("line1\rline2", "apt_release_version").unwrap_err();
         assert!(err.to_string().contains("apt_release_version"));
         assert!(err.to_string().contains("single-line"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #3078: GET /api/v1/repositories reads `storage_used_bytes` from the
+    // trigger-maintained `repository_usage_ledger` instead of recomputing the
+    // 3-way live SUM per request. The equivalence matrix below seeds the
+    // SOURCE tables (so migration 182's triggers do the charging) and asserts
+    // the listing's ledger-backed figure equals the live-SUM oracle
+    // (`RepositoryService::get_storage_usage` / `get_virtual_storage_usage`,
+    // both deliberately left live) for every seeded shape.
+    // -----------------------------------------------------------------------
+
+    /// Create a repo via the shared fixture helper, then re-key it under the
+    /// caller's unique run prefix so one `?q=<prefix>` listing call returns
+    /// exactly this test's repositories.
+    async fn seeded_repo_3078(
+        pool: &sqlx::PgPool,
+        prefix: &str,
+        tag: &str,
+        repo_type: &str,
+    ) -> Uuid {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (id, _key, _dir) = tdh::create_repo(pool, repo_type, "generic").await;
+        let key = format!("{prefix}-{tag}");
+        sqlx::query("UPDATE repositories SET key = $1, name = $1 WHERE id = $2")
+            .bind(&key)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("re-key repo under run prefix");
+        id
+    }
+
+    /// End-to-end equivalence matrix for the ledger-backed listing (#3078):
+    /// hosted bytes counted; a soft-deleted artifact excluded (seeded live,
+    /// then flipped, so the trigger's decrement is exercised); a legacy
+    /// `proxy-cache/%`-keyed `artifacts` row excluded; `proxy_cache_artifacts`
+    /// and `oci_blobs` counted, including a `pending_delete_at`-marked blob
+    /// (zero-delta no-op); an empty repo with no ledger row renders 0 without
+    /// vanishing from the response; a virtual renders the union of its
+    /// members; a memberless virtual renders 0.
+    #[tokio::test]
+    async fn test_listing_storage_matches_live_sum_oracle_3078() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let prefix = format!("lg3078{}", &Uuid::new_v4().simple().to_string()[..12]);
+
+        let hosted = seeded_repo_3078(&pool, &prefix, "hosted", "local").await;
+        let proxied = seeded_repo_3078(&pool, &prefix, "proxied", "remote").await;
+        let oci = seeded_repo_3078(&pool, &prefix, "oci", "local").await;
+        let empty = seeded_repo_3078(&pool, &prefix, "empty", "local").await;
+        let virt = seeded_repo_3078(&pool, &prefix, "virt", "virtual").await;
+        let hollow = seeded_repo_3078(&pool, &prefix, "hollow", "virtual").await;
+
+        // hosted: one live artifact (counted), one soft-deleted (seeded live
+        // then flipped — trigger must decrement), one legacy proxy-cache-keyed
+        // row (trigger must never charge it).
+        let art = |repo: Uuid, key: String, size: i64, deleted: bool| {
+            let pool = pool.clone();
+            async move {
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+                     checksum_sha256, content_type, storage_key, is_deleted) \
+                     VALUES ($1, $2, $3, $3, $4, repeat('b', 64), 'application/octet-stream', \
+                     $5, $6)",
+                )
+                .bind(id)
+                .bind(repo)
+                .bind(format!("p/{id}"))
+                .bind(size)
+                .bind(key)
+                .bind(deleted)
+                .execute(&pool)
+                .await
+                .expect("insert artifact row");
+                id
+            }
+        };
+        art(hosted, format!("cas/00/{}", Uuid::new_v4()), 1_000, false).await;
+        let doomed = art(hosted, format!("cas/01/{}", Uuid::new_v4()), 4_000, false).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(doomed)
+            .execute(&pool)
+            .await
+            .expect("soft-delete artifact");
+        art(
+            hosted,
+            format!("proxy-cache/{hosted}/x/__content__"),
+            9_999,
+            false,
+        )
+        .await;
+
+        // proxied: a proxy-cache catalog row (counted whole-table).
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (id, repository_id, path, storage_key, \
+             metadata_key, size_bytes) VALUES ($1, $2, 'c/pkg.tgz', $3, $4, 2500)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(proxied)
+        .bind(format!("proxy-cache/{proxied}/c/pkg.tgz/__content__"))
+        .bind(format!(
+            "proxy-cache/{proxied}/c/pkg.tgz/__cache_meta__.json"
+        ))
+        .execute(&pool)
+        .await
+        .expect("insert proxy cache row");
+
+        // oci: one plain blob + one later marked pending_delete_at (the
+        // mark-and-sweep marker is a zero-delta no-op: still counted).
+        let blob = |repo: Uuid, size: i64| {
+            let pool = pool.clone();
+            async move {
+                let digest = format!("sha256:{}", Uuid::new_v4().simple());
+                sqlx::query(
+                    "INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(Uuid::new_v4())
+                .bind(repo)
+                .bind(&digest)
+                .bind(size)
+                .bind(format!("oci-blobs/{digest}"))
+                .execute(&pool)
+                .await
+                .expect("insert oci blob row");
+                digest
+            }
+        };
+        blob(oci, 500_000).await;
+        let marked = blob(oci, 250_000).await;
+        sqlx::query(
+            "UPDATE oci_blobs SET pending_delete_at = NOW() \
+             WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(oci)
+        .bind(&marked)
+        .execute(&pool)
+        .await
+        .expect("mark blob pending delete");
+
+        // empty: force the missing-ledger-row shape even if something seeded it.
+        sqlx::query("DELETE FROM repository_usage_ledger WHERE repository_id = $1")
+            .bind(empty)
+            .execute(&pool)
+            .await
+            .expect("drop empty repo ledger row");
+
+        // virt: union of hosted + oci members.
+        for (member, prio) in [(hosted, 1), (oci, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt)
+            .bind(member)
+            .bind(prio)
+            .execute(&pool)
+            .await
+            .expect("add virtual member");
+        }
+
+        // One listing call scoped to this run's repos, as an admin (sees all).
+        let state = tdh::build_state(pool.clone(), "/tmp/lg3078-unused");
+        let auth = tdh::admin_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+        let (status, body) = tdh::send(router, tdh::get(format!("/?q={prefix}&per_page=50"))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "listing failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
+        let listed: std::collections::HashMap<String, i64> = json["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .map(|item| {
+                (
+                    item["key"].as_str().expect("key").to_string(),
+                    item["storage_used_bytes"].as_i64().expect("storage figure"),
+                )
+            })
+            .collect();
+
+        let service = RepositoryService::new(pool.clone());
+        // (id, tag, live-SUM oracle expectation)
+        let matrix = [
+            (hosted, "hosted", 1_000),
+            (proxied, "proxied", 2_500),
+            (oci, "oci", 750_000),
+            (empty, "empty", 0),
+            (virt, "virt", 751_000),
+            (hollow, "hollow", 0),
+        ];
+        for (id, tag, expected) in matrix {
+            let oracle = if tag == "virt" || tag == "hollow" {
+                service
+                    .get_virtual_storage_usage(id)
+                    .await
+                    .expect("virtual oracle")
+            } else {
+                service
+                    .get_storage_usage(id)
+                    .await
+                    .expect("live-SUM oracle")
+            };
+            assert_eq!(
+                oracle, expected,
+                "live-SUM oracle drifted from the seeded expectation for {tag}"
+            );
+            assert_eq!(
+                listed.get(&format!("{prefix}-{tag}")).copied(),
+                Some(expected),
+                "ledger-backed listing figure must equal the live-SUM oracle for {tag}"
+            );
+        }
+
+        for id in [virt, hollow, hosted, proxied, oci, empty] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
     }
 }
