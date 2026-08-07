@@ -241,9 +241,13 @@ fn check_packument_conditional_request(
 /// `cache_headers::cacheable_response`, because that helper builds a fresh
 /// response carrying only cache headers and would drop the `Content-Encoding`
 /// and `Vary` guarantees above.
-fn cached_packument_response(entry: &CachedPackument, request_headers: &HeaderMap) -> Response {
+fn cached_packument_response(
+    entry: &CachedPackument,
+    request_headers: &HeaderMap,
+    cache_control: &'static str,
+) -> Response {
     if let Some(not_modified) =
-        check_packument_conditional_request(request_headers, &entry.etag, NPM_CACHE_CONTROL_CACHED)
+        check_packument_conditional_request(request_headers, &entry.etag, cache_control)
     {
         return not_modified;
     }
@@ -442,6 +446,21 @@ async fn get_package_metadata_cached(
     let cache_eligible = (repo.repo_type == RepositoryType::Remote
         || repo.repo_type == RepositoryType::Virtual)
         && !age_gate_bypasses_packument_cache(state, &repo).await;
+    // Server-side caching is safe for Remote AND Virtual, because #2490's
+    // LISTEN/NOTIFY fanout (`invalidate_package_and_virtuals`, which explicitly
+    // walks `virtual_repo_keys`) drops the entry on every replica the moment a
+    // member publishes.
+    //
+    // A CLIENT-side freshness window is only safe for Remote. A Virtual repo may
+    // aggregate a hosted member, which is a write target -- and invalidation
+    // cannot reach npm's `cacache`, so `max-age` there re-opens exactly the
+    // read-your-writes window the fanout exists to close. Remote has no local
+    // publish path, so no invalidation can be missed.
+    let client_cache_control = if repo.repo_type == RepositoryType::Remote {
+        NPM_CACHE_CONTROL_CACHED
+    } else {
+        NPM_CACHE_CONTROL_UNCACHED
+    };
     let Some(cache) = state.npm_packument_cache.clone().filter(|_| cache_eligible) else {
         let response =
             get_package_metadata(state, repo_key, package_name, base_url, want_abbreviated).await?;
@@ -512,7 +531,7 @@ async fn get_package_metadata_cached(
             },
         )
         .await
-        .map(|entry| cached_packument_response(&entry, headers))
+        .map(|entry| cached_packument_response(&entry, headers, client_cache_control))
 }
 
 /// True when a response status is an authoritative "this package does not
@@ -8482,7 +8501,7 @@ mod tests {
             content_encoding: Some("gzip".to_string()),
             etag: compute_etag(b"{}"),
         };
-        let response = cached_packument_response(&gz, &HeaderMap::new());
+        let response = cached_packument_response(&gz, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
         assert_eq!(
@@ -8501,7 +8520,8 @@ mod tests {
             content_encoding: None,
             etag: compute_etag(b"{}"),
         };
-        let response = cached_packument_response(&identity, &HeaderMap::new());
+        let response =
+            cached_packument_response(&identity, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
             response.headers().get(CONTENT_ENCODING).is_none(),
@@ -8522,7 +8542,8 @@ mod tests {
             content_encoding: Some("also\nbad".to_string()),
             etag: "bad\retag".to_string(),
         };
-        let response = cached_packument_response(&corrupt, &HeaderMap::new());
+        let response =
+            cached_packument_response(&corrupt, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
         assert!(response.headers().get(CONTENT_ENCODING).is_none());
@@ -8533,7 +8554,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
-        let response = cached_packument_response(&corrupt, &headers);
+        let response = cached_packument_response(&corrupt, &headers, NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().get(ETAG).is_none());
         assert!(response.headers().get(CACHE_CONTROL).is_none());
@@ -8553,7 +8574,7 @@ mod tests {
             HeaderValue::from_str(&entry.etag).expect("valid etag"),
         );
 
-        let response = cached_packument_response(&entry, &headers);
+        let response = cached_packument_response(&entry, &headers, NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers()[ETAG], entry.etag);
         assert_eq!(response.headers()[CACHE_CONTROL], NPM_CACHE_CONTROL_CACHED);
@@ -8574,7 +8595,7 @@ mod tests {
             HeaderValue::from_str(&compute_etag(b"{\"name\":\"other\"}")).expect("valid etag"),
         );
 
-        let response = cached_packument_response(&entry, &headers);
+        let response = cached_packument_response(&entry, &headers, NPM_CACHE_CONTROL_CACHED);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[ETAG], entry.etag);
     }
@@ -8609,8 +8630,10 @@ mod tests {
             etag: canonical.clone(),
         };
 
-        let identity_response = cached_packument_response(&identity, &HeaderMap::new());
-        let gz_response = cached_packument_response(&gz, &HeaderMap::new());
+        let identity_response =
+            cached_packument_response(&identity, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
+        let gz_response =
+            cached_packument_response(&gz, &HeaderMap::new(), NPM_CACHE_CONTROL_CACHED);
         assert_eq!(identity_response.headers()[ETAG], canonical);
         assert_eq!(gz_response.headers()[ETAG], canonical);
 
@@ -8621,11 +8644,11 @@ mod tests {
             HeaderValue::from_str(&canonical).expect("valid etag"),
         );
         assert_eq!(
-            cached_packument_response(&identity, &headers).status(),
+            cached_packument_response(&identity, &headers, NPM_CACHE_CONTROL_CACHED).status(),
             StatusCode::NOT_MODIFIED
         );
         assert_eq!(
-            cached_packument_response(&gz, &headers).status(),
+            cached_packument_response(&gz, &headers, NPM_CACHE_CONTROL_CACHED).status(),
             StatusCode::NOT_MODIFIED
         );
     }
@@ -8667,45 +8690,6 @@ mod tests {
         assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
     }
 
-    /// The stored ETag must be DERIVED from the identity body, not merely
-    /// present and well-formed.
-    ///
-    /// Review found this unguarded: replacing the stored tag with a hardcoded
-    /// constant left the whole suite green, because every cached-path test
-    /// hand-builds `CachedPackument { etag: compute_etag(...) }` rather than
-    /// going through `compute_and_store_packument`. A constant satisfies
-    /// "is quoted" and "round-trips", which was all anything asserted.
-    ///
-    /// This pins the derivation itself: the tag a cached entry carries must
-    /// equal `compute_etag` over the identity bytes, and must CHANGE when the
-    /// body changes. A constant fails the second assertion immediately.
-    #[test]
-    fn test_cached_entry_etag_is_derived_from_the_identity_body() {
-        let body_a = Bytes::from_static(b"{\"name\":\"left-pad\",\"v\":1}");
-        let body_b = Bytes::from_static(b"{\"name\":\"left-pad\",\"v\":2}");
-
-        let etag_a = compute_etag(&body_a);
-        let etag_b = compute_etag(&body_b);
-
-        assert_eq!(
-            etag_a,
-            compute_etag(&body_a),
-            "the tag must be a pure function of the body"
-        );
-        assert_ne!(
-            etag_a, etag_b,
-            "a changed packument MUST produce a different tag, or a client \
-             revalidates forever against stale content"
-        );
-        // Guard the fixture against itself: two bodies that hashed alike would
-        // make the assertion above vacuous.
-        assert_ne!(body_a, body_b, "fixture bodies must actually differ");
-        assert!(
-            etag_a.starts_with('"') && etag_a.ends_with('"'),
-            "ETag must be a quoted-string per RFC 9110: {etag_a}"
-        );
-    }
-
     #[tokio::test]
     async fn test_uncached_packument_304_matches_cached_path_etag() {
         // The uncached path must derive the same tag the cached path stores, so
@@ -8731,7 +8715,7 @@ mod tests {
             etag: canonical.clone(),
         };
         assert_eq!(
-            cached_packument_response(&cached, &headers).status(),
+            cached_packument_response(&cached, &headers, NPM_CACHE_CONTROL_CACHED).status(),
             StatusCode::NOT_MODIFIED
         );
     }
@@ -8795,7 +8779,7 @@ mod tests {
             };
             headers.insert(IF_NONE_MATCH, header);
 
-            let response = cached_packument_response(&corrupt, &headers);
+            let response = cached_packument_response(&corrupt, &headers, NPM_CACHE_CONTROL_CACHED);
             assert_eq!(
                 response.status(),
                 StatusCode::OK,
@@ -8903,7 +8887,6 @@ mod tests {
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod db_cov_tests {
-    use super::NPM_CACHE_CONTROL_CACHED;
     use crate::api::handlers::test_db_helpers as tdh;
 
     // Exercises the DB-query happy paths so the sweep's db_err/db_status
@@ -9100,6 +9083,91 @@ mod db_cov_tests {
     /// `Cache-Control`, and a conditional re-request is answered with another
     /// full `200` instead of a `304`, so `npm`/`yarn` re-download every
     /// packument on every metadata request.
+    /// The served ETag must be DERIVED from the packument bytes, through the
+    /// real store path -- not merely present and well-formed.
+    ///
+    /// My first attempt at this guard called `compute_etag` directly and never
+    /// touched `compute_and_store_packument`. Replacing the production
+    /// `let etag = compute_packument_etag(&body_bytes).await?` with a hardcoded
+    /// constant left it green, along with the rest of the suite: every
+    /// cached-path test hand-builds `CachedPackument { etag: compute_etag(..) }`,
+    /// so nothing asserted the stored tag came from the body.
+    ///
+    /// This drives `get_package_metadata_cached` and checks the tag the client
+    /// actually receives against `compute_etag` over the body it actually
+    /// receives. A constant fails immediately, because the two cannot agree.
+    #[tokio::test]
+    async fn test_served_etag_is_derived_from_the_served_body() {
+        use axum::http::header::ETAG;
+        use axum::http::{HeaderMap, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/derive-widget"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "derive-widget",
+                "dist-tags": {"latest": "2.0.0"},
+                "versions": {
+                    "2.0.0": {
+                        "name": "derive-widget",
+                        "version": "2.0.0",
+                        "dist": {"tarball": "https://registry.example.test/d.tgz"}
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let response = super::get_package_metadata_cached(
+            &state,
+            &fx.repo_key,
+            "derive-widget",
+            "http://localhost",
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|error_response| error_response);
+
+        let status = response.status();
+        let served_etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let served_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let served_etag = served_etag.expect("packument must carry an ETag");
+        assert_eq!(
+            served_etag,
+            crate::api::handlers::cache_headers::compute_etag(&served_body),
+            "the served ETag must be computed from the served bytes; a constant \
+             or any tag not derived from the body fails here"
+        );
+    }
+
     #[tokio::test]
     async fn test_remote_packument_carries_etag_and_answers_304() {
         use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
@@ -9187,10 +9255,15 @@ mod db_cov_tests {
         fx.teardown().await;
 
         assert_eq!(first_status, StatusCode::OK);
+        // Literal, not the constant: comparing against the constant is a
+        // tautology -- change its value and both sides move together, so it
+        // cannot catch a regression. `private` is the load-bearing half here;
+        // `public` would invite shared caches to store an authenticated,
+        // per-repo packument.
         assert_eq!(
             cache_control.as_deref(),
-            Some(NPM_CACHE_CONTROL_CACHED),
-            "packument must advertise a freshness lifetime"
+            Some("private, max-age=60"),
+            "a Remote packument must be privately cacheable with a short window"
         );
         let etag = etag.expect("packument must carry an ETag");
         assert!(

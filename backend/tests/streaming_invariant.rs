@@ -54,11 +54,10 @@ use std::path::{Path, PathBuf};
 ///   * npm.rs 5 -> 6: the packument stale-while-revalidate cache (#2166) added a
 ///     bounded `axum::body::to_bytes` read of a computed packument JSON, capped
 ///     at `NPM_PACKUMENT_BUFFER_CAP`. A legitimate new metadata buffer site.
-/// #3052: npm.rs 6 -> 7. Packument HTTP caching needs the identity body in hand
-/// to compute the ETag the client revalidates against, so the per-request
-/// (uncached) path buffers it once, bounded by `NPM_PACKUMENT_BUFFER_CAP`. A
-/// legitimate new metadata buffer site, same shape as the #2166 row above.
-///
+///   * npm.rs 6 -> 7: packument HTTP caching (#3052) needs the identity body in
+///     hand to compute the ETag the client revalidates against, so the
+///     per-request (uncached) path buffers it once, bounded by
+///     `NPM_PACKUMENT_BUFFER_CAP`. Same shape as the #2166 row above.
 ///   * pypi.rs 1 -> removed: the shared content-addressed upload primitive
 ///     (#2199) streamed the pypi upload to storage, deleting the last `.bytes()`
 ///     multipart-field read. Phase progress — the row is gone.
@@ -77,7 +76,9 @@ use std::path::{Path, PathBuf};
 /// #2599) added a third capped-metadata buffer site in scheduler_service.rs
 /// (an upstream repo-index gz-decode, not an artifact blob) without updating
 /// this allowlist. Reconciled here to match the current source: 2 -> 3, so the
-/// total is 28 + 1 = 29.
+/// total was 28 + 1 = 29; packument HTTP caching (#3052) then took npm.rs
+/// 6 -> 7, making the total 30. Keep this sentence in step with the assertion
+/// below -- stale arithmetic here is how the allowlist drifted before.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/goproxy.rs", 1),
     ("src/api/handlers/npm.rs", 7),
