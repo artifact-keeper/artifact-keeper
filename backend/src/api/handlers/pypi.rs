@@ -12,7 +12,7 @@
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -2895,6 +2895,15 @@ fn build_streaming_file_response(
         );
     if let Some(len) = result.content_length {
         builder = builder.header(CONTENT_LENGTH, len.to_string());
+    }
+    // #3149: the proxy pins `Accept-Encoding: identity` and no longer decodes
+    // upstream bodies (see `http_client::base_client_builder`), so a
+    // content-coded body must be declared or pip writes compressed bytes to
+    // disk and fails the hash check. `content_length` above is the CODED
+    // length; forwarding it without the coding is a protocol defect, so both
+    // come off the same `StreamingFetchResult`.
+    if let Some(ref encoding) = result.content_encoding {
+        builder = builder.header(CONTENT_ENCODING, encoding);
     }
     builder
         .body(Body::from_stream(
@@ -11406,5 +11415,89 @@ mod tests {
             html.contains("data-core-metadata"),
             "wheel core-metadata not advertised in the HTML branch"
         );
+    }
+}
+
+/// #3149 — upstream `Content-Encoding` forwarding on PyPI file serves.
+///
+/// `build_streaming_file_response` is the SINGLE response builder behind all
+/// six PyPI file-serving call sites (last-known-good replay, remote cache-hit,
+/// remote cache-miss, the two virtual arms, and the scan-pending serve). Each
+/// hands it the whole `StreamingFetchResult`, so none of them can drop the
+/// coding independently -- the builder is the only regression point, and these
+/// guards cover it for every call site at once.
+///
+/// It read `content_length` (the CODED length) and discarded
+/// `content_encoding`, so pip received compressed bytes advertised as a plain
+/// wheel and failed the hash check.
+#[cfg(test)]
+mod content_encoding_forwarding_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn result_with_encoding(
+        body: &'static [u8],
+        encoding: Option<&str>,
+    ) -> crate::services::proxy_service::StreamingFetchResult {
+        let data = Bytes::from_static(body);
+        let len = data.len() as u64;
+        crate::services::proxy_service::StreamingFetchResult {
+            body: Box::pin(futures::stream::once(async move {
+                Ok::<Bytes, crate::error::AppError>(data)
+            })),
+            content_type: Some("application/zip".to_string()),
+            content_length: Some(len),
+            artifact_id: None,
+            etag: None,
+            content_encoding: encoding.map(str::to_owned),
+            commit_sha: None,
+        }
+    }
+
+    /// A coded upstream wheel must arrive declared.
+    #[tokio::test]
+    async fn test_build_streaming_file_response_forwards_content_encoding() {
+        let resp = build_streaming_file_response(
+            "numpy-1.0-py3-none-any.whl",
+            result_with_encoding(b"coded-wheel-bytes", Some("gzip")),
+        );
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_ENCODING).as_deref(),
+            Some("gzip"),
+            "upstream Content-Encoding must be forwarded or pip writes bytes \
+             it cannot inflate and fails the hash check (#3149)",
+        );
+        // The coded length and the coding must describe the same bytes.
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_LENGTH).as_deref(),
+            Some("17"),
+        );
+    }
+
+    /// Negative control: an uncoded serve must not gain a manufactured coding.
+    #[tokio::test]
+    async fn test_build_streaming_file_response_omits_absent_content_encoding() {
+        let resp = build_streaming_file_response(
+            "numpy-1.0-py3-none-any.whl",
+            result_with_encoding(b"plain-wheel-bytes", None),
+        );
+        assert!(
+            resp.headers().get(CONTENT_ENCODING).is_none(),
+            "an uncoded serve must not have a coding manufactured for it",
+        );
+    }
+
+    /// The body must reach the client byte-identical either way -- the fix
+    /// declares the coding, it must never re-code or decode the payload.
+    #[tokio::test]
+    async fn test_build_streaming_file_response_passes_body_through_untouched() {
+        let payload: &[u8] = b"coded-wheel-bytes";
+        let resp = build_streaming_file_response(
+            "numpy-1.0-py3-none-any.whl",
+            result_with_encoding(b"coded-wheel-bytes", Some("gzip")),
+        );
+        let (status, body, _headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], payload);
     }
 }
