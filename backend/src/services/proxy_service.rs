@@ -9178,6 +9178,87 @@ mod tests {
         assert_eq!(copies[0].1, "cache-key");
     }
 
+    /// The `Err` arm: an upstream error mid-stream must leave the live key
+    /// untouched and discard whatever was staged.
+    ///
+    /// NOT a revert-proof guard, and labelled so deliberately: it passes on
+    /// the pre-fix shape too. At merge-base this arm had no delete at all (the
+    /// writer's only two deletes were the digest-mismatch and reject arms),
+    /// which looks like a third corruption path -- a failed `put_stream`
+    /// leaving partial bytes at the live key forever. It is not one, because
+    /// every `put_stream` implementation is atomic at the destination:
+    /// `FilesystemBackend` writes a temp file and only renames on success
+    /// (removing the temp on any error), `S3Backend` runs multipart behind an
+    /// abort guard, `GcsBackend` aborts the resumable session, and the default
+    /// trait impl buffers before calling `put`. So there was never anything at
+    /// `cache_key` for the missing delete to remove. Verified by running this
+    /// test against the pre-fix shape rather than by reading the arms.
+    ///
+    /// It earns its place as an invariant pin, not as a gate: it is the
+    /// assertion that fails if a future backend gains a `put_stream` that
+    /// streams straight to the destination key, at which point the arm really
+    /// would need its own cleanup. It also covers what the pre-existing
+    /// `test_tee_upstream_error_mid_stream_aborts_cache` leaves out -- that
+    /// one asserts only `metadata_writes.is_empty()`, and `#3068` established
+    /// that three readers reach `__content__` without consulting the sidecar,
+    /// so "no sidecar" is not sufficient protection on its own.
+    ///
+    /// Uses the real filesystem backend so the assertion is about bytes on
+    /// disk rather than about which calls a mock recorded.
+    #[tokio::test]
+    async fn test_upstream_error_mid_stream_leaves_live_key_untouched() {
+        use crate::services::storage_service::FilesystemBackend;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let storage = Arc::new(RealStorageService::new(Arc::new(FilesystemBackend::new(
+            root.clone(),
+        ))));
+
+        // One good chunk, then the upstream dies.
+        let upstream: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"first-chunk")),
+            Err(AppError::Storage("upstream exploded".to_string())),
+        ]));
+
+        let mut client = CachePersister::new(test_catalog_pool(), Arc::clone(&storage)).tee_stream(
+            upstream,
+            "proxy-cache/repo/errored".to_string(),
+            "proxy-cache/repo/errored.meta".to_string(),
+            template(),
+            None,
+        );
+        let mut saw_error = false;
+        while let Some(chunk) = client.next().await {
+            if chunk.is_err() {
+                saw_error = true;
+            }
+        }
+        assert!(saw_error, "the upstream error must surface to the client");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            !storage.exists("proxy-cache/repo/errored").await.unwrap(),
+            "an aborted upstream must not leave a partial object at the live key"
+        );
+        assert!(
+            !storage
+                .exists("proxy-cache/repo/errored.meta")
+                .await
+                .unwrap(),
+            "an aborted upstream must not leave a metadata sidecar"
+        );
+        let staging_root = root.join(TEE_STAGING_KEY_PREFIX.trim_end_matches('/'));
+        let leaked: Vec<_> = std::fs::read_dir(&staging_root)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leaked.is_empty(),
+            "the staged partial must be discarded: leaked {leaked:?}"
+        );
+    }
+
     /// The test that actually distinguishes this fix from `main`.
     ///
     /// Everything else in this module -- including the real-backend round trip
