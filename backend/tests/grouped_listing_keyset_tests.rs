@@ -161,7 +161,7 @@ async fn docker_tag_grouping_is_exact_above_ten_thousand_tags() {
     )
     .bind(repo_id)
     .bind(&key)
-    .bind(storage_path.to_string_lossy().as_ref())
+    .bind(&*storage_path.to_string_lossy())
     .execute(&pool)
     .await
     .expect("insert docker repo");
@@ -248,7 +248,7 @@ async fn remote_maven_component_grouping_is_exact_above_ten_thousand_components(
     )
     .bind(repo_id)
     .bind(&key)
-    .bind(storage_path.to_string_lossy().as_ref())
+    .bind(&*storage_path.to_string_lossy())
     .execute(&pool)
     .await
     .expect("insert remote maven repo");

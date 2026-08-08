@@ -1168,7 +1168,14 @@ mod tests {
 
     /// The unrepaired ledger must abort the real migrator at slot 154.
     async fn assert_migrator_red_at_154(pool: &PgPool) {
-        let err = sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        // This scratch database is unique to the test, so migration locking is
+        // unnecessary. More importantly, sqlx 0.8.6 returns early on a
+        // VersionMismatch without releasing its session advisory lock. A
+        // later run through the pool can select another connection and block
+        // forever waiting for the leaked lock.
+        migrator.set_locking(false);
+        let err = migrator
             .run(pool)
             .await
             .expect_err("unrepaired v1.5.x ledger must fail the migrator");

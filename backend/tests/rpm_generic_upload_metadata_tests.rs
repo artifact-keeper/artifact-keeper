@@ -109,7 +109,7 @@ async fn create_rpm_repo(pool: &PgPool, label: &str) -> (Uuid, String, PathBuf) 
     )
     .bind(id)
     .bind(&key)
-    .bind(storage_path.to_string_lossy().as_ref())
+    .bind(&*storage_path.to_string_lossy())
     .execute(pool)
     .await
     .expect("insert rpm repo");

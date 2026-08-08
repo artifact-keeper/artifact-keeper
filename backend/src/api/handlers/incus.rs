@@ -1090,7 +1090,7 @@ async fn upload_image(
     .bind(&version)
     .bind(&filename)
     .bind(size_bytes)
-    .bind(temp_path.to_string_lossy().as_ref())
+    .bind(&*temp_path.to_string_lossy())
     .bind(finalize_token)
     .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
     .execute(&state.db)
@@ -1294,7 +1294,7 @@ async fn start_chunked_upload(
     .bind(&version)
     .bind(&filename)
     .bind(initial_bytes)
-    .bind(temp_path.to_string_lossy().as_ref())
+    .bind(&*temp_path.to_string_lossy())
     .execute(&state.db)
     .await
     .map_err(db_err)?;
@@ -3740,7 +3740,7 @@ mod cross_repo_session_regression_tests {
         .bind(id)
         .bind(&key)
         .bind(&key)
-        .bind(storage_dir.to_string_lossy().as_ref())
+        .bind(&*storage_dir.to_string_lossy())
         .execute(pool)
         .await
         .expect("create second repo");
@@ -4341,7 +4341,7 @@ mod streaming_pipeline_regression_tests {
         .bind(f.repo_id)
         .bind(f.user_id)
         .bind(&artifact_path)
-        .bind(bogus_temp.to_string_lossy().as_ref())
+        .bind(&*bogus_temp.to_string_lossy())
         .bind(finalize_token)
         .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
         .execute(&f.pool)
@@ -4422,10 +4422,9 @@ mod streaming_pipeline_regression_tests {
         .bind(f.user_id)
         .bind(build_artifact_path("ubuntu", "1", "incus.tar.xz"))
         .bind(
-            std::env::temp_dir()
+            &*std::env::temp_dir()
                 .join(format!("ak-incus-lease-{session_id}"))
-                .to_string_lossy()
-                .as_ref(),
+                .to_string_lossy(),
         )
         .execute(&f.pool)
         .await
@@ -5074,7 +5073,7 @@ mod streaming_pipeline_regression_tests {
         .bind(f.user_id)
         .bind(artifact_path)
         .bind(committed.len() as i64)
-        .bind(temp_path.to_string_lossy().as_ref())
+        .bind(&*temp_path.to_string_lossy())
         .bind(Uuid::new_v4())
         .execute(&f.pool)
         .await

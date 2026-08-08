@@ -15816,7 +15816,7 @@ mod manifest_digest_db_tests {
         )
         .bind(other_id)
         .bind(&other_key)
-        .bind(fx.storage_dir.to_string_lossy().as_ref())
+        .bind(&*fx.storage_dir.to_string_lossy())
         .execute(&fx.pool)
         .await
         .expect("create shared-backend repo");
@@ -22847,7 +22847,7 @@ mod cross_repo_session_regression_tests {
         )
         .bind(id)
         .bind(&key)
-        .bind(storage_dir.to_string_lossy().as_ref())
+        .bind(&*storage_dir.to_string_lossy())
         .execute(pool)
         .await
         .expect("insert docker repo");
@@ -23371,7 +23371,7 @@ mod cross_repo_session_regression_tests {
         )
         .bind(id)
         .bind(&key)
-        .bind(storage_dir.to_string_lossy().as_ref())
+        .bind(&*storage_dir.to_string_lossy())
         .execute(pool)
         .await
         .expect("insert sharing docker repo");
@@ -23546,7 +23546,7 @@ mod cross_repo_session_regression_tests {
         sqlx::query(&sql)
             .bind(id)
             .bind(&key)
-            .bind(storage_dir.to_string_lossy().as_ref())
+            .bind(&*storage_dir.to_string_lossy())
             .bind(upstream)
             .execute(pool)
             .await
@@ -24062,7 +24062,7 @@ mod oci_write_authz_and_size_tests {
         )
         .bind(id)
         .bind(&key)
-        .bind(storage_dir.to_string_lossy().as_ref())
+        .bind(&*storage_dir.to_string_lossy())
         .execute(pool)
         .await
         .expect("insert private repo");

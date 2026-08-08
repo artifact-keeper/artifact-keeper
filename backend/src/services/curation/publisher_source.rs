@@ -90,11 +90,51 @@ pub fn is_applicable_format(format: &str) -> bool {
 /// Any other format, and any metadata where no non-empty publisher can be
 /// found, returns `None` — callers must not fabricate trust from absence.
 pub fn extract_publisher(format: &str, metadata: &Value) -> Option<PublisherIdentity> {
+    // Verified path (#2955): the sync/evaluation loop runs the sigstore verifier
+    // and, on a persisted SUCCESS, injects a verification record into the
+    // metadata context under [`VERIFICATION_MARKER`]. When present, the
+    // publisher identity is the CERTIFICATE-BOUND owner with `verified = true` —
+    // never the forgeable metadata blob. Absence of the marker reproduces
+    // exactly the pre-#2955 behavior below, so this stays a strict superset of
+    // the shipped fail-safe. Only honored for formats with a publisher concept.
+    if is_applicable_format(format) {
+        if let Some(verified) = verified_identity_from_marker(metadata) {
+            return Some(verified);
+        }
+    }
+
     match format.to_ascii_lowercase().as_str() {
         "pypi" => extract_pypi(metadata),
         "npm" => extract_npm(metadata),
         _ => None,
     }
+}
+
+/// Metadata-context key under which the evaluation loop injects a successful
+/// attestation-verification record (#2955). This is NOT part of the registry
+/// blob — it is added by trusted server code after `attestation_verify` returns
+/// `verified`, carrying the certificate-bound owner. A package's own metadata
+/// can never set it: the loop overwrites/derives it from the verification
+/// record, and a `state != "verified"` marker is ignored here (fail-safe).
+pub const VERIFICATION_MARKER: &str = "_ak_attestation_verification";
+
+/// Read a verified publisher identity from an injected verification record.
+/// Returns `Some` only for a `state == "verified"` record carrying a non-empty
+/// cert-bound `owner`; anything else yields `None` so the caller falls through
+/// to the unverified extraction (today's behavior).
+fn verified_identity_from_marker(metadata: &Value) -> Option<PublisherIdentity> {
+    let record = metadata.get(VERIFICATION_MARKER)?;
+    if record.get("state").and_then(Value::as_str) != Some("verified") {
+        return None;
+    }
+    let owner = non_empty_str(record.get("owner"))?;
+    Some(PublisherIdentity {
+        name: owner,
+        source: PublisherSource::Attestation,
+        // The whole point of #2955: a persisted, cryptographically verified
+        // provenance record is the strong trust signal.
+        verified: true,
+    })
 }
 
 // -- PyPI --------------------------------------------------------------------
@@ -365,5 +405,61 @@ mod tests {
         assert!(!is_applicable_format("raw"));
         assert!(!is_applicable_format("docker"));
         assert!(!is_applicable_format("maven"));
+    }
+
+    // -- verified path (#2955) ------------------------------------------------
+
+    #[test]
+    fn verified_marker_yields_cert_bound_owner_verified_true() {
+        // The evaluation loop injects a SUCCESSFUL verification record; the
+        // identity is the cert-bound owner with verified=true — regardless of
+        // whatever the (forgeable) blob claims.
+        let md = json!({
+            "info": {"author": "attacker-claims-microsoft"},
+            "provenance": {"attestation_bundles": [{"publisher": {"repository": "attacker/repo"}}]},
+            VERIFICATION_MARKER: {
+                "state": "verified",
+                "owner": "sigstore",
+                "identity": "https://github.com/sigstore/sigstore-python/...",
+                "issuer": "https://token.actions.githubusercontent.com"
+            }
+        });
+        let id = extract_publisher("pypi", &md).unwrap();
+        assert_eq!(id.name, "sigstore"); // cert-bound owner, NOT the blob
+        assert_eq!(id.source, PublisherSource::Attestation);
+        assert!(
+            id.verified,
+            "a persisted verified record sets verified=true"
+        );
+    }
+
+    #[test]
+    fn non_verified_or_missing_marker_is_exactly_todays_behavior() {
+        // A failed/absent marker must fall through to the unverified extraction
+        // (strict superset guarantee).
+        let failed = json!({
+            "info": {"author": "NumFOCUS"},
+            VERIFICATION_MARKER: {"state": "failed", "error": "signature"}
+        });
+        let id = extract_publisher("pypi", &failed).unwrap();
+        assert_eq!(id.name, "NumFOCUS");
+        assert!(!id.verified);
+
+        // A marker with no owner cannot fabricate a verified identity.
+        let no_owner = json!({
+            "info": {"author": "NumFOCUS"},
+            VERIFICATION_MARKER: {"state": "verified"}
+        });
+        let id = extract_publisher("pypi", &no_owner).unwrap();
+        assert!(!id.verified);
+    }
+
+    #[test]
+    fn verified_marker_is_ignored_on_non_applicable_formats() {
+        // A stray marker on a format with no publisher concept must not
+        // fabricate identity.
+        let md = json!({VERIFICATION_MARKER: {"state": "verified", "owner": "evil"}});
+        assert_eq!(extract_publisher("raw", &md), None);
+        assert_eq!(extract_publisher("maven", &md), None);
     }
 }

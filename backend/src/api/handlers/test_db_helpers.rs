@@ -672,7 +672,7 @@ pub async fn create_repo(pool: &PgPool, repo_type: &str, format: &str) -> (Uuid,
         .bind(id)
         .bind(&key)
         .bind(&key)
-        .bind(storage_dir.to_string_lossy().as_ref())
+        .bind(&*storage_dir.to_string_lossy())
         .bind(upstream)
         .execute(pool)
         .await

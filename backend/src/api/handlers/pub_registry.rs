@@ -1781,7 +1781,7 @@ dev_dependencies:
         .bind(virtual_id)
         .bind(&virtual_key)
         .bind(&virtual_key)
-        .bind(storage_dir.to_string_lossy().as_ref())
+        .bind(&*storage_dir.to_string_lossy())
         .execute(&fx.pool)
         .await
         .expect("create virtual repo");
@@ -1880,7 +1880,7 @@ dev_dependencies:
         .bind(virtual_id)
         .bind(&virtual_key)
         .bind(&virtual_key)
-        .bind(storage_dir.to_string_lossy().as_ref())
+        .bind(&*storage_dir.to_string_lossy())
         .execute(&fx.pool)
         .await
         .expect("create virtual repo");

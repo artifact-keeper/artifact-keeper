@@ -1565,6 +1565,32 @@ pub(crate) async fn run_curation_sync_cycle(
             .await
             .unwrap_or(None);
 
+        // pypi/npm have no enumerable global upstream index — they are ingested
+        // ON DEMAND by the proxy seam (#2955 Stage 2). There is nothing to walk
+        // here; instead evaluate the pending rows the proxy enqueued, exactly as
+        // rpm/debian rows are evaluated after upsert, running attestation
+        // verification off this tick first (never on the hot download path).
+        if matches!(format.as_str(), "pypi" | "npm") {
+            evaluate_ondemand_curation(
+                &curation,
+                *staging_id,
+                default_action,
+                format,
+                upstream_url,
+                &popularity_source,
+                &client,
+                &upstream_auth,
+            )
+            .await;
+            let _ = sqlx::query(
+                "UPDATE repositories SET curation_last_synced_at = NOW() WHERE id = $1",
+            )
+            .bind(staging_id)
+            .execute(db)
+            .await;
+            continue;
+        }
+
         let entries = match format.as_str() {
             "rpm" => {
                 let base = upstream_url.trim_end_matches('/');
@@ -1886,6 +1912,286 @@ pub(crate) async fn run_curation_sync_cycle(
     }
 
     Ok(())
+}
+
+/// Max distribution-file size the off-hot-path verifier will fetch to bind an
+/// attestation subject (#2955). A wheel/sdist beyond this is treated as
+/// unverifiable (fail-safe: the row stays unverified and Flags), never OOM.
+const MAX_VERIFY_DIST_BYTES: usize = 128 * 1024 * 1024;
+
+/// Evaluate the pending on-demand-ingested pypi/npm curation rows for one
+/// staging repo (#2955 Stage 2/3). For each pending row: run attestation
+/// verification off the hot path (pypi only; npm records the unsupported
+/// reason), persist the result, inject a verified marker into the evaluation
+/// context on success, then run the typed rule dispatch exactly as rpm/debian.
+///
+/// Every step is fail-SAFE: any error yields at most today's behavior (the row
+/// stays unverified and the publisher-trust evaluator Flags it), never a false
+/// `verified=true` and never a dead sync loop.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_ondemand_curation(
+    curation: &crate::services::curation_service::CurationService,
+    staging_id: uuid::Uuid,
+    default_action: &str,
+    format: &str,
+    upstream_url: &str,
+    popularity_source: &dyn crate::services::curation::popularity_source::PopularitySource,
+    client: &reqwest::Client,
+    upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+) {
+    use crate::services::curation::{attestation_verify, publisher_source};
+    use crate::services::curation_service::CurationService;
+
+    const MAX_PENDING_PER_TICK: i64 = 500;
+    let pending = match curation
+        .list_pending_packages_by_format(staging_id, format, MAX_PENDING_PER_TICK)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                staging_repo_id = %staging_id,
+                format = %format,
+                error = %e,
+                "on-demand curation: failed to load pending packages"
+            );
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    // Fail-safe trust root: if the vendored root is somehow unusable, we simply
+    // never verify (rows stay unverified → Flag), never an outage.
+    let trust = attestation_verify::TrustRoot::vendored().ok();
+    let allowlist: Vec<String> = attestation_verify::DEFAULT_ISSUER_ALLOWLIST
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    for pkg in pending {
+        let mut eval_metadata = pkg.metadata.clone();
+
+        match format {
+            "pypi" => {
+                let verdict = match &trust {
+                    Some(t) => {
+                        verify_pypi_curation_row(
+                            client,
+                            upstream_auth,
+                            upstream_url,
+                            &pkg,
+                            &allowlist,
+                            t,
+                        )
+                        .await
+                    }
+                    None => attestation_verify::AttestationVerdict::unverified(),
+                };
+                let _ = curation
+                    .record_attestation(
+                        pkg.id,
+                        verdict.state.as_str(),
+                        verdict.identity.as_deref(),
+                        verdict.issuer.as_deref(),
+                        verdict.owner.as_deref(),
+                        verdict.error.as_deref(),
+                    )
+                    .await;
+                if let Some(marker) = attestation_verify::verified_marker(&verdict) {
+                    if let Some(obj) = eval_metadata.as_object_mut() {
+                        obj.insert(publisher_source::VERIFICATION_MARKER.to_string(), marker);
+                    }
+                }
+            }
+            "npm" => {
+                // npm is ingested but unsupported (sha512-only subject binding);
+                // it never verifies and stays on the fail-safe Flag.
+                let verdict = attestation_verify::verify_npm_unsupported();
+                let _ = curation
+                    .record_attestation(
+                        pkg.id,
+                        verdict.state.as_str(),
+                        None,
+                        None,
+                        None,
+                        verdict.error.as_deref(),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+
+        if let Ok((decision, rule_id)) = curation
+            .evaluate_package_typed(
+                staging_id,
+                default_action,
+                format,
+                &pkg.package_name,
+                &pkg.version,
+                pkg.architecture.as_deref(),
+                &eval_metadata,
+                popularity_source,
+            )
+            .await
+        {
+            let (status, reason) = CurationService::decision_to_status_reason(&decision, rule_id);
+            let _ = curation
+                .set_package_status(pkg.id, status, &reason, None, rule_id)
+                .await;
+        }
+    }
+}
+
+/// Verify one pending pypi curation row's attestation, off the hot path.
+///
+/// The on-demand proxy seam enqueues pypi rows with only name+version+filename
+/// (it serves the simple index, not the JSON API), so this step best-effort
+/// ENRICHES the row from the upstream — fetching `{base}/pypi/{n}/{v}/json` for
+/// the distribution URL and the PEP 740 `{base}/integrity/.../provenance` — then
+/// downloads the exact distribution bytes and verifies. Every miss (no upstream
+/// JSON, no provenance, fetch/parse error, non-PyPI-shaped mirror) yields
+/// `unverified`/`failed` (fail-safe), never a false `verified`.
+async fn verify_pypi_curation_row(
+    client: &reqwest::Client,
+    upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    upstream_url: &str,
+    pkg: &crate::models::curation::CurationPackage,
+    allowlist: &[String],
+    trust: &crate::services::curation::attestation_verify::TrustRoot,
+) -> crate::services::curation::attestation_verify::AttestationVerdict {
+    use crate::services::curation::attestation_verify::{
+        verify_pypi_provenance, AttestationVerdict,
+    };
+    use crate::services::curation_sync::build_pypi_curation_entry;
+
+    // Resolve the distribution filename we are gating.
+    let filename = pkg
+        .metadata
+        .get("_ak_dist")
+        .and_then(|d| d.get("filename"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| pkg.upstream_path.clone());
+    if filename.is_empty() {
+        return AttestationVerdict::unverified();
+    }
+
+    // The PyPI base (strip a trailing `/simple[/]` from a simple-index upstream).
+    let base = pypi_base_url(upstream_url);
+
+    // Enrich: fetch the JSON metadata (for the dist download URL) and the PEP 740
+    // provenance. If the row already carries provenance + a dist URL, reuse it.
+    let json_url = format!("{base}/pypi/{}/{}/json", pkg.package_name, pkg.version);
+    let pypi_json = bounded_get_json(client, upstream_auth, &json_url).await;
+
+    let prov_url = format!(
+        "{base}/integrity/{}/{}/{}/provenance",
+        pkg.package_name, pkg.version, filename
+    );
+    let provenance = bounded_get_json(client, upstream_auth, &prov_url).await;
+    let Some(provenance) = provenance else {
+        // No provenance published upstream: exactly today's behavior.
+        return AttestationVerdict::unverified();
+    };
+
+    // Build a full entry (dist URL + merged provenance) from whatever we fetched.
+    let entry = pypi_json.as_ref().and_then(|j| {
+        build_pypi_curation_entry(&pkg.package_name, &pkg.version, j, Some(&provenance))
+    });
+    let dist_url = entry
+        .as_ref()
+        .and_then(|e| e.metadata.get("_ak_dist"))
+        .and_then(|d| d.get("url"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let Some(dist_url) = dist_url else {
+        return AttestationVerdict::failure(
+            "could not resolve the distribution download URL for attestation verification"
+                .to_string(),
+        );
+    };
+
+    let Some(bytes) = bounded_download(client, upstream_auth, &dist_url).await else {
+        return AttestationVerdict::failure(format!(
+            "could not fetch distribution `{filename}` for attestation verification"
+        ));
+    };
+
+    verify_pypi_provenance(&provenance, &bytes, &filename, allowlist, trust).await
+}
+
+/// Normalize a pypi remote's upstream URL to the API base by trimming a trailing
+/// `/simple` (PEP 503 index) and slashes: `https://pypi.org/simple/` →
+/// `https://pypi.org`.
+fn pypi_base_url(upstream_url: &str) -> String {
+    let trimmed = upstream_url.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/simple")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Bounded GET of a small JSON body (metadata / provenance). Returns `None` on
+/// any transport error, non-2xx, oversize body, or parse failure (fail-safe).
+async fn bounded_get_json(
+    client: &reqwest::Client,
+    upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    url: &str,
+) -> Option<serde_json::Value> {
+    const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+    let mut req = client.get(url);
+    if let Some(auth) = upstream_auth {
+        req = crate::services::upstream_auth::apply_upstream_auth(req, auth);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if buf.len().saturating_add(chunk.len()) > MAX_JSON_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).ok()
+}
+
+/// Bounded, streaming download of a distribution file for attestation
+/// verification. Returns `None` on any transport error, non-2xx status, or if
+/// the body exceeds [`MAX_VERIFY_DIST_BYTES`] (so a hostile/huge artifact cannot
+/// OOM the sync tick).
+async fn bounded_download(
+    client: &reqwest::Client,
+    upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    url: &str,
+) -> Option<Vec<u8>> {
+    use futures::StreamExt;
+
+    let mut req = client.get(url);
+    if let Some(auth) = upstream_auth {
+        req = crate::services::upstream_auth::apply_upstream_auth(req, auth);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if buf.len().saturating_add(chunk.len()) > MAX_VERIFY_DIST_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
 }
 
 /// Decompress a gzip-compressed upstream repo index (RPM `primary.xml.gz`,

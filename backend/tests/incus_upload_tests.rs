@@ -186,7 +186,7 @@ async fn create_incus_repo(pool: &PgPool, name: &str) -> (Uuid, PathBuf) {
     .bind(id)
     .bind(&key)
     .bind(name)
-    .bind(storage_path.to_string_lossy().as_ref())
+    .bind(&*storage_path.to_string_lossy())
     .execute(pool)
     .await
     .expect("failed to create test repository");

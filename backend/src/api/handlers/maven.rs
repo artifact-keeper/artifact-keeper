@@ -4586,7 +4586,7 @@ mod tests {
         .bind(virtual_id)
         .bind(&virtual_key)
         .bind(&virtual_key)
-        .bind(virtual_dir.to_string_lossy().as_ref())
+        .bind(&*virtual_dir.to_string_lossy())
         .execute(&pool)
         .await
         .expect("insert virtual repo");
@@ -5001,7 +5001,7 @@ mod tests {
         .bind(virtual_id)
         .bind(&virtual_key)
         .bind(&virtual_key)
-        .bind(virtual_dir.to_string_lossy().as_ref())
+        .bind(&*virtual_dir.to_string_lossy())
         .execute(&pool)
         .await
         .expect("insert virtual repo");
@@ -5428,7 +5428,7 @@ mod tests {
         .bind(virtual_id)
         .bind(&virtual_key)
         .bind(&virtual_key)
-        .bind(virtual_dir.to_string_lossy().as_ref())
+        .bind(&*virtual_dir.to_string_lossy())
         .execute(&pool)
         .await
         .expect("insert virtual repo");

@@ -15,6 +15,7 @@
 //!   (issue #2949), backed by [`popularity_source`] (pluggable download-count
 //!   providers) and [`typosquat`] (lexical-distance matching).
 
+pub mod attestation_verify;
 pub mod popularity;
 pub mod popularity_source;
 pub mod publisher_source;

@@ -3114,7 +3114,7 @@ mod tests {
         .bind(&f.repo_key)
         .bind(artifact_path)
         .bind("2802f84f021907deee7e9470ed10c0e78af7457ac9a08a6cd7d55adef835fede")
-        .bind(stale_temp.to_string_lossy().as_ref())
+        .bind(&*stale_temp.to_string_lossy())
         .execute(&f.pool)
         .await
         .expect("insert stale replication session");
@@ -3449,7 +3449,7 @@ mod tests {
         .bind(&f.repo_key)
         .bind(payload.len() as i64)
         .bind(&checksum)
-        .bind(temp_path.to_string_lossy().as_ref())
+        .bind(&*temp_path.to_string_lossy())
         .fetch_one(&f.pool)
         .await
         .expect("insert staged session");

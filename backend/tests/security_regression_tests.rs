@@ -555,7 +555,7 @@ mod qc_metadata_leak_2437 {
         )
         .bind(id)
         .bind(&key)
-        .bind(dir.to_string_lossy().as_ref())
+        .bind(&*dir.to_string_lossy())
         .execute(pool)
         .await
         .expect("insert private repo");
@@ -805,7 +805,7 @@ mod age_gate_config_2264 {
         )
         .bind(id)
         .bind(&key)
-        .bind(dir.to_string_lossy().as_ref())
+        .bind(&*dir.to_string_lossy())
         .execute(pool)
         .await
         .expect("insert remote repo");
@@ -966,7 +966,7 @@ mod scan_sbom_leak_2439 {
         )
         .bind(id)
         .bind(&key)
-        .bind(dir.to_string_lossy().as_ref())
+        .bind(&*dir.to_string_lossy())
         .execute(pool)
         .await
         .expect("insert private repo");
@@ -1377,7 +1377,7 @@ mod xrepo_authz_2443 {
         )
         .bind(id)
         .bind(&key)
-        .bind(dir.to_string_lossy().as_ref())
+        .bind(&*dir.to_string_lossy())
         .execute(pool)
         .await
         .expect("insert private repo");

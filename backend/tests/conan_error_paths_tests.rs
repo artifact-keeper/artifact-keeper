@@ -107,7 +107,7 @@ async fn create_conan_repo(pool: &PgPool, name: &str, is_public: bool) -> (Uuid,
     .bind(id)
     .bind(&key)
     .bind(name)
-    .bind(storage_path.to_string_lossy().as_ref())
+    .bind(&*storage_path.to_string_lossy())
     .bind(is_public)
     .execute(pool)
     .await

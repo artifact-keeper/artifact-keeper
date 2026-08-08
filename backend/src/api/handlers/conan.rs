@@ -3778,7 +3778,7 @@ mod tests {
                 .bind(id)
                 .bind(&key)
                 .bind(format!("conan-test-{}", id))
-                .bind(storage_dir.to_string_lossy().as_ref())
+                .bind(&*storage_dir.to_string_lossy())
                 .bind(upstream_url)
                 .execute(pool)
                 .await
@@ -4769,7 +4769,7 @@ mod tests {
             .bind(repo_id)
             .bind(&repo_key)
             .bind(format!("mvn-test-{}", repo_id))
-            .bind(storage_dir.to_string_lossy().as_ref())
+            .bind(&*storage_dir.to_string_lossy())
             .execute(&pool)
             .await
             .expect("seed maven repo");

@@ -331,7 +331,7 @@ impl UploadService {
         .bind(chunk_size)
         .bind(total_chunks)
         .bind(p.checksum_sha256)
-        .bind(temp_file_path.to_string_lossy().as_ref())
+        .bind(&*temp_file_path.to_string_lossy())
         .fetch_one(&mut *tx)
         .await?;
 
@@ -2390,7 +2390,7 @@ mod tests {
         .bind(&repo_key)
         .bind(payload.len() as i64)
         .bind(&checksum)
-        .bind(temp_path.to_string_lossy().as_ref())
+        .bind(&*temp_path.to_string_lossy())
         .fetch_one(&pool)
         .await
         .expect("insert session");
@@ -2575,7 +2575,7 @@ mod tests {
              WHERE id = $1",
         )
         .bind(f.session_id)
-        .bind(bad_dir.to_string_lossy().as_ref())
+        .bind(&*bad_dir.to_string_lossy())
         .bind(dir_size)
         .execute(&f.pool)
         .await

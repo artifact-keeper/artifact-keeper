@@ -88,7 +88,7 @@ async fn create_docker_repo(pool: &PgPool) -> (Uuid, String, PathBuf) {
     )
     .bind(id)
     .bind(&key)
-    .bind(storage_path.to_string_lossy().as_ref())
+    .bind(&*storage_path.to_string_lossy())
     .execute(pool)
     .await
     .expect("insert docker repo");

@@ -97,7 +97,7 @@ async fn create_typed_oci_repo(pool: &PgPool, label: &str) -> (Uuid, String, Pat
     )
     .bind(id)
     .bind(&key)
-    .bind(storage_path.to_string_lossy().as_ref())
+    .bind(&*storage_path.to_string_lossy())
     .execute(pool)
     .await
     .expect("insert docker repo");

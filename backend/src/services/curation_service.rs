@@ -705,6 +705,61 @@ impl CurationService {
         .await
     }
 
+    /// Persist an attestation-verification result (#2955) onto a curation
+    /// package. `state` is one of `unverified|verified|failed`; identity /
+    /// issuer / owner are the CERTIFICATE-BOUND values (populated on success
+    /// only), and `error` the specific failing-check reason otherwise. The
+    /// non-macro query API is used deliberately so no offline `.sqlx` cache
+    /// regeneration is needed.
+    pub async fn record_attestation(
+        &self,
+        id: Uuid,
+        state: &str,
+        identity: Option<&str>,
+        issuer: Option<&str>,
+        owner: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"UPDATE curation_packages SET
+               attestation_state = $2, attestation_identity = $3,
+               attestation_issuer = $4, attestation_owner = $5,
+               attestation_error = $6, attestation_verified_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(id)
+        .bind(state)
+        .bind(identity)
+        .bind(issuer)
+        .bind(owner)
+        .bind(error)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Load pending catalog rows for one format under a staging repo — the
+    /// on-demand-ingested pypi/npm packages the scheduler evaluates (#2955
+    /// Stage 2). Bounded by `limit` so a large backlog is processed in slices.
+    pub async fn list_pending_packages_by_format(
+        &self,
+        staging_repo_id: Uuid,
+        format: &str,
+        limit: i64,
+    ) -> Result<Vec<CurationPackage>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT * FROM curation_packages
+               WHERE staging_repo_id = $1 AND format = $2 AND status = 'pending'
+               ORDER BY first_seen_at ASC
+               LIMIT $3"#,
+        )
+        .bind(staging_repo_id)
+        .bind(format)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+    }
+
     pub async fn bulk_set_status(
         &self,
         ids: &[Uuid],
@@ -2120,5 +2175,251 @@ mod tests {
             matches!(err, AppError::NotFound(_)),
             "expected NotFound, got {err:?}"
         );
+    }
+
+    // -- #2955 on-demand pypi/npm ingestion + verified path (DB-backed) --------
+
+    /// End-to-end proof that (1) an on-demand-ingested pypi package reaches the
+    /// typed evaluator, (2) the attestation-verification columns round-trip, and
+    /// (3) a persisted VERIFIED record makes the previously-unreachable
+    /// `verified=true` Allow arm fire under `match:attestation, action:allow`.
+    #[tokio::test]
+    async fn test_ondemand_pypi_ingest_and_verified_path_end_to_end_db() {
+        use crate::api::handlers::proxy_helpers::enqueue_curation_on_demand;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::curation::publisher_source::VERIFICATION_MARKER;
+        use crate::services::curation_sync::build_npm_curation_entry;
+
+        let _guard = tdh::curation_global_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, _uname) = tdh::create_user(&pool).await;
+        let svc = CurationService::new(pool.clone());
+
+        // A remote (proxy) repo and a staging repo that curates it.
+        let (remote_id, _rk, _rp) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (staging_id, _sk, _sp) = tdh::create_repo(&pool, "staging", "pypi").await;
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, curation_source_repo_id = $2, curation_default_action = 'allow' WHERE id = $1",
+        )
+        .bind(staging_id)
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("wire staging->remote curation");
+
+        // Global publisher_trust rule: allow only the verified, trusted org.
+        let config = serde_json::json!({
+            "trusted_publishers": ["sigstore"],
+            "match": "attestation",
+            "action": "allow"
+        });
+        let rule = svc
+            .create_rule(
+                None,
+                "*",
+                "*",
+                "*",
+                "allow",
+                1,
+                "#2955 integ",
+                "publisher_trust",
+                &config,
+                user,
+            )
+            .await
+            .expect("create rule");
+
+        // On-demand ingest via the proxy seam helper (reverse-lookup + upsert).
+        let npm_like_pypi = serde_json::json!({
+            "name": "sigstore", "version": "4.5.0",
+            "_ak_dist": {"filename": "sigstore-4.5.0-py3-none-any.whl"},
+            "provenance": {"attestation_bundles": [{"publisher": {"repository": "sigstore/sigstore-python"}}]}
+        });
+        // Reuse the npm builder only to get a well-formed entry object shape;
+        // then coerce format to pypi with our own metadata.
+        let mut entry =
+            build_npm_curation_entry("sigstore", "4.5.0", &serde_json::json!({"dist": {}}))
+                .expect("entry shell");
+        entry.format = "pypi".to_string();
+        entry.metadata = npm_like_pypi;
+        enqueue_curation_on_demand(&pool, remote_id, "remote", entry).await;
+
+        // The scheduler would find exactly this pending row.
+        let pending = svc
+            .list_pending_packages_by_format(staging_id, "pypi", 100)
+            .await
+            .expect("list pending");
+        let pkg = pending
+            .iter()
+            .find(|p| p.package_name == "sigstore")
+            .expect("ingested pypi row is pending")
+            .clone();
+        assert_eq!(pkg.status, "pending");
+
+        // Before verification: attested-but-unverified -> review (fail-safe).
+        let (decision, _rid) = svc
+            .evaluate_package_typed(
+                staging_id,
+                "allow",
+                "pypi",
+                "sigstore",
+                "4.5.0",
+                None,
+                &pkg.metadata,
+                &no_source(),
+            )
+            .await
+            .expect("pre-verify eval");
+        assert!(
+            matches!(decision, CurationDecision::Flag(_)),
+            "pre-verify must Flag, got {decision:?}"
+        );
+
+        // Persist a VERIFIED record (as the scheduler does after the verifier).
+        svc.record_attestation(
+            pkg.id,
+            "verified",
+            Some("https://github.com/sigstore/sigstore-python/.github/workflows/release.yml@refs/tags/v4.5.0"),
+            Some("https://token.actions.githubusercontent.com"),
+            Some("sigstore"),
+            None,
+        )
+        .await
+        .expect("record attestation");
+
+        // Inject the marker exactly as the scheduler eval loop does, then eval.
+        let mut eval_md = pkg.metadata.clone();
+        eval_md.as_object_mut().unwrap().insert(
+            VERIFICATION_MARKER.to_string(),
+            serde_json::json!({"state": "verified", "owner": "sigstore"}),
+        );
+        let (decision, matched) = svc
+            .evaluate_package_typed(
+                staging_id,
+                "allow",
+                "pypi",
+                "sigstore",
+                "4.5.0",
+                None,
+                &eval_md,
+                &no_source(),
+            )
+            .await
+            .expect("post-verify eval");
+        assert_eq!(matched, Some(rule.id));
+        assert_eq!(
+            decision,
+            CurationDecision::Allow,
+            "a VERIFIED trusted publisher must finally be Allowed (#2955)"
+        );
+
+        // Columns round-trip.
+        let row = svc.get_package(pkg.id).await.expect("get pkg");
+        let db_state: String =
+            sqlx::query_scalar("SELECT attestation_state FROM curation_packages WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read attestation_state");
+        assert_eq!(db_state, "verified");
+        let db_owner: Option<String> =
+            sqlx::query_scalar("SELECT attestation_owner FROM curation_packages WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read attestation_owner");
+        assert_eq!(db_owner.as_deref(), Some("sigstore"));
+
+        // Cleanup.
+        svc.delete_rule(rule.id).await.ok();
+        sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
+            .bind(staging_id)
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup(&pool, staging_id, user).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// npm is ingested but recorded unsupported — it must never flip to verified.
+    #[tokio::test]
+    async fn test_ondemand_npm_records_unsupported_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _guard = tdh::curation_global_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, _uname) = tdh::create_user(&pool).await;
+        let svc = CurationService::new(pool.clone());
+        let (remote_id, _rk, _rp) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (staging_id, _sk, _sp) = tdh::create_repo(&pool, "staging", "npm").await;
+        sqlx::query("UPDATE repositories SET curation_enabled = true, curation_source_repo_id = $2 WHERE id = $1")
+            .bind(staging_id)
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("wire");
+
+        let entry = crate::services::curation_sync::build_npm_curation_entry(
+            "left-pad",
+            "1.3.0",
+            &serde_json::json!({"_npmUser": {"name": "someone"}, "dist": {"integrity": "sha512-x"}}),
+        )
+        .expect("npm entry");
+        crate::api::handlers::proxy_helpers::enqueue_curation_on_demand(
+            &pool, remote_id, "remote", entry,
+        )
+        .await;
+
+        let pending = svc
+            .list_pending_packages_by_format(staging_id, "npm", 100)
+            .await
+            .expect("list pending npm");
+        let pkg = pending
+            .into_iter()
+            .find(|p| p.package_name == "left-pad")
+            .expect("npm row");
+
+        let verdict = crate::services::curation::attestation_verify::verify_npm_unsupported();
+        assert!(!verdict.is_verified());
+        svc.record_attestation(
+            pkg.id,
+            verdict.state.as_str(),
+            None,
+            None,
+            None,
+            verdict.error.as_deref(),
+        )
+        .await
+        .expect("record npm");
+        let db_state: String =
+            sqlx::query_scalar("SELECT attestation_state FROM curation_packages WHERE id = $1")
+                .bind(pkg.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read state");
+        assert_eq!(
+            db_state, "failed",
+            "npm records failed/unsupported, never verified"
+        );
+
+        sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
+            .bind(staging_id)
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup(&pool, staging_id, user).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }

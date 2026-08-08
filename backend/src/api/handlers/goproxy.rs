@@ -2443,7 +2443,7 @@ mod tests {
         .bind(virtual_id)
         .bind(&virtual_key)
         .bind(&virtual_key)
-        .bind(fx.storage_dir.to_string_lossy().as_ref())
+        .bind(&*fx.storage_dir.to_string_lossy())
         .execute(&fx.pool)
         .await
         .expect("insert virtual repo");
@@ -2473,7 +2473,7 @@ mod tests {
         )
         .bind(remote_id)
         .bind(&remote_key)
-        .bind(fx.storage_dir.to_string_lossy().as_ref())
+        .bind(&*fx.storage_dir.to_string_lossy())
         .execute(&fx.pool)
         .await
         .expect("insert gated remote member");

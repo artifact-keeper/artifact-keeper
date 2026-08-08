@@ -199,7 +199,7 @@ async fn create_composer_repo(pool: &PgPool) -> (Uuid, String, std::path::PathBu
     .bind(id)
     .bind(&key)
     .bind("composer-index-test")
-    .bind(storage_path.to_string_lossy().as_ref())
+    .bind(&*storage_path.to_string_lossy())
     .execute(pool)
     .await
     .expect("failed to create test repository");

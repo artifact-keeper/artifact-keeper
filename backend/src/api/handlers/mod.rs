@@ -573,7 +573,7 @@ mod tests {
             .bind(id)
             .bind(&key)
             .bind(&key)
-            .bind(dir.to_string_lossy().as_ref())
+            .bind(&*dir.to_string_lossy())
             .execute(pool)
             .await
             .expect("create test repo");

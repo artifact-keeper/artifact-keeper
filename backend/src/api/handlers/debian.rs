@@ -5745,7 +5745,7 @@ mod apt_release_metadata_db_tests {
         .bind(id)
         .bind(&key)
         .bind(&key)
-        .bind(dir.to_string_lossy().as_ref())
+        .bind(&*dir.to_string_lossy())
         .execute(pool)
         .await
         .expect("insert hosted debian repo");

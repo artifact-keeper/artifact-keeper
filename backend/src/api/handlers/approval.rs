@@ -2125,7 +2125,7 @@ mod tests {
             )
             .bind(id)
             .bind(&key)
-            .bind(storage_path.to_string_lossy().as_ref())
+            .bind(&*storage_path.to_string_lossy())
             .execute(pool)
             .await
             .expect("insert repo");

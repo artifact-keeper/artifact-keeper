@@ -188,6 +188,21 @@ mimalloc = { version = "0.1", optional = true }
 unicode-security = "0.1.2"
 unicode-normalization = "0.1.25"
 
+# Sigstore attestation verification for `publisher_trust match:attestation`
+# (#2955). Pinned exactly — the crate's verify API is documented experimental
+# and its internals moved between 0.13 and 0.14, so a caret range would be
+# reckless. `default-features = false` keeps the signing/oauth interactive
+# surface out; `rustls-tls` selects the ring-compatible TLS stack the backend
+# already uses (rustls 0.23 above). `x509-cert` is used to extract the Fulcio
+# leaf-certificate identity ourselves AFTER verification (the crate exposes
+# only assertion policies, never the parsed identity).
+sigstore = { version = "=0.14.0", default-features = false, features = [
+    "verify",
+    "sigstore-trust-root",
+    "rustls-tls",
+] }
+x509-cert = { version = "0.2", features = ["pem"] }
+
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
@@ -205,3 +220,6 @@ tokio-test = "0.4"
 axum-test = "18"
 wiremock = "0.6"
 metrics-util = "0.20"
+# Mint self-signed / non-Fulcio leaf certificates for the attestation red-team
+# suite (#2955 Stage 4, rows 3 and 8 — the Stage-1 fixtures were missing them).
+rcgen = "0.13"
