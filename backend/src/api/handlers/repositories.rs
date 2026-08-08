@@ -21608,7 +21608,40 @@ mod content_encoding_forwarding_tests {
     /// is a distinct regression point from `download_artifact` above.
     #[tokio::test]
     async fn test_virtual_get_artifact_metadata_forwards_upstream_content_encoding() {
-        let (_plain, coded) = tdh::gzip_fixture(b"generic metadata-route payload. ");
+        let (_plain, coded) = tdh::coded_fixture("deflate", b"generic metadata-route payload. ");
+        let Some((fx, state, member_id, _server, _dir)) =
+            coded_virtual_fixture("blobs/meta.bin", coded.clone(), Some("deflate")).await
+        else {
+            return;
+        };
+
+        let result = super::get_artifact_metadata(
+            axum::extract::State(state.clone()),
+            Extension(None),
+            axum::extract::Path((fx.repo_key.clone(), "blobs/meta.bin".to_string())),
+            axum::extract::Query(ArtifactVersionQuery { version: None }),
+            Default::default(),
+        )
+        .await;
+        drop_member(&fx, member_id).await;
+        fx.teardown().await;
+
+        let resp =
+            result.unwrap_or_else(|e| panic!("virtual generic metadata serve failed: {e:?}"));
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tdh::header_str(&headers, header::CONTENT_ENCODING).as_deref(),
+            Some("deflate"),
+            "the virtual artifact serve must forward the member's upstream \
+             coding (#3149)",
+        );
+        assert_eq!(&body[..], &coded[..]);
+    }
+
+    #[tokio::test]
+    async fn test_virtual_get_artifact_metadata_without_coding_has_no_encoding_header() {
+        let (_plain, coded) = tdh::coded_fixture("deflate", b"generic metadata-uncoded payload. ");
         let Some((fx, state, member_id, _server, _dir)) =
             coded_virtual_fixture("blobs/meta.bin", coded.clone(), Some("gzip")).await
         else {
