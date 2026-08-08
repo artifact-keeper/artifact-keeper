@@ -1898,10 +1898,17 @@ impl StorageGcService {
     ///    and the sweep's guarded row `DELETE` re-checks liveness only *after*
     ///    the bytes are already gone — it saves the journal row, not the blob.
     ///    Re-asserting the predicate here is the check that actually protects
-    ///    the data, the same shape as the per-row re-check
-    ///    [`is_blob_still_orphan`] performs before the two-phase blob GC's
-    ///    destructive act, and the #1682 "never orphan a live image" guard in
-    ///    `lifecycle_service`.
+    ///    the data.
+    ///
+    /// This re-check is deliberately *weaker* than the per-row re-check
+    /// [`is_blob_still_orphan`] performs before the two-phase blob GC's
+    /// destructive act, and the difference is the whole point of the caveat
+    /// below. `is_blob_still_orphan` runs inside an open transaction that took
+    /// `SELECT ... FOR UPDATE` on the `oci_blobs` row and *holds that lock
+    /// across the storage delete*, so a racing pusher blocks. This hook holds
+    /// nothing: it is a single autocommit `UPDATE` whose lock is gone before
+    /// the caller touches storage. Same predicate, different guarantee — do not
+    /// read the two as equivalent.
     ///
     /// The renewal and the re-check are one atomic `UPDATE`, so a row that has
     /// become live cannot have its lease extended. `kind` selects the predicate
@@ -1918,7 +1925,13 @@ impl StorageGcService {
     /// `oci_blobs` row inside that gap still has its bytes destroyed. Nothing
     /// in the push path serializes against this: `register_oci_upload_cleanup_key`
     /// is `ON CONFLICT (storage_key) DO NOTHING`, which against an already
-    /// claimed row is a complete no-op.
+    /// claimed row is a complete no-op, and the push's success path calls
+    /// `clear_oci_upload_cleanup_key_best_effort` (`api/handlers/oci_v2.rs`), a
+    /// bare `DELETE ... WHERE storage_key = $1` with no `claim_token` guard —
+    /// so the push can remove the journal row out from under an in-flight
+    /// sweep. Nor is that interleaving observable: each sweep's guarded row
+    /// `DELETE` never inspects `rows_affected`, so a zero-row match is counted
+    /// as a clean success.
     ///
     /// What this buys is a large reduction, not a proof. Before the re-check,
     /// liveness was evaluated once per batch in the candidate `SELECT`, so the
@@ -1933,6 +1946,9 @@ impl StorageGcService {
     /// committing `oci_blobs` — or a two-phase tombstone, which this codebase
     /// already implements for blob GC via `oci_blobs.pending_delete_at`
     /// (migration 141, `run_blob_gc_mark` / `run_blob_gc_sweep`).
+    ///
+    /// Tracked in #3187. Until that lands, this remains a narrowed window, not
+    /// a closed one.
     async fn hold_cleanup_key_claim_for_delete(
         &self,
         cleanup_key: &OciUploadCleanupKey,
