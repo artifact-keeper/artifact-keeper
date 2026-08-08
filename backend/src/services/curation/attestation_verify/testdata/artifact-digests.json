@@ -1,0 +1,21 @@
+{
+  "npm": {
+    "dist_integrity": "sha512-hJqJfoG/e4qFQaauQL00c6J6FrHLBGKtkFvW3JbTSIEFOhLrSjdSM/gWd/yUOfYo/gsERehTXGC1VZWX+9X4Dg==",
+    "package": "sigstore",
+    "tarball_sha256": "3718e9a74a5a824a785b5f3930f767a4efdb052b3d4db65cd7649a5e2aa2f465",
+    "tarball_sha512": "849a897e81bf7b8a8541a6ae40bd3473a27a16b1cb0462ad905bd6dc96d34881053a12eb4a375233f81677fc9439f628fe0b0445e8535c60b5559597fbd5f80e",
+    "version": "5.0.0"
+  },
+  "pypi": {
+    "package": "sigstore",
+    "sdist": {
+      "filename": "sigstore-4.5.0.tar.gz",
+      "sha256": "020d3e07f622b2916bf453e66ff6ff0711e1fdc5ab69e8bd8902f71d9fcb316f"
+    },
+    "version": "4.5.0",
+    "wheel": {
+      "filename": "sigstore-4.5.0-py3-none-any.whl",
+      "sha256": "f045b207f2e12605cf775ec38e89c5eda625d71ffa7830477db65e47ec2bc8b2"
+    }
+  }
+}
