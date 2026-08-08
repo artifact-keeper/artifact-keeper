@@ -7447,16 +7447,24 @@ mod tests {
     /// the same batch live before the sweep reaches it.
     struct MidBatchPushStorage {
         db: PgPool,
-        trip_key: String,
         revive_key: String,
         revive_repo: Uuid,
         revive_digest: String,
         deleted: std::sync::Mutex<Vec<String>>,
+        pushed: std::sync::atomic::AtomicBool,
     }
 
     impl MidBatchPushStorage {
         fn deleted_keys(&self) -> Vec<String> {
             self.deleted.lock().expect("deleted lock").clone()
+        }
+
+        /// Did the simulated concurrent push actually commit its `oci_blobs`
+        /// row? If it never fired, the sweep reached the revive key first and
+        /// the test never entered the window it exists to cover — a false red
+        /// rather than a regression, so the tests assert this explicitly.
+        fn pushed(&self) -> bool {
+            self.pushed.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -7472,10 +7480,21 @@ mod tests {
             Ok(true)
         }
         async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            // Fire the concurrent push on the FIRST delete that is not the
+            // revive key itself, rather than on one specific "head" key.
+            //
+            // The claim query orders its candidate CTE by `created_at`, but it
+            // returns rows from `UPDATE ... RETURNING`, which carries NO row
+            // order guarantee — the CTE's ORDER BY does not survive it. The
+            // observed order therefore depends on the chosen plan, and it
+            // flips once `oci_upload_cleanup_keys` holds rows from other
+            // tests. Keying the push off a named head made this test pass in
+            // isolation and fail in the full module run.
             let tripped = {
                 let mut seen = self.deleted.lock().expect("deleted lock");
                 seen.push(key.to_string());
-                key == self.trip_key
+                key != self.revive_key
+                    && !self.pushed.swap(true, std::sync::atomic::Ordering::SeqCst)
             };
             if tripped {
                 sqlx::query(
@@ -7518,12 +7537,16 @@ mod tests {
         let revive_key = format!("oci-blobs/{revive_digest}");
         let control_key = format!("oci-uploads/{tag}-control/{run}");
 
+        // `revive` ($3) is seeded NEWEST so that any order-preserving plan puts
+        // it last, maximising the chance another key is deleted (and so fires
+        // the push) before the sweep reaches it. The tests assert the push
+        // actually fired rather than trusting this.
         sqlx::query(
             "INSERT INTO oci_upload_cleanup_keys \
                  (repository_id, storage_key, created_at, storage_write_completed_at) \
              VALUES ($1, $2, NOW() - INTERVAL '72 hours', NOW() - INTERVAL '72 hours'), \
-                    ($1, $3, NOW() - INTERVAL '71 hours', NOW() - INTERVAL '71 hours'), \
-                    ($1, $4, NOW() - INTERVAL '70 hours', NOW() - INTERVAL '70 hours')",
+                    ($1, $3, NOW() - INTERVAL '70 hours', NOW() - INTERVAL '70 hours'), \
+                    ($1, $4, NOW() - INTERVAL '71 hours', NOW() - INTERVAL '71 hours')",
         )
         .bind(fixture.repo_id)
         .bind(&trip_key)
@@ -7535,11 +7558,11 @@ mod tests {
 
         let storage = Arc::new(MidBatchPushStorage {
             db: fixture.pool.clone(),
-            trip_key: trip_key.clone(),
             revive_key: revive_key.clone(),
             revive_repo: fixture.repo_id,
             revive_digest,
             deleted: std::sync::Mutex::new(Vec::new()),
+            pushed: std::sync::atomic::AtomicBool::new(false),
         });
         let mut backends = std::collections::HashMap::new();
         backends.insert(
@@ -7587,6 +7610,18 @@ mod tests {
     async fn unreferenced_sweep_keeps_bytes_of_blob_that_went_live_after_claim() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        // BOTH guards are required, and they are not interchangeable.
+        //
+        // `storage_gc_test_guard` is an in-process mutex; `blob_gc_serial_lock`
+        // is a Postgres advisory lock. This test runs an UNSCOPED
+        // (`repo_scope = None`) cleanup-key sweep, exactly like the sibling
+        // `test_run_gc_*` tests, which take only the in-process mutex. Holding
+        // just the advisory lock does not exclude them, so under the single-
+        // process `cargo test --workspace --lib` job a sibling's cluster-wide
+        // sweep reaps this test's fixtures first and `deleted` comes back
+        // empty. (Under nextest the `db-serial` group already serializes the
+        // module, which is why that run stayed green and hid this.)
+        let _sweep_guard = storage_gc_test_guard().await;
         let _gc_guard = tdh::blob_gc_serial_lock().await;
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
@@ -7595,17 +7630,28 @@ mod tests {
         let (service, storage, keys) = setup_mid_batch_push_sweep(&fixture, "gc3085u").await;
         let [trip_key, revive_key, control_key] = keys.clone();
 
+        // Scope the sweep to this fixture's repository. The sweep is otherwise
+        // cluster-wide, so rows other tests left in `oci_upload_cleanup_keys`
+        // join the batch and change both its size and its walk order. The
+        // pre-delete hook under test is per-key and identical either way.
         let mut result = empty_gc_result(false);
         service
-            .cleanup_unreferenced_oci_upload_keys(None, false, &mut result)
+            .cleanup_unreferenced_oci_upload_keys(Some(fixture.repo_id), false, &mut result)
             .await
             .expect("unreferenced cleanup-key sweep runs");
 
+        let pushed = storage.pushed();
         let deleted = finish_mid_batch_push_sweep(&fixture, &storage, &keys).await;
 
         assert!(
+            pushed,
+            "precondition: the concurrent push must fire before the sweep reaches the revive \
+             key, otherwise this test never enters the window it covers: {deleted:?}"
+        );
+        assert!(
             deleted.contains(&trip_key),
-            "batch head must be swept (it drives the concurrent push): {deleted:?}"
+            "a still-unreferenced key must be swept (one of these drives the concurrent \
+             push): {deleted:?}"
         );
         assert!(
             deleted.contains(&control_key),
@@ -7626,6 +7672,11 @@ mod tests {
     async fn pending_reaper_keeps_bytes_of_blob_that_went_live_after_claim() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        // See the note on the unreferenced-sweep test above: the in-process
+        // mutex is what excludes the sibling `test_run_gc_*` cluster-wide
+        // sweeps under `cargo test --workspace --lib`. The advisory lock alone
+        // does not.
+        let _sweep_guard = storage_gc_test_guard().await;
         let _gc_guard = tdh::blob_gc_serial_lock().await;
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
@@ -7644,17 +7695,25 @@ mod tests {
         .await
         .expect("un-mark the seeded rows");
 
+        // Repo-scoped for the same reason as the unreferenced-sweep test above.
         let mut result = empty_gc_result(false);
         service
-            .reap_pending_oci_upload_cleanup_keys(None, false, &mut result)
+            .reap_pending_oci_upload_cleanup_keys(Some(fixture.repo_id), false, &mut result)
             .await
             .expect("pending cleanup-key reaper runs");
 
+        let pushed = storage.pushed();
         let deleted = finish_mid_batch_push_sweep(&fixture, &storage, &keys).await;
 
         assert!(
+            pushed,
+            "precondition: the concurrent push must fire before the reaper reaches the revive \
+             key, otherwise this test never enters the window it covers: {deleted:?}"
+        );
+        assert!(
             deleted.contains(&trip_key),
-            "batch head must be reaped (it drives the concurrent push): {deleted:?}"
+            "a still-unreferenced pending key must be reaped (one of these drives the \
+             concurrent push): {deleted:?}"
         );
         assert!(
             deleted.contains(&control_key),
