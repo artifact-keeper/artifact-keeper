@@ -1195,16 +1195,39 @@ fn extract_index_fields(
 }
 
 /// Build a JSON response with cache-control for index responses.
+///
+/// For server-built index bodies (local rows, virtual aggregation, and the
+/// in-process cache fast path), which are always uncoded.
 fn index_response(content: impl Into<Body>, content_type: Option<String>) -> Response {
-    Response::builder()
+    index_response_coded(content, content_type, None)
+}
+
+/// [`index_response`] for the one arm that re-serves UPSTREAM bytes verbatim:
+/// the Remote sparse-index proxy.
+///
+/// #3149: the proxy pins `Accept-Encoding: identity` and does not decode
+/// upstream bodies, so a sparse index fetched from a coding intermediary
+/// arrives still coded. Cargo reads the index as JSON, so an undeclared coding
+/// makes it fail to parse the index rather than silently corrupt a `.crate` —
+/// it degrades rather than producing a bad artifact, which is why this is the
+/// lower-severity half of #3149. `Content-Length` is derived by axum from the
+/// bytes actually in the body, so it describes the same coded bytes.
+fn index_response_coded(
+    content: impl Into<Body>,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+) -> Response {
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(
             CONTENT_TYPE,
             content_type.unwrap_or_else(|| "application/json".to_string()),
         )
-        .header("cache-control", "max-age=300")
-        .body(content.into())
-        .unwrap()
+        .header("cache-control", "max-age=300");
+    if let Some(ref encoding) = content_encoding {
+        builder = builder.header(CONTENT_ENCODING, encoding);
+    }
+    builder.body(content.into()).unwrap()
 }
 
 /// Try to resolve a crate index from a remote upstream proxy.
@@ -1227,20 +1250,38 @@ async fn try_remote_index(
 
     let base_url = repo.index_upstream_url.as_deref().unwrap_or(upstream_url);
     let index_path = cargo_sparse_index_path_upstream(name_lower);
-    let result = proxy_helpers::proxy_fetch_capped(
+    // #3149: the encoding-preserving 3-tuple variant. `proxy_fetch_capped`
+    // structurally discards the upstream `Content-Encoding`, so the coded
+    // bytes were re-served (and cached) advertised as plain JSON.
+    let result = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_encoded(
         proxy,
         repo.id,
         repo_key,
         base_url,
         &index_path,
+        &index_path,
+        None,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
     .await;
 
     Some(match result {
-        Ok((content, content_type)) => {
-            index_cache_set(index_cache, cache_key.to_string(), content.clone()).await;
-            Ok(index_response(content, content_type))
+        Ok((content, content_type, content_encoding)) => {
+            // Only memoize UNCODED bytes. The in-process `index_cache` stores
+            // bare bytes with no room for a coding, and its fast path serves
+            // them as `application/json`, so pinning a coded body here would
+            // hand every later hit an undeclared coded index. Coded responses
+            // simply skip this cache; the ProxyService's own cache (whose
+            // sidecar does carry the coding) still serves them warm through
+            // this same arm, which re-declares it.
+            if content_encoding.is_none() {
+                index_cache_set(index_cache, cache_key.to_string(), content.clone()).await;
+            }
+            Ok(index_response_coded(
+                content,
+                content_type,
+                content_encoding,
+            ))
         }
         Err(e) => Err(e),
     })
@@ -3820,5 +3861,163 @@ mod tests {
             crate_data,
             "the advertised download URL must serve the published .crate bytes"
         );
+    }
+}
+
+/// #3149 — upstream `Content-Encoding` forwarding on the cargo SPARSE INDEX.
+///
+/// A different mechanism from the `.crate` download arms fixed in #2922:
+/// `try_remote_index` fetched through `proxy_fetch_capped`, whose 2-tuple
+/// return type STRUCTURALLY discards the coding, and `index_response` set only
+/// a content type and cache-control. Coded index bytes were therefore re-served
+/// as plain JSON — and pinned into the in-process `index_cache`, which stores
+/// bare bytes and has no room for a coding, so every later hit repeated it.
+///
+/// Cargo parses the index server-side rather than writing it to disk, so this
+/// degrades (a failed parse) instead of silently corrupting an artifact, which
+/// is why it is the lower-severity half of the issue.
+#[cfg(test)]
+mod index_content_encoding_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/cargo", super::router())
+    }
+
+    /// Builder guard: the coded index builder declares the coding.
+    #[test]
+    fn test_index_response_coded_forwards_content_encoding() {
+        let resp = index_response_coded(
+            "{}",
+            Some("application/json".to_string()),
+            Some("gzip".to_string()),
+        );
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_ENCODING).as_deref(),
+            Some("gzip"),
+        );
+    }
+
+    /// Negative control: server-built index bodies are uncoded, and
+    /// `index_response` must never manufacture a coding for them.
+    #[test]
+    fn test_index_response_omits_content_encoding_for_server_built_bodies() {
+        let resp = index_response("{}", Some("application/json".to_string()));
+        assert!(
+            resp.headers().get(CONTENT_ENCODING).is_none(),
+            "server-built index bodies are uncoded",
+        );
+    }
+
+    /// A coded upstream sparse index must be served declared -- on the FIRST
+    /// request and on every later one. The second request is the real point:
+    /// the pre-fix code pinned the coded bytes into `index_cache`, so even a
+    /// fix that only touched the fresh-fetch path would keep serving
+    /// undeclared coded bytes from memory afterwards.
+    #[tokio::test]
+    async fn test_remote_sparse_index_forwards_upstream_content_encoding() {
+        let Some(fx) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+        let (_plain, coded) =
+            tdh::coded_fixture("deflate", b"{\"name\":\"serde\",\"vers\":\"1.0.0\"}\n");
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/se/rd/serde"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "deflate")
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(coded.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (status, body, headers) = tdh::send_with_headers(
+                tdh::router_anon(mounted_router(), state.clone()),
+                tdh::get(format!("/cargo/{}/se/rd/serde", fx.repo_key)),
+            )
+            .await;
+            seen.push((
+                status,
+                tdh::header_str(&headers, CONTENT_ENCODING),
+                body.to_vec(),
+            ));
+        }
+        fx.teardown().await;
+
+        for (i, (status, encoding, body)) in seen.iter().enumerate() {
+            assert_eq!(*status, StatusCode::OK, "request {i} must succeed");
+            assert_eq!(
+                encoding.as_deref(),
+                Some("deflate"),
+                "request {i}: the coded sparse index must be declared -- \
+                 request 1 is the fresh fetch, request 2 proves the coded body \
+                 was not memoized undeclared (#3149)",
+            );
+            assert_eq!(&body[..], &coded[..], "request {i}: bytes pass through");
+        }
+    }
+
+    /// Control for the SAME change: skipping the in-process cache must apply
+    /// ONLY to coded bodies. An ordinary uncoded index must still be memoized,
+    /// so upstream is hit exactly once across two requests and no coding is
+    /// manufactured. Without this, "never cache" would satisfy the test above
+    /// while quietly removing the index cache for everyone.
+    #[tokio::test]
+    async fn test_uncoded_sparse_index_is_still_memoized_and_declares_no_coding() {
+        let Some(fx) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+        let plain = b"{\"name\":\"tokio\",\"vers\":\"1.0.0\"}\n".to_vec();
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/to/ki/tokio"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(plain.clone()),
+            )
+            // The in-process index cache must absorb the second request.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (status, body, headers) = tdh::send_with_headers(
+                tdh::router_anon(mounted_router(), state.clone()),
+                tdh::get(format!("/cargo/{}/to/ki/tokio", fx.repo_key)),
+            )
+            .await;
+            seen.push((
+                status,
+                tdh::header_str(&headers, CONTENT_ENCODING),
+                body.to_vec(),
+            ));
+        }
+        // Drop the server to assert the `.expect(1)` upstream-hit count.
+        drop(server);
+        fx.teardown().await;
+
+        for (i, (status, encoding, body)) in seen.iter().enumerate() {
+            assert_eq!(*status, StatusCode::OK, "request {i} must succeed");
+            assert!(
+                encoding.is_none(),
+                "request {i}: an uncoded index must not gain a coding",
+            );
+            assert_eq!(&body[..], &plain[..], "request {i}: bytes unchanged");
+        }
     }
 }

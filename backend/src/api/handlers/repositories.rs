@@ -6718,6 +6718,14 @@ pub async fn get_artifact_metadata(
         if let Some(size) = result.content_length {
             builder = builder.header(header::CONTENT_LENGTH, size.to_string());
         }
+        // #3149: a Remote member resolved through this virtual serve returns
+        // upstream's bytes untouched — the proxy pins `Accept-Encoding:
+        // identity` and does not decode — so a content coding must be
+        // declared or the client saves bytes it cannot inflate. Sourced from
+        // the same `StreamingFetchResult` as the CODED `content_length` above.
+        if let Some(ref encoding) = result.content_encoding {
+            builder = builder.header(header::CONTENT_ENCODING, encoding);
+        }
         return Ok(builder.body(Body::from_stream(result.body)).unwrap());
     }
 
@@ -7999,6 +8007,13 @@ pub async fn download_artifact(
                 );
             if let Some(size) = result.content_length {
                 builder = builder.header(header::CONTENT_LENGTH, size.to_string());
+            }
+            // #3149: as in the virtual-artifact serve above. Set before the
+            // HEAD/GET body split so HEAD and GET advertise identical headers
+            // (RFC 9110 §9.3.2) — a HEAD that hid the coding would mislead a
+            // client that sizes its read from it.
+            if let Some(ref encoding) = result.content_encoding {
+                builder = builder.header(header::CONTENT_ENCODING, encoding);
             }
             let body = if is_head {
                 Body::empty()
@@ -21077,5 +21092,278 @@ mod apt_validation_tests {
                 .await;
         }
         tdh::cleanup_user(&pool, user_id).await;
+    }
+}
+
+/// #3149 — upstream `Content-Encoding` forwarding on generic virtual serves.
+///
+/// `repositories.rs` contained ZERO references to `content_encoding`. Both
+/// virtual serve paths read the (CODED) `content_length` off the
+/// `StreamingFetchResult` and discarded the coding one line later, so a
+/// Remote member behind a coding intermediary handed clients bytes they could
+/// not inflate under a `Content-Length` that described the coded form.
+///
+/// These are two INDEPENDENT hand-rolled builders in two different handlers,
+/// so each carries its own guard.
+#[cfg(test)]
+mod content_encoding_forwarding_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Stand up `virtual -> remote member` over a wiremock upstream that codes
+    /// its response, returning the wired state plus a cleanup handle.
+    async fn coded_virtual_fixture(
+        artifact_path: &str,
+        coded: Vec<u8>,
+        encoding: Option<&str>,
+    ) -> Option<(
+        tdh::Fixture,
+        SharedState,
+        Uuid,
+        MockServer,
+        tempfile::TempDir,
+    )> {
+        let fx = tdh::Fixture::setup("virtual", "generic").await?;
+        // These tests are about response headers, not authorization: make the
+        // virtual repo public so the anonymous `require_visible` check passes.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish virtual repo");
+        let server = MockServer::start().await;
+        let mut tmpl = ResponseTemplate::new(200)
+            .insert_header("content-type", "application/octet-stream")
+            .set_body_bytes(coded);
+        if let Some(enc) = encoding {
+            tmpl = tmpl.insert_header("content-encoding", enc);
+        }
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/{artifact_path}")))
+            .respond_with(tmpl)
+            .mount(&server)
+            .await;
+
+        let (member_id, _k, _d) = tdh::create_repo(&fx.pool, "remote", "generic").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(server.uri())
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
+        Some((fx, state, member_id, server, dir))
+    }
+
+    async fn drop_member(fx: &tdh::Fixture, member_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await;
+    }
+
+    /// `download_artifact` (GET) — the virtual artifact download arm.
+    #[tokio::test]
+    async fn test_virtual_download_artifact_forwards_upstream_content_encoding() {
+        let (_plain, coded) = tdh::coded_fixture("deflate", b"generic virtual artifact payload. ");
+        let Some((fx, state, member_id, _server, _dir)) =
+            coded_virtual_fixture("blobs/thing.bin", coded.clone(), Some("deflate")).await
+        else {
+            return;
+        };
+
+        let result = super::download_artifact(
+            axum::extract::State(state.clone()),
+            Extension(None),
+            axum::extract::Path((fx.repo_key.clone(), "blobs/thing.bin".to_string())),
+            axum::extract::Query(ArtifactVersionQuery { version: None }),
+            Default::default(),
+            axum::http::Request::builder()
+                .method("GET")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        drop_member(&fx, member_id).await;
+        fx.teardown().await;
+
+        let resp = result
+            .map(axum::response::IntoResponse::into_response)
+            .unwrap_or_else(|e| panic!("virtual generic download failed: {e:?}"));
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tdh::header_str(&headers, header::CONTENT_ENCODING).as_deref(),
+            Some("deflate"),
+            "the virtual generic download must forward the member's upstream \
+             coding, or the client saves bytes it cannot inflate (#3149)",
+        );
+        assert_eq!(&body[..], &coded[..], "coded bytes must pass through");
+    }
+
+    /// Negative control for the same arm.
+    #[tokio::test]
+    async fn test_virtual_download_artifact_without_coding_has_no_encoding_header() {
+        let plain = b"plain generic artifact bytes".to_vec();
+        let Some((fx, state, member_id, _server, _dir)) =
+            coded_virtual_fixture("blobs/plain.bin", plain.clone(), None).await
+        else {
+            return;
+        };
+
+        let result = super::download_artifact(
+            axum::extract::State(state.clone()),
+            Extension(None),
+            axum::extract::Path((fx.repo_key.clone(), "blobs/plain.bin".to_string())),
+            axum::extract::Query(ArtifactVersionQuery { version: None }),
+            Default::default(),
+            axum::http::Request::builder()
+                .method("GET")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        drop_member(&fx, member_id).await;
+        fx.teardown().await;
+
+        let resp = result
+            .map(axum::response::IntoResponse::into_response)
+            .unwrap_or_else(|e| panic!("virtual generic download failed: {e:?}"));
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers.get(header::CONTENT_ENCODING).is_none(),
+            "an uncoded member serve must not gain a manufactured coding",
+        );
+        assert_eq!(&body[..], &plain[..]);
+    }
+
+    /// The HEAD arm of `download_artifact` shares the builder with GET and
+    /// must advertise the same coding — the handler already documents that
+    /// "a HEAD request must return identical headers to GET but no body", and
+    /// the coding is part of those headers (RFC 9110 §9.3.2).
+    #[tokio::test]
+    async fn test_virtual_download_artifact_head_declares_same_coding_as_get() {
+        let (_plain, coded) = tdh::gzip_fixture(b"generic head parity payload. ");
+        let Some((fx, state, member_id, _server, _dir)) =
+            coded_virtual_fixture("blobs/head.bin", coded.clone(), Some("gzip")).await
+        else {
+            return;
+        };
+
+        let result = super::download_artifact(
+            axum::extract::State(state.clone()),
+            Extension(None),
+            axum::extract::Path((fx.repo_key.clone(), "blobs/head.bin".to_string())),
+            axum::extract::Query(ArtifactVersionQuery { version: None }),
+            Default::default(),
+            axum::http::Request::builder()
+                .method("HEAD")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        drop_member(&fx, member_id).await;
+        fx.teardown().await;
+
+        let resp = result
+            .map(axum::response::IntoResponse::into_response)
+            .unwrap_or_else(|e| panic!("virtual generic HEAD failed: {e:?}"));
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tdh::header_str(&headers, header::CONTENT_ENCODING).as_deref(),
+            Some("gzip"),
+            "HEAD must declare the coding the matching GET would send",
+        );
+        assert!(body.is_empty(), "HEAD must carry no body");
+    }
+
+    /// `get_artifact_metadata` — the SECOND, independent hand-rolled builder.
+    /// It serves a virtual member's BYTES on the generic artifact route, so it
+    /// is a distinct regression point from `download_artifact` above.
+    #[tokio::test]
+    async fn test_virtual_get_artifact_metadata_forwards_upstream_content_encoding() {
+        let (_plain, coded) = tdh::coded_fixture("deflate", b"generic metadata-route payload. ");
+        let Some((fx, state, member_id, _server, _dir)) =
+            coded_virtual_fixture("blobs/meta.bin", coded.clone(), Some("deflate")).await
+        else {
+            return;
+        };
+
+        let result = super::get_artifact_metadata(
+            axum::extract::State(state.clone()),
+            Extension(None),
+            axum::extract::Path((fx.repo_key.clone(), "blobs/meta.bin".to_string())),
+            axum::extract::Query(ArtifactVersionQuery { version: None }),
+            Default::default(),
+        )
+        .await;
+        drop_member(&fx, member_id).await;
+        fx.teardown().await;
+
+        let resp =
+            result.unwrap_or_else(|e| panic!("virtual generic metadata serve failed: {e:?}"));
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tdh::header_str(&headers, header::CONTENT_ENCODING).as_deref(),
+            Some("deflate"),
+            "the virtual artifact serve must forward the member's upstream \
+             coding (#3149)",
+        );
+        assert_eq!(&body[..], &coded[..]);
+    }
+
+    #[tokio::test]
+    async fn test_virtual_get_artifact_metadata_without_coding_has_no_encoding_header() {
+        let (_plain, coded) = tdh::coded_fixture("deflate", b"generic metadata-uncoded payload. ");
+        let Some((fx, state, member_id, _server, _dir)) =
+            coded_virtual_fixture("blobs/meta.bin", coded.clone(), Some("gzip")).await
+        else {
+            return;
+        };
+
+        let result = super::get_artifact_metadata(
+            axum::extract::State(state.clone()),
+            Extension(None),
+            axum::extract::Path((fx.repo_key.clone(), "blobs/meta.bin".to_string())),
+            axum::extract::Query(ArtifactVersionQuery { version: None }),
+            Default::default(),
+        )
+        .await;
+        drop_member(&fx, member_id).await;
+        fx.teardown().await;
+
+        let resp =
+            result.unwrap_or_else(|e| panic!("virtual generic metadata serve failed: {e:?}"));
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tdh::header_str(&headers, header::CONTENT_ENCODING).as_deref(),
+            Some("gzip"),
+            "the virtual artifact serve must forward the member's upstream \
+             coding (#3149)",
+        );
+        assert_eq!(&body[..], &coded[..]);
     }
 }

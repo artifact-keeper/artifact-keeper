@@ -1448,3 +1448,116 @@ pub async fn rewire_remote_proxy(
     let state = build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
     (state, dir)
 }
+
+// ---------------------------------------------------------------------------
+// #3149: Content-Encoding forwarding fixtures.
+// ---------------------------------------------------------------------------
+
+/// Build a gzip-coded body for the #3149 `Content-Encoding`-forwarding tests,
+/// returning `(plain, coded)`.
+///
+/// Shared across the npm / PyPI / OCI / generic-repository / cargo arms so the
+/// five suites do not each carry their own copy of the encoder block (the
+/// jscpd duplication gate scores changed files). The payload is deliberately
+/// repetitive so gzip actually shrinks it: the caller asserts `coded != plain`,
+/// without which a "forwarding" test could pass while proving nothing.
+/// Build a body coded with `encoding`, returning `(plain, coded)`.
+///
+/// Exists because every #3149 fixture was gzip and every assertion was
+/// `== Some("gzip")`, so replacing the forwarded value with a hardcoded
+/// `"gzip"` literal left all fourteen tests green -- the builders were pinned
+/// to "some coding is declared", not to "the UPSTREAM's coding is declared".
+/// That is not academic: `http_client.rs` documents that S3 returns a stored
+/// `Content-Encoding` regardless of the request, and S3 commonly stores `br`.
+/// A brotli-stored wheel labelled `gzip` makes pip raise `DecodeError`
+/// mid-stream, which is strictly worse than the bug being fixed.
+///
+/// Use a NON-gzip coding in at least one test per builder.
+pub fn coded_fixture(encoding: &str, seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    use flate2::write::{DeflateEncoder, GzEncoder};
+    use flate2::Compression;
+    use std::io::Write;
+
+    let plain = seed.repeat(64);
+    let coded = match encoding {
+        "gzip" => {
+            let mut e = GzEncoder::new(Vec::new(), Compression::default());
+            e.write_all(&plain).expect("gzip encode");
+            e.finish().expect("gzip finish")
+        }
+        "deflate" => {
+            let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
+            e.write_all(&plain).expect("deflate encode");
+            e.finish().expect("deflate finish")
+        }
+        other => panic!("unsupported test coding {other}"),
+    };
+    assert_ne!(
+        coded, plain,
+        "fixture must actually be coded or the test proves nothing"
+    );
+    (plain, coded)
+}
+
+/// Decode a `deflate` body, so a test can assert the client receives BYTES it
+/// can actually decode rather than only that a header is present.
+pub fn inflate_deflate(coded: &[u8]) -> Vec<u8> {
+    use flate2::read::DeflateDecoder;
+    use std::io::Read;
+
+    let mut out = Vec::new();
+    DeflateDecoder::new(coded)
+        .read_to_end(&mut out)
+        .expect("body must be decodable with the coding it declares");
+    out
+}
+
+pub fn gzip_fixture(seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let plain = seed.repeat(64);
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&plain).expect("gzip encode");
+    let coded = encoder.finish().expect("gzip finish");
+    assert_ne!(
+        coded, plain,
+        "fixture must actually be coded or the test proves nothing"
+    );
+    (plain, coded)
+}
+
+/// Read a header off a response as a `String`, or `None` when absent.
+///
+/// The #3149 tests assert both presence (proxied serve forwards the upstream
+/// coding) and ABSENCE (an uncoded upstream must not have a coding
+/// manufactured for it), so they need the negative case to be expressible.
+pub fn header_str(
+    headers: &axum::http::HeaderMap,
+    name: axum::http::header::HeaderName,
+) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Collect a `Response` produced by calling a handler DIRECTLY (rather than
+/// through a `Router`) into `(status, body, headers)`.
+///
+/// [`send_with_headers`] covers the router path; several #3149 arms are
+/// reached by invoking the handler function with its extractors, which yields
+/// a bare `Response`. Body buffering lives here because `.clippy.toml`
+/// disallows `axum::body::to_bytes` at call sites under the #1608 streaming
+/// invariant, and this module carries the documented exemption.
+pub async fn collect_response(
+    resp: axum::response::Response,
+) -> (StatusCode, Bytes, axum::http::HeaderMap) {
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .expect("body");
+    (status, body, headers)
+}
