@@ -966,6 +966,13 @@ jobs:
     # peak RSS.
     env:
       CARGO_INCREMENTAL: "0"
+      # This job carries no rust-cache (see the sccache note below), so it
+      # resolves and downloads the whole dependency graph from crates.io on
+      # every run — more registry exposure than any other Rust job here. Now
+      # that a failure blocks a PR rather than just reddening a `main` push,
+      # a transient registry hiccup costs a developer a rerun, so let cargo
+      # retry the fetch itself before the step fails.
+      CARGO_NET_RETRY: "10"
     services:
       postgres:
         # Use the GHCR mirror to avoid Docker Hub anonymous-pull rate limits.
@@ -984,6 +991,38 @@ jobs:
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Resolve and download the dependency graph in its own step, ahead of the
+      # test steps, with a retry.
+      #
+      # Why: on 2026-08-07 this job failed on `main` (run 31176621357) with
+      #   error: failed to select a version for the requirement `axum = "^0.7"`
+      #          (locked to 0.7.9)
+      #   candidate versions found which didn't match: 0.6.6, 0.6.5, ...
+      # i.e. cargo saw a stale/truncated crates.io index. No test ever ran.
+      # That was the only non-test failure of this job on `main` in the last
+      # 13 runs, and under this PR the same hiccup would red a developer's PR
+      # instead of a post-merge push.
+      #
+      # This retries the *resolution and download* only. It deliberately does
+      # NOT wrap `cargo test`: retrying the test steps would mask exactly the
+      # real regressions this gate exists to catch. A genuine dependency
+      # problem still fails after the last attempt.
+      #
+      # No `--locked`: the test steps below do not use it either, so adding it
+      # here would newly fail PRs with a legitimately-updated Cargo.lock.
+      - name: Fetch dependencies
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo fetch; then
+              exit 0
+            fi
+            echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
+            sleep $(( attempt * 10 ))
+          done
+          echo "ERROR: cargo fetch failed after 3 attempts" >&2
+          exit 1
 
       # The integration suites under `backend/tests/` insert into real tables
       # (users, api_tokens, repositories, ...) via the SQLx pool. The service
