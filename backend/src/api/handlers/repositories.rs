@@ -245,6 +245,41 @@ pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibilit
     }
 }
 
+/// The GRANT half of [`require_visible`], for rows reached *through* an
+/// already-authorized parent — a virtual repository's members.
+///
+/// Deliberately not [`visibility_for_auth`]. That function answers "which
+/// repositories may this principal LIST", and for a repo-scoped token the
+/// answer is exactly its allowed set — the listing's documented contract.
+/// Membership is a different question, and reusing the `Ids` arm for it gets
+/// two things wrong, because `require_visible` is
+///
+/// ```text
+/// is_public OR (in_scope AND (is_admin OR grants))
+/// ```
+///
+/// and the `Ids` arm is `in_scope` alone. It drops the `is_public` arm — so a
+/// token scoped to a virtual reported 0 bytes for members it could plainly
+/// read, and an authenticated scoped caller saw a SMALLER total than an
+/// anonymous one — and it drops the grant conjunct, so a token kept counting a
+/// member's bytes after its owner's grant was revoked. Scope is a mint-time
+/// snapshot; entitlement is not.
+///
+/// The scope half is already satisfied here: `require_visible` gated the parent
+/// before any aggregation runs, so the caller is entitled to read this virtual,
+/// and a virtual's members are its content. That is the same read-through the
+/// by-path download already grants such a token.
+///
+/// NOTE: PR #3173 adds an identical helper to this file for the member
+/// LISTING paths. Whichever lands second should drop its copy.
+pub(crate) fn member_grant_visibility(auth: Option<&AuthExtension>) -> RepoVisibility {
+    match auth {
+        None => RepoVisibility::PublicOnly,
+        Some(a) if a.is_admin => RepoVisibility::All,
+        Some(a) => RepoVisibility::User(a.user_id),
+    }
+}
+
 /// Ensure a repository is visible to the current user.
 ///
 /// Public repos are visible to everyone. Private repos require authentication
@@ -2215,6 +2250,9 @@ pub async fn list_repositories(
     // a repo-scoped token, only the token's allowed repositories rather than
     // every repo the owning user can reach.
     let visibility = visibility_for_auth(auth.as_ref());
+    // The LISTING uses token scope; the per-virtual byte AGGREGATE uses the
+    // grant half only. See  for why they differ.
+    let member_visibility = member_grant_visibility(auth.as_ref());
     let service = RepositoryService::new(state.db.clone());
     let (repos, total) = service
         .list(
@@ -2293,7 +2331,7 @@ pub async fn list_repositories(
         // through the virtual's total.
         storage_map.extend(
             service
-                .get_virtual_storage_usage_batch(&virtual_ids, &visibility)
+                .get_virtual_storage_usage_batch(&virtual_ids, &member_visibility)
                 .await?,
         );
     }
@@ -2815,7 +2853,7 @@ pub async fn get_repository(
     // #3081: that union is scoped to the members THIS caller may see, so the
     // aggregate cannot disclose the size of a member whose own GET 404s.
     let storage_used = service
-        .get_display_storage_usage(&repo, &visibility_for_auth(auth.as_ref()))
+        .get_display_storage_usage(&repo, &member_grant_visibility(auth.as_ref()))
         .await?;
     let auth_type =
         crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
@@ -3646,7 +3684,7 @@ pub async fn update_repository(
     // #2785: virtual repos report the union of their members' contents.
     // #3081: scoped to the members this caller may see.
     let storage_used = service
-        .get_display_storage_usage(&repo, &visibility_for_auth(Some(&auth)))
+        .get_display_storage_usage(&repo, &member_grant_visibility(Some(&auth)))
         .await?;
 
     state.event_bus.emit_repository_event(
@@ -21533,6 +21571,17 @@ mod apt_validation_tests {
         .await
         .expect("insert visible member artifact");
         seed_oci_blob_test(&pool, hidden, 500_000).await;
+
+        // A repo `member` CAN see, holding bytes, that is deliberately NOT a
+        // member of the virtual. Without it, removing the
+        // `virtual_repo_members` join entirely -- making `leaves` "every repo
+        // the caller can see" -- still satisfies the outsider (0) and member
+        // (1,000) assertions below. Only the admin total would catch it, and
+        // only incidentally, via unrelated repos left in the shared database.
+        // That is state-dependent rather than by construction.
+        let outside = seeded_repo_3078(&pool, &prefix, "outside", "local").await;
+        seed_oci_blob_test(&pool, outside, 7_000).await;
+
         link_virtual_members_test(&pool, virt, &[(vis, 1), (hidden, 2)]).await;
 
         let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
@@ -21541,6 +21590,7 @@ mod apt_validation_tests {
         tdh::grant_repo_access(&pool, virt, outsider_id).await;
         tdh::grant_repo_access(&pool, virt, member_id).await;
         tdh::grant_repo_access(&pool, vis, member_id).await;
+        tdh::grant_repo_access(&pool, outside, member_id).await;
 
         let virt_key = format!("{prefix}-virt");
         let vis_key = format!("{prefix}-vis");
