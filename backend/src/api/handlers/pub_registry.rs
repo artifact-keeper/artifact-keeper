@@ -1145,6 +1145,152 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Build a gzipped tar containing exactly one `pubspec.yaml` with `body`.
+    fn archive_with_pubspec(body: &str) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("pubspec.yaml").unwrap();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder
+            .append(&header, body.as_bytes())
+            .expect("append pubspec");
+        let tar_bytes = tar_builder.into_inner().expect("finish tar");
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_bytes).expect("gzip write");
+        encoder.finish().expect("gzip finish")
+    }
+
+    /// Negative controls for the #3058 widening.
+    ///
+    /// `dependencies` moved from `HashMap<String, String>` to an untyped
+    /// value, which is the right fix -- but it also means a fully
+    /// attacker-controlled pubspec now drives an untyped deserializer at
+    /// publish time. These pin that malformed input still degrades to a clean
+    /// `Err` (a 400) rather than a panic or a stack overflow, which is the
+    /// property the widening could plausibly have broken.
+    ///
+    /// Deliberately assert `is_err()` and not a specific message: the point is
+    /// that the request fails gracefully, not how the error is worded.
+    #[test]
+    fn test_malformed_pubspec_dependencies_fail_cleanly_3058() {
+        // Deeply nested map. serde_yaml caps nesting at 128 and returns
+        // RecursionLimitExceeded; without a limit this is a stack overflow,
+        // which aborts the process rather than the request.
+        let deep = format!(
+            "name: x\nversion: 1.0.0\ndependencies:\n  bomb:{}",
+            // Indentation must INCREASE per level -- a constant indent is 200
+            // siblings, not 200 levels deep, and parses fine.
+            (0..200)
+                .map(|i| format!("\n{}k:", " ".repeat(4 + i * 2)))
+                .collect::<String>()
+        );
+        assert!(
+            extract_pubspec_from_archive(&archive_with_pubspec(&deep)).is_err(),
+            "a 200-deep dependency map must be rejected, not overflow the stack"
+        );
+
+        // Non-string mapping keys, at both levels. Measured rather than
+        // assumed: serde coerces a scalar key to a string in BOTH the outer
+        // `HashMap<String, _>` and the untyped value, so these parse rather
+        // than erroring. That is benign -- what matters is that neither
+        // panics on the conversion, which is the failure mode a widened
+        // untyped deserializer could plausibly introduce.
+        for coerced in [
+            "name: x\nversion: 1.0.0\ndependencies:\n  1: foo\n",
+            "name: x\nversion: 1.0.0\ndependencies:\n  foo:\n    1: bar\n",
+        ] {
+            assert!(
+                extract_pubspec_from_archive(&archive_with_pubspec(coerced)).is_ok(),
+                "scalar mapping keys are coerced to strings, not rejected: {coerced:?}"
+            );
+        }
+
+        // Wrong container shape where a mapping is required.
+        let sequence = "name: x\nversion: 1.0.0\ndependencies:\n  - a\n  - b\n";
+        assert!(
+            extract_pubspec_from_archive(&archive_with_pubspec(sequence)).is_err(),
+            "a sequence where a mapping is required must be rejected cleanly"
+        );
+
+        // Positive control. Without this the three assertions above are
+        // satisfied by a parser that rejects everything -- including every
+        // real Flutter pubspec, which is the bug #3058 fixed.
+        let good = "name: x\nversion: 1.0.0\ndependencies:\n  flutter:\n    sdk: flutter\n";
+        assert!(
+            extract_pubspec_from_archive(&archive_with_pubspec(good)).is_ok(),
+            "the legitimate map form must still parse"
+        );
+    }
+
+    /// Regression test for #3058: a real Flutter plugin archive must survive
+    /// pubspec extraction. Every non-string dependency form Pub permits is
+    /// present here; each one previously aborted the upload with 400.
+    #[test]
+    fn test_extract_pubspec_from_flutter_plugin_archive_3058() {
+        let pubspec = r#"
+name: my_flutter_plugin
+version: 2.1.0
+description: A Flutter plugin with the full range of dependency forms.
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^0.13.0
+  some_git_pkg:
+    git:
+      url: https://example.com/pkg.git
+      ref: main
+  some_path_pkg:
+    path: ../local_pkg
+  some_hosted_pkg:
+    hosted:
+      name: some_hosted_pkg
+      url: https://pub.example.com
+    version: ^1.0.0
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  test: ^1.16.0
+"#;
+
+        let spec = extract_pubspec_from_archive(&archive_with_pubspec(pubspec))
+            .expect("Flutter plugin archive must yield a pubspec");
+
+        assert_eq!(spec.name, "my_flutter_plugin");
+        assert_eq!(spec.version, "2.1.0");
+
+        let deps = spec.dependencies.expect("dependencies present");
+        assert_eq!(deps["flutter"], serde_json::json!({ "sdk": "flutter" }));
+        assert_eq!(deps["http"], serde_json::json!("^0.13.0"));
+        assert_eq!(
+            deps["some_path_pkg"],
+            serde_json::json!({ "path": "../local_pkg" })
+        );
+        assert_eq!(
+            deps["some_git_pkg"]["git"]["url"],
+            serde_json::json!("https://example.com/pkg.git")
+        );
+        assert_eq!(
+            deps["some_hosted_pkg"]["hosted"]["url"],
+            serde_json::json!("https://pub.example.com")
+        );
+
+        let dev_deps = spec.dev_dependencies.expect("dev_dependencies present");
+        assert_eq!(
+            dev_deps["flutter_test"],
+            serde_json::json!({ "sdk": "flutter" })
+        );
+    }
+
     #[test]
     fn test_pub_error_response_format() {
         let resp = pub_error_response(StatusCode::NOT_FOUND, "NOT_FOUND", "Package not found");

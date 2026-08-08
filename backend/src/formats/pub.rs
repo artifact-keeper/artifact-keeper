@@ -28,10 +28,16 @@ pub struct PubSpec {
     pub repository: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<HashMap<String, String>>,
+    /// Dependency constraints, keyed by package name.
+    ///
+    /// Values are intentionally untyped: Pub allows a plain version string
+    /// (`http: ^0.13.0`) *or* a mapping for SDK, git, path and hosted
+    /// dependencies (`flutter: {sdk: flutter}`). Modelling this as a string
+    /// rejected every Flutter package at publish time (#3058).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dependencies: Option<HashMap<String, String>>,
+    pub dependencies: Option<HashMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dev_dependencies: Option<HashMap<String, String>>,
+    pub dev_dependencies: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Handler for Pub.dev format (Dart/Flutter packages)
@@ -237,12 +243,21 @@ mod tests {
                     .collect(),
             ),
             dependencies: Some(
-                vec![("http".to_string(), "^0.13.0".to_string())]
-                    .into_iter()
-                    .collect(),
+                vec![
+                    ("http".to_string(), serde_json::json!("^0.13.0")),
+                    // The map form #3058 added support for. It has to survive
+                    // SERIALIZATION too, not just parsing: `newUpload`
+                    // persists `serde_json::to_value(&pubspec)` and the
+                    // registry serves that back as the published pubspec, so
+                    // a `skip_serializing` on this field would leave every
+                    // client resolving against an empty dependency set.
+                    ("flutter".to_string(), serde_json::json!({"sdk": "flutter"})),
+                ]
+                .into_iter()
+                .collect(),
             ),
             dev_dependencies: Some(
-                vec![("test".to_string(), "^1.16.0".to_string())]
+                vec![("test".to_string(), serde_json::json!("^1.16.0"))]
                     .into_iter()
                     .collect(),
             ),
@@ -252,6 +267,13 @@ mod tests {
         assert_eq!(json["name"], "my_package");
         assert_eq!(json["version"], "1.0.0");
         assert_eq!(json["description"], "A test package");
+        assert_eq!(json["dependencies"]["http"], "^0.13.0");
+        assert_eq!(
+            json["dependencies"]["flutter"],
+            serde_json::json!({"sdk": "flutter"}),
+            "the map dependency form must survive the round trip the registry \
+             actually serves"
+        );
     }
 
     #[test]
@@ -297,5 +319,41 @@ mod tests {
         assert!(result.is_ok());
         let info = result.unwrap();
         assert_eq!(info.version, Some("1.0.0-beta.1".to_string()));
+    }
+
+    /// A Flutter plugin's pubspec.yaml declares SDK dependencies as nested
+    /// mappings (`flutter: {sdk: flutter}`), not as version strings. Parsing
+    /// must accept them; rejecting them made `dart pub publish` fail with 400
+    /// during the multipart upload step (#3058).
+    #[test]
+    fn test_deserialize_pubspec_with_flutter_sdk_dependencies_3058() {
+        let yaml = r#"
+name: my_flutter_plugin
+version: 1.0.0
+description: A Flutter plugin
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^0.13.0
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  test: ^1.16.0
+"#;
+
+        let spec: PubSpec = serde_yaml::from_str(yaml).expect("Flutter pubspec must parse");
+
+        assert_eq!(spec.name, "my_flutter_plugin");
+        let deps = spec.dependencies.expect("dependencies present");
+        assert_eq!(deps["flutter"], serde_json::json!({ "sdk": "flutter" }));
+        assert_eq!(deps["http"], serde_json::json!("^0.13.0"));
+        let dev_deps = spec.dev_dependencies.expect("dev_dependencies present");
+        assert_eq!(
+            dev_deps["flutter_test"],
+            serde_json::json!({ "sdk": "flutter" })
+        );
     }
 }
