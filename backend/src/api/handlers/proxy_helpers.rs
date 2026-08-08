@@ -5339,6 +5339,83 @@ pub async fn enforce_curation_lookup(
     enforce_curation(db, target, package, version).await
 }
 
+/// On-demand curation INGESTION for pypi/npm (#2955 Stage 2).
+///
+/// Unlike rpm/debian, pypi and npm have no enumerable global upstream index, so
+/// they are ingested on first sight: when the proxy serves a package, this
+/// enqueues a `pending` `curation_packages` row for every staging repo whose
+/// `curation_source_repo_id` points at the proxy repo. The scheduler tick then
+/// evaluates those rows exactly as it does rpm/debian — and, off this hot path,
+/// runs attestation verification.
+///
+/// Deliberately best-effort and fail-OPEN: this is enrichment, not enforcement
+/// (enforcement is [`enforce_curation`], unchanged). Callers should
+/// `tokio::spawn` it so the proxy response latency is untouched. Any DB error is
+/// logged and swallowed. `upsert_package`'s `ON CONFLICT DO UPDATE` makes
+/// repeated proxy hits idempotent. Only proxy repos (`remote`/`virtual`) have an
+/// upstream worth ingesting from.
+pub async fn enqueue_curation_on_demand(
+    db: &PgPool,
+    proxy_repo_id: Uuid,
+    proxy_repo_type: &str,
+    entry: crate::services::curation_sync::CurationPackageEntry,
+) {
+    if !matches!(proxy_repo_type, "remote" | "virtual") {
+        return;
+    }
+    // Reverse lookup: the staging repos that curate this proxy repo.
+    let staging: Vec<Uuid> = match sqlx::query_scalar(
+        r#"SELECT id FROM repositories
+           WHERE repo_type = 'staging'
+             AND curation_enabled = true
+             AND curation_source_repo_id = $1"#,
+    )
+    .bind(proxy_repo_id)
+    .fetch_all(db)
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(
+                proxy_repo_id = %proxy_repo_id,
+                package = %entry.package_name,
+                error = %e,
+                "on-demand curation ingest: staging-repo lookup failed; skipping"
+            );
+            return;
+        }
+    };
+    if staging.is_empty() {
+        return;
+    }
+    let svc = crate::services::curation_service::CurationService::new(db.clone());
+    for staging_id in staging {
+        if let Err(e) = svc
+            .upsert_package(
+                staging_id,
+                proxy_repo_id,
+                &entry.format,
+                &entry.package_name,
+                &entry.version,
+                entry.release.as_deref(),
+                entry.architecture.as_deref(),
+                entry.checksum_sha256.as_deref(),
+                &entry.upstream_path,
+                &entry.metadata,
+                entry.primary_metadata.as_ref(),
+            )
+            .await
+        {
+            tracing::warn!(
+                staging_repo_id = %staging_id,
+                package = %entry.package_name,
+                error = %e,
+                "on-demand curation ingest: upsert failed; skipping"
+            );
+        }
+    }
+}
+
 /// 503 response when a repository's age gate is enabled but cannot be
 /// evaluated (service unwired, config unreadable, or no evidence resolution
 /// at the calling seam). The age gate fails CLOSED (#2264): an evaluation
@@ -9060,7 +9137,7 @@ mod tests {
                 .bind(id)
                 .bind(&key)
                 .bind(format!("ph-test-{}", id))
-                .bind(storage_dir.to_string_lossy().as_ref())
+                .bind(&*storage_dir.to_string_lossy())
                 .bind(upstream_url)
                 .execute(pool)
                 .await

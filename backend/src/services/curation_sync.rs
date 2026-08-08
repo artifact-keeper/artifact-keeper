@@ -868,6 +868,220 @@ pub fn primary_gz_pinned_by_repomd(
     }
 }
 
+// ---------------------------------------------------------------------------
+// pypi / npm on-demand ingestion adapters (#2955 Stage 2)
+//
+// Unlike rpm/debian, pypi and npm have no enumerable global upstream index, so
+// they are ingested ON DEMAND: when the proxy first serves a package the fetch
+// seam already knows name+version+metadata, and enqueues a curation_packages
+// row (the scheduler then evaluates it exactly as rpm/debian rows). These pure
+// builders turn registry metadata into a `CurationPackageEntry` whose `metadata`
+// blob carries precisely what `publisher_source::extract_publisher` parses —
+// nothing more (so a size-bomb in an unrelated field like `info.description` is
+// never copied). Zero crypto here: this only labels the publisher signal;
+// verification is a separate step (`attestation_verify`).
+// ---------------------------------------------------------------------------
+
+/// Ceiling on any single string field copied into the curation metadata blob
+/// (#2358/#2556 hardening analogue). A hostile registry cannot inflate the
+/// stored blob through an oversized `author`/`maintainer` string.
+const MAX_META_FIELD_BYTES: usize = 8 * 1024;
+
+/// Ceiling on the number of `maintainers[]` / `urls[]` entries copied.
+const MAX_META_LIST_ENTRIES: usize = 256;
+
+/// Ceiling on the serialized size of a copied provenance / attestations object.
+/// Beyond this the provenance is dropped (the entry still ingests as
+/// metadata-only) rather than parsed into the blob.
+const MAX_PROVENANCE_BYTES: usize = 256 * 1024;
+
+/// Copy a string field only if present, non-empty, and within the size cap.
+fn bounded_str(value: Option<&serde_json::Value>) -> Option<String> {
+    let s = value?.as_str()?.trim();
+    if s.is_empty() || s.len() > MAX_META_FIELD_BYTES {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// Copy a nested object only if it serializes within `MAX_PROVENANCE_BYTES`.
+fn bounded_object(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let v = value?;
+    if !v.is_object() && !v.is_array() {
+        return None;
+    }
+    // `to_string` here is bounded by the proxy's fetch cap on the source blob;
+    // this second check keeps a merged provenance object from bloating the row.
+    let len = serde_json::to_string(v).ok()?.len();
+    if len > MAX_PROVENANCE_BYTES {
+        return None;
+    }
+    Some(v.clone())
+}
+
+/// The representative distribution file for a pypi version.
+#[derive(Debug, Clone, Default)]
+pub struct PypiDistFile {
+    pub filename: String,
+    pub sha256: Option<String>,
+    /// The upstream download URL (files.pythonhosted.org / mirror), used by the
+    /// off-hot-path verifier to fetch the exact bytes the attestation binds.
+    pub url: Option<String>,
+}
+
+/// Pick the representative distribution file for a pypi version: prefer a wheel
+/// (`bdist_wheel`), else the first file with a sha256.
+fn pypi_representative_file(pypi_json: &serde_json::Value) -> Option<PypiDistFile> {
+    let urls = pypi_json.get("urls").and_then(|v| v.as_array())?;
+    let mut fallback: Option<PypiDistFile> = None;
+    for (i, u) in urls.iter().enumerate() {
+        if i >= MAX_META_LIST_ENTRIES {
+            break;
+        }
+        let Some(filename) = bounded_str(u.get("filename")) else {
+            continue;
+        };
+        let file = PypiDistFile {
+            filename,
+            sha256: bounded_str(u.get("digests").and_then(|d| d.get("sha256"))),
+            url: bounded_str(u.get("url")),
+        };
+        if u.get("packagetype").and_then(|v| v.as_str()) == Some("bdist_wheel") {
+            return Some(file);
+        }
+        fallback.get_or_insert(file);
+    }
+    fallback
+}
+
+/// Build a curation entry from a PyPI `/pypi/{name}/{version}/json` document and
+/// (optionally) a merged PEP 740 provenance object. Returns `None` for
+/// malformed input (never a guess). The metadata blob carries only the fields
+/// `publisher_source::extract_pypi` reads, plus the representative distribution
+/// file (name + sha256) the verifier binds against.
+pub fn build_pypi_curation_entry(
+    name: &str,
+    version: &str,
+    pypi_json: &serde_json::Value,
+    provenance: Option<&serde_json::Value>,
+) -> Option<CurationPackageEntry> {
+    let name = name.trim();
+    let version = version.trim();
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+
+    let dist = pypi_representative_file(pypi_json).unwrap_or_default();
+
+    // Minimal `info` — only the self-asserted publisher fields.
+    let info = pypi_json.get("info");
+    let mut info_blob = serde_json::Map::new();
+    for key in ["author", "maintainer", "author_email", "maintainer_email"] {
+        if let Some(v) = bounded_str(info.and_then(|i| i.get(key))) {
+            info_blob.insert(key.to_string(), serde_json::Value::String(v));
+        }
+    }
+
+    let mut metadata = serde_json::json!({
+        "name": name,
+        "version": version,
+        "info": serde_json::Value::Object(info_blob),
+    });
+    if !dist.filename.is_empty() {
+        metadata["_ak_dist"] = serde_json::json!({
+            "filename": dist.filename,
+            "sha256": dist.sha256,
+            "url": dist.url,
+        });
+    }
+    // Prefer an explicitly-merged provenance object; else a `provenance` already
+    // embedded in the pypi document.
+    if let Some(prov) = bounded_object(provenance.or_else(|| pypi_json.get("provenance"))) {
+        metadata["provenance"] = prov;
+    }
+
+    Some(CurationPackageEntry {
+        format: "pypi".to_string(),
+        package_name: name.to_string(),
+        version: version.to_string(),
+        release: None,
+        architecture: None,
+        checksum_sha256: dist.sha256,
+        upstream_path: dist.filename,
+        metadata,
+        primary_metadata: None,
+    })
+}
+
+/// Build a curation entry from an npm version document (a `versions[ver]` object
+/// out of a packument). Returns `None` for malformed input. The metadata blob
+/// carries only the fields `publisher_source::extract_npm` reads (`_npmUser`,
+/// `maintainers`, `dist.attestations`) plus the dist checksum/tarball.
+pub fn build_npm_curation_entry(
+    name: &str,
+    version: &str,
+    version_doc: &serde_json::Value,
+) -> Option<CurationPackageEntry> {
+    let name = name.trim();
+    let version = version.trim();
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+
+    let dist = version_doc.get("dist");
+    let tarball = bounded_str(dist.and_then(|d| d.get("tarball")));
+    // npm publishes sha512 as `dist.integrity`; `dist.shasum` is a legacy sha1.
+    let shasum = bounded_str(dist.and_then(|d| d.get("shasum")));
+    let integrity = bounded_str(dist.and_then(|d| d.get("integrity")));
+
+    let mut dist_blob = serde_json::Map::new();
+    if let Some(t) = tarball.clone() {
+        dist_blob.insert("tarball".to_string(), serde_json::Value::String(t));
+    }
+    if let Some(s) = shasum.clone() {
+        dist_blob.insert("shasum".to_string(), serde_json::Value::String(s));
+    }
+    if let Some(i) = integrity {
+        dist_blob.insert("integrity".to_string(), serde_json::Value::String(i));
+    }
+    if let Some(att) = bounded_object(dist.and_then(|d| d.get("attestations"))) {
+        dist_blob.insert("attestations".to_string(), att);
+    }
+
+    let mut metadata = serde_json::json!({
+        "name": name,
+        "version": version,
+        "dist": serde_json::Value::Object(dist_blob),
+    });
+    if let Some(user) = bounded_str(version_doc.get("_npmUser").and_then(|u| u.get("name"))) {
+        metadata["_npmUser"] = serde_json::json!({ "name": user });
+    }
+    if let Some(maints) = version_doc.get("maintainers").and_then(|m| m.as_array()) {
+        let list: Vec<serde_json::Value> = maints
+            .iter()
+            .take(MAX_META_LIST_ENTRIES)
+            .filter_map(|m| bounded_str(m.get("name")).map(|n| serde_json::json!({ "name": n })))
+            .collect();
+        if !list.is_empty() {
+            metadata["maintainers"] = serde_json::Value::Array(list);
+        }
+    }
+
+    // npm sha1 shasum is not a security-grade digest; store it for identity but
+    // the curation checksum column stays None (we do not bind on sha1).
+    Some(CurationPackageEntry {
+        format: "npm".to_string(),
+        package_name: name.to_string(),
+        version: version.to_string(),
+        release: None,
+        architecture: None,
+        checksum_sha256: None,
+        upstream_path: tarball.unwrap_or_default(),
+        metadata,
+        primary_metadata: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1264,5 +1478,152 @@ Description: Command line URL transfer tool
         let content = "Package: incomplete\n\n";
         let entries = parse_deb_packages_index(content, "main");
         assert_eq!(entries.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod ondemand_ingestion_tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- PyPI --------------------------------------------------------------
+
+    fn pypi_json_with_provenance() -> serde_json::Value {
+        json!({
+            "info": {
+                "author": "NumPy Developers",
+                "author_email": "NumFOCUS <admin@numfocus.org>",
+                "maintainer": null,
+                "name": "numpy",
+                "version": "2.0.0",
+                "description": "x".repeat(500)  // must NOT be copied into the blob
+            },
+            "urls": [
+                {"filename": "numpy-2.0.0.tar.gz", "packagetype": "sdist",
+                 "digests": {"sha256": "aaaa"}},
+                {"filename": "numpy-2.0.0-py3-none-any.whl", "packagetype": "bdist_wheel",
+                 "digests": {"sha256": "bbbb"}}
+            ],
+            "provenance": {
+                "attestation_bundles": [{
+                    "publisher": {"kind": "GitHub", "repository": "numpy/numpy"},
+                    "attestations": [{"envelope": {}}]
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn pypi_entry_prefers_wheel_and_carries_publisher_fields() {
+        let e = build_pypi_curation_entry("numpy", "2.0.0", &pypi_json_with_provenance(), None)
+            .expect("entry builds");
+        assert_eq!(e.format, "pypi");
+        assert_eq!(e.package_name, "numpy");
+        assert_eq!(e.version, "2.0.0");
+        // Wheel is preferred as the representative file.
+        assert_eq!(e.upstream_path, "numpy-2.0.0-py3-none-any.whl");
+        assert_eq!(e.checksum_sha256.as_deref(), Some("bbbb"));
+        // The blob carries exactly what extract_publisher reads...
+        assert_eq!(e.metadata["info"]["author"], "NumPy Developers");
+        assert!(e.metadata["provenance"]["attestation_bundles"].is_array());
+        // ...and NOT the size-bomb-prone description.
+        assert!(e.metadata["info"].get("description").is_none());
+        // The evaluator sees the attested publisher through it.
+        let id =
+            crate::services::curation::publisher_source::extract_publisher("pypi", &e.metadata)
+                .expect("publisher extracted");
+        assert_eq!(id.name, "numpy"); // repo owner
+        assert!(!id.verified); // presence != trust, still fail-safe
+    }
+
+    #[test]
+    fn pypi_entry_malformed_inputs_fail_closed() {
+        // Empty name/version.
+        assert!(build_pypi_curation_entry("", "1.0", &json!({}), None).is_none());
+        assert!(build_pypi_curation_entry("p", "", &json!({}), None).is_none());
+        // No urls / no info: still ingests (metadata-only) but with empty file.
+        let e = build_pypi_curation_entry("p", "1.0", &json!({}), None).unwrap();
+        assert!(e.upstream_path.is_empty());
+        assert!(e.checksum_sha256.is_none());
+    }
+
+    #[test]
+    fn pypi_entry_size_bomb_fields_are_dropped_not_copied() {
+        let bomb = json!({
+            "info": {"author": "A".repeat(MAX_META_FIELD_BYTES + 1)},
+            "urls": []
+        });
+        let e = build_pypi_curation_entry("p", "1.0", &bomb, None).unwrap();
+        // Oversized author is dropped rather than copied — the blob stays small.
+        assert!(e.metadata["info"].get("author").is_none());
+    }
+
+    #[test]
+    fn pypi_entry_oversize_provenance_is_dropped() {
+        // A provenance object beyond the cap is dropped; the entry still ingests.
+        let huge = json!({"attestation_bundles": ["x".repeat(MAX_PROVENANCE_BYTES + 10)]});
+        let e = build_pypi_curation_entry("p", "1.0", &json!({"urls": []}), Some(&huge)).unwrap();
+        assert!(e.metadata.get("provenance").is_none());
+    }
+
+    // --- npm ---------------------------------------------------------------
+
+    fn npm_version_doc() -> serde_json::Value {
+        json!({
+            "name": "sigstore",
+            "version": "5.0.0",
+            "_npmUser": {"name": "GitHub Actions", "email": "x@y"},
+            "maintainers": [{"name": "bdehamer", "email": "z@y"}],
+            "dist": {
+                "integrity": "sha512-AAAA",
+                "shasum": "deadbeef",
+                "tarball": "https://registry.npmjs.org/sigstore/-/sigstore-5.0.0.tgz",
+                "attestations": {"url": "https://.../attestations", "provenance": {"predicateType": "https://slsa.dev/provenance/v1"}}
+            }
+        })
+    }
+
+    #[test]
+    fn npm_entry_carries_publisher_and_attestation_fields() {
+        let e = build_npm_curation_entry("sigstore", "5.0.0", &npm_version_doc()).unwrap();
+        assert_eq!(e.format, "npm");
+        assert_eq!(
+            e.upstream_path,
+            "https://registry.npmjs.org/sigstore/-/sigstore-5.0.0.tgz"
+        );
+        // sha1 shasum is not a security digest -> the checksum column stays None.
+        assert!(e.checksum_sha256.is_none());
+        assert_eq!(e.metadata["_npmUser"]["name"], "GitHub Actions");
+        assert_eq!(e.metadata["dist"]["integrity"], "sha512-AAAA");
+        assert!(e.metadata["dist"]["attestations"]["provenance"].is_object());
+        // The evaluator sees the attested (but unverified) publisher.
+        let id = crate::services::curation::publisher_source::extract_publisher("npm", &e.metadata)
+            .expect("publisher extracted");
+        assert_eq!(id.name, "GitHub Actions");
+        assert!(!id.verified);
+    }
+
+    #[test]
+    fn npm_entry_malformed_fails_closed() {
+        assert!(build_npm_curation_entry("", "1", &json!({})).is_none());
+        // Missing dist: still ingests as metadata-only.
+        let e =
+            build_npm_curation_entry("p", "1.0", &json!({"maintainers": [{"name": "m"}]})).unwrap();
+        assert!(e.upstream_path.is_empty());
+        assert_eq!(e.metadata["maintainers"][0]["name"], "m");
+    }
+
+    #[test]
+    fn npm_entry_maintainers_list_is_bounded() {
+        let many: Vec<serde_json::Value> = (0..(MAX_META_LIST_ENTRIES + 50))
+            .map(|i| json!({"name": format!("m{i}")}))
+            .collect();
+        let doc = json!({"maintainers": many, "dist": {}});
+        let e = build_npm_curation_entry("p", "1.0", &doc).unwrap();
+        let len = e.metadata["maintainers"].as_array().unwrap().len();
+        assert!(
+            len <= MAX_META_LIST_ENTRIES,
+            "maintainers capped, got {len}"
+        );
     }
 }

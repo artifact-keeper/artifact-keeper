@@ -2441,6 +2441,30 @@ async fn get_package_version_metadata(
             .into_response()
         })?;
 
+    // #2955 on-demand curation ingestion: when a proxy first serves an npm
+    // version doc, enqueue a pending curation row for any staging repo curating
+    // this proxy. Best-effort and spawned so the metadata response latency is
+    // untouched; attestation verification runs later on the scheduler tick, off
+    // this hot path.
+    if repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual {
+        if let Some(entry) = crate::services::curation_sync::build_npm_curation_entry(
+            package_name,
+            version,
+            &version_obj,
+        ) {
+            let db = state.db.clone();
+            let proxy_id = repo.id;
+            let proxy_type = if repo.repo_type == RepositoryType::Remote {
+                "remote"
+            } else {
+                "virtual"
+            };
+            tokio::spawn(async move {
+                proxy_helpers::enqueue_curation_on_demand(&db, proxy_id, proxy_type, entry).await;
+            });
+        }
+    }
+
     Ok(build_json_metadata_response(
         serde_json::to_string(&version_obj).unwrap(),
     ))
