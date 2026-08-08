@@ -1630,6 +1630,17 @@ async fn download_or_metadata(
             return Err(AppError::NotFound(format!("File not found: {}", filename)).into_response());
         }
         let real_filename = distribution;
+        if repo.repo_type == RepositoryType::Virtual {
+            return serve_virtual_metadata(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &normalized,
+                requested_version.as_deref(),
+                real_filename,
+            )
+            .await;
+        }
         if repo.repo_type == RepositoryType::Remote {
             if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
                 return serve_remote_metadata(
@@ -1638,7 +1649,12 @@ async fn download_or_metadata(
                     repo.id,
                     &repo.key,
                     upstream_url,
-                    &project,
+                    // NORMALIZED, exactly as the virtual arm above. This
+                    // branch was left on the raw segment when the virtual one
+                    // was fixed, so a curation block on a direct Remote repo
+                    // was still evadable by spelling: the gate saw "acmesdk"
+                    // and the fetch resolved "acme-sdk".
+                    &normalized,
                     real_filename,
                 )
                 .await;
@@ -1665,6 +1681,199 @@ async fn download_or_metadata(
         &ctx,
     )
     .await
+}
+
+/// Resolve a PEP 658 metadata request through a virtual repository's members.
+///
+/// Virtual repositories do not own artifacts, so metadata cannot be served
+/// against the virtual repository ID. Resolve members in priority order,
+/// applying the member authorization filter, the per-member curation gate, and
+/// the PEP 708 dependency-confusion isolation the download path uses.
+///
+/// It is NOT full parity with the download path, and the difference is worth
+/// stating rather than implying: `serve_file` additionally enforces the
+/// download age gate, the inline scan-and-block gate, and the quarantine check
+/// (`serve_metadata`'s query selects no quarantine columns). So a quarantined
+/// or age-withheld distribution returns 403/451 on download while its METADATA
+/// -- name, version, full `Requires-Dist` -- is served here. That is a
+/// disclosure gap, not an install bypass, and it is tracked separately.
+///
+/// A missing distribution falls through to the next member. Other failures are
+/// recorded and returned only if NO member serves, so one misconfigured
+/// upstream cannot deny metadata for a package another member owns.
+/// Takes ONLY the normalized project name. The raw path segment is
+/// deliberately not a parameter: every gate here keys on the PEP 503 form, and
+/// an earlier revision passed the raw segment to the upstream fetch, which
+/// re-normalizes with a DIFFERENT function. Not having the raw name in scope
+/// is what stops that from being reintroduced.
+async fn serve_virtual_metadata(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    virtual_repo: &RepoInfo,
+    normalized_project: &str,
+    requested_version: Option<&str>,
+    filename: &str,
+) -> Result<Response, Response> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo.id).await?;
+    if members.is_empty() {
+        return Err(
+            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
+        );
+    }
+
+    let members =
+        proxy_helpers::authorize_virtual_members(&state.permission_service, auth, members).await;
+
+    // Keep PEP 658 metadata resolution symmetric with the simple-index and
+    // distribution-download paths. A higher-priority local owner suppresses a
+    // lower-priority Remote member unless the requested distribution is an
+    // admitted Case-A platform wheel. Without this gate, a direct or stale
+    // `.metadata` URL could expose a remote-only Case-B version that neither
+    // the index advertises nor the download route serves.
+    let owning_local_min_priority =
+        proxy_helpers::pypi_virtual_isolates_name(&state.db, virtual_repo.id, normalized_project)
+            .await?;
+    let member_priorities = if owning_local_min_priority.is_some() {
+        proxy_helpers::fetch_virtual_member_priorities(&state.db, virtual_repo.id).await?
+    } else {
+        Default::default()
+    };
+    let owned_profile = if owning_local_min_priority.is_some() {
+        pypi_owned_wheel_profile(&state.db, &members, normalized_project).await
+    } else {
+        OwnedWheelProfile::default()
+    };
+
+    let mut first_member_error: Option<Response> = None;
+    for member in members {
+        let member_info = proxy_helpers::repo_info_from_member(&member);
+        if enforce_pypi_curation(state, &member_info, normalized_project, requested_version)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+
+        // Local-first for EVERY member, including Remote ones -- mirroring
+        // `serve_file`, which calls `local_fetch_or_redirect_by_suffix` before
+        // its own Remote branch precisely because Remote-typed repos do carry
+        // `artifacts` rows (direct upload, replication, promotion).
+        //
+        // Dispatching on `repo_type` alone made metadata and the wheel resolve
+        // from different places: the download served a Remote member's stored
+        // bytes while `.metadata` skipped the row and fetched the upstream's.
+        // PEP 658 metadata is not hash-tied to the distribution, so pip would
+        // resolve against one package's dependencies and install another's,
+        // with nothing anywhere to detect it.
+        match serve_metadata(
+            state,
+            &state.db,
+            member.id,
+            &member.storage_location(),
+            filename,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(response) if response.status() == StatusCode::NOT_FOUND => {}
+            // A non-404 here is a storage or DB fault, or a 503 from the
+            // decode-permit fast-fail -- not "this member does not have it".
+            // Swallowing it would fall through to a lower-priority REMOTE
+            // member and serve the upstream's metadata for a distribution this
+            // member holds locally, which is exactly the bytes-mismatch the
+            // local-first ordering exists to prevent, reappearing under load.
+            Err(response) => {
+                if first_member_error.is_none() {
+                    first_member_error = Some(response);
+                }
+                continue;
+            }
+        }
+
+        let result = if member.repo_type == RepositoryType::Remote {
+            let remote_suppressed = match owning_local_min_priority {
+                Some(local_min) => {
+                    local_min
+                        < member_priorities
+                            .get(&member.id)
+                            .copied()
+                            .unwrap_or(i32::MAX)
+                        && !owned_profile.admits(filename)
+                }
+                None => false,
+            };
+            if remote_suppressed {
+                continue;
+            }
+            match (&member.upstream_url, state.proxy_service.as_ref()) {
+                (Some(upstream_url), Some(proxy)) => {
+                    serve_remote_metadata(
+                        state,
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        // The NORMALIZED name, not the raw path segment.
+                        //
+                        // Every gate above keys on `normalized_project`
+                        // (`normalize_pep503`), but the upstream fetch
+                        // re-normalizes with `PypiHandler::normalize_name`,
+                        // and the two disagree: `normalize_pep503` silently
+                        // DROPS any character outside [A-Za-z0-9._-] without
+                        // marking a separator, while `normalize_name` maps
+                        // every non-alphanumeric to '-'. So "acme sdk" clears
+                        // the gate as "acmesdk" -- owned by nobody -- and then
+                        // fetches "acme-sdk", which is precisely the private
+                        // package the gate exists to protect.
+                        //
+                        // `normalize_name` is idempotent on PEP 503 output, so
+                        // passing the normalized name keeps the policy string
+                        // and the fetch string identical.
+                        normalized_project,
+                        filename,
+                    )
+                    .await
+                }
+                _ => continue,
+            }
+        } else {
+            // Local storage was already tried for this member above.
+            continue;
+        };
+
+        // M2: record and continue, do NOT abort the whole resolution.
+        //
+        // `serve_file`'s virtual loop logs and continues on a member error;
+        // this returned immediately on any non-404. Upstream 401/403/5xx map
+        // to BadGateway and an SSRF-blocked href maps to 400, so one Remote
+        // member with expired credentials at priority 0 made EVERY
+        // locally-owned package's metadata 502 -- while the sibling wheel
+        // download succeeded from the local member. That is the exact topology
+        // this function exists to serve.
+        //
+        // The first non-404 is kept and returned only if nothing serves, so a
+        // genuine upstream failure is still visible rather than masked as a
+        // 404.
+        match result {
+            Ok(response) => return Ok(response),
+            Err(response) if response.status() == StatusCode::NOT_FOUND => continue,
+            Err(response) => {
+                if first_member_error.is_none() {
+                    first_member_error = Some(response);
+                }
+                continue;
+            }
+        }
+    }
+
+    if let Some(error) = first_member_error {
+        return Err(error);
+    }
+
+    Err(
+        AppError::NotFound("Metadata not found in any member repository".to_string())
+            .into_response(),
+    )
 }
 
 async fn serve_remote_metadata(
@@ -9334,6 +9543,571 @@ mod tests {
             &body[..],
             metadata,
             "served metadata must be the wheel's METADATA bytes"
+        );
+    }
+
+    /// A virtual repository has no artifacts of its own. PEP 658 metadata must
+    /// therefore resolve through its remote member, just as a wheel download
+    /// does. This exercises the PR #3077 404-to-wheel fallback through the
+    /// virtual route that previously passed the virtual repository ID to
+    /// `serve_metadata` and returned 404.
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_resolves_remote_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(wheel_with_metadata("demo-1.0", metadata)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "virtual metadata request must resolve its member"
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "virtual member must return wheel METADATA"
+        );
+    }
+
+    /// A higher-priority local owner without a `tracks` declaration isolates
+    /// its project from lower-priority remote-only versions. PEP 658 metadata
+    /// must enforce the same Case-B suppression as the simple index and wheel
+    /// download, including for direct or stale `.metadata` URLs.
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_suppresses_remote_only_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let local_wheel = "demo-1.0-cp39-cp39-manylinux_2_17_x86_64.whl";
+        let remote_wheel = "demo-2.0-cp39-cp39-win_amd64.whl";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(pep658_index_html(remote_wheel)),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{remote_wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Metadata-Version: 2.1\nName: demo\nVersion: 2.0\n"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (remote_id, _remote_key, remote_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make local owner public");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach higher-priority local owner");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)",
+        )
+        .bind(local_id)
+        .bind(format!("simple/{project}/{local_wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind("test-local-owner")
+        .bind("application/zip")
+        .bind(format!("local/{local_wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed local ownership artifact");
+
+        // Write the local owner's wheel to its storage so the local branch can
+        // actually resolve. Without this the local member is only ever a miss,
+        // and the 404 below cannot distinguish "the guard suppressed the
+        // remote" from "nothing resolved at all".
+        let local_wheel_path = local_dir.join("local");
+        std::fs::create_dir_all(&local_wheel_path).expect("local storage dir");
+        std::fs::write(
+            local_wheel_path.join(local_wheel),
+            wheel_with_metadata(
+                "demo-1.0",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
+            ),
+        )
+        .expect("seed local wheel bytes");
+
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{remote_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        // POSITIVE CONTROL. The local owner's own wheel must resolve through
+        // the virtual. This is the half that fails on `main`: pre-fix, a
+        // virtual `.metadata` request falls through to
+        // `serve_metadata(repo.id)` against a repo that owns no artifacts, so
+        // EVERYTHING 404s -- which silently satisfies the negative assertion
+        // above. Without this control the suppression test is green on `main`
+        // and carries no information about whether the fix shipped.
+        let app = tdh::router_anon(super::router(), state);
+        let (local_status, local_body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{local_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        cleanup_virtual_member(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "remote-only metadata must stay hidden when the local owner outranks the remote"
+        );
+        assert_eq!(
+            local_status,
+            StatusCode::OK,
+            "the local owner's own wheel must still resolve through the virtual"
+        );
+        assert!(
+            String::from_utf8_lossy(&local_body).contains("Version: 1.0"),
+            "the served metadata must come from the LOCAL member's wheel, not \
+             the remote's -- got {:?}",
+            String::from_utf8_lossy(&local_body)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_does_not_leak_a_private_member_to_anon() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let local_wheel = "demo-1.0-cp39-cp39-manylinux_2_17_x86_64.whl";
+        let remote_wheel = "demo-2.0-cp39-cp39-win_amd64.whl";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(pep658_index_html(remote_wheel)),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{remote_wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Metadata-Version: 2.1\nName: demo\nVersion: 2.0\n"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (remote_id, _remote_key, remote_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        // PRIVATE, unlike the sibling fixture. An anonymous caller must not
+        // be able to read this member's content through the virtual.
+        sqlx::query("UPDATE repositories SET is_public = false WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make local owner private");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach higher-priority local owner");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)",
+        )
+        .bind(local_id)
+        .bind(format!("simple/{project}/{local_wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind("test-local-owner")
+        .bind("application/zip")
+        .bind(format!("local/{local_wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed local ownership artifact");
+
+        // Write the local owner's wheel to its storage so the local branch can
+        // actually resolve. Without this the local member is only ever a miss,
+        // and the 404 below cannot distinguish "the guard suppressed the
+        // remote" from "nothing resolved at all".
+        let local_wheel_path = local_dir.join("local");
+        std::fs::create_dir_all(&local_wheel_path).expect("local storage dir");
+        std::fs::write(
+            local_wheel_path.join(local_wheel),
+            wheel_with_metadata(
+                "demo-1.0",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
+            ),
+        )
+        .expect("seed local wheel bytes");
+
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{remote_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        // POSITIVE CONTROL. The local owner's own wheel must resolve through
+        // the virtual. This is the half that fails on `main`: pre-fix, a
+        // virtual `.metadata` request falls through to
+        // `serve_metadata(repo.id)` against a repo that owns no artifacts, so
+        // EVERYTHING 404s -- which silently satisfies the negative assertion
+        // above. Without this control the suppression test is green on `main`
+        // and carries no information about whether the fix shipped.
+        let app = tdh::router_anon(super::router(), state);
+        let (local_status, local_body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{local_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        cleanup_virtual_member(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        let _ = status;
+        // `serve_virtual_metadata` is a NEW way to read member content through
+        // a virtual repo, so the member filter is load-bearing here rather
+        // than inherited. Deleting `authorize_virtual_members` leaves every
+        // other test in this module green.
+        assert_ne!(
+            local_status,
+            StatusCode::OK,
+            "an anonymous caller must not read a PRIVATE member's metadata \
+             through the virtual: got body {:?}",
+            String::from_utf8_lossy(&local_body)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_survives_a_failing_higher_priority_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let local_wheel = "demo-1.0-cp39-cp39-manylinux_2_17_x86_64.whl";
+        let remote_wheel = "demo-2.0-cp39-cp39-win_amd64.whl";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{remote_wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Metadata-Version: 2.1\nName: demo\nVersion: 2.0\n"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (remote_id, _remote_key, remote_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make local owner public");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 10)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach LOWER-priority local owner (remote outranks it)");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)",
+        )
+        .bind(local_id)
+        .bind(format!("simple/{project}/{local_wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind("test-local-owner")
+        .bind("application/zip")
+        .bind(format!("local/{local_wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed local ownership artifact");
+
+        // Write the local owner's wheel to its storage so the local branch can
+        // actually resolve. Without this the local member is only ever a miss,
+        // and the 404 below cannot distinguish "the guard suppressed the
+        // remote" from "nothing resolved at all".
+        let local_wheel_path = local_dir.join("local");
+        std::fs::create_dir_all(&local_wheel_path).expect("local storage dir");
+        std::fs::write(
+            local_wheel_path.join(local_wheel),
+            wheel_with_metadata(
+                "demo-1.0",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
+            ),
+        )
+        .expect("seed local wheel bytes");
+
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{remote_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        // POSITIVE CONTROL. The local owner's own wheel must resolve through
+        // the virtual. This is the half that fails on `main`: pre-fix, a
+        // virtual `.metadata` request falls through to
+        // `serve_metadata(repo.id)` against a repo that owns no artifacts, so
+        // EVERYTHING 404s -- which silently satisfies the negative assertion
+        // above. Without this control the suppression test is green on `main`
+        // and carries no information about whether the fix shipped.
+        let app = tdh::router_anon(super::router(), state);
+        let (local_status, local_body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{local_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        cleanup_virtual_member(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        let _ = status;
+        // `serve_virtual_metadata` is a NEW way to read member content through
+        // a virtual repo, so the member filter is load-bearing here rather
+        // than inherited. Deleting `authorize_virtual_members` leaves every
+        // other test in this module green.
+        // The remote outranks the local owner and returns 500. Previously any
+        // non-404 aborted the whole loop, so a misconfigured or briefly-down
+        // upstream made EVERY locally-owned package's metadata 502 -- while
+        // the sibling wheel download succeeded, because `serve_file`'s loop
+        // logs and continues. Resolution must reach the local member.
+        assert_eq!(
+            local_status,
+            StatusCode::OK,
+            "a failing higher-priority member must not deny metadata for a \
+             package a lower-priority member owns: got body {:?}",
+            String::from_utf8_lossy(&local_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&local_body).contains("Version: 1.0"),
+            "and the body must be the local member's"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_isolation_survives_a_divergent_project_spelling() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "acme-sdk";
+        let local_wheel = "acme_sdk-1.0-cp39-cp39-manylinux_2_17_x86_64.whl";
+        let remote_wheel = "acme_sdk-9.9.9-py3-none-any.whl";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(pep658_index_html(remote_wheel)),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{remote_wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Metadata-Version: 2.1\nName: acme-sdk\nVersion: 9.9.9\n"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (remote_id, _remote_key, remote_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make local owner public");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach higher-priority local owner");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)",
+        )
+        .bind(local_id)
+        .bind(format!("simple/{project}/{local_wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind("test-local-owner")
+        .bind("application/zip")
+        .bind(format!("local/{local_wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed local ownership artifact");
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, _body) = tdh::send(
+            app,
+            // Same request, but the project segment is spelled with a
+            // character that the two normalizers disagree about. axum
+            // percent-decodes the segment, so the handler sees "demo x".
+            //
+            // `normalize_pep503` (the gate) DROPS any character outside
+            // [A-Za-z0-9._-] without marking a separator, so it yields
+            // "demox" and no local owner is found. `PypiHandler::normalize_name`
+            // (the upstream fetch) maps every non-alphanumeric to '-', so it
+            // yields "demo-x" and asks upstream for a different project than
+            // the one the gate cleared.
+            // "acme sdk" -- one space. axum percent-decodes it.
+            //
+            // `normalize_pep503` (the GATE) drops any character outside
+            // [A-Za-z0-9._-] without marking a separator  -> "acmesdk",
+            // which no local member owns, so nothing is suppressed.
+            // `PypiHandler::normalize_name` (the upstream FETCH) maps every
+            // non-alphanumeric to '-'                      -> "acme-sdk",
+            // which is exactly the private package the gate was supposed to
+            // protect. The upstream mock below answers on that spelling, the
+            // way public PyPI would for an attacker-published shadow.
+            tdh::get(format!(
+                "/{}/simple/acme%20sdk/{remote_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        cleanup_virtual_member(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "isolation must not depend on how the client spells the project. If the \
+             string used for the policy check differs from the string used to fetch, \
+             one percent-encoded character turns the dependency-confusion gate off."
         );
     }
 
