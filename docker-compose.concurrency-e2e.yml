@@ -86,12 +86,15 @@ services:
     image: ak-concurrency-mock-upstream:test
     # No container_name: must be scalable-safe and we run a single instance.
     environment:
-      # 256 MiB artifact, 1.5s latency to widen the race window.
-      ARTIFACT_SIZE_BYTES: "268435456"
-      ARTIFACT_NAME: big-artifact.bin
-      LATENCY_MS: "1500"
+      # 256 MiB artifact, 1.5s latency. All overridable from the shell,
+      # including FAIL_EVERY_NTH for fault-injection runs.
+      ARTIFACT_SIZE_BYTES: "${ARTIFACT_SIZE_BYTES:-268435456}"
+      ARTIFACT_NAME: "${ARTIFACT_NAME:-big-artifact.bin}"
+      LATENCY_MS: "${LATENCY_MS:-1500}"
       PORT: "9999"
-      SEED: "1624"
+      SEED: "${SEED:-1624}"
+      FAIL_EVERY_NTH: "${FAIL_EVERY_NTH:-0}"
+      FAIL_MODE: "${FAIL_MODE:-truncated}"
     ports:
       - "19999:9999"
     healthcheck:

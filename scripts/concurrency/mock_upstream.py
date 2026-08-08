@@ -47,6 +47,12 @@ ARTIFACT_NAME = os.environ.get("ARTIFACT_NAME", "big-artifact.bin")
 LATENCY_MS = int(os.environ.get("LATENCY_MS", "1500"))
 PORT = int(os.environ.get("PORT", "9999"))
 SEED = int(os.environ.get("SEED", "1624"))
+# Fault injection: when > 0, every Nth fetch serves a bad (short) response
+# instead of the full artifact, with a real Content-Length header so the
+# backend classifies it as truncated rather than a small complete response.
+# Disabled (0) by default.
+FAIL_EVERY_NTH = int(os.environ.get("FAIL_EVERY_NTH", "0"))
+FAIL_MODE = os.environ.get("FAIL_MODE", "truncated")  # "empty" or "truncated"
 
 CHUNK = 1024 * 1024  # 1 MiB streaming chunk
 
@@ -181,7 +187,13 @@ class Handler(BaseHTTPRequestHandler):
         # mid-stream is counted as a real upstream hit. This makes the
         # "exactly one upstream fetch" assertion strict.
         n = _bump_counter()
-        self.log_message("ARTIFACT FETCH #%d begins (latency=%dms)", n, LATENCY_MS)
+        inject_fault = FAIL_EVERY_NTH > 0 and n % FAIL_EVERY_NTH == 0
+        self.log_message(
+            "ARTIFACT FETCH #%d begins (latency=%dms%s)",
+            n,
+            LATENCY_MS,
+            ", INJECTING FAULT: %s" % FAIL_MODE if inject_fault else "",
+        )
 
         # Widen the race window: delay before sending the body. This is the
         # critical knob that lets N replica requests pile up on a cold cache.
@@ -190,9 +202,26 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
+        # Real Content-Length even on a fault, so the backend classifies the
+        # short body as truncated rather than a small complete response.
         self.send_header("Content-Length", str(PUBLISHED_SIZE))
         self.send_header("X-Mock-Upstream-Fetch", str(n))
         self.end_headers()
+        if inject_fault:
+            # Force-close rather than hang: on keep-alive the client would
+            # otherwise wait forever for bytes we advertised but won't send.
+            self.close_connection = True
+            if FAIL_MODE == "empty":
+                self.log_message("ARTIFACT FETCH #%d: fault injected, writing 0 bytes", n)
+                return
+            try:
+                # Default to b"" so ARTIFACT_SIZE_BYTES=0 (an empty artifact)
+                # doesn't turn this into an unhandled StopIteration.
+                self.wfile.write(next(iter_artifact(), b""))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.log_message("ARTIFACT FETCH #%d: fault injected, truncated after 1 chunk", n)
+            return
         try:
             for blk in iter_artifact():
                 self.wfile.write(blk)
