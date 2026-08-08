@@ -10480,14 +10480,15 @@ mod content_encoding_forwarding_tests {
         let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
             return;
         };
-        let (plain, coded) = tdh::gzip_fixture(b"\x1f\x8b npm remote tarball payload. ");
+        let (plain, coded) =
+            tdh::coded_fixture("deflate", b"\x1f\x8b npm remote tarball payload. ");
 
         let upstream = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/coded-pkg/-/coded-pkg-1.0.0.tgz"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-encoding", "deflate")
                     .set_body_bytes(coded.clone()),
             )
             .mount(&upstream)
@@ -10511,7 +10512,7 @@ mod content_encoding_forwarding_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             tdh::header_str(&headers, CONTENT_ENCODING).as_deref(),
-            Some("gzip"),
+            Some("deflate"),
             "upstream Content-Encoding must be forwarded on the Remote arm, or \
              npm writes undecodable bytes and fails the integrity check (#3149)",
         );
@@ -10524,6 +10525,17 @@ mod content_encoding_forwarding_tests {
             &body[..],
             &plain[..],
             "body must still be compressed -- the proxy must not have decoded it",
+        );
+        // Decode it. Every assertion in this suite checked only that a header
+        // was present; none proved the client receives bytes it can actually
+        // decode with the coding it was handed. A builder that declares one
+        // coding while serving another passes a header check and then breaks
+        // the client mid-stream -- which is worse than the bug being fixed,
+        // because the client hard-fails instead of writing raw bytes.
+        assert_eq!(
+            tdh::inflate_deflate(&body),
+            plain,
+            "the served body must decode with the coding it declares"
         );
     }
 
