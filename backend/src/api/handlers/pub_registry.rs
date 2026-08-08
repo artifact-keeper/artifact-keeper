@@ -1167,6 +1167,68 @@ mod tests {
         encoder.finish().expect("gzip finish")
     }
 
+    /// Negative controls for the #3058 widening.
+    ///
+    /// `dependencies` moved from `HashMap<String, String>` to an untyped
+    /// value, which is the right fix -- but it also means a fully
+    /// attacker-controlled pubspec now drives an untyped deserializer at
+    /// publish time. These pin that malformed input still degrades to a clean
+    /// `Err` (a 400) rather than a panic or a stack overflow, which is the
+    /// property the widening could plausibly have broken.
+    ///
+    /// Deliberately assert `is_err()` and not a specific message: the point is
+    /// that the request fails gracefully, not how the error is worded.
+    #[test]
+    fn test_malformed_pubspec_dependencies_fail_cleanly_3058() {
+        // Deeply nested map. serde_yaml caps nesting at 128 and returns
+        // RecursionLimitExceeded; without a limit this is a stack overflow,
+        // which aborts the process rather than the request.
+        let deep = format!(
+            "name: x\nversion: 1.0.0\ndependencies:\n  bomb:{}",
+            // Indentation must INCREASE per level -- a constant indent is 200
+            // siblings, not 200 levels deep, and parses fine.
+            (0..200)
+                .map(|i| format!("\n{}k:", " ".repeat(4 + i * 2)))
+                .collect::<String>()
+        );
+        assert!(
+            extract_pubspec_from_archive(&archive_with_pubspec(&deep)).is_err(),
+            "a 200-deep dependency map must be rejected, not overflow the stack"
+        );
+
+        // Non-string mapping keys, at both levels. Measured rather than
+        // assumed: serde coerces a scalar key to a string in BOTH the outer
+        // `HashMap<String, _>` and the untyped value, so these parse rather
+        // than erroring. That is benign -- what matters is that neither
+        // panics on the conversion, which is the failure mode a widened
+        // untyped deserializer could plausibly introduce.
+        for coerced in [
+            "name: x\nversion: 1.0.0\ndependencies:\n  1: foo\n",
+            "name: x\nversion: 1.0.0\ndependencies:\n  foo:\n    1: bar\n",
+        ] {
+            assert!(
+                extract_pubspec_from_archive(&archive_with_pubspec(coerced)).is_ok(),
+                "scalar mapping keys are coerced to strings, not rejected: {coerced:?}"
+            );
+        }
+
+        // Wrong container shape where a mapping is required.
+        let sequence = "name: x\nversion: 1.0.0\ndependencies:\n  - a\n  - b\n";
+        assert!(
+            extract_pubspec_from_archive(&archive_with_pubspec(sequence)).is_err(),
+            "a sequence where a mapping is required must be rejected cleanly"
+        );
+
+        // Positive control. Without this the three assertions above are
+        // satisfied by a parser that rejects everything -- including every
+        // real Flutter pubspec, which is the bug #3058 fixed.
+        let good = "name: x\nversion: 1.0.0\ndependencies:\n  flutter:\n    sdk: flutter\n";
+        assert!(
+            extract_pubspec_from_archive(&archive_with_pubspec(good)).is_ok(),
+            "the legitimate map form must still parse"
+        );
+    }
+
     /// Regression test for #3058: a real Flutter plugin archive must survive
     /// pubspec extraction. Every non-string dependency form Pub permits is
     /// present here; each one previously aborted the upload with 400.

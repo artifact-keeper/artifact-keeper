@@ -243,9 +243,18 @@ mod tests {
                     .collect(),
             ),
             dependencies: Some(
-                vec![("http".to_string(), serde_json::json!("^0.13.0"))]
-                    .into_iter()
-                    .collect(),
+                vec![
+                    ("http".to_string(), serde_json::json!("^0.13.0")),
+                    // The map form #3058 added support for. It has to survive
+                    // SERIALIZATION too, not just parsing: `newUpload`
+                    // persists `serde_json::to_value(&pubspec)` and the
+                    // registry serves that back as the published pubspec, so
+                    // a `skip_serializing` on this field would leave every
+                    // client resolving against an empty dependency set.
+                    ("flutter".to_string(), serde_json::json!({"sdk": "flutter"})),
+                ]
+                .into_iter()
+                .collect(),
             ),
             dev_dependencies: Some(
                 vec![("test".to_string(), serde_json::json!("^1.16.0"))]
@@ -258,6 +267,13 @@ mod tests {
         assert_eq!(json["name"], "my_package");
         assert_eq!(json["version"], "1.0.0");
         assert_eq!(json["description"], "A test package");
+        assert_eq!(json["dependencies"]["http"], "^0.13.0");
+        assert_eq!(
+            json["dependencies"]["flutter"],
+            serde_json::json!({"sdk": "flutter"}),
+            "the map dependency form must survive the round trip the registry \
+             actually serves"
+        );
     }
 
     #[test]
