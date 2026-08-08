@@ -152,6 +152,62 @@ pub(crate) enum VisibilityBind {
     Ids(Vec<Uuid>),
 }
 
+/// Controls which repositories a caller can see when they are reached
+/// *through* an already-authorized parent — today, a virtual repository's
+/// members, whose bytes are folded into the parent's storage total (#3081).
+///
+/// This is a DIFFERENT question from [`RepoVisibility`], which answers "which
+/// repositories may this principal LIST". `RepoVisibility` has no variant that
+/// can express the member question, because the handler's canonical gate
+///
+/// ```text
+/// require_visible(repo) = is_public
+///                         OR (in_scope AND (is_admin OR grants))
+/// ```
+///
+/// conjoins TWO independent facts — the token's repo scope and the user's
+/// entitlement — inside the `is_public` disjunction, and each
+/// `RepoVisibility` variant carries only one of them
+/// ([`RepoVisibility::Ids`] is `in_scope` alone; [`RepoVisibility::User`] is
+/// `is_public OR grants` alone). Composing them by intersecting two
+/// `RepoVisibility` results does not work either: the `is_public` arm must
+/// bypass scope, not be intersected with it.
+///
+/// So the member question gets its own type carrying the whole principal, and
+/// [`build_member_visibility_clause`] renders `require_visible` verbatim.
+/// `RepoVisibility::Ids` keeps its existing "scope only" listing contract
+/// untouched.
+///
+/// This is exactly the predicate PR #3173 composes row-wise for the member
+/// LISTING paths (`member_grant_visibility` in SQL AND `member_passes_token_scope`
+/// per row); the aggregate cannot filter row-wise — its rows are summed inside
+/// the database — so it renders the same predicate as one clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberVisibility {
+    /// Unauthenticated caller: only public members, matching
+    /// `require_visible`'s `None` arm (public early-return, otherwise 404).
+    Anonymous,
+    /// An authenticated principal, carrying both halves of `require_visible`.
+    Principal {
+        /// The caller's user id, consulted by the grant half.
+        user_id: Uuid,
+        /// Global admin: satisfies the entitlement half for every repository.
+        /// Does NOT bypass `allowed_repo_ids` — `require_visible` checks token
+        /// scope BEFORE the admin bypass, so an admin's repo-scoped token is
+        /// still confined to its allowed set.
+        is_admin: bool,
+        /// The token's repository scope: `None` is unrestricted
+        /// ([`crate::models::access_scope::AccessScope::Admin`]), `Some(ids)`
+        /// is the allowlist — and `Some(vec![])` grants nothing, never
+        /// everything.
+        allowed_repo_ids: Option<Vec<Uuid>>,
+    },
+    /// No principal: internal callers (reconcilers, ledger oracles, tests
+    /// asserting the true union) that must see the unfiltered total. Never
+    /// reachable from a request path.
+    Unfiltered,
+}
+
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
 // ---------------------------------------------------------------------------
@@ -400,19 +456,33 @@ pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -
     )
 }
 
-/// Split a [`VisibilityBind`] into the two concrete positional-bind shapes a
-/// visibility-filtered query can carry: a single `Uuid` (`PublicOnly` / `All` /
-/// `User`) or a `Uuid[]` (`Ids`).
+/// The GRANT half of repository visibility, WITHOUT the `is_public` disjunct:
+/// the user holds a `role_assignments` row (repo-scoped or global) or a
+/// fine-grained `permissions` rule (direct or via a group).
 ///
-/// Exactly one is `Some` per call; the unused one stays `None` and binds as a
-/// typed NULL, which the generated clause never references. Shared by the
-/// repository listing and by the virtual-repository storage aggregation
-/// (#3081) so both bind the visibility parameter identically.
-pub(crate) fn split_visibility_bind(bind: VisibilityBind) -> (Option<Uuid>, Option<Vec<Uuid>>) {
-    match bind {
-        VisibilityBind::User(uid) => (uid, None),
-        VisibilityBind::Ids(ids) => (None, Some(ids)),
-    }
+/// Factored out of [`build_visibility_clause_for`]'s `User` arm so the
+/// member-visibility predicate (#3081) composes the identical grant SQL rather
+/// than a second copy that could drift. `build_visibility_clause_for` is
+/// `is_public = true OR <this>`; [`build_member_visibility_clause`] needs the
+/// grant half on its own because `require_visible` conjoins token scope with
+/// it *inside* the `is_public` disjunction.
+pub(crate) fn build_grant_predicate(table_alias: &str, user_param: usize) -> String {
+    // Visibility honours BOTH authz stores: the legacy `role_assignments`
+    // grant (creator auto-grant + seeded admin) AND fine-grained `permissions`
+    // grants written by `POST /api/v1/permissions` (including group grants).
+    // The shared fragment reuses the same `$user_param` bind, so no extra bind
+    // is introduced for any caller.
+    let perms = permissions_grant_exists(&format!("{table_alias}.id"), user_param);
+    format!(
+        r#"(
+                EXISTS (
+                    SELECT 1 FROM role_assignments ra
+                    WHERE ra.user_id = ${user_param}
+                      AND (ra.repository_id = {table_alias}.id OR ra.repository_id IS NULL)
+                )
+                OR {perms}
+            )"#
+    )
 }
 
 /// Build the SQL visibility clause and optional user_id bind value for
@@ -452,21 +522,11 @@ pub(crate) fn build_visibility_clause_for(
         RepoVisibility::PublicOnly => ("is_public = true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::All => ("true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::User(user_id) => {
-            // Visibility honours BOTH authz stores: the legacy `role_assignments`
-            // grant (creator auto-grant + seeded admin) AND fine-grained
-            // `permissions` grants written by `POST /api/v1/permissions`
-            // (including group grants). The shared fragment reuses the same
-            // `$user_param` bind, so no extra bind is introduced for any caller.
-            let perms = permissions_grant_exists(&format!("{table_alias}.id"), user_param);
+            let grants = build_grant_predicate(table_alias, user_param);
             let clause = format!(
                 r#"(
                 is_public = true
-                OR EXISTS (
-                    SELECT 1 FROM role_assignments ra
-                    WHERE ra.user_id = ${user_param}
-                      AND (ra.repository_id = {table_alias}.id OR ra.repository_id IS NULL)
-                )
-                OR {perms}
+                OR {grants}
             )"#
             );
             (clause, VisibilityBind::User(Some(*user_id)))
@@ -479,6 +539,69 @@ pub(crate) fn build_visibility_clause_for(
                 format!("{table_alias}.id = ANY(${user_param})"),
                 VisibilityBind::Ids(ids.clone()),
             )
+        }
+    }
+}
+
+/// Render [`MemberVisibility`] as `require_visible` verbatim, plus BOTH
+/// positional binds (#3081).
+///
+/// Returns `(clause, user_bind, scope_bind)`. Unlike
+/// [`build_visibility_clause_for`], whose bind SHAPE varies by variant (a
+/// `Uuid` for some arms, a `Uuid[]` for others, so the caller must branch on
+/// which one to `.bind()`), the shape here is fixed: the caller always binds
+/// `$first_param` as `Option<Uuid>` and `$first_param + 1` as
+/// `Option<Vec<Uuid>>`, in that order, for every variant. A bind the generated
+/// clause does not reference is sent as a typed NULL, which is harmless
+/// because sqlx supplies the parameter's type OID at Parse time. Fixing the
+/// shape is deliberate: a variant-dependent bind order is how a future arm
+/// silently binds the scope list into the user slot.
+///
+/// The `Principal` clause is
+///
+/// ```text
+/// (is_public = true OR (<scope> AND <entitlement>))
+/// ```
+///
+/// with `<scope>` = `true` for an unrestricted token or
+/// `{alias}.id = ANY($scope)` for a repo-scoped one (an empty allowlist
+/// correctly matches nothing), and `<entitlement>` = `true` for a global admin
+/// or [`build_grant_predicate`] otherwise — the same grant SQL the listing's
+/// `User` arm uses.
+pub(crate) fn build_member_visibility_clause(
+    visibility: &MemberVisibility,
+    table_alias: &str,
+    first_param: usize,
+) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
+    match visibility {
+        MemberVisibility::Unfiltered => ("true".to_string(), None, None),
+        MemberVisibility::Anonymous => ("is_public = true".to_string(), None, None),
+        MemberVisibility::Principal {
+            user_id,
+            is_admin,
+            allowed_repo_ids,
+        } => {
+            let scope_param = first_param + 1;
+            let scope = match allowed_repo_ids {
+                None => "true".to_string(),
+                Some(_) => format!("{table_alias}.id = ANY(${scope_param})"),
+            };
+            let entitlement = if *is_admin {
+                "true".to_string()
+            } else {
+                build_grant_predicate(table_alias, first_param)
+            };
+            let clause = format!(
+                r#"(
+                is_public = true
+                OR ({scope} AND {entitlement})
+            )"#
+            );
+            // The user bind is only referenced by the non-admin entitlement
+            // half; it is still SENT for an admin (as a typed NULL) so the
+            // bind order never depends on the variant.
+            let user_bind = if *is_admin { None } else { Some(*user_id) };
+            (clause, user_bind, allowed_repo_ids.clone())
         }
     }
 }
@@ -1053,7 +1176,10 @@ impl RepositoryService {
         // Split the visibility bind into the two concrete `$3` shapes. Exactly
         // one is `Some` per call; the unused one stays `None` and binds as a
         // typed NULL, which the clause never references.
-        let (user_id_bind, ids_bind) = split_visibility_bind(visibility_bind);
+        let (user_id_bind, ids_bind): (Option<Uuid>, Option<Vec<Uuid>>) = match visibility_bind {
+            VisibilityBind::User(uid) => (uid, None),
+            VisibilityBind::Ids(ids) => (None, Some(ids)),
+        };
 
         // -- fetch page --
         // NOTE: the project-filter bind index differs between the page query
@@ -1659,14 +1785,14 @@ impl RepositoryService {
     /// repo we instead sum over the union of its resolvable member contents;
     /// every other repo type keeps the existing per-repo figure unchanged.
     ///
-    /// `visibility` is the CALLER's repository visibility (issue #3081): the
+    /// `visibility` is the CALLER's member visibility (issue #3081): the
     /// virtual total is aggregated only over the members that caller is
     /// allowed to see. It is unused for non-virtual repositories, whose own
     /// figure is already gated by the handler's `require_visible` check.
     pub async fn get_display_storage_usage(
         &self,
         repo: &Repository,
-        visibility: &RepoVisibility,
+        visibility: &MemberVisibility,
     ) -> Result<i64> {
         if repo.repo_type == RepositoryType::Virtual {
             self.get_virtual_storage_usage(repo.id, visibility).await
@@ -1695,24 +1821,30 @@ impl RepositoryService {
     ///
     /// # Caller-scoped (issue #3081)
     ///
-    /// The leaf set is filtered through the SAME visibility predicate the
-    /// repository listing uses ([`build_visibility_clause_for`]), so a caller
-    /// granted the virtual parent but not a member never sees that member's
-    /// bytes folded into the total. Without it the aggregate was a byte-size
-    /// oracle for private repositories whose direct `GET` correctly 404s.
-    /// [`RepoVisibility::All`] (admins, and internal oracles/reconcilers)
-    /// produces the literal `true` clause, i.e. the unfiltered pre-#3081 sum.
+    /// The leaf set is filtered through [`build_member_visibility_clause`],
+    /// which is `require_visible` verbatim — BOTH the caller's entitlement and
+    /// their token's repository scope. So a caller who reaches the virtual
+    /// parent but could not `GET` a member never sees that member's bytes
+    /// folded into the total. Without it the aggregate was a byte-size oracle
+    /// for repositories whose direct `GET` correctly 404s — including, because
+    /// `require_visible` early-returns on `is_public` without consulting
+    /// `can_access_repo` and `get_repository` carries no `require_repo_access`,
+    /// for a repo-scoped token that reached a PUBLIC virtual outside its scope.
+    /// [`MemberVisibility::Unfiltered`] (internal oracles/reconcilers) produces
+    /// the literal `true` clause, i.e. the unfiltered pre-#3081 sum.
+    ///
     /// Only the LEAVES are filtered — the membership walk itself is unchanged,
     /// so an invisible intermediate virtual still contributes the leaves the
     /// caller *can* see.
     pub async fn get_virtual_storage_usage(
         &self,
         virtual_repo_id: Uuid,
-        visibility: &RepoVisibility,
+        visibility: &MemberVisibility,
     ) -> Result<i64> {
-        let (visibility_clause, visibility_bind) =
-            build_visibility_clause_for(visibility, "leaf", 2);
-        let (user_id_bind, ids_bind) = split_visibility_bind(visibility_bind);
+        // `$2` = user id, `$3` = token scope, `$4` = depth. The bind order is
+        // the same for every variant; an unreferenced bind is a typed NULL.
+        let (visibility_clause, user_id_bind, scope_bind) =
+            build_member_visibility_clause(visibility, "leaf", 2);
         let sql = format!(
             r#"
             WITH RECURSIVE reachable(repo_id, depth) AS (
@@ -1727,7 +1859,7 @@ impl RepositoryService {
                    AND parent.repo_type = 'virtual'
                   JOIN virtual_repo_members vrm
                     ON vrm.virtual_repo_id = reachable.repo_id
-                 WHERE reachable.depth < $3
+                 WHERE reachable.depth < $4
             ),
             leaves AS (
                 SELECT DISTINCT reachable.repo_id AS id
@@ -1754,13 +1886,10 @@ impl RepositoryService {
             ) t
             "#
         );
-        let query = sqlx::query_scalar(&sql).bind(virtual_repo_id);
-        // `$2` shape depends on the visibility variant (single uuid vs uuid[]).
-        let query = match &ids_bind {
-            Some(ids) => query.bind(ids.clone()),
-            None => query.bind(user_id_bind),
-        };
-        let usage: i64 = query
+        let usage: i64 = sqlx::query_scalar(&sql)
+            .bind(virtual_repo_id)
+            .bind(user_id_bind)
+            .bind(scope_bind)
             .bind(MAX_VIRTUAL_DEPTH as i32)
             .fetch_one(&self.db)
             .await
@@ -1795,18 +1924,18 @@ impl RepositoryService {
     pub async fn get_virtual_storage_usage_batch(
         &self,
         virtual_ids: &[Uuid],
-        visibility: &RepoVisibility,
+        visibility: &MemberVisibility,
     ) -> Result<std::collections::HashMap<Uuid, i64>> {
         if virtual_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        // #3081: same caller-scoped leaf filter as the per-repo walk — the
-        // listing must not disclose the byte size of a member the caller
-        // cannot see. `RepoVisibility::All` yields the literal `true` clause,
-        // so an admin listing is byte-identical to the pre-#3081 aggregate.
-        let (visibility_clause, visibility_bind) =
-            build_visibility_clause_for(visibility, "leaf", 2);
-        let (user_id_bind, ids_bind) = split_visibility_bind(visibility_bind);
+        // #3081: the SAME caller-scoped leaf filter as the per-repo walk — the
+        // listing must not disclose the byte size of a member the caller could
+        // not `GET`. `MemberVisibility::Unfiltered` yields the literal `true`
+        // clause, so an internal read is byte-identical to the pre-#3081
+        // aggregate. `$2` = user id, `$3` = token scope, `$4` = depth.
+        let (visibility_clause, user_id_bind, scope_bind) =
+            build_member_visibility_clause(visibility, "leaf", 2);
         let sql = format!(
             r#"
             WITH RECURSIVE reachable(root_id, repo_id, depth) AS (
@@ -1821,7 +1950,7 @@ impl RepositoryService {
                    AND parent.repo_type = 'virtual'
                   JOIN virtual_repo_members vrm
                     ON vrm.virtual_repo_id = reachable.repo_id
-                 WHERE reachable.depth < $3
+                 WHERE reachable.depth < $4
             ),
             leaves AS (
                 SELECT DISTINCT reachable.root_id AS root_id, reachable.repo_id AS id
@@ -1837,13 +1966,10 @@ impl RepositoryService {
              GROUP BY leaves.root_id
             "#
         );
-        let query = sqlx::query_as(&sql).bind(virtual_ids);
-        // `$2` shape depends on the visibility variant (single uuid vs uuid[]).
-        let query = match &ids_bind {
-            Some(ids) => query.bind(ids.clone()),
-            None => query.bind(user_id_bind),
-        };
-        let rows: Vec<(Uuid, i64)> = query
+        let rows: Vec<(Uuid, i64)> = sqlx::query_as(&sql)
+            .bind(virtual_ids)
+            .bind(user_id_bind)
+            .bind(scope_bind)
             .bind(MAX_VIRTUAL_DEPTH as i32)
             .fetch_all(&self.db)
             .await
@@ -4915,7 +5041,7 @@ mod tests {
             // Fix: the combined figure equals the sum of the members, and the
             // display helper routes a virtual repo through that union.
             let combined = service
-                .get_virtual_storage_usage(virt.id, &RepoVisibility::All)
+                .get_virtual_storage_usage(virt.id, &MemberVisibility::Unfiltered)
                 .await
                 .expect("virtual combined");
             assert_eq!(
@@ -4925,7 +5051,7 @@ mod tests {
             );
             assert_eq!(
                 service
-                    .get_display_storage_usage(&virt, &RepoVisibility::All)
+                    .get_display_storage_usage(&virt, &MemberVisibility::Unfiltered)
                     .await
                     .expect("display"),
                 combined,
@@ -4934,7 +5060,7 @@ mod tests {
             // A non-virtual repo keeps its own per-repo figure via the helper.
             assert_eq!(
                 service
-                    .get_display_storage_usage(&m1, &RepoVisibility::All)
+                    .get_display_storage_usage(&m1, &MemberVisibility::Unfiltered)
                     .await
                     .expect("display m1"),
                 m1_usage
@@ -5005,7 +5131,7 @@ mod tests {
             // B counted once despite two reachable paths.
             assert_eq!(
                 service
-                    .get_virtual_storage_usage(v.id, &RepoVisibility::All)
+                    .get_virtual_storage_usage(v.id, &MemberVisibility::Unfiltered)
                     .await
                     .expect("v combined"),
                 1_000,
@@ -5121,12 +5247,12 @@ mod tests {
 
             let roots = [v.id, a.id, w.id, hollow.id];
             let batch = service
-                .get_virtual_storage_usage_batch(&roots, &RepoVisibility::All)
+                .get_virtual_storage_usage_batch(&roots, &MemberVisibility::Unfiltered)
                 .await
                 .expect("batch read");
             for (label, root) in [("v", v.id), ("a", a.id), ("w", w.id)] {
                 let oracle = service
-                    .get_virtual_storage_usage(root, &RepoVisibility::All)
+                    .get_virtual_storage_usage(root, &MemberVisibility::Unfiltered)
                     .await
                     .expect("per-repo oracle");
                 assert_eq!(
@@ -5149,7 +5275,7 @@ mod tests {
             );
             assert!(
                 service
-                    .get_virtual_storage_usage_batch(&[], &RepoVisibility::All)
+                    .get_virtual_storage_usage_batch(&[], &MemberVisibility::Unfiltered)
                     .await
                     .expect("empty batch")
                     .is_empty(),
@@ -5224,12 +5350,12 @@ mod tests {
             .expect("force b->a cycle edge");
 
             let batch = service
-                .get_virtual_storage_usage_batch(&[a.id, b.id], &RepoVisibility::All)
+                .get_virtual_storage_usage_batch(&[a.id, b.id], &MemberVisibility::Unfiltered)
                 .await
                 .expect("batch read under cycle");
             for (label, root) in [("a", a.id), ("b", b.id)] {
                 let oracle = service
-                    .get_virtual_storage_usage(root, &RepoVisibility::All)
+                    .get_virtual_storage_usage(root, &MemberVisibility::Unfiltered)
                     .await
                     .expect("per-repo oracle under cycle");
                 assert_eq!(oracle, 1_000, "cycle walk reaches the leaf once ({label})");
