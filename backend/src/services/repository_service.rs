@@ -954,6 +954,71 @@ impl RepositoryService {
         Ok(granted)
     }
 
+    /// Narrow `candidate_ids` to the repositories this caller is allowed to
+    /// SEE, preserving the caller's input order (issue #3163).
+    ///
+    /// This is the set-shaped counterpart to [`Self::user_can_access_repo`],
+    /// for the paths that aggregate over a list of OTHER repositories on the
+    /// caller's behalf — today a virtual repository's members, which are
+    /// separate repositories with their own ACLs. It evaluates the SAME
+    /// predicate the repository listing uses ([`build_visibility_clause_for`]),
+    /// so "which members does this caller see through the virtual" and "which
+    /// repositories does this caller see in `GET /repositories`" cannot drift
+    /// apart.
+    ///
+    /// It is deliberately NOT [`crate::api::middleware::auth::AuthExtension::can_access_repo`],
+    /// which answers a different question — "is this repository within my
+    /// TOKEN's scope?" — and returns `true` for every repository in the
+    /// instance whenever the principal is unscoped (a browser JWT session, an
+    /// unrestricted API token, an admin).
+    ///
+    /// Order is preserved because callers depend on it: virtual members are
+    /// resolved in priority order.
+    pub async fn filter_visible_repo_ids(
+        &self,
+        candidate_ids: &[Uuid],
+        visibility: &RepoVisibility,
+    ) -> Result<Vec<Uuid>> {
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `All` (admins, and internal oracles/reconcilers) is the literal
+        // `true` clause, so the admin path costs no extra round trip and is
+        // byte-identical to the pre-#3163 unfiltered set.
+        if matches!(visibility, RepoVisibility::All) {
+            return Ok(candidate_ids.to_vec());
+        }
+
+        let (visibility_clause, visibility_bind) = build_visibility_clause_for(visibility, "r", 2);
+        // Split the visibility bind into the two concrete `$2` shapes. Exactly
+        // one is `Some` per call; the unused one stays `None` and binds as a
+        // typed NULL, which the generated clause never references.
+        let (user_id_bind, ids_bind): (Option<Uuid>, Option<Vec<Uuid>>) = match visibility_bind {
+            VisibilityBind::User(uid) => (uid, None),
+            VisibilityBind::Ids(ids) => (None, Some(ids)),
+        };
+        let sql = format!(
+            "SELECT r.id FROM repositories r \
+             WHERE r.id = ANY($1) AND ({visibility_clause})"
+        );
+        let query = sqlx::query_scalar(&sql).bind(candidate_ids);
+        let query = match &ids_bind {
+            Some(ids) => query.bind(ids.clone()),
+            None => query.bind(user_id_bind),
+        };
+        let visible: Vec<Uuid> = query
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let visible: std::collections::HashSet<Uuid> = visible.into_iter().collect();
+        Ok(candidate_ids
+            .iter()
+            .copied()
+            .filter(|id| visible.contains(id))
+            .collect())
+    }
+
     /// Get a repository by ID
     pub async fn get_by_id(&self, id: Uuid) -> Result<Repository> {
         let repo = sqlx::query_as!(
