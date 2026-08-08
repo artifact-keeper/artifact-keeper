@@ -11459,11 +11459,14 @@ mod content_encoding_forwarding_tests {
     async fn test_build_streaming_file_response_forwards_content_encoding() {
         let resp = build_streaming_file_response(
             "numpy-1.0-py3-none-any.whl",
-            result_with_encoding(b"coded-wheel-bytes", Some("gzip")),
+            // deflate, not gzip: with every fixture gzip, hardcoding "gzip" in
+            // this builder -- the single choke point for six PyPI serve paths --
+            // left all three tests green.
+            result_with_encoding(b"coded-wheel-bytes", Some("deflate")),
         );
         assert_eq!(
             tdh::header_str(resp.headers(), CONTENT_ENCODING).as_deref(),
-            Some("gzip"),
+            Some("deflate"),
             "upstream Content-Encoding must be forwarded or pip writes bytes \
              it cannot inflate and fails the hash check (#3149)",
         );
