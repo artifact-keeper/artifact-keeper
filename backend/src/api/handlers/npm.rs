@@ -761,10 +761,10 @@ fn normalize_package_name(raw: &str) -> String {
 
 /// Validate a decoded npm package name.
 ///
-/// Rejects names with path traversal sequences, null bytes, and names that
-/// violate the npm naming rules (empty, too long, leading dot/underscore,
-/// non-lowercase for unscoped packages). Called after URL decoding to catch
-/// percent-encoded attacks like `%2e%2e%2f`.
+/// Rejects non-ASCII names, path traversal sequences, null bytes, and names
+/// that violate the handler's existing shape rules (empty, too long, leading
+/// dot/underscore). Called after URL decoding to catch percent-encoded attacks
+/// like `%2e%2e%2f` and percent-encoded Unicode homoglyphs.
 #[allow(clippy::result_large_err)]
 fn validate_package_name(name: &str) -> Result<(), Response> {
     if name.is_empty() {
@@ -775,6 +775,12 @@ fn validate_package_name(name: &str) -> Result<(), Response> {
     }
     if name.len() > 214 {
         return Err(map_status(StatusCode::BAD_REQUEST, "Package name too long"));
+    }
+    if !name.is_ascii() {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Package name must contain only ASCII characters",
+        ));
     }
     if name.contains('\0') {
         return Err(map_status(
@@ -813,6 +819,25 @@ fn validate_package_name(name: &str) -> Result<(), Response> {
         ));
     }
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_publish_package_name(raw: &str) -> Result<String, Response> {
+    let package = normalize_package_name(raw);
+    validate_package_name(&package)?;
+    Ok(package)
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_scoped_publish_package_name(
+    raw_scope: &str,
+    raw_package: &str,
+) -> Result<String, Response> {
+    let scope = normalize_package_name(raw_scope);
+    let package = normalize_package_name(raw_package);
+    let full_name = build_scoped_package_name(&scope, &package);
+    validate_package_name(&full_name)?;
+    Ok(full_name)
 }
 
 fn map_status(status: StatusCode, msg: &str) -> Response {
@@ -3624,8 +3649,7 @@ async fn publish(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let package = normalize_package_name(&package);
-    validate_package_name(&package)?;
+    let package = validate_publish_package_name(&package)?;
     publish_package(&state, auth, &repo_key, &package, &headers, body).await
 }
 
@@ -3636,10 +3660,7 @@ async fn publish_scoped(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let scope = normalize_package_name(&scope);
-    let package = normalize_package_name(&package);
-    let full_name = build_scoped_package_name(&scope, &package);
-    validate_package_name(&full_name)?;
+    let full_name = validate_scoped_publish_package_name(&scope, &package)?;
     publish_package(&state, auth, &repo_key, &full_name, &headers, body).await
 }
 
@@ -6152,9 +6173,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_npm_package_name_uppercase_rejected() {
-        // The handler-level validator does not enforce lowercase; callers
-        // normalise case before storage (see NPM_NAME_PATTERN docs).
+    fn test_validate_npm_package_name_uppercase_accepted() {
+        // Preserve the hosted publish handler's existing ASCII compatibility;
+        // the stricter proxy-path validator separately enforces lowercase.
         assert!(validate_package_name("MyPackage").is_ok());
     }
 
@@ -6167,6 +6188,66 @@ mod tests {
     fn test_validate_npm_package_name_max_length() {
         let name = "a".repeat(214);
         assert!(validate_package_name(&name).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_publish_unscoped_non_ascii_names_rejected() {
+        for raw_name in ["nｕmpy", "n%EF%BD%95mpy"] {
+            let response = validate_publish_package_name(raw_name).unwrap_err();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{raw_name}");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "error": "Package name must contain only ASCII characters"
+                }),
+                "{raw_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_publish_scoped_non_ascii_names_rejected() {
+        for (raw_scope, raw_package) in [
+            ("ｓcope", "package"),
+            ("%EF%BD%93cope", "package"),
+            ("scope", "pａckage"),
+            ("scope", "p%EF%BD%81ckage"),
+        ] {
+            let response =
+                validate_scoped_publish_package_name(raw_scope, raw_package).unwrap_err();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{raw_scope}/{raw_package}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "error": "Package name must contain only ASCII characters"
+                }),
+                "{raw_scope}/{raw_package}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_publish_ascii_names_accepted() {
+        assert_eq!(
+            validate_publish_package_name("MyPackage").unwrap(),
+            "MyPackage"
+        );
+        assert_eq!(
+            validate_scoped_publish_package_name("Scope", "Package").unwrap(),
+            "@Scope/Package"
+        );
     }
 
     // -----------------------------------------------------------------------
