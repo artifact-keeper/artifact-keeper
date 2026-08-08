@@ -1441,6 +1441,18 @@ async fn flatcontainer_download(
     // stays missing: a transient bad upstream self-heals on the next request and a
     // persistently wrong one keeps erroring instead of poisoning the cache.
     //
+    // The refetch still commits to the SHARED proxy cache under
+    // `v3/flatcontainer/...` before this gate sees the bytes, exactly as the
+    // streaming repair does. That is contained rather than ignored: the artifact
+    // row is looked up ABOVE this point, so while the row exists every request
+    // for it lands here and is re-gated — a mismatching cached body is refused
+    // again rather than served warm (the repair is idempotent in that sense).
+    // The proxy-cache entry only becomes directly reachable through the
+    // no-row arm, where there is no recorded digest and no row-scoped quarantine
+    // decision to honour in the first place. Keeping unverified bytes out of the
+    // proxy cache as well needs a buffered-verified fetch primitive that does not
+    // exist yet; it is a cache-hygiene improvement, not a hole in this gate.
+    //
     // Buffering is bounded by `VERIFIED_NUPKG_REPAIR_MAX_BYTES` (#2928), applied
     // twice: pre-flight against the row's recorded `size_bytes`, and again as the
     // capped fetch's own ceiling in case the row understates what upstream serves.
@@ -4532,6 +4544,32 @@ mod read_db_tests {
         filename: &str,
         size_bytes: i64,
     ) -> Uuid {
+        // Not a bare 64-hex SHA-256, so `normalize_expected_sha256` reads it as
+        // "no enforceable digest" and the repair takes the UNVERIFIED streaming
+        // route — which is what the two tests using this seed are about.
+        seed_row_without_blob_with_checksum(
+            fx,
+            name,
+            version,
+            filename,
+            size_bytes,
+            "test-seed-missing-blob",
+        )
+        .await
+    }
+
+    /// As [`seed_row_without_blob`], but pins the row's `checksum_sha256`.
+    ///
+    /// A bare lowercase 64-hex value here is what routes the repair through the
+    /// digest-verified buffered path (#2929).
+    async fn seed_row_without_blob_with_checksum(
+        fx: &tdh::Fixture,
+        name: &str,
+        version: &str,
+        filename: &str,
+        size_bytes: i64,
+        checksum_sha256: &str,
+    ) -> Uuid {
         let artifact_path = format!("v3/flatcontainer/{}/{}/{}", name, version, filename);
         let storage_key = format!("nuget/{}/{}/{}", name, version, filename);
         proxy_helpers::insert_artifact(
@@ -4542,7 +4580,7 @@ mod read_db_tests {
                 name,
                 version,
                 size_bytes,
-                checksum_sha256: "test-seed-missing-blob",
+                checksum_sha256,
                 content_type: "application/octet-stream",
                 storage_key: &storage_key,
                 uploaded_by: fx.user_id,
@@ -4550,6 +4588,190 @@ mod read_db_tests {
         )
         .await
         .expect("insert artifacts row without blob")
+    }
+
+    /// Drive `flatcontainer_download` against an upstream that serves
+    /// `upstream_body`, for a row seeded with `row_checksum` and no blob.
+    ///
+    /// Returns `(result, upstream_request_paths)`. The caller asserts; teardown
+    /// happens here so a failing assertion never leaks fixture rows.
+    async fn run_repair_with_row_checksum(
+        package_id: &str,
+        version: &str,
+        upstream_body: &[u8],
+        row_checksum: &str,
+        calls: usize,
+    ) -> Option<(Vec<Result<(StatusCode, Vec<u8>), StatusCode>>, Vec<String>)> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let fx = tdh::Fixture::setup("remote", "nuget").await?;
+        let upstream = MockServer::start().await;
+        mount_v3_index(&upstream).await;
+
+        let filename = format!("{}.{}.nupkg", package_id, version);
+        let discovered_path = format!("/flat/{}/{}/{}", package_id, version, filename);
+        Mock::given(method("GET"))
+            .and(path(discovered_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(upstream_body.to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+
+        seed_row_without_blob_with_checksum(
+            &fx,
+            package_id,
+            version,
+            &filename,
+            upstream_body.len() as i64,
+            row_checksum,
+        )
+        .await;
+
+        let mut outcomes = Vec::new();
+        for _ in 0..calls {
+            let resp = super::flatcontainer_download(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    fx.repo_key.clone(),
+                    package_id.to_string(),
+                    version.to_string(),
+                    filename.clone(),
+                )),
+                Default::default(),
+            )
+            .await;
+            outcomes.push(match resp {
+                Ok(r) => {
+                    let status = r.status();
+                    let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                    Ok((status, body.to_vec()))
+                }
+                Err(r) => Err(r.status()),
+            });
+        }
+
+        let requested: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        fx.teardown().await;
+        Some((outcomes, requested))
+    }
+
+    /// #2929: a repaired `.nupkg` whose bytes match the row's recorded
+    /// `checksum_sha256` is served, and the write-back makes the next request a
+    /// local hit rather than a second upstream pull.
+    ///
+    /// The companion to the mismatch test below: without this one, "refuse every
+    /// repair" would also satisfy that assertion.
+    #[tokio::test]
+    async fn test_flatcontainer_repair_serves_a_body_matching_the_rows_digest_2929() {
+        let body = b"PK\x03\x04-repaired-and-verified-nupkg-bytes".repeat(8);
+        let digest = crate::services::storage_service::StorageService::calculate_hash(&body);
+
+        let Some((outcomes, requested)) =
+            run_repair_with_row_checksum("verified.package", "1.0.0", &body, &digest, 2).await
+        else {
+            return;
+        };
+
+        let (status, served) = match &outcomes[0] {
+            Ok(v) => v.clone(),
+            Err(status) => panic!("a digest-matching repair must succeed, got {status}"),
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &served[..],
+            &body[..],
+            "the verified repair must serve the upstream bytes in full"
+        );
+
+        match &outcomes[1] {
+            Ok((status, served)) => {
+                assert_eq!(*status, StatusCode::OK, "the warm read must succeed");
+                assert_eq!(&served[..], &body[..], "the warm read must be identical");
+            }
+            Err(status) => panic!("the warm read must succeed, got {status}"),
+        }
+
+        let pulls = requested.iter().filter(|p| p.starts_with("/flat/")).count();
+        assert_eq!(
+            pulls, 1,
+            "a verified repair must write back, so the second request is a local \
+             hit; upstream saw {requested:?}"
+        );
+    }
+
+    /// #2929 — the load-bearing one. VERIFY THEN SERVE.
+    ///
+    /// `check_artifact_download` authorises on the artifact row, so the hash an
+    /// admin reviewed when releasing that row from quarantine has to be the hash
+    /// the client actually receives. The repair re-pulls from upstream and writes
+    /// back under the row's own storage key; if those bytes are never compared to
+    /// the row's `checksum_sha256`, the quarantine decision was made about a blob
+    /// nobody ever delivered.
+    ///
+    /// So a mismatching body must reach the client NOT AT ALL — not "truncated
+    /// after the mismatch was noticed", which is why this path buffers instead of
+    /// streaming. And it must not be written back: the second call below must
+    /// fail exactly like the first, proving the bad body did not become a warm
+    /// entry that later requests are served from.
+    #[tokio::test]
+    async fn test_flatcontainer_repair_refuses_a_body_failing_the_rows_digest_2929() {
+        let body = b"PK\x03\x04-bytes-that-are-not-what-the-row-records".repeat(8);
+        // Well-formed so it is actually enforced rather than being discarded as
+        // "no digest available" by `normalize_expected_sha256`.
+        let wrong = "b".repeat(64);
+        assert_ne!(
+            wrong,
+            crate::services::storage_service::StorageService::calculate_hash(&body),
+            "fixture digest must differ or the test proves nothing"
+        );
+
+        let Some((outcomes, requested)) =
+            run_repair_with_row_checksum("forged.package", "2.0.0", &body, &wrong, 2).await
+        else {
+            return;
+        };
+
+        for (i, outcome) in outcomes.iter().enumerate() {
+            match outcome {
+                Err(status) => assert_eq!(
+                    *status,
+                    StatusCode::BAD_GATEWAY,
+                    "call {i}: a digest mismatch must fail the repair explicitly"
+                ),
+                Ok((status, served)) => panic!(
+                    "call {i}: a body failing the row's recorded digest must never be \
+                     served (#2929); got {status} with {} bytes",
+                    served.len()
+                ),
+            }
+        }
+
+        assert!(
+            requested.iter().any(|p| p.starts_with("/flat/")),
+            "the repair must actually have pulled upstream, or the refusal is \
+             vacuous; upstream saw {requested:?}"
+        );
     }
 
     /// The repair must re-pull through the **discovered** `PackageBaseAddress`,
