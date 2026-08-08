@@ -566,6 +566,45 @@ pub async fn create_user(pool: &PgPool) -> (Uuid, String) {
     (id, username)
 }
 
+/// Like [`create_user`], but the row is `is_service_account = true`. Shared
+/// so DB-backed tests that need a service-account principal (e.g. the
+/// #2826 permission-name hydration tests, and any legacy-grant test that
+/// needs a `principal_type = 'user'` row naming a service account) don't
+/// each hand-roll the same INSERT.
+pub async fn create_service_account(pool: &PgPool) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let username = format!("ph-test-sa-{}", id);
+    sqlx::query(
+        r#"
+        INSERT INTO users
+            (id, username, email, password_hash, auth_provider,
+             is_admin, is_active, is_service_account)
+        VALUES ($1, $2, $3, 'unused', 'local', false, true, true)
+        "#,
+    )
+    .bind(id)
+    .bind(&username)
+    .bind(format!("{}@test.local", username))
+    .execute(pool)
+    .await
+    .expect("create service account");
+    (id, username)
+}
+
+/// Insert a bare `groups` row (id + name only). Shared by DB-backed tests
+/// that need a group principal but not the full `GroupService` create flow.
+pub async fn create_group(pool: &PgPool) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let name = format!("ph-test-group-{}", id);
+    sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+        .bind(id)
+        .bind(&name)
+        .execute(pool)
+        .await
+        .expect("create group");
+    (id, name)
+}
+
 /// Insert a repository row of the given type and format. `format` must be
 /// a valid `repository_format` enum value (e.g. "ansible", "helm", "rpm").
 pub async fn create_repo(pool: &PgPool, repo_type: &str, format: &str) -> (Uuid, String, PathBuf) {
@@ -727,16 +766,7 @@ pub fn admin_auth(user_id: Uuid, username: &str) -> AuthExtension {
 /// `invalidate_cache`) require this for non-admins; the smoke tests that assert
 /// a successful admin-tier call grant it here. Cleaned up by `cleanup`.
 pub async fn grant_repo_admin(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
-    sqlx::query(
-        "INSERT INTO permissions \
-         (principal_type, principal_id, target_type, target_id, actions) \
-         VALUES ('user', $1, 'repository', $2, ARRAY['admin'])",
-    )
-    .bind(user_id)
-    .bind(repo_id)
-    .execute(pool)
-    .await
-    .expect("grant repository:admin");
+    grant_permission(pool, "user", user_id, "repository", repo_id, &["admin"]).await;
 }
 
 /// Insert a fine-grained `permissions` rule granting `user_id` exactly the
@@ -750,18 +780,41 @@ pub async fn grant_repo_admin(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
 /// action it exercises. Rows are cleaned up by `cleanup` (which deletes all
 /// `permissions WHERE target_id = repo_id`).
 pub async fn grant_repo_actions(pool: &PgPool, repo_id: Uuid, user_id: Uuid, actions: &[&str]) {
+    grant_permission(pool, "user", user_id, "repository", repo_id, actions).await;
+}
+
+/// Insert a fine-grained `permissions` row for an arbitrary
+/// `(principal_type, principal_id, target_type, target_id)` pair and return
+/// its id. The general form behind [`grant_repo_admin`] and
+/// [`grant_repo_actions`] (both `principal_type = "user"`,
+/// `target_type = "repository"` specializations); use this directly for
+/// group/service-account principals or non-repository targets (e.g. the
+/// #2826 permission-name hydration tests). Rows are cleaned up by
+/// [`cleanup`]'s `target_id = repo_id` delete when the target is a
+/// repository; other targets need their own teardown.
+pub async fn grant_permission(
+    pool: &PgPool,
+    principal_type: &str,
+    principal_id: Uuid,
+    target_type: &str,
+    target_id: Uuid,
+    actions: &[&str],
+) -> Uuid {
     let actions: Vec<String> = actions.iter().map(|s| s.to_string()).collect();
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO permissions \
          (principal_type, principal_id, target_type, target_id, actions) \
-         VALUES ('user', $1, 'repository', $2, $3)",
+         VALUES ($1, $2, $3, $4, $5) \
+         RETURNING id",
     )
-    .bind(user_id)
-    .bind(repo_id)
+    .bind(principal_type)
+    .bind(principal_id)
+    .bind(target_type)
+    .bind(target_id)
     .bind(&actions)
-    .execute(pool)
+    .fetch_one(pool)
     .await
-    .expect("insert repository permission rule");
+    .expect("insert permission rule")
 }
 
 /// Mint a `Bearer <jwt>` authorization header for `user_id` using the same

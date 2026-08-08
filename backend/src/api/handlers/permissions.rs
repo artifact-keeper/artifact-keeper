@@ -88,6 +88,53 @@ impl From<PermissionRow> for PermissionResponse {
     }
 }
 
+/// Shared SELECT/JOIN fragment that hydrates a `permissions` row's
+/// `principal_name` / `target_name` display columns.
+///
+/// `from_clause` supplies both the row source and its alias, always `p`:
+/// either the base table (`"permissions p"`, used by the plain read paths
+/// [`fetch_permission_row`] and [`list_permissions`]) or a data-modifying
+/// CTE named `p` (used by [`create_permission`] / [`update_permission`] to
+/// collapse INSERT/UPDATE + hydration into one round trip). Every caller
+/// appends its own `WHERE`/`ORDER BY`/pagination clause (or, for the CTE
+/// callers, prefixes a `WITH p AS (...)`) via `format!`. Centralizing this
+/// keeps the principal/target CASE+JOIN logic in exactly one place.
+fn hydrate_select(from_clause: &str) -> String {
+    format!(
+        r#"
+        SELECT p.id, p.principal_type, p.principal_id, p.target_type, p.target_id,
+               p.actions, p.created_at, p.updated_at,
+               CASE
+                   WHEN p.principal_type IN ('user', 'service_account') THEN u.username
+                   WHEN p.principal_type = 'group' THEN g.name
+               END as principal_name,
+               CASE
+                   WHEN p.target_type = 'repository' THEN r.name
+               END as target_name
+        FROM {from_clause}
+        LEFT JOIN users u ON p.principal_id = u.id
+                         AND ((p.principal_type = 'user' AND u.is_service_account = FALSE)
+                           OR (p.principal_type = 'service_account' AND u.is_service_account = TRUE))
+        LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
+        LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
+        "#
+    )
+}
+
+async fn fetch_permission_row<'e, E>(executor: E, id: Uuid) -> Result<Option<PermissionRow>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_as(&format!(
+        "{} WHERE p.id = $1",
+        hydrate_select("permissions p")
+    ))
+    .bind(id)
+    .fetch_optional(executor)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PermissionListResponse {
     pub items: Vec<PermissionResponse>,
@@ -135,30 +182,16 @@ pub async fn list_permissions(
         }));
     }
 
-    let permissions: Vec<PermissionRow> = sqlx::query_as(
-        r#"
-        SELECT p.id, p.principal_type, p.principal_id, p.target_type, p.target_id,
-               p.actions, p.created_at, p.updated_at,
-               CASE
-                   WHEN p.principal_type = 'user' THEN u.username
-                   WHEN p.principal_type = 'group' THEN g.name
-               END as principal_name,
-               CASE
-                   WHEN p.target_type = 'repository' THEN r.name
-               END as target_name
-        FROM permissions p
-        LEFT JOIN users u ON p.principal_type = 'user' AND p.principal_id = u.id
-        LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
-        LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
-        WHERE ($1::text IS NULL OR p.principal_type = $1)
+    let permissions: Vec<PermissionRow> = sqlx::query_as(&format!(
+        "{} WHERE ($1::text IS NULL OR p.principal_type = $1)
           AND ($2::uuid IS NULL OR p.principal_id = $2)
           AND ($3::text IS NULL OR p.target_type = $3)
           AND ($4::uuid IS NULL OR p.target_id = $4)
         ORDER BY p.created_at DESC
         OFFSET $5
-        LIMIT $6
-        "#,
-    )
+        LIMIT $6",
+        hydrate_select("permissions p")
+    ))
     .bind(&query.principal_type)
     .bind(query.principal_id)
     .bind(&query.target_type)
@@ -210,18 +243,6 @@ pub struct CreatePermissionRequest {
     pub target_type: String,
     pub target_id: Uuid,
     pub actions: Vec<String>,
-}
-
-#[derive(Debug, FromRow, ToSchema)]
-pub struct CreatedPermissionRow {
-    pub id: Uuid,
-    pub principal_type: String,
-    pub principal_id: Uuid,
-    pub target_type: String,
-    pub target_id: Uuid,
-    pub actions: Vec<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Create a permission
@@ -282,46 +303,49 @@ pub async fn create_permission(
         .validate_principal(&payload.principal_type, payload.principal_id)
         .await?;
 
-    let permission: CreatedPermissionRow = sqlx::query_as(
+    // Single autocommit data-modifying CTE: the INSERT and the hydration
+    // SELECT run as one statement on the pool, so this no longer holds a
+    // dedicated transaction/connection across four round trips (BEGIN,
+    // INSERT ... RETURNING id, re-SELECT via fetch_permission_row, COMMIT).
+    // `fetch_one` erroring on zero rows is deliberate: the CTE's INSERT
+    // always produces exactly one output row on success, so a miss here is
+    // an invariant failure, not a legitimate 404 -- it falls through to the
+    // `AppError::Database` arm below rather than the unreachable NotFound
+    // this used to construct.
+    let query = format!(
         r#"
-        INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, principal_type, principal_id, target_type, target_id, actions, created_at, updated_at
-        "#
-    )
-    .bind(&payload.principal_type)
-    .bind(payload.principal_id)
-    .bind(&payload.target_type)
-    .bind(payload.target_id)
-    .bind(&payload.actions)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("duplicate key") {
-            AppError::Conflict("Permission already exists".to_string())
-        } else {
-            AppError::Database(msg)
-        }
-    })?;
+        WITH p AS (
+            INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *
+        )
+        {}
+        "#,
+        hydrate_select("p")
+    );
+    let permission: PermissionRow = sqlx::query_as(&query)
+        .bind(&payload.principal_type)
+        .bind(payload.principal_id)
+        .bind(&payload.target_type)
+        .bind(payload.target_id)
+        .bind(&payload.actions)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("duplicate key") {
+                AppError::Conflict("Permission already exists".to_string())
+            } else {
+                AppError::Database(msg)
+            }
+        })?;
 
     state.permission_service.invalidate_cache();
     state
         .event_bus
         .emit("permission.created", permission.id, None);
 
-    Ok(Json(PermissionResponse {
-        id: permission.id,
-        principal_type: permission.principal_type,
-        principal_id: permission.principal_id,
-        principal_name: None,
-        target_type: permission.target_type,
-        target_id: permission.target_id,
-        target_name: None,
-        actions: permission.actions,
-        created_at: permission.created_at,
-        updated_at: permission.updated_at,
-    }))
+    Ok(Json(PermissionResponse::from(permission)))
 }
 
 /// Get a permission by ID
@@ -356,29 +380,9 @@ pub async fn get_permission(
         return Err(AppError::NotFound("Permission not found".to_string()));
     }
 
-    let permission: PermissionRow = sqlx::query_as(
-        r#"
-        SELECT p.id, p.principal_type, p.principal_id, p.target_type, p.target_id,
-               p.actions, p.created_at, p.updated_at,
-               CASE
-                   WHEN p.principal_type = 'user' THEN u.username
-                   WHEN p.principal_type = 'group' THEN g.name
-               END as principal_name,
-               CASE
-                   WHEN p.target_type = 'repository' THEN r.name
-               END as target_name
-        FROM permissions p
-        LEFT JOIN users u ON p.principal_type = 'user' AND p.principal_id = u.id
-        LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
-        LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
-        WHERE p.id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
+    let permission = fetch_permission_row(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
 
     Ok(Json(PermissionResponse::from(permission)))
 }
@@ -425,43 +429,41 @@ pub async fn update_permission(
         .validate_principal(&payload.principal_type, payload.principal_id)
         .await?;
 
-    let permission: CreatedPermissionRow = sqlx::query_as(
+    // Single autocommit data-modifying CTE, mirroring create_permission
+    // above. Unlike create, a zero-row result here is a legitimate outcome
+    // (the id does not exist), so `fetch_optional` -> `None` still maps to
+    // `NotFound` rather than a 500.
+    let query = format!(
         r#"
-        UPDATE permissions
-        SET principal_type = $2, principal_id = $3, target_type = $4, target_id = $5,
-            actions = $6, updated_at = NOW()
-        WHERE id = $1
-        RETURNING id, principal_type, principal_id, target_type, target_id, actions, created_at, updated_at
-        "#
-    )
-    .bind(id)
-    .bind(&payload.principal_type)
-    .bind(payload.principal_id)
-    .bind(&payload.target_type)
-    .bind(payload.target_id)
-    .bind(&payload.actions)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
+        WITH p AS (
+            UPDATE permissions
+            SET principal_type = $2, principal_id = $3, target_type = $4, target_id = $5,
+                actions = $6, updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+        )
+        {}
+        "#,
+        hydrate_select("p")
+    );
+    let permission: PermissionRow = sqlx::query_as(&query)
+        .bind(id)
+        .bind(&payload.principal_type)
+        .bind(payload.principal_id)
+        .bind(&payload.target_type)
+        .bind(payload.target_id)
+        .bind(&payload.actions)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
 
     state.permission_service.invalidate_cache();
     state
         .event_bus
         .emit("permission.updated", permission.id, None);
 
-    Ok(Json(PermissionResponse {
-        id: permission.id,
-        principal_type: permission.principal_type,
-        principal_id: permission.principal_id,
-        principal_name: None,
-        target_type: permission.target_type,
-        target_id: permission.target_id,
-        target_name: None,
-        actions: permission.actions,
-        created_at: permission.created_at,
-        updated_at: permission.updated_at,
-    }))
+    Ok(Json(PermissionResponse::from(permission)))
 }
 
 /// Delete a permission
@@ -522,7 +524,6 @@ pub async fn delete_permission(
         PermissionResponse,
         PermissionListResponse,
         CreatePermissionRequest,
-        CreatedPermissionRow,
     ))
 )]
 pub struct PermissionsApiDoc;
@@ -530,7 +531,265 @@ pub struct PermissionsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
     use chrono::Utc;
+    use serde_json::json;
+
+    fn permission_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        tdh::router_with_auth(router(), state, auth)
+    }
+
+    /// Seed a fine-grained `permissions` row scoped to a single `["read"]`
+    /// action -- these tests only assert on hydration, so the exact action
+    /// set doesn't matter. Thin wrapper over `tdh::grant_permission` (the
+    /// general form; `tdh::grant_repo_admin`/`grant_repo_actions` are the
+    /// `user` + `repository` specializations these tests don't want).
+    async fn seed_permission(
+        pool: &sqlx::PgPool,
+        principal_type: &str,
+        principal_id: Uuid,
+        target_type: &str,
+        target_id: Uuid,
+    ) -> Uuid {
+        tdh::grant_permission(
+            pool,
+            principal_type,
+            principal_id,
+            target_type,
+            target_id,
+            &["read"],
+        )
+        .await
+    }
+
+    /// Send a request built via the `tdh` request helpers and parse the JSON
+    /// body, asserting 200 OK. Request construction (method/uri/content-type
+    /// boilerplate) lives in `tdh::get`/`tdh::post`/`tdh::put_json`; this
+    /// keeps only the send+assert+parse step local, since that part isn't
+    /// shared with other handler test modules.
+    async fn response_json(
+        state: SharedState,
+        auth: AuthExtension,
+        request: Request<Body>,
+    ) -> serde_json::Value {
+        let (status, body) = tdh::send(permission_app(state, auth), request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "permission request failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body).expect("permission response JSON")
+    }
+
+    /// Teardown for this module's fixtures. `tdh::cleanup` handles the
+    /// admin user + repo-target permissions + repo row; `tdh::cleanup_user`
+    /// handles each extra user principal (service accounts). What's left --
+    /// permissions keyed by a non-admin/non-repo-target row (e.g. the
+    /// `target_type = "global"` fixture) and group rows -- isn't covered by
+    /// either shared helper, so it stays local.
+    async fn cleanup_permission_fixtures(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        admin_id: Uuid,
+        extra_user_ids: &[Uuid],
+        group_ids: &[Uuid],
+    ) {
+        let mut principal_ids: Vec<Uuid> = extra_user_ids.to_vec();
+        principal_ids.push(admin_id);
+        principal_ids.extend_from_slice(group_ids);
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = ANY($1)")
+            .bind(&principal_ids)
+            .execute(pool)
+            .await;
+        if !group_ids.is_empty() {
+            let _ = sqlx::query("DELETE FROM groups WHERE id = ANY($1)")
+                .bind(group_ids)
+                .execute(pool)
+                .await;
+        }
+        for &id in extra_user_ids {
+            tdh::cleanup_user(pool, id).await;
+        }
+        tdh::cleanup(pool, repo_id, admin_id).await;
+    }
+
+    #[tokio::test]
+    async fn list_and_get_hydrate_type_guarded_principal_names() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (service_account_id, service_account_name) = tdh::create_service_account(&pool).await;
+        let (group_id, group_name) = tdh::create_group(&pool).await;
+        let (repo_id, repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        let human_permission =
+            seed_permission(&pool, "user", admin_id, "repository", repo_id).await;
+        let service_account_permission = seed_permission(
+            &pool,
+            "service_account",
+            service_account_id,
+            "repository",
+            repo_id,
+        )
+        .await;
+        let group_permission =
+            seed_permission(&pool, "group", group_id, "repository", repo_id).await;
+        let mismatched_permission =
+            seed_permission(&pool, "service_account", admin_id, "repository", repo_id).await;
+
+        let listed = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/?target_id={repo_id}")),
+        )
+        .await;
+        let items = listed["items"].as_array().expect("permission items");
+        let find = |id: Uuid| {
+            items
+                .iter()
+                .find(|item| item["id"] == id.to_string())
+                .expect("listed permission")
+        };
+
+        assert_eq!(find(human_permission)["principal_name"], admin_name);
+        assert_eq!(
+            find(service_account_permission)["principal_name"],
+            service_account_name
+        );
+        assert_eq!(find(group_permission)["principal_name"], group_name);
+        assert!(find(mismatched_permission)["principal_name"].is_null());
+        assert!(items.iter().all(|item| item["target_name"] == repo_name));
+
+        let fetched_human = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/{human_permission}")),
+        )
+        .await;
+        assert_eq!(fetched_human["principal_name"], admin_name);
+        assert_eq!(fetched_human["target_name"], repo_name);
+
+        let fetched_service_account = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/{service_account_permission}")),
+        )
+        .await;
+        assert_eq!(
+            fetched_service_account["principal_name"],
+            service_account_name
+        );
+        assert_eq!(fetched_service_account["target_name"], repo_name);
+
+        let fetched_group = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/{group_permission}")),
+        )
+        .await;
+        assert_eq!(fetched_group["principal_name"], group_name);
+        assert_eq!(fetched_group["target_name"], repo_name);
+
+        let fetched_mismatch =
+            response_json(state, auth, tdh::get(format!("/{mismatched_permission}"))).await;
+        assert!(fetched_mismatch["principal_name"].is_null());
+        assert_eq!(fetched_mismatch["target_name"], repo_name);
+
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[group_id])
+            .await;
+    }
+
+    #[tokio::test]
+    async fn create_and_update_return_hydrated_permission_names() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (service_account_id, service_account_name) = tdh::create_service_account(&pool).await;
+        let (repo_id, repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        let created = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::post(
+                "/".to_string(),
+                "application/json",
+                Bytes::from(
+                    json!({
+                        "principal_type": "service_account",
+                        "principal_id": service_account_id,
+                        "target_type": "repository",
+                        "target_id": repo_id,
+                        "actions": ["read", "write"]
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(created["principal_name"], service_account_name);
+        assert_eq!(created["target_name"], repo_name);
+
+        let global_target_id = Uuid::new_v4();
+        let permission_id =
+            seed_permission(&pool, "user", admin_id, "global", global_target_id).await;
+        let updated = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::put_json(
+                format!("/{permission_id}"),
+                Bytes::from(
+                    json!({
+                        "principal_type": "service_account",
+                        "principal_id": service_account_id,
+                        "target_type": "global",
+                        "target_id": global_target_id,
+                        "actions": ["admin"]
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(updated["principal_name"], service_account_name);
+        assert!(updated["target_name"].is_null());
+
+        let fetched = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/{permission_id}")),
+        )
+        .await;
+        assert_eq!(fetched["principal_name"], service_account_name);
+        assert!(fetched["target_name"].is_null());
+
+        let listed = response_json(
+            state,
+            auth,
+            tdh::get(format!(
+                "/?principal_id={service_account_id}&target_id={global_target_id}"
+            )),
+        )
+        .await;
+        let listed_permission = listed["items"]
+            .as_array()
+            .expect("permission items")
+            .iter()
+            .find(|item| item["id"] == permission_id.to_string())
+            .expect("updated permission in list");
+        assert_eq!(listed_permission["principal_name"], service_account_name);
+        assert!(listed_permission["target_name"].is_null());
+
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[]).await;
+    }
 
     // -----------------------------------------------------------------------
     // ListPermissionsQuery deserialization
