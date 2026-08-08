@@ -213,8 +213,9 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 /// Guards 2 and 5 -- the `files[]` reference tests -- are built from the
 /// shared [`crate::services::maven_flat_attribution::metadata_files_name_key_sql`]
 /// fragment rather than an inline copy. Their inline copies matched snake_case
-/// `storage_key` only, while the GAV-grouped upload handler writes camelCase
-/// `storageKey`; in a `NOT EXISTS` guard a missed reference means DELETE, so
+/// `storage_key` only, while the legacy #418-era GAV-grouped upload handler
+/// wrote camelCase `storageKey`; in a `NOT EXISTS` guard a missed reference
+/// means DELETE, so
 /// every live GAV companion (and every checksum sidecar of one) read as
 /// unreferenced and was purged by the sweep while its parent artifact was
 /// still serving it (#3156).

@@ -3960,8 +3960,8 @@ async fn purge_storage_object_keys(
 /// DELETE. It therefore has to match every spelling the read path accepts, and
 /// gets that from the shared [`metadata_files_name_key_sql`] fragment rather
 /// than an inline copy: the inline copy matched snake_case `storage_key` only,
-/// so the camelCase `storageKey` entries the GAV-grouped upload handler
-/// actually writes were invisible to it and this repository's delete purged
+/// so the camelCase `storageKey` entries the legacy #418-era GAV-grouped
+/// upload handler wrote were invisible to it and this repository's delete purged
 /// companions another repository's live parent artifact still referenced
 /// (#3156). Once this repository's attribution rows CASCADE away with it, that
 /// other repository becomes the key's sole read-path owner -- of bytes the

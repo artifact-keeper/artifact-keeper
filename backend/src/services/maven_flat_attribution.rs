@@ -71,10 +71,13 @@ const OWNER_BY_ARTIFACT_ROW_SQL: &str = "SELECT DISTINCT a.repository_id FROM ar
 ///
 /// Two facts are encoded here, and both must hold for every caller:
 ///
-/// * **Both key spellings match.** The GAV-grouped upload handler has always
-///   serialized `files[]` entries with camelCase keys (`"storageKey"`, since
-///   #418); snake_case `storage_key` is accepted as a fallback spelling for
-///   hand-repaired rows (#2706). Migration 170 backfills the attribution table
+/// * **Both key spellings match.** No handler in the current tree writes
+///   `files[]` -- the #418-era GAV-grouped upload handler that did has since
+///   been removed, so every such row is legacy, carried by deployments
+///   upgraded through that version. It serialized entries with camelCase keys
+///   (`"storageKey"`); snake_case `storage_key` is accepted as a fallback
+///   spelling for hand-repaired rows (#2706). Migration 170 backfills the
+///   attribution table
 ///   from both spellings, and `expand_maven_secondary_files` /
 ///   `sbom.rs` read camelCase. A caller that matched only one spelling had a
 ///   predicate that never fired on real data -- harmless on the read path
@@ -498,6 +501,29 @@ mod tests {
         assert!(
             !sql.contains("jsonb_array_elements"),
             "the per-row EXISTS form is not index-eligible: {sql}"
+        );
+
+        // The two branches must be a DISJUNCTION, and nothing above pins that:
+        // every assertion so far still holds if `OR` is "simplified" to `AND`.
+        // A `files[]` entry carries ONE spelling, so requiring both would make
+        // the fragment match nothing on real data -- silently restoring the
+        // #3156 data loss in all three NOT EXISTS delete guards (an unmatched
+        // live companion reads as unreferenced and is purged) and breaking the
+        // read path at the same time. Assert the connective directly, then pin
+        // the whole rendered fragment.
+        assert!(
+            !sql.contains(" AND "),
+            "the two spellings must be OR-ed, never AND-ed: a files[] entry \
+             carries one spelling, so an AND matches nothing on real data and \
+             re-opens the #3156 purge of live companions: {sql}"
+        );
+        assert_eq!(
+            sql,
+            "(am.metadata->'files' @> jsonb_build_array(jsonb_build_object('storageKey', o.storage_key)) \
+             OR am.metadata->'files' @> jsonb_build_array(jsonb_build_object('storage_key', o.storage_key)))",
+            "rendered fragment changed; every caller (read path + three delete \
+             guards) depends on this exact shape -- update deliberately, and \
+             keep the two branches OR-ed"
         );
     }
 

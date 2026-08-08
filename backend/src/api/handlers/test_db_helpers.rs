@@ -889,8 +889,8 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
 
 /// Attach a Maven GAV-grouped `files[]` metadata document to the artifact at
 /// `parent_key`, listing one row-less companion under the JSON key spelling
-/// `json_key_name` (`"storageKey"` is what the upload handler writes;
-/// `"storage_key"` is the hand-repair fallback, #2706).
+/// `json_key_name` (`"storageKey"` is what the legacy #418-era upload handler
+/// wrote; `"storage_key"` is the hand-repair fallback, #2706).
 ///
 /// The entry shape mirrors the production fixture in
 /// `test_expand_maven_secondary_files_emits_each_file`. Shared by the
