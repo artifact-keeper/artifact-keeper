@@ -3955,8 +3955,19 @@ async fn purge_storage_object_keys(
 /// artifact's metadata `files[]` reference): deleting this repository must
 /// never destroy an object another tenant still serves. Best-effort: a DB
 /// error logs and returns the empty set.
+///
+/// The `files[]` guard is a `NOT EXISTS`, so a *missed* reference means
+/// DELETE. It therefore has to match every spelling the read path accepts, and
+/// gets that from the shared [`metadata_files_name_key_sql`] fragment rather
+/// than an inline copy: the inline copy matched snake_case `storage_key` only,
+/// so the camelCase `storageKey` entries the GAV-grouped upload handler
+/// actually writes were invisible to it and this repository's delete purged
+/// companions another repository's live parent artifact still referenced
+/// (#3156). Once this repository's attribution rows CASCADE away with it, that
+/// other repository becomes the key's sole read-path owner -- of bytes the
+/// delete has already destroyed.
 async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
-    sqlx::query_scalar(
+    let sql = format!(
         "SELECT o.storage_key \
          FROM maven_flat_object_owner o \
          WHERE o.repository_id = $1 \
@@ -3973,24 +3984,25 @@ async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec
                JOIN repositories pr ON pr.id = pa.repository_id \
                WHERE pa.repository_id <> $1 \
                  AND pr.storage_backend = o.storage_backend \
-                 AND jsonb_typeof(am.metadata->'files') = 'array' \
-                 AND EXISTS ( \
-                     SELECT 1 FROM jsonb_array_elements(am.metadata->'files') f \
-                     WHERE f->>'storage_key' = o.storage_key \
-                 ) \
+                 AND {files_match} \
            )",
-    )
-    .bind(repo_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(
-            repo_id = %repo_id,
-            error = %e,
-            "Failed to list Maven flat-object keys to purge before repository delete"
-        );
-        Vec::new()
-    })
+        files_match = crate::services::maven_flat_attribution::metadata_files_name_key_sql(
+            "am.metadata->'files'",
+            "o.storage_key",
+        ),
+    );
+    sqlx::query_scalar(&sql)
+        .bind(repo_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Failed to list Maven flat-object keys to purge before repository delete"
+            );
+            Vec::new()
+        })
 }
 
 /// Derived row-less Maven keys for a FILESYSTEM repository being deleted:
@@ -21077,5 +21089,132 @@ mod apt_validation_tests {
                 .await;
         }
         tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_repo_maven_flat_keys: the pre-repository-delete purge list
+    // (#2668), and its `files[]` key-spelling guard (#3156).
+    // -----------------------------------------------------------------------
+
+    /// Seed a parent artifact plus an `artifact_metadata` row whose `files[]`
+    /// lists a row-less companion under the given JSON key spelling. The entry
+    /// shape mirrors what the GAV-grouped upload handler writes -- see the
+    /// fixture in `test_expand_maven_secondary_files_emits_each_file`.
+    async fn seed_flat_parent(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        parent_key: &str,
+        json_key_name: &str,
+        companion_key: &str,
+    ) {
+        let parent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts \
+                 (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                  content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, $3, $3, 1, repeat('0', 64), \
+                     'application/java-archive', $4, false)",
+        )
+        .bind(parent_id)
+        .bind(repo_id)
+        .bind(format!("p/{parent_id}.jar"))
+        .bind(parent_key)
+        .execute(pool)
+        .await
+        .expect("seed flat parent artifact");
+        crate::api::handlers::test_db_helpers::attach_maven_files_metadata(
+            pool,
+            parent_key,
+            json_key_name,
+            companion_key,
+        )
+        .await;
+    }
+
+    /// Record an aged `maven_flat_object_owner` claim, as migration 170's
+    /// backfill or a write-time claim would.
+    async fn seed_flat_claim(pool: &sqlx::PgPool, repo_id: Uuid, storage_key: &str) {
+        sqlx::query(
+            "INSERT INTO maven_flat_object_owner \
+                 (storage_backend, storage_key, repository_id, source, created_at) \
+             VALUES ('filesystem', $1, $2, 'metadata_files', NOW() - INTERVAL '2 hours')",
+        )
+        .bind(storage_key)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("seed flat attribution claim");
+    }
+
+    /// #3156: deleting a repository must not purge a flat Maven object that
+    /// ANOTHER repository's live parent artifact still lists in its metadata
+    /// `files[]` -- including (in fact, primarily) when that entry uses the
+    /// camelCase `storageKey` spelling the GAV-grouped upload handler writes.
+    ///
+    /// The guard is a `NOT EXISTS`, so a missed reference means DELETE. Before
+    /// the fix it matched `f->>'storage_key'` only, so the camelCase entry was
+    /// invisible and the companion was collected for purge. This test FAILS if
+    /// the production predicate is reverted to the snake_case-only form.
+    ///
+    /// The positive control -- a genuinely unreferenced key -- must still be
+    /// collected, so the fix cannot pass by simply never purging anything.
+    #[tokio::test]
+    async fn collect_repo_maven_flat_keys_spares_camelcase_referenced_companion_3156() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_repo, _, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (other_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let uid = Uuid::new_v4().simple().to_string();
+
+        // Two companions the OTHER repository's live parent still references,
+        // one per spelling; plus a key nothing references at all.
+        let camel_key = format!("maven/gav3156/{uid}/demo-1.0.0.pom");
+        let snake_key = format!("maven/gav3156/{uid}/demo-1.0.0-sources.jar");
+        let orphan_key = format!("maven/gav3156/{uid}/gone-9.9.9.pom");
+        seed_flat_parent(
+            &pool,
+            other_repo,
+            &format!("maven/gav3156/{uid}/demo-1.0.0.jar"),
+            "storageKey",
+            &camel_key,
+        )
+        .await;
+        seed_flat_parent(
+            &pool,
+            other_repo,
+            &format!("maven/gav3156/{uid}/legacy-1.0.0.jar"),
+            "storage_key",
+            &snake_key,
+        )
+        .await;
+        // ...but the repository being deleted holds all three claims.
+        for key in [&camel_key, &snake_key, &orphan_key] {
+            seed_flat_claim(&pool, owner_repo, key).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let collected = collect_repo_maven_flat_keys(&state, owner_repo).await;
+
+        tdh::cleanup(&pool, other_repo, Uuid::nil()).await;
+        tdh::cleanup(&pool, owner_repo, Uuid::nil()).await;
+
+        assert!(
+            !collected.contains(&camel_key),
+            "a companion another repository's live parent lists as camelCase \
+             `storageKey` must NOT be purged by this repository's delete (#3156); \
+             collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&snake_key),
+            "the snake_case spelling must keep being honoured too; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&orphan_key),
+            "positive control: a key no parent references must still be \
+             collected for purge; collected: {collected:?}"
+        );
     }
 }

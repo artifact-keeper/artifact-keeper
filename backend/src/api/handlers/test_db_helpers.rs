@@ -887,6 +887,39 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
     );
 }
 
+/// Attach a Maven GAV-grouped `files[]` metadata document to the artifact at
+/// `parent_key`, listing one row-less companion under the JSON key spelling
+/// `json_key_name` (`"storageKey"` is what the upload handler writes;
+/// `"storage_key"` is the hand-repair fallback, #2706).
+///
+/// The entry shape mirrors the production fixture in
+/// `test_expand_maven_secondary_files_emits_each_file`. Shared by the
+/// repository-delete and GC flat-object guard tests (#3156) so the two do not
+/// carry independent copies of the same seed.
+pub async fn attach_maven_files_metadata(
+    pool: &PgPool,
+    parent_key: &str,
+    json_key_name: &str,
+    companion_key: &str,
+) {
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         SELECT id, 'maven', jsonb_build_object('files', $2::jsonb) \
+         FROM artifacts WHERE storage_key = $1",
+    )
+    .bind(parent_key)
+    .bind(serde_json::json!([{
+        "path": "com/example/demo/1.0.0/demo-1.0.0.pom",
+        "extension": "pom",
+        json_key_name: companion_key,
+        "sizeBytes": 200,
+        "sha256": "pom-sha",
+    }]))
+    .execute(pool)
+    .await
+    .expect("attach maven files[] metadata");
+}
+
 pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
         .bind(repo_id)

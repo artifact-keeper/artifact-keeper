@@ -27,6 +27,7 @@
 //! entry point short-circuits to the pre-existing behavior there and never
 //! consults the catalog.
 
+use once_cell::sync::Lazy;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -57,30 +58,64 @@ const OWNER_BY_ARTIFACT_ROW_SQL: &str = "SELECT DISTINCT a.repository_id FROM ar
      WHERE a.storage_key = $1 AND a.is_deleted = false AND r.storage_backend = $2 \
      LIMIT 2";
 
+/// The one definition of "does a parent artifact's metadata `files[]` array
+/// name this storage key?", shared by every caller that asks the question
+/// (#3156).
+///
+/// `files_expr` is the SQL expression yielding the `files` array (e.g.
+/// `am.metadata->'files'`) and `key_expr` the expression yielding the storage
+/// key to look for -- a bind parameter (`$1::text`) on the read path, an outer
+/// column (`o.storage_key`) or a derived expression (`regexp_replace(...)`) in
+/// the delete guards. Both are SQL fragments composed by this crate, never
+/// caller input.
+///
+/// Two facts are encoded here, and both must hold for every caller:
+///
+/// * **Both key spellings match.** The GAV-grouped upload handler has always
+///   serialized `files[]` entries with camelCase keys (`"storageKey"`, since
+///   #418); snake_case `storage_key` is accepted as a fallback spelling for
+///   hand-repaired rows (#2706). Migration 170 backfills the attribution table
+///   from both spellings, and `expand_maven_secondary_files` /
+///   `sbom.rs` read camelCase. A caller that matched only one spelling had a
+///   predicate that never fired on real data -- harmless on the read path
+///   (fails closed, 404) but *destructive* in a `NOT EXISTS` delete guard,
+///   where an unmatched live companion reads as unreferenced and is purged
+///   (#3156). Keeping the fragment in one place is what stops the two sides
+///   drifting apart again (the #418 -> #2706 shape).
+/// * **Containment, not `jsonb_array_elements`.** Matching with `@>` lets the
+///   GIN index from migration 179 serve the lookup; the per-row `EXISTS` over
+///   `jsonb_array_elements` it replaces cannot use any index and forced a
+///   sequential scan of all of `artifact_metadata` (#2942). Containment
+///   against an array operand is false when `files` is not an array, so the
+///   explicit `jsonb_typeof(...) = 'array'` guard the `EXISTS` form needed is
+///   implicit here.
+pub(crate) fn metadata_files_name_key_sql(files_expr: &str, key_expr: &str) -> String {
+    format!(
+        "({files_expr} @> jsonb_build_array(jsonb_build_object('storageKey', {key_expr})) \
+          OR {files_expr} @> jsonb_build_array(jsonb_build_object('storage_key', {key_expr})))"
+    )
+}
+
 /// Distinct owning repositories of a live parent artifact whose metadata
 /// `files[]` array lists this key (legacy GAV-grouped uploads whose companion
 /// files have no row of their own), restricted to repositories on `$2`. LIMIT 2
 /// for the same ambiguity test.
 ///
-/// The GAV-grouped upload handler has always serialized `files[]` entries with
-/// camelCase keys (`"storageKey"`, since #418); snake_case `storage_key` is
-/// accepted as a fallback spelling for hand-repaired rows (#2706). Both
-/// spellings are matched with jsonb containment (`@>`) rather than a per-row
-/// `EXISTS` over `jsonb_array_elements` so the lookup is served by the GIN
-/// index from migration 179 -- the EXISTS predicate cannot use any index and
-/// forced a sequential scan of all of `artifact_metadata` on every row-less
-/// read (#2942). Containment against an array operand is false when `files`
-/// is not an array, so the explicit `jsonb_typeof` guard the EXISTS form
-/// needed is implicit here.
-const OWNER_BY_METADATA_FILES_SQL: &str = "SELECT DISTINCT a.repository_id \
-     FROM artifact_metadata am \
-     JOIN artifacts a ON a.id = am.artifact_id \
-     JOIN repositories r ON r.id = a.repository_id \
-     WHERE a.is_deleted = false \
-       AND r.storage_backend = $2 \
-       AND (am.metadata->'files' @> jsonb_build_array(jsonb_build_object('storageKey', $1::text)) \
-         OR am.metadata->'files' @> jsonb_build_array(jsonb_build_object('storage_key', $1::text))) \
-     LIMIT 2";
+/// The `files[]` match is [`metadata_files_name_key_sql`] -- the same fragment
+/// the repository-delete and GC delete guards use.
+static OWNER_BY_METADATA_FILES_SQL: Lazy<String> = Lazy::new(|| {
+    format!(
+        "SELECT DISTINCT a.repository_id \
+         FROM artifact_metadata am \
+         JOIN artifacts a ON a.id = am.artifact_id \
+         JOIN repositories r ON r.id = a.repository_id \
+         WHERE a.is_deleted = false \
+           AND r.storage_backend = $2 \
+           AND {files_match} \
+         LIMIT 2",
+        files_match = metadata_files_name_key_sql("am.metadata->'files'", "$1::text"),
+    )
+});
 
 /// The attribution table (backfilled legacy keys + write-time claims). The
 /// `(storage_backend, storage_key)` primary key means this yields at most one
@@ -147,7 +182,7 @@ async fn resolve_direct(
     for sql in [
         OWNER_BY_ARTIFACT_ROW_SQL,
         OWNER_BY_ATTRIBUTION_TABLE_SQL,
-        OWNER_BY_METADATA_FILES_SQL,
+        OWNER_BY_METADATA_FILES_SQL.as_str(),
     ] {
         match query_layer(db, sql, storage_backend, storage_key).await? {
             LayerResult::Absent => continue,
@@ -437,6 +472,46 @@ pub async fn release_flat_key_claim(
 mod tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// The shared `files[]` fragment must always emit BOTH spellings and use
+    /// containment. Every caller — the read path and the three delete guards
+    /// (#3156) — is built from it, so this is the one place the property has
+    /// to hold. Cheap enough to run without a database.
+    #[test]
+    fn metadata_files_name_key_sql_matches_both_spellings_by_containment() {
+        let sql = metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key");
+        assert!(
+            sql.contains("jsonb_build_object('storageKey', o.storage_key)"),
+            "camelCase spelling (what the GAV-grouped upload handler writes) \
+             must be matched: {sql}"
+        );
+        assert!(
+            sql.contains("jsonb_build_object('storage_key', o.storage_key)"),
+            "snake_case fallback spelling must be matched: {sql}"
+        );
+        assert_eq!(
+            sql.matches("am.metadata->'files' @>").count(),
+            2,
+            "both spellings must be tested with jsonb containment so the \
+             migration-179 GIN index can serve them: {sql}"
+        );
+        assert!(
+            !sql.contains("jsonb_array_elements"),
+            "the per-row EXISTS form is not index-eligible: {sql}"
+        );
+    }
+
+    /// The read path's owner lookup is built from the shared fragment, not an
+    /// inline copy — this is what stopped it drifting from the delete guards.
+    #[test]
+    fn owner_by_metadata_files_sql_uses_the_shared_fragment() {
+        assert!(
+            OWNER_BY_METADATA_FILES_SQL.contains(&metadata_files_name_key_sql(
+                "am.metadata->'files'",
+                "$1::text"
+            ))
+        );
+    }
 
     async fn seed_artifact(pool: &PgPool, repo_id: Uuid, path: &str, storage_key: &str) {
         sqlx::query(
