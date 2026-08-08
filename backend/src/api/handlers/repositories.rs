@@ -253,6 +253,61 @@ pub(crate) fn visibility_for_auth(auth: Option<&AuthExtension>) -> RepoVisibilit
     }
 }
 
+/// The GRANT half of [`require_visible`], for filtering rows the caller reaches
+/// *through* an already-authorized parent (a virtual repo's members).
+///
+/// Deliberately not [`visibility_for_auth`]. That function answers "which
+/// repositories may this principal LIST", where a repo-scoped token's answer is
+/// exactly its allowed set — the listing's documented contract. Membership is a
+/// different question, and reusing the `Ids` arm for it gets two things wrong,
+/// because `require_visible` is
+///
+/// ```text
+/// is_public OR (in_scope AND (is_admin OR grants))
+/// ```
+///
+/// and the `Ids` arm is `in_scope` alone. It drops the `is_public` arm — so an
+/// authenticated scoped caller saw LESS than an anonymous one — and it drops
+/// the grant conjunct, so a token kept working against a member after its
+/// owner's grant was revoked. Scope is a mint-time snapshot; entitlement is not.
+///
+/// So: this returns the grant half only, and [`member_passes_token_scope`]
+/// applies the scope half. Composed, they are `require_visible` exactly.
+pub(crate) fn member_grant_visibility(auth: Option<&AuthExtension>) -> RepoVisibility {
+    match auth {
+        None => RepoVisibility::PublicOnly,
+        Some(a) if a.is_admin => RepoVisibility::All,
+        Some(a) => RepoVisibility::User(a.user_id),
+    }
+}
+
+/// The SCOPE half, applied per member row.
+///
+/// A public member bypasses scope entirely, matching `require_visible`'s
+/// early return. Otherwise the member passes when it is itself in scope, OR
+/// when the PARENT virtual is — read-through.
+///
+/// Read-through is a deliberate choice, not an oversight. Scoping a token to a
+/// virtual repository is the canonical way to point CI at one, and the
+/// by-path download through that virtual already serves member bytes for such
+/// a token. Without read-through the listing returns `200 OK` with zero items
+/// while the download of those same items succeeds — two answers to one
+/// question. The grant half still applies on top, so this widens which members
+/// a token may ENUMERATE, never which a user may READ.
+pub(crate) fn member_passes_token_scope(
+    auth: Option<&AuthExtension>,
+    parent_repo_id: Uuid,
+    member_id: Uuid,
+    member_is_public: bool,
+) -> bool {
+    match auth {
+        None => member_is_public,
+        Some(a) => {
+            member_is_public || a.can_access_repo(parent_repo_id) || a.can_access_repo(member_id)
+        }
+    }
+}
+
 /// Ensure a repository is visible to the current user.
 ///
 /// Public repos are visible to everyone. Private repos require authentication
@@ -4522,7 +4577,7 @@ pub async fn list_artifacts(
             count_exact,
             page,
             per_page,
-            &visibility_for_auth(auth.as_ref()),
+            auth.as_ref(),
         )
         .await;
     }
@@ -4603,9 +4658,18 @@ pub async fn list_artifacts(
         // members this caller may see, using the same predicate as the
         // repository listing and `GET /{key}/members`.
         let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-        let member_ids = repo_service
-            .filter_visible_repo_ids(&member_ids, &visibility_for_auth(auth.as_ref()))
+        let granted = repo_service
+            .filter_visible_repo_ids(&member_ids, &member_grant_visibility(auth.as_ref()))
             .await?;
+        let granted: std::collections::HashSet<uuid::Uuid> = granted.into_iter().collect();
+        let member_ids: Vec<uuid::Uuid> = members
+            .iter()
+            .filter(|m| {
+                granted.contains(&m.id)
+                    && member_passes_token_scope(auth.as_ref(), repo.id, m.id, m.is_public)
+            })
+            .map(|m| m.id)
+            .collect();
 
         let page_rows = artifact_service
             .list_for_repos_page(
@@ -5455,10 +5519,13 @@ async fn list_artifacts_grouped_by_maven_component(
     count_exact: bool,
     page: u32,
     per_page: u32,
-    // The CALLER's repository visibility (#3163). Only consulted for a
-    // Virtual repo, whose members are separate repositories with their own
-    // ACLs; a non-virtual repo is already gated by `require_visible`.
-    visibility: &RepoVisibility,
+    // The CALLER (#3163). Only consulted for a Virtual repo, whose members are
+    // separate repositories with their own ACLs; a non-virtual repo is already
+    // gated by `require_visible`. Takes the auth extension rather than a
+    // pre-computed `RepoVisibility` because member filtering needs BOTH halves
+    // of `require_visible` -- the grant half and the token-scope half -- and a
+    // single `RepoVisibility` can only carry one of them.
+    auth: Option<&AuthExtension>,
 ) -> Result<Json<ArtifactListResponse>> {
     // Remote (proxy) repositories do NOT record cached items in the `artifacts`
     // table (#1278 / #1280), so `artifact_service.list` returns nothing for them
@@ -5545,9 +5612,19 @@ async fn list_artifacts_grouped_by_maven_component(
         // private member's GAV coordinates are not disclosed through the
         // grouped view.
         let member_ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
-        RepositoryService::new(state.db.clone())
-            .filter_visible_repo_ids(&member_ids, visibility)
+        let granted: std::collections::HashSet<Uuid> = RepositoryService::new(state.db.clone())
+            .filter_visible_repo_ids(&member_ids, &member_grant_visibility(auth))
             .await?
+            .into_iter()
+            .collect();
+        members
+            .iter()
+            .filter(|m| {
+                granted.contains(&m.id)
+                    && member_passes_token_scope(auth, repo.id, m.id, m.is_public)
+            })
+            .map(|m| m.id)
+            .collect()
     } else {
         vec![repo.id]
     };
@@ -8294,6 +8371,9 @@ struct VirtualMemberRow {
     member_key: String,
     member_name: String,
     repo_type: RepositoryType,
+    /// Needed by `member_passes_token_scope`: a public member bypasses token
+    /// scope entirely, matching `require_visible`'s early return.
+    is_public: bool,
 }
 
 /// List virtual repository members
@@ -8359,7 +8439,8 @@ pub async fn list_virtual_members(
             vrm.created_at,
             r.key as member_key,
             r.name as member_name,
-            r.repo_type
+            r.repo_type,
+            r.is_public
         FROM virtual_repo_members vrm
         INNER JOIN repositories r ON r.id = vrm.member_repo_id
         WHERE vrm.virtual_repo_id = $1
@@ -8381,12 +8462,30 @@ pub async fn list_virtual_members(
     // caller holds no grant on. Members are separate repositories with their
     // own ACLs, so they are filtered through the SAME predicate the repository
     // listing uses. Priority order is preserved.
-    let visibility = visibility_for_auth(Some(&auth));
+    // Two halves, composed: the SQL filter answers the GRANT half, and
+    // `member_passes_token_scope` answers the SCOPE half per row. Together they
+    // are `require_visible` exactly. Using `visibility_for_auth` here instead
+    // got both halves wrong for a repo-scoped token -- see
+    // `member_grant_visibility`.
+    let visibility = member_grant_visibility(Some(&auth));
     let member_ids: Vec<Uuid> = members.iter().map(|row| row.member_repo_id).collect();
-    let visible: std::collections::HashSet<Uuid> = service
+    let granted: std::collections::HashSet<Uuid> = service
         .filter_visible_repo_ids(&member_ids, &visibility)
         .await?
         .into_iter()
+        .collect();
+    let visible: std::collections::HashSet<Uuid> = members
+        .iter()
+        .filter(|row| {
+            granted.contains(&row.member_repo_id)
+                && member_passes_token_scope(
+                    Some(&auth),
+                    repo.id,
+                    row.member_repo_id,
+                    row.is_public,
+                )
+        })
+        .map(|row| row.member_repo_id)
         .collect();
     let members = members
         .into_iter()
@@ -15884,6 +15983,7 @@ mod tests {
             member_key: "maven-local".to_string(),
             member_name: "Maven Local".to_string(),
             repo_type: RepositoryType::Local,
+            is_public: false,
         };
         let resp = map_member_row(row);
         assert_eq!(resp.id, id);
@@ -15905,6 +16005,7 @@ mod tests {
             member_key: "maven-central".to_string(),
             member_name: "Maven Central".to_string(),
             repo_type: RepositoryType::Remote,
+            is_public: false,
         };
         let resp = map_member_row(row);
         assert_eq!(resp.member_repo_type, "remote");
@@ -15921,6 +16022,7 @@ mod tests {
             member_key: "r".to_string(),
             member_name: "R".to_string(),
             repo_type: RepositoryType::Local,
+            is_public: false,
         };
         assert_eq!(map_member_row(row).priority, 42);
     }
@@ -21340,6 +21442,22 @@ mod virtual_member_visibility_tests {
             tdh::admin_auth(self.admin.0, &self.admin.1)
         }
 
+        /// A repo-scoped API token: the `AccessScope::Restricted` principal
+        /// that no test exercised, and the one both defects lived in.
+        fn scoped_token(&self, who: &(Uuid, String), scope: Vec<Uuid>) -> AuthExtension {
+            let mut auth = tdh::make_auth(who.0, &who.1);
+            auth.is_api_token = true;
+            auth.allowed_repo_ids = crate::models::access_scope::AccessScope::Restricted(scope);
+            auth
+        }
+
+        fn scoped_admin_token(&self, scope: Vec<Uuid>) -> AuthExtension {
+            let mut auth = tdh::admin_auth(self.admin.0, &self.admin.1);
+            auth.is_api_token = true;
+            auth.allowed_repo_ids = crate::models::access_scope::AccessScope::Restricted(scope);
+            auth
+        }
+
         /// Drive a GET on the real `router()` as `auth` and return
         /// `(status, parsed-json)`.
         async fn get_as(
@@ -21428,6 +21546,75 @@ mod virtual_member_visibility_tests {
     /// (`allowed_repo_ids = AccessScope::Admin`) that predicate is `true` for
     /// every repository in the instance, so `viewer` received the key, name and
     /// type of the private member it holds no grant on.
+    /// The `AccessScope::Restricted` principal -- a repo-scoped API token.
+    ///
+    /// Nothing exercised this arm, and both defects lived in it. Member
+    /// filtering used `visibility_for_auth`, whose `Ids` arm is `in_scope`
+    /// alone, while `require_visible` is
+    /// `is_public OR (in_scope AND (is_admin OR grants))`. Dropping the
+    /// `is_public` arm made an authenticated scoped caller see LESS than an
+    /// anonymous one; dropping the grant conjunct let a token keep reading a
+    /// member after its owner's grant was revoked.
+    ///
+    /// It also asserts read-through: a token scoped to the VIRTUAL reaches the
+    /// virtual's members. That is deliberate -- the by-path download through
+    /// the same virtual already serves member bytes to such a token, so
+    /// without it the listing returns `200 OK` with zero items while the
+    /// download of those same items succeeds.
+    #[tokio::test]
+    async fn members_endpoint_honours_token_scope_and_grants_3163() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = Fixture::seed(&pool, "generic").await;
+
+        // Scoped to the VIRTUAL only. Read-through must reach its members,
+        // and the grant half must still hide the private one from `viewer`.
+        let vt = fx.scoped_token(&fx.viewer, vec![fx.virt_id]);
+        let (virt_status, virt_keys) = fx.members_seen(vt).await;
+
+        // Same token shape for a caller WITH the grant: the private member
+        // must appear, proving the filter is not "hide everything".
+        let it = fx.scoped_token(&fx.insider, vec![fx.virt_id]);
+        let (ins_status, ins_keys) = fx.members_seen(it).await;
+
+        // An ADMIN whose token is deliberately scoped to the virtual only.
+        // Before the fix `is_admin` was matched ahead of `Restricted`, so the
+        // scope was discarded entirely.
+        let at = fx.scoped_admin_token(vec![fx.virt_id]);
+        let (adm_status, adm_keys) = fx.members_seen(at).await;
+
+        let (private_key, public_key) = (fx.private_key.clone(), fx.public_key.clone());
+        fx.cleanup().await;
+
+        assert_eq!(virt_status, StatusCode::OK);
+        assert_eq!(ins_status, StatusCode::OK);
+        assert_eq!(adm_status, StatusCode::OK);
+
+        // Read-through + the public arm the `Ids` arm had dropped.
+        assert!(
+            virt_keys.contains(&public_key),
+            "a token scoped to the virtual must reach its public member, or \
+             the listing contradicts the download path; got {virt_keys:?}"
+        );
+        // The grant half still applies.
+        assert!(
+            !virt_keys.contains(&private_key),
+            "token scope must not substitute for a grant: {private_key} has no \
+             grant for this caller; got {virt_keys:?}"
+        );
+        assert!(
+            ins_keys.contains(&private_key),
+            "a scoped token whose owner HOLDS the grant must still see \
+             {private_key}; got {ins_keys:?}"
+        );
+        assert!(
+            adm_keys.contains(&public_key) && adm_keys.contains(&private_key),
+            "an admin token scoped to the virtual reaches its members; \
+             got {adm_keys:?}"
+        );
+    }
+
     #[tokio::test]
     async fn members_endpoint_hides_members_the_caller_cannot_see_3163() {
         let Some(pool) = tdh::try_pool().await else {
