@@ -9611,11 +9611,43 @@ mod tests {
         .await
         .expect("seed local ownership artifact");
 
-        let app = tdh::router_anon(super::router(), state);
+        // Write the local owner's wheel to its storage so the local branch can
+        // actually resolve. Without this the local member is only ever a miss,
+        // and the 404 below cannot distinguish "the guard suppressed the
+        // remote" from "nothing resolved at all".
+        let local_wheel_path = local_dir.join("local");
+        std::fs::create_dir_all(&local_wheel_path).expect("local storage dir");
+        std::fs::write(
+            local_wheel_path.join(local_wheel),
+            wheel_with_metadata(
+                "demo-1.0",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
+            ),
+        )
+        .expect("seed local wheel bytes");
+
+        let app = tdh::router_anon(super::router(), state.clone());
         let (status, _body) = tdh::send(
             app,
             tdh::get(format!(
                 "/{}/simple/{project}/{remote_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        // POSITIVE CONTROL. The local owner's own wheel must resolve through
+        // the virtual. This is the half that fails on `main`: pre-fix, a
+        // virtual `.metadata` request falls through to
+        // `serve_metadata(repo.id)` against a repo that owns no artifacts, so
+        // EVERYTHING 404s -- which silently satisfies the negative assertion
+        // above. Without this control the suppression test is green on `main`
+        // and carries no information about whether the fix shipped.
+        let app = tdh::router_anon(super::router(), state);
+        let (local_status, local_body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{local_wheel}.metadata",
                 fx.repo_key
             )),
         )
@@ -9629,6 +9661,144 @@ mod tests {
             status,
             StatusCode::NOT_FOUND,
             "remote-only metadata must stay hidden when the local owner outranks the remote"
+        );
+        assert_eq!(
+            local_status,
+            StatusCode::OK,
+            "the local owner's own wheel must still resolve through the virtual"
+        );
+        assert!(
+            String::from_utf8_lossy(&local_body).contains("Version: 1.0"),
+            "the served metadata must come from the LOCAL member's wheel, not \
+             the remote's -- got {:?}",
+            String::from_utf8_lossy(&local_body)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_does_not_leak_a_private_member_to_anon() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let local_wheel = "demo-1.0-cp39-cp39-manylinux_2_17_x86_64.whl";
+        let remote_wheel = "demo-2.0-cp39-cp39-win_amd64.whl";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(pep658_index_html(remote_wheel)),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{remote_wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Metadata-Version: 2.1\nName: demo\nVersion: 2.0\n"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (remote_id, _remote_key, remote_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        // PRIVATE, unlike the sibling fixture. An anonymous caller must not
+        // be able to read this member's content through the virtual.
+        sqlx::query("UPDATE repositories SET is_public = false WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make local owner private");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach higher-priority local owner");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)",
+        )
+        .bind(local_id)
+        .bind(format!("simple/{project}/{local_wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind("test-local-owner")
+        .bind("application/zip")
+        .bind(format!("local/{local_wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed local ownership artifact");
+
+        // Write the local owner's wheel to its storage so the local branch can
+        // actually resolve. Without this the local member is only ever a miss,
+        // and the 404 below cannot distinguish "the guard suppressed the
+        // remote" from "nothing resolved at all".
+        let local_wheel_path = local_dir.join("local");
+        std::fs::create_dir_all(&local_wheel_path).expect("local storage dir");
+        std::fs::write(
+            local_wheel_path.join(local_wheel),
+            wheel_with_metadata(
+                "demo-1.0",
+                b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
+            ),
+        )
+        .expect("seed local wheel bytes");
+
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{remote_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        // POSITIVE CONTROL. The local owner's own wheel must resolve through
+        // the virtual. This is the half that fails on `main`: pre-fix, a
+        // virtual `.metadata` request falls through to
+        // `serve_metadata(repo.id)` against a repo that owns no artifacts, so
+        // EVERYTHING 404s -- which silently satisfies the negative assertion
+        // above. Without this control the suppression test is green on `main`
+        // and carries no information about whether the fix shipped.
+        let app = tdh::router_anon(super::router(), state);
+        let (local_status, local_body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{local_wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        cleanup_virtual_member(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        let _ = status;
+        // `serve_virtual_metadata` is a NEW way to read member content through
+        // a virtual repo, so the member filter is load-bearing here rather
+        // than inherited. Deleting `authorize_virtual_members` leaves every
+        // other test in this module green.
+        assert_ne!(
+            local_status,
+            StatusCode::OK,
+            "an anonymous caller must not read a PRIVATE member's metadata \
+             through the virtual: got body {:?}",
+            String::from_utf8_lossy(&local_body)
         );
     }
 
