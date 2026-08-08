@@ -789,7 +789,7 @@ async fn simple_project(
                             &state,
                             &repo,
                             &effective_upstream,
-                            &project,
+                            &normalized,
                             json,
                         )
                         .await;
@@ -805,12 +805,12 @@ async fn simple_project(
                 // Rewrite absolute download URLs to route through our proxy.
                 if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
-                    let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                    let rewritten = rewrite_upstream_urls(&html, &repo_key, &normalized);
                     let rewritten = filter_pypi_simple_html_response(
                         &state,
                         &repo,
                         &effective_upstream,
-                        &project,
+                        &normalized,
                         rewritten,
                     )
                     .await;
@@ -832,7 +832,7 @@ async fn simple_project(
                                     &state,
                                     &repo,
                                     &effective_upstream,
-                                    &project,
+                                    &normalized,
                                     json,
                                 )
                                 .await;
@@ -847,12 +847,12 @@ async fn simple_project(
                     }
                     SniffedSimpleIndex::Html => {
                         let html = String::from_utf8_lossy(&content);
-                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &normalized);
                         let rewritten = filter_pypi_simple_html_response(
                             &state,
                             &repo,
                             &effective_upstream,
-                            &project,
+                            &normalized,
                             rewritten,
                         )
                         .await;
@@ -1075,7 +1075,7 @@ async fn simple_project(
                                 &state,
                                 &member_info,
                                 &effective_upstream,
-                                &project,
+                                &normalized,
                                 String::from_utf8_lossy(&content).into_owned(),
                             )
                             .await;
@@ -1085,7 +1085,7 @@ async fn simple_project(
                                 &state,
                                 &member_info,
                                 &effective_upstream,
-                                &project,
+                                &normalized,
                                 String::from_utf8_lossy(&content).into_owned(),
                             )
                             .await;
@@ -1235,7 +1235,7 @@ async fn simple_project(
 
                     if ct.contains("text/html") {
                         let html = String::from_utf8_lossy(&content);
-                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &normalized);
                         let merged = merge_local_into_remote_simple_html(
                             &rewritten,
                             &repo_key,
@@ -1272,7 +1272,7 @@ async fn simple_project(
                         }
                         SniffedSimpleIndex::Html => {
                             let html = String::from_utf8_lossy(&content);
-                            let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                            let rewritten = rewrite_upstream_urls(&html, &repo_key, &normalized);
                             let merged = merge_local_into_remote_simple_html(
                                 &rewritten,
                                 &repo_key,
@@ -1670,12 +1670,26 @@ async fn download_or_metadata(
         .await;
     }
 
-    // Regular file download
+    // Regular file download.
+    //
+    // The NORMALIZED name, not the raw path segment (#3183). The curation gate
+    // above and every gate inside `serve_file` key on `normalize_pep503`, but
+    // the upstream fetch re-normalizes with `PypiHandler::normalize_name`, and
+    // the two disagree: `normalize_pep503` silently DROPS any character outside
+    // [A-Za-z0-9._-] without marking a separator, while `normalize_name` maps
+    // every non-alphanumeric to '-'. So "acme sdk" cleared the gates as
+    // "acmesdk" -- owned by nobody, blocked by nobody -- and then fetched
+    // "acme-sdk", which is precisely the private package the dependency-
+    // confusion gate exists to protect. That served the attacker's WHEEL BYTES.
+    //
+    // `normalize_name` is idempotent on `normalize_pep503` output (see
+    // `test_normalize_name_is_idempotent_on_pep503_output`), so upstream URLs
+    // and proxy-cache keys are byte-identical for every well-formed name.
     serve_file(
         &state,
         &repo,
         &repo_key,
-        &project,
+        &normalized,
         &filename,
         auth.as_ref(),
         &ctx,
@@ -2211,11 +2225,23 @@ async fn enforce_pypi_download_age_gate(
     Ok(Some(build_streaming_file_response(&lkg_filename, result)))
 }
 
+/// Serve a PyPI distribution download.
+///
+/// Takes ONLY the PEP 503 normalized project name. The raw path segment is
+/// deliberately not a parameter (#3183, same shape as the #3179 metadata fix):
+/// every gate on this path -- the PEP 708 dependency-confusion isolation, the
+/// per-member curation gate, the download age gate, and the inline scan gate --
+/// keys on the `normalize_pep503` form, while the upstream fetch re-normalizes
+/// with `PypiHandler::normalize_name`. Those two functions disagree on any
+/// character outside `[A-Za-z0-9._-]`: the gate DROPS it, the fetch turns it
+/// into a '-'. Passing the raw segment therefore let a client check one name
+/// and download another. Not having the raw name in scope is what stops that
+/// from being reintroduced.
 async fn serve_file(
     state: &SharedState,
     repo: &RepoInfo,
     repo_key: &str,
-    project: &str,
+    normalized_project: &str,
     filename: &str,
     auth: Option<&AuthExtension>,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
@@ -2245,14 +2271,17 @@ async fn serve_file(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let normalized = PypiHandler::normalize_name(project);
-
                     // Enforce the download age gate before any proxy fetch, and
                     // serve the last-known-good wheel if the requested version is
                     // withheld. Shared with the local-`artifacts`-hit branch below.
-                    if let Some(resp) =
-                        enforce_pypi_download_age_gate(state, repo, repo_key, project, filename)
-                            .await?
+                    if let Some(resp) = enforce_pypi_download_age_gate(
+                        state,
+                        repo,
+                        repo_key,
+                        normalized_project,
+                        filename,
+                    )
+                    .await?
                     {
                         return Ok(resp);
                     }
@@ -2283,7 +2312,7 @@ async fn serve_file(
                             repo.id,
                             repo_key,
                             upstream_url,
-                            project,
+                            normalized_project,
                             filename,
                             action,
                             ctx,
@@ -2297,7 +2326,11 @@ async fn serve_file(
                     // already cached from a previous request. Streamed straight
                     // from storage (#895): buffering cached multi-hundred-MiB
                     // wheels per request OOM-killed memory-constrained pods.
-                    let local_cache_path = build_pypi_proxy_cache_path(&normalized, filename);
+                    // Already PEP 503 normalized by the caller;
+                    // `PypiHandler::normalize_name` is the identity on that
+                    // form, so this is the same cache key it always was.
+                    let local_cache_path =
+                        build_pypi_proxy_cache_path(normalized_project, filename);
 
                     // #1555: redirect to a presigned URL on a fresh cache hit
                     // before falling back to streaming.
@@ -2339,7 +2372,7 @@ async fn serve_file(
                         repo.id,
                         repo_key,
                         upstream_url,
-                        project,
+                        normalized_project,
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
@@ -2413,11 +2446,10 @@ async fn serve_file(
                 // member at equal or higher priority than the owning local
                 // still serves, mirroring the simple-index decision above so
                 // every version the index lists is downloadable.
-                let normalized_project = normalize_pep503(project);
                 let owning_local_min_priority = proxy_helpers::pypi_virtual_isolates_name(
                     &state.db,
                     repo.id,
-                    &normalized_project,
+                    normalized_project,
                 )
                 .await?;
                 let member_priorities = if owning_local_min_priority.is_some() {
@@ -2435,7 +2467,7 @@ async fn serve_file(
                 // symmetric: every distribution the index lists is downloadable
                 // and every one it hides 404s here.
                 let owned_profile = if owning_local_min_priority.is_some() {
-                    pypi_owned_wheel_profile(&state.db, &members, &normalized_project).await
+                    pypi_owned_wheel_profile(&state.db, &members, normalized_project).await
                 } else {
                     OwnedWheelProfile::default()
                 };
@@ -2460,7 +2492,7 @@ async fn serve_file(
                     if enforce_pypi_curation(
                         state,
                         &member_info,
-                        &normalize_pep503(project),
+                        normalized_project,
                         version_from_pypi_filename(filename).as_deref(),
                     )
                     .await
@@ -2473,7 +2505,7 @@ async fn serve_file(
                         state,
                         &member_info,
                         &member.key,
-                        project,
+                        normalized_project,
                         filename,
                     )
                     .await?
@@ -2562,7 +2594,7 @@ async fn serve_file(
                                     member.id,
                                     &member.key,
                                     upstream_url,
-                                    project,
+                                    normalized_project,
                                     filename,
                                     action,
                                     ctx,
@@ -2591,9 +2623,12 @@ async fn serve_file(
                             // direct Remote path). This avoids re-fetching the
                             // simple index from upstream when the file is already
                             // cached from a previous request through this member.
-                            let normalized = PypiHandler::normalize_name(project);
+                            // Already PEP 503 normalized by the caller;
+                            // `PypiHandler::normalize_name` is the identity on
+                            // that form, so this is the same cache key it
+                            // always was for a well-formed name.
                             let local_cache_path =
-                                build_pypi_proxy_cache_path(&normalized, filename);
+                                build_pypi_proxy_cache_path(normalized_project, filename);
 
                             // #1555: redirect to a presigned URL on a fresh
                             // cache hit before falling back to streaming.
@@ -2628,7 +2663,7 @@ async fn serve_file(
                                 member.id,
                                 &member.key,
                                 upstream_url,
-                                project,
+                                normalized_project,
                                 filename,
                                 &member_index_path,
                                 member.format.clone(),
@@ -2668,7 +2703,8 @@ async fn serve_file(
     // young local artifact.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(resp) =
-            enforce_pypi_download_age_gate(state, repo, repo_key, project, filename).await?
+            enforce_pypi_download_age_gate(state, repo, repo_key, normalized_project, filename)
+                .await?
         {
             return Ok(resp);
         }
@@ -2700,7 +2736,7 @@ async fn serve_file(
                         repo.id,
                         repo_key,
                         upstream_url,
-                        project,
+                        normalized_project,
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
@@ -10809,6 +10845,251 @@ mod tests {
             "a package blocked by a virtual member's curation rule must not be served \
              through the virtual repository"
         );
+    }
+
+    /// #3183: the PEP 708 dependency-confusion isolation must not depend on how
+    /// the client spells the project segment.
+    ///
+    /// `serve_file`'s gates keyed on `normalize_pep503(project)` while the raw
+    /// segment was passed downstream, where `PypiHandler::normalize_name`
+    /// re-normalized it differently:
+    ///
+    /// ```text
+    /// input        gate (normalize_pep503)   fetch (normalize_name)
+    /// "acme-sdk"   acme-sdk                  acme-sdk      same
+    /// "acme sdk"   acmesdk                   acme-sdk      DIVERGE
+    /// ```
+    ///
+    /// So one space turned the gate off (nothing owns "acmesdk", so nothing was
+    /// suppressed) and then resolved the private package's real name upstream —
+    /// serving the attacker's WHEEL BYTES, not merely metadata.
+    ///
+    /// FIXTURE NOTE, and it is load-bearing: the private package name MUST
+    /// contain a separator. With a separator-free name like `demo` the two
+    /// normalizers cannot diverge in the exploitable direction ("demo x" ->
+    /// "demox" vs "demo-x", neither of which is `demo`), and this test reports a
+    /// FALSE PASS. That cost a full cycle on #3179.
+    #[tokio::test]
+    async fn test_virtual_pypi_download_isolation_survives_a_divergent_project_spelling() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        // A HYPHENATED private name -- see the fixture note above.
+        let project = "acme-sdk";
+        let local_wheel = "acme_sdk-1.0-py3-none-any.whl";
+        let attacker_wheel = "acme_sdk-9.9.9-py3-none-any.whl";
+        let attacker_bytes: &[u8] = b"PK\x03\x04 ATTACKER-SHADOW-WHEEL";
+        let local_bytes: &[u8] = b"PK\x03\x04 private-acme-sdk-wheel";
+
+        // The public shadow: the attacker has published `acme-sdk` upstream,
+        // the classic dependency-confusion setup. The upstream answers ONLY on
+        // the private package's real, hyphenated spelling -- exactly as
+        // pypi.org would. It has no `acmesdk` project, so an unmatched request
+        // 404s, which is what makes the assertion below meaningful.
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(pep658_index_html(attacker_wheel)),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{attacker_wheel}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(attacker_bytes.to_vec()))
+            .mount(&upstream)
+            .await;
+
+        // Remote member at priority 1 (the public upstream).
+        let (remote_id, _remote_key, remote_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+
+        // Local member at priority 0 owning the private `acme-sdk`.
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make local owner public");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach higher-priority local owner");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(local_id)
+        .bind(format!("simple/{project}/{local_wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind(local_bytes.len() as i64)
+        .bind("test-local-owner")
+        .bind("application/zip")
+        .bind(format!("local/{local_wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed local ownership artifact");
+
+        // Write the owner's wheel bytes so the POSITIVE CONTROL below can
+        // actually resolve. Without this the local member is only ever a miss,
+        // and a 404 on the attack request could not be distinguished from "the
+        // fixture never wired anything up at all".
+        let local_storage = local_dir.join("local");
+        std::fs::create_dir_all(&local_storage).expect("local storage dir");
+        std::fs::write(local_storage.join(local_wheel), local_bytes).expect("seed local wheel");
+
+        // THE ATTACK. Same wheel request, but the project segment is spelled
+        // "acme sdk" -- one space. axum percent-decodes it, so the handler sees
+        // the literal space.
+        //
+        // `normalize_pep503` (the GATE) drops any character outside
+        // [A-Za-z0-9._-] WITHOUT marking a separator -> "acmesdk", which no
+        // local member owns, so `owning_local_min_priority` is None and nothing
+        // is suppressed. `PypiHandler::normalize_name` (the upstream FETCH)
+        // maps every non-alphanumeric to '-' -> "acme-sdk", which is exactly
+        // the private package the gate exists to protect.
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/acme%20sdk/{attacker_wheel}",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        // POSITIVE CONTROL. The owner's own wheel must still resolve through
+        // the virtual under the canonical spelling, proving both members are
+        // wired and reachable and that the 404 above is the gate and the fetch
+        // finally agreeing -- not a broken fixture.
+        let app = tdh::router_anon(super::router(), state);
+        let (control_status, control_body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/simple/{project}/{local_wheel}", fx.repo_key)),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        cleanup_virtual_member(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_ne!(
+            &body[..],
+            attacker_bytes,
+            "the attacker's shadow wheel was SERVED. Isolation must not depend on \
+             how the client spells the project: if the string used for the policy \
+             check differs from the string used to fetch, one percent-encoded \
+             character turns the dependency-confusion gate off and the upstream \
+             resolves the private package's real name."
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a divergent spelling must not resolve any distribution"
+        );
+        assert_eq!(
+            control_status,
+            StatusCode::OK,
+            "positive control: the local owner's wheel must still serve"
+        );
+        assert_eq!(
+            &control_body[..],
+            local_bytes,
+            "positive control: the local owner's OWN bytes must be served"
+        );
+    }
+
+    /// The fix in `serve_file` / `download_or_metadata` passes the
+    /// `normalize_pep503` output to helpers that re-normalize with
+    /// `PypiHandler::normalize_name`. That is only behavior-preserving if the
+    /// second function is the IDENTITY on the first one's output — otherwise
+    /// every upstream URL and proxy-cache key would shift for well-formed
+    /// names. Prove it rather than asserting it.
+    ///
+    /// `normalize_pep503` emits only `[a-z0-9]` and `-`, never leading,
+    /// trailing, or consecutive `-`. `normalize_name` lowercases alphanumerics
+    /// (already lowercase) and maps a non-alphanumeric to `-` unless the
+    /// previous character was a separator — which, given no runs, is exactly a
+    /// copy.
+    #[test]
+    fn test_normalize_name_is_idempotent_on_pep503_output() {
+        let inputs = [
+            "acme-sdk",
+            "acme sdk",
+            "acme_sdk",
+            "acme.sdk",
+            "Acme..SDK",
+            "ACME__SDK",
+            "zope.interface",
+            "backports.ssl_match_hostname",
+            "ruamel.yaml",
+            "Jinja2",
+            "requests",
+            "a",
+            "_leading",
+            "trailing_",
+            "my--package",
+            "my_._package",
+            "<script>alert(1)</script>",
+            "foo&bar",
+            "acme!sdk",
+            "acmeésdk",
+            "a\\b\tc\nd",
+            "café-au-lait",
+            "..--__..",
+        ];
+
+        for input in inputs {
+            let pep503 = normalize_pep503(input);
+            assert_eq!(
+                PypiHandler::normalize_name(&pep503),
+                pep503,
+                "normalize_name must be the identity on normalize_pep503 output \
+                 (input {input:?} normalized to {pep503:?}); if it is not, passing \
+                 the normalized name downstream would change upstream URLs and \
+                 proxy-cache keys"
+            );
+        }
+    }
+
+    /// The divergence this whole class of bug rests on, pinned so it cannot be
+    /// silently "fixed" by making `normalize_pep503` permissive — the dropping
+    /// behavior is a deliberate XSS boundary (see the function's docs and
+    /// `test_normalize_pep503_drops_script_chars`). The point is that the FETCH
+    /// must consume the gate's output, not that the two agree on raw input.
+    #[test]
+    fn test_the_two_pypi_normalizers_still_diverge_on_invalid_names() {
+        assert_eq!(normalize_pep503("acme sdk"), "acmesdk");
+        assert_eq!(PypiHandler::normalize_name("acme sdk"), "acme-sdk");
+        assert_ne!(
+            normalize_pep503("acme sdk"),
+            PypiHandler::normalize_name("acme sdk"),
+            "if these ever converge, the #3183 fix is still correct but this \
+             test's premise changed; see #3186 for rejecting invalid names at \
+             the edge instead"
+        );
+        // They agree on every WELL-FORMED (PEP 508) name, which is why passing
+        // the normalized form downstream is behavior-preserving.
+        for name in ["acme-sdk", "acme_sdk", "acme.sdk", "Acme-SDK", "requests"] {
+            assert_eq!(
+                normalize_pep503(name),
+                PypiHandler::normalize_name(name),
+                "the two normalizers must agree on the valid-name domain"
+            );
+        }
     }
 
     #[tokio::test]
