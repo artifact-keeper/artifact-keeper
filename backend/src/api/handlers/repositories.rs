@@ -3966,6 +3966,31 @@ async fn purge_storage_object_keys(
 /// (#3156). Once this repository's attribution rows CASCADE away with it, that
 /// other repository becomes the key's sole read-path owner -- of bytes the
 /// delete has already destroyed.
+///
+/// Each of those two guards is then run a SECOND time against the
+/// sidecar-stripped key, which is what makes the invariant hold:
+///
+/// > a checksum/signature sidecar is spared whenever its BASE object is spared.
+///
+/// Without that, the guards tested only the candidate key verbatim, and
+/// *nothing ever references a sidecar by name* -- a parent's `files[]` lists
+/// the companion, not the companion's `.sha1`. So both guards always missed on
+/// a sidecar, and a miss in a `NOT EXISTS` means DELETE: `<companion>.sha1` was
+/// collected for purge even while `<companion>` itself was correctly spared
+/// (#3160, #3188). The GC sweep has carried the equivalent arms since #2668;
+/// this path never grew them. #3159 made the gap newly reachable -- before it
+/// the companion was purged too, so the sidecar was the lesser half of a larger
+/// loss; after it the companion survives and the sidecar alone is destroyed,
+/// leaving another repository serving an artifact whose checksum 404s (a
+/// warning under Maven's default `checksumPolicy=warn`, a hard build failure
+/// under `checksumPolicy=fail` and under Gradle dependency verification).
+///
+/// The sidecar arms mirror the verbatim guards *exactly* apart from the
+/// stripped key -- same joins, same `<> $1` scoping, and likewise no
+/// `is_deleted` test. That symmetry is load-bearing rather than incidental: any
+/// condition present on a sidecar arm but absent from the guard it shadows
+/// re-creates this same bug for the rows it excludes, by letting a base be
+/// spared while its sidecar is collected.
 async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
     let sql = format!(
         "SELECT o.storage_key \
@@ -3985,10 +4010,33 @@ async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec
                WHERE pa.repository_id <> $1 \
                  AND pr.storage_backend = o.storage_backend \
                  AND {files_match} \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM artifacts sb \
+               JOIN repositories srb ON srb.id = sb.repository_id \
+               WHERE {is_sidecar} \
+                 AND sb.storage_key = {base_key} \
+                 AND sb.repository_id <> $1 \
+                 AND srb.storage_backend = o.storage_backend \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM artifact_metadata sam \
+               JOIN artifacts spa ON spa.id = sam.artifact_id \
+               JOIN repositories spr ON spr.id = spa.repository_id \
+               WHERE {is_sidecar} \
+                 AND spa.repository_id <> $1 \
+                 AND spr.storage_backend = o.storage_backend \
+                 AND {sidecar_files_match} \
            )",
         files_match = crate::services::maven_flat_attribution::metadata_files_name_key_sql(
             "am.metadata->'files'",
             "o.storage_key",
+        ),
+        is_sidecar = crate::services::maven_flat_attribution::is_sidecar_key_sql("o.storage_key"),
+        base_key = crate::services::maven_flat_attribution::sidecar_base_key_sql("o.storage_key"),
+        sidecar_files_match = crate::services::maven_flat_attribution::metadata_files_name_key_sql(
+            "sam.metadata->'files'",
+            &crate::services::maven_flat_attribution::sidecar_base_key_sql("o.storage_key"),
         ),
     );
     sqlx::query_scalar(&sql)
@@ -21215,6 +21263,124 @@ mod apt_validation_tests {
             collected.contains(&orphan_key),
             "positive control: a key no parent references must still be \
              collected for purge; collected: {collected:?}"
+        );
+    }
+
+    /// Seed a live `artifacts` row (no `files[]` metadata) at `storage_key`,
+    /// so it can anchor its own key against the verbatim guard.
+    async fn seed_flat_artifact_row(pool: &sqlx::PgPool, repo_id: Uuid, storage_key: &str) {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts \
+                 (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                  content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, $3, $3, 1, repeat('0', 64), \
+                     'application/java-archive', $4, false)",
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("p/{id}.jar"))
+        .bind(storage_key)
+        .execute(pool)
+        .await
+        .expect("seed flat artifact row");
+    }
+
+    /// #3160 / #3188: a checksum or signature sidecar must be spared whenever
+    /// its BASE object is spared.
+    ///
+    /// Both pre-existing guards test the candidate key *verbatim*, and nothing
+    /// ever references a sidecar by name -- a parent's `files[]` lists the
+    /// companion, not the companion's `.sha1`. So both guards always missed on
+    /// a sidecar, and a miss in a `NOT EXISTS` means DELETE: deleting this
+    /// repository destroyed `<companion>.sha1` while another repository was
+    /// still serving `<companion>`.
+    ///
+    /// Both anchoring layers are exercised, because the fix adds a sidecar arm
+    /// to each: a base anchored by a parent's `files[]` entry, and a base
+    /// anchored by a live `artifacts` row. `.asc` is included because
+    /// migrations 163 and 170 step (3') both backfill `.asc` attribution rows
+    /// -- it is a real inhabitant of this table, and the GC predicate's regex
+    /// omits it.
+    ///
+    /// TWO positive controls keep the fix honest: a genuinely unreferenced
+    /// base, and a genuinely unreferenced *sidecar*. Without the latter a fix
+    /// that spared every key ending in `.sha1` would pass.
+    #[tokio::test]
+    async fn collect_repo_maven_flat_keys_spares_sidecar_of_spared_base_3160() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_repo, _, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (other_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let uid = Uuid::new_v4().simple().to_string();
+
+        // Base 1: spared by the files[] guard (camelCase, as #3159 fixed).
+        let pom_key = format!("maven/gav3160/{uid}/demo-1.0.0.pom");
+        // Base 2: spared by the live-artifacts-row guard.
+        let jar_key = format!("maven/gav3160/{uid}/sibling-1.0.0.jar");
+        // Positive controls: nothing references either of these.
+        let orphan_key = format!("maven/gav3160/{uid}/gone-9.9.9.pom");
+        let orphan_sidecar_key = format!("{orphan_key}.sha1");
+
+        seed_flat_parent(
+            &pool,
+            other_repo,
+            &format!("maven/gav3160/{uid}/demo-1.0.0.jar"),
+            "storageKey",
+            &pom_key,
+        )
+        .await;
+        seed_flat_artifact_row(&pool, other_repo, &jar_key).await;
+
+        // The repository being deleted holds the claims for every base and
+        // every sidecar -- exactly the pairs migration 170 step (3') creates.
+        let pom_sidecars: Vec<String> = [".sha1", ".md5", ".sha256", ".sha512", ".asc"]
+            .iter()
+            .map(|s| format!("{pom_key}{s}"))
+            .collect();
+        let jar_sidecar = format!("{jar_key}.sha1");
+        for key in pom_sidecars.iter().map(String::as_str).chain([
+            jar_sidecar.as_str(),
+            &orphan_key,
+            &orphan_sidecar_key,
+        ]) {
+            seed_flat_claim(&pool, owner_repo, key).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let collected = collect_repo_maven_flat_keys(&state, owner_repo).await;
+
+        tdh::cleanup(&pool, other_repo, Uuid::nil()).await;
+        tdh::cleanup(&pool, owner_repo, Uuid::nil()).await;
+
+        for sidecar in &pom_sidecars {
+            assert!(
+                !collected.contains(sidecar),
+                "the sidecar of a base another repository's live parent lists in \
+                 files[] must NOT be purged by this repository's delete -- that \
+                 leaves the other repository serving an artifact whose checksum \
+                 404s (#3160/#3188); collected: {collected:?}"
+            );
+        }
+        assert!(
+            !collected.contains(&jar_sidecar),
+            "the sidecar of a base anchored by another repository's live \
+             artifacts row must NOT be purged either (#3160/#3188); \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&orphan_key),
+            "positive control: a base no repository references must still be \
+             collected for purge; collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&orphan_sidecar_key),
+            "positive control: a sidecar whose BASE is itself unreferenced is a \
+             genuine orphan and must still be collected -- otherwise sparing \
+             every sidecar unconditionally would pass this test; \
+             collected: {collected:?}"
         );
     }
 }

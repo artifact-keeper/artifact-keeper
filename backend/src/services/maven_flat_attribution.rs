@@ -99,6 +99,66 @@ pub(crate) fn metadata_files_name_key_sql(files_expr: &str, key_expr: &str) -> S
     )
 }
 
+/// Sidecar suffixes a *delete guard* must strip before asking whether the
+/// object's BASE is still referenced (#3160/#3188).
+///
+/// Nothing ever references a sidecar by name: a parent artifact's `files[]`
+/// lists the companion, never the companion's `.sha1`. So a guard that tests
+/// the sidecar key verbatim always misses -- and in a `NOT EXISTS` guard a
+/// miss means DELETE. A sidecar is referenced exactly when its base is, which
+/// is why every such guard has to be run a second time against the stripped
+/// key.
+///
+/// The read path in this module has always known this: [`strip_checksum_suffix`]
+/// resolves a sidecar's owner from its base via [`CHECKSUM_SUFFIXES`]. This list
+/// must stay a superset of that one, or a sidecar the read path still serves
+/// (because its base resolves an owner) is one the delete path treats as
+/// unreferenced and purges -- the same read-path / delete-guard disagreement
+/// that produced #3156.
+///
+/// This is deliberately **not** `storage_gc_service::MAVEN_SIDECAR_SUFFIXES`,
+/// which serves a different and opposite purpose: that list *derives keys to
+/// delete* when GC reclaims a base object, so adding a suffix to it widens
+/// deletion. This list only ever *spares*, so it is the union of every suffix
+/// any path can produce -- the four GC derives, plus `.asc`, which migrations
+/// 163 and 170 step (3') both backfill into `maven_flat_object_owner`
+/// (`VALUES ('.sha1'), ('.md5'), ('.sha256'), ('.asc')`) and which the GC
+/// predicate's own regex omits. Erring wide is the safe direction here:
+/// a suffix listed in error spares an object that a later GC pass will
+/// reclaim anyway, while a suffix missing destroys a served one.
+pub(crate) const GUARDED_SIDECAR_SUFFIXES: [&str; 5] =
+    [".md5", ".sha1", ".sha256", ".sha512", ".asc"];
+
+/// The `(md5|sha1|...)` regex alternation built from
+/// [`GUARDED_SIDECAR_SUFFIXES`], so the SQL and the list cannot drift.
+fn guarded_sidecar_alternation() -> String {
+    GUARDED_SIDECAR_SUFFIXES
+        .iter()
+        .map(|s| s.trim_start_matches('.'))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// SQL predicate: does `key_expr` name a checksum/signature sidecar?
+///
+/// Pairs with [`sidecar_base_key_sql`]: a guard arm is only meaningful for
+/// keys that actually are sidecars, and without this test `regexp_replace`
+/// returns the key unchanged, so the arm would degenerate into a duplicate of
+/// the verbatim guard it is meant to complement.
+pub(crate) fn is_sidecar_key_sql(key_expr: &str) -> String {
+    let alt = guarded_sidecar_alternation();
+    format!(r"{key_expr} ~ '\.({alt})$'")
+}
+
+/// SQL expression stripping a [`GUARDED_SIDECAR_SUFFIXES`] suffix off
+/// `key_expr`, yielding the base object key the sidecar belongs to. Keys that
+/// are not sidecars come back unchanged -- always gate on
+/// [`is_sidecar_key_sql`].
+pub(crate) fn sidecar_base_key_sql(key_expr: &str) -> String {
+    let alt = guarded_sidecar_alternation();
+    format!(r"regexp_replace({key_expr}, '\.({alt})$', '')")
+}
+
 /// Distinct owning repositories of a live parent artifact whose metadata
 /// `files[]` array lists this key (legacy GAV-grouped uploads whose companion
 /// files have no row of their own), restricted to repositories on `$2`. LIMIT 2
@@ -524,6 +584,82 @@ mod tests {
             "rendered fragment changed; every caller (read path + three delete \
              guards) depends on this exact shape -- update deliberately, and \
              keep the two branches OR-ed"
+        );
+    }
+
+    /// The guard suffix list must stay a SUPERSET of the list GC derives
+    /// sidecar keys to delete from (#3160/#3188).
+    ///
+    /// The two lists point in opposite directions. `MAVEN_SIDECAR_SUFFIXES`
+    /// widens *deletion*: a suffix added there makes GC reclaim that sidecar
+    /// class. `GUARDED_SIDECAR_SUFFIXES` widens *sparing*. So a suffix that GC
+    /// deletes but no guard strips is a key that gets purged while its base is
+    /// still served — the #3160 bug, re-created one suffix at a time. `.asc`
+    /// is the standing example in the other direction: migrations 163 and 170
+    /// step (3') backfill `.asc` attribution rows, so it must be guarded even
+    /// though GC never derives it.
+    #[test]
+    fn guarded_sidecar_suffixes_are_a_superset_of_the_gc_derived_list() {
+        for suffix in crate::services::storage_gc_service::MAVEN_SIDECAR_SUFFIXES {
+            assert!(
+                GUARDED_SIDECAR_SUFFIXES.contains(&suffix),
+                "{suffix} is derived for deletion by GC but not stripped by the \
+                 delete guards: its base could be spared while it is purged"
+            );
+        }
+        // ...and a superset of the READ path's own list. This is the tighter
+        // constraint, and the one that states the bug exactly:
+        // `strip_checksum_suffix` already resolves a sidecar's owner from its
+        // BASE, so the read path has always known sidecars inherit base
+        // ownership. A suffix the read path resolves but the delete guard does
+        // not strip is precisely a sidecar that stays *served* (its base
+        // resolves an owner) while the delete path treats it as unreferenced
+        // and purges it -- the #3160/#3188 shape, and the same read-path /
+        // delete-guard disagreement as #3156.
+        for suffix in CHECKSUM_SUFFIXES {
+            assert!(
+                GUARDED_SIDECAR_SUFFIXES.contains(&suffix),
+                "{suffix} is resolved to its base by the read path \
+                 (strip_checksum_suffix) but not stripped by the delete guards: \
+                 the object stays served while the delete path purges it"
+            );
+        }
+        assert!(
+            GUARDED_SIDECAR_SUFFIXES.contains(&".asc"),
+            "migrations 163 and 170 step (3') backfill `.asc` attribution rows, \
+             so `.asc` sidecars must be guarded against their base"
+        );
+    }
+
+    /// Both sidecar helpers must be built from [`GUARDED_SIDECAR_SUFFIXES`] and
+    /// anchor at end-of-string. An unanchored or hand-edited alternation would
+    /// silently stop matching a suffix class, and in a `NOT EXISTS` guard a key
+    /// that stops matching is a key that gets DELETED.
+    ///
+    /// This is the only check on the sidecar guards that runs WITHOUT a
+    /// database — `collect_repo_maven_flat_keys_spares_sidecar_of_spared_base_3160`
+    /// skips silently when `DATABASE_URL` is unset.
+    #[test]
+    fn sidecar_helpers_render_every_guarded_suffix_anchored() {
+        let base = sidecar_base_key_sql("o.storage_key");
+        let is_sidecar = is_sidecar_key_sql("o.storage_key");
+        for suffix in GUARDED_SIDECAR_SUFFIXES {
+            let bare = suffix.trim_start_matches('.');
+            assert!(base.contains(bare), "{suffix} missing from {base}");
+            assert!(
+                is_sidecar.contains(bare),
+                "{suffix} missing from {is_sidecar}"
+            );
+        }
+        assert_eq!(
+            base, r"regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512|asc)$', '')",
+            "rendered base-key expression changed; the repository-delete sidecar \
+             guards depend on this exact shape"
+        );
+        assert_eq!(
+            is_sidecar, r"o.storage_key ~ '\.(md5|sha1|sha256|sha512|asc)$'",
+            "rendered sidecar test changed; without the `$` anchor a key merely \
+             CONTAINING a suffix would be treated as a sidecar"
         );
     }
 

@@ -174,7 +174,7 @@ const MAVEN_FLAT_KEY_PREFIX: &str = "maven/";
 /// artifacts-driven orphan sweep, which is exactly why GC used to leave
 /// `.md5`/`.sha1` files behind after their base artifact was reclaimed
 /// (#2668). GC derives these keys from the base key when reclaiming it.
-const MAVEN_SIDECAR_SUFFIXES: [&str; 4] = [".md5", ".sha1", ".sha256", ".sha512"];
+pub(crate) const MAVEN_SIDECAR_SUFFIXES: [&str; 4] = [".md5", ".sha1", ".sha256", ".sha512"];
 
 /// Upper bound on flat-object attribution rows examined per GC pass.
 const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
