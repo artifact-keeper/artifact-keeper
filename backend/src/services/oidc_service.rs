@@ -1428,6 +1428,54 @@ mod tests {
         assert_ne!(blank.email, absent.email);
     }
 
+    /// The derivation must key on `sub`, not on the username.
+    ///
+    /// In every other test here sub and username co-vary, so substituting
+    /// `synthetic_email_for_sub(&username)` at both call sites leaves the
+    /// whole module green -- while reintroducing the collision for two
+    /// subjects that share a `preferred_username`. That is worse than the
+    /// original bug: `preferred_username` is self-settable at many IdPs, so it
+    /// turns an availability defect into a targeted one.
+    #[tokio::test]
+    async fn derivation_keys_on_sub_not_username() {
+        let one = user_from_token("sub-unique-101", "shared_name", None);
+        let two = user_from_token("sub-unique-102", "shared_name", None);
+        assert_ne!(
+            one.email, two.email,
+            "two subjects sharing a preferred_username must still get \
+             distinct addresses"
+        );
+
+        // And the converse: the same subject keeps one address even if the
+        // IdP changes the display name between logins.
+        let before = user_from_token("sub-stable-103", "old_name", None).email;
+        let after = user_from_token("sub-stable-103", "new_name", None).email;
+        assert_eq!(
+            before, after,
+            "a renamed user must not be handed a new synthetic address"
+        );
+    }
+
+    /// The userinfo branch must return a provider-supplied address verbatim.
+    ///
+    /// `fetch_userinfo` is taken whenever the token response carries no
+    /// `id_token`, and nothing pinned its email handling -- so passing `None`
+    /// at that call site, which replaces every real address with a synthetic
+    /// one, left all nine tests green.
+    #[tokio::test]
+    async fn userinfo_supplied_email_is_stored_verbatim() {
+        assert_eq!(
+            resolve_federated_email(Some("grace@example.com"), "sub-grace-007"),
+            "grace@example.com"
+        );
+        // A blank claim on that path still falls back, and the fallback is the
+        // sub-derived address rather than anything username-shaped.
+        assert_eq!(
+            resolve_federated_email(Some("  "), "sub-grace-007"),
+            resolve_federated_email(None, "sub-grace-007")
+        );
+    }
+
     #[tokio::test]
     async fn synthetic_address_is_stable_across_logins() {
         // Re-login writes `email` back to the row; an unstable value would
@@ -1552,11 +1600,21 @@ mod tests {
         let sub = format!("stranded-{}", id);
 
         // Only one empty-email row can exist at a time — that is the bug. Clear
-        // any left behind by an earlier run before seeding this one.
-        sqlx::query!("DELETE FROM users WHERE email = '' AND auth_provider = 'oidc'")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // any left behind by an EARLIER RUN OF THIS TEST before seeding.
+        //
+        // Scoped to this test's own `stranded_` username prefix on purpose.
+        // An unscoped `WHERE email = '' AND auth_provider = 'oidc'` also
+        // matches the real stranded user this fix exists to rescue, and 11 of
+        // the foreign keys to `users(id)` are ON DELETE CASCADE -- so against
+        // the local Postgres loop this repo documents, it would silently take
+        // that user's dependent rows with it.
+        sqlx::query!(
+            "DELETE FROM users WHERE email = '' AND auth_provider = 'oidc' \
+             AND username LIKE 'stranded\\_%'"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query!(
             "INSERT INTO users (id, username, email, auth_provider, external_id, \
