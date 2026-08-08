@@ -1649,7 +1649,12 @@ async fn download_or_metadata(
                     repo.id,
                     &repo.key,
                     upstream_url,
-                    &project,
+                    // NORMALIZED, exactly as the virtual arm above. This
+                    // branch was left on the raw segment when the virtual one
+                    // was fixed, so a curation block on a direct Remote repo
+                    // was still evadable by spelling: the gate saw "acmesdk"
+                    // and the fetch resolved "acme-sdk".
+                    &normalized,
                     real_filename,
                 )
                 .await;
@@ -1760,7 +1765,7 @@ async fn serve_virtual_metadata(
         // PEP 658 metadata is not hash-tied to the distribution, so pip would
         // resolve against one package's dependencies and install another's,
         // with nothing anywhere to detect it.
-        if let Ok(response) = serve_metadata(
+        match serve_metadata(
             state,
             &state.db,
             member.id,
@@ -1769,7 +1774,20 @@ async fn serve_virtual_metadata(
         )
         .await
         {
-            return Ok(response);
+            Ok(response) => return Ok(response),
+            Err(response) if response.status() == StatusCode::NOT_FOUND => {}
+            // A non-404 here is a storage or DB fault, or a 503 from the
+            // decode-permit fast-fail -- not "this member does not have it".
+            // Swallowing it would fall through to a lower-priority REMOTE
+            // member and serve the upstream's metadata for a distribution this
+            // member holds locally, which is exactly the bytes-mismatch the
+            // local-first ordering exists to prevent, reappearing under load.
+            Err(response) => {
+                if first_member_error.is_none() {
+                    first_member_error = Some(response);
+                }
+                continue;
+            }
         }
 
         let result = if member.repo_type == RepositoryType::Remote {
