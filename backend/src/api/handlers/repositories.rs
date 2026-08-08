@@ -337,28 +337,32 @@ pub(crate) fn member_grant_visibility(auth: Option<&AuthExtension>) -> RepoVisib
 
 /// The SCOPE half, applied per member row.
 ///
-/// A public member bypasses scope entirely, matching `require_visible`'s
-/// early return. Otherwise the member passes when it is itself in scope, OR
-/// when the PARENT virtual is — read-through.
+/// A public member bypasses scope entirely, matching `require_visible`'s early
+/// return. Otherwise the member must itself be in the token's scope.
 ///
-/// Read-through is a deliberate choice, not an oversight. Scoping a token to a
-/// virtual repository is the canonical way to point CI at one, and the
-/// by-path download through that virtual already serves member bytes for such
-/// a token. Without read-through the listing returns `200 OK` with zero items
-/// while the download of those same items succeeds — two answers to one
-/// question. The grant half still applies on top, so this widens which members
-/// a token may ENUMERATE, never which a user may READ.
+/// An earlier revision also passed when the PARENT virtual was in scope,
+/// arguing that the by-path download already read through. That premise was
+/// wrong: `proxy_helpers::caller_can_read_member` gates on
+/// `can_access_repo(member.id)` and has no parent term anywhere, so a token
+/// scoped to a virtual but not to a member is DENIED that member's bytes.
+/// Read-through would have created the inconsistency it claimed to remove,
+/// reversed — and widened enumeration past `require_visible`, letting a token
+/// list artifact names, versions and sizes for a member it is scoped away
+/// from. Strict scoping is what agrees with both.
+///
+/// Consequence, accepted deliberately: a token scoped only to a virtual sees
+/// an empty listing. That is consistent with the download, which also refuses.
+/// Scope tokens to the members, or to both.
 pub(crate) fn member_passes_token_scope(
     auth: Option<&AuthExtension>,
     parent_repo_id: Uuid,
     member_id: Uuid,
     member_is_public: bool,
 ) -> bool {
+    let _ = parent_repo_id;
     match auth {
         None => member_is_public,
-        Some(a) => {
-            member_is_public || a.can_access_repo(parent_repo_id) || a.can_access_repo(member_id)
-        }
+        Some(a) => member_is_public || a.can_access_repo(member_id),
     }
 }
 
@@ -8701,7 +8705,8 @@ pub async fn add_virtual_member(
             vrm.created_at,
             r.key as member_key,
             r.name as member_name,
-            r.repo_type
+            r.repo_type,
+            r.is_public
         FROM virtual_repo_members vrm
         INNER JOIN repositories r ON r.id = vrm.member_repo_id
         WHERE vrm.virtual_repo_id = $1 AND vrm.member_repo_id = $2
@@ -22919,6 +22924,10 @@ mod virtual_member_visibility_tests {
         let at = fx.scoped_admin_token(vec![fx.virt_id]);
         let (adm_status, adm_keys) = fx.members_seen(at).await;
 
+        // Positive control: same caller, member now IN scope.
+        let it2 = fx.scoped_token(&fx.insider, vec![fx.virt_id, fx.private_id]);
+        let (ins2_status, ins2_keys) = fx.members_seen(it2).await;
+
         let (private_key, public_key) = (fx.private_key.clone(), fx.public_key.clone());
         fx.cleanup().await;
 
@@ -22926,11 +22935,13 @@ mod virtual_member_visibility_tests {
         assert_eq!(ins_status, StatusCode::OK);
         assert_eq!(adm_status, StatusCode::OK);
 
-        // Read-through + the public arm the `Ids` arm had dropped.
+        // The public arm the `Ids` arm had dropped: a public member is
+        // readable regardless of scope, matching `require_visible`'s early
+        // return on `is_public`.
         assert!(
             virt_keys.contains(&public_key),
-            "a token scoped to the virtual must reach its public member, or \
-             the listing contradicts the download path; got {virt_keys:?}"
+            "a public member is readable regardless of token scope; \
+             got {virt_keys:?}"
         );
         // The grant half still applies.
         assert!(
@@ -22938,14 +22949,32 @@ mod virtual_member_visibility_tests {
             "token scope must not substitute for a grant: {private_key} has no \
              grant for this caller; got {virt_keys:?}"
         );
+        // STRICT scoping: the private member is NOT in this token's scope, so
+        // even a caller who holds the grant must not enumerate it. This is what
+        // agrees with the download path -- `caller_can_read_member` gates on
+        // `can_access_repo(member.id)` with no parent term, so read-through
+        // here would let a token list what it cannot fetch.
         assert!(
-            ins_keys.contains(&private_key),
-            "a scoped token whose owner HOLDS the grant must still see \
-             {private_key}; got {ins_keys:?}"
+            !ins_keys.contains(&private_key),
+            "a token scoped only to the virtual must not enumerate a private \
+             member outside its scope, because the download refuses it too; \
+             got {ins_keys:?}"
         );
+        // Scope the token to the MEMBER and the same caller does see it --
+        // the positive control, without which the assertion above is
+        // satisfied by a filter that hides everything.
+        assert_eq!(ins2_status, StatusCode::OK);
         assert!(
-            adm_keys.contains(&public_key) && adm_keys.contains(&private_key),
-            "an admin token scoped to the virtual reaches its members; \
+            ins2_keys.contains(&private_key),
+            "with {private_key} in scope AND a grant, it must be listed; \
+             got {ins2_keys:?}"
+        );
+        // An admin token scoped to the virtual only: the scope still binds.
+        // Before the fix `is_admin` was matched ahead of `Restricted`, so the
+        // scope was discarded entirely and every member was listed.
+        assert!(
+            !adm_keys.contains(&private_key),
+            "an admin's deliberately-scoped token must stay scoped; \
              got {adm_keys:?}"
         );
     }
