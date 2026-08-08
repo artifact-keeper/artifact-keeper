@@ -1483,18 +1483,17 @@ pub async fn rewire_remote_proxy(
 }
 
 // ---------------------------------------------------------------------------
-// #3149: Content-Encoding forwarding fixtures.
+// #3149 / #3184: Content-Encoding forwarding fixtures.
 // ---------------------------------------------------------------------------
 
-/// Build a gzip-coded body for the #3149 `Content-Encoding`-forwarding tests,
-/// returning `(plain, coded)`.
+/// Build a body coded with `encoding`, returning `(plain, coded)`.
 ///
 /// Shared across the npm / PyPI / OCI / generic-repository / cargo arms so the
-/// five suites do not each carry their own copy of the encoder block (the
-/// jscpd duplication gate scores changed files). The payload is deliberately
-/// repetitive so gzip actually shrinks it: the caller asserts `coded != plain`,
-/// without which a "forwarding" test could pass while proving nothing.
-/// Build a body coded with `encoding`, returning `(plain, coded)`.
+/// suites do not each carry their own copy of the encoder block (the jscpd
+/// duplication gate scores changed files). The payload is deliberately
+/// repetitive so the coding actually shrinks it: the caller asserts
+/// `coded != plain`, without which a "forwarding" test could pass while
+/// proving nothing.
 ///
 /// Exists because every #3149 fixture was gzip and every assertion was
 /// `== Some("gzip")`, so replacing the forwarded value with a hardcoded
@@ -1545,6 +1544,13 @@ pub fn inflate_deflate(coded: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Build a gzip-coded body, returning `(plain, coded)`.
+///
+/// Retained for the arms that assert GET/HEAD header parity, where the point
+/// of the test is that two builders agree with each other rather than which
+/// coding is in play. Prefer [`coded_fixture`] with a NON-gzip coding for
+/// anything asserting that the UPSTREAM's coding is what gets forwarded: a
+/// gzip fixture cannot tell that apart from a hardcoded `"gzip"`.
 pub fn gzip_fixture(seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
     use flate2::write::GzEncoder;
     use flate2::Compression;

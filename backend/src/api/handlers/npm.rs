@@ -3451,13 +3451,24 @@ fn npm_synthetic_artifact(
 /// Build a buffered 200 response for scanned npm tarball bytes. `pending`
 /// selects the loud `X-AK-Scan: pending` header for the fail-open
 /// serve-before-verdict path so a served-unscanned byte is observable.
+///
+/// `content_encoding` is the coding the UPSTREAM declared on these exact bytes,
+/// forwarded verbatim (#3184). This builder previously did not take the
+/// parameter at all, so a scan-enabled npm proxy served a coded tarball with no
+/// coding declared and a `Content-Length` describing the CODED length — #3149,
+/// left live on this arm when #3176 fixed the streaming sibling beside it.
+/// Note the transfer coding is distinct from the `.tgz` gzip that is part of the
+/// tarball format itself: a `Content-Encoding` here is an EXTRA layer the client
+/// must strip before it sees a tarball at all. Pass `None` when the upstream
+/// sent no coding, so the header stays absent rather than being manufactured.
 fn build_scanned_tarball_response(
     filename: &str,
     bytes: Bytes,
+    content_encoding: Option<&str>,
     digest: &str,
     pending: bool,
 ) -> Response {
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, NPM_TARBALL_CONTENT_TYPE)
         .header(
@@ -3466,9 +3477,11 @@ fn build_scanned_tarball_response(
         )
         .header(CONTENT_LENGTH, bytes.len().to_string())
         .header("X-AK-Scan", if pending { "pending" } else { "clean" })
-        .header("X-NPM-Tarball-SHA256", digest)
-        .body(Body::from(bytes))
-        .unwrap()
+        .header("X-NPM-Tarball-SHA256", digest);
+    if let Some(enc) = content_encoding {
+        builder = builder.header(CONTENT_ENCODING, enc);
+    }
+    builder.body(Body::from(bytes)).unwrap()
 }
 
 /// Inline scan-and-block for an npm proxy tarball download (#3003).
@@ -3504,7 +3517,11 @@ async fn serve_scanned_npm_tarball(
         upstream_url,
         RepositoryFormat::Npm,
     );
-    let bytes = match proxy
+    // The upstream content-type is discarded on purpose (the tarball type is
+    // fixed by the format), but the upstream CODING is not: this arm forwards
+    // the buffered body verbatim, so it must declare what the bytes are coded
+    // with or reproduce #3149 (#3184).
+    let (bytes, content_encoding) = match proxy
         .fetch_artifact_with_cache_path_capped(
             &remote_repo,
             fetch_path,
@@ -3513,7 +3530,7 @@ async fn serve_scanned_npm_tarball(
         )
         .await
     {
-        Ok((bytes, _upstream_content_type)) => bytes,
+        Ok((bytes, _upstream_content_type, content_encoding)) => (bytes, content_encoding),
         Err(e) if proxy_helpers::is_over_cap_error(&e) => {
             // Over the byte cap: never buffer unbounded (#895 OOM).
             return match crate::services::proxy_scan_service::decide_inconclusive(action) {
@@ -3628,7 +3645,11 @@ async fn serve_scanned_npm_tarball(
         proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
             proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx).await;
             Ok(build_scanned_tarball_response(
-                filename, bytes, &digest, pending,
+                filename,
+                bytes,
+                content_encoding.as_deref(),
+                &digest,
+                pending,
             ))
         }
     }
@@ -9096,6 +9117,100 @@ mod tests {
         assert_eq!(npm_package_name_from_artifact_path("lodash/4.17.21"), None);
         assert_eq!(npm_package_name_from_artifact_path(""), None);
         assert_eq!(npm_package_name_from_artifact_path("//file.tgz"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3184: the buffered scan-on-proxy tarball serve must forward the
+    // UPSTREAM's Content-Encoding.
+    //
+    // Fixtures are `deflate`, never gzip. A gzip fixture cannot distinguish
+    // "forwards the upstream coding" from "hardcodes gzip" -- which is how
+    // #3176's fourteen tests stayed green under exactly that mutation. It
+    // matters doubly here: a `.tgz` is gzip by format, so a gzip fixture would
+    // also be indistinguishable from the tarball's own inner compression.
+    // -----------------------------------------------------------------------
+
+    /// Positive: a deflate-coded upstream tarball is served with
+    /// `Content-Encoding: deflate`.
+    ///
+    /// Fails if the builder hardcodes `"gzip"`, and fails if the builder drops
+    /// the coding -- the #3184 bug, which was structural here because this
+    /// builder did not even take the parameter.
+    #[test]
+    fn test_build_scanned_tarball_response_forwards_upstream_deflate_coding() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (_plain, coded) = tdh::coded_fixture("deflate", b"tarball-payload-");
+        let bytes = Bytes::from(coded.clone());
+
+        let resp =
+            build_scanned_tarball_response("pkg-1.0.0.tgz", bytes, Some("deflate"), "d", false);
+
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_ENCODING).as_deref(),
+            Some("deflate"),
+            "buffered scanned tarball serve must declare the UPSTREAM's coding; \
+             `gzip` here means the value is hardcoded, `None` means #3184 is live"
+        );
+        // Content-Length is the CODED length, only correct once declared.
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_LENGTH).as_deref(),
+            Some(coded.len().to_string().as_str())
+        );
+    }
+
+    /// Negative control: an UNCODED upstream tarball must not have a coding
+    /// manufactured for it. Fails if the header is emitted unconditionally.
+    ///
+    /// The plain `.tgz` case is the overwhelmingly common one -- npm registries
+    /// serve tarballs uncoded -- so an unconditional header would break the
+    /// default path rather than an edge case.
+    #[test]
+    fn test_build_scanned_tarball_response_omits_coding_when_upstream_uncoded() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let resp = build_scanned_tarball_response(
+            "pkg-1.0.0.tgz",
+            Bytes::from_static(b"\x1f\x8b plain tgz bytes"),
+            None,
+            "d",
+            false,
+        );
+
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_ENCODING),
+            None,
+            "an uncoded upstream must be served with NO Content-Encoding; \
+             manufacturing one makes npm try to decode a raw tarball"
+        );
+    }
+
+    /// End-to-end on the bytes: decode the served body with the coding the
+    /// response declares and compare to the plaintext. Also asserts the proxy
+    /// does NOT decode on the client's behalf -- the wire bytes stay coded.
+    #[tokio::test]
+    async fn test_build_scanned_tarball_response_body_decodes_under_declared_coding() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (plain, coded) = tdh::coded_fixture("deflate", b"decodable-tarball-");
+
+        let resp = build_scanned_tarball_response(
+            "pkg-1.0.0.tgz",
+            Bytes::from(coded.clone()),
+            Some("deflate"),
+            "d",
+            true,
+        );
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_ENCODING).as_deref(),
+            Some("deflate")
+        );
+
+        let (status, body, _headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), coded.as_slice());
+        assert_eq!(
+            tdh::inflate_deflate(&body),
+            plain,
+            "body must decode under the coding the response declares"
+        );
     }
 }
 

@@ -2634,19 +2634,28 @@ impl ProxyService {
 
     /// Byte-ceiling-aware sibling of
     /// [`Self::fetch_artifact_with_cache_path`] (#1608 Phase 4b / #2181).
+    ///
+    /// Returns a [`CachedBody`] — `(body, content_type, content_encoding)` —
+    /// rather than the `(body, content_type)` pair it used to (#3184). The
+    /// coding was previously dropped right here, which is why the buffered
+    /// scan-on-proxy serve paths for npm and PyPI could not forward it even
+    /// after #3176 fixed their streaming siblings: the value never reached
+    /// them. Widening in place rather than adding a `_with_encoding` sibling is
+    /// deliberate — it breaks every caller at compile time and forces each one
+    /// to state whether it forwards the bytes verbatim (must declare the
+    /// coding) or parses/transforms them (must drop it), instead of letting a
+    /// new caller silently reintroduce #3149.
     pub async fn fetch_artifact_with_cache_path_capped(
         &self,
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
         max: usize,
-    ) -> Result<(Bytes, Option<String>)> {
-        let (content, content_type, _encoding) = self
-            .fetch_artifact_with_cache_path_and_accept_capped(
-                repo, fetch_path, cache_path, None, max,
-            )
-            .await?;
-        Ok((content, content_type))
+    ) -> Result<CachedBody> {
+        self.fetch_artifact_with_cache_path_and_accept_capped(
+            repo, fetch_path, cache_path, None, max,
+        )
+        .await
     }
 
     /// Variant of [`Self::fetch_artifact`] that forwards a client-supplied

@@ -3172,10 +3172,20 @@ fn pypi_synthetic_artifact(
 /// Build a buffered 200 response for scanned bytes. `pending` adds the loud
 /// `X-AK-Scan: pending` header for the fail-open serve-before-verdict path so a
 /// served-unscanned byte is observable (kills the #1274 silent gap).
+///
+/// `content_encoding` is the coding the UPSTREAM declared on these exact bytes,
+/// forwarded verbatim (#3184). The proxy no longer lets reqwest decode upstream
+/// bodies, so a coded wheel arrives here still coded and `bytes.len()` — which
+/// feeds `Content-Length` — is the CODED length. Serving that without declaring
+/// the coding is #3149: pip receives compressed data labelled as identity and
+/// fails to unpack it. Pass `None` when the upstream sent no coding; the header
+/// must then be ABSENT rather than manufactured, or every uncoded serve is
+/// mislabelled instead.
 fn build_scanned_file_response(
     filename: &str,
     bytes: Bytes,
     content_type: Option<String>,
+    content_encoding: Option<&str>,
     digest: Option<&str>,
     pending: bool,
 ) -> Response {
@@ -3189,6 +3199,9 @@ fn build_scanned_file_response(
         )
         .header(CONTENT_LENGTH, bytes.len().to_string())
         .header("X-AK-Scan", if pending { "pending" } else { "clean" });
+    if let Some(enc) = content_encoding {
+        builder = builder.header(CONTENT_ENCODING, enc);
+    }
     if let Some(d) = digest {
         builder = builder.header("X-PyPI-File-SHA256", d);
     }
@@ -3234,7 +3247,11 @@ async fn serve_scanned_pypi_file(
         &target.fetch_base,
         RepositoryFormat::Pypi,
     );
-    let (bytes, content_type) = match proxy
+    // `content_encoding` is the coding these exact bytes arrived under. It has
+    // to travel with them to `build_scanned_file_response` below: this arm
+    // forwards the buffered body VERBATIM, so dropping the coding here is the
+    // #3149 bug (#3184).
+    let (bytes, content_type, content_encoding) = match proxy
         .fetch_artifact_with_cache_path_capped(
             &repo,
             &target.fetch_path,
@@ -3243,7 +3260,7 @@ async fn serve_scanned_pypi_file(
         )
         .await
     {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(e) if is_over_cap_error(&e) => {
             // Over the byte cap: never buffer unbounded (#895 OOM).
             return match crate::services::proxy_scan_service::decide_inconclusive(action) {
@@ -3346,6 +3363,7 @@ async fn serve_scanned_pypi_file(
                 filename,
                 bytes,
                 content_type,
+                content_encoding.as_deref(),
                 Some(&digest),
                 pending,
             ))
@@ -10953,6 +10971,7 @@ mod tests {
             "pkg-1.0-py3-none-any.whl",
             bytes.clone(),
             Some("application/x-custom".to_string()),
+            None,
             Some(&digest),
             false,
         );
@@ -10984,7 +11003,7 @@ mod tests {
 
         // Pending serve (fail-open before a verdict): loud header, and the
         // content type falls back to the filename-derived default.
-        let resp = build_scanned_file_response("pkg-1.0.tar.gz", bytes, None, None, true);
+        let resp = build_scanned_file_response("pkg-1.0.tar.gz", bytes, None, None, None, true);
         assert_eq!(
             resp.headers().get("X-AK-Scan").unwrap().to_str().unwrap(),
             "pending"
@@ -10994,6 +11013,112 @@ mod tests {
             "application/gzip"
         );
         assert!(resp.headers().get("X-PyPI-File-SHA256").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // #3184: the buffered scan-on-proxy serve path must forward the UPSTREAM's
+    // Content-Encoding.
+    //
+    // Every fixture below is `deflate`, never gzip. #3176 shipped fourteen
+    // tests that all stayed green when the forwarded value was replaced by a
+    // hardcoded `"gzip"` literal, because every fixture WAS gzip -- they pinned
+    // "a coding is declared", not "the upstream's coding is declared". A
+    // gzip-only fixture cannot tell the two apart; deflate can.
+    // -----------------------------------------------------------------------
+
+    /// Positive: a deflate-coded upstream body is served with
+    /// `Content-Encoding: deflate`, not with some other coding and not bare.
+    ///
+    /// Fails if the builder hardcodes `"gzip"` (asserts `deflate`), and fails
+    /// if the builder drops the coding (asserts the header is present) -- the
+    /// #3184 bug itself.
+    #[test]
+    fn test_build_scanned_file_response_forwards_upstream_deflate_coding() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (_plain, coded) = tdh::coded_fixture("deflate", b"wheel-payload-");
+        let bytes = Bytes::from(coded.clone());
+        let digest = sha256_hex(&bytes);
+
+        let resp = build_scanned_file_response(
+            "pkg-1.0-py3-none-any.whl",
+            bytes.clone(),
+            None,
+            Some("deflate"),
+            Some(&digest),
+            false,
+        );
+
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_ENCODING).as_deref(),
+            Some("deflate"),
+            "buffered scanned serve must declare the UPSTREAM's coding; \
+             `gzip` here means the value is hardcoded, `None` means #3184 is live"
+        );
+        // Content-Length describes the CODED bytes, which is only correct
+        // once the coding is declared alongside it.
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_LENGTH).as_deref(),
+            Some(coded.len().to_string().as_str())
+        );
+    }
+
+    /// Negative control: an UNCODED upstream must not have a coding
+    /// manufactured for it. Fails if the header is emitted unconditionally.
+    #[test]
+    fn test_build_scanned_file_response_omits_coding_when_upstream_uncoded() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let bytes = Bytes::from_static(b"PK\x03\x04plain-wheel-bytes");
+        let digest = sha256_hex(&bytes);
+
+        let resp = build_scanned_file_response(
+            "pkg-1.0-py3-none-any.whl",
+            bytes,
+            None,
+            None,
+            Some(&digest),
+            false,
+        );
+
+        assert_eq!(
+            tdh::header_str(resp.headers(), CONTENT_ENCODING),
+            None,
+            "an uncoded upstream must be served with NO Content-Encoding; \
+             manufacturing one mislabels every plain wheel"
+        );
+    }
+
+    /// End-to-end on the bytes, not just the header: decode the served body
+    /// with the coding the response declares and compare to the plaintext.
+    ///
+    /// This is the assertion a client actually makes. A response whose declared
+    /// coding does not match its bytes fails here even if the header is
+    /// non-empty, which is exactly what a hardcoded `"gzip"` produces.
+    #[tokio::test]
+    async fn test_build_scanned_file_response_body_decodes_under_declared_coding() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (plain, coded) = tdh::coded_fixture("deflate", b"decodable-wheel-");
+        let resp = build_scanned_file_response(
+            "pkg-1.0-py3-none-any.whl",
+            Bytes::from(coded.clone()),
+            None,
+            Some("deflate"),
+            None,
+            true,
+        );
+
+        let declared = tdh::header_str(resp.headers(), CONTENT_ENCODING);
+        assert_eq!(declared.as_deref(), Some("deflate"));
+
+        let (status, body, _headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        // The proxy must not decode on the client's behalf either: the wire
+        // bytes are the coded ones.
+        assert_eq!(body.as_ref(), coded.as_slice());
+        assert_eq!(
+            tdh::inflate_deflate(&body),
+            plain,
+            "body must decode under the coding the response declares"
+        );
     }
 
     #[test]

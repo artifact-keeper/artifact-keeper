@@ -13,7 +13,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -632,24 +632,30 @@ async fn proxy_v3_flatcontainer(
         )
         .await
     } else {
-        let (content, content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
-            proxy,
-            fetch_repo_id,
-            fetch_repo_key,
-            upstream_url,
-            &fetch_url,
-            &cache_path,
-            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-        )
-        .await?;
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                CONTENT_TYPE,
-                content_type.unwrap_or_else(|| "application/json".to_string()),
+        // Unlike the registration / search / OData arms, this one serves the
+        // upstream body VERBATIM (a version list carries no URLs, so nothing is
+        // rewritten). That makes it the one NuGet caller that has to forward the
+        // upstream coding, hence the `_encoded` variant — surfaced by the #3184
+        // widening of `fetch_artifact_with_cache_path_capped`.
+        let (content, content_type, content_encoding) =
+            proxy_helpers::proxy_fetch_capped_with_cache_key_encoded(
+                proxy,
+                fetch_repo_id,
+                fetch_repo_key,
+                upstream_url,
+                &fetch_url,
+                &cache_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
             )
-            .body(Body::from(content))
-            .unwrap())
+            .await?;
+        let mut builder = Response::builder().status(StatusCode::OK).header(
+            CONTENT_TYPE,
+            content_type.unwrap_or_else(|| "application/json".to_string()),
+        );
+        if let Some(enc) = content_encoding.as_deref() {
+            builder = builder.header(CONTENT_ENCODING, enc);
+        }
+        Ok(builder.body(Body::from(content)).unwrap())
     }
 }
 

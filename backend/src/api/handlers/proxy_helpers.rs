@@ -1384,6 +1384,14 @@ pub async fn proxy_fetch_capped_anonymous(
 
 /// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key`] (#1608 Phase
 /// 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+///
+/// DROPS the upstream `Content-Encoding`. That is correct only for callers that
+/// PARSE or REWRITE the buffered body (the NuGet service-index / registration /
+/// search / OData arms all `from_utf8_lossy` + rewrite before serving), because
+/// the bytes they emit are not the bytes that arrived and the upstream coding no
+/// longer describes them. A caller that forwards the buffered body VERBATIM must
+/// use [`proxy_fetch_capped_with_cache_key_encoded`] instead, or it reproduces
+/// #3149 — coded bytes served with no coding declared.
 pub async fn proxy_fetch_capped_with_cache_key(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -1393,6 +1401,31 @@ pub async fn proxy_fetch_capped_with_cache_key(
     cache_path: &str,
     max: usize,
 ) -> Result<(Bytes, Option<String>), Response> {
+    let (content, content_type, _encoding) = proxy_fetch_capped_with_cache_key_encoded(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        cache_path,
+        max,
+    )
+    .await?;
+    Ok((content, content_type))
+}
+
+/// As [`proxy_fetch_capped_with_cache_key`], but also reports the upstream
+/// `Content-Encoding` so a caller that passes the buffered body through
+/// untouched can declare the coding it is actually serving (#3184).
+pub async fn proxy_fetch_capped_with_cache_key_encoded(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
