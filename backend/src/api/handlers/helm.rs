@@ -101,6 +101,21 @@ fn is_prov_filename(filename: &str) -> bool {
 /// OCI Distribution API before repository-format validation was added (#3150).
 /// The media-type check is a second guard in case an imported manifest uses a
 /// non-standard path.
+///
+/// This filter is LOAD-BEARING, not redundant with the `/v2` write gate. That
+/// gate only covers the Distribution API; `services/oci_referenced_content.rs`
+/// (migration import) and `services/peer_instance_service.rs` (federation
+/// replication) also write OCI manifest rows and apply NO repository-format
+/// check. Removing this filter would let those two paths put manifests back
+/// into a classic Helm `index.yaml`.
+///
+/// NOTE on the `"v2/"` literal: this is the artifact PATH prefix written by
+/// `oci_v2::upsert_manifest_artifact` (`format!("v2/{image}/manifests/{ref}")`,
+/// the `artifacts.path` column). Do NOT "unify" it with
+/// `storage::keys::OCI_MANIFEST_STORAGE_PREFIX` (`"oci-manifests/"`) — that
+/// constant is a STORAGE KEY prefix (the `artifacts.storage_key` column). The
+/// two live in different namespaces and only coincidentally describe the same
+/// rows; substituting one for the other silently breaks this filter.
 fn is_oci_manifest_artifact(path: &str, content_type: &str) -> bool {
     let media_type = content_type
         .split(';')
@@ -1340,21 +1355,62 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         assert_eq!(url, "/helm/helm-local/charts/ingress-nginx-4.8.0.tgz");
     }
 
+    /// Pins the PATH arm on its own: an OCI-shaped `artifacts.path` with a
+    /// content type that matches NO entry in the media-type list. If the
+    /// `path.starts_with("v2/") && path.contains("/manifests/")` arm is
+    /// deleted, this case flips to false.
     #[test]
-    fn test_oci_manifests_are_not_classic_helm_chart_artifacts() {
+    fn test_oci_manifest_detected_by_path_arm_alone() {
+        assert!(is_oci_manifest_artifact(
+            "v2/keycloak/manifests/26.7.0",
+            "application/json"
+        ));
+        // The exact shape upsert_manifest_artifact writes, with the generic
+        // content type an older row may carry.
+        assert!(is_oci_manifest_artifact(
+            "v2/org/keycloak/manifests/sha256:abc",
+            "application/octet-stream"
+        ));
+    }
+
+    /// Pins the MEDIA-TYPE arm on its own: a path that fails the `v2/` test so
+    /// only the media type can match. If the media-type arm is deleted, these
+    /// flip to false.
+    #[test]
+    fn test_oci_manifest_detected_by_media_type_arm_alone() {
         for content_type in [
             "application/vnd.oci.image.manifest.v1+json",
             "application/vnd.oci.image.index.v1+json; charset=utf-8",
             "application/vnd.docker.distribution.manifest.v2+json",
             "application/vnd.docker.distribution.manifest.list.v2+json",
         ] {
-            assert!(is_oci_manifest_artifact("imported/manifest", content_type));
+            assert!(
+                is_oci_manifest_artifact("imported/manifest", content_type),
+                "{content_type} must be recognised without an OCI-shaped path"
+            );
         }
+    }
 
-        assert!(is_oci_manifest_artifact(
-            "v2/keycloak/manifests/26.7.0",
-            "application/json"
+    /// Pins the `&&` INSIDE the path arm. Each of these satisfies exactly one
+    /// half of the path test and carries a non-OCI media type, so flipping the
+    /// `&&` to `||` turns them true and fails this test.
+    #[test]
+    fn test_oci_manifest_path_arm_requires_both_halves() {
+        // `v2/` prefix but not a manifest path (a blob).
+        assert!(!is_oci_manifest_artifact(
+            "v2/keycloak/blobs/sha256:abc",
+            "application/octet-stream"
         ));
+        // `/manifests/` present but not under the `v2/` prefix: a classic
+        // chart that merely lives in a directory called `manifests`.
+        assert!(!is_oci_manifest_artifact(
+            "keycloak/manifests/keycloak-26.7.0.tgz",
+            "application/gzip"
+        ));
+    }
+
+    #[test]
+    fn test_classic_helm_chart_artifacts_are_not_oci_manifests() {
         assert!(!is_oci_manifest_artifact(
             "keycloak/26.7.0/keycloak-26.7.0.tgz",
             "application/gzip"
