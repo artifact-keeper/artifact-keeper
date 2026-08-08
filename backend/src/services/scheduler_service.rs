@@ -1217,7 +1217,9 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
         return Ok(());
     }
 
-    let storage = match StorageService::from_config(config).await {
+    // Handle that reads ARTIFACT BYTES: must carry the configured `S3_PREFIX`
+    // so it resolves the keys primary storage wrote artifacts under (#3171).
+    let storage = match StorageService::artifact_source_from_config(config).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
             tracing::error!(
@@ -1228,18 +1230,32 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
         }
     };
 
-    // Route backup archives to a dedicated bucket when BACKUP_S3_BUCKET is set
-    // (#2507); otherwise this is a clone of the primary storage handle.
-    let archive_storage = match StorageService::backup_archive_from_config(config, &storage).await {
-        Ok(s) => s,
+    // Handle that backup ARCHIVES live on. Kept prefix-less (the historical
+    // layout) so archives written before #3171 stay reachable.
+    let archive_root = match StorageService::from_config(config).await {
+        Ok(s) => Arc::new(s),
         Err(e) => {
             tracing::error!(
-                "Failed to create backup archive storage for scheduled backups: {}",
+                "Failed to create archive storage service for scheduled backups: {}",
                 e
             );
             return Err(e);
         }
     };
+
+    // Route backup archives to a dedicated bucket when BACKUP_S3_BUCKET is set
+    // (#2507); otherwise this is a clone of the prefix-less archive handle.
+    let archive_storage =
+        match StorageService::backup_archive_from_config(config, &archive_root).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create backup archive storage for scheduled backups: {}",
+                    e
+                );
+                return Err(e);
+            }
+        };
 
     for due_schedule in &due_schedules {
         let claimed = match claim_backup_schedule_run(

@@ -475,8 +475,9 @@ macro_rules! impl_storage_wrapper {
 ///
 /// Forwards the facade `StorageBackend` trait — including `supports_redirect`
 /// and `get_presigned_url` — to the inner S3 backend, so the single facade
-/// handle carries presign capability (built with `prefix = None` for the
-/// proxy cache; #1555).
+/// handle carries presign capability. The inner backend's key prefix is set by
+/// the [`StorageRole`] the handle was built for (`prefix = None` for the proxy
+/// cache, #1555; the configured `S3_PREFIX` for artifact bytes, #3171).
 pub struct S3BackendWrapper {
     inner: Arc<crate::storage::s3::S3Backend>,
 }
@@ -502,8 +503,11 @@ pub struct StorageService {
     /// parallel side-channel field, so no call site can silently get a
     /// non-presigning handle.
     ///
-    /// For S3 the inner backend is built with `prefix = None` so the signed
-    /// key matches the no-prefix layout the proxy cache writes.
+    /// For S3 the inner backend's key prefix depends on the [`StorageRole`]
+    /// the handle was built for: `ProxyCache` forces `prefix = None` so the
+    /// signed key matches the no-prefix layout the proxy cache writes (#1555),
+    /// while `ArtifactSource` keeps the configured `S3_PREFIX` so artifact
+    /// bytes are read at the key primary storage wrote them under (#3171).
     backend: Arc<dyn StorageBackend>,
 }
 
@@ -522,9 +526,71 @@ pub fn backend_supports_proxy_cache(storage_backend: &str) -> bool {
     matches!(storage_backend, "filesystem" | "s3" | "gcs")
 }
 
+/// What a [`StorageService`] handle is being built to address.
+///
+/// The two roles differ in exactly one thing — S3 key-prefix policy — and that
+/// difference is load-bearing in both directions, which is why it is named
+/// here instead of being an unlabelled line inside one constructor (#3171):
+///
+/// * [`StorageRole::ProxyCache`] must force `prefix = None`. Proxy-cache
+///   content lives at the bucket root (`proxy-cache/...`), not under
+///   `S3_PREFIX`, so a presigned key must carry no prefix (#1555).
+/// * [`StorageRole::ArtifactSource`] must keep the configured `S3_PREFIX`,
+///   because that is where primary storage actually wrote the artifact bytes.
+///
+/// Reusing the prefix-less proxy-cache handle to read artifact bytes was the
+/// #3171 bug: backup looked for `<storage_key>` while the bytes lived at
+/// `<S3_PREFIX>/<storage_key>`, so it missed every object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRole {
+    /// Cache facade for remote/proxy repositories. Content is anchored at the
+    /// bucket root, so the key prefix is deliberately forced off (#1555).
+    ProxyCache,
+    /// Artifact bytes for hosted repositories, laid out exactly as primary
+    /// storage writes them — including `S3_PREFIX` (#3171).
+    ArtifactSource,
+}
+
+impl StorageRole {
+    /// Apply this role's S3 key-prefix policy to an env-derived config.
+    ///
+    /// Only the S3 backend has a key prefix; filesystem and GCS resolve keys
+    /// identically for both roles, so this is the whole of the divergence.
+    pub fn apply_s3_prefix_policy(self, config: &mut crate::storage::s3::S3Config) {
+        match self {
+            // Proxy-cache content is anchored at the bucket root (#1555).
+            StorageRole::ProxyCache => config.prefix = None,
+            // Artifact bytes keep the prefix primary storage wrote them under
+            // (#3171); leaving `from_env`'s value untouched is the fix.
+            StorageRole::ArtifactSource => {}
+        }
+    }
+}
+
 impl StorageService {
-    /// Create storage service from config
+    /// Create the proxy-cache storage service from config.
+    ///
+    /// Equivalent to [`StorageService::from_config_for_role`] with
+    /// [`StorageRole::ProxyCache`]. Every historical caller of this function
+    /// wants the prefix-less proxy-cache handle, so its behavior is unchanged.
+    /// Callers that need to read or write **artifact bytes** must use
+    /// [`StorageService::artifact_source_from_config`] instead (#3171).
     pub async fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_for_role(config, StorageRole::ProxyCache).await
+    }
+
+    /// Build the storage handle used to read and write **artifact bytes**,
+    /// laid out exactly as primary storage wrote them (#3171).
+    ///
+    /// This is what the backup source path and the artifact-restore path must
+    /// use. It differs from [`StorageService::from_config`] only on S3, where
+    /// it preserves the configured `S3_PREFIX` rather than forcing it off.
+    pub async fn artifact_source_from_config(config: &Config) -> Result<Self> {
+        Self::from_config_for_role(config, StorageRole::ArtifactSource).await
+    }
+
+    /// Create storage service from config for an explicit [`StorageRole`].
+    pub async fn from_config_for_role(config: &Config, role: StorageRole) -> Result<Self> {
         let backend: Arc<dyn StorageBackend> = match config.storage_backend.as_str() {
             "filesystem" => {
                 let path = PathBuf::from(&config.storage_path);
@@ -532,17 +598,18 @@ impl StorageService {
                 Arc::new(FilesystemBackend::new(path))
             }
             "s3" => {
-                // Build the proxy-cache S3 backend from the SAME env-derived
-                // config the primary storage uses (redirect_downloads, presign
-                // creds, CloudFront, path_format, TLS, pool tuning), then force
-                // the key prefix to None. Proxy-cache content lives at the
-                // bucket root (`proxy-cache/...`), not under S3_PREFIX, so the
-                // signed key must carry no prefix. Reusing from_env() (instead
-                // of S3Config::new, which hardcodes redirect_downloads=false and
-                // no presign creds) is what makes presigning actually fire on
-                // this handle (#1555).
+                // Build the S3 backend from the SAME env-derived config the
+                // primary storage uses (redirect_downloads, presign creds,
+                // CloudFront, path_format, TLS, pool tuning). Reusing
+                // from_env() (instead of S3Config::new, which hardcodes
+                // redirect_downloads=false and no presign creds) is what makes
+                // presigning actually fire on this handle (#1555).
+                //
+                // The key-prefix policy is the one thing that depends on what
+                // the handle is for, so it is delegated to the role (#3171):
+                // ProxyCache forces the prefix off, ArtifactSource keeps it.
                 let mut s3_config = crate::storage::s3::S3Config::from_env()?;
-                s3_config.prefix = None;
+                role.apply_s3_prefix_policy(&mut s3_config);
                 let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
                 Arc::new(S3BackendWrapper { inner })
             }
@@ -1627,5 +1694,99 @@ mod tests {
             bytes_written: 42,
         };
         assert_ne!(r1, r3);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3171: the handle a backup reads artifact bytes through must resolve the
+    // SAME object key the artifact was written under.
+    //
+    // Primary storage (main.rs) builds its S3 backend from `S3Config::from_env`
+    // and keeps `S3_PREFIX`, so hosted artifacts live at
+    // `<S3_PREFIX>/<storage_key>`. `StorageService::from_config` deliberately
+    // forces `prefix = None` because the proxy cache it was written for keeps
+    // content at the bucket root (#1555) — correct for that role. The bug was
+    // reusing that prefix-less handle for backup, which then looked for
+    // `<storage_key>`, missed every object, and (because of #3170) still
+    // reported `completed`.
+    // -----------------------------------------------------------------------
+
+    static S3_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn s3_env_lock() -> &'static std::sync::Mutex<()> {
+        S3_ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn artifact_source_role_reads_the_prefix_artifacts_were_written_under() {
+        let _guard = s3_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+        let orig_bucket = std::env::var("S3_BUCKET").ok();
+        let orig_prefix = std::env::var("S3_PREFIX").ok();
+        std::env::set_var("S3_BUCKET", "ak-artifacts");
+        std::env::set_var("S3_PREFIX", "team-a/registry");
+
+        // What primary storage (main.rs) writes artifact bytes through.
+        let primary = crate::storage::s3::S3Config::from_env().expect("primary config");
+        assert_eq!(
+            primary.prefix.as_deref(),
+            Some("team-a/registry"),
+            "sanity: primary storage keeps S3_PREFIX"
+        );
+
+        // What the backup source handle reads through: must match primary.
+        let mut source = crate::storage::s3::S3Config::from_env().expect("source config");
+        StorageRole::ArtifactSource.apply_s3_prefix_policy(&mut source);
+        assert_eq!(
+            source.prefix, primary.prefix,
+            "backup must read artifact bytes at the key they were written under; \
+             a prefix-less handle looks at <storage_key> while the bytes live at \
+             <S3_PREFIX>/<storage_key> and every object is missed (#3171)"
+        );
+
+        // ...while the proxy-cache role keeps forcing the prefix off (#1555).
+        let mut proxy = crate::storage::s3::S3Config::from_env().expect("proxy config");
+        StorageRole::ProxyCache.apply_s3_prefix_policy(&mut proxy);
+        assert_eq!(
+            proxy.prefix, None,
+            "#1555 regression guard: proxy-cache content stays at the bucket root"
+        );
+        assert_ne!(
+            proxy.prefix, source.prefix,
+            "the two roles must genuinely differ when S3_PREFIX is set"
+        );
+
+        let restore = |name: &str, val: Option<String>| match val {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        restore("S3_BUCKET", orig_bucket);
+        restore("S3_PREFIX", orig_prefix);
+    }
+
+    #[test]
+    fn storage_roles_agree_when_no_s3_prefix_is_configured() {
+        // Deployments without S3_PREFIX are explicitly listed as unaffected in
+        // #3171: both roles resolve identical keys, so the fix is a no-op there.
+        let _guard = s3_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+        let orig_bucket = std::env::var("S3_BUCKET").ok();
+        let orig_prefix = std::env::var("S3_PREFIX").ok();
+        std::env::set_var("S3_BUCKET", "ak-artifacts");
+        std::env::remove_var("S3_PREFIX");
+
+        let mut source = crate::storage::s3::S3Config::from_env().expect("source config");
+        StorageRole::ArtifactSource.apply_s3_prefix_policy(&mut source);
+        let mut proxy = crate::storage::s3::S3Config::from_env().expect("proxy config");
+        StorageRole::ProxyCache.apply_s3_prefix_policy(&mut proxy);
+
+        assert_eq!(source.prefix, None);
+        assert_eq!(proxy.prefix, None);
+
+        let restore = |name: &str, val: Option<String>| match val {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        restore("S3_BUCKET", orig_bucket);
+        restore("S3_PREFIX", orig_prefix);
     }
 }

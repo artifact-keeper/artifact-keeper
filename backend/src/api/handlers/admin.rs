@@ -473,10 +473,17 @@ pub async fn execute_backup(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BackupResponse>> {
-    let storage = Arc::new(StorageService::from_config(&state.config).await?);
+    // Two distinct handles, deliberately (#3171):
+    //  * `archive_root` is the prefix-less handle backup ARCHIVES have always
+    //    been written to/read from; it must stay prefix-less or existing
+    //    archives become unreachable.
+    //  * `source` reads ARTIFACT BYTES and must carry the configured
+    //    `S3_PREFIX`, because that is where primary storage wrote them.
+    let archive_root = Arc::new(StorageService::from_config(&state.config).await?);
     let archive_storage =
-        StorageService::backup_archive_from_config(&state.config, &storage).await?;
-    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
+        StorageService::backup_archive_from_config(&state.config, &archive_root).await?;
+    let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
+    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
 
     let backup = service.execute(id).await?;
 
@@ -531,14 +538,18 @@ pub async fn restore_backup(
     Path(id): Path<Uuid>,
     Json(payload): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>> {
-    let storage = Arc::new(
+    // As in `execute_backup`: archives keep the prefix-less handle, artifact
+    // bytes are restored through the prefixed artifact-source handle so they
+    // land at the keys the rest of the system reads them from (#3171).
+    let archive_root = Arc::new(
         StorageService::from_config(&state.config)
             .await
             .map_err(|e: AppError| e)?,
     );
     let archive_storage =
-        StorageService::backup_archive_from_config(&state.config, &storage).await?;
-    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
+        StorageService::backup_archive_from_config(&state.config, &archive_root).await?;
+    let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
+    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
 
     let options = RestoreOptions {
         restore_database: payload.restore_database.unwrap_or(true),

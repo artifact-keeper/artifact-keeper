@@ -77,9 +77,66 @@ pub struct BackupManifest {
     pub backup_type: BackupType,
     pub created_at: DateTime<Utc>,
     pub database_tables: Vec<String>,
+    /// Number of artifact objects whose bytes were successfully read and are
+    /// present in the archive.
     pub artifact_count: i64,
+    /// Number of enumerated artifact objects whose bytes could **not** be read
+    /// and are therefore absent from the archive (#3170).
+    ///
+    /// Recorded so an existing archive can be audited without re-running the
+    /// backup, and so [`BackupService::restore`] can refuse to present an
+    /// incomplete archive as a clean restore. Defaults to `0` when absent so
+    /// archives written before this field existed still deserialize.
+    #[serde(default)]
+    pub artifacts_unreadable: i64,
     pub total_size_bytes: i64,
     pub checksum: String,
+}
+
+/// Metadata key that opts a backup in to completing despite unreadable
+/// artifact bytes (#3170).
+///
+/// Absent/false — the default — means a backup that cannot read an artifact's
+/// bytes FAILS. Partial backups remain possible, but only as an explicit
+/// operator choice, never as a silent default.
+const ALLOW_PARTIAL_ARTIFACTS_KEY: &str = "allow_partial_artifacts";
+
+/// Whether the backup's metadata opts in to a partial (best-effort) archive.
+fn allow_partial_artifacts(metadata: Option<&serde_json::Value>) -> bool {
+    metadata
+        .and_then(|m| m.get(ALLOW_PARTIAL_ARTIFACTS_KEY))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Build the operator-facing message for a backup that could not read every
+/// artifact's bytes (#3170).
+///
+/// Names the affected keys (capped, with an overflow count) so the job's
+/// `error_message` is actionable without trawling logs.
+fn unreadable_artifacts_message(unreadable: &[(String, String)]) -> String {
+    const MAX_LISTED: usize = 5;
+    let listed = unreadable
+        .iter()
+        .take(MAX_LISTED)
+        .map(|(key, err)| format!("{key} ({err})"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let overflow = unreadable.len().saturating_sub(MAX_LISTED);
+    let suffix = if overflow > 0 {
+        format!(" and {overflow} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "backup is missing artifact content: {} artifact object(s) could not be read: {}{}. \
+         The archive does NOT contain these bytes. Set `{}` in the backup metadata to accept \
+         a partial archive deliberately.",
+        unreadable.len(),
+        listed,
+        suffix,
+        ALLOW_PARTIAL_ARTIFACTS_KEY
+    )
 }
 
 /// Request to create a backup
@@ -601,14 +658,28 @@ impl BackupService {
         let storage_keys = self
             .artifact_storage_keys(repository_filter.as_deref(), since_filter)
             .await?;
+        // Read each artifact's bytes, tracking failures rather than discarding
+        // them (#3170). A read that fails means the archive will not contain
+        // that artifact's content; that must never be invisible.
         let mut artifact_data: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut unreadable: Vec<(String, String)> = Vec::new();
         for key in storage_keys {
-            if let Ok(content) = self.storage.get(&key).await {
-                artifact_data.push((key, content.to_vec()));
+            match self.storage.get(&key).await {
+                Ok(content) => artifact_data.push((key, content.to_vec())),
+                Err(e) => {
+                    tracing::warn!(
+                        backup_id = %backup_id,
+                        storage_key = %key,
+                        error = %e,
+                        "backup could not read artifact bytes; the archive will not contain this object"
+                    );
+                    unreadable.push((key, e.to_string()));
+                }
             }
         }
 
-        // Build manifest
+        // Build manifest. Both counts are recorded so an archive can be audited
+        // after the fact without re-running the backup (#3170).
         let manifest = BackupManifest {
             version: "1.0".to_string(),
             backup_id,
@@ -616,6 +687,7 @@ impl BackupService {
             created_at: Utc::now(),
             database_tables: table_names.iter().map(|s| s.to_string()).collect(),
             artifact_count: artifact_data.len() as i64,
+            artifacts_unreadable: unreadable.len() as i64,
             total_size_bytes: 0,     // Will be actual size in final backup
             checksum: String::new(), // Will be computed after archive is complete
         };
@@ -658,6 +730,27 @@ impl BackupService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // A backup that could not read every artifact's bytes must not present
+        // as a clean success (#3170). The archive and its manifest are written
+        // first, deliberately: the partial data plus the recorded miss count is
+        // strictly more useful to an operator than discarding both, and the
+        // manifest is what lets `restore` refuse the archive later. The job
+        // itself then fails, so the failure is visible at the moment it happens
+        // rather than at restore time when there is no recourse.
+        if !unreadable.is_empty() {
+            let message = unreadable_artifacts_message(&unreadable);
+            if allow_partial_artifacts(backup.metadata.as_ref()) {
+                tracing::warn!(
+                    backup_id = %backup_id,
+                    unreadable = unreadable.len(),
+                    "{}", message
+                );
+            } else {
+                tracing::error!(backup_id = %backup_id, "{}", message);
+                return Err(AppError::Internal(message));
+            }
+        }
 
         self.get_by_id(backup_id).await
     }
@@ -851,6 +944,23 @@ impl BackupService {
             errors: Vec::new(),
         };
 
+        // An archive whose manifest records unreadable artifacts is known to be
+        // missing content. Surface that as a restore error so the restore can
+        // never report `errors=[]` over an incomplete archive (#3170). This is
+        // the second half of the honesty guarantee: the backup fails loudly at
+        // capture time, and if a partial archive was deliberately opted in to,
+        // the restore still refuses to call it clean.
+        if let Some(manifest) = Self::read_manifest(&entries) {
+            if manifest.artifacts_unreadable > 0 {
+                result.errors.push(format!(
+                    "archive is incomplete: its manifest records {} artifact object(s) that were \
+                     unreadable at backup time and are absent from this archive (backup {}). \
+                     {} artifact object(s) were captured.",
+                    manifest.artifacts_unreadable, manifest.backup_id, manifest.artifact_count
+                ));
+            }
+        }
+
         // Restore database tables in dependency order
         if options.restore_database {
             let table_order = [
@@ -934,6 +1044,19 @@ impl BackupService {
         }
 
         Ok(result)
+    }
+
+    /// Parse `manifest.json` out of already-extracted archive entries.
+    ///
+    /// Returns `None` when the archive has no manifest or it does not parse —
+    /// both are tolerated so a malformed manifest never blocks an otherwise
+    /// usable restore. Archives written before #3170 simply report
+    /// `artifacts_unreadable = 0` via the field's serde default.
+    fn read_manifest(entries: &[(std::path::PathBuf, Vec<u8>)]) -> Option<BackupManifest> {
+        entries
+            .iter()
+            .find(|(path, _)| path.file_name().and_then(|n| n.to_str()) == Some("manifest.json"))
+            .and_then(|(_, content)| serde_json::from_slice::<BackupManifest>(content).ok())
     }
 
     /// Extract all entries from a tar.gz archive synchronously.
@@ -1341,6 +1464,7 @@ mod tests {
             created_at: Utc::now(),
             database_tables: vec!["users".to_string(), "artifacts".to_string()],
             artifact_count: 42,
+            artifacts_unreadable: 0,
             total_size_bytes: 1024 * 1024,
             checksum: "abc123".to_string(),
         };
@@ -1353,6 +1477,7 @@ mod tests {
         assert_eq!(deserialized.backup_type, BackupType::Full);
         assert_eq!(deserialized.database_tables.len(), 2);
         assert_eq!(deserialized.artifact_count, 42);
+        assert_eq!(deserialized.artifacts_unreadable, 0);
         assert_eq!(deserialized.total_size_bytes, 1024 * 1024);
         assert_eq!(deserialized.checksum, "abc123");
     }
@@ -2183,5 +2308,225 @@ mod tests {
             .execute(&pool)
             .await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3170: a backup that cannot read an artifact's bytes must not report a
+    // clean success. Historically the collect loop was
+    //
+    //     if let Ok(content) = self.storage.get(&key).await { ... }
+    //
+    // so a failed read was discarded entirely: not counted, not logged, not in
+    // the manifest, not in the job status. The job reported `completed` with
+    // `artifact_count=0` and the restore reported `errors=[]` while restoring
+    // nothing — an operator got no signal at any point that the archive held
+    // no content. These tests assert on honesty (the miss is surfaced), not on
+    // any particular storage-path resolution, so they keep passing after the
+    // #2863 root-resolution fix lands.
+    // -----------------------------------------------------------------------
+
+    /// Build a backup service whose primary storage is an **empty** directory,
+    /// so every artifact key enumerated from the database is unreadable. This
+    /// is the in-process stand-in for the real-world condition in #3170/#3171:
+    /// the row says the bytes exist, the handle the backup reads through
+    /// cannot find them.
+    fn service_with_empty_storage(pool: PgPool) -> (BackupService, std::path::PathBuf) {
+        use crate::services::storage_service::FilesystemBackend;
+        let dir = std::env::temp_dir().join(format!("bk-3170-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp storage dir");
+        let backend = Arc::new(FilesystemBackend::new(dir.clone()));
+        let storage = Arc::new(StorageService::new(backend));
+        (BackupService::new(pool, storage), dir)
+    }
+
+    fn full_backup_of(repo_id: Uuid) -> CreateBackupRequest {
+        CreateBackupRequest {
+            backup_type: BackupType::Full,
+            repository_ids: Some(vec![repo_id]),
+            exclude_repository_ids: None,
+            since: None,
+            created_by: None,
+            name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_with_unreadable_artifact_bytes_does_not_report_success() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        // One artifact row whose bytes are NOT present at the resolved root.
+        let missing_key = insert_artifact_at(&pool, repo_id, "unreadable", Utc::now()).await;
+
+        let (service, storage_dir) = service_with_empty_storage(pool.clone());
+        let backup = service
+            .create(full_backup_of(repo_id))
+            .await
+            .expect("create backup job");
+
+        let result = service.execute(backup.id).await;
+
+        // The core assertion: the job must NOT succeed while the archive is
+        // missing artifact content.
+        assert!(
+            result.is_err(),
+            "backup whose artifact bytes are unreadable must not report success"
+        );
+
+        let row = service
+            .get_by_id(backup.id)
+            .await
+            .expect("reload backup row");
+        assert_ne!(
+            row.status,
+            BackupStatus::Completed,
+            "a backup missing artifact content must not present as completed"
+        );
+        let message = row.error_message.unwrap_or_default();
+        assert!(
+            message.contains(&missing_key),
+            "the unreadable key must be named in the job error; got {message:?}"
+        );
+
+        // A failed backup is not restorable, so the missing bytes can never be
+        // silently "restored" as a clean run.
+        let restore = service
+            .restore(
+                backup.id,
+                RestoreOptions {
+                    restore_database: false,
+                    restore_artifacts: true,
+                    target_repository_id: None,
+                },
+            )
+            .await;
+        assert!(
+            restore.is_err(),
+            "restore must refuse an archive whose backup did not complete cleanly"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn opt_in_partial_backup_records_misses_and_restore_refuses_them() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let missing_key = insert_artifact_at(&pool, repo_id, "unreadable", Utc::now()).await;
+
+        let (service, storage_dir) = service_with_empty_storage(pool.clone());
+        let backup = service
+            .create(full_backup_of(repo_id))
+            .await
+            .expect("create backup job");
+
+        // Operators who genuinely want a best-effort archive opt in explicitly.
+        sqlx::query("UPDATE backups SET metadata = metadata || $2::jsonb WHERE id = $1")
+            .bind(backup.id)
+            .bind(serde_json::json!({ "allow_partial_artifacts": true }))
+            .execute(&pool)
+            .await
+            .expect("set allow_partial_artifacts");
+
+        service
+            .execute(backup.id)
+            .await
+            .expect("opt-in partial backup completes");
+
+        let row = service
+            .get_by_id(backup.id)
+            .await
+            .expect("reload backup row");
+        assert_eq!(
+            row.status,
+            BackupStatus::Completed,
+            "an explicitly opted-in partial backup may complete"
+        );
+
+        // ...but the archive must record the miss so it can be audited without
+        // re-running, and so the restore path can refuse it.
+        let manifest = read_manifest_from_backup(&service, &row).await;
+        assert_eq!(
+            manifest.artifacts_unreadable, 1,
+            "the manifest must record the unreadable artifact"
+        );
+        assert_eq!(
+            manifest.artifact_count, 0,
+            "the unreadable artifact must not be counted as captured"
+        );
+
+        let restore = service
+            .restore(
+                backup.id,
+                RestoreOptions {
+                    restore_database: false,
+                    restore_artifacts: true,
+                    target_repository_id: None,
+                },
+            )
+            .await
+            .expect("restore of a partial archive runs");
+        assert!(
+            restore
+                .errors
+                .iter()
+                .any(|e| e.contains("unreadable") || e.contains(&missing_key)),
+            "restore must not report errors=[] for an archive with recorded misses; got {:?}",
+            restore.errors
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Pull `backup/manifest.json` back out of a written archive.
+    async fn read_manifest_from_backup(service: &BackupService, row: &Backup) -> BackupManifest {
+        let path = row.storage_path.as_ref().expect("archive path");
+        let bytes = service
+            .archive_storage
+            .get(path)
+            .await
+            .expect("archive readable");
+        let entries = BackupService::extract_entries(&bytes).expect("extract archive");
+        let (_, content) = entries
+            .iter()
+            .find(|(p, _)| p.to_string_lossy().contains("manifest.json"))
+            .expect("archive contains a manifest");
+        serde_json::from_slice(content).expect("manifest parses")
+    }
+
+    #[test]
+    fn manifest_without_unreadable_field_defaults_to_zero() {
+        // Archives written before #3170 have no `artifacts_unreadable` key;
+        // they must still deserialize (as 0) so old backups stay auditable.
+        let legacy = serde_json::json!({
+            "version": "1.0",
+            "backup_id": Uuid::nil(),
+            "backup_type": "full",
+            "created_at": "2026-01-01T00:00:00Z",
+            "database_tables": ["users"],
+            "artifact_count": 3,
+            "total_size_bytes": 0,
+            "checksum": ""
+        });
+        let manifest: BackupManifest =
+            serde_json::from_value(legacy).expect("legacy manifest deserializes");
+        assert_eq!(manifest.artifacts_unreadable, 0);
+        assert_eq!(manifest.artifact_count, 3);
     }
 }
