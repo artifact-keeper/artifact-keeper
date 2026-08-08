@@ -32,6 +32,7 @@ pub mod protobuf;
 pub mod r#pub;
 pub mod puppet;
 pub mod pypi;
+pub mod pypi_name;
 pub mod rpm;
 pub mod rubygems;
 pub mod sbt;

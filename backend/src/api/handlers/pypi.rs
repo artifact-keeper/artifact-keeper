@@ -37,6 +37,7 @@ use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
+use crate::formats::pypi_name::NormalizedProjectName;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::age_gate_service::AgeGateService;
 use crate::services::upstream_metadata::metadata_http_client;
@@ -61,6 +62,62 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/simple/:project/:filename",
             get(download_or_metadata),
         )
+}
+
+// ---------------------------------------------------------------------------
+// PEP 508 project-name validation (the routed edge)
+// ---------------------------------------------------------------------------
+
+/// Validate a `:project` path segment against PEP 508 and return it in PEP 503
+/// canonical form, or a 404.
+///
+/// This is the ONLY way a routed project segment enters the PyPI handlers, and
+/// it runs before any curation gate, any DB lookup and any upstream fetch.
+///
+/// # Why validate rather than coerce
+///
+/// PEP 503 defines normalization as exactly `re.sub(r"[-_.]+", "-",
+/// name).lower()` and says nothing about any other character, because it
+/// presupposes a name that is already valid. PEP 508 supplies that
+/// precondition: a name matches `^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$`
+/// (case-insensitive). `acme sdk` is therefore not a project name and has no
+/// correct normalization — which is precisely why our two coercions could
+/// disagree about it ([`normalize_pep503`] drops the space to `acmesdk`,
+/// [`PypiHandler::normalize_name`] turns it into `acme-sdk`), letting a client
+/// clear a gate under one name and be served another package's bytes (#3077,
+/// #3179, #3183). See [`crate::formats::pypi_name`].
+///
+/// # Why 404
+///
+/// Measured against the reference implementation, not inferred: pypi.org
+/// returns `404` for `/simple/acme%20sdk/`, `/simple/acme!sdk/`,
+/// `/simple/_leading/` and `/simple/trailing-/`, and `301`s a *valid* but
+/// non-canonical name (`/simple/Django/`, `/simple/zope.interface/`) to its
+/// canonical URL. A name that cannot exist has no route, so 404 — not 400 — is
+/// the behaviour clients already handle.
+///
+/// # Why the body is "Invalid project name" and does not echo the segment
+///
+/// Two reasons, and both are load-bearing.
+///
+/// *It does not repeat the input.* Reflecting an unvalidated segment would hand
+/// back the very characters [`normalize_pep503`] exists to strip, and a 404 that
+/// repeats its input is a reflection sink. The rejected name is only logged.
+///
+/// *It is not "Package not found".* An absent-but-valid project already 404s
+/// with that message, so reusing it would make a validation rejection and an
+/// ordinary lookup miss indistinguishable -- to an operator debugging a broken
+/// `pip install`, and to the tests that have to prove this change does not
+/// over-reject. Distinct wording is what lets a test assert *which* 404 it got.
+#[allow(clippy::result_large_err)]
+fn parse_project_segment(project: &str) -> Result<NormalizedProjectName, Response> {
+    NormalizedProjectName::parse(project).ok_or_else(|| {
+        debug!(
+            "rejecting PyPI project segment that is not a PEP 508 name (len {})",
+            project.len()
+        );
+        AppError::NotFound("Invalid project name".to_string()).into_response()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -686,13 +743,16 @@ async fn simple_project(
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
-    let normalized = normalize_pep503(&project);
+    // PEP 508 validation FIRST (#3186), before the curation gate, the local
+    // lookup and any upstream fetch. An invalid segment is not a project name,
+    // so there is nothing to gate and nothing to fetch.
+    let normalized = parse_project_segment(&project)?;
 
     // Curation gate (#2912): block a curation-ruled package
     // before doing any local lookup or upstream fetch for it. The index request
     // names only a project, so version-constrained rules do not apply here — they
     // are enforced on the download path, which knows the version.
-    enforce_pypi_curation(&state, &repo, &normalized, None).await?;
+    enforce_pypi_curation(&state, &repo, normalized.as_str(), None).await?;
 
     // PEP 691 content negotiation also governs the proxy path: a JSON client
     // must get the upstream's JSON representation (which carries PEP 700
@@ -718,7 +778,7 @@ async fn simple_project(
         ORDER BY a.created_at DESC
         "#,
         repo.id,
-        normalized
+        normalized.as_str()
     )
     .fetch_all(&state.db)
     .await
@@ -783,13 +843,13 @@ async fn simple_project(
                 // HTML and fall through to the HTML rewrite below.
                 if wants_json && ct.contains("json") {
                     if let Some(json) =
-                        rewrite_upstream_simple_json(&content, &repo_key, &normalized)
+                        rewrite_upstream_simple_json(&content, &repo_key, normalized.as_str())
                     {
                         let json = filter_pypi_simple_json_response(
                             &state,
                             &repo,
                             &effective_upstream,
-                            &normalized,
+                            normalized.as_str(),
                             json,
                         )
                         .await;
@@ -805,12 +865,12 @@ async fn simple_project(
                 // Rewrite absolute download URLs to route through our proxy.
                 if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
-                    let rewritten = rewrite_upstream_urls(&html, &repo_key, &normalized);
+                    let rewritten = rewrite_upstream_urls(&html, &repo_key, normalized.as_str());
                     let rewritten = filter_pypi_simple_html_response(
                         &state,
                         &repo,
                         &effective_upstream,
-                        &normalized,
+                        normalized.as_str(),
                         rewritten,
                     )
                     .await;
@@ -826,13 +886,14 @@ async fn simple_project(
                 // bytes, which carry un-rewritten offsite download URLs.
                 return match sniff_simple_index(&content) {
                     SniffedSimpleIndex::Json => {
-                        match rewrite_upstream_simple_json(&content, &repo_key, &normalized) {
+                        match rewrite_upstream_simple_json(&content, &repo_key, normalized.as_str())
+                        {
                             Some(json) => {
                                 let json = filter_pypi_simple_json_response(
                                     &state,
                                     &repo,
                                     &effective_upstream,
-                                    &normalized,
+                                    normalized.as_str(),
                                     json,
                                 )
                                 .await;
@@ -847,12 +908,13 @@ async fn simple_project(
                     }
                     SniffedSimpleIndex::Html => {
                         let html = String::from_utf8_lossy(&content);
-                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &normalized);
+                        let rewritten =
+                            rewrite_upstream_urls(&html, &repo_key, normalized.as_str());
                         let rewritten = filter_pypi_simple_html_response(
                             &state,
                             &repo,
                             &effective_upstream,
-                            &normalized,
+                            normalized.as_str(),
                             rewritten,
                         )
                         .await;
@@ -890,7 +952,8 @@ async fn simple_project(
             // The download path makes the same per-member decision, keeping
             // index and download consistent.
             let owning_local_min_priority =
-                proxy_helpers::pypi_virtual_isolates_name(&state.db, repo.id, &normalized).await?;
+                proxy_helpers::pypi_virtual_isolates_name(&state.db, repo.id, normalized.as_str())
+                    .await?;
             let member_priorities = if owning_local_min_priority.is_some() {
                 proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?
             } else {
@@ -930,7 +993,7 @@ async fn simple_project(
         ORDER BY a.created_at DESC
         "#,
                     member.id,
-                    normalized
+                    normalized.as_str()
                 )
                 .fetch_all(&state.db)
                 .await
@@ -1024,7 +1087,7 @@ async fn simple_project(
                 // block suppresses this member's contribution rather than failing
                 // the whole listing, exactly as the age gate filters it.
                 let member_info = proxy_helpers::repo_info_from_member(member);
-                if enforce_pypi_curation(&state, &member_info, &normalized, None)
+                if enforce_pypi_curation(&state, &member_info, normalized.as_str(), None)
                     .await
                     .is_err()
                 {
@@ -1075,7 +1138,7 @@ async fn simple_project(
                                 &state,
                                 &member_info,
                                 &effective_upstream,
-                                &normalized,
+                                normalized.as_str(),
                                 String::from_utf8_lossy(&content).into_owned(),
                             )
                             .await;
@@ -1085,7 +1148,7 @@ async fn simple_project(
                                 &state,
                                 &member_info,
                                 &effective_upstream,
-                                &normalized,
+                                normalized.as_str(),
                                 String::from_utf8_lossy(&content).into_owned(),
                             )
                             .await;
@@ -1104,7 +1167,7 @@ async fn simple_project(
                                 &content,
                                 &owned_profile,
                                 &repo_key,
-                                &normalized,
+                                normalized.as_str(),
                             )
                         } else {
                             content
@@ -1127,7 +1190,8 @@ async fn simple_project(
                 .filter(|m| matches!(m.repo_type, RepositoryType::Local | RepositoryType::Staging))
                 .map(|m| m.id)
                 .collect();
-            let tracks = pypi_project_tracks_for(&state.db, &local_member_ids, &normalized).await;
+            let tracks =
+                pypi_project_tracks_for(&state.db, &local_member_ids, normalized.as_str()).await;
 
             // Render the union.
             match (local_artifacts.is_empty(), remote_response) {
@@ -1141,7 +1205,7 @@ async fn simple_project(
                     return build_simple_project_response(
                         &headers,
                         &repo_key,
-                        &normalized,
+                        normalized.as_str(),
                         &local_artifacts,
                         &tracks,
                     );
@@ -1165,11 +1229,11 @@ async fn simple_project(
                                 let merged = merge_local_into_remote_simple_json(
                                     &content,
                                     &repo_key,
-                                    &normalized,
+                                    normalized.as_str(),
                                     &local_artifacts,
                                     &tracks,
                                 )
-                                .unwrap_or_else(|| empty_pep691_listing(&normalized));
+                                .unwrap_or_else(|| empty_pep691_listing(normalized.as_str()));
                                 Ok(cacheable_response(
                                     merged.into_bytes(),
                                     PEP691_JSON_CONTENT_TYPE,
@@ -1182,7 +1246,7 @@ async fn simple_project(
                                 let merged = merge_local_into_remote_simple_html(
                                     &String::from_utf8_lossy(&content),
                                     &repo_key,
-                                    &normalized,
+                                    normalized.as_str(),
                                     &local_artifacts,
                                     &tracks,
                                 );
@@ -1196,13 +1260,13 @@ async fn simple_project(
                             // listing, never raw upstream bytes.
                             SniffedSimpleIndex::Binary => {
                                 let merged = merge_local_into_remote_simple_json(
-                                    empty_pep691_listing(&normalized).as_bytes(),
+                                    empty_pep691_listing(normalized.as_str()).as_bytes(),
                                     &repo_key,
-                                    &normalized,
+                                    normalized.as_str(),
                                     &local_artifacts,
                                     &tracks,
                                 )
-                                .unwrap_or_else(|| empty_pep691_listing(&normalized));
+                                .unwrap_or_else(|| empty_pep691_listing(normalized.as_str()));
                                 Ok(cacheable_response(
                                     merged.into_bytes(),
                                     PEP691_JSON_CONTENT_TYPE,
@@ -1220,7 +1284,7 @@ async fn simple_project(
                         if let Some(json) = merge_local_into_remote_simple_json(
                             &content,
                             &repo_key,
-                            &normalized,
+                            normalized.as_str(),
                             &local_artifacts,
                             &tracks,
                         ) {
@@ -1235,11 +1299,12 @@ async fn simple_project(
 
                     if ct.contains("text/html") {
                         let html = String::from_utf8_lossy(&content);
-                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &normalized);
+                        let rewritten =
+                            rewrite_upstream_urls(&html, &repo_key, normalized.as_str());
                         let merged = merge_local_into_remote_simple_html(
                             &rewritten,
                             &repo_key,
-                            &normalized,
+                            normalized.as_str(),
                             &local_artifacts,
                             &tracks,
                         );
@@ -1258,7 +1323,7 @@ async fn simple_project(
                             match merge_local_into_remote_simple_json(
                                 &content,
                                 &repo_key,
-                                &normalized,
+                                normalized.as_str(),
                                 &local_artifacts,
                                 &tracks,
                             ) {
@@ -1272,11 +1337,12 @@ async fn simple_project(
                         }
                         SniffedSimpleIndex::Html => {
                             let html = String::from_utf8_lossy(&content);
-                            let rewritten = rewrite_upstream_urls(&html, &repo_key, &normalized);
+                            let rewritten =
+                                rewrite_upstream_urls(&html, &repo_key, normalized.as_str());
                             let merged = merge_local_into_remote_simple_html(
                                 &rewritten,
                                 &repo_key,
-                                &normalized,
+                                normalized.as_str(),
                                 &local_artifacts,
                                 &tracks,
                             );
@@ -1295,8 +1361,14 @@ async fn simple_project(
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
-    let tracks = pypi_project_tracks_for(&state.db, &[repo.id], &normalized).await;
-    build_simple_project_response(&headers, &repo_key, &normalized, &simple_artifacts, &tracks)
+    let tracks = pypi_project_tracks_for(&state.db, &[repo.id], normalized.as_str()).await;
+    build_simple_project_response(
+        &headers,
+        &repo_key,
+        normalized.as_str(),
+        &simple_artifacts,
+        &tracks,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1608,10 +1680,19 @@ async fn download_or_metadata(
     // the gate must evaluate exactly the distribution the serve path resolves,
     // or a suffix shape that parses to a different (or no) version slips past a
     // version-constrained rule and is then served anyway.
-    let normalized = normalize_pep503(&project);
+    // PEP 508 validation FIRST (#3186). This covers BOTH branches below --
+    // the PEP 658 `.metadata` resource and the regular distribution download --
+    // because both are reached through this one route.
+    let normalized = parse_project_segment(&project)?;
     let distribution = pypi_distribution_filename(&filename);
     let requested_version = version_from_pypi_filename(distribution);
-    enforce_pypi_curation(&state, &repo, &normalized, requested_version.as_deref()).await?;
+    enforce_pypi_curation(
+        &state,
+        &repo,
+        normalized.as_str(),
+        requested_version.as_deref(),
+    )
+    .await?;
 
     // PEP 658: serve metadata from the remote upstream when possible. If the
     // upstream advertises metadata but returns 404, fall back to extracting it
@@ -1654,6 +1735,9 @@ async fn download_or_metadata(
                     // was fixed, so a curation block on a direct Remote repo
                     // was still evadable by spelling: the gate saw "acmesdk"
                     // and the fetch resolved "acme-sdk".
+                    // The VALIDATED, normalized name -- not the raw segment.
+                    // This is #3179's fix, now enforced by the type system:
+                    // `serve_remote_metadata` no longer accepts a `&str`.
                     &normalized,
                     real_filename,
                 )
@@ -1685,6 +1769,10 @@ async fn download_or_metadata(
     // `normalize_name` is idempotent on `normalize_pep503` output (see
     // `test_normalize_name_is_idempotent_on_pep503_output`), so upstream URLs
     // and proxy-cache keys are byte-identical for every well-formed name.
+    // The VALIDATED, normalized name -- not the raw segment. This is #3183's
+    // fix, now enforced by the type system: `serve_file` no longer accepts a
+    // `&str`, so the gates it runs and the upstream fetch it performs cannot
+    // key on different strings.
     serve_file(
         &state,
         &repo,
@@ -1724,7 +1812,7 @@ async fn serve_virtual_metadata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     virtual_repo: &RepoInfo,
-    normalized_project: &str,
+    normalized_project: &NormalizedProjectName,
     requested_version: Option<&str>,
     filename: &str,
 ) -> Result<Response, Response> {
@@ -1744,16 +1832,19 @@ async fn serve_virtual_metadata(
     // admitted Case-A platform wheel. Without this gate, a direct or stale
     // `.metadata` URL could expose a remote-only Case-B version that neither
     // the index advertises nor the download route serves.
-    let owning_local_min_priority =
-        proxy_helpers::pypi_virtual_isolates_name(&state.db, virtual_repo.id, normalized_project)
-            .await?;
+    let owning_local_min_priority = proxy_helpers::pypi_virtual_isolates_name(
+        &state.db,
+        virtual_repo.id,
+        normalized_project.as_str(),
+    )
+    .await?;
     let member_priorities = if owning_local_min_priority.is_some() {
         proxy_helpers::fetch_virtual_member_priorities(&state.db, virtual_repo.id).await?
     } else {
         Default::default()
     };
     let owned_profile = if owning_local_min_priority.is_some() {
-        pypi_owned_wheel_profile(&state.db, &members, normalized_project).await
+        pypi_owned_wheel_profile(&state.db, &members, normalized_project.as_str()).await
     } else {
         OwnedWheelProfile::default()
     };
@@ -1761,9 +1852,14 @@ async fn serve_virtual_metadata(
     let mut first_member_error: Option<Response> = None;
     for member in members {
         let member_info = proxy_helpers::repo_info_from_member(&member);
-        if enforce_pypi_curation(state, &member_info, normalized_project, requested_version)
-            .await
-            .is_err()
+        if enforce_pypi_curation(
+            state,
+            &member_info,
+            normalized_project.as_str(),
+            requested_version,
+        )
+        .await
+        .is_err()
         {
             continue;
         }
@@ -1889,14 +1985,18 @@ async fn serve_virtual_metadata(
             .into_response(),
     )
 }
-
+/// Serve a PEP 658 `.metadata` resource from a remote upstream.
+///
+/// `project` is a [`NormalizedProjectName`] (#3186), so the string this fetches
+/// with is by construction the same string the curation gate in
+/// `download_or_metadata` evaluated.
 async fn serve_remote_metadata(
     state: &SharedState,
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
     upstream_url: &str,
-    project: &str,
+    project: &NormalizedProjectName,
     filename: &str,
 ) -> Result<Response, Response> {
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
@@ -1985,8 +2085,15 @@ fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
         .to_string()
 }
 
-fn build_pypi_proxy_cache_path(normalized_project: &str, filename: &str) -> String {
-    format!("simple/{}/{}", normalized_project, filename)
+/// Build the stable proxy-cache key for a proxied PyPI distribution.
+///
+/// Takes a [`NormalizedProjectName`], not a `&str` (#3186): the cache key is a
+/// *name-keyed* store, so if this could be called with a raw segment then two
+/// spellings of one request could address two different cache entries -- or,
+/// worse, one spelling could address the entry another package's bytes were
+/// written under. The newtype makes that unrepresentable.
+fn build_pypi_proxy_cache_path(project: &NormalizedProjectName, filename: &str) -> String {
+    format!("simple/{}/{}", project.as_str(), filename)
 }
 
 /// Apply the age-gate listing filter to a rewritten PEP 691 JSON simple
@@ -2176,7 +2283,7 @@ async fn enforce_pypi_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
     repo_key: &str,
-    project: &str,
+    project: &NormalizedProjectName,
     filename: &str,
 ) -> Result<Option<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
@@ -2184,13 +2291,16 @@ async fn enforce_pypi_download_age_gate(
         _ => return Ok(None),
     };
 
-    let lkg_filename = match apply_pypi_download_age_gate(state, repo, project, filename).await? {
-        Some(lkg) => lkg,
-        None => return Ok(None),
-    };
+    let lkg_filename =
+        match apply_pypi_download_age_gate(state, repo, project.as_str(), filename).await? {
+            Some(lkg) => lkg,
+            None => return Ok(None),
+        };
 
-    let normalized = PypiHandler::normalize_name(project);
-    let lkg_cache_path = build_pypi_proxy_cache_path(&normalized, &lkg_filename);
+    // The gate above and this cache key are now the SAME string by
+    // construction (#3186); they used to be `project` and
+    // `PypiHandler::normalize_name(project)` respectively.
+    let lkg_cache_path = build_pypi_proxy_cache_path(project, &lkg_filename);
     // #1555 ordering holds on the LKG fallback too: presigned redirect on a
     // fresh cache hit BEFORE the streaming cache check, so a cached LKG wheel is
     // not streamed through the backend.
@@ -2237,11 +2347,17 @@ async fn enforce_pypi_download_age_gate(
 /// into a '-'. Passing the raw segment therefore let a client check one name
 /// and download another. Not having the raw name in scope is what stops that
 /// from being reintroduced.
+/// `project` is a [`NormalizedProjectName`] (#3186). Every gate on this path --
+/// the PEP 708 dependency-confusion isolation, the per-member curation gate,
+/// the download age gate and the inline scan gate -- keys on the PEP 503 form,
+/// while the upstream fetch and the proxy-cache key are built from the same
+/// value. Because the parameter is not a `&str`, "gate one name, fetch another"
+/// is no longer expressible here.
 async fn serve_file(
     state: &SharedState,
     repo: &RepoInfo,
     repo_key: &str,
-    normalized_project: &str,
+    project: &NormalizedProjectName,
     filename: &str,
     auth: Option<&AuthExtension>,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
@@ -2274,14 +2390,9 @@ async fn serve_file(
                     // Enforce the download age gate before any proxy fetch, and
                     // serve the last-known-good wheel if the requested version is
                     // withheld. Shared with the local-`artifacts`-hit branch below.
-                    if let Some(resp) = enforce_pypi_download_age_gate(
-                        state,
-                        repo,
-                        repo_key,
-                        normalized_project,
-                        filename,
-                    )
-                    .await?
+                    if let Some(resp) =
+                        enforce_pypi_download_age_gate(state, repo, repo_key, project, filename)
+                            .await?
                     {
                         return Ok(resp);
                     }
@@ -2312,7 +2423,7 @@ async fn serve_file(
                             repo.id,
                             repo_key,
                             upstream_url,
-                            normalized_project,
+                            project,
                             filename,
                             action,
                             ctx,
@@ -2326,11 +2437,10 @@ async fn serve_file(
                     // already cached from a previous request. Streamed straight
                     // from storage (#895): buffering cached multi-hundred-MiB
                     // wheels per request OOM-killed memory-constrained pods.
-                    // Already PEP 503 normalized by the caller;
-                    // `PypiHandler::normalize_name` is the identity on that
-                    // form, so this is the same cache key it always was.
-                    let local_cache_path =
-                        build_pypi_proxy_cache_path(normalized_project, filename);
+                    // `project` is already canonical, so this is the same
+                    // cache key it always was for a well-formed name -- but it
+                    // can no longer be a DIFFERENT one for a malformed name.
+                    let local_cache_path = build_pypi_proxy_cache_path(project, filename);
 
                     // #1555: redirect to a presigned URL on a fresh cache hit
                     // before falling back to streaming.
@@ -2372,7 +2482,7 @@ async fn serve_file(
                         repo.id,
                         repo_key,
                         upstream_url,
-                        normalized_project,
+                        project,
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
@@ -2446,12 +2556,9 @@ async fn serve_file(
                 // member at equal or higher priority than the owning local
                 // still serves, mirroring the simple-index decision above so
                 // every version the index lists is downloadable.
-                let owning_local_min_priority = proxy_helpers::pypi_virtual_isolates_name(
-                    &state.db,
-                    repo.id,
-                    normalized_project,
-                )
-                .await?;
+                let owning_local_min_priority =
+                    proxy_helpers::pypi_virtual_isolates_name(&state.db, repo.id, project.as_str())
+                        .await?;
                 let member_priorities = if owning_local_min_priority.is_some() {
                     proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?
                 } else {
@@ -2467,7 +2574,7 @@ async fn serve_file(
                 // symmetric: every distribution the index lists is downloadable
                 // and every one it hides 404s here.
                 let owned_profile = if owning_local_min_priority.is_some() {
-                    pypi_owned_wheel_profile(&state.db, &members, normalized_project).await
+                    pypi_owned_wheel_profile(&state.db, &members, project.as_str()).await
                 } else {
                     OwnedWheelProfile::default()
                 };
@@ -2492,7 +2599,7 @@ async fn serve_file(
                     if enforce_pypi_curation(
                         state,
                         &member_info,
-                        normalized_project,
+                        project.as_str(),
                         version_from_pypi_filename(filename).as_deref(),
                     )
                     .await
@@ -2505,7 +2612,7 @@ async fn serve_file(
                         state,
                         &member_info,
                         &member.key,
-                        normalized_project,
+                        project,
                         filename,
                     )
                     .await?
@@ -2594,7 +2701,7 @@ async fn serve_file(
                                     member.id,
                                     &member.key,
                                     upstream_url,
-                                    normalized_project,
+                                    project,
                                     filename,
                                     action,
                                     ctx,
@@ -2623,12 +2730,8 @@ async fn serve_file(
                             // direct Remote path). This avoids re-fetching the
                             // simple index from upstream when the file is already
                             // cached from a previous request through this member.
-                            // Already PEP 503 normalized by the caller;
-                            // `PypiHandler::normalize_name` is the identity on
-                            // that form, so this is the same cache key it
-                            // always was for a well-formed name.
-                            let local_cache_path =
-                                build_pypi_proxy_cache_path(normalized_project, filename);
+                            // Already canonical; see the direct-remote arm.
+                            let local_cache_path = build_pypi_proxy_cache_path(project, filename);
 
                             // #1555: redirect to a presigned URL on a fresh
                             // cache hit before falling back to streaming.
@@ -2663,7 +2766,7 @@ async fn serve_file(
                                 member.id,
                                 &member.key,
                                 upstream_url,
-                                normalized_project,
+                                project,
                                 filename,
                                 &member_index_path,
                                 member.format.clone(),
@@ -2703,8 +2806,7 @@ async fn serve_file(
     // young local artifact.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(resp) =
-            enforce_pypi_download_age_gate(state, repo, repo_key, normalized_project, filename)
-                .await?
+            enforce_pypi_download_age_gate(state, repo, repo_key, project, filename).await?
         {
             return Ok(resp);
         }
@@ -2736,7 +2838,7 @@ async fn serve_file(
                         repo.id,
                         repo_key,
                         upstream_url,
-                        normalized_project,
+                        project,
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
@@ -2945,16 +3047,27 @@ struct PypiRemoteFetchTarget {
 /// The index fetch stays buffered by design: simple-index pages are small
 /// HTML documents that must be parsed in-process. Only the package file
 /// itself (potentially hundreds of MiB) needs the streaming path.
+///
+/// `project` is a [`NormalizedProjectName`], not a `&str` (#3186). This is the
+/// single place a route-derived project name becomes an OUTBOUND upstream URL,
+/// so it is the exact boundary the newtype exists to guard: the gates upstream
+/// of here key on the PEP 503 form, and a raw segment reaching this function
+/// re-normalized differently is what produced #3077, #3179 and #3183. A `&str`
+/// no longer compiles here, so a fourth path cannot reintroduce it.
 async fn resolve_pypi_remote_fetch_target(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
     upstream_url: &str,
-    project: &str,
+    project: &NormalizedProjectName,
     filename: &str,
     index_path: &str,
 ) -> Result<PypiRemoteFetchTarget, Response> {
-    let normalized = PypiHandler::normalize_name(project);
+    // `PypiHandler::normalize_name` is the identity on canonical input (see
+    // `pypi_name::tests::legacy_fetch_normalizer_is_identity_on_canonical_form`),
+    // so this is retained only to keep the produced URLs byte-identical to what
+    // they were before, and can be dropped once nothing else calls it.
+    let normalized = PypiHandler::normalize_name(project.as_str());
 
     // Build the upstream index URL using the configured index_path.
     // When `index_path` is "simple" (the default), the existing /simple-dedup
@@ -3087,7 +3200,7 @@ async fn fetch_from_pypi_remote_streaming(
     repo_id: uuid::Uuid,
     repo_key: &str,
     upstream_url: &str,
-    project: &str,
+    project: &NormalizedProjectName,
     filename: &str,
     index_path: &str,
     format: RepositoryFormat,
@@ -3258,7 +3371,7 @@ async fn serve_scanned_pypi_file(
     repo_id: uuid::Uuid,
     repo_key: &str,
     upstream_url: &str,
-    project: &str,
+    project: &NormalizedProjectName,
     filename: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
@@ -3364,7 +3477,11 @@ async fn serve_scanned_pypi_file(
         Some(version) => proxy_helpers::ProxyScanIdentity::Established(
             crate::services::scanner_service::ExpectedComponent::new(
                 crate::services::scanner_service::ComponentEcosystem::Python,
-                project,
+                // The canonical name. The scan gate grades a component by
+                // name+version, so before #3186 it could grade `acme sdk`
+                // while the fetch resolved `acme-sdk` -- the same divergence,
+                // in the component identity the verdict is keyed on.
+                project.as_str(),
                 &version,
             ),
         ),
@@ -4565,6 +4682,18 @@ mod tests {
     use crate::api::handlers::proxy_helpers::scan_blocked_response;
     use sha2::{Digest, Sha256};
 
+    /// Build a [`NormalizedProjectName`] for a test fixture (#3186).
+    ///
+    /// Panics on an invalid name on purpose: a fixture that cannot produce one
+    /// is not exercising a real request, because `download_or_metadata` and
+    /// `simple_project` reject such a segment with 404 before they ever reach
+    /// the function under test. The rejection itself is covered end-to-end by
+    /// the route-level tests, not here.
+    fn proj(name: &str) -> NormalizedProjectName {
+        NormalizedProjectName::parse(name)
+            .unwrap_or_else(|| panic!("test fixture project name is not PEP 508-valid: {name:?}"))
+    }
+
     #[test]
     fn metadata_filename_uses_distribution_version_for_curation() {
         let wheel = "demo-1.2.3-py3-none-any.whl";
@@ -4678,8 +4807,461 @@ mod tests {
     #[test]
     fn build_pypi_proxy_cache_path_format() {
         assert_eq!(
-            build_pypi_proxy_cache_path("requests", "requests-2.31.0.tar.gz"),
+            build_pypi_proxy_cache_path(&proj("requests"), "requests-2.31.0.tar.gz"),
             "simple/requests/requests-2.31.0.tar.gz"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3186 -- PEP 508 project-name validation at the routed edge
+    // -----------------------------------------------------------------------
+
+    /// The exact body `parse_project_segment` produces on rejection. Asserted
+    /// literally so a route test cannot confuse a validation 404 with an
+    /// ordinary "Package not found" / "File not found" 404 -- which is the
+    /// failure mode that would let an over-rejecting fix look like it passes.
+    const PROJECT_REJECTED_MESSAGE: &str = "Invalid project name";
+
+    /// PEP 508-valid names, weighted towards the unusual-but-legal.
+    ///
+    /// Over-rejection here does not break one request, it takes the entire
+    /// PyPI surface offline, so this list matters more than the rejection list.
+    fn valid_route_names() -> Vec<&'static str> {
+        vec![
+            "a",
+            "A",
+            "z",
+            "0",
+            "9",
+            "123",
+            "2024",
+            "ab",
+            "a1",
+            "1a",
+            "a-b",
+            "a_b",
+            "a.b",
+            "a.b-c_d",
+            "a__b",
+            "a--b",
+            "a._-b",
+            "MyPackage",
+            "Django",
+            "PyYAML",
+            "Jinja2",
+            "zope.interface",
+            "ruamel.yaml",
+            "backports.ssl_match_hostname",
+            "acme-sdk",
+            "requests",
+        ]
+    }
+
+    /// Names that fail `^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$`, paired with
+    /// their percent-encoded URI form so they can be sent over a real route.
+    fn invalid_route_names() -> Vec<(&'static str, &'static str)> {
+        vec![
+            // The motivating case (#3077 / #3179 / #3183): a space is where
+            // `normalize_pep503` ("acmesdk") and `PypiHandler::normalize_name`
+            // ("acme-sdk") disagree, so the gate and the fetch saw different
+            // packages.
+            ("acme sdk", "acme%20sdk"),
+            ("acme+sdk", "acme%2Bsdk"),
+            ("acme!sdk", "acme%21sdk"),
+            ("acme@sdk", "acme%40sdk"),
+            ("acme:sdk", "acme%3Asdk"),
+            ("acme#sdk", "acme%23sdk"),
+            // Leading / trailing separators: PEP 508 requires an alphanumeric
+            // at both ends.
+            ("_leading", "_leading"),
+            ("-leading", "-leading"),
+            (".leading", ".leading"),
+            ("trailing_", "trailing_"),
+            ("trailing-", "trailing-"),
+            ("trailing.", "trailing."),
+            ("-", "-"),
+            ("---", "---"),
+            // Non-ASCII, including the Kelvin sign that a `(?i)[A-Z]` class
+            // would have accepted under Unicode case folding.
+            ("acmeésdk", "acme%C3%A9sdk"),
+            ("acme\u{212A}sdk", "acme%E2%84%AAsdk"),
+            // A newline: Rust's `$` matches before a trailing newline, which is
+            // why the pattern is anchored with `\z`.
+            ("acme-sdk\n", "acme-sdk%0A"),
+            ("acme\tsdk", "acme%09sdk"),
+            // The stored-XSS payload `normalize_pep503`'s character dropping
+            // exists to neutralize. Rejecting it outright is strictly stronger
+            // than sanitizing it -- and the sanitizer is left untouched.
+            ("<script>", "%3Cscript%3E"),
+        ]
+    }
+
+    /// Pure, exhaustive over-rejection guard.
+    ///
+    /// Runs without a database so it can never be skipped, and covers far more
+    /// names than the route tests below can afford to.
+    #[test]
+    fn parse_project_segment_accepts_valid_and_rejects_invalid() {
+        for name in valid_route_names() {
+            let parsed = parse_project_segment(name);
+            assert!(
+                parsed.is_ok(),
+                "PEP 508-valid name must be accepted, got a rejection: {name:?}"
+            );
+        }
+
+        for (raw, _encoded) in invalid_route_names() {
+            match parse_project_segment(raw) {
+                Ok(accepted) => panic!(
+                    "PEP 508-invalid name {raw:?} was accepted and normalized to {accepted:?}"
+                ),
+                Err(response) => assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "rejection must be 404 (pypi.org has no route for an invalid name): {raw:?}"
+                ),
+            }
+        }
+    }
+
+    /// Validation must not change the answer for any name that HAS one: on the
+    /// PEP 508-valid domain the accepted form equals `normalize_pep503`, which
+    /// is what every existing gate keys on.
+    #[test]
+    fn accepted_names_normalize_exactly_as_the_gate_does() {
+        for name in valid_route_names() {
+            let accepted = parse_project_segment(name).expect("valid");
+            assert_eq!(
+                accepted.as_str(),
+                normalize_pep503(name),
+                "validation changed the canonical form of {name:?}"
+            );
+        }
+    }
+
+    /// Every PyPI route that takes a `:project` segment must reject a name that
+    /// is not a PEP 508 name, with 404, on all three shapes: the simple index,
+    /// the distribution download, and the PEP 658 `.metadata` resource.
+    #[tokio::test]
+    async fn pep508_invalid_project_segment_is_404_on_every_pypi_route() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let wheel = "pkg-1.0.0-py3-none-any.whl";
+        let mut failures: Vec<String> = Vec::new();
+
+        for (raw, encoded) in invalid_route_names() {
+            for (route, uri) in [
+                (
+                    "simple index",
+                    format!("/{}/simple/{encoded}/", fx.repo_key),
+                ),
+                (
+                    "download",
+                    format!("/{}/simple/{encoded}/{wheel}", fx.repo_key),
+                ),
+                (
+                    "PEP 658 metadata",
+                    format!("/{}/simple/{encoded}/{wheel}.metadata", fx.repo_key),
+                ),
+            ] {
+                let app = fx.router_with_auth(super::router());
+                let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+                let body = String::from_utf8_lossy(&body).into_owned();
+
+                if status != StatusCode::NOT_FOUND {
+                    failures.push(format!(
+                        "{route} {uri} (name {raw:?}): expected 404, got {status}; body {body}"
+                    ));
+                } else if !body.contains(PROJECT_REJECTED_MESSAGE) {
+                    // A 404 alone is not proof: an unknown-but-valid package
+                    // also 404s on these routes. The rejection message is what
+                    // shows validation -- not a lookup miss -- produced it.
+                    failures.push(format!(
+                        "{route} {uri} (name {raw:?}): 404 but not from validation; body {body}"
+                    ));
+                }
+            }
+        }
+
+        fx.teardown().await;
+
+        assert!(
+            failures.is_empty(),
+            "PEP 508-invalid project segments were not rejected:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Groups of PEP 508-valid spellings that PEP 503 says name the SAME
+    /// project, keyed by their canonical form.
+    ///
+    /// One upload per group, then a read back under every spelling in it. That
+    /// covers acceptance (no spelling is rejected) and correctness (every
+    /// spelling resolves to the one project) in a single pass, and it makes the
+    /// case-folding and separator-collapsing rules of PEP 503 executable rather
+    /// than asserted only against a helper.
+    fn valid_name_groups() -> Vec<(&'static str, Vec<&'static str>)> {
+        vec![
+            // Single character: the first branch of the PEP 508 alternation,
+            // and the shape an off-by-one in the pattern breaks first.
+            ("a", vec!["a", "A"]),
+            ("z", vec!["z", "Z"]),
+            // Digits only.
+            ("0", vec!["0"]),
+            ("123", vec!["123"]),
+            ("2024", vec!["2024"]),
+            // Two characters: the second branch with an empty middle.
+            ("ab", vec!["ab", "AB", "Ab"]),
+            ("a1", vec!["a1"]),
+            ("1a", vec!["1a"]),
+            // Every separator, and every run of separators, collapses to one
+            // '-' per PEP 503's `re.sub(r"[-_.]+", "-", name)`.
+            (
+                "a-b",
+                vec!["a-b", "a_b", "a.b", "a__b", "a--b", "a._-b", "A-B"],
+            ),
+            ("a-b-c-d", vec!["a.b-c_d", "a-b-c-d", "A.B-C_D"]),
+            // Mixed case lowercases.
+            ("mypackage", vec!["MyPackage", "mypackage", "MYPACKAGE"]),
+            ("django", vec!["Django"]),
+            ("pyyaml", vec!["PyYAML"]),
+            ("jinja2", vec!["Jinja2"]),
+            // Real-world dotted names.
+            ("zope-interface", vec!["zope.interface", "zope-interface"]),
+            ("ruamel-yaml", vec!["ruamel.yaml"]),
+            (
+                "backports-ssl-match-hostname",
+                vec!["backports.ssl_match_hostname"],
+            ),
+            ("acme-sdk", vec!["acme-sdk", "acme_sdk", "ACME-SDK"]),
+            ("requests", vec!["requests"]),
+        ]
+    }
+
+    /// The positive control, and the one that matters more than the rejection
+    /// tests: a name that IS a PEP 508 name must still work end to end.
+    ///
+    /// This deliberately does NOT settle for "did not return the validation
+    /// 404". It uploads a real distribution under each name and reads it back
+    /// from the simple index, so the assertion is a 200 that LISTS THE WHEEL --
+    /// something an over-rejecting validator cannot produce, and something a
+    /// wrongly-normalizing one cannot produce either.
+    ///
+    /// An earlier revision asserted "an unknown valid project returns 200 with
+    /// an empty index". That was simply false -- a local repo 404s "Package not
+    /// found" for an absent project -- and the test caught it. Recorded because
+    /// the false version would have passed while proving nothing.
+    #[tokio::test]
+    async fn valid_project_names_round_trip_upload_to_index() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+
+        for (canonical, spellings) in valid_name_groups() {
+            let upload_name = spellings[0];
+            // Wheel filenames use '_' where the project name uses a separator.
+            let filename = format!(
+                "{}-1.0.0-py3-none-any.whl",
+                upload_name.replace(['.', '-'], "_")
+            );
+            let (content_type, body) = pypi_upload_multipart(
+                upload_name,
+                "1.0.0",
+                &filename,
+                b"fake-wheel-bytes",
+                "pep508 positive control",
+                ">=3.8",
+            );
+            let app = fx.router_with_auth(super::router());
+            let (upload_status, upload_body) = tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            )
+            .await;
+            if upload_status != StatusCode::OK {
+                failures.push(format!(
+                    "upload of valid name {upload_name:?} failed with {upload_status}; body {}",
+                    String::from_utf8_lossy(&upload_body)
+                ));
+                continue;
+            }
+
+            for spelling in &spellings {
+                let uri = format!("/{}/simple/{spelling}/", fx.repo_key);
+                let app = fx.router_with_auth(super::router());
+                let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+                let body = String::from_utf8_lossy(&body).into_owned();
+                if status != StatusCode::OK {
+                    failures.push(format!(
+                        "index {uri}: spelling {spelling:?} of canonical {canonical:?} \
+                         must serve 200, got {status}; body {body}"
+                    ));
+                } else if !body.contains(&filename) {
+                    failures.push(format!(
+                        "index {uri}: spelling {spelling:?} served 200 but did not list \
+                         {filename} -- it resolved to the wrong project; body {body}"
+                    ));
+                }
+            }
+        }
+
+        fx.teardown().await;
+
+        assert!(
+            failures.is_empty(),
+            "PEP 508-valid project names did not work -- over-rejection here breaks \
+             all real pip traffic:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// The download and PEP 658 metadata routes 404 for an absent file whether
+    /// or not validation ran, so they get their own targeted assertion: a valid
+    /// name must never produce the *validation* 404 on either of them.
+    #[tokio::test]
+    async fn valid_names_are_not_rejected_on_download_or_metadata_routes() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let wheel = "pkg-1.0.0-py3-none-any.whl";
+        let mut failures: Vec<String> = Vec::new();
+
+        for (_canonical, spellings) in valid_name_groups() {
+            for name in spellings {
+                for (route, uri) in [
+                    (
+                        "download",
+                        format!("/{}/simple/{name}/{wheel}", fx.repo_key),
+                    ),
+                    (
+                        "PEP 658 metadata",
+                        format!("/{}/simple/{name}/{wheel}.metadata", fx.repo_key),
+                    ),
+                ] {
+                    let app = fx.router_with_auth(super::router());
+                    let (_status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+                    let body = String::from_utf8_lossy(&body).into_owned();
+                    if body.contains(PROJECT_REJECTED_MESSAGE) {
+                        failures.push(format!(
+                            "{route} {uri}: valid name {name:?} was rejected by name validation"
+                        ));
+                    }
+                }
+            }
+        }
+
+        fx.teardown().await;
+
+        assert!(
+            failures.is_empty(),
+            "PEP 508-valid names were rejected on a serve route:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Rejection must happen BEFORE any upstream fetch, not merely before the
+    /// response is written.
+    ///
+    /// Differential, so it cannot pass vacuously: the same mock upstream is hit
+    /// with a valid name and an invalid one. The valid name must reach it (which
+    /// proves the proxy wiring is live) and the invalid name must not (which
+    /// proves validation short-circuits ahead of the fetch). Without the
+    /// control, "upstream saw nothing" would also be satisfied by a broken
+    /// fixture.
+    #[tokio::test]
+    async fn invalid_project_segment_never_reaches_the_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point the fixture repo at the mock upstream");
+
+        let proxy = tdh::build_proxy_service_with_fs(
+            fx.pool.clone(),
+            fx.storage_dir.to_str().expect("storage dir"),
+        );
+        let state = tdh::build_state_with_proxy(
+            fx.pool.clone(),
+            fx.storage_dir.to_str().expect("storage dir"),
+            proxy,
+        );
+
+        let wheel = "pkg-1.0.0-py3-none-any.whl";
+
+        // Invalid name first, so the count below cannot be polluted by the
+        // control request.
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (invalid_status, invalid_body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/simple/acme%20sdk/{wheel}", fx.repo_key)),
+        )
+        .await;
+        let after_invalid = upstream
+            .received_requests()
+            .await
+            .expect("mock upstream records requests")
+            .len();
+
+        // Control: a valid name on the same repo MUST reach the upstream.
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (_control_status, _control_body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/simple/acme-sdk/{wheel}", fx.repo_key)),
+        )
+        .await;
+        let after_control = upstream
+            .received_requests()
+            .await
+            .expect("mock upstream records requests")
+            .len();
+
+        fx.teardown().await;
+
+        assert_eq!(
+            invalid_status,
+            StatusCode::NOT_FOUND,
+            "invalid name must 404; body: {}",
+            String::from_utf8_lossy(&invalid_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&invalid_body).contains(PROJECT_REJECTED_MESSAGE),
+            "the 404 must come from name validation; body: {}",
+            String::from_utf8_lossy(&invalid_body)
+        );
+        assert_eq!(
+            after_invalid, 0,
+            "an invalid project name made {after_invalid} upstream request(s); \
+             validation must short-circuit before ANY fetch"
+        );
+        assert!(
+            after_control > 0,
+            "control failed: a VALID name made no upstream request either, so the \
+             zero-request assertion above proves nothing"
         );
     }
 
@@ -6973,7 +7555,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -7132,7 +7714,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -7349,7 +7931,7 @@ mod tests {
             &state,
             &virtual_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -7410,7 +7992,7 @@ mod tests {
             &state,
             &virtual_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -7463,7 +8045,7 @@ mod tests {
             &state,
             &virtual_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -9420,7 +10002,7 @@ mod tests {
             repo_id,
             "pypi-remote",
             &server.uri(),
-            "numpy",
+            &proj("numpy"),
             "numpy-2.0.0-py3-none-any.whl",
             "simple",
             RepositoryFormat::Pypi,
@@ -11514,7 +12096,7 @@ mod tests {
             &state,
             &virtual_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -11587,7 +12169,7 @@ mod tests {
             &state,
             &virtual_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -11639,7 +12221,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -11687,7 +12269,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -11777,7 +12359,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -11864,7 +12446,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -11994,7 +12576,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -12078,7 +12660,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -12169,7 +12751,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -12254,7 +12836,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
@@ -12340,7 +12922,7 @@ mod tests {
             &state,
             &repo_info,
             &fx.repo_key,
-            project,
+            &proj(project),
             filename,
             None,
             &Default::default(),
