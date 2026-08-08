@@ -1494,6 +1494,57 @@ pub async fn rewire_remote_proxy(
 /// jscpd duplication gate scores changed files). The payload is deliberately
 /// repetitive so gzip actually shrinks it: the caller asserts `coded != plain`,
 /// without which a "forwarding" test could pass while proving nothing.
+/// Build a body coded with `encoding`, returning `(plain, coded)`.
+///
+/// Exists because every #3149 fixture was gzip and every assertion was
+/// `== Some("gzip")`, so replacing the forwarded value with a hardcoded
+/// `"gzip"` literal left all fourteen tests green -- the builders were pinned
+/// to "some coding is declared", not to "the UPSTREAM's coding is declared".
+/// That is not academic: `http_client.rs` documents that S3 returns a stored
+/// `Content-Encoding` regardless of the request, and S3 commonly stores `br`.
+/// A brotli-stored wheel labelled `gzip` makes pip raise `DecodeError`
+/// mid-stream, which is strictly worse than the bug being fixed.
+///
+/// Use a NON-gzip coding in at least one test per builder.
+pub fn coded_fixture(encoding: &str, seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    use flate2::write::{DeflateEncoder, GzEncoder};
+    use flate2::Compression;
+    use std::io::Write;
+
+    let plain = seed.repeat(64);
+    let coded = match encoding {
+        "gzip" => {
+            let mut e = GzEncoder::new(Vec::new(), Compression::default());
+            e.write_all(&plain).expect("gzip encode");
+            e.finish().expect("gzip finish")
+        }
+        "deflate" => {
+            let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
+            e.write_all(&plain).expect("deflate encode");
+            e.finish().expect("deflate finish")
+        }
+        other => panic!("unsupported test coding {other}"),
+    };
+    assert_ne!(
+        coded, plain,
+        "fixture must actually be coded or the test proves nothing"
+    );
+    (plain, coded)
+}
+
+/// Decode a `deflate` body, so a test can assert the client receives BYTES it
+/// can actually decode rather than only that a header is present.
+pub fn inflate_deflate(coded: &[u8]) -> Vec<u8> {
+    use flate2::read::DeflateDecoder;
+    use std::io::Read;
+
+    let mut out = Vec::new();
+    DeflateDecoder::new(coded)
+        .read_to_end(&mut out)
+        .expect("body must be decodable with the coding it declares");
+    out
+}
+
 pub fn gzip_fixture(seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
     use flate2::write::GzEncoder;
     use flate2::Compression;

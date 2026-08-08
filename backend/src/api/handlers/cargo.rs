@@ -3922,14 +3922,15 @@ mod index_content_encoding_tests {
         let Some(fx) = tdh::Fixture::setup("remote", "cargo").await else {
             return;
         };
-        let (_plain, coded) = tdh::gzip_fixture(b"{\"name\":\"serde\",\"vers\":\"1.0.0\"}\n");
+        let (_plain, coded) =
+            tdh::coded_fixture("deflate", b"{\"name\":\"serde\",\"vers\":\"1.0.0\"}\n");
 
         let server = MockServer::start().await;
         Mock::given(wm_method("GET"))
             .and(wm_path("/se/rd/serde"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-encoding", "deflate")
                     .insert_header("content-type", "application/json")
                     .set_body_bytes(coded.clone()),
             )
@@ -3957,7 +3958,7 @@ mod index_content_encoding_tests {
             assert_eq!(*status, StatusCode::OK, "request {i} must succeed");
             assert_eq!(
                 encoding.as_deref(),
-                Some("gzip"),
+                Some("deflate"),
                 "request {i}: the coded sparse index must be declared -- \
                  request 1 is the fresh fetch, request 2 proves the coded body \
                  was not memoized undeclared (#3149)",

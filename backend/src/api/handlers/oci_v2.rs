@@ -26514,16 +26514,16 @@ mod content_encoding_forwarding_tests {
     /// and the virtual-member blob GET, so it is the regression point for both.
     #[tokio::test]
     async fn test_oci_streaming_blob_response_forwards_content_encoding() {
-        let (_plain, coded) = tdh::gzip_fixture(b"oci layer payload. ");
+        let (_plain, coded) = tdh::coded_fixture("deflate", b"oci layer payload. ");
         let digest = "sha256:deadbeef";
         let resp = super::build_oci_streaming_proxy_response(
-            stream_result(coded.clone(), Some("gzip")),
+            stream_result(coded.clone(), Some("deflate")),
             digest,
             "application/octet-stream",
         );
         assert_eq!(
             tdh::header_str(resp.headers(), CONTENT_ENCODING).as_deref(),
-            Some("gzip"),
+            Some("deflate"),
             "an undeclared coded layer cannot be inflated, so its digest can \
              never match Docker-Content-Digest (#3149)",
         );

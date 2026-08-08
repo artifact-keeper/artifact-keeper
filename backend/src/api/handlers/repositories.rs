@@ -21489,9 +21489,9 @@ mod content_encoding_forwarding_tests {
     /// `download_artifact` (GET) — the virtual artifact download arm.
     #[tokio::test]
     async fn test_virtual_download_artifact_forwards_upstream_content_encoding() {
-        let (_plain, coded) = tdh::gzip_fixture(b"generic virtual artifact payload. ");
+        let (_plain, coded) = tdh::coded_fixture("deflate", b"generic virtual artifact payload. ");
         let Some((fx, state, member_id, _server, _dir)) =
-            coded_virtual_fixture("blobs/thing.bin", coded.clone(), Some("gzip")).await
+            coded_virtual_fixture("blobs/thing.bin", coded.clone(), Some("deflate")).await
         else {
             return;
         };
@@ -21518,7 +21518,7 @@ mod content_encoding_forwarding_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             tdh::header_str(&headers, header::CONTENT_ENCODING).as_deref(),
-            Some("gzip"),
+            Some("deflate"),
             "the virtual generic download must forward the member's upstream \
              coding, or the client saves bytes it cannot inflate (#3149)",
         );
