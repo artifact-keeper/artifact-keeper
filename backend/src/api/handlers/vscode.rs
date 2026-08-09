@@ -120,6 +120,20 @@ struct GalleryAssetQuery {
     target_platform: Option<String>,
 }
 
+struct GalleryAssetCoordinate<'a> {
+    repo_key: &'a str,
+    publisher: &'a str,
+    name: &'a str,
+    version: &'a str,
+    target_platform: &'a str,
+}
+
+struct GalleryAssetSource<'a> {
+    upstream_url: &'a str,
+    cache_path: &'a str,
+    default_content_type: &'a str,
+}
+
 /// Parsed gallery metadata plus the reservation that covers the simultaneous
 /// wire buffer, parsed JSON, and serialized AK response. Keep the permit until
 /// the handler has rewritten and serialized the response, not merely until the
@@ -440,8 +454,10 @@ async fn fetch_gallery_query(
             upstream_url,
             "extensionquery",
             body,
-            GALLERY_METADATA_MAX_BYTES,
-            GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
+            proxy_helpers::MetadataWorkingSetLimits {
+                max_bytes: GALLERY_METADATA_MAX_BYTES,
+                reservation_bytes: GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
+            },
         )
         .await?;
     let response: serde_json::Value = serde_json::from_slice(&content).map_err(|_| {
@@ -463,40 +479,33 @@ async fn fetch_gallery_query(
     })
 }
 
-fn gallery_extension_identity(
-    extension: &serde_json::Value,
-) -> Result<(String, String, String), Response> {
+fn gallery_extension_identity(extension: &serde_json::Value) -> Option<(String, String, String)> {
     let publisher = extension
         .get("publisher")
         .and_then(|publisher| publisher.get("publisherName"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(invalid_gallery_response)?;
+        .and_then(serde_json::Value::as_str)?;
     let name = extension
         .get("extensionName")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(invalid_gallery_response)?;
-    validate_gallery_response_segment(publisher)?;
-    validate_gallery_response_segment(name)?;
-    Ok((
+        .and_then(serde_json::Value::as_str)?;
+    validate_gallery_response_segment(publisher).ok()?;
+    validate_gallery_response_segment(name).ok()?;
+    Some((
         publisher.to_string(),
         name.to_string(),
         vscode_age_gate_package(publisher, name),
     ))
 }
 
-fn gallery_version_coordinate(version: &serde_json::Value) -> Result<String, Response> {
-    let name = version
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(invalid_gallery_response)?;
+fn gallery_version_coordinate(version: &serde_json::Value) -> Option<String> {
+    let name = version.get("version").and_then(serde_json::Value::as_str)?;
     let platform = normal_target_platform(
         version
             .get("targetPlatform")
             .and_then(serde_json::Value::as_str),
     );
-    validate_gallery_response_segment(name)?;
-    validate_gallery_response_segment(platform)?;
-    Ok(vscode_age_gate_version(name, Some(platform)))
+    validate_gallery_response_segment(name).ok()?;
+    validate_gallery_response_segment(platform).ok()?;
+    Some(vscode_age_gate_version(name, Some(platform)))
 }
 
 /// Reconcile the gallery's per-result count after age-gate filtering. Gallery
@@ -569,7 +578,8 @@ async fn filter_gallery_response_age_gate(
             .ok_or_else(invalid_gallery_response)?;
         let extension_count_before = extensions.len();
         for extension in extensions.iter_mut() {
-            let (_, _, package) = gallery_extension_identity(extension)?;
+            let (_, _, package) =
+                gallery_extension_identity(extension).ok_or_else(invalid_gallery_response)?;
             let versions = extension
                 .get_mut("versions")
                 .and_then(serde_json::Value::as_array_mut)
@@ -578,7 +588,7 @@ async fn filter_gallery_response_age_gate(
                 .iter()
                 .map(|version| {
                     Ok((
-                        gallery_version_coordinate(version)?,
+                        gallery_version_coordinate(version).ok_or_else(invalid_gallery_response)?,
                         gallery_last_updated(version),
                     ))
                 })
@@ -593,7 +603,7 @@ async fn filter_gallery_response_age_gate(
                 *versions = original
                     .into_iter()
                     .filter_map(|version| {
-                        let coordinate = gallery_version_coordinate(&version).ok()?;
+                        let coordinate = gallery_version_coordinate(&version)?;
                         (!blocked.contains(&coordinate)).then_some(version)
                     })
                     .collect();
@@ -883,19 +893,19 @@ async fn gallery_vspackage(
         upstream_url.trim_end_matches('/'),
         upstream_path.trim_start_matches('/'),
     );
-    proxy_gallery_asset(
-        &state,
-        &repo,
-        &repo_key,
-        &publisher,
-        &name,
-        &version,
+    let coordinate = GalleryAssetCoordinate {
+        repo_key: &repo_key,
+        publisher: &publisher,
+        name: &name,
+        version: &version,
         target_platform,
-        &upstream_asset_url,
-        &cache_path,
-        "application/vsix",
-    )
-    .await
+    };
+    let source = GalleryAssetSource {
+        upstream_url: &upstream_asset_url,
+        cache_path: &cache_path,
+        default_content_type: "application/vsix",
+    };
+    proxy_gallery_asset(&state, &repo, &coordinate, &source).await
 }
 
 async fn gallery_asset(
@@ -937,32 +947,26 @@ async fn gallery_asset(
         urlencoding::encode(target_platform),
         Sha256::digest(asset_type.as_bytes()),
     );
-    proxy_gallery_asset(
-        &state,
-        &repo,
-        &repo_key,
-        &publisher,
-        &name,
-        &version,
+    let coordinate = GalleryAssetCoordinate {
+        repo_key: &repo_key,
+        publisher: &publisher,
+        name: &name,
+        version: &version,
         target_platform,
-        &upstream_url,
-        &cache_path,
-        "application/octet-stream",
-    )
-    .await
+    };
+    let source = GalleryAssetSource {
+        upstream_url: &upstream_url,
+        cache_path: &cache_path,
+        default_content_type: "application/octet-stream",
+    };
+    proxy_gallery_asset(&state, &repo, &coordinate, &source).await
 }
 
 async fn proxy_gallery_asset(
     state: &SharedState,
     repo: &RepoInfo,
-    repo_key: &str,
-    publisher: &str,
-    name: &str,
-    version: &str,
-    target_platform: &str,
-    upstream_url: &str,
-    cache_path: &str,
-    default_content_type: &str,
+    coordinate: &GalleryAssetCoordinate<'_>,
+    source: &GalleryAssetSource<'_>,
 ) -> Result<Response, Response> {
     // The raw exact-metadata query and shared gate run before ProxyService can
     // inspect its cache, so a direct AK asset URL or a warm cache entry never
@@ -970,11 +974,11 @@ async fn proxy_gallery_asset(
     enforce_gallery_age_gate(
         state,
         repo,
-        repo_key,
-        publisher,
-        name,
-        version,
-        target_platform,
+        coordinate.repo_key,
+        coordinate.publisher,
+        coordinate.name,
+        coordinate.version,
+        coordinate.target_platform,
     )
     .await?;
     let proxy = state.proxy_service.as_deref().ok_or_else(|| {
@@ -987,7 +991,7 @@ async fn proxy_gallery_asset(
     // Gallery metadata is never used as a fetch URL. Validate this derived
     // configured-adapter sibling anyway so a malformed remote URL gets a
     // controlled response before the shared SSRF-safe HTTP client is invoked.
-    validate_outbound_url(upstream_url, "VS Code gallery asset URL").map_err(|error| {
+    validate_outbound_url(source.upstream_url, "VS Code gallery asset URL").map_err(|error| {
         (
             StatusCode::BAD_GATEWAY,
             format!("Configured Open VSX gallery URL is disallowed: {error}"),
@@ -997,11 +1001,11 @@ async fn proxy_gallery_asset(
     proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
         proxy,
         repo.id,
-        repo_key,
-        upstream_url,
-        upstream_url,
-        cache_path,
-        default_content_type,
+        coordinate.repo_key,
+        source.upstream_url,
+        source.upstream_url,
+        source.cache_path,
+        source.default_content_type,
         RepositoryFormat::Vscode,
     )
     .await
@@ -1801,8 +1805,8 @@ mod tests {
         let (aged_status, aged_body) =
             tdh::send(tdh::router_anon(super::router(), state), query()).await;
         assert_eq!(aged_status, StatusCode::OK);
-        let versions = serde_json::from_slice::<serde_json::Value>(&aged_body).unwrap()["results"]
-            [0]["extensions"][0]["versions"]
+        let aged_json = serde_json::from_slice::<serde_json::Value>(&aged_body).unwrap();
+        let versions = aged_json["results"][0]["extensions"][0]["versions"]
             .as_array()
             .unwrap();
         assert_eq!(versions.len(), 1);
