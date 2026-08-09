@@ -1641,6 +1641,21 @@ mod tests {
         (state, cache)
     }
 
+    async fn rewire_remote_gallery(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        gallery_url: &str,
+    ) -> (SharedState, tempfile::TempDir) {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make Remote gallery repository public");
+
+        tdh::rewire_remote_proxy(fx, gallery_url).await
+    }
+
     fn gallery_extension_response(versions: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "results": [{
@@ -1909,7 +1924,7 @@ mod tests {
         sqlx::query(
             "UPDATE repositories
              SET upstream_url = 'https://open-vsx.example/vscode/gallery',
-                 age_gate_enabled = true, age_gate_mode = 'upstream_publish_time'
+                 is_public = true, age_gate_enabled = true, age_gate_mode = 'upstream_publish_time'
              WHERE id = $1",
         )
         .bind(fx.repo_id)
@@ -2144,7 +2159,7 @@ mod tests {
         // Gallery endpoints require a gallery-root upstream even though this
         // malformed body must be rejected before any upstream request.
         let gallery_root = format!("{}/vscode/gallery", server.uri());
-        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &gallery_root).await;
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
         let app = tdh::router_anon(super::router(), state);
         let (status, _) = tdh::send(
             app,
@@ -2260,7 +2275,7 @@ mod tests {
             .mount(&server)
             .await;
         let gallery_root = format!("{}/vscode/gallery", server.uri());
-        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &gallery_root).await;
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
 
         // Axum extracts a decoded Path<String>, not a raw URL segment. Pin all
         // representative escapes at router level so none can reach upstream URL
@@ -2378,7 +2393,7 @@ mod tests {
             .await;
 
         let gallery_root = format!("{}/vscode/gallery", server.uri());
-        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &gallery_root).await;
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
         let app = tdh::router_anon(super::router(), state.clone());
         let (status, body) = tdh::send(
             app,
@@ -2449,7 +2464,7 @@ mod tests {
             .mount(&server)
             .await;
         let gallery_root = format!("{}/vscode/gallery", server.uri());
-        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &gallery_root).await;
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
         let app = tdh::router_anon(super::router(), state);
         let (status, _) = tdh::send(
             app,
@@ -2502,7 +2517,7 @@ mod tests {
             .mount(&server)
             .await;
         let gallery_root = format!("{}/vscode/gallery", server.uri());
-        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &gallery_root).await;
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
         let app = tdh::router_anon(super::router(), state.clone());
         let (status, body) = tdh::send(
             app,
@@ -2565,7 +2580,7 @@ mod tests {
             .mount(&server)
             .await;
         let gallery_root = format!("{}/vscode/gallery", server.uri());
-        let (state, cache) = tdh::rewire_remote_proxy(&fx, &gallery_root).await;
+        let (state, cache) = rewire_remote_gallery(&fx, &gallery_root).await;
 
         let request = |platform: &str| {
             tdh::get(format!(
@@ -2624,7 +2639,7 @@ mod tests {
             .mount(&server)
             .await;
         let gallery_root = format!("{}/vscode/gallery", server.uri());
-        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &gallery_root).await;
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
         let (status, received) = tdh::send(
             tdh::router_anon(super::router(), state),
             tdh::get(format!(
