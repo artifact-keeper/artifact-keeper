@@ -1650,16 +1650,17 @@ impl StorageGcService {
                 }
             };
 
-            // Re-assert ownership AND liveness immediately before the
-            // destructive delete: earlier keys in this batch may have taken
-            // long enough that this row's claim lapsed and another replica's
-            // sweep now owns it, or that a concurrent push committed an
-            // `oci_blobs` row for this key and the object is live again
-            // (#3085). The row DELETE below re-checks liveness too, but it
-            // runs after the bytes are gone, so this is the check that
-            // prevents the data loss.
+            // PHASE 1 (#3187): re-assert ownership AND liveness and publish the
+            // `pending_delete_at` tombstone, atomically, before touching
+            // storage. Earlier keys in this batch may have taken long enough
+            // that this row's claim lapsed and another replica's sweep now owns
+            // it, or that a concurrent push committed an `oci_blobs` row for
+            // this key and the object is live again (#3085). The tombstone is
+            // what a racing push reads to know it must not commit; a push that
+            // beat us to the row lock has already deleted the row, so this
+            // matches nothing and we skip the delete.
             if !self
-                .hold_cleanup_key_claim_for_delete(&cleanup_key, CleanupSweepKind::Unreferenced)
+                .tombstone_cleanup_key_for_delete(&cleanup_key, CleanupSweepKind::Unreferenced)
                 .await
             {
                 tracing::info!(
@@ -1686,11 +1687,15 @@ impl StorageGcService {
                 }
             }
 
-            if let Err(e) = sqlx::query(
+            // PHASE 3 (#3187): reap the journal row. `pending_delete_at IS NOT
+            // NULL` ties this to the tombstone phase 1 published, so the row we
+            // remove is provably the one whose object we just deleted.
+            let reaped = sqlx::query(
                 r#"
                 DELETE FROM oci_upload_cleanup_keys
                 WHERE id = $1
                   AND claim_token = $2
+                  AND pending_delete_at IS NOT NULL
                   AND storage_write_completed_at IS NOT NULL
                   -- Intentionally NOT guarded by `s.id = upload_session_id`
                   -- (unlike the pending reaper): a committed cleanup key is a
@@ -1726,12 +1731,34 @@ impl StorageGcService {
             .bind(cleanup_key.id)
             .bind(cleanup_key.claim_token)
             .execute(&self.db)
-            .await
-            {
+            .await;
+
+            let reaped = match reaped {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format_gc_error(
+                        "delete OCI upload cleanup-key row",
+                        &cleanup_key.storage_key,
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            // #3187: a zero-row match used to be counted as a clean success —
+            // the sweep incremented both counters unconditionally — which is
+            // precisely how a lost race made itself invisible. Phase 1 proved
+            // this row was ours, tombstoned, and reclaimable, and the push side
+            // can no longer remove a live tombstone, so a miss here is a real
+            // anomaly: report it instead of banking it.
+            if reaped.rows_affected() != 1 {
                 let msg = format_gc_error(
-                    "delete OCI upload cleanup-key row",
+                    "reap OCI upload cleanup-key row",
                     &cleanup_key.storage_key,
-                    &e.to_string(),
+                    "tombstoned row vanished or stopped matching between the storage delete \
+                     and its reap; the object was deleted but its journal row was not",
                 );
                 tracing::warn!("{}", msg);
                 result.errors.push(msg);
@@ -1893,10 +1920,12 @@ impl StorageGcService {
         .await;
     }
 
-    /// Re-assert ownership **and liveness** for one cleanup key immediately
-    /// before its storage delete. Returns `true` only when the key is still
-    /// this sweeper's and still reclaimable; the caller must skip the
-    /// destructive delete otherwise.
+    /// **Phase 1 of the two-phase cleanup-key sweep (#3187).** Re-assert
+    /// ownership **and liveness** for one cleanup key and, in the same atomic
+    /// `UPDATE`, stamp `pending_delete_at` — the durable tombstone that tells
+    /// the push path this key's bytes are about to be destroyed. Returns `true`
+    /// only when the key is still this sweeper's, still reclaimable, and now
+    /// tombstoned; the caller must skip the destructive delete otherwise.
     ///
     /// Two independent things can change between the claim and the delete:
     ///
@@ -1907,71 +1936,65 @@ impl StorageGcService {
     ///    replica's sweep while this one is still walking its list, letting
     ///    both attempt the same destructive delete.
     /// 2. **Liveness (#3085).** A digest re-pushed after this row was claimed
-    ///    commits an `oci_blobs` row for the very same `storage_key` (the push
-    ///    path re-uses the journal row via `ON CONFLICT (storage_key)`), so
-    ///    the object is live again. The claim-time predicate is stale by then
-    ///    and the sweep's guarded row `DELETE` re-checks liveness only *after*
-    ///    the bytes are already gone — it saves the journal row, not the blob.
-    ///    Re-asserting the predicate here is the check that actually protects
-    ///    the data.
+    ///    commits an `oci_blobs` row for the very same `storage_key`, so the
+    ///    object is live again. The claim-time predicate is stale by then and
+    ///    the sweep's guarded row `DELETE` re-checks liveness only *after* the
+    ///    bytes are already gone — it saves the journal row, not the blob.
     ///
-    /// This re-check is deliberately *weaker* than the per-row re-check
-    /// [`is_blob_still_orphan`] performs before the two-phase blob GC's
-    /// destructive act, and the difference is the whole point of the caveat
-    /// below. `is_blob_still_orphan` runs inside an open transaction that took
-    /// `SELECT ... FOR UPDATE` on the `oci_blobs` row and *holds that lock
-    /// across the storage delete*, so a racing pusher blocks. This hook holds
-    /// nothing: it is a single autocommit `UPDATE` whose lock is gone before
-    /// the caller touches storage. Same predicate, different guarantee — do not
-    /// read the two as equivalent.
+    /// # Why the tombstone, and why this closes the window
     ///
-    /// The renewal and the re-check are one atomic `UPDATE`, so a row that has
-    /// become live cannot have its lease extended. `kind` selects the predicate
-    /// matching the calling sweep's own row `DELETE`.
+    /// #3158 performed the re-check here but nothing else, and was explicit
+    /// that this only *narrowed* the race: the `UPDATE` runs on the pool as a
+    /// single autocommit statement, so its row lock — on
+    /// `oci_upload_cleanup_keys`, never on `oci_blobs` — is released the
+    /// instant it commits, and the caller then deletes the object holding
+    /// nothing. A push committing its `oci_blobs` row inside that gap still
+    /// lost its bytes.
     ///
-    /// This NARROWS the window; it does not close it. Be precise about what is
-    /// and is not guaranteed here, because the difference decides whether
-    /// anyone finishes the job:
+    /// It cannot be fixed on this side alone. The blob GC one layer down gets
+    /// its guarantee from [`is_blob_still_orphan`] holding `SELECT ... FOR
+    /// UPDATE` on the *`oci_blobs` row* across the storage delete, which works
+    /// because a re-push of a marked blob `ON CONFLICT`s onto that existing
+    /// row and blocks. Here the racing push **INSERTs a new** `oci_blobs` row,
+    /// so there is no row to lock and `FOR UPDATE` on `oci_blobs` would lock
+    /// nothing. The only object both sides already touch is this journal row,
+    /// so the push has to participate — see
+    /// [`claim_cleanup_journal_row_for_blob_commit`], which is the other half
+    /// of this protocol and must be read with it.
     ///
-    /// The `UPDATE` runs on the pool as a single autocommit statement, so its
-    /// row lock — which is on `oci_upload_cleanup_keys`, never on `oci_blobs` —
-    /// is released the instant it commits. The caller then performs an
-    /// object-store `DELETE` with no lock held. A push that commits its
-    /// `oci_blobs` row inside that gap still has its bytes destroyed. Nothing
-    /// in the push path serializes against this: `register_oci_upload_cleanup_key`
-    /// is `ON CONFLICT (storage_key) DO NOTHING`, which against an already
-    /// claimed row is a complete no-op, and the push's success path calls
-    /// `clear_oci_upload_cleanup_key_best_effort` (`api/handlers/oci_v2.rs`), a
-    /// bare `DELETE ... WHERE storage_key = $1` with no `claim_token` guard —
-    /// so the push can remove the journal row out from under an in-flight
-    /// sweep. Nor is that interleaving observable: each sweep's guarded row
-    /// `DELETE` never inspects `rows_affected`, so a zero-row match is counted
-    /// as a clean success.
+    /// The two halves meet on this row's lock, and the tombstone is what makes
+    /// the meeting decisive in both orders:
     ///
-    /// What this buys is a large reduction, not a proof. Before the re-check,
-    /// liveness was evaluated once per batch in the candidate `SELECT`, so the
-    /// exposure spanned the entire batch walk — up to
-    /// `OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT` sequential object-store deletes,
-    /// which is minutes. It is now one storage round trip, order tens of
-    /// milliseconds.
+    /// * **Sweep first.** This `UPDATE` commits the tombstone. The push's
+    ///   `SELECT ... FOR UPDATE` then sees `pending_delete_at` set with a live
+    ///   claim and refuses to commit its `oci_blobs` row at all. The storage
+    ///   delete destroys bytes nothing references.
+    /// * **Push first.** The push holds `FOR UPDATE` on this row and deletes
+    ///   it inside the same transaction that inserts `oci_blobs`. This
+    ///   `UPDATE` blocks on that lock, and when it is released the row is
+    ///   gone — zero rows affected, `false`, and the caller skips the storage
+    ///   delete. The bytes survive.
     ///
-    /// Closing it properly requires the push and the sweep to serialize on the
-    /// journal row — an explicit transaction holding `SELECT ... FOR UPDATE`
-    /// across the storage delete, with the push taking the same row lock before
-    /// committing `oci_blobs` — or a two-phase tombstone, which this codebase
-    /// already implements for blob GC via `oci_blobs.pending_delete_at`
-    /// (migration 141, `run_blob_gc_mark` / `run_blob_gc_sweep`).
+    /// Neither side holds a lock across the object-store call, which is the
+    /// reason this shape was chosen over wrapping the storage delete in an
+    /// explicit `FOR UPDATE` transaction (see migration 194 for the cost
+    /// comparison).
     ///
-    /// Tracked in #3187. Until that lands, this remains a narrowed window, not
-    /// a closed one.
-    async fn hold_cleanup_key_claim_for_delete(
+    /// A tombstone is only binding while the claim that set it is live. A
+    /// sweep that crashes between phase 1 and phase 3 leaves one behind; it
+    /// lapses with `claim_expires_at` rather than dooming that digest forever,
+    /// and the push side treats an expired claim as no tombstone.
+    ///
+    /// `kind` selects the liveness predicate matching the calling sweep's own
+    /// row `DELETE`, so phase 1 and phase 3 agree on "still reclaimable".
+    async fn tombstone_cleanup_key_for_delete(
         &self,
         cleanup_key: &OciUploadCleanupKey,
         kind: CleanupSweepKind,
     ) -> bool {
         let sql = format!(
             "UPDATE oci_upload_cleanup_keys \
-             SET claim_expires_at = NOW() + {claim_ttl} \
+             SET claim_expires_at = NOW() + {claim_ttl}, pending_delete_at = NOW() \
              WHERE id = $1 AND claim_token = $2{liveness}",
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             liveness = kind.liveness_predicate_sql(),
@@ -1987,7 +2010,7 @@ impl StorageGcService {
                 tracing::warn!(
                     storage_key = %cleanup_key.storage_key,
                     error = %e,
-                    "failed to re-assert cleanup-key claim; skipping its storage delete"
+                    "failed to tombstone cleanup-key claim; skipping its storage delete"
                 );
                 false
             }
@@ -2053,14 +2076,14 @@ impl StorageGcService {
                 }
             };
 
-            // Same tail-expiry and same liveness window as the unreferenced
-            // sweep (#3085): re-assert ownership and the pending-key liveness
-            // predicate immediately before the destructive delete, so neither
-            // a lapsed claim nor a concurrent push that committed an
-            // `oci_blobs` row for this key can be followed by a delete of its
-            // bytes.
+            // PHASE 1 (#3187): same tail-expiry and same liveness window as the
+            // unreferenced sweep (#3085), and the same tombstone. Re-assert
+            // ownership and the pending-key liveness predicate and publish
+            // `pending_delete_at` atomically, so neither a lapsed claim nor a
+            // concurrent push that committed an `oci_blobs` row for this key
+            // can be followed by a delete of its bytes.
             if !self
-                .hold_cleanup_key_claim_for_delete(&cleanup_key, CleanupSweepKind::Pending)
+                .tombstone_cleanup_key_for_delete(&cleanup_key, CleanupSweepKind::Pending)
                 .await
             {
                 tracing::info!(
@@ -2095,11 +2118,14 @@ impl StorageGcService {
             // upload is still live is never reaped, even when the row's
             // storage_key is a part key that does not textually match the
             // session's storage_temp_key.
-            if let Err(e) = sqlx::query(
+            // PHASE 3 (#3187): see the unreferenced sweep. `pending_delete_at
+            // IS NOT NULL` ties the reap to the tombstone phase 1 published.
+            let reaped = sqlx::query(
                 r#"
                 DELETE FROM oci_upload_cleanup_keys
                 WHERE id = $1
                   AND claim_token = $2
+                  AND pending_delete_at IS NOT NULL
                   AND storage_write_completed_at IS NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM oci_upload_sessions s
@@ -2123,12 +2149,30 @@ impl StorageGcService {
             .bind(cleanup_key.id)
             .bind(cleanup_key.claim_token)
             .execute(&self.db)
-            .await
-            {
+            .await;
+
+            let reaped = match reaped {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format_gc_error(
+                        "delete pending OCI upload cleanup-key row",
+                        &cleanup_key.storage_key,
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            // #3187: a zero-row match is an anomaly, not a success. See the
+            // matching block in `cleanup_unreferenced_oci_upload_keys`.
+            if reaped.rows_affected() != 1 {
                 let msg = format_gc_error(
-                    "delete pending OCI upload cleanup-key row",
+                    "reap pending OCI upload cleanup-key row",
                     &cleanup_key.storage_key,
-                    &e.to_string(),
+                    "tombstoned row vanished or stopped matching between the storage delete \
+                     and its reap; the object was deleted but its journal row was not",
                 );
                 tracing::warn!("{}", msg);
                 result.errors.push(msg);
@@ -2827,6 +2871,143 @@ async fn is_blob_still_orphan(
         .await?;
 
     Ok(row.try_get::<bool, _>("still_orphan").unwrap_or(false))
+}
+
+/// Outcome of the push side's commit-time guard on a blob key's
+/// cleanup-journal row. See [`claim_cleanup_journal_row_for_blob_commit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CleanupJournalClaim {
+    /// No sweep owns this key. The journal row (if it still existed) has been
+    /// deleted inside the caller's transaction, under the row lock, so a sweep
+    /// that reaches phase 1 afterwards will match zero rows and skip its
+    /// storage delete. The caller may commit its `oci_blobs` row.
+    Cleared,
+    /// A cleanup sweep has tombstoned this key under a live claim, or has
+    /// already reaped its journal row: the object either is being deleted right
+    /// now or is already gone. The caller **must not** commit an `oci_blobs`
+    /// row for it, and must roll back and report a retryable failure.
+    Doomed,
+}
+
+/// **The push side of the two-phase cleanup-key protocol (#3187).** Read this
+/// together with [`StorageGcService::tombstone_cleanup_key_for_delete`], which
+/// is the sweep side; neither half is correct alone.
+///
+/// Call this inside the *same transaction* that commits the `oci_blobs` row
+/// for `storage_key`, strictly before that INSERT commits. `journal_id` is the
+/// row id returned when the push registered the key
+/// (`register_oci_upload_cleanup_key`), captured then rather than looked up by
+/// `storage_key` now, so that a sweep having reaped *the row this push
+/// registered* is distinguishable from there never having been one.
+///
+/// # Why the push has to participate
+///
+/// The cleanup sweep destroys `oci-blobs/<digest>` objects it believes nothing
+/// references. Its liveness predicate is `NOT EXISTS (SELECT 1 FROM oci_blobs
+/// ...)`, and a re-push of a swept digest **INSERTs a new** `oci_blobs` row —
+/// there is no existing row for the sweep to have locked, so no amount of
+/// `FOR UPDATE` on `oci_blobs` (the mechanism that protects the blob GC one
+/// layer down, via [`is_blob_still_orphan`]) can serialize the two. The
+/// journal row is the only object both sides touch, and this function is what
+/// makes the push touch it under a lock.
+///
+/// # The protocol
+///
+/// 1. `SELECT ... FOR UPDATE` the journal row. This blocks against a sweep's
+///    in-flight phase-1 tombstone `UPDATE`, and makes a sweep's phase-1
+///    `UPDATE` block against us. That mutual exclusion is the whole guarantee;
+///    everything below is just deciding who won.
+/// 2. **Row present, tombstoned, claim still live** → [`Doomed`]. The sweep
+///    committed its intent before we took the lock, so its `storage.delete()`
+///    is already in flight or done. Committing an `oci_blobs` row here is
+///    exactly the #3085 data loss.
+/// 3. **Row present, no tombstone (or a lapsed claim)** → delete it under the
+///    lock and return [`Cleared`]. A sweep's phase-1 `UPDATE` now finds no row,
+///    so it never deletes the object. A tombstone whose `claim_expires_at` has
+///    passed belongs to a crashed sweep and is not binding — otherwise a crash
+///    would doom that digest permanently.
+/// 4. **Row absent** → the push registered a row and something removed it.
+///    Three causes, and they must not be conflated:
+///    * A **concurrent push of the same key** won and cleared the row in the
+///      same transaction that committed its own `oci_blobs` row. An
+///      `oci_blobs` row referencing this key proves it: the peer's journal
+///      delete and its INSERT commit together, so we cannot observe one
+///      without the other. The bytes are live → [`Cleared`].
+///    * The **repository was deleted**, cascading the journal row away
+///      (`oci_upload_cleanup_keys.repository_id ... ON DELETE CASCADE`). No
+///      sweep is involved and there is nothing to protect; return [`Cleared`]
+///      so the caller's own `oci_blobs` INSERT fails on its foreign key and
+///      reports *that*, rather than this function inventing a concurrent-GC
+///      diagnosis for an unrelated failure.
+///    * Otherwise a **sweep reaped it**. Phase 3 only removes a row whose
+///      object it just deleted, so the bytes are gone → [`Doomed`].
+///
+/// [`Doomed`]: CleanupJournalClaim::Doomed
+/// [`Cleared`]: CleanupJournalClaim::Cleared
+pub(crate) async fn claim_cleanup_journal_row_for_blob_commit(
+    conn: &mut sqlx::PgConnection,
+    journal_id: i64,
+    repository_id: Uuid,
+    storage_key: &str,
+) -> sqlx::Result<CleanupJournalClaim> {
+    // Step 1: take the row lock. `FOR UPDATE` conflicts with the sweep's
+    // phase-1 `UPDATE`, so from here on exactly one of the two proceeds.
+    //
+    // `claim_expires_at IS NULL` is folded into "binding", not out of it, so
+    // the expression is never SQL NULL and the conservative answer is the
+    // default. Phase 1 always writes the tombstone and the lease together, so
+    // a tombstone with no lease should not exist; if one ever does, refusing
+    // the push is the safe way to be wrong.
+    let row = sqlx::query(
+        "SELECT pending_delete_at IS NOT NULL \
+              AND (claim_expires_at IS NULL OR claim_expires_at > NOW()) AS doomed \
+         FROM oci_upload_cleanup_keys WHERE id = $1 FOR UPDATE",
+    )
+    .bind(journal_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    let Some(row) = row else {
+        // Step 4: our journal row is gone. A peer push that cleared it
+        // committed its `oci_blobs` row in the same transaction, so that row
+        // is visible to us now if it exists at all.
+        let live = sqlx::query("SELECT 1 AS present FROM oci_blobs WHERE storage_key = $1 LIMIT 1")
+            .bind(storage_key)
+            .fetch_optional(&mut *conn)
+            .await?;
+        if live.is_some() {
+            return Ok(CleanupJournalClaim::Cleared);
+        }
+        // Not a peer push. Before blaming a sweep, rule out the repository
+        // having been deleted underneath us, which cascades the journal row
+        // away for reasons that have nothing to do with GC.
+        let repo_alive = sqlx::query("SELECT 1 AS present FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        return Ok(if repo_alive.is_some() {
+            CleanupJournalClaim::Doomed
+        } else {
+            CleanupJournalClaim::Cleared
+        });
+    };
+
+    // Step 2: a live tombstone means the sweep got here first. A decode
+    // failure propagates rather than defaulting — a guard against data loss
+    // must not fail open on an unreadable answer.
+    if row.try_get::<bool, _>("doomed")? {
+        return Ok(CleanupJournalClaim::Doomed);
+    }
+
+    // Step 3: we hold the lock and the key is not doomed. Remove the journal
+    // row inside the caller's transaction so it lands atomically with the
+    // `oci_blobs` INSERT that follows.
+    sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE id = $1")
+        .bind(journal_id)
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(CleanupJournalClaim::Cleared)
 }
 
 /// Accumulate dry-run totals into a GC result.
@@ -7460,7 +7641,7 @@ mod tests {
         // invisible to concurrent sweepers.
         assert!(
             service
-                .hold_cleanup_key_claim_for_delete(&mine, CleanupSweepKind::Unreferenced)
+                .tombstone_cleanup_key_for_delete(&mine, CleanupSweepKind::Unreferenced)
                 .await,
             "the live owner must be able to renew its claim"
         );
@@ -7494,7 +7675,7 @@ mod tests {
         );
         assert!(
             !service
-                .hold_cleanup_key_claim_for_delete(&mine, CleanupSweepKind::Unreferenced)
+                .tombstone_cleanup_key_for_delete(&mine, CleanupSweepKind::Unreferenced)
                 .await,
             "a superseded token must not renew (the delete is skipped)"
         );
@@ -7843,6 +8024,732 @@ mod tests {
             !deleted.contains(&revive_key),
             "#3085: the pending reaper shares the pre-delete hook and must also refuse to \
              delete the bytes of a blob that went live after the claim: {deleted:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3187: closing the pre-delete window #3158 only narrowed.
+    //
+    // The tests above cover the POST-CLAIM gap: a push landing after the batch
+    // was claimed but before the sweep reached that key, which the #3158
+    // per-key liveness re-check already refuses. They deliberately do NOT
+    // cover the residual window, which is what these tests exist for: the gap
+    // between the sweep's pre-delete hook returning `true` and its
+    // `storage.delete()` completing. In #3158 the hook held no lock there, so
+    // a push committing an `oci_blobs` row inside that gap still lost its
+    // bytes and nothing could observe it.
+    //
+    // Proving a TOCTOU closure needs a seam at the exact instant of the race,
+    // not a sequence of calls. Two seams are used:
+    //
+    //   * `PreDeleteWindowStorage` runs the real push-side protocol INSIDE the
+    //     sweep's own `storage.delete()` await for the very key being deleted.
+    //     That is, by construction, the post-hold/pre-delete window.
+    //   * `cleanup_key_tombstone_blocks_while_a_push_holds_the_journal_row`
+    //     drives the opposite order with two live connections and proves the
+    //     sweep's phase 1 genuinely BLOCKS on the push's row lock — the
+    //     mutual exclusion #3158's autocommit `UPDATE` did not have.
+    // -----------------------------------------------------------------------
+
+    /// What the simulated push did when it ran inside the sweep's storage
+    /// delete. `None` means the seam never fired.
+    type PushOutcome = std::sync::Mutex<Option<CleanupJournalClaim>>;
+
+    /// Storage backend that, while deleting `target_key`, runs the **real**
+    /// push-side commit protocol
+    /// ([`claim_cleanup_journal_row_for_blob_commit`]) on its own connection
+    /// and, if that protocol permits it, commits the `oci_blobs` row exactly
+    /// as a real push would.
+    ///
+    /// The push therefore executes strictly after the sweep's phase-1 hook
+    /// returned `true` and strictly before the object is gone — the window
+    /// #3158 left open. Committing the `oci_blobs` row for real (rather than
+    /// just recording a verdict) is what makes the test revert-sensitive: with
+    /// the tombstone removed from phase 1, the guard returns `Cleared`, the
+    /// row lands, and the invariant assertion below fails on live bytes being
+    /// deleted.
+    struct PreDeleteWindowStorage {
+        db: PgPool,
+        target_key: String,
+        target_journal_id: i64,
+        target_repo: Uuid,
+        target_digest: String,
+        deleted: std::sync::Mutex<Vec<String>>,
+        outcome: PushOutcome,
+    }
+
+    impl PreDeleteWindowStorage {
+        fn deleted_keys(&self) -> Vec<String> {
+            self.deleted.lock().expect("deleted lock").clone()
+        }
+        fn outcome(&self) -> Option<CleanupJournalClaim> {
+            *self.outcome.lock().expect("outcome lock")
+        }
+    }
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for PreDeleteWindowStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(Bytes::new())
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            let fire = {
+                let mut seen = self.deleted.lock().expect("deleted lock");
+                seen.push(key.to_string());
+                key == self.target_key
+            };
+            if fire {
+                // The push runs on its own connection, as it does in
+                // production: this is a different request, not the sweep.
+                let mut tx = self.db.begin().await.expect("push begins its transaction");
+                let claim = claim_cleanup_journal_row_for_blob_commit(
+                    &mut tx,
+                    self.target_journal_id,
+                    self.target_repo,
+                    &self.target_key,
+                )
+                .await
+                .expect("push runs the cleanup-journal guard");
+                match claim {
+                    CleanupJournalClaim::Cleared => {
+                        // The protocol said it was safe to publish the blob.
+                        sqlx::query(
+                            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, \
+                             storage_key) VALUES ($1, $2, 1, $3) \
+                             ON CONFLICT (repository_id, digest) DO NOTHING",
+                        )
+                        .bind(self.target_repo)
+                        .bind(&self.target_digest)
+                        .bind(&self.target_key)
+                        .execute(&mut *tx)
+                        .await
+                        .expect("push commits its oci_blobs row");
+                        tx.commit().await.expect("push commits");
+                    }
+                    CleanupJournalClaim::Doomed => {
+                        // The protocol refused. A real push returns a
+                        // retryable 503 here and publishes nothing.
+                        tx.rollback().await.expect("push rolls back");
+                    }
+                }
+                *self.outcome.lock().expect("outcome lock") = Some(claim);
+            }
+            Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
+    }
+
+    /// Seed one aged, unreferenced blob-key journal row plus a control key,
+    /// and wire a [`PreDeleteWindowStorage`] that races the blob key.
+    async fn setup_pre_delete_window_sweep(
+        fixture: &crate::api::handlers::test_db_helpers::Fixture,
+        tag: &str,
+        marked_complete: bool,
+    ) -> (StorageGcService, Arc<PreDeleteWindowStorage>, [String; 2]) {
+        set_repo_backend(&fixture.pool, fixture.repo_id, "s3").await;
+
+        let run = Uuid::new_v4().simple().to_string();
+        let digest = format!("sha256:{run}{}", "0".repeat(32));
+        let blob_key = format!("oci-blobs/{digest}");
+        let control_key = format!("oci-uploads/{tag}-control/{run}");
+        let marker = if marked_complete {
+            "NOW() - INTERVAL '72 hours'"
+        } else {
+            "NULL"
+        };
+
+        let journal_id: i64 = sqlx::query(&format!(
+            "INSERT INTO oci_upload_cleanup_keys \
+                 (repository_id, storage_key, created_at, storage_write_completed_at) \
+             VALUES ($1, $2, NOW() - INTERVAL '72 hours', {marker}) RETURNING id"
+        ))
+        .bind(fixture.repo_id)
+        .bind(&blob_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("seed blob cleanup key")
+        .try_get("id")
+        .expect("journal id");
+
+        sqlx::query(&format!(
+            "INSERT INTO oci_upload_cleanup_keys \
+                 (repository_id, storage_key, created_at, storage_write_completed_at) \
+             VALUES ($1, $2, NOW() - INTERVAL '71 hours', {marker})"
+        ))
+        .bind(fixture.repo_id)
+        .bind(&control_key)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed control cleanup key");
+
+        let storage = Arc::new(PreDeleteWindowStorage {
+            db: fixture.pool.clone(),
+            target_key: blob_key.clone(),
+            target_journal_id: journal_id,
+            target_repo: fixture.repo_id,
+            target_digest: digest,
+            deleted: std::sync::Mutex::new(Vec::new()),
+            outcome: std::sync::Mutex::new(None),
+        });
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(
+            "s3".to_string(),
+            storage.clone() as Arc<dyn crate::storage::StorageBackend>,
+        );
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            backends,
+            "s3".to_string(),
+        ));
+        let service = StorageGcService::new(fixture.pool.clone(), registry);
+        (service, storage, [blob_key, control_key])
+    }
+
+    /// Is there a live `oci_blobs` row for this storage key?
+    async fn blob_row_exists(pool: &PgPool, storage_key: &str) -> bool {
+        sqlx::query("SELECT 1 AS present FROM oci_blobs WHERE storage_key = $1")
+            .bind(storage_key)
+            .fetch_optional(pool)
+            .await
+            .expect("query oci_blobs")
+            .is_some()
+    }
+
+    async fn cleanup_pre_delete_window(
+        fixture: &crate::api::handlers::test_db_helpers::Fixture,
+        keys: &[String; 2],
+    ) {
+        let _ = sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE storage_key = ANY($1)")
+            .bind(&keys[..])
+            .execute(&fixture.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_blobs WHERE storage_key = $1")
+            .bind(&keys[0])
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+    }
+
+    /// #3187, the window itself: a push that commits **inside** the sweep's
+    /// `storage.delete()` await for the very key being deleted.
+    ///
+    /// This is the interleaving #3158 explicitly could not cover. The sweep's
+    /// phase-1 hook has already returned `true`, so under #3158 nothing at all
+    /// stood between the push and a live `oci_blobs` row pointing at bytes the
+    /// next instruction destroys.
+    ///
+    /// The invariant asserted is the one that actually matters, and it is
+    /// symmetric: the registry must never end up with BOTH the object deleted
+    /// AND a row referencing it. Either outcome alone is fine — a refused push
+    /// is a retry, a survived blob is a skipped sweep.
+    #[tokio::test]
+    async fn unreferenced_sweep_refuses_a_push_landing_in_the_pre_delete_window() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        // Both guards, for the reasons documented on the #3085 tests above:
+        // the in-process mutex excludes the sibling cluster-wide sweeps, the
+        // advisory lock excludes other processes under nextest.
+        let _sweep_guard = storage_gc_test_guard().await;
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let (service, storage, keys) =
+            setup_pre_delete_window_sweep(&fixture, "gc3187u", true).await;
+        let [blob_key, control_key] = keys.clone();
+
+        let mut result = empty_gc_result(false);
+        service
+            .cleanup_unreferenced_oci_upload_keys(Some(fixture.repo_id), false, &mut result)
+            .await
+            .expect("unreferenced cleanup-key sweep runs");
+
+        let outcome = storage.outcome();
+        let deleted = storage.deleted_keys();
+        let row_live = blob_row_exists(&fixture.pool, &blob_key).await;
+        cleanup_pre_delete_window(&fixture, &keys).await;
+
+        // Precondition first: if the seam never fired, the test entered no
+        // window at all and every assertion below would pass vacuously.
+        assert!(
+            outcome.is_some(),
+            "precondition: the simulated push must run inside the sweep's storage delete for \
+             this key, otherwise this test proves nothing. deleted={deleted:?}"
+        );
+        // THE claim. Not "the push was refused" — that is one way to satisfy
+        // it. The registry must simply never end up with the object deleted
+        // AND a row still pointing at it.
+        assert!(
+            !(deleted.contains(&blob_key) && row_live),
+            "#3187 data loss: the sweep deleted {blob_key} AND an oci_blobs row references it. \
+             A push landing in the post-hold, pre-storage-delete window must never produce \
+             both. outcome={outcome:?} deleted={deleted:?}"
+        );
+        // And the mechanism that delivered it, so a future change that
+        // satisfies the invariant by accident is still visible here.
+        assert_eq!(
+            outcome,
+            Some(CleanupJournalClaim::Doomed),
+            "the two-phase tombstone must be what refused the push. `Cleared` means the push \
+             was allowed to publish a blob whose bytes are being destroyed. deleted={deleted:?}"
+        );
+        assert!(
+            !row_live,
+            "a push the protocol refused must not leave an oci_blobs row behind"
+        );
+        assert!(
+            deleted.contains(&control_key),
+            "positive control: a genuinely unreferenced key must still be swept, otherwise \
+             the guard could pass by never deleting anything: {deleted:?}"
+        );
+    }
+
+    /// Same window on the pending (NULL-marked) reaper, which shares phase 1.
+    #[tokio::test]
+    async fn pending_reaper_refuses_a_push_landing_in_the_pre_delete_window() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _sweep_guard = storage_gc_test_guard().await;
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let (service, storage, keys) =
+            setup_pre_delete_window_sweep(&fixture, "gc3187p", false).await;
+        let [blob_key, control_key] = keys.clone();
+
+        let mut result = empty_gc_result(false);
+        service
+            .reap_pending_oci_upload_cleanup_keys(Some(fixture.repo_id), false, &mut result)
+            .await
+            .expect("pending cleanup-key reaper runs");
+
+        let outcome = storage.outcome();
+        let deleted = storage.deleted_keys();
+        let row_live = blob_row_exists(&fixture.pool, &blob_key).await;
+        cleanup_pre_delete_window(&fixture, &keys).await;
+
+        assert!(
+            outcome.is_some(),
+            "precondition: the simulated push must run inside the reaper's storage delete for \
+             this key. deleted={deleted:?}"
+        );
+        assert!(
+            !(deleted.contains(&blob_key) && row_live),
+            "#3187 data loss via the pending reaper: {blob_key} deleted AND referenced. \
+             outcome={outcome:?} deleted={deleted:?}"
+        );
+        assert_eq!(
+            outcome,
+            Some(CleanupJournalClaim::Doomed),
+            "the pending reaper shares phase 1, so a push landing inside its storage delete \
+             must be refused the same way. deleted={deleted:?}"
+        );
+        assert!(
+            deleted.contains(&control_key),
+            "positive control: a genuinely unreferenced pending key must still be reaped: \
+             {deleted:?}"
+        );
+    }
+
+    /// #3187, the other order: the **push** reaches the journal row first.
+    ///
+    /// This is the half a sequential test cannot fake, and the half #3158's
+    /// autocommit `UPDATE` did not have. Two live connections: the push holds
+    /// `SELECT ... FOR UPDATE` on the journal row inside an open transaction,
+    /// and the sweep's phase-1 tombstone `UPDATE` must **block** on it rather
+    /// than sail past and go on to delete the object.
+    ///
+    /// The blocking assertion is one-sided in the safe direction: Postgres
+    /// cannot grant two conflicting row locks, so this cannot pass by timing
+    /// luck. It can only fail if phase 1 stopped taking the row lock at all.
+    #[tokio::test]
+    async fn cleanup_key_tombstone_blocks_while_a_push_holds_the_journal_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::time::Duration;
+
+        let _sweep_guard = storage_gc_test_guard().await;
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let run = Uuid::new_v4().simple().to_string();
+        let digest = format!("sha256:{run}{}", "0".repeat(32));
+        let blob_key = format!("oci-blobs/{digest}");
+        let claim_token = Uuid::new_v4();
+        let journal_id: i64 = sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys \
+                 (repository_id, storage_key, created_at, storage_write_completed_at, \
+                  claim_token, claim_expires_at) \
+             VALUES ($1, $2, NOW() - INTERVAL '72 hours', NOW() - INTERVAL '72 hours', \
+                     $3, NOW() + INTERVAL '15 minutes') RETURNING id",
+        )
+        .bind(fixture.repo_id)
+        .bind(&blob_key)
+        .bind(claim_token)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("seed claimed blob cleanup key")
+        .try_get("id")
+        .expect("journal id");
+
+        let cleanup_key = OciUploadCleanupKey {
+            id: journal_id,
+            location: StorageLocation {
+                backend: "s3".to_string(),
+                path: String::new(),
+            },
+            storage_key: blob_key.clone(),
+            claim_token: Some(claim_token),
+        };
+        let service = StorageGcService::new(
+            fixture.pool.clone(),
+            Arc::new(crate::storage::StorageRegistry::new(
+                std::collections::HashMap::new(),
+                "s3".to_string(),
+            )),
+        );
+
+        // The push gets there first and holds the row lock in an open
+        // transaction, exactly as it does around its `oci_blobs` INSERT.
+        let mut push_tx = fixture.pool.begin().await.expect("push begins");
+        let claim = claim_cleanup_journal_row_for_blob_commit(
+            &mut push_tx,
+            journal_id,
+            fixture.repo_id,
+            &blob_key,
+        )
+        .await
+        .expect("push runs the cleanup-journal guard");
+        assert_eq!(
+            claim,
+            CleanupJournalClaim::Cleared,
+            "no sweep has tombstoned this key yet, so the push must be allowed to proceed"
+        );
+
+        // Phase 1 must not be able to make progress while that transaction is
+        // open. `timeout` returning Err is the proof: the future is parked on
+        // the row lock.
+        let tombstone =
+            service.tombstone_cleanup_key_for_delete(&cleanup_key, CleanupSweepKind::Unreferenced);
+        tokio::pin!(tombstone);
+        let blocked = tokio::time::timeout(Duration::from_millis(750), &mut tombstone).await;
+        assert!(
+            blocked.is_err(),
+            "#3187: the sweep's phase-1 tombstone must BLOCK on the journal row lock a \
+             committing push holds. It completed instead, which means the push and the \
+             sweep no longer serialize and the sweep would go on to delete live bytes."
+        );
+
+        // Release: the push commits its journal-row delete (in production, in
+        // the same transaction as the `oci_blobs` INSERT).
+        push_tx.commit().await.expect("push commits");
+
+        let held = tombstone.await;
+        assert!(
+            !held,
+            "once the push committed, the journal row is gone, so phase 1 must match zero \
+             rows and report `false` — the caller then skips the storage delete and the \
+             pushed bytes survive"
+        );
+
+        let _ = sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE id = $1")
+            .bind(journal_id)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+    }
+
+    /// A tombstone left by a sweep that crashed must not doom the digest
+    /// forever: it lapses with the claim lease, and a later push proceeds.
+    #[tokio::test]
+    async fn expired_cleanup_key_tombstone_does_not_block_a_push() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _sweep_guard = storage_gc_test_guard().await;
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let run = Uuid::new_v4().simple().to_string();
+        let blob_key = format!("oci-blobs/sha256:{run}{}", "0".repeat(32));
+        let journal_id: i64 = sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys \
+                 (repository_id, storage_key, storage_write_completed_at, \
+                  claim_token, claim_expires_at, pending_delete_at) \
+             VALUES ($1, $2, NOW(), $3, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour') \
+             RETURNING id",
+        )
+        .bind(fixture.repo_id)
+        .bind(&blob_key)
+        .bind(Uuid::new_v4())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("seed stranded tombstone")
+        .try_get("id")
+        .expect("journal id");
+
+        let mut tx = fixture.pool.begin().await.expect("push begins");
+        let claim = claim_cleanup_journal_row_for_blob_commit(
+            &mut tx,
+            journal_id,
+            fixture.repo_id,
+            &blob_key,
+        )
+        .await
+        .expect("push runs the cleanup-journal guard");
+        tx.commit().await.expect("push commits");
+
+        let _ = sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE id = $1")
+            .bind(journal_id)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+
+        assert_eq!(
+            claim,
+            CleanupJournalClaim::Cleared,
+            "a tombstone whose claim lease has lapsed belongs to a crashed sweep and must \
+             not block the push — otherwise one crash strands that digest permanently"
+        );
+    }
+
+    /// A push whose journal row a sweep already reaped must NOT be allowed to
+    /// publish an `oci_blobs` row: the reap only happens after the object was
+    /// deleted, so those bytes are gone.
+    #[tokio::test]
+    async fn push_whose_journal_row_was_reaped_is_refused() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _sweep_guard = storage_gc_test_guard().await;
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let run = Uuid::new_v4().simple().to_string();
+        let blob_key = format!("oci-blobs/sha256:{run}{}", "0".repeat(32));
+        let journal_id: i64 = sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(fixture.repo_id)
+        .bind(&blob_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("seed journal row")
+        .try_get("id")
+        .expect("journal id");
+
+        // The sweep completes: object deleted, row reaped.
+        sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE id = $1")
+            .bind(journal_id)
+            .execute(&fixture.pool)
+            .await
+            .expect("sweep reaps the row");
+
+        let mut tx = fixture.pool.begin().await.expect("push begins");
+        let claim = claim_cleanup_journal_row_for_blob_commit(
+            &mut tx,
+            journal_id,
+            fixture.repo_id,
+            &blob_key,
+        )
+        .await
+        .expect("push runs the cleanup-journal guard");
+        tx.rollback().await.expect("push rolls back");
+        fixture.teardown().await;
+
+        assert_eq!(
+            claim,
+            CleanupJournalClaim::Doomed,
+            "the journal row this push registered is gone and no oci_blobs row references \
+             the key, so a sweep reaped it after deleting the object. Treating a missing \
+             row as `Cleared` would publish a blob whose bytes no longer exist."
+        );
+    }
+
+    /// The counterpart to the test above: a journal row that vanished because
+    /// its **repository** was deleted (`ON DELETE CASCADE`) was not reaped by a
+    /// sweep, and must not be reported as one.
+    ///
+    /// Absence of the row is not by itself evidence of GC. Conflating the two
+    /// makes an unrelated failure — a push racing a repository deletion, whose
+    /// `oci_blobs` INSERT is about to fail on its foreign key — surface as a
+    /// misleading "storage was being reclaimed concurrently; retry" that no
+    /// retry can fix.
+    #[tokio::test]
+    async fn push_whose_repository_was_deleted_is_not_blamed_on_gc() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _sweep_guard = storage_gc_test_guard().await;
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let run = Uuid::new_v4().simple().to_string();
+        let blob_key = format!("oci-blobs/sha256:{run}{}", "0".repeat(32));
+        let journal_id: i64 = sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(fixture.repo_id)
+        .bind(&blob_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("seed journal row")
+        .try_get("id")
+        .expect("journal id");
+        let repo_id = fixture.repo_id;
+
+        // The repository goes away mid-push; the journal row cascades with it.
+        // `teardown` deletes the repository, so run it before the guard.
+        fixture.teardown().await;
+
+        let mut tx = fixture.pool.begin().await.expect("push begins");
+        let claim =
+            claim_cleanup_journal_row_for_blob_commit(&mut tx, journal_id, repo_id, &blob_key)
+                .await
+                .expect("push runs the cleanup-journal guard");
+        tx.rollback().await.expect("push rolls back");
+
+        assert_eq!(
+            claim,
+            CleanupJournalClaim::Cleared,
+            "the repository is gone, so no sweep reaped this row and there are no bytes to \
+             protect. The caller's oci_blobs INSERT will fail on its foreign key and report \
+             that accurately, instead of this guard inventing a concurrent-GC diagnosis."
+        );
+    }
+
+    /// The acceptance criterion the issue calls out separately: a reap that
+    /// matches zero rows must be REPORTED, not banked as a success.
+    ///
+    /// Before #3187 the sweeps incremented `cleanup_rows_removed` and
+    /// `storage_keys_deleted` unconditionally, so the exact interleaving where
+    /// a push won left no journal row and no error — the data loss was
+    /// invisible. Here the seam removes the journal row during the storage
+    /// delete, reproducing what the old unguarded
+    /// `clear_oci_upload_cleanup_key_best_effort` did.
+    #[tokio::test]
+    async fn sweep_reports_a_zero_row_reap_instead_of_counting_it_as_a_success() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _sweep_guard = storage_gc_test_guard().await;
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        /// Deletes the journal row out from under the sweep, mid storage
+        /// delete — the old push behaviour this fix removed.
+        struct RowStealingStorage {
+            db: PgPool,
+            journal_id: i64,
+        }
+
+        #[async_trait]
+        impl crate::storage::StorageBackend for RowStealingStorage {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(true)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE id = $1")
+                    .bind(self.journal_id)
+                    .execute(&self.db)
+                    .await
+                    .expect("steal the journal row");
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+            ) -> crate::error::Result<crate::storage::PutStreamResult> {
+                crate::storage::buffered_put_stream_fallback(self, key, stream).await
+            }
+        }
+
+        set_repo_backend(&fixture.pool, fixture.repo_id, "s3").await;
+        let run = Uuid::new_v4().simple().to_string();
+        let blob_key = format!("oci-blobs/sha256:{run}{}", "0".repeat(32));
+        let journal_id: i64 = sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys \
+                 (repository_id, storage_key, created_at, storage_write_completed_at) \
+             VALUES ($1, $2, NOW() - INTERVAL '72 hours', NOW() - INTERVAL '72 hours') \
+             RETURNING id",
+        )
+        .bind(fixture.repo_id)
+        .bind(&blob_key)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("seed journal row")
+        .try_get("id")
+        .expect("journal id");
+
+        let mut backends = std::collections::HashMap::new();
+        backends.insert(
+            "s3".to_string(),
+            Arc::new(RowStealingStorage {
+                db: fixture.pool.clone(),
+                journal_id,
+            }) as Arc<dyn crate::storage::StorageBackend>,
+        );
+        let service = StorageGcService::new(
+            fixture.pool.clone(),
+            Arc::new(crate::storage::StorageRegistry::new(
+                backends,
+                "s3".to_string(),
+            )),
+        );
+
+        let mut result = empty_gc_result(false);
+        service
+            .cleanup_unreferenced_oci_upload_keys(Some(fixture.repo_id), false, &mut result)
+            .await
+            .expect("unreferenced cleanup-key sweep runs");
+
+        let _ = sqlx::query("DELETE FROM oci_upload_cleanup_keys WHERE storage_key = $1")
+            .bind(&blob_key)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+
+        assert_eq!(
+            result.storage_keys_deleted, 0,
+            "#3187: a reap that matched zero rows must not be counted as a swept key — \
+             counting it unconditionally is exactly what made a lost race invisible"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("reap OCI upload cleanup-key row")),
+            "#3187: a zero-row reap must be reported as an error so the operator can see \
+             the object was deleted but its journal row was not: {:?}",
+            result.errors
         );
     }
 }

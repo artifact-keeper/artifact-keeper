@@ -917,25 +917,41 @@ async fn delete_storage_key_best_effort(
     }
 }
 
+/// Register a cleanup-journal row for a storage key that is about to be
+/// written, returning the row's id.
+///
+/// The id matters for final `oci-blobs/<digest>` keys: the commit-time guard
+/// [`claim_cleanup_journal_row_for_blob_commit`] re-reads *this specific row*
+/// rather than looking the key up again, so that "a sweep reaped the row this
+/// push registered" (its object is gone) stays distinguishable from "there was
+/// never a row" (#3187). Looking up by `storage_key` at commit time cannot tell
+/// those apart.
+///
+/// `ON CONFLICT ... DO UPDATE SET storage_key = EXCLUDED.storage_key` is a
+/// no-op write chosen over `DO NOTHING` purely because `DO NOTHING` returns no
+/// row on conflict, and a re-push of a digest whose journal row still exists is
+/// the common case.
 async fn register_oci_upload_cleanup_key(
     db: &PgPool,
     repository_id: Uuid,
     upload_session_id: Option<Uuid>,
     storage_key: &str,
-) -> Result<(), Response> {
+) -> Result<i64, Response> {
     sqlx::query(
         r#"
         INSERT INTO oci_upload_cleanup_keys (repository_id, upload_session_id, storage_key)
         VALUES ($1, $2, $3)
-        ON CONFLICT (storage_key) DO NOTHING
+        ON CONFLICT (storage_key) DO UPDATE SET storage_key = EXCLUDED.storage_key
+        RETURNING id
         "#,
     )
     .bind(repository_id)
     .bind(upload_session_id)
     .bind(storage_key)
-    .execute(db)
+    .fetch_one(db)
     .await
-    .map(|_| ())
+    .map_err(|e| oci_internal_error(&e.to_string()))?
+    .try_get::<i64, _>("id")
     .map_err(|e| oci_internal_error(&e.to_string()))
 }
 
@@ -970,28 +986,65 @@ async fn mark_oci_upload_cleanup_key_committed(
     Ok(())
 }
 
-/// Remove a cleanup-journal row once the storage object it tracked is durably
-/// referenced (an `oci_blobs` row now points at it). Used on the blob-upload
-/// success path so a now-live `oci-blobs/<digest>` key does not leave a journal
-/// row behind forever. Best-effort: a failed delete only leaves a stale row,
-/// and the reaper's `oci_blobs` EXISTS guard still refuses to reclaim the live
-/// blob, so it is never data loss — just a row to be cleaned up later.
+/// Remove a cleanup-journal row for a **temp / part / completion** key whose
+/// storage object the push path has already deleted itself, so the 24-48h
+/// sweeps do not have to issue a redundant `NotFound` delete for it later.
+///
+/// Best-effort: a failed delete only leaves a stale row for those sweeps to
+/// pick up.
+///
+/// This is **not** the guard for a final `oci-blobs/<digest>` key. That path
+/// must use [`claim_cleanup_journal_row_for_blob_commit`] inside the same
+/// transaction as its `oci_blobs` INSERT — the whole point of #3187 is that a
+/// blob key's journal row is the object the push and the sweep serialize on,
+/// which an out-of-band `DELETE` like this one cannot do.
+///
+/// It still refuses to remove a row a sweep has tombstoned under a live claim
+/// (#3187). Before, this was a bare `DELETE ... WHERE storage_key = $1`: a push
+/// could erase an in-flight sweep's journal row, the sweep's guarded row
+/// `DELETE` would then match nothing, and — because neither sweep inspected
+/// `rows_affected` — the lost race was recorded as a clean success. The sweeps
+/// now report a zero-row reap, and this no longer causes one.
 async fn clear_oci_upload_cleanup_key_best_effort(db: &PgPool, storage_key: &str) {
-    if let Err(e) = sqlx::query(
+    match sqlx::query(
         r#"
         DELETE FROM oci_upload_cleanup_keys
         WHERE storage_key = $1
+          AND (pending_delete_at IS NULL OR claim_expires_at <= NOW())
         "#,
     )
     .bind(storage_key)
     .execute(db)
     .await
     {
-        warn!(
-            storage_key = %storage_key,
-            error = %e,
-            "Failed to clear OCI upload cleanup-key row after blob became referenced"
-        );
+        Ok(r) if r.rows_affected() == 0 => {
+            // Either the row was already gone (the common, uninteresting case)
+            // or a sweep owns it right now. Distinguishing the two is what
+            // makes a lost race observable rather than silent.
+            let tombstoned = sqlx::query(
+                "SELECT 1 AS present FROM oci_upload_cleanup_keys \
+                 WHERE storage_key = $1 AND pending_delete_at IS NOT NULL \
+                   AND (claim_expires_at IS NULL OR claim_expires_at > NOW())",
+            )
+            .bind(storage_key)
+            .fetch_optional(db)
+            .await;
+            if matches!(tombstoned, Ok(Some(_))) {
+                warn!(
+                    storage_key = %storage_key,
+                    "Left an in-flight cleanup sweep's tombstoned journal row in place; \
+                     the sweep is deleting this object now (#3187)"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                storage_key = %storage_key,
+                error = %e,
+                "Failed to clear OCI upload cleanup-key row after blob became referenced"
+            );
+        }
     }
 }
 
@@ -4980,15 +5033,19 @@ async fn handle_start_upload(
         // key first so the cleanup-key reaper can reclaim it on DB failure; the
         // reaper treats a blob key as referenced once an `oci_blobs` row for the
         // digest exists, so a committed/referenced blob is never reclaimed.
-        if let Err(resp) = register_oci_upload_cleanup_key(&state.db, repo_id, None, &key).await {
-            delete_storage_key_best_effort(
-                &storage,
-                &temp_key,
-                "monolithic blob cleanup registration failed",
-            )
-            .await;
-            return resp;
-        }
+        let blob_journal_id =
+            match register_oci_upload_cleanup_key(&state.db, repo_id, None, &key).await {
+                Ok(id) => id,
+                Err(resp) => {
+                    delete_storage_key_best_effort(
+                        &storage,
+                        &temp_key,
+                        "monolithic blob cleanup registration failed",
+                    )
+                    .await;
+                    return resp;
+                }
+            };
 
         if let Err(e) = storage.copy(&temp_key, &key).await {
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob copy failed")
@@ -5002,23 +5059,96 @@ async fn handle_start_upload(
 
         // Record in oci_blobs. On conflict the blob already exists; clear any
         // `pending_delete_at` marker (#1660) so re-uploading a blob that GC had
-        // marked for deletion resurrects it. The push path holds no row lock
-        // here, but the sweep re-check re-reads `pending_delete_at` under its
-        // own `FOR UPDATE`, so a marker cleared before that re-check protects
-        // the blob and one cleared after is re-marked on the next mark pass.
+        // marked for deletion resurrects it.
+        //
+        // #3187: the INSERT and the blob key's cleanup-journal guard commit in
+        // ONE transaction. The guard takes `SELECT ... FOR UPDATE` on the
+        // journal row registered above, which is the only lock a cleanup sweep
+        // and this push both contend for — the sweep cannot lock the `oci_blobs`
+        // row because this statement is the thing that creates it. Committing
+        // the row without that lock is what let a sweep delete the bytes of a
+        // blob this push had just made live.
+        let mut blob_tx = match state.db.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &temp_key,
+                    "monolithic blob commit begin failed",
+                )
+                .await;
+                return oci_error(
+                    crate::api::handlers::db_status(&e.to_string()),
+                    "INTERNAL_ERROR",
+                    &e.to_string(),
+                );
+            }
+        };
+
+        match crate::services::storage_gc_service::claim_cleanup_journal_row_for_blob_commit(
+            &mut blob_tx,
+            blob_journal_id,
+            repo_id,
+            &key,
+        )
+        .await
+        {
+            Ok(crate::services::storage_gc_service::CleanupJournalClaim::Cleared) => {}
+            Ok(crate::services::storage_gc_service::CleanupJournalClaim::Doomed) => {
+                // A cleanup sweep owns this key and is deleting (or has
+                // deleted) its object. Committing an `oci_blobs` row now would
+                // publish a blob whose bytes are gone — #3085 exactly. Fail the
+                // push instead; it is retryable, and the retry re-journals a
+                // fresh row once the sweep has finished with this one.
+                let _ = blob_tx.rollback().await;
+                delete_storage_key_best_effort(
+                    &storage,
+                    &temp_key,
+                    "monolithic blob raced a cleanup sweep",
+                )
+                .await;
+                warn!(
+                    storage_key = %key,
+                    digest = %canonical_digest,
+                    "Monolithic blob push lost the race with a cleanup sweep deleting the same \
+                     key; refusing to commit an oci_blobs row for deleted bytes (#3187)"
+                );
+                return oci_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "BLOB_UPLOAD_INVALID",
+                    "blob storage was being reclaimed concurrently; retry the upload",
+                );
+            }
+            Err(e) => {
+                let _ = blob_tx.rollback().await;
+                delete_storage_key_best_effort(
+                    &storage,
+                    &temp_key,
+                    "monolithic blob cleanup-journal guard failed",
+                )
+                .await;
+                return oci_error(
+                    crate::api::handlers::db_status(&e.to_string()),
+                    "INTERNAL_ERROR",
+                    &e.to_string(),
+                );
+            }
+        }
+
         if let Err(e) = sqlx::query!(
             "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
             repo_id, canonical_digest.as_str(), put_result.bytes_written as i64, key
         )
-        .execute(&state.db)
+        .execute(&mut *blob_tx)
         .await
         {
-            // Leave the (still NULL-marked) journal entry for the blob key in
-            // place: the pending reaper reclaims the orphaned
-            // `oci-blobs/<digest>` object since no `oci_blobs` row references it.
-            // Do NOT delete the blob object here — a concurrent push of the same
-            // digest may be committing it (the reaper's `oci_blobs` EXISTS guard
-            // protects that live blob).
+            // Rolling back restores the (still NULL-marked) journal entry for
+            // the blob key, so the pending reaper reclaims the orphaned
+            // `oci-blobs/<digest>` object since no `oci_blobs` row references
+            // it. Do NOT delete the blob object here — a concurrent push of the
+            // same digest may be committing it (the reaper's `oci_blobs` EXISTS
+            // guard protects that live blob).
+            let _ = blob_tx.rollback().await;
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob row insert failed")
                 .await;
             return oci_error(
@@ -5028,10 +5158,18 @@ async fn handle_start_upload(
             );
         }
 
-        // The blob row is durable, so the blob key is now referenced. Drop its
-        // journal entry; the reaper would in any case refuse to reclaim it via
-        // the `oci_blobs` EXISTS guard.
-        clear_oci_upload_cleanup_key_best_effort(&state.db, &key).await;
+        // Commit publishes the `oci_blobs` row and the journal-row removal
+        // together: no sweep can observe one without the other.
+        if let Err(e) = blob_tx.commit().await {
+            delete_storage_key_best_effort(&storage, &temp_key, "monolithic blob commit failed")
+                .await;
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+
         delete_storage_key_best_effort(&storage, &temp_key, "monolithic upload completed").await;
         // GC-LOW-3: the streamed temp object has now been deleted and the
         // `oci_blobs` row is durable, so the temp key's cleanup-journal row is
@@ -5947,6 +6085,15 @@ async fn handle_complete_upload(
     // cleared inline on the confirmed success path below (post-commit). It is
     // created inside the multi-part branch, so carry its key out here.
     let mut completion_temp_journal_key: Option<String> = None;
+    // #3187: the cleanup-journal row id for `blob_key`, registered by whichever
+    // completion branch runs below — both journal the blob key before promoting
+    // an object to it, so this is always assigned before the commit transaction
+    // reads it. That transaction re-reads THIS row under `FOR UPDATE` before
+    // publishing the `oci_blobs` row, which is how this push and a cleanup
+    // sweep serialize on the same key. Deliberately left uninitialised so the
+    // compiler enforces that a branch which skips the journal registration also
+    // fails to compile, rather than silently skipping the guard.
+    let blob_journal_id: i64;
 
     // Single-part fast path: one streamed part whose digest was already computed
     // and cached during PATCH/POST and already equals the client's requested
@@ -5978,9 +6125,9 @@ async fn handle_complete_upload(
         // `oci_blobs` commit below fails, the copied `oci-blobs/<digest>` object
         // would otherwise be an unreclaimable orphan. The reaper treats the key
         // as referenced once an `oci_blobs` row exists, so a committed blob is
-        // never reclaimed; see `clear_oci_upload_cleanup_key_best_effort` after
-        // the transaction commits.
-        if let Err(resp) = register_oci_upload_cleanup_key(
+        // never reclaimed. The row is removed inside the commit transaction by
+        // the #3187 guard, not by a best-effort DELETE afterwards.
+        match register_oci_upload_cleanup_key(
             &state.db,
             session.repository_id,
             Some(session_id),
@@ -5988,17 +6135,20 @@ async fn handle_complete_upload(
         )
         .await
         {
-            if let Err(reset_resp) = reset_oci_upload_session_state(
-                &state.db,
-                session_id,
-                session.repository_id,
-                completion_state_token,
-            )
-            .await
-            {
-                return reset_resp;
+            Ok(id) => blob_journal_id = id,
+            Err(resp) => {
+                if let Err(reset_resp) = reset_oci_upload_session_state(
+                    &state.db,
+                    session_id,
+                    session.repository_id,
+                    completion_state_token,
+                )
+                .await
+                {
+                    return reset_resp;
+                }
+                return resp;
             }
-            return resp;
         }
         if let Err(e) = storage.copy(&parts[0].storage_key, &blob_key).await {
             if let Err(reset_resp) = reset_oci_upload_session_state(
@@ -6258,7 +6408,7 @@ async fn handle_complete_upload(
         // it, mirroring the single-part branch above. On `oci_blobs` commit
         // failure the reaper reclaims the orphaned `oci-blobs/<digest>` object;
         // once the row commits the reaper treats the key as referenced.
-        if let Err(resp) = register_oci_upload_cleanup_key(
+        match register_oci_upload_cleanup_key(
             &state.db,
             session.repository_id,
             Some(session_id),
@@ -6266,31 +6416,34 @@ async fn handle_complete_upload(
         )
         .await
         {
-            delete_storage_key_best_effort(
-                &storage,
-                &completion_temp_key,
-                "completion blob cleanup registration failed",
-            )
-            .await;
-            if final_part.is_some() {
+            Ok(id) => blob_journal_id = id,
+            Err(resp) => {
                 delete_storage_key_best_effort(
                     &storage,
-                    &final_part_key,
+                    &completion_temp_key,
                     "completion blob cleanup registration failed",
                 )
                 .await;
+                if final_part.is_some() {
+                    delete_storage_key_best_effort(
+                        &storage,
+                        &final_part_key,
+                        "completion blob cleanup registration failed",
+                    )
+                    .await;
+                }
+                if let Err(reset_resp) = reset_oci_upload_session_state(
+                    &state.db,
+                    session_id,
+                    session.repository_id,
+                    completion_state_token,
+                )
+                .await
+                {
+                    return reset_resp;
+                }
+                return resp;
             }
-            if let Err(reset_resp) = reset_oci_upload_session_state(
-                &state.db,
-                session_id,
-                session.repository_id,
-                completion_state_token,
-            )
-            .await
-            {
-                return reset_resp;
-            }
-            return resp;
         }
         if let Err(e) = storage.copy(&completion_temp_key, &blob_key).await {
             delete_storage_key_best_effort(
@@ -6382,6 +6535,82 @@ async fn handle_complete_upload(
             );
         }
     };
+    // #3187: take the blob key's cleanup-journal row under `FOR UPDATE` inside
+    // THIS transaction, before the `oci_blobs` INSERT below commits. A cleanup
+    // sweep tombstones that same row before it deletes the object, so whichever
+    // of the two reaches the row lock first decides: we find a live tombstone
+    // and refuse to publish a row for bytes that are being destroyed, or we
+    // delete the row here and the sweep's tombstone `UPDATE` then matches
+    // nothing and skips its storage delete. Mirrors the monolithic path above.
+    match crate::services::storage_gc_service::claim_cleanup_journal_row_for_blob_commit(
+        &mut tx,
+        blob_journal_id,
+        session.repository_id,
+        &blob_key,
+    )
+    .await
+    {
+        Ok(crate::services::storage_gc_service::CleanupJournalClaim::Cleared) => {}
+        Ok(crate::services::storage_gc_service::CleanupJournalClaim::Doomed) => {
+            let _ = tx.rollback().await;
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion blob raced a cleanup sweep",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            warn!(
+                session_id = %session_id,
+                storage_key = %blob_key,
+                digest = %digest,
+                "Chunked blob completion lost the race with a cleanup sweep deleting the \
+                 same key; refusing to commit an oci_blobs row for deleted bytes (#3187)"
+            );
+            return oci_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BLOB_UPLOAD_INVALID",
+                "blob storage was being reclaimed concurrently; retry the upload",
+            );
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            if final_part.is_some() {
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "completion cleanup-journal guard failed",
+                )
+                .await;
+            }
+            if let Err(reset_resp) = reset_oci_upload_session_state(
+                &state.db,
+                session_id,
+                session.repository_id,
+                completion_state_token,
+            )
+            .await
+            {
+                return reset_resp;
+            }
+            return oci_error(
+                crate::api::handlers::db_status(&e.to_string()),
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
+    }
     // On conflict clear any `pending_delete_at` marker (#1660): finalizing a
     // chunked upload of a blob GC had marked resurrects it, mirroring the
     // monolithic-upload path above.
@@ -6485,10 +6714,10 @@ async fn handle_complete_upload(
         .await
         {
             Ok(true) => {
-                // The `oci_blobs` row is durable, so the blob key is now
-                // referenced. Drop its journal entry (the reaper's `oci_blobs`
-                // guard would refuse to reclaim it regardless).
-                clear_oci_upload_cleanup_key_best_effort(&state.db, &blob_key).await;
+                // The `oci_blobs` row is durable, which means the transaction
+                // committed — and the #3187 guard's DELETE of the blob key's
+                // journal row was part of that same transaction, so the row is
+                // already gone. Nothing to clear here.
                 let mut cleanup_keys: Vec<String> =
                     parts.iter().map(|part| part.storage_key.clone()).collect();
                 cleanup_keys.push(session.storage_temp_key.clone());
@@ -6545,11 +6774,10 @@ async fn handle_complete_upload(
         );
     }
 
-    // The `oci_blobs` row committed durably, so the blob key is now referenced.
-    // Drop its journal entry. (The reaper independently refuses to reclaim it via
-    // the `oci_blobs` EXISTS guard, so a committed blob is never reclaimed even
-    // if this best-effort clear is lost.)
-    clear_oci_upload_cleanup_key_best_effort(&state.db, &blob_key).await;
+    // The `oci_blobs` row committed durably. The blob key's journal row was
+    // deleted by the #3187 guard inside that same transaction, so the row and
+    // the reference it protected became visible together — there is deliberately
+    // no best-effort clear here to lose.
 
     let mut cleanup_keys: Vec<String> = parts.iter().map(|part| part.storage_key.clone()).collect();
     cleanup_keys.push(session.storage_temp_key.clone());
