@@ -1566,6 +1566,92 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         f.teardown().await;
     }
 
+    /// #3143 scope correction + regression guard: the Helm chart download
+    /// route ALREADY enforces the scan policy, and must keep doing so.
+    ///
+    /// #3143 reported that "`helm.rs` and `terraform.rs` call neither gate on
+    /// their download paths". That is accurate for terraform, but not for the
+    /// Helm hosted download: `download_chart` serves through
+    /// `proxy_helpers::serve_local_artifact`, which calls
+    /// `check_artifact_download` -> `enforce_download_gate`. Grepping `helm.rs`
+    /// for the gate finds nothing because the call is one level down. This test
+    /// pins that indirect coverage so a future refactor away from
+    /// `serve_local_artifact` cannot silently drop it.
+    ///
+    /// (The genuinely ungated Helm path is the VIRTUAL-member arm in
+    /// `download_chart_via_index`, which resolves via `local_fetch_by_path_suffix`.
+    /// That belongs to the cross-format virtual-member class tracked separately.)
+    #[tokio::test]
+    async fn test_hosted_chart_download_already_applies_scan_policy_3143() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let blob = bytes::Bytes::from_static(b"helm-gate-chart-bytes");
+        let filename = "gatechart-0.1.0.tgz";
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &f.repo_info("local", None),
+            filename,
+            filename,
+            "gatechart",
+            "0.1.0",
+            "application/gzip",
+            blob.clone(),
+            f.user_id,
+        )
+        .await;
+
+        let uri = format!("/{}/charts/{}", f.repo_key, filename);
+
+        // POSITIVE CONTROL: no policy -> serves.
+        let (before_status, before_body) =
+            tdh::send(f.router_anon(super::router()), tdh::get(uri.clone())).await;
+
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-3143-helm-{}", f.repo_id))
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("insert block_unscanned policy");
+
+        let (blocked_status, _) =
+            tdh::send(f.router_anon(super::router()), tdh::get(uri.clone())).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
+
+        // NEGATIVE CONTROL: policy removed -> serves again.
+        let (after_status, _) =
+            tdh::send(f.router_anon(super::router()), tdh::get(uri.clone())).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            before_status,
+            StatusCode::OK,
+            "positive control: with no scan policy the chart must download"
+        );
+        assert_eq!(&before_body[..], &blob[..], "positive control: chart bytes");
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "the Helm hosted download must enforce the scan policy (via \
+             serve_local_artifact -> enforce_download_gate), got {blocked_status}"
+        );
+        assert_eq!(
+            after_status,
+            StatusCode::OK,
+            "negative control: removing the policy must restore the download"
+        );
+    }
+
     /// Regression guard for #3150: OCI manifest rows written into a classic
     /// Helm repository by older versions must not leak into `index.yaml`.
     #[tokio::test]

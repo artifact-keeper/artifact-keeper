@@ -438,9 +438,10 @@ async fn download_module_archive(
     )
     .await?;
 
-    if let Some(artifact_id) = result.artifact_id {
-        crate::services::artifact_service::record_download(&state.db, artifact_id, &ctx).await;
-    }
+    // #3143: enforce quarantine + scan policy before streaming. `local_fetch_by_path`
+    // applies the quarantine predicate only, so this route served artifacts that
+    // `block_unscanned` / `block_on_fail` / `max_severity` should have blocked.
+    proxy_helpers::gate_and_record_streamed_local(&state.db, result.artifact_id, &ctx).await?;
 
     let filename = format!("{}-{}-{}-{}.tar.gz", namespace, name, provider, version);
     proxy_helpers::stream_fetch_result(result, "application/gzip", Some(&filename))
@@ -1020,9 +1021,9 @@ async fn serve_provider_archive(
     )
     .await?;
 
-    if let Some(artifact_id) = result.artifact_id {
-        crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
-    }
+    // #3143: enforce quarantine + scan policy before streaming. Also covers
+    // `mirror_download`'s hosted arm, which resolves through this function.
+    proxy_helpers::gate_and_record_streamed_local(&state.db, result.artifact_id, ctx).await?;
 
     proxy_helpers::stream_fetch_result(result, "application/zip", Some(&pkg.filename()))
 }
@@ -3885,6 +3886,110 @@ mod tests {
         assert_eq!(index_status, axum::http::StatusCode::NOT_FOUND);
         assert_eq!(version_status, axum::http::StatusCode::NOT_FOUND);
         assert_eq!(archive_status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// #3143: terraform download routes must apply the repository's scan
+    /// policy, not just the quarantine predicate.
+    ///
+    /// `download_provider_binary` -> `serve_provider_archive` resolves bytes via
+    /// `local_fetch_by_path`, whose only gate is `check_quarantine_row` (the raw
+    /// quarantine predicate). `block_unscanned` / `block_on_fail` /
+    /// `max_severity` were therefore never consulted on ANY terraform download
+    /// route — `terraform.rs` contained zero `check_artifact_download` calls —
+    /// while the ~25 per-format handlers routed through `enforce_download_gate`
+    /// and blocked. An artifact a format handler would 403 was downloadable here.
+    ///
+    /// Positive control in the SAME fixture: the identical request succeeds
+    /// with no policy in force, so the 403 is attributable to the policy rather
+    /// than to a broken fixture or a route that 403s unconditionally.
+    #[tokio::test]
+    async fn test_provider_binary_applies_scan_policy_3143() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip: &[u8] = b"PK\x03\x04 provider archive";
+        let published = publish_provider_version(&fx, "1.0.0", zip).await;
+
+        let k = fx.repo_key.clone();
+        let m = MOUNT_PREFIX;
+        let binary_path = format!("{m}/{k}/v1/providers/dtf/marker/1.0.0/binary/linux/arm64");
+
+        // POSITIVE CONTROL: no scan policy in force -> the download must work.
+        let (before_status, before_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(binary_path.clone()),
+        )
+        .await;
+
+        // Enable a policy that blocks unscanned artifacts. The published
+        // provider has no `scan_results` rows at all, so it is unscanned.
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-3143-tf-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert block_unscanned policy");
+
+        let (blocked_status, blocked_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(binary_path.clone()),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+
+        // NEGATIVE CONTROL: with the policy removed the same request must serve
+        // again, proving the block was the policy and is fully reversible.
+        let (after_status, after_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(binary_path.clone()),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            published,
+            axum::http::StatusCode::CREATED,
+            "fixture: provider must publish"
+        );
+        assert_eq!(
+            before_status,
+            axum::http::StatusCode::OK,
+            "positive control: with no scan policy the provider binary must download"
+        );
+        assert_eq!(
+            before_body.as_ref(),
+            zip,
+            "positive control: the served bytes must be the published archive"
+        );
+        assert_eq!(
+            blocked_status,
+            axum::http::StatusCode::FORBIDDEN,
+            "#3143: an unscanned provider under block_unscanned must be refused with 403, \
+             got {blocked_status} body={:?}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        assert_ne!(
+            blocked_body.as_ref(),
+            zip,
+            "#3143: the archive bytes must not be served when the policy blocks"
+        );
+        assert_eq!(
+            after_status,
+            axum::http::StatusCode::OK,
+            "negative control: removing the policy must restore the download"
+        );
+        assert_eq!(after_body.as_ref(), zip, "negative control: bytes restored");
     }
 
     /// A package under a quarantine hold must not appear in the metadata
