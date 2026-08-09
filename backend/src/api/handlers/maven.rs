@@ -1165,8 +1165,9 @@ async fn download(
             // way the artifact bytes are.
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
             let members = proxy_helpers::authorize_virtual_members(
-                &state.permission_service,
+                &state.db,
                 auth.as_ref(),
+                repo.id,
                 members,
             )
             .await;
@@ -1326,8 +1327,7 @@ async fn fetch_maven_metadata_bytes(
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
         let members =
-            proxy_helpers::authorize_virtual_members(&state.permission_service, auth, members)
-                .await;
+            proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
 
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
             let cache_key: VirtualMetadataCacheKey =
@@ -1845,12 +1845,9 @@ async fn serve_artifact(
                 // member behaves exactly as if it did not contain the artifact
                 // (404), never leaking its existence.
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-                let members = proxy_helpers::authorize_virtual_members(
-                    &state.permission_service,
-                    auth,
-                    members,
-                )
-                .await;
+                let members =
+                    proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
+                        .await;
 
                 let result = proxy_helpers::resolve_virtual_download_from_members(
                     members,
@@ -4470,6 +4467,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert virtual member");
+        // #3178: the virtual byte/metadata paths filter members by CALLER using
+        // `require_visible`. This fixture is about resolution order, not
+        // authorization, so publish the members -- `require_visible`
+        // early-returns on a public repo. (Before #3178 the fixture passed
+        // with private members because the predicate fell open for any
+        // authenticated caller; that fail-open is the bug.) Authorization is
+        // covered by `repositories::virtual_member_authz_tests`.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![hosted_id])
+            .execute(&pool)
+            .await
+            .expect("publish virtual members");
 
         // -- Build a state rooted at the hosted storage dir so the
         //    virtual-resolution callback can read the jar bytes back.
@@ -4875,6 +4884,18 @@ mod tests {
             .execute(&pool)
             .await
             .expect("insert virtual member");
+            // #3178: the virtual byte/metadata paths filter members by CALLER using
+            // `require_visible`. This fixture is about resolution order, not
+            // authorization, so publish the members -- `require_visible`
+            // early-returns on a public repo. (Before #3178 the fixture passed
+            // with private members because the predicate fell open for any
+            // authenticated caller; that fail-open is the bug.) Authorization is
+            // covered by `repositories::virtual_member_authz_tests`.
+            sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+                .bind(vec![member_a, member_b])
+                .execute(&pool)
+                .await
+                .expect("publish virtual members");
         }
 
         let state = tdh::build_state(pool.clone(), dir_a.to_str().unwrap());
@@ -5290,6 +5311,18 @@ mod tests {
             .execute(&pool)
             .await
             .expect("link virtual member");
+            // #3178: the virtual byte/metadata paths filter members by CALLER using
+            // `require_visible`. This fixture is about resolution order, not
+            // authorization, so publish the members -- `require_visible`
+            // early-returns on a public repo. (Before #3178 the fixture passed
+            // with private members because the predicate fell open for any
+            // authenticated caller; that fail-open is the bug.) Authorization is
+            // covered by `repositories::virtual_member_authz_tests`.
+            sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+                .bind(vec![local_id, remote_id])
+                .execute(&pool)
+                .await
+                .expect("publish virtual members");
         }
 
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir_r.to_str().unwrap());
@@ -5398,6 +5431,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("link local (prio 1) and remote (prio 2) as virtual members");
+        // #3178: the virtual byte/metadata paths filter members by CALLER using
+        // `require_visible`. This fixture is about resolution order, not
+        // authorization, so publish the members -- `require_visible`
+        // early-returns on a public repo. (Before #3178 the fixture passed
+        // with private members because the predicate fell open for any
+        // authenticated caller; that fail-open is the bug.) Authorization is
+        // covered by `repositories::virtual_member_authz_tests`.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![local_id, remote_id])
+            .execute(&pool)
+            .await
+            .expect("publish virtual members");
 
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
@@ -5590,6 +5635,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("link local (prio 1) and remote (prio 2) as virtual members");
+        // #3178: the virtual byte/metadata paths filter members by CALLER using
+        // `require_visible`. This fixture is about resolution order, not
+        // authorization, so publish the members -- `require_visible`
+        // early-returns on a public repo. (Before #3178 the fixture passed
+        // with private members because the predicate fell open for any
+        // authenticated caller; that fail-open is the bug.) Authorization is
+        // covered by `repositories::virtual_member_authz_tests`.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![local_id, remote_id])
+            .execute(&pool)
+            .await
+            .expect("publish virtual members");
 
         let auth = tdh::make_auth(user_id, "ph-2328-user");
 

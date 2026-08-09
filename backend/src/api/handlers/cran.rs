@@ -195,6 +195,7 @@ async fn package_index_gz(
 
 async fn download_package(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, filename)): Path<(String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -207,6 +208,7 @@ async fn download_package(
                 let upstream_path = format!("src/contrib/{}", filename);
                 if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
                     &state,
+                    auth.as_ref(),
                     &repo,
                     &ctx,
                     proxy_helpers::DownloadResponseOpts {

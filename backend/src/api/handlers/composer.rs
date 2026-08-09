@@ -1245,6 +1245,7 @@ async fn metadata_v1(
 
 async fn download_archive(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, vendor, package, version, reference)): Path<(
         String,
         String,
@@ -1330,6 +1331,7 @@ async fn download_archive(
                     format!("dist/{}/{}/{}/{}.zip", vendor, package, version, reference);
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,

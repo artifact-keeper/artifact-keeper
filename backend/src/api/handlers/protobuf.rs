@@ -1262,6 +1262,7 @@ async fn upload(
 
 async fn download(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
     axum::Json(body): axum::Json<DownloadRequest>,
@@ -1375,6 +1376,7 @@ async fn download(
 
                     let result = proxy_helpers::resolve_virtual_download(
                         &state.db,
+                        auth.as_ref(),
                         state.proxy_service.as_deref(),
                         repo.id,
                         &upstream_path,

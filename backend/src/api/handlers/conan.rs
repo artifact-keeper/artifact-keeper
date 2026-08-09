@@ -1554,6 +1554,7 @@ async fn recipe_files_list(
 
 async fn recipe_file_download(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision, file_path)): Path<(
         String,
         String,
@@ -1626,6 +1627,7 @@ async fn recipe_file_download(
                 let vpath = artifact_path.clone();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
@@ -2333,6 +2335,7 @@ fn files_listing_response(filenames: Vec<String>) -> Response {
 #[allow(clippy::type_complexity)]
 async fn package_file_download(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision, file_path)): Path<(
         String,
         String,
@@ -2427,6 +2430,7 @@ async fn package_file_download(
                 let vpath = artifact_path.clone();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,

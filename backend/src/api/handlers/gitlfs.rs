@@ -595,6 +595,7 @@ async fn upload_object(
 
 async fn download_object(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, oid)): Path<(String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -653,6 +654,7 @@ async fn download_object(
                 let upstream_path = format!("objects/{}", oid);
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,

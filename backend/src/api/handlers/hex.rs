@@ -556,6 +556,7 @@ async fn package_info(
 
 async fn download_tarball(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, tarball_file)): Path<(String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -597,8 +598,14 @@ async fn download_tarball(
             if repo.repo_type == RepositoryType::Virtual
                 && virtual_local_owns_tarball_name(&state.db, repo.id, filename).await?
             {
-                return serve_virtual_tarball_local_only(&state, repo.id, &upstream_path, filename)
-                    .await;
+                return serve_virtual_tarball_local_only(
+                    &state,
+                    auth.as_ref(),
+                    repo.id,
+                    &upstream_path,
+                    filename,
+                )
+                .await;
             }
 
             // Remote: no Content-Disposition; Virtual: include filename.
@@ -609,6 +616,7 @@ async fn download_tarball(
             };
             if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
                 &state,
+                auth.as_ref(),
                 &repo,
                 &ctx,
                 proxy_helpers::DownloadResponseOpts {
@@ -749,6 +757,7 @@ async fn virtual_local_owns_tarball_name(
 /// and `order_members_local_first` (metadata side, see `package_info`).
 async fn serve_virtual_tarball_local_only(
     state: &SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     upstream_path: &str,
     filename: &str,
@@ -758,6 +767,7 @@ async fn serve_virtual_tarball_local_only(
 
     let result = proxy_helpers::resolve_virtual_download(
         &state.db,
+        auth,
         // Explicit None: any Remote member would route to upstream, which is
         // exactly what the shadowing guard must block. Local members fall
         // through to `local_fetch_by_path_suffix` regardless of proxy state.
@@ -3151,6 +3161,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("link virtual member");
+        // #3178: the virtual byte/metadata paths filter members by CALLER using
+        // `require_visible`. This fixture is about resolution order, not
+        // authorization, so publish the members -- `require_visible`
+        // early-returns on a public repo. (Before #3178 the fixture passed
+        // with private members because the predicate fell open for any
+        // authenticated caller; that fail-open is the bug.) Authorization is
+        // covered by `repositories::virtual_member_authz_tests`.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![local_repo_id])
+            .execute(&pool)
+            .await
+            .expect("publish virtual members");
 
         let name = "jason";
         let version = "1.4.1";
@@ -3278,6 +3300,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("link virtual member");
+        // #3178: the virtual byte/metadata paths filter members by CALLER using
+        // `require_visible`. This fixture is about resolution order, not
+        // authorization, so publish the members -- `require_visible`
+        // early-returns on a public repo. (Before #3178 the fixture passed
+        // with private members because the predicate fell open for any
+        // authenticated caller; that fail-open is the bug.) Authorization is
+        // covered by `repositories::virtual_member_authz_tests`.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![local_repo_id])
+            .execute(&pool)
+            .await
+            .expect("publish virtual members");
 
         let local_repo =
             tdh::make_repo_info(local_repo_id, "local-hex", &local_storage_dir, "hex", None);

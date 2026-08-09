@@ -61,6 +61,7 @@ async fn resolve_sbt_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 
 async fn download_by_path(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, artifact_path)): Path<(String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -113,6 +114,7 @@ async fn download_by_path(
                 let path_clone = artifact_path.to_string();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     artifact_path,

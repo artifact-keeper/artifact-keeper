@@ -834,14 +834,16 @@ async fn virtual_member_checksum(
 
 async fn download_file(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, model_id, revision, filename)): Path<(String, String, String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    download_file_impl(state, repo_key, model_id, revision, filename, ctx).await
+    download_file_impl(state, auth, repo_key, model_id, revision, filename, ctx).await
 }
 
 async fn download_file_namespaced(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, revision, filename)): Path<(
         String,
         String,
@@ -853,6 +855,7 @@ async fn download_file_namespaced(
 ) -> Result<Response, Response> {
     download_file_impl(
         state,
+        auth,
         repo_key,
         format!("{namespace}/{name}"),
         revision,
@@ -864,6 +867,7 @@ async fn download_file_namespaced(
 
 async fn download_file_impl(
     state: SharedState,
+    auth: Option<crate::api::middleware::auth::AuthExtension>,
     repo_key: String,
     model_id: String,
     revision: String,
@@ -907,6 +911,7 @@ async fn download_file_impl(
         );
         if let Some(mut resp) = proxy_helpers::try_remote_or_virtual_download(
             &state,
+            auth.as_ref(),
             &repo,
             &ctx,
             proxy_helpers::DownloadResponseOpts {

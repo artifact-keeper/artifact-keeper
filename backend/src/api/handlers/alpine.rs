@@ -1099,6 +1099,7 @@ async fn public_key(
 
 async fn download_package(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, branch, repository, arch, filename)): Path<(
         String,
         String,
@@ -1159,6 +1160,7 @@ async fn download_package(
                 let artifact_path_clone = artifact_path.clone();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,

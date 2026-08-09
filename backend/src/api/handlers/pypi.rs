@@ -1736,7 +1736,7 @@ async fn serve_virtual_metadata(
     }
 
     let members =
-        proxy_helpers::authorize_virtual_members(&state.permission_service, auth, members).await;
+        proxy_helpers::authorize_virtual_members(&state.db, auth, virtual_repo.id, members).await;
 
     // Keep PEP 658 metadata resolution symmetric with the simple-index and
     // distribution-download paths. A higher-priority local owner suppresses a
@@ -2420,12 +2420,9 @@ async fn serve_file(
                 // as if it did not contain the artifact (404) and its existence
                 // is never leaked. Routes through the SAME helper the Maven
                 // download path uses.
-                let members = proxy_helpers::authorize_virtual_members(
-                    &state.permission_service,
-                    auth,
-                    members,
-                )
-                .await;
+                let members =
+                    proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
+                        .await;
 
                 // PEP 708 dependency-confusion guard (#1600), superseding the
                 // version-aware shadowing guard (#1217, #1582) and the

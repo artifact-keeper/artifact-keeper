@@ -245,6 +245,7 @@ async fn version_info(
 
 async fn download_cookbook(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version)): Path<(String, String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -303,6 +304,7 @@ async fn download_cookbook(
                 let version_clone = version.clone();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,

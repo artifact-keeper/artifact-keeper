@@ -2828,16 +2828,18 @@ fn rewrite_and_respond_inner(
 
 async fn download_tarball(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package, filename)): Path<(String, String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    serve_tarball(&state, &repo_key, &package, &filename, &ctx).await
+    serve_tarball(&state, auth.as_ref(), &repo_key, &package, &filename, &ctx).await
 }
 
 async fn download_scoped_tarball(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, package, filename)): Path<(String, String, String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -2845,7 +2847,15 @@ async fn download_scoped_tarball(
     let package = normalize_package_name(&package);
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
-    serve_tarball(&state, &repo_key, &full_name, &filename, &ctx).await
+    serve_tarball(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &full_name,
+        &filename,
+        &ctx,
+    )
+    .await
 }
 
 /// Fetch an npm tarball from a virtual member's local storage, matching
@@ -2946,6 +2956,7 @@ async fn npm_local_fetch(
 
 async fn serve_tarball(
     state: &SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     repo_key: &str,
     package_name: &str,
     filename: &str,
@@ -3112,6 +3123,11 @@ async fn serve_tarball(
         // always eligible, preserving the `virtual_non_remote_owns_name`
         // shadowing guard and the local-only primitive above.
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // #3178: authorize the member set against the CALLER before any
+        // format-specific filtering, so a member this caller could not read
+        // directly can never reach the byte resolver.
+        let members =
+            proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
         let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
         let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
             .await
@@ -7334,6 +7350,7 @@ mod tests {
         // segments via the Path extractor.
         let result = super::download_scoped_tarball(
             axum::extract::State(state.clone()),
+            axum::Extension(tdh::admin_auth_ext()),
             axum::extract::Path((
                 fx.repo_key.clone(),
                 "e2escope".to_string(),
@@ -7437,6 +7454,7 @@ mod tests {
             }
             let result = super::download_tarball(
                 axum::extract::State(state.clone()),
+                axum::Extension(tdh::admin_auth_ext()),
                 axum::extract::Path((
                     fx.repo_key.clone(),
                     "bigpkg".to_string(),
@@ -9694,6 +9712,7 @@ mod db_cov_tests {
 
         let young = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             package,
             &format!("{package}-9.9.9.tgz"),
@@ -9702,6 +9721,7 @@ mod db_cov_tests {
         .await;
         let aged = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             package,
             &format!("{package}-1.0.0.tgz"),
@@ -10544,9 +10564,15 @@ mod proxy_scan_block_tests {
         let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
         let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
 
-        let result =
-            super::serve_tarball(&state, &fx.repo_key, package, filename, &Default::default())
-                .await;
+        let result = super::serve_tarball(
+            &state,
+            tdh::admin_auth_ext().as_ref(),
+            &fx.repo_key,
+            package,
+            filename,
+            &Default::default(),
+        )
+        .await;
 
         cleanup_proxy_scan_row(&fx.pool, &digest).await;
         cleanup_npm_member(&fx.pool, member_id, &member_dir).await;
@@ -10606,9 +10632,15 @@ mod proxy_scan_block_tests {
         let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
         let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
 
-        let result =
-            super::serve_tarball(&state, &fx.repo_key, package, filename, &Default::default())
-                .await;
+        let result = super::serve_tarball(
+            &state,
+            tdh::admin_auth_ext().as_ref(),
+            &fx.repo_key,
+            package,
+            filename,
+            &Default::default(),
+        )
+        .await;
         let status = result
             .as_ref()
             .map(|r| r.status())
@@ -10817,6 +10849,7 @@ mod proxy_scan_block_tests {
 
             let result = super::serve_tarball(
                 &state,
+                tdh::admin_auth_ext().as_ref(),
                 &fx.repo_key,
                 "lodash",
                 "lodash-4.17.11.tgz",
@@ -10876,6 +10909,7 @@ mod proxy_scan_block_tests {
 
         let result = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             "lodash",
             "lodash-4.17.11.tgz",
@@ -10936,6 +10970,7 @@ mod proxy_scan_block_tests {
 
         let result = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             "sealed-widget",
             "sealed-widget-1.0.0.tgz",
@@ -10985,6 +11020,7 @@ mod proxy_scan_block_tests {
 
         let result = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             "open-widget",
             "open-widget-2.0.0.tgz",
@@ -11089,6 +11125,7 @@ mod proxy_scan_block_tests {
         for pull in ["first", "second (cache-served)"] {
             let result = super::serve_tarball(
                 &state,
+                tdh::admin_auth_ext().as_ref(),
                 &fx.repo_key,
                 "poisoned-widget",
                 "poisoned-widget-0.1.0.tgz",
@@ -11166,6 +11203,7 @@ mod proxy_scan_block_tests {
 
         let result = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             "@acme/secret-widget",
             "secret-widget-1.0.0.tgz",
@@ -11235,6 +11273,7 @@ mod proxy_scan_block_tests {
 
         let result = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             "verified-widget",
             "verified-widget-3.2.1.tgz",
@@ -11328,6 +11367,7 @@ mod proxy_scan_block_tests {
 
         let result = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             "staleclean-widget",
             "staleclean-widget-1.0.0.tgz",
@@ -11407,6 +11447,7 @@ mod proxy_scan_block_tests {
 
         let result = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             "probenone-widget",
             "probenone-widget-1.0.0.tgz",
@@ -11455,6 +11496,7 @@ mod proxy_scan_block_tests {
 
         let result = super::serve_tarball(
             &state,
+            tdh::admin_auth_ext().as_ref(),
             &fx.repo_key,
             "plain-widget",
             "plain-widget-1.0.0.tgz",
@@ -11565,6 +11607,7 @@ mod content_encoding_forwarding_tests {
         let (state, _dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
         let result = super::download_tarball(
             axum::extract::State(state.clone()),
+            axum::Extension(tdh::admin_auth_ext()),
             axum::extract::Path((
                 fx.repo_key.clone(),
                 "coded-pkg".to_string(),
@@ -11629,6 +11672,7 @@ mod content_encoding_forwarding_tests {
         let (state, _dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
         let result = super::download_tarball(
             axum::extract::State(state.clone()),
+            axum::Extension(tdh::admin_auth_ext()),
             axum::extract::Path((
                 fx.repo_key.clone(),
                 "plain-pkg".to_string(),
@@ -11697,6 +11741,7 @@ mod content_encoding_forwarding_tests {
 
         let result = super::download_tarball(
             axum::extract::State(state.clone()),
+            axum::Extension(tdh::admin_auth_ext()),
             axum::extract::Path((
                 fx.repo_key.clone(),
                 "vcoded-pkg".to_string(),

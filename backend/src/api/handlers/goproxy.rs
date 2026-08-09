@@ -203,6 +203,7 @@ async fn resolve_go_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respon
 
 async fn handle_get(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -215,10 +216,10 @@ async fn handle_get(
             version_info(&state, &repo, &module, &version).await
         }
         GoProxyRequest::Mod { module, version } => {
-            get_mod_file(&state, &repo, &module, &version, &ctx).await
+            get_mod_file(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
         }
         GoProxyRequest::Zip { module, version } => {
-            download_zip(&state, &repo, &module, &version, &ctx).await
+            download_zip(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
         }
         GoProxyRequest::Latest { module } => latest_version(&state, &repo, &module).await,
         GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
@@ -838,6 +839,7 @@ async fn version_info(
 
 async fn get_mod_file(
     state: &SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     repo: &RepoInfo,
     module: &str,
     version: &str,
@@ -905,6 +907,7 @@ async fn get_mod_file(
                 let version_clone = version.to_string();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth,
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
@@ -970,6 +973,7 @@ async fn get_mod_file(
 
 async fn download_zip(
     state: &SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     repo: &RepoInfo,
     module: &str,
     version: &str,
@@ -1040,6 +1044,12 @@ async fn download_zip(
             // the structured 451 is the answer, not a bare 404.
             if repo.repo_type == RepositoryType::Virtual {
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                // #3178: authorize the member set against the CALLER before any
+                // format-specific filtering, so a member this caller could not
+                // read directly can never reach the byte resolver.
+                let members =
+                    proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
+                        .await;
                 let mut allowed = Vec::with_capacity(members.len());
                 let mut blocked_response = None;
                 for member in members {
@@ -1692,9 +1702,16 @@ mod tests {
 
         // The requested artifact itself blocks with the structured 451.
         let ctx = Default::default();
-        let err = download_zip(&state, &repo, module, "v1.1.0", &ctx)
-            .await
-            .expect_err("young zip must block");
+        let err = download_zip(
+            &state,
+            tdh::admin_auth_ext().as_ref(),
+            &repo,
+            module,
+            "v1.1.0",
+            &ctx,
+        )
+        .await
+        .expect_err("young zip must block");
         assert_eq!(err.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
         let blocked: serde_json::Value =
             serde_json::from_str(&body_string(err).await).expect("451 JSON body");
@@ -1734,9 +1751,16 @@ mod tests {
             .expect("aged latest must serve");
         let latest_body = body_string(latest).await;
         assert!(latest_body.contains("v1.1.0"), "got {latest_body}");
-        let zip = download_zip(&state, &repo, module, "v1.1.0", &ctx)
-            .await
-            .expect("aged zip must serve");
+        let zip = download_zip(
+            &state,
+            tdh::admin_auth_ext().as_ref(),
+            &repo,
+            module,
+            "v1.1.0",
+            &ctx,
+        )
+        .await
+        .expect("aged zip must serve");
         assert_eq!(zip.status(), StatusCode::OK);
 
         tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;

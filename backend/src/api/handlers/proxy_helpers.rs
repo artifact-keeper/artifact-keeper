@@ -2082,8 +2082,16 @@ pub(crate) fn classify_streaming_upstream(
 ///
 /// Returns the first successful result, or `NOT_FOUND` if no member
 /// has the artifact.
+///
+/// `auth` is the CALLER (#3178). It is not optional-by-omission: this function
+/// used to take no caller at all, so it structurally could not filter members
+/// and streamed a PRIVATE member's bytes to anyone who could reach the virtual
+/// parent — including, when that parent was public, an anonymous `curl`. The
+/// member set is narrowed by [`authorize_virtual_members`] before any member is
+/// probed, so a member the caller could not read directly can never serve.
 pub async fn resolve_virtual_download<F, Fut>(
     db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     proxy_service: Option<&ProxyService>,
     virtual_repo_id: Uuid,
     path: &str,
@@ -2094,6 +2102,18 @@ where
     Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let had_members = !members.is_empty();
+    let members = authorize_virtual_members(db, auth, virtual_repo_id, members).await;
+    if had_members && members.is_empty() {
+        // Do NOT fall through to the "has no members" message: that would
+        // distinguish "this virtual is empty" from "this virtual has members
+        // you may not see", an existence oracle over private repositories.
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Artifact not found in any member repository",
+        )
+            .into_response());
+    }
     resolve_virtual_download_from_members(members, proxy_service, path, local_fetch).await
 }
 
@@ -2246,8 +2266,13 @@ fn is_quarantine_block_response(resp: &Response) -> bool {
 /// upstream-free only for immutable content; mutable indexes/metadata must go
 /// through [`resolve_virtual_metadata`] / the metadata-merge helpers instead.
 #[allow(clippy::too_many_arguments)]
+///
+/// `auth` is the CALLER (#3178), applied by [`authorize_virtual_members`]
+/// exactly as in the buffered [`resolve_virtual_download`]: both byte paths
+/// must agree on which members this caller may see.
 pub async fn resolve_virtual_download_streaming<F, Fut>(
     state: &AppState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     proxy_service: Option<&ProxyService>,
     virtual_repo_id: Uuid,
     path: &str,
@@ -2264,6 +2289,18 @@ where
 
     if members.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+    }
+
+    // #3178: narrow to the members this caller may read BEFORE any member is
+    // probed. The collapsed message is deliberate — see `resolve_virtual_
+    // download` for why it must not be distinguishable from a genuine miss.
+    let members = authorize_virtual_members(&state.db, auth, virtual_repo_id, members).await;
+    if members.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Artifact not found in any member repository",
+        )
+            .into_response());
     }
 
     // Two-phase, priority-preserving resolution (#2069), streaming sibling of
@@ -2695,95 +2732,115 @@ pub async fn fetch_virtual_members(
     .map_err(map_db_err)
 }
 
-/// Decide whether `auth` is allowed to read `member` directly, mirroring the
-/// read-access model that [`crate::api::middleware::auth::repo_visibility_middleware`]
-/// applies to the URL-named repository.
+/// Filter a virtual repository's members down to those the caller may read
+/// DIRECTLY, preserving priority order.
 ///
 /// Security (#1804): the visibility middleware only authorizes the URL repo. A
-/// public Virtual repo therefore became a confused deputy that streamed its
-/// PRIVATE members' bytes to anyone allowed to read the virtual. Every member
-/// that would actually serve a response must be re-checked against the same
-/// model as a direct read so aggregation cannot bypass access control.
+/// Virtual repo is therefore a confused deputy — everything it aggregates on
+/// the caller's behalf is a SEPARATE repository with its own ACL, and must be
+/// re-checked against the same model as a direct read so aggregation cannot
+/// bypass access control.
 ///
-/// The decision is:
-/// * public member → readable by anyone;
-/// * otherwise the caller must be authenticated, and either:
-///   * an admin, or
-///   * pass the API-token repo scope ([`AuthExtension::can_access_repo`]) AND,
-///     if fine-grained rules exist for the member, hold the `read` (or `admin`)
-///     action on it.
+/// The predicate is `require_visible`'s composition, verbatim:
+///
+/// ```text
+/// is_public OR (in_scope AND (is_admin OR grants))
+/// ```
+///
+/// composed here exactly as PR #3173 composes it for the member LISTING paths:
+/// the GRANT half in SQL via
+/// [`RepositoryService::filter_visible_repo_ids`] +
+/// [`member_grant_visibility`], and the token-SCOPE half per row via
+/// [`member_passes_token_scope`]. Reusing those two helpers is deliberate:
+/// listing and byte resolution now evaluate the SAME predicate from the SAME
+/// code, so "which members does this caller see" cannot drift between the two.
+///
+/// What this replaces (#3178). The previous implementation was NOT this
+/// predicate. Its entitlement half was
+///
+/// ```text
+/// can_access_repo(member.id) AND (rules_exist_for_member ? holds_read : TRUE)
+/// ```
+///
+/// which is wrong twice over:
+///
+/// * `can_access_repo` is the caller's TOKEN SCOPE, not repository visibility.
+///   It returns `true` for every repository in the instance whenever the
+///   principal is unscoped — a browser JWT session, an unrestricted API token —
+///   so for the common caller it was not a check at all.
+/// * the `Ok(false) => true` arm FELL OPEN: a private member carrying no
+///   fine-grained `permissions` rows was readable by any authenticated caller,
+///   regardless of grants. Measured on the same repo and principal,
+///   `require_visible` said false while this said true.
+///
+/// Together those two made an authenticated caller with no grant — and, through
+/// a public Virtual parent, an ANONYMOUS caller — able to read a private
+/// member's bytes.
+///
+/// Note the entitlement half is now identical to a direct read of the member
+/// ([`build_grant_predicate`] honours BOTH the `role_assignments` store and the
+/// fine-grained `permissions` store, including group grants), so a member is
+/// readable through the virtual exactly when its own `GET` would succeed.
+///
+/// Fails CLOSED: a database error yields the empty set rather than the
+/// unfiltered one.
 ///
 /// Callers should treat a denied member as if it did not contain the artifact
 /// (continue to the next member / return not-found) so member existence is not
 /// leaked through the virtual repo.
-pub async fn caller_can_read_member(
-    permission_service: &crate::services::permission_service::PermissionService,
-    auth: Option<&crate::api::middleware::auth::AuthExtension>,
-    member: &Repository,
-) -> bool {
-    // Public members are readable by everyone, exactly like a direct read of a
-    // public repo.
-    if member.is_public {
-        return true;
-    }
-
-    // Private member: anonymous callers can never read it directly.
-    let Some(ext) = auth else {
-        return false;
-    };
-
-    // Admins bypass fine-grained checks, matching the middleware.
-    if ext.is_admin {
-        return true;
-    }
-
-    // API-token repository scope (#504): a token scoped to other repos must not
-    // reach this member.
-    if !ext.can_access_repo(member.id) {
-        return false;
-    }
-
-    // Fine-grained repository permissions (#817): if rules exist for the member,
-    // the caller must hold the `read` action (or `admin`, which implies it). If
-    // no rules exist, the visibility check above (private + authenticated) is
-    // the access model. Fail closed on DB errors.
-    match permission_service
-        .has_any_rules_for_target("repository", member.id)
-        .await
-    {
-        Ok(true) => {
-            let read = permission_service
-                .check_permission(ext.user_id, "repository", member.id, "read", false)
-                .await
-                .unwrap_or(false);
-            if read {
-                return true;
-            }
-            permission_service
-                .check_permission(ext.user_id, "repository", member.id, "admin", false)
-                .await
-                .unwrap_or(false)
-        }
-        Ok(false) => true,
-        Err(_) => false,
-    }
-}
-
-/// Filter a virtual repository's members down to those the caller may read
-/// directly, preserving priority order. See [`caller_can_read_member`] for the
-/// per-member access model and the #1804 confused-deputy background.
+///
+/// [`member_grant_visibility`]: crate::api::handlers::repositories::member_grant_visibility
+/// [`member_passes_token_scope`]: crate::api::handlers::repositories::member_passes_token_scope
+/// [`build_grant_predicate`]: crate::services::repository_service::build_grant_predicate
+/// [`RepositoryService::filter_visible_repo_ids`]: crate::services::repository_service::RepositoryService::filter_visible_repo_ids
 pub async fn authorize_virtual_members(
-    permission_service: &crate::services::permission_service::PermissionService,
+    db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    virtual_repo_id: Uuid,
     members: Vec<Repository>,
 ) -> Vec<Repository> {
-    let mut allowed = Vec::with_capacity(members.len());
-    for member in members {
-        if caller_can_read_member(permission_service, auth, &member).await {
-            allowed.push(member);
-        }
+    use crate::api::handlers::repositories::{member_grant_visibility, member_passes_token_scope};
+
+    if members.is_empty() {
+        return members;
     }
-    allowed
+    let member_ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
+    let granted: std::collections::HashSet<Uuid> =
+        match crate::services::repository_service::RepositoryService::new(db.clone())
+            .filter_visible_repo_ids(&member_ids, &member_grant_visibility(auth))
+            .await
+        {
+            Ok(ids) => ids.into_iter().collect(),
+            // Fail closed: a DB error must never WIDEN the member set.
+            Err(e) => {
+                tracing::warn!(
+                    virtual_repo_id = %virtual_repo_id,
+                    error = %e,
+                    "virtual member authorization query failed; denying all members"
+                );
+                return Vec::new();
+            }
+        };
+    members
+        .into_iter()
+        .filter(|m| {
+            granted.contains(&m.id)
+                && member_passes_token_scope(auth, virtual_repo_id, m.id, m.is_public)
+        })
+        .collect()
+}
+
+/// Single-member form of [`authorize_virtual_members`]; see it for the access
+/// model and the #1804 / #3178 background.
+pub async fn caller_can_read_member(
+    db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    virtual_repo_id: Uuid,
+    member: &Repository,
+) -> bool {
+    !authorize_virtual_members(db, auth, virtual_repo_id, vec![member.clone()])
+        .await
+        .is_empty()
 }
 
 /// Row type for local artifact fetch queries, including quarantine fields.
@@ -3967,8 +4024,12 @@ pub(crate) async fn record_proxy_download(
     }
 }
 
+/// `auth` is the CALLER (#3178). Only the Virtual arm consults it, to narrow
+/// the member set to what this caller may read; the Remote arm is the URL repo
+/// itself, already authorized by `repo_visibility_middleware`.
 pub async fn try_remote_or_virtual_download(
     state: &crate::api::SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     repo: &RepoInfo,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
     opts: DownloadResponseOpts<'_>,
@@ -4026,6 +4087,7 @@ pub async fn try_remote_or_virtual_download(
                 let state_arc = state.clone();
                 resolve_virtual_download_streaming(
                     state,
+                    auth,
                     proxy_for_virtual,
                     repo.id,
                     opts.upstream_path,
@@ -4049,6 +4111,7 @@ pub async fn try_remote_or_virtual_download(
                 let state_arc = state.clone();
                 resolve_virtual_download_streaming(
                     state,
+                    auth,
                     proxy_for_virtual,
                     repo.id,
                     opts.upstream_path,
@@ -9483,6 +9546,7 @@ mod tests {
         };
         let result = try_remote_or_virtual_download(
             &state,
+            crate::api::handlers::test_db_helpers::admin_auth_ext().as_ref(),
             &repo,
             &crate::api::middleware::download_telemetry::DownloadContext {
                 client_ip: None,
@@ -9535,6 +9599,7 @@ mod tests {
         };
         let result = try_remote_or_virtual_download(
             &state,
+            crate::api::handlers::test_db_helpers::admin_auth_ext().as_ref(),
             &repo,
             &crate::api::middleware::download_telemetry::DownloadContext {
                 client_ip: None,
@@ -9586,6 +9651,7 @@ mod tests {
         };
         let result = try_remote_or_virtual_download(
             &state,
+            crate::api::handlers::test_db_helpers::admin_auth_ext().as_ref(),
             &repo,
             &crate::api::middleware::download_telemetry::DownloadContext {
                 client_ip: None,
@@ -10662,6 +10728,7 @@ mod tests {
 
         let resp = resolve_virtual_download_streaming(
             &state,
+            crate::api::handlers::test_db_helpers::admin_auth_ext().as_ref(),
             Some(&proxy),
             virtual_id,
             "pkg/pkg-1.0.0-py3-none-any.whl",
@@ -10938,6 +11005,7 @@ mod tests {
 
         let err = resolve_virtual_download_streaming(
             &state,
+            crate::api::handlers::test_db_helpers::admin_auth_ext().as_ref(),
             Some(&proxy),
             virtual_id,
             "pkg/pkg-1.0.0-py3-none-any.whl",
@@ -11459,6 +11527,7 @@ mod tests {
         // proxy_service = None so only the Local member can win.
         let result = resolve_virtual_download_streaming(
             &state,
+            crate::api::handlers::test_db_helpers::admin_auth_ext().as_ref(),
             None,
             virtual_id,
             path,
@@ -11491,41 +11560,7 @@ mod tests {
         );
     }
 
-    // ── #1804: per-member authorization for virtual repos ───────────────
-
-    /// Build an in-memory `Repository` for member-authorization tests. Only the
-    /// fields the access decision reads (`id`, `is_public`) are meaningful; the
-    /// rest are inert defaults. Keeping this local avoids duplicating the wide
-    /// struct literal across each member variant (jscpd).
-    fn member_repo(id: Uuid, is_public: bool) -> Repository {
-        Repository {
-            versioning_enabled: false,
-            id,
-            key: format!("member-{}", id.simple()),
-            name: "member".to_string(),
-            description: None,
-            format: RepositoryFormat::Maven,
-            repo_type: RepositoryType::Local,
-            storage_backend: "filesystem".to_string(),
-            storage_path: "/tmp/member-1804".to_string(),
-            upstream_url: None,
-            is_public,
-            quota_bytes: None,
-            promotion_only: false,
-            replication_priority: ReplicationPriority::OnDemand,
-            curation_enabled: false,
-            curation_source_repo_id: None,
-            curation_target_repo_id: None,
-            curation_default_action: "allow".to_string(),
-            curation_sync_interval_secs: 0,
-            curation_auto_fetch: false,
-            age_gate_enabled: false,
-            age_gate_min_age_days: 0,
-            project_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
+    // ── #1804 / #3178: per-member authorization for virtual repos ───────
 
     fn nonadmin_auth(user_id: Uuid) -> crate::api::middleware::auth::AuthExtension {
         crate::api::middleware::auth::AuthExtension {
@@ -11541,64 +11576,75 @@ mod tests {
         }
     }
 
-    /// Verified-bug regression for #1804: a public virtual repo must not serve a
-    /// PRIVATE member's bytes to a caller who could not read that member
-    /// directly. This drives the exact authorization predicate the maven
-    /// download path now applies to every member before fetching bytes:
+    /// Verified-bug regression for #1804, CORRECTED by #3178.
     ///
-    ///   * public member            -> readable by anyone (even anonymous);
-    ///   * private member, no rules  -> readable by any authenticated user,
-    ///                                   denied to anonymous (matches the
-    ///                                   middleware's default access model);
-    ///   * private member WITH rules -> only the caller holding `read` may
-    ///                                   read it; admins are exempt.
+    /// A virtual repo must not serve a PRIVATE member's bytes to a caller who
+    /// could not read that member directly. The predicate is `require_visible`:
     ///
-    /// `authorize_virtual_members` then drops the members the caller could not
-    /// read, so a denied private member behaves as a 404 (never leaked) — the
-    /// fix for the confused-deputy aggregation bypass.
+    /// ```text
+    /// is_public OR (in_scope AND (is_admin OR grants))
+    /// ```
+    ///
+    /// so:
+    ///
+    ///   * public member             -> readable by anyone, even anonymous;
+    ///   * private member, NO grant  -> denied, whether or not the member
+    ///                                  carries fine-grained `permissions` rows;
+    ///   * private member, granted   -> readable (either authz store);
+    ///   * admin                     -> readable.
+    ///
+    /// The middle case is the #3178 correction. This test previously asserted
+    /// the OPPOSITE for a private member with no rules —
+    /// `assert!(caller_can_read_member(perms, Some(&auth), &private_norules))`
+    /// — because the implementation's `Ok(false) => true` arm fell open there.
+    /// The test was written from the implementation, so it pinned the bug
+    /// instead of catching it: an authenticated caller holding NOTHING read a
+    /// private repository's bytes through any virtual that listed it.
+    ///
+    /// Repositories are seeded as REAL rows, not in-memory structs: the grant
+    /// half is evaluated in SQL against `repositories`, so a synthetic id would
+    /// be denied for the wrong reason and the positive controls below would be
+    /// vacuous.
     #[tokio::test]
     async fn test_caller_can_read_member_blocks_private_member_1804() {
+        use crate::api::handlers::test_db_helpers as tdh3178;
         let Some(pool) = db_helpers::try_pool().await else {
             return;
         };
-        let storage_dir = std::env::temp_dir().join(format!("p1804-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&storage_dir).expect("storage dir");
-        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
-        let perms = state.permission_service.as_ref();
+        let virtual_id = Uuid::new_v4();
 
-        // Two private members: one with NO fine-grained rules, one WITH rules
-        // (so the user must hold `read`). Plus a public member.
-        let public_id = Uuid::new_v4();
-        let private_norules_id = Uuid::new_v4();
-        let private_ruled_id = Uuid::new_v4();
+        // Three real member repositories: public; private with no fine-grained
+        // rows; private carrying a rule for an UNRELATED principal (the shape
+        // whose absence used to make the gate fall open).
+        let (public_id, _pk, public_dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(public_id)
+            .execute(&pool)
+            .await
+            .expect("publish member");
+        let (private_norules_id, _nk, norules_dir) =
+            db_helpers::create_repo(&pool, "local", "maven").await;
+        let (private_ruled_id, _rk, ruled_dir) =
+            db_helpers::create_repo(&pool, "local", "maven").await;
 
-        let user_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
-             VALUES ($1, $2, $3, 'unused', 'local', false, true)",
-        )
-        .bind(user_id)
-        .bind(format!("u1804-{}", user_id.simple()))
-        .bind(format!("u1804-{}@test.local", user_id.simple()))
-        .execute(&pool)
-        .await
-        .expect("create user");
+        let (user_id, _uname) = tdh3178::create_user(&pool).await;
+        let (other_id, _oname) = tdh3178::create_user(&pool).await;
 
-        // A rule on `private_ruled_id` (granted to an unrelated principal) makes
-        // `has_any_rules_for_target` true, so the member is gated by `read`.
-        sqlx::query(
-            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
-             VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
-        )
-        .bind(Uuid::new_v4())
-        .bind(private_ruled_id)
-        .execute(&pool)
-        .await
-        .expect("seed ruled-member permission");
+        // A rule on `private_ruled_id` held by someone ELSE.
+        tdh3178::grant_repo_actions(&pool, private_ruled_id, other_id, &["read"]).await;
 
-        let public = member_repo(public_id, true);
-        let private_norules = member_repo(private_norules_id, false);
-        let private_ruled = member_repo(private_ruled_id, false);
+        let load = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                crate::services::repository_service::RepositoryService::new(pool)
+                    .get_by_id(id)
+                    .await
+                    .expect("load member row")
+            }
+        };
+        let public = load(public_id).await;
+        let private_norules = load(private_norules_id).await;
+        let private_ruled = load(private_ruled_id).await;
 
         let auth = nonadmin_auth(user_id);
         let admin = crate::api::middleware::auth::AuthExtension {
@@ -11606,73 +11652,79 @@ mod tests {
             ..nonadmin_auth(Uuid::new_v4())
         };
 
-        // Public member: everyone, including anonymous.
-        assert!(caller_can_read_member(perms, None, &public).await);
-        assert!(caller_can_read_member(perms, Some(&auth), &public).await);
+        // Public member: everyone, including anonymous. (Positive control: a
+        // fix that denied everything would fail here.)
+        assert!(caller_can_read_member(&pool, None, virtual_id, &public).await);
+        assert!(caller_can_read_member(&pool, Some(&auth), virtual_id, &public).await);
 
-        // Private member, no rules: anonymous denied, authenticated allowed.
+        // Private member with NO fine-grained rows -- the #3178 correction.
         assert!(
-            !caller_can_read_member(perms, None, &private_norules).await,
+            !caller_can_read_member(&pool, None, virtual_id, &private_norules).await,
             "anonymous must NOT read a private member (the #1804 leak)"
         );
-        assert!(caller_can_read_member(perms, Some(&auth), &private_norules).await);
-
-        // Private member WITH rules: anonymous + zero-grant user denied.
-        assert!(!caller_can_read_member(perms, None, &private_ruled).await);
         assert!(
-            !caller_can_read_member(perms, Some(&auth), &private_ruled).await,
+            !caller_can_read_member(&pool, Some(&auth), virtual_id, &private_norules).await,
+            "#3178: an authenticated caller holding NO grant must not read a private \
+             member just because the member carries no fine-grained permission rows"
+        );
+
+        // Private member WITH rules held by someone else: still denied.
+        assert!(!caller_can_read_member(&pool, None, virtual_id, &private_ruled).await);
+        assert!(
+            !caller_can_read_member(&pool, Some(&auth), virtual_id, &private_ruled).await,
             "zero-grant non-admin must NOT read a ruled private member (#1804)"
         );
         // Admins are exempt.
-        assert!(caller_can_read_member(perms, Some(&admin), &private_ruled).await);
+        assert!(caller_can_read_member(&pool, Some(&admin), virtual_id, &private_ruled).await);
 
-        // The aggregating filter drops members the anonymous caller cannot read,
-        // leaving only the public member (so private members never serve bytes).
+        // The aggregating filter drops what the anonymous caller cannot read,
+        // leaving ONLY the public member.
         let members = vec![
             public.clone(),
             private_norules.clone(),
             private_ruled.clone(),
         ];
-        let allowed_anon = authorize_virtual_members(perms, None, members.clone()).await;
+        let allowed_anon =
+            authorize_virtual_members(&pool, None, virtual_id, members.clone()).await;
         assert_eq!(
             allowed_anon.iter().map(|m| m.id).collect::<Vec<_>>(),
             vec![public_id],
             "anonymous virtual aggregation must keep ONLY public members (#1804)"
         );
 
-        // Grant the user `read` on the ruled member -> it becomes readable, and a
-        // fresh PermissionService (fresh cache) observes the new grant.
-        sqlx::query(
-            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
-             VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
-        )
-        .bind(user_id)
-        .bind(private_ruled_id)
-        .execute(&pool)
-        .await
-        .expect("grant user read");
-        let state2 = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
-        let perms2 = state2.permission_service.as_ref();
-        let allowed_user = authorize_virtual_members(perms2, Some(&auth), members).await;
+        // POSITIVE CONTROL for the whole change: grant this user on BOTH private
+        // members -- one through each authz store -- and every member comes back.
+        // Without this, a fix that denied all private members would pass.
+        tdh3178::grant_repo_actions(&pool, private_ruled_id, user_id, &["read"]).await;
+        tdh3178::grant_repo_access(&pool, private_norules_id, user_id).await;
+        let allowed_user = authorize_virtual_members(&pool, Some(&auth), virtual_id, members).await;
         assert_eq!(
             allowed_user
                 .iter()
                 .map(|m| m.id)
                 .collect::<std::collections::HashSet<_>>(),
             std::collections::HashSet::from([public_id, private_norules_id, private_ruled_id]),
-            "a user granted read on the member must still see it (no over-restriction)"
+            "a user granted on the members must still see them (no over-restriction)"
         );
 
+        // An admin sees everything regardless of grants.
+        let allowed_admin = authorize_virtual_members(
+            &pool,
+            Some(&admin),
+            virtual_id,
+            vec![public, private_norules, private_ruled],
+        )
+        .await;
+        assert_eq!(allowed_admin.len(), 3, "admin must still see every member");
+
         // -- Cleanup.
-        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = ANY($1)")
-            .bind(vec![private_ruled_id])
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
-            .bind(user_id)
-            .execute(&pool)
-            .await;
-        let _ = std::fs::remove_dir_all(&storage_dir);
+        db_helpers::cleanup(&pool, public_id, user_id).await;
+        db_helpers::cleanup(&pool, private_norules_id, other_id).await;
+        db_helpers::cleanup(&pool, private_ruled_id, user_id).await;
+        tdh3178::cleanup_user(&pool, other_id).await;
+        for d in [public_dir, norules_dir, ruled_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]

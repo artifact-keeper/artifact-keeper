@@ -1600,3 +1600,20 @@ pub async fn collect_response(
         .expect("body");
     (status, body, headers)
 }
+
+/// An admin-shaped `Extension<Option<AuthExtension>>` payload for tests that
+/// invoke a download handler (or `proxy_helpers` resolver) DIRECTLY rather than
+/// through a router.
+///
+/// Since #3178 the virtual-repo byte resolvers filter members by caller, so a
+/// direct call must supply one. A global admin reproduces the pre-#3178
+/// unfiltered member set exactly, which keeps those tests measuring what they
+/// were written to measure (resolution order, caching, telemetry) instead of
+/// silently becoming authorization tests. Authorization itself is covered by
+/// `repositories::virtual_member_authz_tests`.
+///
+/// No `users` row is required: `RepoVisibility::All` short-circuits before any
+/// query.
+pub fn admin_auth_ext() -> Option<AuthExtension> {
+    Some(admin_auth(Uuid::new_v4(), "tdh-resolver-admin"))
+}

@@ -2721,6 +2721,7 @@ fn xz_compress(data: &[u8]) -> Result<Vec<u8>, io::Error> {
 
 async fn pool_download(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, component, path)): Path<(String, String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -2814,6 +2815,16 @@ async fn pool_download(
                 // aggregate. Fail-closed per member: a filter-load error skips
                 // only that member, it does not fail the whole request open.
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                // #3178: authorize the member set against the CALLER before any
+                // format-specific filtering, so a member this caller could not
+                // read directly can never reach the byte resolver.
+                let members = proxy_helpers::authorize_virtual_members(
+                    &state.db,
+                    auth.as_ref(),
+                    repo.id,
+                    members,
+                )
+                .await;
                 let mut allowed_members = Vec::with_capacity(members.len());
                 for member in members {
                     match remote_member_upstream(&member) {

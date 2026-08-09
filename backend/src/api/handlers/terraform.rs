@@ -272,6 +272,7 @@ async fn list_module_versions(
 
 async fn download_module(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, provider, version)): Path<(
         String,
         String,
@@ -349,6 +350,7 @@ async fn download_module(
                 let vversion = version.clone();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
@@ -796,6 +798,7 @@ async fn list_provider_versions(
 
 async fn download_provider(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, type_name, version, os, arch)): Path<(
         String,
         String,
@@ -881,6 +884,7 @@ async fn download_provider(
                 let vversion = version.clone();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,

@@ -821,6 +821,7 @@ async fn publish(
 
 async fn download(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version)): Path<(String, String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -998,6 +999,7 @@ async fn download(
 
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     proxy_for_virtual,
                     repo.id,
                     &upstream_path,
@@ -1942,6 +1944,19 @@ mod tests {
         .execute(&virt.pool)
         .await
         .expect("link remote member into the virtual repo");
+
+        // #3178: the virtual byte path filters members by CALLER, and this
+        // request is ANONYMOUS. The subject here is Content-Encoding
+        // forwarding, not authorization, so publish both repositories --
+        // `require_visible` early-returns on a public repo. Before #3178 an
+        // anonymous caller was served a PRIVATE member's bytes, which is
+        // exactly the bug; that behaviour is now asserted (inverted) in
+        // `repositories::virtual_member_authz_tests`.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![virt.repo_id, member.repo_id])
+            .execute(&virt.pool)
+            .await
+            .expect("publish the virtual repo and its member");
 
         let (state, _dir) = tdh::rewire_remote_proxy(&member, &server.uri()).await;
         let (status, body, headers) = tdh::send_with_headers(

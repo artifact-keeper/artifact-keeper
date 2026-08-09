@@ -321,6 +321,7 @@ pub async fn query_release_versions_virtual(
 
 async fn version_path_handler(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, name, version_path)): Path<(String, String, String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -329,7 +330,16 @@ async fn version_path_handler(
     if version_path.ends_with(".zip") {
         // Download source archive: /:scope/:name/:version.zip
         let version = version_path.trim_end_matches(".zip");
-        return download_archive(state, &repo_key, &scope, &name, version, &ctx).await;
+        return download_archive(
+            state,
+            auth.as_ref(),
+            &repo_key,
+            &scope,
+            &name,
+            version,
+            &ctx,
+        )
+        .await;
     }
 
     if version_path.ends_with("/Package.swift") || version_path.contains("/Package.swift") {
@@ -491,6 +501,7 @@ async fn get_release_metadata(
 
 async fn download_archive(
     state: SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     repo_key: &str,
     scope: &str,
     name: &str,
@@ -557,6 +568,7 @@ async fn download_archive(
                 let upstream_path = format!("{}/{}/{}.zip", scope, name, version);
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth,
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
@@ -1570,6 +1582,7 @@ mod db_cov_tests {
             }
             let result = super::download_archive(
                 state.clone(),
+                tdh::admin_auth_ext().as_ref(),
                 &fx.repo_key,
                 "apple",
                 "swift-nio",

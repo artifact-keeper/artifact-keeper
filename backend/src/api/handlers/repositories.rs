@@ -446,17 +446,69 @@ fn member_mutation_admin_allowed(is_admin: bool, has_repo_admin: bool) -> bool {
     is_admin || has_repo_admin
 }
 
+/// The gate every virtual-member ATTACH must pass on the MEMBER being attached
+/// (#3177).
+///
+/// Attaching a repository as a virtual member re-exports its contents through a
+/// repository the caller controls, so the member must be one the caller can
+/// actually see. `require_repo_access` is NOT that check: it is a two-line
+/// wrapper over `AuthExtension::can_access_repo`, the caller's TOKEN SCOPE,
+/// which returns `true` for every repository in the instance whenever the
+/// principal is unscoped — which is every browser session. A non-admin who held
+/// `repository:admin` on a virtual of their own could therefore attach any
+/// private repository in the instance and read it straight back out.
+///
+/// The gate is [`require_visible`] — the canonical
+/// `is_public OR (in_scope AND (is_admin OR grants))` — applied to the member
+/// repository the handler has already loaded. A member the caller may not see
+/// therefore collapses to the same existence-hiding 404 as a direct `GET`,
+/// rather than the 403 the old token-scope wrapper produced, which confirmed
+/// the repository exists.
+///
+/// Note this is a VISIBILITY bar, not a write/ownership bar. Whether re-export
+/// through a virtual should additionally require write or ownership on the
+/// member is the open question raised in #3177; raising the bar further is a
+/// product decision, and this change deliberately closes the escalation without
+/// making it.
+async fn require_member_attachable(
+    db: &sqlx::PgPool,
+    auth: &AuthExtension,
+    virtual_repo: &crate::models::repository::Repository,
+    member_repo: &crate::models::repository::Repository,
+    action: &str,
+) -> Result<()> {
+    let service = RepositoryService::new(db.clone());
+    if let Err(e) = require_visible(member_repo, &Some(auth.clone()), &service).await {
+        tracing::warn!(
+            actor_user_id = %auth.user_id,
+            actor_username = %auth.username,
+            virtual_repo_id = %virtual_repo.id,
+            virtual_repo_key = %virtual_repo.key,
+            member_repo_id = %member_repo.id,
+            member_repo_key = %member_repo.key,
+            action = action,
+            "denied virtual-member mutation: member repository is not visible to the caller"
+        );
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Issue #913: authorize a virtual-member mutation.
 ///
 /// All three mutating handlers (`add_virtual_member`, `remove_virtual_member`,
-/// per-iteration step of `update_virtual_members`) must enforce two things
+/// per-iteration step of `update_virtual_members`) must enforce three things
 /// before mutating membership:
 ///
-///   1. Token-scope (`require_repo_access`) on BOTH the virtual parent and the
-///      member repo. A repository-scoped API token must not reach repos it was
-///      not granted. Tokens with `allowed_repo_ids = None` (admins, JWT
-///      sessions, unrestricted API tokens) pass this naturally.
-///   2. Fine-grained privilege on the virtual parent: managing a virtual
+///   1. Token-scope (`require_repo_access`) on the virtual parent. A
+///      repository-scoped API token must not reach repos it was not granted.
+///      Tokens with `allowed_repo_ids = None` (admins, JWT sessions,
+///      unrestricted API tokens) pass this naturally.
+///   2. VISIBILITY on the member repository being attached
+///      ([`require_member_attachable`]). This slot used to hold a second
+///      `require_repo_access` — token scope again, under a name that reads like
+///      an access check — which is the #3177 privilege escalation.
+///   3. Fine-grained privilege on the virtual parent: managing a virtual
 ///      repository's member resolution graph is an administrative change to
 ///      that repository, so non-admins must hold `repository:admin` on the
 ///      virtual parent — the same check `update_repository` /
@@ -469,6 +521,7 @@ fn member_mutation_admin_allowed(is_admin: bool, has_repo_admin: bool) -> bool {
 /// On denial, emit a structured `tracing::warn!` so the event is recoverable
 /// from logs.
 async fn authorize_virtual_member_mutation(
+    db: &sqlx::PgPool,
     auth: &AuthExtension,
     virtual_repo: &crate::models::repository::Repository,
     member_repo: &crate::models::repository::Repository,
@@ -488,19 +541,7 @@ async fn authorize_virtual_member_mutation(
         );
         return Err(e);
     }
-    if let Err(e) = require_repo_access(auth, member_repo.id) {
-        tracing::warn!(
-            actor_user_id = %auth.user_id,
-            actor_username = %auth.username,
-            virtual_repo_id = %virtual_repo.id,
-            virtual_repo_key = %virtual_repo.key,
-            member_repo_id = %member_repo.id,
-            member_repo_key = %member_repo.key,
-            action = action,
-            "denied virtual-member mutation: caller lacks access to member repo"
-        );
-        return Err(e);
-    }
+    require_member_attachable(db, auth, virtual_repo, member_repo, action).await?;
 
     // Fine-grained privilege gate on the virtual parent. Admins short-circuit
     // with no DB lookup; non-admins need `repository:admin` on the virtual repo.
@@ -2809,6 +2850,14 @@ pub async fn create_repository(
             );
             for (idx, input) in member_inputs.iter().enumerate() {
                 let member_repo = service.get_by_key(&input.repo_key).await?;
+                // #3177: this loop applied NO member check at all -- not even
+                // the token-scope one `authorize_virtual_member_mutation` had.
+                // Creating a virtual with a member list is the same re-export
+                // as attaching one afterwards, so it takes the same visibility
+                // gate. `create_repository` is already gated on system-level
+                // `admin` for non-admins, which makes this the narrower of the
+                // two attach paths -- but "narrower" is not "closed".
+                require_member_attachable(&state.db, &auth, &repo, &member_repo, "create").await?;
                 let priority = resolve_member_priority(input.priority, idx);
                 tracing::debug!(
                     virtual_repo = %repo.key,
@@ -6923,6 +6972,7 @@ pub async fn get_artifact_metadata(
         let state_clone = state.clone();
         let result = proxy_helpers::resolve_virtual_download(
             &state.db,
+            auth.as_ref(),
             proxy_for_virtual,
             repo.id,
             &path,
@@ -8090,7 +8140,7 @@ pub async fn download_artifact(
         .download_stream(
             repo.id,
             &path,
-            auth.map(|a| a.user_id),
+            auth.as_ref().map(|a| a.user_id),
             client_ip_str.clone(),
             user_agent.as_deref(),
             // #2260 §5: a HEAD serves no body, so it must not count.
@@ -8208,6 +8258,7 @@ pub async fn download_artifact(
             let path_clone = path.clone();
             let result = proxy_helpers::resolve_virtual_download(
                 &state.db,
+                auth.as_ref(),
                 proxy_for_virtual,
                 repo.id,
                 &path,
@@ -8680,6 +8731,7 @@ pub async fn add_virtual_member(
     let virtual_repo = service.get_by_key(&key).await?;
     let member_repo = service.get_by_key(&payload.member_key).await?;
     authorize_virtual_member_mutation(
+        &state.db,
         &auth,
         &virtual_repo,
         &member_repo,
@@ -8768,6 +8820,7 @@ pub async fn remove_virtual_member(
     }
     let member_repo = service.get_by_key(&member_key).await?;
     authorize_virtual_member_mutation(
+        &state.db,
         &auth,
         &virtual_repo,
         &member_repo,
@@ -8891,6 +8944,7 @@ pub async fn update_virtual_members(
     for member in &payload.members {
         let member_repo = service.get_by_key(&member.member_key).await?;
         authorize_virtual_member_mutation(
+            &state.db,
             &auth,
             &virtual_repo,
             &member_repo,
@@ -13258,17 +13312,30 @@ mod tests {
         let v = make_repo_with_id(virtual_id, "v");
         let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![virtual_id]));
-        let result =
-            authorize_virtual_member_mutation(&ext, &v, &m, "add", &lazy_perm_service()).await;
+        let result = authorize_virtual_member_mutation(
+            &tdh::lazy_pool(),
+            &ext,
+            &v,
+            &m,
+            "add",
+            &lazy_perm_service(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "caller with access to parent only must be denied"
         );
+        // #3177: the member gate is now VISIBILITY, not token scope, so a
+        // member the caller may not see is existence-hidden as a 404 rather
+        // than answered with a 403 that confirms the repository exists. `m` is
+        // private and out of the token's scope, so `require_visible` refuses
+        // at its `can_access_repo` conjunct -- with no database round trip,
+        // which is why the lazy pool here is never contacted.
         match result.unwrap_err() {
-            AppError::Authorization(msg) => {
-                assert!(msg.contains("does not have access"))
+            AppError::NotFound(msg) => {
+                assert!(msg.contains("not found"), "unexpected message: {msg}")
             }
-            other => panic!("Expected Authorization error, got: {:?}", other),
+            other => panic!("Expected NotFound error, got: {:?}", other),
         }
     }
 
@@ -13281,8 +13348,15 @@ mod tests {
         let v = make_repo_with_id(virtual_id, "v");
         let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![member_id]));
-        let result =
-            authorize_virtual_member_mutation(&ext, &v, &m, "remove", &lazy_perm_service()).await;
+        let result = authorize_virtual_member_mutation(
+            &tdh::lazy_pool(),
+            &ext,
+            &v,
+            &m,
+            "remove",
+            &lazy_perm_service(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "caller with access to member only must be denied"
@@ -13298,8 +13372,15 @@ mod tests {
         let v = make_repo_with_id(virtual_id, "v");
         let m = make_repo_with_id(member_id, "m");
         let ext = make_admin_ext();
-        let result =
-            authorize_virtual_member_mutation(&ext, &v, &m, "update", &lazy_perm_service()).await;
+        let result = authorize_virtual_member_mutation(
+            &tdh::lazy_pool(),
+            &ext,
+            &v,
+            &m,
+            "update",
+            &lazy_perm_service(),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "admin must be allowed via is_admin short-circuit with no DB: {:?}",
@@ -13317,8 +13398,15 @@ mod tests {
         let v = make_repo_with_id(virtual_id, "v");
         let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![other]));
-        let result =
-            authorize_virtual_member_mutation(&ext, &v, &m, "add", &lazy_perm_service()).await;
+        let result = authorize_virtual_member_mutation(
+            &tdh::lazy_pool(),
+            &ext,
+            &v,
+            &m,
+            "add",
+            &lazy_perm_service(),
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -14116,13 +14204,22 @@ mod tests {
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
         let v = make_repo_with_id(virtual_id, "v");
-        let m = make_repo_with_id(member_id, "m");
+        // #3177: this test measures the `repository:admin` gate on the PARENT.
+        // Make the member PUBLIC so `require_member_attachable` early-returns
+        // and cannot be what fails -- otherwise a denial here would no longer
+        // distinguish the two gates. The member gate has its own coverage in
+        // `virtual_member_authz_tests`.
+        let m = crate::models::repository::Repository {
+            is_public: true,
+            ..make_repo_with_id(member_id, "m")
+        };
         // Non-admin, unrestricted token-scope (allowed_repo_ids = None) — exactly
         // the password/JWT session shape that the old code let through.
         let ext = tdh::make_auth(user_id, &username);
 
         // Deny: no repository:admin grant on the virtual parent.
         let denied = authorize_virtual_member_mutation(
+            &pool,
             &ext,
             &v,
             &m,
@@ -14153,6 +14250,7 @@ mod tests {
         .expect("grant repository:admin");
 
         let allowed = authorize_virtual_member_mutation(
+            &pool,
             &ext,
             &v,
             &m,
@@ -17317,6 +17415,13 @@ mod tests {
         .await
         .expect("add virtual member");
 
+        // #3178: the virtual byte paths now filter members by CALLER, so the
+        // fixture user needs a grant on the MEMBER, not just on the virtual
+        // parent. Before that fix this test passed without one -- which is
+        // precisely the leak: an unentitled caller was served the member's
+        // bytes.
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+
         let body_bytes: &[u8] = b"virtual-member-content-bytes";
         let member_repo = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
         let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
@@ -17371,11 +17476,16 @@ mod tests {
         assert_eq!(rows[0].2.as_deref(), Some("dl-telemetry-test/1.0"));
 
         // Anonymous content GET: user_id records as NULL, not dropped.
-        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
-            .bind(fx.repo_id)
+        // #3178: a PUBLIC virtual no longer re-exports a PRIVATE member to
+        // anonymous callers, so publish the MEMBER as well. This test is about
+        // download attribution, not authorization; the authorization behaviour
+        // it used to depend on is now asserted (inverted) in
+        // `virtual_member_authz_tests`.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![fx.repo_id, member_id])
             .execute(&fx.pool)
             .await
-            .expect("make virtual repo public");
+            .expect("make virtual repo and member public");
         let mut anon_req = tdh::get(format!("/{}/artifacts/vpath/blob.bin", fx.repo_key));
         anon_req
             .headers_mut()
@@ -17548,6 +17658,13 @@ mod tests {
         .await
         .expect("add virtual member");
 
+        // #3178: the virtual byte paths now filter members by CALLER, so the
+        // fixture user needs a grant on the MEMBER, not just on the virtual
+        // parent. Before that fix this test passed without one -- which is
+        // precisely the leak: an unentitled caller was served the member's
+        // bytes.
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+
         let body_bytes: &[u8] = b"virtual-member-download-bytes";
         let member_repo = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
         let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
@@ -17602,11 +17719,16 @@ mod tests {
         assert_eq!(rows[0].2.as_deref(), Some("dl-telemetry-test/2.0"));
 
         // Anonymous download: user_id records as NULL, not dropped.
-        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
-            .bind(fx.repo_id)
+        // #3178: a PUBLIC virtual no longer re-exports a PRIVATE member to
+        // anonymous callers, so publish the MEMBER as well. This test is about
+        // download attribution, not authorization; the authorization behaviour
+        // it used to depend on is now asserted (inverted) in
+        // `virtual_member_authz_tests`.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![fx.repo_id, member_id])
             .execute(&fx.pool)
             .await
-            .expect("make virtual repo public");
+            .expect("make virtual repo and member public");
         let mut anon_req = tdh::get(format!("/{}/download/vdl/blob.bin", fx.repo_key));
         anon_req
             .headers_mut()

@@ -2683,6 +2683,7 @@ async fn download_package(
                 let artifact_path_clone = artifact_path.clone();
                 let result = proxy_helpers::resolve_virtual_download(
                     &state.db,
+                    auth.as_ref(),
                     state.proxy_service.as_deref(),
                     repo.id,
                     &upstream_path,
