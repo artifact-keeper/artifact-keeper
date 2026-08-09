@@ -8004,17 +8004,27 @@ pub async fn download_artifact(
     // the original URL shape.
     let path = resolve_stored_path(&state, &repo, path).await?;
 
-    // Check quarantine status before serving the artifact.
-    // If the artifact is quarantined or rejected, return 409 Conflict.
+    // Enforce quarantine AND the repository's scan policy before serving the
+    // artifact: quarantined/rejected is a 409/403, a scan-policy violation
+    // (`block_unscanned` / `block_on_fail` / `max_severity`) is a 403.
+    //
+    // #3143: this used to resolve the row itself and call the raw
+    // `check_download_allowed` predicate — quarantine only. The generic REST
+    // download (`/api/v1/repositories/{key}/download/*path`) and the Generic
+    // format route (`/general/{key}/*path`, which re-exports this very handler)
+    // therefore skipped the scan policy entirely, while the ~25 per-format
+    // handlers routed through `enforce_download_gate` and blocked. An artifact
+    // a format handler would 403 was downloadable through the generic path.
+    // Resolving the artifact id and delegating to the shared choke point closes
+    // that and keeps ONE definition of "may this be downloaded" (#2954).
+    //
+    // Deliberately still keyed on the coordinate's HEAD row, so this also
+    // covers the `?version=` historical-revision branch below — which serves
+    // straight from content-addressed storage and never reaches
+    // `ArtifactService::prepare_download`.
     {
-        #[derive(sqlx::FromRow)]
-        struct QuarantineRow {
-            quarantine_status: Option<String>,
-            quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
-        }
-
-        if let Some(qrow) = sqlx::query_as::<_, QuarantineRow>(
-            "SELECT quarantine_status, quarantine_until \
+        if let Some(artifact_id) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id \
              FROM artifacts \
              WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
         )
@@ -8024,11 +8034,8 @@ pub async fn download_artifact(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         {
-            crate::services::quarantine_service::check_download_allowed(
-                qrow.quarantine_status.as_deref(),
-                qrow.quarantine_until,
-                chrono::Utc::now(),
-            )?;
+            crate::services::quarantine_service::enforce_download_gate(&state.db, artifact_id)
+                .await?;
         }
     }
 

@@ -2869,9 +2869,25 @@ async fn serve_file(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
+            // #3147: this arm used to stream `artifacts.storage_key` straight
+            // out of storage with no sidecar, digest or freshness check of any
+            // kind. For a Remote PyPI repo that key IS proxy-cache content
+            // (`proxy-cache/<repo>/simple/<project>/<file>/__content__`), so
+            // the `__cache_meta__.json` sidecar beside it is the record of what
+            // this server actually committed there. Consult it before serving.
+            let verdict = proxy_cache_object_verdict(proxy, &artifact.storage_key).await;
+            if verdict == CachedObjectVerdict::Held {
+                // Package Age Policy (#1770 / #2075) parity: every other read
+                // path 409s on a held entry rather than serving it.
+                return Err(AppError::Conflict(
+                    "Artifact is quarantined and pending security review".to_string(),
+                )
+                .into_response());
+            }
             get_remote_cached_or_refetch_stream(
                 storage.clone(),
                 &artifact.storage_key,
+                verdict.may_serve_stored_object(),
                 || async move {
                     // Fetched lazily inside the closure: this path serves
                     // cache hits straight from storage, and the index_path is
@@ -2941,12 +2957,34 @@ async fn serve_file(
 async fn get_remote_cached_or_refetch_stream<F, Fut>(
     storage: std::sync::Arc<dyn crate::storage::StorageBackend>,
     storage_key: &str,
+    may_serve_stored_object: bool,
     refetch: F,
 ) -> Result<BoxStream<'static, Result<Bytes, std::io::Error>>, Response>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<crate::services::proxy_service::StreamingFetchResult, Response>>,
 {
+    // #3147: when nothing vouches for the stored object, treat it exactly as if
+    // it were absent — refuse it and re-fetch upstream. That is the same
+    // self-healing move the `NotFound` arm below already makes, and the refetch
+    // runs through the proxy service's normal streaming cache path, which
+    // rewrites BOTH the object and its sidecar. So an entry rejected here is
+    // repaired by the very next request rather than refetching forever.
+    if !may_serve_stored_object {
+        tracing::warn!(
+            storage_key = %storage_key,
+            "remote PyPI proxy-cache object has no valid metadata sidecar vouching for it; \
+             refusing to serve it and re-fetching from upstream (#3147)"
+        );
+        let result = refetch().await?;
+        return Ok(tee_refetch_to_storage(
+            storage,
+            storage_key.to_string(),
+            result.content_length,
+            result.body,
+        ));
+    }
+
     match storage.get_stream(storage_key).await {
         Ok(stream) => Ok(stream
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
@@ -2965,6 +3003,68 @@ where
             ))
         }
         Err(e) => Err(map_storage_err(e)),
+    }
+}
+
+/// Whether the object stored at an `artifacts.storage_key` may be streamed
+/// straight out of storage, per the proxy-cache sidecar beside it (#3147).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedObjectVerdict {
+    /// The key is not proxy-cache content, so no sidecar can exist and the
+    /// `artifacts` row is the metadata of record. Serve it as before — this is
+    /// an ordinary local artifact read (a locally-published wheel in a Remote
+    /// repo), not the proxy-cache path #3147 is about.
+    NotProxyCache,
+    /// A positive sidecar vouches for the object.
+    Vouched,
+    /// Proxy-cache content with no usable sidecar: absent, unreadable, or a
+    /// negative-cache marker (#1611) that vouches for no body at all.
+    Unvouched,
+    /// A Package Age Policy hold (#1770) is still active on the entry.
+    Held,
+}
+
+impl CachedObjectVerdict {
+    fn may_serve_stored_object(self) -> bool {
+        matches!(self, Self::NotProxyCache | Self::Vouched)
+    }
+}
+
+/// Map a proxy-cache CONTENT key to its metadata sidecar key.
+///
+/// Returns `None` when `storage_key` is not proxy-cache content, which is the
+/// signal that no sidecar can exist for it. Kept pure so the key algebra is
+/// unit-testable without storage.
+fn proxy_cache_metadata_key_for(storage_key: &str) -> Option<String> {
+    if !storage_key.starts_with("proxy-cache/") {
+        return None;
+    }
+    let stem = storage_key.strip_suffix("__content__")?;
+    Some(format!("{stem}__cache_meta__.json"))
+}
+
+/// Resolve the sidecar verdict for an `artifacts.storage_key`.
+///
+/// Absent and unreadable sidecars both resolve to [`CachedObjectVerdict::Unvouched`]:
+/// `load_cache_metadata_pub` collapses them, and they warrant the same answer
+/// anyway — neither tells us anything about the object, so neither is grounds
+/// to serve it.
+async fn proxy_cache_object_verdict(
+    proxy: &crate::services::proxy_service::ProxyService,
+    storage_key: &str,
+) -> CachedObjectVerdict {
+    let Some(metadata_key) = proxy_cache_metadata_key_for(storage_key) else {
+        return CachedObjectVerdict::NotProxyCache;
+    };
+    match proxy.load_cache_metadata_pub(&metadata_key).await {
+        None => CachedObjectVerdict::Unvouched,
+        Some(metadata) if metadata.negative_cached_until.is_some() => {
+            CachedObjectVerdict::Unvouched
+        }
+        Some(metadata) => match metadata.quarantine_until {
+            Some(until) if until > chrono::Utc::now() => CachedObjectVerdict::Held,
+            _ => CachedObjectVerdict::Vouched,
+        },
     }
 }
 
@@ -7173,16 +7273,20 @@ mod tests {
 
         let storage_key =
             "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
-        let stream =
-            super::get_remote_cached_or_refetch_stream(storage.clone(), storage_key, move || {
+        let stream = super::get_remote_cached_or_refetch_stream(
+            storage.clone(),
+            storage_key,
+            true,
+            move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
                     refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Ok(one_shot_result(b"refetched-bytes"))
                 }
-            })
-            .await
-            .expect("refetch should succeed");
+            },
+        )
+        .await
+        .expect("refetch should succeed");
         let content = collect_stream(stream).await;
 
         assert_eq!(content, Bytes::from_static(b"refetched-bytes"));
@@ -7248,6 +7352,7 @@ mod tests {
         let stream = super::get_remote_cached_or_refetch_stream(
             storage.clone(),
             "proxy-cache/pypi-remote/simple/urllib3/urllib3-2.2.0-py3-none-any.whl/__content__",
+            true,
             move || async move { Ok(one_shot_result(b"refetched-when-disk-full")) },
         )
         .await
@@ -7270,6 +7375,7 @@ mod tests {
         let stream = super::get_remote_cached_or_refetch_stream(
             storage.clone(),
             "proxy-cache/pypi-remote/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux.whl/__content__",
+            true,
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
@@ -7302,6 +7408,7 @@ mod tests {
         let result = super::get_remote_cached_or_refetch_stream(
             storage.clone(),
             "proxy-cache/pypi-remote/simple/six/six-1.16.0.tar.gz/__content__",
+            true,
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
@@ -7338,6 +7445,7 @@ mod tests {
         let result = super::get_remote_cached_or_refetch_stream(
             storage.clone(),
             "proxy-cache/pypi-remote/simple/requests/requests-2.32.0-py3-none-any.whl/__content__",
+            true,
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
@@ -7362,12 +7470,22 @@ mod tests {
         );
     }
 
+    /// #3147: this test used to be called
+    /// `..._preserves_empty_cached_payload` and asserted that "a legitimately
+    /// empty cached payload (zero bytes) is still a cache hit and must be
+    /// returned". There is no such thing as a legitimately empty PyPI
+    /// distribution: a zero-byte object on a cache content key is exactly what
+    /// a rejected or truncated write leaves behind, which is why #1365 and
+    /// #1912 exist. The assertion was codifying the leak.
+    ///
+    /// What it was actually reaching for — that the reader must not confuse
+    /// "storage returned an empty body" with "storage returned NotFound" — is
+    /// a real invariant and is what this test keeps. The zero-byte object is
+    /// still not treated as a miss by the STORAGE layer; whether it may be
+    /// served at all is now decided by the sidecar gate, which the companion
+    /// test below exercises.
     #[tokio::test]
-    async fn test_get_remote_cached_or_refetch_preserves_empty_cached_payload() {
-        // Edge case: a legitimately empty cached payload (zero bytes) is
-        // still a cache hit and must be returned without triggering a
-        // refetch. This guards against accidentally treating empty bodies
-        // as "missing".
+    async fn test_get_remote_cached_or_refetch_does_not_confuse_empty_with_missing() {
         let storage = std::sync::Arc::new(PresentStorage {
             bytes: Bytes::new(),
         });
@@ -7377,6 +7495,7 @@ mod tests {
         let stream = super::get_remote_cached_or_refetch_stream(
             storage.clone(),
             "proxy-cache/pypi-remote/simple/empty/empty-0.0.0.tar.gz/__content__",
+            true,
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
@@ -7386,14 +7505,147 @@ mod tests {
             },
         )
         .await
-        .expect("empty cached payload should still be a hit");
+        .expect("an empty read is not a NotFound");
         let content = collect_stream(stream).await;
 
         assert!(content.is_empty());
         assert_eq!(
             refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "empty cached payload is a cache hit, not a stale miss"
+            "an empty body from storage is not the same signal as NotFound; the \
+             decision about whether it may be SERVED belongs to the sidecar gate \
+             (#3147), not to a length heuristic buried in the storage read"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3147 -- the PyPI Remote arm's sidecar gate.
+    //
+    // For a Remote PyPI repo, `artifacts.storage_key` IS proxy-cache content
+    // (`proxy-cache/<repo>/simple/<project>/<file>/__content__`, as every
+    // fixture in this module shows). The reader streamed it straight out of
+    // storage with no sidecar, digest or freshness check, so an object that no
+    // sidecar vouched for was served under the `artifacts` row's
+    // `Content-Length` and `X-PyPI-File-SHA256` headers -- headers that assert
+    // a size and a digest nothing in the path had verified.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proxy_cache_metadata_key_for_maps_content_to_sidecar() {
+        assert_eq!(
+            super::proxy_cache_metadata_key_for(
+                "proxy-cache/pypi-remote/simple/flask/flask-3.0.0-py3-none-any.whl/__content__"
+            )
+            .as_deref(),
+            Some(
+                "proxy-cache/pypi-remote/simple/flask/flask-3.0.0-py3-none-any.whl/__cache_meta__.json"
+            )
+        );
+    }
+
+    #[test]
+    fn test_proxy_cache_metadata_key_for_rejects_non_cache_keys() {
+        // A locally-published wheel in a Remote repo: an ordinary artifact key
+        // with no sidecar anywhere. It must NOT be gated, or every local
+        // upload into a Remote repo becomes unservable.
+        assert_eq!(
+            super::proxy_cache_metadata_key_for("pypi/flask/3.0.0/flask-3.0.0-py3-none-any.whl"),
+            None
+        );
+        // Proxy-cache-prefixed but not a content key.
+        assert_eq!(
+            super::proxy_cache_metadata_key_for(
+                "proxy-cache/pypi-remote/simple/flask/__cache_meta__.json"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_cached_object_verdict_serve_matrix() {
+        use super::CachedObjectVerdict::*;
+        assert!(NotProxyCache.may_serve_stored_object());
+        assert!(Vouched.may_serve_stored_object());
+        assert!(!Unvouched.may_serve_stored_object());
+        assert!(!Held.may_serve_stored_object());
+    }
+
+    /// The reproduction: an object present on a proxy-cache content key that
+    /// no sidecar vouches for must NOT be streamed to the client. It is
+    /// refused and re-fetched from upstream instead.
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_refuses_an_unvouched_object() {
+        let storage = std::sync::Arc::new(PresentStorage {
+            bytes: Bytes::from_static(b"UNVALIDATED-WHEEL-BYTES"),
+        });
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let stream = super::get_remote_cached_or_refetch_stream(
+            storage.clone(),
+            "proxy-cache/pypi-remote/simple/jinja2/jinja2-3.1.0-py3-none-any.whl/__content__",
+            // No sidecar vouches for the stored object.
+            false,
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(one_shot_result(b"refetched-from-upstream"))
+                }
+            },
+        )
+        .await
+        .expect("the refetch must succeed");
+        let content = collect_stream(stream).await;
+
+        assert_ne!(
+            content,
+            Bytes::from_static(b"UNVALIDATED-WHEEL-BYTES"),
+            "an object no sidecar vouches for must never reach the client (#3147)"
+        );
+        assert_eq!(content, Bytes::from_static(b"refetched-from-upstream"));
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unvouched object must be treated exactly like an absent one: \
+             refuse and refetch"
+        );
+    }
+
+    /// POSITIVE CONTROL for the guard above. A vouched-for cache entry must
+    /// still be served straight from storage, with no upstream traffic at all.
+    /// Without this, hard-wiring the gate to `false` — which would refetch every
+    /// wheel on every request and quietly destroy the proxy cache — would pass.
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_serves_a_vouched_object_without_upstream() {
+        let storage = std::sync::Arc::new(PresentStorage {
+            bytes: Bytes::from_static(b"cached-wheel-bytes"),
+        });
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let stream = super::get_remote_cached_or_refetch_stream(
+            storage.clone(),
+            "proxy-cache/pypi-remote/simple/jinja2/jinja2-3.1.0-py3-none-any.whl/__content__",
+            true,
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(one_shot_result(b"should-not-be-used"))
+                }
+            },
+        )
+        .await
+        .expect("a vouched cache hit must serve");
+        let content = collect_stream(stream).await;
+
+        assert_eq!(content, Bytes::from_static(b"cached-wheel-bytes"));
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a vouched cache hit must not touch upstream: the gate is a gate, \
+             not a cache bypass"
         );
     }
 
@@ -7466,12 +7718,14 @@ mod tests {
     async fn test_streaming_refetch_tees_multi_chunk_body_to_cache() {
         let storage = std::sync::Arc::new(RecordingStorage::new());
         let key = "proxy-cache/pypi-remote/simple/big/big-9.9.9-py3-none-any.whl/__content__";
-        let stream =
-            super::get_remote_cached_or_refetch_stream(storage.clone(), key, move || async move {
-                Ok(multi_chunk_result(vec![b"aaaa", b"bbbb", b"cc"], Some(10)))
-            })
-            .await
-            .expect("streaming refetch should succeed");
+        let stream = super::get_remote_cached_or_refetch_stream(
+            storage.clone(),
+            key,
+            true,
+            move || async move { Ok(multi_chunk_result(vec![b"aaaa", b"bbbb", b"cc"], Some(10))) },
+        )
+        .await
+        .expect("streaming refetch should succeed");
         let content = collect_stream(stream).await;
 
         assert_eq!(content, Bytes::from_static(b"aaaabbbbcc"));
@@ -7493,12 +7747,14 @@ mod tests {
         let storage = std::sync::Arc::new(RecordingStorage::new());
         let key = "proxy-cache/pypi-remote/simple/trunc/trunc-1.0.0-py3-none-any.whl/__content__";
         // Advertise 100 bytes but only deliver 4: the guard must delete.
-        let stream =
-            super::get_remote_cached_or_refetch_stream(storage.clone(), key, move || async move {
-                Ok(multi_chunk_result(vec![b"abcd"], Some(100)))
-            })
-            .await
-            .expect("streaming refetch should succeed even when truncated");
+        let stream = super::get_remote_cached_or_refetch_stream(
+            storage.clone(),
+            key,
+            true,
+            move || async move { Ok(multi_chunk_result(vec![b"abcd"], Some(100))) },
+        )
+        .await
+        .expect("streaming refetch should succeed even when truncated");
         let content = collect_stream(stream).await;
 
         // The caller still receives whatever bytes arrived.
@@ -9990,6 +10246,173 @@ mod tests {
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy");
         crate::services::proxy_service::ProxyService::new(pool, storage_svc)
+    }
+
+    // -----------------------------------------------------------------------
+    // #3147 -- `proxy_cache_object_verdict` against a real sidecar.
+    // -----------------------------------------------------------------------
+
+    /// Serves one sidecar, at one key. Every other `get` is a miss, so a test
+    /// that names the wrong key sees `Unvouched` rather than a false pass.
+    struct OneSidecarStorage {
+        key: String,
+        sidecar: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for OneSidecarStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            if key == self.key {
+                Ok(self.sidecar.clone())
+            } else {
+                Err(AppError::NotFound(key.to_string()))
+            }
+        }
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(key == self.key)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Build a proxy service whose only readable object is the sidecar for
+    /// `content_key`.
+    ///
+    /// `load_cache_metadata` reads through a process-global LRU keyed by the
+    /// metadata key, so every test here uses its own project name to avoid
+    /// contaminating the others.
+    fn proxy_with_sidecar(
+        content_key: &str,
+        metadata: &crate::services::proxy_service::CacheMetadata,
+    ) -> crate::services::proxy_service::ProxyService {
+        use crate::services::storage_service::StorageService;
+        let storage = std::sync::Arc::new(OneSidecarStorage {
+            key: super::proxy_cache_metadata_key_for(content_key).expect("cache-shaped key"),
+            sidecar: Bytes::from(serde_json::to_vec(metadata).expect("serialize sidecar")),
+        });
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy");
+        crate::services::proxy_service::ProxyService::new(
+            pool,
+            std::sync::Arc::new(StorageService::new(storage)),
+        )
+    }
+
+    fn positive_sidecar() -> crate::services::proxy_service::CacheMetadata {
+        crate::services::proxy_service::CacheMetadata {
+            cached_at: chrono::Utc::now(),
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            content_type: Some("application/octet-stream".to_string()),
+            content_encoding: None,
+            upstream_commit_sha: None,
+            size_bytes: 18,
+            checksum_sha256: "c".repeat(64),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verdict_is_vouched_when_a_positive_sidecar_exists() {
+        let key = "proxy-cache/pypi-remote/simple/vouchedpkg/vouchedpkg-1.0.tar.gz/__content__";
+        let proxy = proxy_with_sidecar(key, &positive_sidecar());
+
+        assert_eq!(
+            super::proxy_cache_object_verdict(&proxy, key).await,
+            super::CachedObjectVerdict::Vouched
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verdict_is_unvouched_when_no_sidecar_exists() {
+        // The proxy's storage serves a sidecar for a DIFFERENT entry only.
+        let present = "proxy-cache/pypi-remote/simple/otherpkg/otherpkg-1.0.tar.gz/__content__";
+        let missing = "proxy-cache/pypi-remote/simple/nosidecar/nosidecar-1.0.tar.gz/__content__";
+        let proxy = proxy_with_sidecar(present, &positive_sidecar());
+
+        assert_eq!(
+            super::proxy_cache_object_verdict(&proxy, missing).await,
+            super::CachedObjectVerdict::Unvouched,
+            "an object with no sidecar must not be served (#3147)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verdict_is_unvouched_under_a_negative_cache_marker() {
+        let key = "proxy-cache/pypi-remote/simple/negpkg/negpkg-1.0.tar.gz/__content__";
+        let mut marker = positive_sidecar();
+        marker.negative_cached_until = Some(chrono::Utc::now() + chrono::Duration::minutes(5));
+        marker.size_bytes = 0;
+        marker.checksum_sha256 = String::new();
+        let proxy = proxy_with_sidecar(key, &marker);
+
+        assert_eq!(
+            super::proxy_cache_object_verdict(&proxy, key).await,
+            super::CachedObjectVerdict::Unvouched,
+            "a negative-cache marker vouches for no body at all (#1611)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verdict_is_held_while_a_package_age_hold_is_active() {
+        let key = "proxy-cache/pypi-remote/simple/heldpkg/heldpkg-1.0.tar.gz/__content__";
+        let mut held = positive_sidecar();
+        held.quarantine_until = Some(chrono::Utc::now() + chrono::Duration::hours(6));
+        let proxy = proxy_with_sidecar(key, &held);
+
+        assert_eq!(
+            super::proxy_cache_object_verdict(&proxy, key).await,
+            super::CachedObjectVerdict::Held,
+            "an active Package Age Policy hold must 409, not serve (#1770/#2075)"
+        );
+    }
+
+    /// An ELAPSED hold is not a hold. Without this, hard-wiring `Held` for any
+    /// non-`None` `quarantine_until` would pass the test above.
+    #[tokio::test]
+    async fn test_verdict_is_vouched_once_a_package_age_hold_has_elapsed() {
+        let key = "proxy-cache/pypi-remote/simple/elapsedpkg/elapsedpkg-1.0.tar.gz/__content__";
+        let mut elapsed = positive_sidecar();
+        elapsed.quarantine_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let proxy = proxy_with_sidecar(key, &elapsed);
+
+        assert_eq!(
+            super::proxy_cache_object_verdict(&proxy, key).await,
+            super::CachedObjectVerdict::Vouched
+        );
+    }
+
+    /// POSITIVE CONTROL for the whole gate: a locally-published wheel in a
+    /// Remote repo has an ordinary artifact key and no sidecar anywhere. It
+    /// must resolve to `NotProxyCache` and stay servable — gating it would make
+    /// every local upload into a Remote repo unreachable.
+    #[tokio::test]
+    async fn test_verdict_leaves_non_proxy_cache_keys_alone() {
+        let key = "pypi/localpkg/1.0/localpkg-1.0-py3-none-any.whl";
+        let proxy = build_proxy_service_no_db();
+
+        let verdict = super::proxy_cache_object_verdict(&proxy, key).await;
+        assert_eq!(verdict, super::CachedObjectVerdict::NotProxyCache);
+        assert!(
+            verdict.may_serve_stored_object(),
+            "a locally-published wheel in a Remote repo must stay servable"
+        );
     }
 
     /// End-to-end test for the streaming download path via the fallback route.
