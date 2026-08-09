@@ -4650,6 +4650,7 @@ mod read_db_tests {
         for _ in 0..calls {
             let resp = super::flatcontainer_download(
                 axum::extract::State(state.clone()),
+                axum::extract::Extension(None),
                 axum::extract::Path((
                     fx.repo_key.clone(),
                     package_id.to_string(),
