@@ -98,14 +98,28 @@ pub async fn get_quarantine_status(
     // Fetch quarantine status along with the artifact's repository to check visibility
     let row = quarantine_service::get_status_with_repo(&state.db, artifact_id).await?;
 
-    // Check that the user has access to the artifact's repository.
-    // For private repos, unauthenticated or unauthorized users get 404.
-    let repo_service =
-        crate::services::repository_service::RepositoryService::new(state.db.clone());
-    let repo = repo_service.get_by_id(row.repository_id).await?;
-    if !repo.is_public && !auth_ext.can_access_repo(row.repository_id) {
-        return Err(AppError::NotFound("Artifact not found".to_string()));
-    }
+    // EXISTENCE gate: the caller must be able to SEE the artifact's repository.
+    //
+    // This used to be `!repo.is_public && !auth_ext.can_access_repo(...)`.
+    // `can_access_repo` is the caller's TOKEN SCOPE — it resolves to
+    // `access_scope().grants(repo_id)`, and `AccessScope::Admin` grants
+    // unconditionally — so for every browser JWT session and every unscoped API
+    // token it returned `true` for EVERY repository in the instance. As a
+    // visibility gate it was inert for the most common caller, and any
+    // authenticated user holding an artifact UUID could confirm the existence
+    // of another tenant's private artifact (#3174).
+    //
+    // `require_repo_id_visible` is the canonical predicate,
+    // `is_public OR (in_scope AND (is_admin OR grants))`, and it collapses
+    // "repository row is gone" into the same existence-hiding 404 rather than
+    // surfacing a "Repository '<key>' not found" message that would name it.
+    crate::api::handlers::repositories::require_repo_id_visible(
+        &state.db,
+        &auth_ext,
+        row.repository_id,
+        "Artifact not found",
+    )
+    .await?;
 
     let now = chrono::Utc::now();
     let is_blocked = quarantine_service::check_download_allowed(
@@ -115,11 +129,33 @@ pub async fn get_quarantine_status(
     )
     .is_err();
 
-    // The reason is per-artifact security detail, so it goes only to callers who
-    // hold the repository. `can_access_repo` is unrestricted for admin scope, so
-    // this covers admins and scoped users who genuinely hold the repo, and excludes
-    // an authenticated caller who merely happens to be able to read a public one.
-    let quarantine_reason = if auth_ext.can_access_repo(row.repository_id) {
+    // REASON gate, deliberately STRICTER than the existence gate above.
+    //
+    // The reason is per-artifact security detail — the policy name, finding
+    // counts and free-text admin incident notes behind the hold. #2912 keeps it
+    // off the blocked-download 403 for exactly that reason, because that path is
+    // reachable anonymously on a public repository. So it goes ONLY to callers
+    // who genuinely HOLD the repository: the `is_public` arm of the visibility
+    // predicate is dropped, leaving `in_scope AND (is_admin OR grants)`. A
+    // caller who can see the artifact only because its repository happens to be
+    // public does not get the finding text.
+    //
+    // That is precisely what the comment here claimed before #3174 — "excludes
+    // an authenticated caller who merely happens to be able to read a public
+    // one". The code did not implement it. Testing `can_access_repo` alone
+    // tested TOKEN SCOPE, which is unconditionally `true` for `AccessScope::
+    // Admin` — every browser JWT session, every unscoped API token — so the
+    // field was handed to any authenticated caller on any repository. The
+    // comment is why the gate survived review; the predicate is now spelled out
+    // instead of delegated to a name that means something else.
+    let repo_service =
+        crate::services::repository_service::RepositoryService::new(state.db.clone());
+    let holds_repository = auth_ext.can_access_repo(row.repository_id)
+        && (auth_ext.is_admin
+            || repo_service
+                .user_can_access_repo(row.repository_id, auth_ext.user_id)
+                .await?);
+    let quarantine_reason = if holds_repository {
         row.quarantine_reason
     } else {
         None
@@ -676,6 +712,147 @@ mod tests {
             reason.as_deref(),
             Some("malicious maintainer takeover"),
             "the rejection reason must replace the earlier quarantine reason"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3174: `can_access_repo` is TOKEN SCOPE, not repository visibility.
+    // -----------------------------------------------------------------------
+
+    /// Flip the fixture repository's `is_public` flag.
+    async fn set_repo_public(fx: &tdh::Fixture, public: bool) {
+        sqlx::query("UPDATE repositories SET is_public = $1 WHERE id = $2")
+            .bind(public)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set is_public");
+    }
+
+    /// `GET /{artifact_id}` as `auth`, decoded.
+    async fn status_as(
+        fx: &tdh::Fixture,
+        auth: crate::api::middleware::auth::AuthExtension,
+        artifact_id: Uuid,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = tdh::router_with_auth(router(), fx.state.clone(), auth);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{artifact_id}"))).await;
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// A private repository's quarantine status must not be readable by an
+    /// authenticated caller who holds no grant on it (#3174).
+    ///
+    /// The caller shape that matters is [`tdh::make_auth`]: a non-admin with
+    /// `allowed_repo_ids = AccessScope::Admin`, i.e. unrestricted token scope.
+    /// That is exactly a browser JWT session, and it is the shape for which the
+    /// pre-fix `can_access_repo` gate returned `true` for every repository in
+    /// the instance — so the endpoint disclosed existence, hold status, and the
+    /// free-text `quarantine_reason` (the malware / CVE finding) cross-tenant.
+    ///
+    /// Both positive controls run against the SAME fixture and the SAME
+    /// artifact, so a "fix" that denied everyone would fail here.
+    #[tokio::test]
+    async fn test_status_private_repo_denies_non_member_but_not_holders() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let reason = "Policy 'cve-gate': 2 findings at or above high";
+        let artifact_id = seed_artifact(&fx, Some("quarantined"), None, Some(reason)).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+
+        // NEGATIVE: authenticated, unrestricted scope, no grant on the repo.
+        let (out_status, out_json) =
+            status_as(&fx, tdh::make_auth(outsider, &outname), artifact_id).await;
+        // POSITIVE CONTROL 1: the fixture user holds a developer grant.
+        let (member_status, member_json) =
+            status_as(&fx, tdh::make_auth(fx.user_id, &fx.username), artifact_id).await;
+        // POSITIVE CONTROL 2: a global admin.
+        let (admin_status, admin_json) =
+            status_as(&fx, tdh::admin_auth(fx.user_id, &fx.username), artifact_id).await;
+
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            out_status,
+            StatusCode::NOT_FOUND,
+            "a non-member must not learn that a private repo's artifact exists; got {out_json}"
+        );
+        assert!(
+            out_json.get("quarantine_reason").is_none(),
+            "the security finding must not be disclosed to a non-member: {out_json}"
+        );
+
+        assert_eq!(
+            member_status,
+            StatusCode::OK,
+            "member must still read status"
+        );
+        assert_eq!(member_json["quarantine_status"], "quarantined");
+        assert_eq!(member_json["quarantine_reason"], reason);
+
+        assert_eq!(admin_status, StatusCode::OK, "admin must still read status");
+        assert_eq!(admin_json["quarantine_reason"], reason);
+    }
+
+    /// On a PUBLIC repository the existence gate opens — anyone may see that
+    /// the artifact is held — but `quarantine_reason` is per-artifact security
+    /// detail and stays with callers who actually HOLD the repository (#3174).
+    ///
+    /// This is the behavior the pre-fix comment claimed ("excludes an
+    /// authenticated caller who merely happens to be able to read a public
+    /// one") and did not implement: `can_access_repo` is `true` for every
+    /// unscoped principal, so the reason went to everyone.
+    ///
+    /// The member and admin controls are in the same fixture, so hiding the
+    /// reason unconditionally would fail.
+    #[tokio::test]
+    async fn test_status_public_repo_reason_only_to_repo_holders() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        set_repo_public(&fx, true).await;
+        let reason = "Policy 'malware-gate': eicar signature match";
+        let artifact_id = seed_artifact(&fx, Some("quarantined"), None, Some(reason)).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+
+        // NEGATIVE: reads the public repo fine, but holds no grant on it.
+        let (out_status, out_json) =
+            status_as(&fx, tdh::make_auth(outsider, &outname), artifact_id).await;
+        // POSITIVE CONTROL 1: grant holder.
+        let (member_status, member_json) =
+            status_as(&fx, tdh::make_auth(fx.user_id, &fx.username), artifact_id).await;
+        // POSITIVE CONTROL 2: admin.
+        let (admin_status, admin_json) =
+            status_as(&fx, tdh::admin_auth(fx.user_id, &fx.username), artifact_id).await;
+
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            out_status,
+            StatusCode::OK,
+            "a public repo's hold STATUS stays readable: {out_json}"
+        );
+        assert_eq!(out_json["quarantine_status"], "quarantined");
+        assert_eq!(out_json["is_blocked"], true);
+        assert!(
+            out_json.get("quarantine_reason").is_none(),
+            "the finding text must not reach a caller who merely reads a public \
+             repo: {out_json}"
+        );
+
+        assert_eq!(member_status, StatusCode::OK);
+        assert_eq!(
+            member_json["quarantine_reason"], reason,
+            "a grant holder must still receive the reason"
+        );
+        assert_eq!(admin_status, StatusCode::OK);
+        assert_eq!(
+            admin_json["quarantine_reason"], reason,
+            "an admin must still receive the reason"
         );
     }
 }

@@ -437,10 +437,17 @@ async fn list_sboms(
     if let Some(artifact_id) = query.artifact_id {
         ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
     }
+    // #3174: this branch used to gate on `auth.can_access_repo(repo_id)` alone.
+    // That is the caller's TOKEN SCOPE, not repository visibility: it resolves
+    // to `access_scope().grants(repo_id)`, which `AccessScope::Admin` satisfies
+    // unconditionally, so for a browser JWT session or any unscoped API token it
+    // was `true` for every repository in the instance. It was the ONLY check
+    // before up to 100 `sbom_documents` rows were returned — a private
+    // repository's whole dependency inventory — while the `artifact_id` branch
+    // one line above already routed through the proper helper. Both branches now
+    // apply the same predicate.
     if let Some(repo_id) = query.repository_id {
-        if !auth.can_access_repo(repo_id) {
-            return Err(AppError::NotFound("Repository not found".into()));
-        }
+        ensure_repo_visibility(&state.db, &auth, repo_id).await?;
     }
     let service = SbomService::new(state.db.clone());
 
@@ -1692,6 +1699,26 @@ async fn require_repo_visibility(
         }
     }
     Ok(())
+}
+
+/// Resolve `repository_id → (id, is_public)` and apply
+/// [`require_repo_visibility`] (#3174).
+///
+/// The repository-scoped sibling of [`ensure_artifact_repo_access`], for the
+/// paths that are handed a bare `repository_id`. A repository id that does not
+/// resolve yields the same existence-hiding 404 as one the caller may not see.
+async fn ensure_repo_visibility(
+    db: &sqlx::PgPool,
+    auth: &AuthExtension,
+    repo_id: Uuid,
+) -> Result<()> {
+    let repo: Option<(Uuid, bool)> =
+        sqlx::query_as("SELECT r.id, r.is_public FROM repositories r WHERE r.id = $1")
+            .bind(repo_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    require_repo_visibility(db, auth, repo, "Repository not found").await
 }
 
 /// Resolve `artifact_id → (repository_id, is_public)` and apply
@@ -3767,5 +3794,114 @@ mod tests {
             .await;
         tdh::cleanup_user(&fx.pool, outsider).await;
         fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3174: `list_sboms`'s `repository_id` branch gated on `can_access_repo`,
+    // which is TOKEN SCOPE, not repository visibility.
+    // -----------------------------------------------------------------------
+
+    /// `GET /sbom?repository_id=…` as `auth`.
+    async fn list_sboms_by_repo(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        auth: AuthExtension,
+        repo_id: Uuid,
+    ) -> Result<Json<Vec<SbomResponse>>> {
+        super::list_sboms(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Query(ListSbomsQuery {
+                artifact_id: None,
+                repository_id: Some(repo_id),
+                format: None,
+            }),
+        )
+        .await
+    }
+
+    /// A private repository's SBOM listing — its full dependency inventory —
+    /// must not be readable by an authenticated caller holding no grant on it
+    /// (#3174).
+    ///
+    /// The `artifact_id` branch one line above already routed through
+    /// `ensure_artifact_repo_access`; the `repository_id` branch did not, and
+    /// `can_access_repo` returns `true` for any unscoped principal — every
+    /// browser JWT session — so it was the sole gate and it was inert.
+    ///
+    /// Both positive controls read the SAME seeded document in the SAME
+    /// fixture, so denying everyone would fail.
+    #[tokio::test]
+    async fn test_list_sboms_by_repository_id_private_denies_non_member_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let sbom_id = seed_sbom_for_handler(&fx.pool, artifact_id, fx.repo_id, "cyclonedx").await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+
+        // NEGATIVE: unrestricted token scope, no grant on the private repo.
+        let denied = list_sboms_by_repo(&fx, tdh::make_auth(outsider, &outname), fx.repo_id).await;
+        // POSITIVE CONTROL 1: the fixture user holds a developer grant.
+        let member =
+            list_sboms_by_repo(&fx, tdh::make_auth(fx.user_id, &fx.username), fx.repo_id).await;
+        // POSITIVE CONTROL 2: a global admin.
+        let admin =
+            list_sboms_by_repo(&fx, tdh::admin_auth(fx.user_id, &fx.username), fx.repo_id).await;
+
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "a non-member listing a private repo's SBOMs must get an \
+             existence-hiding 404, got {:?}",
+            denied.map(|j| j.0.len())
+        );
+
+        let member = member.expect("member must still list").0;
+        assert!(
+            member.iter().any(|s| s.id == sbom_id),
+            "grant holder must still see the repository's SBOM"
+        );
+        let admin = admin.expect("admin must still list").0;
+        assert!(
+            admin.iter().any(|s| s.id == sbom_id),
+            "admin must still see the repository's SBOM"
+        );
+    }
+
+    /// A PUBLIC repository's SBOM listing stays open to any authenticated
+    /// caller — the visibility predicate's `is_public` arm. Guards the fix
+    /// against over-denial (#3174).
+    #[tokio::test]
+    async fn test_list_sboms_by_repository_id_public_allows_non_member_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        set_repo_public(&fx.pool, fx.repo_id, true).await;
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let sbom_id = seed_sbom_for_handler(&fx.pool, artifact_id, fx.repo_id, "cyclonedx").await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+
+        let res = list_sboms_by_repo(&fx, tdh::make_auth(outsider, &outname), fx.repo_id).await;
+
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+
+        let listed = res.expect("public repo listing must stay open").0;
+        assert!(
+            listed.iter().any(|s| s.id == sbom_id),
+            "a public repository's SBOMs must remain listable by any authed caller"
+        );
     }
 }

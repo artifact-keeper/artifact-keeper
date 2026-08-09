@@ -130,9 +130,47 @@ impl AuthExtension {
         self.allowed_repo_ids.clone()
     }
 
-    /// Check whether this auth context has access to a specific repository.
-    /// Returns true if unrestricted (admin scope) or if the repo is in the
-    /// allowed set.
+    /// TOKEN SCOPE only: is `repo_id` within the set this credential was minted
+    /// for? Returns true if unrestricted ([`AccessScope::Admin`]) or if the repo
+    /// is in the allowed set.
+    ///
+    /// # This does NOT answer "may this caller see this repository"
+    ///
+    /// `AccessScope::Admin` grants unconditionally, and that is the scope of
+    /// every browser JWT session, every unscoped API token and every global
+    /// admin. So for the most common caller this returns `true` for EVERY
+    /// repository in the instance, and using it as a visibility gate means any
+    /// authenticated user reads the resource. That mistake has now produced four
+    /// separate cross-tenant leaks: #3081, #3163, and the two in #3174.
+    ///
+    /// The visibility predicate is
+    ///
+    /// ```text
+    /// is_public OR (in_scope AND (is_admin OR grants))
+    /// ```
+    ///
+    /// where `in_scope` is this function and `grants` is
+    /// `RepositoryService::user_can_access_repo` (a similar NAME, an entirely
+    /// different question: role assignments, not token scope). Do not open-code
+    /// it — use one of:
+    ///
+    /// * [`repositories::require_visible`] — a loaded `Repository`;
+    /// * [`repositories::require_repo_id_visible`] — a bare `repository_id`;
+    /// * [`repositories::member_read_visibility`] — a DB-side aggregate;
+    /// * [`repositories::member_grant_visibility`] + `member_passes_token_scope`
+    ///   — row-wise listing;
+    /// * `RepositoryService::filter_visible_repo_ids` — a set of ids.
+    ///
+    /// Calling this directly is correct only where it is one CONJUNCT of a
+    /// larger check that supplies the entitlement half separately (as
+    /// `require_visible` and `repo_visibility_middleware` do), or where token
+    /// scope genuinely is the question being asked (a mutation whose
+    /// entitlement is established by a following permission check).
+    ///
+    /// [`repositories::require_visible`]: crate::api::handlers::repositories::require_visible
+    /// [`repositories::require_repo_id_visible`]: crate::api::handlers::repositories::require_repo_id_visible
+    /// [`repositories::member_read_visibility`]: crate::api::handlers::repositories::member_read_visibility
+    /// [`repositories::member_grant_visibility`]: crate::api::handlers::repositories::member_grant_visibility
     pub fn can_access_repo(&self, repo_id: Uuid) -> bool {
         self.access_scope().grants(repo_id)
     }
