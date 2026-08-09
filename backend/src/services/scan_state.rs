@@ -34,6 +34,47 @@ pub(crate) const SCAN_STATE_SQL: &str = r#"
     WHERE artifact_id = $1
 "#;
 
+/// The LATEST `scan_results` row per `scan_type` for an artifact (#3142).
+///
+/// Deliberately has NO status filter, so every status competes to be the latest
+/// for its own scanner. That is what makes a later `completed` rescan by the
+/// same engine supersede its earlier `failed` row, while a `failed` row from a
+/// DIFFERENT engine keeps its own slot instead of being masked.
+///
+/// Ordering mirrors `scan_result_service::recalculate_score`'s `latest_scans`
+/// window exactly: both `complete_scan` and `fail_scan` stamp
+/// `completed_at = NOW()`, so terminal rows order by it, and non-terminal
+/// (`pending` / `running`) rows carry a NULL `completed_at` and sort LAST. A
+/// scanner that is merely re-running therefore does not erase its previous
+/// terminal verdict — the fail-closed direction.
+pub(crate) const LATEST_PER_SCAN_TYPE_SQL: &str = r#"
+    SELECT DISTINCT ON (scan_type) status, error_message
+    FROM scan_results
+    WHERE artifact_id = $1
+    ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
+"#;
+
+/// Whether ANY scanner's latest row is a genuine failure (#3142).
+///
+/// Input must be the rows returned by [`LATEST_PER_SCAN_TYPE_SQL`] — one row
+/// per `scan_type`. Fires when at least one of them is a real crash.
+///
+/// "Not applicable" rows are excluded via the shared
+/// [`ScanStateRow::is_not_applicable`] definition, which covers both the
+/// dedicated `not_applicable` status (#1470) and the legacy `failed` +
+/// "does not apply" marker. That exclusion is load-bearing, not cosmetic:
+/// widening `block_on_fail` from one global row to "any scanner" would
+/// otherwise start blocking every artifact in every repo where some enabled
+/// engine simply does not apply to the format — turning a security gate into
+/// an outage. Reusing the existing predicate keeps ONE definition of
+/// "not applicable" rather than duplicating the marker match in SQL.
+/// Pure / unit-testable.
+pub(crate) fn any_scanner_failed(latest_per_scan_type: &[ScanStateRow]) -> bool {
+    latest_per_scan_type
+        .iter()
+        .any(|r| r.status == "failed" && !r.is_not_applicable())
+}
+
 /// One `scan_results` row reduced to the only fields that matter for deciding
 /// whether an artifact is "scanned" for gating: its status and whether the row
 /// is a "not applicable" marker (a `failed` row whose `error_message` says the
@@ -172,6 +213,70 @@ mod tests {
     #[test]
     fn test_is_not_applicable_marker_detected() {
         assert!(not_applicable_row().is_not_applicable());
+    }
+
+    // -----------------------------------------------------------------------
+    // any_scanner_failed (#3142)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_any_scanner_failed_sees_a_crash_masked_by_another_engines_clean_scan() {
+        // The #3142 shape: trivy crashed, grype then completed clean. Keying on
+        // a single global newest row read `completed` and the gate went quiet.
+        // One row per scan_type means the crash keeps its own slot.
+        let rows = [
+            row("failed", Some("trivy: unexpected EOF")),
+            row("completed", None),
+        ];
+        assert!(
+            any_scanner_failed(&rows),
+            "a clean scan by another engine must not mask a crashed scanner"
+        );
+    }
+
+    #[test]
+    fn test_any_scanner_failed_quiet_when_all_engines_healthy() {
+        // Positive control for the inverse: without this, the test above could
+        // pass by returning true unconditionally.
+        for rows in [
+            vec![row("completed", None)],
+            vec![row("completed", None), row("completed", None)],
+            vec![row("completed", None), row("pending", None)],
+            vec![row("running", None)],
+            vec![],
+        ] {
+            assert!(
+                !any_scanner_failed(&rows),
+                "no genuine failure -> block_on_fail must stay quiet: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_any_scanner_failed_ignores_not_applicable_rows() {
+        // Load-bearing over-block guard. Widening block_on_fail from one global
+        // row to "any scanner" would otherwise start blocking every artifact in
+        // every repo where an enabled engine simply does not apply to the
+        // format — a security gate turned into an outage. Covers BOTH the
+        // dedicated `not_applicable` status (#1470) and the legacy
+        // `failed` + "does not apply" marker.
+        assert!(
+            !any_scanner_failed(&[not_applicable_row()]),
+            "a legacy 'failed' + does-not-apply row is not a crash"
+        );
+        assert!(
+            !any_scanner_failed(&[row("not_applicable", None)]),
+            "the dedicated not_applicable status is not a crash"
+        );
+        assert!(
+            !any_scanner_failed(&[row("completed", None), not_applicable_row()]),
+            "a completed scan alongside a not-applicable engine must not block"
+        );
+        // ...but a genuine crash sitting next to a not-applicable row still fires.
+        assert!(
+            any_scanner_failed(&[not_applicable_row(), row("failed", Some("grype: OOM"))]),
+            "a real crash must still fire even when another engine is not applicable"
+        );
     }
 
     #[test]
