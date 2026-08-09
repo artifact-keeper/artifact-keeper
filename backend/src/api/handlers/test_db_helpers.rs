@@ -486,6 +486,10 @@ pub fn build_state_with(
 #[derive(Default)]
 pub struct MemStorage {
     pub objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+    /// When true the double advertises presigned-redirect capability, standing
+    /// in for an S3/GCS backend with `S3_REDIRECT_DOWNLOADS=true`. Defaults to
+    /// false so every existing `MemStorage` user keeps the streaming path.
+    pub presign: bool,
 }
 
 #[async_trait::async_trait]
@@ -523,6 +527,32 @@ impl crate::storage::StorageBackend for MemStorage {
     ) -> crate::error::Result<crate::storage::PutStreamResult> {
         crate::storage::buffered_put_stream_fallback(self, key, stream).await
     }
+
+    fn supports_redirect(&self) -> bool {
+        self.presign
+    }
+
+    async fn get_presigned_url(
+        &self,
+        key: &str,
+        expires_in: std::time::Duration,
+    ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+        if !self.presign {
+            return Ok(None);
+        }
+        // Shaped like a real SigV4 URL — in particular the signature is bound
+        // to a single HTTP method, which is the whole point of #3181. Tests
+        // assert on the `X-Amz-` marker rather than parsing it.
+        Ok(Some(crate::storage::PresignedUrl {
+            url: format!(
+                "https://signed.example.com/{key}?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                 &X-Amz-Expires={}&X-Amz-Signature=deadbeef",
+                expires_in.as_secs()
+            ),
+            expires_in,
+            source: crate::storage::PresignedUrlSource::S3,
+        }))
+    }
 }
 
 /// Like [`build_state`], but the registry carries an in-memory backend
@@ -530,7 +560,30 @@ impl crate::storage::StorageBackend for MemStorage {
 /// namespace. Returns the state plus the backing [`MemStorage`] so tests can
 /// assert exactly which physical keys were written (#2624).
 pub fn build_state_with_cloud(pool: PgPool, backend_name: &str) -> (SharedState, Arc<MemStorage>) {
-    let mem = Arc::new(MemStorage::default());
+    build_cloud_state(pool, backend_name, /* presign = */ false)
+}
+
+/// Like [`build_state_with_cloud`], but the in-memory backend advertises
+/// presigned-redirect capability AND `presigned_downloads_enabled` is on —
+/// i.e. the S3-with-`S3_REDIRECT_DOWNLOADS=true` deployment shape of #1555 /
+/// #1945. Used by the #3181 HEAD regression coverage, which needs a router
+/// whose GETs really do 302 so the HEAD assertion is not vacuous.
+pub fn build_state_with_presigning_cloud(
+    pool: PgPool,
+    backend_name: &str,
+) -> (SharedState, Arc<MemStorage>) {
+    build_cloud_state(pool, backend_name, /* presign = */ true)
+}
+
+fn build_cloud_state(
+    pool: PgPool,
+    backend_name: &str,
+    presign: bool,
+) -> (SharedState, Arc<MemStorage>) {
+    let mem = Arc::new(MemStorage {
+        presign,
+        ..Default::default()
+    });
     let mut backends: std::collections::HashMap<String, Arc<dyn crate::storage::StorageBackend>> =
         std::collections::HashMap::new();
     backends.insert(backend_name.to_string(), mem.clone());
@@ -539,12 +592,9 @@ pub fn build_state_with_cloud(pool: PgPool, backend_name: &str) -> (SharedState,
         backend_name.to_string(),
     ));
     let storage: Arc<dyn crate::storage::StorageBackend> = mem.clone();
-    let state = Arc::new(AppState::new(
-        cfg("/tmp/ak-cloud-test-unused"),
-        pool,
-        storage,
-        registry,
-    ));
+    let mut config = cfg("/tmp/ak-cloud-test-unused");
+    config.presigned_downloads_enabled = presign;
+    let state = Arc::new(AppState::new(config, pool, storage, registry));
     (state, mem)
 }
 
@@ -1199,6 +1249,19 @@ pub fn get(uri: String) -> Request<Body> {
         .uri(uri)
         .body(Body::empty())
         .expect("build GET request")
+}
+
+/// Build a HEAD request.
+///
+/// Note that a router registering only `get(..)` still answers HEAD by running
+/// the GET handler, so this exercises the same handler code the GET does — the
+/// distinction lives in `DownloadContext::is_head` (#3181).
+pub fn head(uri: String) -> Request<Body> {
+    Request::builder()
+        .method("HEAD")
+        .uri(uri)
+        .body(Body::empty())
+        .expect("build HEAD request")
 }
 
 /// Build a POST request with the given body and content-type header.

@@ -4178,6 +4178,138 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
+    /// #3181: `HEAD` on a Maven artifact served from a presigned-redirect
+    /// backend must NOT be answered with a 302.
+    ///
+    /// The Maven router registers only `get(..)`/`put(..)`, so axum answers a
+    /// HEAD by running the GET handler — which short-circuits into a presigned
+    /// redirect for blob extensions. A presigned URL is signed for one HTTP
+    /// method, so the client's follow-up HEAD against that URL is rejected with
+    /// 403 by the object store. Maven itself never HEADs an artifact, but
+    /// Gradle does before every download, so this breaks Gradle builds against
+    /// any repository with `S3_REDIRECT_DOWNLOADS` enabled.
+    ///
+    /// Drives the real router so the assertion covers the wiring, not just the
+    /// helper. The GET arms are the negative control: they must still 302, or
+    /// a "fix" that just turned presigning off would pass.
+    #[tokio::test]
+    async fn test_head_is_not_presigned_redirect_3181() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, _mem) = tdh::build_state_with_presigning_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        let path = "com/example/head3181/demo/1.0.0/demo-1.0.0.jar";
+        let jar = bytes::Bytes::from_static(b"head-3181-jar-bytes");
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{path}"), jar.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "PUT failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Negative control FIRST: presigning really is active on this router,
+        // so the HEAD assertion below is not passing for the trivial reason.
+        let (get_status, _, get_headers) =
+            tdh::send_with_headers(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+        assert_eq!(
+            get_status,
+            StatusCode::FOUND,
+            "GET on a hosted .jar must still redirect to the presigned URL"
+        );
+        let location = get_headers
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            location.contains("X-Amz-Signature"),
+            "GET must redirect to a signed URL, got {location}"
+        );
+
+        let (head_status, head_body, head_headers) =
+            tdh::send_with_headers(router.clone(), tdh::head(format!("/{repo_key}/{path}"))).await;
+
+        // The .pom sidecar is not redirect-eligible, so its HEAD exercises the
+        // path that already worked; it must be unchanged by this fix.
+        let pom_path = "com/example/head3181/demo/1.0.0/demo-1.0.0.pom";
+        let pom = bytes::Bytes::from_static(b"<project/>");
+        let (pom_put, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{pom_path}"), pom.clone()),
+        )
+        .await;
+        let (pom_head_status, _, _) =
+            tdh::send_with_headers(router.clone(), tdh::head(format!("/{repo_key}/{pom_path}")))
+                .await;
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_ne!(
+            head_status,
+            StatusCode::FOUND,
+            "#3181: HEAD must not return a 302 to a method-scoped presigned URL"
+        );
+        assert_eq!(
+            head_status,
+            StatusCode::OK,
+            "HEAD must answer with the artifact's metadata"
+        );
+        assert!(
+            head_headers.get(axum::http::header::LOCATION).is_none(),
+            "HEAD must carry no Location header"
+        );
+        assert_eq!(
+            head_headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(jar.len().to_string().as_str()),
+            "HEAD must advertise the artifact's real Content-Length"
+        );
+        assert_eq!(
+            head_headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/java-archive"),
+            "HEAD must advertise the artifact's Content-Type"
+        );
+        assert!(
+            head_body.is_empty(),
+            "a HEAD response carries no body, got {} bytes",
+            head_body.len()
+        );
+
+        assert_eq!(pom_put, StatusCode::CREATED, "pom PUT failed");
+        assert_eq!(
+            pom_head_status,
+            StatusCode::OK,
+            "HEAD on the non-eligible .pom sidecar must keep working"
+        );
+    }
+
     /// #2624 back-compat: objects stored under the LEGACY flat scheme
     /// (`maven/{path}`) must stay readable after the repo-scoped scheme takes
     /// over new writes — row-anchored artifacts through the storage_key their
