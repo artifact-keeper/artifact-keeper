@@ -8,6 +8,16 @@
 //!   the pod and prevent operators from completing setup via `kubectl exec`.
 //! - `/health`  - rich status page for dashboards (all services + pool stats)
 //! - `/healthz` - alias for `/health`
+//!
+//! All four are registered at the router root (`api::routes`), outside the
+//! `/api/v1` nest, so they are unauthenticated and no `rate_limit_*` layer
+//! applies. That is deliberate: orchestrators, load balancers and dashboards
+//! poll these constantly, and throttling or authenticating them turns a
+//! dependency hiccup into a self-inflicted outage (a 429'd or 401'd liveness
+//! probe reads as "dead" to Kubernetes). The cost of an anonymous request is
+//! bounded at the work instead — every dependency sub-check on `/health` runs
+//! behind a short-TTL, single-flight cache, so an arbitrary request rate
+//! collapses to one probe per dependency per window (#3127).
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use once_cell::sync::Lazy;
@@ -141,11 +151,31 @@ fn gate_detailed_health_fields(
 /// Cloud-metadata, loopback and link-local targets stay hard-blocked.
 ///
 /// [`internal_service_client_builder`]: crate::services::http_client::internal_service_client_builder
-fn service_probe_client() -> reqwest::Client {
+fn build_service_probe_client() -> reqwest::Client {
     crate::services::http_client::internal_service_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_default()
+}
+
+/// The one probe client, built on first use and reused for the process
+/// lifetime.
+///
+/// Building a `reqwest::Client` is not free: every build runs
+/// `apply_custom_ca_cert`, which does a **blocking** `std::fs::read` of
+/// `CUSTOM_CA_CERT_PATH` on the async runtime when that variable is set
+/// (`services/http_client.rs`), re-parses the PEM bundle, and hands back a
+/// client with an empty connection pool — so each probe also pays a fresh TCP
+/// (and TLS) handshake. Doing that per `/health` request on an
+/// unauthenticated endpoint turns anonymous polling into runtime-blocking
+/// filesystem work; one shared client makes it a one-off and lets the probe
+/// keep its connection alive between windows (#3127).
+static SERVICE_PROBE_CLIENT: Lazy<reqwest::Client> = Lazy::new(build_service_probe_client);
+
+/// Return the shared probe client. `reqwest::Client` is an `Arc` internally,
+/// so the clone shares one connection pool rather than creating a new one.
+fn service_probe_client() -> reqwest::Client {
+    SERVICE_PROBE_CLIENT.clone()
 }
 
 /// Probe an external service health endpoint and return a CheckStatus.
@@ -179,7 +209,13 @@ async fn check_service_health(
 /// Health check endpoint -- rich status page for dashboards.
 ///
 /// Checks database, storage (real write/read probe), optional services (Trivy,
-/// OpenSearch), and exposes DB connection pool statistics.
+/// OpenSearch, LDAP), and exposes DB connection pool statistics.
+///
+/// Every dependency sub-check is served through [`cached_check`], so repeated
+/// polling of this unauthenticated endpoint cannot drive one probe per request
+/// (#3127). The database check is left uncached deliberately: it is a single
+/// `SELECT 1` against an already-established pool connection, which is the
+/// cheapest thing on the page and the one signal that most needs to be live.
 #[utoipa::path(
     get,
     path = "/health",
@@ -204,57 +240,23 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
 
     let storage_check = check_storage_health(&state.config, &state.storage).await;
 
+    // Every dependency sub-check below runs behind a short-TTL, single-flight
+    // cache (#3127). `/health` is unauthenticated and, by design, not
+    // rate-limited, so the ceiling on what an anonymous caller can make this
+    // endpoint do has to live in the work itself: one probe per dependency
+    // per TTL window, regardless of request rate.
     let scanner_check = match &state.config.trivy_url {
-        Some(url) => Some(check_service_health(url, "/healthz", "Trivy").await),
+        Some(url) => Some(check_scanner_health(url).await),
         None => None,
     };
 
     let opensearch_check = match &state.search_service {
-        Some(ref svc) => match svc.cluster_health().await {
-            Ok(status) => match status.as_str() {
-                "green" | "yellow" => Some(CheckStatus {
-                    status: STATUS_HEALTHY.to_string(),
-                    message: None,
-                }),
-                other => Some(CheckStatus {
-                    status: STATUS_UNHEALTHY.to_string(),
-                    message: Some(format!("OpenSearch cluster status: {}", other)),
-                }),
-            },
-            Err(e) => Some(CheckStatus {
-                status: "unavailable".to_string(),
-                message: Some(format!("OpenSearch unreachable: {}", e)),
-            }),
-        },
+        Some(svc) => Some(check_opensearch_health(svc).await),
         None => None,
     };
 
     let ldap_check = if state.config.ldap_url.is_some() {
-        match crate::services::ldap_service::LdapService::new(
-            state.db.clone(),
-            std::sync::Arc::new(state.config.clone()),
-        ) {
-            Ok(svc) => match svc.check_health().await {
-                Ok(()) => Some(CheckStatus {
-                    status: STATUS_HEALTHY.to_string(),
-                    message: None,
-                }),
-                Err(e) => {
-                    tracing::warn!(error = %e, "LDAP health check failed");
-                    Some(CheckStatus {
-                        status: STATUS_UNHEALTHY.to_string(),
-                        message: Some("LDAP server unreachable".to_string()),
-                    })
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "LDAP configuration error");
-                Some(CheckStatus {
-                    status: STATUS_UNHEALTHY.to_string(),
-                    message: Some("LDAP configuration error".to_string()),
-                })
-            }
-        }
+        Some(check_ldap_health(&state.db, &state.config).await)
     } else {
         None
     };
@@ -488,8 +490,103 @@ const STORAGE_HEALTH_TTL: Duration = Duration::from_secs(5);
 /// short critical section never blocks the async runtime. The first poll after
 /// a TTL expiry refreshes it; concurrent pollers that arrive while a fresh
 /// entry exists return the cached value without touching the disk.
-static STORAGE_HEALTH_CACHE: Lazy<Mutex<Option<(Instant, CheckStatus)>>> =
-    Lazy::new(|| Mutex::new(None));
+static STORAGE_HEALTH_CACHE: Lazy<HealthCache> = Lazy::new(|| Mutex::new(None));
+
+/// One cached sub-check result: `(probed_at, status)`.
+///
+/// Guarded by a `tokio::sync::Mutex` rather than a `std::sync::Mutex` because
+/// the guard is held across the probe `.await` (see [`cached_check`]).
+type HealthCache = Mutex<Option<(Instant, CheckStatus)>>;
+
+/// TTL for the Trivy / OpenSearch / LDAP sub-checks. Same value and same
+/// reasoning as [`STORAGE_HEALTH_TTL`]: short enough that a genuinely-broken
+/// dependency is surfaced within seconds, long enough that any realistic
+/// polling rate collapses to one probe per dependency per window.
+const DEPENDENCY_HEALTH_TTL: Duration = Duration::from_secs(5);
+
+/// Cached result of the security-scanner (Trivy) probe.
+static SCANNER_HEALTH_CACHE: Lazy<HealthCache> = Lazy::new(|| Mutex::new(None));
+
+/// Cached result of the OpenSearch cluster-health probe.
+static OPENSEARCH_HEALTH_CACHE: Lazy<HealthCache> = Lazy::new(|| Mutex::new(None));
+
+/// Cached result of the LDAP directory-bind probe.
+static LDAP_HEALTH_CACHE: Lazy<HealthCache> = Lazy::new(|| Mutex::new(None));
+
+/// Serve a dependency probe through a short-TTL, single-flight cache.
+///
+/// `/health` and `/healthz` are registered at the router root, outside the
+/// `/api/v1` nest, so no `rate_limit_*` layer applies to them — and that is
+/// deliberate (orchestrators and dashboards must never be throttled off their
+/// own liveness signal). The cost of an anonymous request is therefore capped
+/// here, at the work itself, rather than gated at the door: however many
+/// requests arrive, each dependency is touched at most once per `ttl`.
+///
+/// The lock is intentionally held **across** `probe().await`, which makes
+/// this single-flight as well as time-bounded. Releasing it first — the
+/// obvious shape — leaves the interesting hole wide open: a cold cache plus a
+/// simultaneous burst of N requests would let all N through to the real
+/// dependency, which is exactly the request-storm shape this is meant to
+/// absorb. Under the guard, the first caller probes and the rest wait briefly
+/// and then read the entry it just wrote.
+///
+/// Taking `cache` as a parameter (rather than reaching for a static) keeps
+/// the TTL and single-flight behaviour unit-testable against a caller-owned
+/// cache, independent of process-wide state.
+async fn cached_check<F, Fut>(cache: &HealthCache, ttl: Duration, probe: F) -> CheckStatus
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = CheckStatus>,
+{
+    let mut guard = cache.lock().await;
+    if let Some((probed_at, ref status)) = *guard {
+        if probed_at.elapsed() < ttl {
+            return status.clone();
+        }
+    }
+
+    let status = probe().await;
+    *guard = Some((Instant::now(), status.clone()));
+    status
+}
+
+/// Every process-wide health cache, so test helpers can treat them as a set.
+#[cfg(test)]
+fn all_health_caches() -> [&'static HealthCache; 4] {
+    [
+        &STORAGE_HEALTH_CACHE,
+        &SCANNER_HEALTH_CACHE,
+        &OPENSEARCH_HEALTH_CACHE,
+        &LDAP_HEALTH_CACHE,
+    ]
+}
+
+/// Clear every process-wide health cache.
+///
+/// These are `Lazy` statics shared by the whole test binary, so a test that
+/// exercises caching must be able to start from a known-empty state or it
+/// becomes order-dependent.
+#[cfg(test)]
+async fn reset_health_caches() {
+    for cache in all_health_caches() {
+        *cache.lock().await = None;
+    }
+}
+
+/// Backdate every cached entry past its TTL so the next call re-probes.
+/// Lets expiry behaviour be exercised deterministically, without sleeping.
+#[cfg(test)]
+async fn expire_health_caches() {
+    let ttl = std::cmp::max(STORAGE_HEALTH_TTL, DEPENDENCY_HEALTH_TTL);
+    let stale_at = Instant::now()
+        .checked_sub(ttl + Duration::from_secs(1))
+        .expect("test clock");
+    for cache in all_health_caches() {
+        if let Some((ref mut at, _)) = *cache.lock().await {
+            *at = stale_at;
+        }
+    }
+}
 
 impl Clone for CheckStatus {
     fn clone(&self) -> Self {
@@ -511,23 +608,104 @@ async fn check_storage_health(
     config: &crate::config::Config,
     storage: &Arc<dyn StorageBackend>,
 ) -> CheckStatus {
-    {
-        let cache = STORAGE_HEALTH_CACHE.lock().await;
-        if let Some((probed_at, ref status)) = *cache {
-            if probed_at.elapsed() < STORAGE_HEALTH_TTL {
-                return status.clone();
+    cached_check(&STORAGE_HEALTH_CACHE, STORAGE_HEALTH_TTL, || {
+        probe_storage_health(config, storage)
+    })
+    .await
+}
+
+/// Probe the configured security scanner (Trivy), behind a short-TTL cache.
+///
+/// The uncached probe builds an HTTP request against the operator-configured
+/// `TRIVY_URL`; running it per `/health` request let anonymous polling drive
+/// scanner traffic one-for-one (#3127).
+async fn check_scanner_health(url: &str) -> CheckStatus {
+    cached_check(&SCANNER_HEALTH_CACHE, DEPENDENCY_HEALTH_TTL, || {
+        check_service_health(url, "/healthz", "Trivy")
+    })
+    .await
+}
+
+/// Probe the OpenSearch cluster, behind a short-TTL cache.
+async fn check_opensearch_health(
+    svc: &crate::services::opensearch_service::OpenSearchService,
+) -> CheckStatus {
+    cached_check(&OPENSEARCH_HEALTH_CACHE, DEPENDENCY_HEALTH_TTL, || {
+        probe_opensearch_health(svc)
+    })
+    .await
+}
+
+/// Perform the actual OpenSearch cluster-health query (uncached).
+///
+/// `yellow` counts as healthy: a single-node cluster reports yellow whenever
+/// a replica cannot be allocated, which is the normal steady state for most
+/// deployments and is not a service failure.
+async fn probe_opensearch_health(
+    svc: &crate::services::opensearch_service::OpenSearchService,
+) -> CheckStatus {
+    match svc.cluster_health().await {
+        Ok(status) => match status.as_str() {
+            "green" | "yellow" => CheckStatus {
+                status: STATUS_HEALTHY.to_string(),
+                message: None,
+            },
+            other => CheckStatus {
+                status: STATUS_UNHEALTHY.to_string(),
+                message: Some(format!("OpenSearch cluster status: {}", other)),
+            },
+        },
+        Err(e) => CheckStatus {
+            status: "unavailable".to_string(),
+            message: Some(format!("OpenSearch unreachable: {}", e)),
+        },
+    }
+}
+
+/// Probe the configured LDAP directory, behind a short-TTL cache.
+///
+/// This is the sharpest leg of the `/health` fan-out (#3127): the uncached
+/// probe constructs a fresh `LdapService` (which itself builds an HTTP client)
+/// and performs a real service-account bind. Once per request, on an
+/// unauthenticated endpoint, that lets an anonymous request storm be amplified
+/// into a directory connection storm — capable of exhausting server-side
+/// connection limits or interacting badly with the directory's own lockout and
+/// throttling counters. Caching turns it into one bind per TTL window no
+/// matter the request rate.
+async fn check_ldap_health(db: &sqlx::PgPool, config: &crate::config::Config) -> CheckStatus {
+    cached_check(&LDAP_HEALTH_CACHE, DEPENDENCY_HEALTH_TTL, || {
+        probe_ldap_health(db, config)
+    })
+    .await
+}
+
+/// Perform the actual LDAP service-account bind (uncached).
+async fn probe_ldap_health(db: &sqlx::PgPool, config: &crate::config::Config) -> CheckStatus {
+    match crate::services::ldap_service::LdapService::new(
+        db.clone(),
+        std::sync::Arc::new(config.clone()),
+    ) {
+        Ok(svc) => match svc.check_health().await {
+            Ok(()) => CheckStatus {
+                status: STATUS_HEALTHY.to_string(),
+                message: None,
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "LDAP health check failed");
+                CheckStatus {
+                    status: STATUS_UNHEALTHY.to_string(),
+                    message: Some("LDAP server unreachable".to_string()),
+                }
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "LDAP configuration error");
+            CheckStatus {
+                status: STATUS_UNHEALTHY.to_string(),
+                message: Some("LDAP configuration error".to_string()),
             }
         }
     }
-
-    let status = probe_storage_health(config, storage).await;
-
-    {
-        let mut cache = STORAGE_HEALTH_CACHE.lock().await;
-        *cache = Some((Instant::now(), status.clone()));
-    }
-
-    status
 }
 
 /// Perform the actual storage backend connectivity probe (uncached).
@@ -1656,5 +1834,658 @@ mod tests {
 
         // Leave the cache clean for any other consumer.
         *STORAGE_HEALTH_CACHE.lock().await = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3127: the unauthenticated, un-rate-limited `/health` must not fan out
+    // one live dependency probe per request.
+    //
+    // The oracle here is deliberately "how many times did the dependency get
+    // touched", not "did we call a cache wrapper": each sub-check is pointed
+    // at a counting stub server (an HTTP listener for Trivy and OpenSearch, a
+    // raw TCP listener for the LDAP directory) and the real `health_check`
+    // handler is driven N times. A test that only asserted on the cache
+    // internals would still pass if the handler stopped consulting them.
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Serializes every test that touches the process-wide health caches.
+    ///
+    /// Those caches are `Lazy` statics shared by the entire test binary, so
+    /// two tests seeding them concurrently would observe each other's
+    /// entries and become order-dependent. Every cache-touching test takes
+    /// this lock and starts from a cleared cache, which makes them
+    /// deterministic in any order and under `--test-threads` > 1.
+    static HEALTH_CACHE_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    /// Index of the end of the first complete HTTP request head in `buf`.
+    fn request_head_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    }
+
+    /// A keep-alive-capable HTTP stub on loopback that counts accepted TCP
+    /// connections and complete HTTP requests.
+    struct CountingHttpStub {
+        port: u16,
+        conns: Arc<AtomicUsize>,
+        reqs: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl CountingHttpStub {
+        fn conns(&self) -> usize {
+            self.conns.load(AtomicOrdering::SeqCst)
+        }
+        fn reqs(&self) -> usize {
+            self.reqs.load(AtomicOrdering::SeqCst)
+        }
+        /// Flip the stub to answering `500` so the dependency it stands in
+        /// for looks genuinely broken.
+        fn break_it(&self) {
+            self.fail.store(true, AtomicOrdering::SeqCst);
+        }
+    }
+
+    /// Spawn a [`CountingHttpStub`] that answers `200` with `body` until
+    /// [`CountingHttpStub::break_it`] is called, then `500`.
+    ///
+    /// The connection is kept alive between requests, which is what makes
+    /// the accepted-connection counter a usable oracle for "was one client
+    /// (and therefore one connection pool) reused, or was a fresh
+    /// `reqwest::Client` built per call".
+    async fn spawn_counting_http_stub(body: &'static str) -> CountingHttpStub {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let port = listener.local_addr().expect("stub addr").port();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let reqs = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+
+        let (conns_t, reqs_t, fail_t) = (conns.clone(), reqs.clone(), fail.clone());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                conns_t.fetch_add(1, AtomicOrdering::SeqCst);
+                let (reqs_c, fail_c) = (reqs_t.clone(), fail_t.clone());
+                tokio::spawn(async move {
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => acc.extend_from_slice(&buf[..n]),
+                        }
+                        while let Some(end) = request_head_end(&acc) {
+                            acc.drain(..end);
+                            reqs_c.fetch_add(1, AtomicOrdering::SeqCst);
+                            let (code, reason) = if fail_c.load(AtomicOrdering::SeqCst) {
+                                (500, "Internal Server Error")
+                            } else {
+                                (200, "OK")
+                            };
+                            let resp = format!(
+                                "HTTP/1.1 {code} {reason}\r\n\
+                                 Content-Type: application/json\r\n\
+                                 Content-Length: {}\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            if sock.write_all(resp.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        CountingHttpStub {
+            port,
+            conns,
+            reqs,
+            fail,
+        }
+    }
+
+    /// A raw TCP stub standing in for the LDAP directory. Counts accepted
+    /// connections — i.e. directory binds attempted — then drops the socket
+    /// so the bind fails fast instead of hanging until the 5s timeout.
+    struct CountingTcpStub {
+        port: u16,
+        conns: Arc<AtomicUsize>,
+    }
+
+    impl CountingTcpStub {
+        fn conns(&self) -> usize {
+            self.conns.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    async fn spawn_counting_tcp_stub() -> CountingTcpStub {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let port = listener.local_addr().expect("stub addr").port();
+        let conns = Arc::new(AtomicUsize::new(0));
+
+        let conns_t = conns.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                conns_t.fetch_add(1, AtomicOrdering::SeqCst);
+                drop(sock);
+            }
+        });
+
+        CountingTcpStub { port, conns }
+    }
+
+    /// `LdapConfig` reads the service-account credentials from the process
+    /// environment, and `check_health` only performs a real directory bind
+    /// when both are present — which is precisely the leg #3127 calls the
+    /// sharpest. Set them for the duration of a test and restore them after.
+    /// Always constructed while [`HEALTH_CACHE_TEST_LOCK`] is held.
+    struct LdapBindEnvGuard {
+        prev_dn: Option<String>,
+        prev_pw: Option<String>,
+    }
+
+    impl LdapBindEnvGuard {
+        fn set() -> Self {
+            let prev_dn = std::env::var("LDAP_BIND_DN").ok();
+            let prev_pw = std::env::var("LDAP_BIND_PASSWORD").ok();
+            std::env::set_var("LDAP_BIND_DN", "cn=probe,dc=example,dc=com");
+            std::env::set_var("LDAP_BIND_PASSWORD", "probe-secret");
+            Self { prev_dn, prev_pw }
+        }
+    }
+
+    impl Drop for LdapBindEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev_dn {
+                Some(v) => std::env::set_var("LDAP_BIND_DN", v),
+                None => std::env::remove_var("LDAP_BIND_DN"),
+            }
+            match &self.prev_pw {
+                Some(v) => std::env::set_var("LDAP_BIND_PASSWORD", v),
+                None => std::env::remove_var("LDAP_BIND_PASSWORD"),
+            }
+        }
+    }
+
+    /// Build a real `SharedState` whose Trivy, OpenSearch and LDAP legs all
+    /// point at the given loopback stub ports.
+    fn fanout_state(
+        pool: sqlx::PgPool,
+        dir: &std::path::Path,
+        trivy_port: u16,
+        opensearch_port: u16,
+        ldap_port: u16,
+    ) -> crate::api::SharedState {
+        let config = crate::config::Config {
+            storage_backend: "filesystem".to_string(),
+            storage_path: dir.to_string_lossy().into_owned(),
+            trivy_url: Some(format!("http://127.0.0.1:{trivy_port}")),
+            ldap_url: Some(format!("ldap://127.0.0.1:{ldap_port}")),
+            ldap_base_dn: Some("dc=example,dc=com".to_string()),
+            ..crate::config::Config::test_config()
+        };
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(config.storage_path.clone()),
+        );
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let mut state = crate::api::AppState::new(config, pool, storage, registry);
+        state.search_service = Some(Arc::new(
+            crate::services::opensearch_service::OpenSearchService::new(
+                &format!("http://127.0.0.1:{opensearch_port}"),
+                None,
+                None,
+                false,
+            )
+            .expect("build opensearch stub client"),
+        ));
+        Arc::new(state)
+    }
+
+    /// Drive `health_check` once and return the HTTP status it produced.
+    async fn call_health(state: &crate::api::SharedState) -> StatusCode {
+        use axum::response::IntoResponse as _;
+        health_check(axum::extract::State(state.clone()))
+            .await
+            .into_response()
+            .status()
+    }
+
+    /// Drive `health_check` once and return `(status, parsed body)`.
+    ///
+    /// streaming-invariant: test scaffolding exempt — the health response is
+    /// a small bounded JSON document, not an artifact path (#1608). The limit
+    /// is explicit so a runaway body still fails rather than OOMs.
+    #[allow(clippy::disallowed_methods)]
+    async fn call_health_json(state: &crate::api::SharedState) -> (StatusCode, serde_json::Value) {
+        use axum::response::IntoResponse as _;
+        let resp = health_check(axum::extract::State(state.clone()))
+            .await
+            .into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read health body");
+        (status, serde_json::from_slice(&bytes).expect("health json"))
+    }
+
+    /// #3127 core guard: repeated `/health` polling must touch each
+    /// dependency ONCE per TTL window, not once per request.
+    ///
+    /// Ten sequential calls against the stubs. Pre-fix (an uncached probe per
+    /// sub-check) this records 10 Trivy requests, 10 OpenSearch requests and
+    /// 10 LDAP binds; with the TTL cache in place each counter is 1.
+    #[tokio::test]
+    async fn test_health_check_collapses_dependency_fanout_across_requests() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let _env = LdapBindEnvGuard::set();
+
+        let trivy = spawn_counting_http_stub("{}").await;
+        let opensearch = spawn_counting_http_stub("{\"status\":\"green\"}").await;
+        let ldap = spawn_counting_tcp_stub().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = fanout_state(pool, dir.path(), trivy.port, opensearch.port, ldap.port);
+
+        const POLLS: usize = 10;
+        for _ in 0..POLLS {
+            let _ = call_health(&state).await;
+        }
+
+        println!(
+            "[#3127] {POLLS} sequential /health requests -> \
+             trivy_probes={} opensearch_probes={} ldap_binds={}",
+            trivy.reqs(),
+            opensearch.reqs(),
+            ldap.conns()
+        );
+
+        assert_eq!(
+            trivy.reqs(),
+            1,
+            "{POLLS} /health requests must produce exactly 1 Trivy probe, got {}",
+            trivy.reqs()
+        );
+        assert_eq!(
+            opensearch.reqs(),
+            1,
+            "{POLLS} /health requests must produce exactly 1 OpenSearch \
+             cluster-health query, got {}",
+            opensearch.reqs()
+        );
+        assert_eq!(
+            ldap.conns(),
+            1,
+            "{POLLS} /health requests must produce exactly 1 LDAP bind, got {}",
+            ldap.conns()
+        );
+
+        reset_health_caches().await;
+    }
+
+    /// A concurrent burst — the shape an actual request storm takes — must
+    /// also collapse to one probe per dependency. A cache that releases its
+    /// lock before probing would let every request in a cold-cache burst
+    /// through, so this pins the single-flight property specifically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_health_check_collapses_dependency_fanout_under_concurrent_burst() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let _env = LdapBindEnvGuard::set();
+
+        let trivy = spawn_counting_http_stub("{}").await;
+        let opensearch = spawn_counting_http_stub("{\"status\":\"green\"}").await;
+        let ldap = spawn_counting_tcp_stub().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = fanout_state(pool, dir.path(), trivy.port, opensearch.port, ldap.port);
+
+        const BURST: usize = 25;
+        let mut tasks = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let state = state.clone();
+            tasks.push(tokio::spawn(async move { call_health(&state).await }));
+        }
+        for t in tasks {
+            let _ = t.await.expect("health task");
+        }
+
+        println!(
+            "[#3127] {BURST} CONCURRENT /health requests -> \
+             trivy_probes={} opensearch_probes={} ldap_binds={}",
+            trivy.reqs(),
+            opensearch.reqs(),
+            ldap.conns()
+        );
+
+        assert_eq!(
+            trivy.reqs(),
+            1,
+            "a concurrent burst must still produce 1 Trivy probe, got {}",
+            trivy.reqs()
+        );
+        assert_eq!(
+            opensearch.reqs(),
+            1,
+            "a concurrent burst must still produce 1 OpenSearch query, got {}",
+            opensearch.reqs()
+        );
+        assert_eq!(
+            ldap.conns(),
+            1,
+            "a concurrent burst must still produce 1 LDAP bind, got {}",
+            ldap.conns()
+        );
+
+        reset_health_caches().await;
+    }
+
+    /// The probe client must be built once and reused, not rebuilt per call
+    /// (each rebuild re-reads `CUSTOM_CA_CERT_PATH` with a blocking
+    /// `std::fs::read` on the async runtime and throws away the connection
+    /// pool).
+    ///
+    /// Oracle: connection reuse. `check_service_health` is the *uncached*
+    /// inner probe, so five sequential calls always make five HTTP requests;
+    /// what changes is how many TCP connections they need. A fresh
+    /// `reqwest::Client` per call means a fresh pool per call, so five
+    /// connections. One shared client keeps the connection alive and needs
+    /// exactly one.
+    #[tokio::test]
+    async fn test_service_probe_client_is_reused_across_probes() {
+        let stub = spawn_counting_http_stub("{}").await;
+        let base = format!("http://127.0.0.1:{}", stub.port);
+
+        const PROBES: usize = 5;
+        for _ in 0..PROBES {
+            let status = check_service_health(&base, "/healthz", "Trivy").await;
+            assert_eq!(status.status, STATUS_HEALTHY);
+        }
+
+        println!(
+            "[#3127] {PROBES} uncached Trivy probes -> \
+             http_requests={} tcp_connections={}",
+            stub.reqs(),
+            stub.conns()
+        );
+
+        assert_eq!(stub.reqs(), PROBES, "each probe must issue one request");
+        assert_eq!(
+            stub.conns(),
+            1,
+            "the probe client must be built once and reused: {PROBES} probes \
+             opened {} TCP connections, meaning a new client (and a new \
+             connection pool, and a re-read of the CA bundle) per call",
+            stub.conns()
+        );
+    }
+
+    /// Positive control (i): caching must not make `/health` claim health it
+    /// does not have. With the OpenSearch dependency answering 500, `/health`
+    /// reports 503 and names the broken legs in the body.
+    #[tokio::test]
+    async fn test_health_check_reports_unhealthy_when_dependency_is_down() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let _env = LdapBindEnvGuard::set();
+
+        let trivy = spawn_counting_http_stub("{}").await;
+        let opensearch = spawn_counting_http_stub("{\"status\":\"green\"}").await;
+        let ldap = spawn_counting_tcp_stub().await;
+        trivy.break_it();
+        opensearch.break_it();
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = fanout_state(pool, dir.path(), trivy.port, opensearch.port, ldap.port);
+
+        let (status, body) = call_health_json(&state).await;
+        println!("[#3127] dependency down -> status={status} body={body}");
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a genuinely broken dependency must still produce a 503"
+        );
+        assert_eq!(body["status"], STATUS_UNHEALTHY);
+        assert_ne!(
+            body["checks"]["opensearch"]["status"], STATUS_HEALTHY,
+            "a 500 from OpenSearch must not be reported as healthy"
+        );
+        assert_ne!(
+            body["checks"]["security_scanner"]["status"], STATUS_HEALTHY,
+            "a 500 from Trivy must not be reported as healthy"
+        );
+        assert_eq!(
+            body["checks"]["ldap"]["status"], STATUS_UNHEALTHY,
+            "a directory that resets the connection must be reported unhealthy"
+        );
+
+        reset_health_caches().await;
+    }
+
+    /// Positive control (ii): the cache must not pin a stale `healthy`
+    /// forever. A dependency that goes bad is served from cache inside the
+    /// TTL window and surfaced as soon as the window expires.
+    #[tokio::test]
+    async fn test_health_check_surfaces_dependency_failure_after_ttl_expiry() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let _lock = HEALTH_CACHE_TEST_LOCK.lock().await;
+        reset_health_caches().await;
+        let _env = LdapBindEnvGuard::set();
+
+        let trivy = spawn_counting_http_stub("{}").await;
+        let opensearch = spawn_counting_http_stub("{\"status\":\"green\"}").await;
+        let ldap = spawn_counting_tcp_stub().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = fanout_state(pool, dir.path(), trivy.port, opensearch.port, ldap.port);
+
+        let (status, body) = call_health_json(&state).await;
+        assert_eq!(status, StatusCode::OK, "healthy deps must produce a 200");
+        assert_eq!(body["checks"]["opensearch"]["status"], STATUS_HEALTHY);
+
+        // Dependency breaks. Inside the TTL window the cached result stands.
+        opensearch.break_it();
+        let (cached_status, cached_body) = call_health_json(&state).await;
+        println!(
+            "[#3127] dependency broke, within TTL -> status={cached_status} \
+             opensearch={} (opensearch_probes={})",
+            cached_body["checks"]["opensearch"]["status"],
+            opensearch.reqs()
+        );
+        assert_eq!(
+            cached_status,
+            StatusCode::OK,
+            "inside the TTL window the cached result is served"
+        );
+        assert_eq!(opensearch.reqs(), 1, "no re-probe inside the TTL window");
+
+        // Expire every cached entry; the next poll must re-probe and report
+        // the real, now-broken state.
+        expire_health_caches().await;
+        let (expired_status, expired_body) = call_health_json(&state).await;
+        println!(
+            "[#3127] after TTL expiry -> status={expired_status} \
+             opensearch={} (opensearch_probes={})",
+            expired_body["checks"]["opensearch"]["status"],
+            opensearch.reqs()
+        );
+
+        assert_eq!(
+            expired_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an expired cache entry must re-probe and surface the failure"
+        );
+        assert_ne!(
+            expired_body["checks"]["opensearch"]["status"], STATUS_HEALTHY,
+            "the broken dependency must be reported once the TTL lapses"
+        );
+        assert_eq!(
+            opensearch.reqs(),
+            2,
+            "exactly one re-probe after expiry, got {} total",
+            opensearch.reqs()
+        );
+
+        reset_health_caches().await;
+    }
+
+    /// `cached_check` itself, driven against a caller-owned cache so the
+    /// TTL and single-flight properties are pinned without touching any
+    /// process-wide static: fresh entries are served without probing,
+    /// expired ones re-probe, and a concurrent burst on a cold cache
+    /// produces exactly one probe.
+    #[tokio::test]
+    async fn test_cached_check_ttl_and_single_flight() {
+        let cache: HealthCache = Mutex::new(None);
+        let probes = Arc::new(AtomicUsize::new(0));
+        let ttl = Duration::from_secs(60);
+
+        let probe = || {
+            let probes = probes.clone();
+            async move {
+                probes.fetch_add(1, AtomicOrdering::SeqCst);
+                // Yield so a burst genuinely interleaves rather than
+                // completing inside one poll.
+                tokio::task::yield_now().await;
+                CheckStatus {
+                    status: STATUS_HEALTHY.to_string(),
+                    message: None,
+                }
+            }
+        };
+
+        // Cold cache -> one probe. Warm cache -> none.
+        assert_eq!(
+            cached_check(&cache, ttl, probe).await.status,
+            STATUS_HEALTHY
+        );
+        assert_eq!(probes.load(AtomicOrdering::SeqCst), 1);
+        for _ in 0..10 {
+            let _ = cached_check(&cache, ttl, probe).await;
+        }
+        assert_eq!(
+            probes.load(AtomicOrdering::SeqCst),
+            1,
+            "a fresh entry must be served without re-probing"
+        );
+
+        // A fresh entry is served verbatim, proving it came from the cache
+        // and not from a re-run of the (healthy) probe.
+        {
+            let mut guard = cache.lock().await;
+            *guard = Some((
+                Instant::now(),
+                CheckStatus {
+                    status: STATUS_UNHEALTHY.to_string(),
+                    message: Some("cached sentinel".to_string()),
+                },
+            ));
+        }
+        let served = cached_check(&cache, ttl, probe).await;
+        assert_eq!(served.message.as_deref(), Some("cached sentinel"));
+        assert_eq!(probes.load(AtomicOrdering::SeqCst), 1);
+
+        // Backdate past the TTL -> exactly one refresh.
+        {
+            let mut guard = cache.lock().await;
+            if let Some((ref mut at, _)) = *guard {
+                *at = Instant::now()
+                    .checked_sub(ttl + Duration::from_secs(1))
+                    .expect("test clock");
+            }
+        }
+        assert_eq!(
+            cached_check(&cache, ttl, probe).await.status,
+            STATUS_HEALTHY
+        );
+        assert_eq!(
+            probes.load(AtomicOrdering::SeqCst),
+            2,
+            "an expired entry must trigger exactly one re-probe"
+        );
+
+        // Single flight: a burst against a cold cache probes once.
+        let cache = Arc::new(Mutex::new(None));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..25 {
+            let (cache, probes) = (cache.clone(), probes.clone());
+            tasks.push(tokio::spawn(async move {
+                cached_check(&cache, ttl, || {
+                    let probes = probes.clone();
+                    async move {
+                        probes.fetch_add(1, AtomicOrdering::SeqCst);
+                        tokio::task::yield_now().await;
+                        CheckStatus {
+                            status: STATUS_HEALTHY.to_string(),
+                            message: None,
+                        }
+                    }
+                })
+                .await
+            }));
+        }
+        for t in tasks {
+            assert_eq!(t.await.expect("burst task").status, STATUS_HEALTHY);
+        }
+        assert_eq!(
+            probes.load(AtomicOrdering::SeqCst),
+            1,
+            "a cold-cache burst must produce exactly one probe, got {}",
+            probes.load(AtomicOrdering::SeqCst)
+        );
+    }
+
+    /// `/livez` must stay genuinely dependency-free: it is the probe
+    /// Kubernetes uses to decide whether to restart the pod, so it must never
+    /// touch Trivy, OpenSearch, the directory, storage or the database. The
+    /// handler takes no `State` at all, and this pins the observable
+    /// consequence.
+    #[tokio::test]
+    async fn test_liveness_check_touches_no_dependencies() {
+        use axum::response::IntoResponse as _;
+
+        let trivy = spawn_counting_http_stub("{}").await;
+        let opensearch = spawn_counting_http_stub("{\"status\":\"green\"}").await;
+        let ldap = spawn_counting_tcp_stub().await;
+
+        for _ in 0..5 {
+            let resp = liveness_check().await.into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        println!(
+            "[#3127] 5 /livez requests -> trivy_probes={} opensearch_probes={} \
+             ldap_binds={}",
+            trivy.reqs(),
+            opensearch.reqs(),
+            ldap.conns()
+        );
+
+        assert_eq!(trivy.reqs(), 0, "/livez must not probe the scanner");
+        assert_eq!(opensearch.reqs(), 0, "/livez must not probe OpenSearch");
+        assert_eq!(ldap.conns(), 0, "/livez must not bind to the directory");
     }
 }
