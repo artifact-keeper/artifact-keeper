@@ -1,8 +1,83 @@
 //! Application configuration loaded from environment variables.
 
 use crate::error::{AppError, Result};
+#[cfg(not(test))]
 use std::env;
 use std::path::Path;
+/// In test builds `env` resolves to [`test_env`] — a thread-local overlay over
+/// the process environment — rather than [`std::env`]. Production builds use
+/// [`std::env`] unchanged. See [`test_env`] for why (#3191).
+#[cfg(test)]
+use test_env as env;
+
+#[cfg(test)]
+mod test_env {
+    //! Thread-local overlay over the process environment, compiled only into
+    //! test builds (#3191).
+    //!
+    //! [`super::Config::from_env`] reads ~200 environment variables, so the
+    //! tests covering it must control those variables. Historically they did
+    //! that with [`std::env::set_var`], which mutates state shared by the
+    //! *entire process*. Under `cargo test` the whole suite runs in **one**
+    //! process across many threads, so while a config test held the sentinel
+    //! `DATABASE_URL=postgresql://127.0.0.1:1/testdb` (a deliberately dead
+    //! port), every DB-backed test that happened to start during that window
+    //! read the sentinel and failed with `Connection refused (os error 111)`.
+    //! Restoring the saved value promptly narrowed the window but could never
+    //! close it: the racing reader is on another thread, and no lock held by
+    //! this module can cover a reader that does not take it.
+    //!
+    //! The overlay closes the window instead of narrowing it. Each test thread
+    //! gets its own map; [`set_var`] and [`remove_var`] write only to that map,
+    //! and [`var`] consults it before falling back to [`std::env::var`]. A
+    //! config test therefore sees exactly the environment it asked for, while a
+    //! DB-backed test on another thread keeps seeing the real `DATABASE_URL`.
+    //! No mutation is ever visible off-thread, so there is no window to lose.
+    //!
+    //! Note this is why the fix is *not* a connect retry: port 1 is not
+    //! transiently unavailable, it is permanently wrong for the lifetime of the
+    //! process. Retrying would only make the failure slower.
+    //!
+    //! `cargo nextest` (used by CI) runs a process per test and was never
+    //! affected; this bug bites `cargo test`, which is what developers run
+    //! locally.
+
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::env::VarError;
+
+    thread_local! {
+        /// This thread's overrides. `Some(v)` shadows the process value with
+        /// `v`; `None` masks the variable as unset even when the process
+        /// defines it (so the "`DATABASE_URL` not set" error paths stay
+        /// testable without unsetting it for anyone else).
+        static OVERLAY: RefCell<HashMap<String, Option<String>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// Read a variable, preferring this thread's overlay, else the real
+    /// process environment.
+    pub fn var(key: &str) -> Result<String, VarError> {
+        match OVERLAY.with(|o| o.borrow().get(key).cloned()) {
+            Some(Some(value)) => Ok(value),
+            Some(None) => Err(VarError::NotPresent),
+            None => std::env::var(key),
+        }
+    }
+
+    /// Set a variable **for the current thread only**.
+    pub fn set_var(key: &str, value: impl AsRef<str>) {
+        OVERLAY.with(|o| {
+            o.borrow_mut()
+                .insert(key.to_owned(), Some(value.as_ref().to_owned()))
+        });
+    }
+
+    /// Mask a variable as unset **for the current thread only**.
+    pub fn remove_var(key: &str) {
+        OVERLAY.with(|o| o.borrow_mut().insert(key.to_owned(), None));
+    }
+}
 
 /// Read an environment variable and parse it, falling back to a default on missing or invalid values.
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -1587,22 +1662,25 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // Environment variable tests must be serialized because env is global state.
-    // We use a mutex to prevent parallel test interference.
+    // Retained for ordering stability between tests in THIS module that read
+    // and write the same keys. It is no longer what keeps env changes from
+    // escaping: as of #3191 `env` here is `super::test_env`, a thread-local
+    // overlay, so nothing these tests write is visible to any other thread in
+    // the first place. Removing this mutex would be a safe, separate cleanup.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    // The sentinel DATABASE_URL these tests export deliberately points at
-    // `127.0.0.1:1` (a port nothing listens on, so connects are REFUSED
-    // instantly) rather than `localhost:5432`. `std::env` is process-global
-    // and ENV_MUTEX only serializes THIS module, so while any of these tests
-    // runs, concurrently-starting DB-gated tests elsewhere in the suite can
-    // observe the sentinel via `testing::require_db_url()`. Pointing it at a
-    // real Postgres port meant those tests tried to speak to whatever squats
-    // on :5432 — and a listener that accepts but never answers turned each
-    // observation into a long (pre-#2986: unbounded) stall. An
-    // instantly-refused sentinel makes a window-sampled URL cost microseconds.
+    // These tests point the sentinel `DATABASE_URL` at `127.0.0.1:1` — a port
+    // nothing listens on, so a connect is refused instantly rather than
+    // hanging against whatever squats on :5432.
+    //
+    // Before #3191 that sentinel was written to the process-global environment,
+    // so any DB-backed test starting elsewhere in the suite could observe it
+    // through `testing::require_db_url()` and fail with `Connection refused
+    // (os error 111)`. ENV_MUTEX did not prevent that, because those tests
+    // never took it. The thread-local overlay now confines the sentinel to the
+    // thread that set it, which is what actually closes the race.
     /// Restore an env var to a previously captured value (or remove it if it
-    /// was unset), so env-mutating tests do not leak state to other tests.
+    /// was unset), so env-mutating tests do not leak state within this thread.
     fn restore_env(key: &str, saved: Option<String>) {
         match saved {
             Some(v) => env::set_var(key, v),
