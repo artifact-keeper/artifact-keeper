@@ -21,6 +21,13 @@
 //! - S3_POOL_MAX_IDLE_PER_HOST: Maximum idle connections per host (default: 256)
 //! - S3_POOL_IDLE_TIMEOUT_SECS: Idle connection timeout in seconds (default: 90)
 //!
+//! For HTTP request timeouts:
+//! - S3_BULK_TIMEOUT_SECS: Overall request timeout for bulk data transfer --
+//!   object payload reads/writes, multipart part uploads, and server-side
+//!   CopyObject (default: 1800). Control-plane calls (head/list/delete/exists)
+//!   keep a short [`S3_CONTROL_TIMEOUT`] so a wedged endpoint still fails fast.
+//!   Set to 0 to disable the bulk timeout entirely.
+//!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
 //! - S3_PRESIGN_EXPIRY_SECS: URL expiry in seconds (default: 3600)
@@ -61,6 +68,23 @@ const S3_MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024;
 const S3_MULTIPART_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 const S3_MULTIPART_MAX_IN_FLIGHT_PARTS: usize = 4;
 const S3_MAX_SINGLE_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+/// Overall HTTP request timeout for control-plane S3 calls: head, exists, list,
+/// delete, multipart create/abort. These are all small, fixed-cost round trips,
+/// so a short cliff keeps a wedged endpoint from stalling a worker. This is the
+/// same value `object_store::ClientOptions` defaults to; it is stated
+/// explicitly here so the contrast with [`S3_DEFAULT_BULK_TIMEOUT_SECS`] is
+/// visible at the call site.
+const S3_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default overall HTTP request timeout for bulk data transfer (#3180).
+///
+/// `object_store`'s 30s default applies "from when the request starts
+/// connecting until the response body has finished", which makes it a cap on
+/// *total transfer duration*, not on stalls. A 2.33 GB OCI layer routinely
+/// exceeds it in two places -- draining a `get_stream` body and waiting out a
+/// server-side `CopyObject` -- so the default silently made multi-GB pushes
+/// impossible. 30 minutes matches the ceiling the GCS backend already uses for
+/// its streaming client (`gcs.rs`), keeping a cliff without capping transfers.
+const S3_DEFAULT_BULK_TIMEOUT_SECS: u64 = 1800;
 /// S3 caps a multipart upload at 10,000 parts.
 const S3_MULTIPART_MAX_PARTS: usize = 10_000;
 /// S3's maximum object size (5 TiB). The adaptive part-size schedule is designed
@@ -401,6 +425,17 @@ pub struct S3Config {
     /// longer than this are closed. Default: 90 seconds (matches hyper/reqwest
     /// defaults).
     pub pool_idle_timeout_secs: u64,
+    /// Overall HTTP request timeout, in seconds, for bulk data transfer:
+    /// payload get/put, streaming get/put, multipart part uploads, and
+    /// server-side CopyObject. Control-plane calls keep [`S3_CONTROL_TIMEOUT`].
+    /// `0` disables the bulk timeout. Default:
+    /// [`S3_DEFAULT_BULK_TIMEOUT_SECS`] (#3180).
+    pub bulk_timeout_secs: u64,
+    /// Overall HTTP request timeout, in seconds, for control-plane calls:
+    /// head/exists/list/delete/multipart-create. Small fixed-cost round trips,
+    /// so this stays short to fail fast on a wedged endpoint. `0` disables it.
+    /// Default: [`S3_CONTROL_TIMEOUT`] (30s).
+    pub control_timeout_secs: u64,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -457,6 +492,14 @@ impl S3Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(90);
+        let bulk_timeout_secs: u64 = std::env::var("S3_BULK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(S3_DEFAULT_BULK_TIMEOUT_SECS);
+        let control_timeout_secs: u64 = std::env::var("S3_CONTROL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(S3_CONTROL_TIMEOUT.as_secs());
 
         Ok(Self {
             bucket,
@@ -474,6 +517,8 @@ impl S3Config {
             disable_multi_delete,
             pool_max_idle_per_host,
             pool_idle_timeout_secs,
+            bulk_timeout_secs,
+            control_timeout_secs,
         })
     }
 
@@ -537,6 +582,8 @@ impl S3Config {
             disable_multi_delete: false,
             pool_max_idle_per_host: 256,
             pool_idle_timeout_secs: 90,
+            bulk_timeout_secs: S3_DEFAULT_BULK_TIMEOUT_SECS,
+            control_timeout_secs: S3_CONTROL_TIMEOUT.as_secs(),
         }
     }
 
@@ -586,6 +633,18 @@ impl S3Config {
 
     pub fn with_pool_idle_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.pool_idle_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Override the bulk-transfer request timeout (seconds). `0` disables it.
+    pub fn with_bulk_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.bulk_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Override the control-plane request timeout (seconds). `0` disables it.
+    pub fn with_control_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.control_timeout_secs = timeout_secs;
         self
     }
 }
@@ -726,6 +785,11 @@ fn artifactory_fallback_path(key: &str) -> Option<String> {
 /// S3-compatible storage backend
 pub struct S3Backend {
     store: AmazonS3,
+    /// Bulk-transfer client (#3180). Same credentials and endpoint as
+    /// [`Self::store`], but with a request timeout sized for multi-GB object
+    /// payloads instead of the control-plane cliff. Used only by `get`/`put`,
+    /// `get_stream`/`put_stream`, and `copy`.
+    bulk_store: AmazonS3,
     prefix: Option<String>,
     redirect_downloads: bool,
     cloudfront: Option<CloudFrontConfig>,
@@ -738,14 +802,53 @@ pub struct S3Backend {
 }
 
 impl S3Backend {
+    /// Build the control-plane store: head, exists, list, delete, multipart
+    /// create/abort, presigning. Short request timeout ([`S3_CONTROL_TIMEOUT`]).
     fn build_store(
         config: &S3Config,
         access_key: Option<&str>,
         secret_key: Option<&str>,
     ) -> Result<AmazonS3> {
+        let timeout = (config.control_timeout_secs > 0)
+            .then(|| Duration::from_secs(config.control_timeout_secs));
+        Self::build_store_with_timeout(config, access_key, secret_key, timeout)
+    }
+
+    /// Build the bulk-transfer store used for object payload movement:
+    /// `get`/`put`, `get_stream`/`put_stream` (including multipart part
+    /// uploads), and server-side `copy`.
+    ///
+    /// These operations' duration scales with object size, so the
+    /// control-plane cliff cannot apply to them (#3180). `bulk_timeout_secs ==
+    /// 0` opts out of the timeout entirely.
+    fn build_bulk_store(
+        config: &S3Config,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+    ) -> Result<AmazonS3> {
+        let timeout =
+            (config.bulk_timeout_secs > 0).then(|| Duration::from_secs(config.bulk_timeout_secs));
+        Self::build_store_with_timeout(config, access_key, secret_key, timeout)
+    }
+
+    fn build_store_with_timeout(
+        config: &S3Config,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<AmazonS3> {
         let mut client_opts = object_store::ClientOptions::new()
             .with_pool_max_idle_per_host(config.pool_max_idle_per_host)
             .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
+
+        // `object_store` defaults this to 30s and applies it from the start of
+        // connect until the response body is fully read, so it caps total
+        // transfer duration rather than detecting stalls. Always set it
+        // explicitly -- leaving it implicit is what caused #3180.
+        client_opts = match timeout {
+            Some(t) => client_opts.with_timeout(t),
+            None => client_opts.with_timeout_disabled(),
+        };
 
         if config
             .endpoint
@@ -932,6 +1035,7 @@ impl S3Backend {
         Self::validate_credentials_present(&config)?;
 
         let store = Self::build_store(&config, None, None)?;
+        let bulk_store = Self::build_bulk_store(&config, None, None)?;
 
         let signing_store = match (&config.presign_access_key, &config.presign_secret_key) {
             (Some(ak), Some(sk)) => {
@@ -965,6 +1069,7 @@ impl S3Backend {
 
         Ok(Self {
             store,
+            bulk_store,
             prefix: config.prefix,
             redirect_downloads: config.redirect_downloads,
             cloudfront: config.cloudfront,
@@ -1028,7 +1133,7 @@ impl S3Backend {
         );
 
         let path: ObjectPath = fallback_full_key.into();
-        match self.store.get(&path).await {
+        match self.bulk_store.get(&path).await {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
@@ -1075,7 +1180,7 @@ impl S3Backend {
         );
 
         let path: ObjectPath = fallback_full_key.into();
-        match self.store.get_range(&path, range).await {
+        match self.bulk_store.get_range(&path, range).await {
             Ok(bytes) => {
                 tracing::info!(
                     key = %key,
@@ -1158,10 +1263,13 @@ impl super::StorageBackend for S3Backend {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
 
-        self.store.put(&path, content.into()).await.map_err(|e| {
-            tracing::error!(key = %key, error = %e, "S3 put_object failed");
-            AppError::Storage(format!("Failed to put object '{}': {}", key, e))
-        })?;
+        self.bulk_store
+            .put(&path, content.into())
+            .await
+            .map_err(|e| {
+                tracing::error!(key = %key, error = %e, "S3 put_object failed");
+                AppError::Storage(format!("Failed to put object '{}': {}", key, e))
+            })?;
 
         tracing::debug!(key = %key, "S3 put object successful");
         Ok(())
@@ -1172,7 +1280,7 @@ impl super::StorageBackend for S3Backend {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
 
-        match self.store.get(&path).await {
+        match self.bulk_store.get(&path).await {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
@@ -1377,7 +1485,7 @@ impl super::StorageBackend for S3Backend {
         let path: ObjectPath = full_key.into();
         let key_owned = key.to_string();
 
-        let result = self.store.get(&path).await.map_err(|e| match e {
+        let result = self.bulk_store.get(&path).await.map_err(|e| match e {
             object_store::Error::NotFound { .. } => {
                 AppError::NotFound(format!("Storage key not found: {}", key_owned))
             }
@@ -1401,7 +1509,7 @@ impl super::StorageBackend for S3Backend {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
 
-        match self.store.get_range(&path, range.clone()).await {
+        match self.bulk_store.get_range(&path, range.clone()).await {
             Ok(bytes) => {
                 tracing::debug!(
                     key = %key,
@@ -1496,7 +1604,7 @@ impl super::StorageBackend for S3Backend {
                                 &mut upload_tasks,
                                 &mut uploaded_parts,
                                 S3PartUploadContext {
-                                    store: &self.store,
+                                    store: &self.bulk_store,
                                     path: &path,
                                     upload_id: upload_id
                                         .as_ref()
@@ -1525,7 +1633,7 @@ impl super::StorageBackend for S3Backend {
                                 &mut upload_tasks,
                                 &mut uploaded_parts,
                                 S3PartUploadContext {
-                                    store: &self.store,
+                                    store: &self.bulk_store,
                                     path: &path,
                                     upload_id: upload_id
                                         .as_ref()
@@ -1560,7 +1668,7 @@ impl super::StorageBackend for S3Backend {
                     &mut upload_tasks,
                     &mut uploaded_parts,
                     S3PartUploadContext {
-                        store: &self.store,
+                        store: &self.bulk_store,
                         path: &path,
                         upload_id: &upload_id,
                         key,
@@ -1586,8 +1694,11 @@ impl super::StorageBackend for S3Backend {
                 .into_iter()
                 .map(|(_, part_id)| part_id)
                 .collect();
+            // CompleteMultipartUpload assembles the object server-side; for a
+            // multi-GB upload S3 can hold the connection well past the
+            // control-plane cliff, so this rides the bulk client too (#3180).
             if let Err(e) = self
-                .store
+                .bulk_store
                 .complete_multipart(&path, &upload_id, parts)
                 .await
             {
@@ -1687,7 +1798,7 @@ impl S3Backend {
         let from: ObjectPath = source_key.into();
         let to: ObjectPath = dest_key.into();
 
-        self.store.copy(&from, &to).await.map_err(|e| {
+        self.bulk_store.copy(&from, &to).await.map_err(|e| {
             AppError::Storage(format!("Failed to copy '{}' to '{}': {}", source, dest, e))
         })?;
 
@@ -3330,8 +3441,12 @@ mod tests {
         // build_store needs explicit creds so the signer can produce URLs
         let store = S3Backend::build_store(&config, Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"))
             .expect("build mock store");
+        let bulk_store =
+            S3Backend::build_bulk_store(&config, Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"))
+                .expect("build mock bulk store");
         S3Backend {
             store,
+            bulk_store,
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
@@ -3483,6 +3598,237 @@ mod tests {
         let _ = crate::storage::StorageBackend::delete(&backend, "multi-key").await;
         // Not asserting success because the mock may not perfectly satisfy
         // the object_store S3 multi-delete protocol, but the branch is exercised.
+    }
+
+    // --- #3180: multi-GB OCI blob operations must not die on the S3 client's
+    // default 30s overall-request timeout ---
+
+    /// Reproduces #3180 without needing a multi-GB object: the failing
+    /// ingredient is *elapsed time on one S3 request*, not the byte count.
+    ///
+    /// `S3Backend::copy` for an object under `S3_MAX_SINGLE_COPY_SIZE` issues a
+    /// native `CopyObject` (PUT + `x-amz-copy-source`). S3 holds that connection
+    /// open for the whole server-side copy, which for a 2.33 GB layer exceeds
+    /// 30 seconds. `object_store::ClientOptions::default()` sets an overall
+    /// request timeout of 30s covering connect + headers + body, so the copy is
+    /// aborted client-side at exactly 30s and the blob PUT 500s.
+    ///
+    /// The mock delays the CopyObject response past 30s; a correctly configured
+    /// client must wait for it.
+    #[tokio::test]
+    async fn test_copy_survives_response_slower_than_30s_default_timeout() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // HEAD for S3Backend::copy's size() probe. Well under the 5 GiB
+        // single-copy threshold, so the native CopyObject branch is taken --
+        // this is NOT the >5 GiB restream path tracked by #3164.
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "2336179827")
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("etag", "\"copy-src-etag\""),
+            )
+            .mount(&server)
+            .await;
+
+        // The CopyObject itself: S3 does not answer until the server-side copy
+        // finishes. 32s is the smallest round delay that clears the 30s default.
+        Mock::given(method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        "<CopyObjectResult><ETag>\"copy-dst-etag\"</ETag></CopyObjectResult>",
+                    )
+                    .set_delay(Duration::from_secs(32)),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+
+        // Bound the failing case: on the 30s default the copy times out and
+        // object_store retries it (retry budget ~180s), so without this guard a
+        // regression would stall the suite for minutes instead of failing.
+        let result = tokio::time::timeout(
+            Duration::from_secs(90),
+            backend.copy(
+                "oci-uploads/756f380e-a6f3-4c16-ab57-051febd01d5e.complete.7a46bd5c",
+                "oci-blobs/sha256:1b31e0aa4b34a899fd9a210679c80ca2f96891e19495cb39cb900734751c317a",
+            ),
+        )
+        .await;
+
+        let result = result.expect(
+            "#3180: CopyObject was still retrying after 90s -- the client aborted the \
+             server-side copy at the 30s default timeout instead of waiting for it",
+        );
+        assert!(
+            result.is_ok(),
+            "#3180: a CopyObject that takes 32s must succeed; the S3 client's overall \
+             request timeout must not cap multi-GB blob operations. Got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Fast counterpart to the 32s test above: proves `bulk_timeout_secs` is
+    /// actually wired into the bulk client rather than being a dead field.
+    ///
+    /// A 1s bulk timeout against a 4s response must fail; the same request with
+    /// a generous timeout must succeed. Without the `with_timeout` wiring in
+    /// `build_store_with_timeout`, the short case silently inherits
+    /// `object_store`'s 30s default and wrongly succeeds.
+    #[tokio::test]
+    async fn test_bulk_timeout_secs_is_wired_into_the_bulk_client() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn copy_with_bulk_timeout(secs: u64, delay: Duration) -> Result<()> {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-length", "1024")
+                        .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                        .insert_header("etag", "\"src\""),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(
+                            "<CopyObjectResult><ETag>\"dst\"</ETag></CopyObjectResult>",
+                        )
+                        .set_delay(delay),
+                )
+                .mount(&server)
+                .await;
+
+            let config = S3Config::new(
+                "test-bucket".to_string(),
+                "us-east-1".to_string(),
+                Some(server.uri()),
+                None,
+            )
+            .with_bulk_timeout_secs(secs);
+            let backend = S3Backend {
+                store: S3Backend::build_store(&config, Some("AKIA"), Some("secret")).unwrap(),
+                bulk_store: S3Backend::build_bulk_store(&config, Some("AKIA"), Some("secret"))
+                    .unwrap(),
+                prefix: None,
+                redirect_downloads: false,
+                cloudfront: None,
+                path_format: StoragePathFormat::Native,
+                signing_store: None,
+                disable_multi_delete: false,
+            };
+            backend.copy("src-key", "dst-key").await
+        }
+
+        let too_short = copy_with_bulk_timeout(1, Duration::from_secs(4)).await;
+        assert!(
+            too_short.is_err(),
+            "a 1s bulk timeout must abort a 4s CopyObject; if this passes, \
+             bulk_timeout_secs never reaches the HTTP client"
+        );
+
+        let generous = copy_with_bulk_timeout(120, Duration::from_secs(4)).await;
+        assert!(
+            generous.is_ok(),
+            "a 120s bulk timeout must tolerate a 4s CopyObject. Got: {:?}",
+            generous.err()
+        );
+    }
+
+    /// Positive control for the #3180 fix: raising the *bulk* ceiling must not
+    /// remove the *control-plane* cliff. A wedged endpoint has to keep failing
+    /// fast on head/exists/list, otherwise the fix trades a broken push for
+    /// stalled workers.
+    ///
+    /// Both stores face the same slow endpoint. The control-plane HEAD (`size`)
+    /// must give up; the bulk read (`get`) of the same object must not.
+    #[tokio::test]
+    async fn test_bulk_ceiling_does_not_leak_onto_control_plane_calls() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let slow = Duration::from_secs(5);
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "4")
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("etag", "\"src\"")
+                    .set_delay(slow),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "4")
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("etag", "\"src\"")
+                    .set_body_bytes(b"blob".to_vec())
+                    .set_delay(slow),
+            )
+            .mount(&server)
+            .await;
+
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some(server.uri()),
+            None,
+        )
+        .with_control_timeout_secs(1)
+        .with_bulk_timeout_secs(120);
+        let backend = S3Backend {
+            store: S3Backend::build_store(&config, Some("AKIA"), Some("secret")).unwrap(),
+            bulk_store: S3Backend::build_bulk_store(&config, Some("AKIA"), Some("secret")).unwrap(),
+            prefix: None,
+            redirect_downloads: false,
+            cloudfront: None,
+            path_format: StoragePathFormat::Native,
+            signing_store: None,
+            disable_multi_delete: false,
+        };
+
+        let bulk = StorageBackendTrait::get(&backend, "slow-key").await;
+        assert!(
+            bulk.is_ok(),
+            "bulk read must tolerate a 5s response under a 120s ceiling. Got: {:?}",
+            bulk.err()
+        );
+        assert_eq!(&bulk.unwrap()[..], b"blob");
+
+        let control = backend.size("slow-key").await;
+        assert!(
+            control.is_err(),
+            "control-plane HEAD must still fail fast under a 1s cliff; the bulk \
+             ceiling must not leak onto it"
+        );
+    }
+
+    /// The default must be generous enough for the multi-GB layers #3180 was
+    /// filed about. A future edit dropping it back toward 30s would make the
+    /// 32s regression test above the only thing standing between this bug and
+    /// production.
+    #[test]
+    fn test_default_bulk_timeout_is_sized_for_multi_gb_transfers() {
+        let config = S3Config::new("b".to_string(), "r".to_string(), None, None);
+        assert_eq!(config.bulk_timeout_secs, S3_DEFAULT_BULK_TIMEOUT_SECS);
+        assert!(
+            config.bulk_timeout_secs >= 900,
+            "bulk transfer ceiling {}s is too small for multi-GB OCI layers (#3180)",
+            config.bulk_timeout_secs
+        );
     }
 
     #[tokio::test]
@@ -4126,6 +4472,73 @@ mod integration_tests {
             .await
             .expect("Failed to delete test file");
         println!("Test complete");
+    }
+
+    /// #3180 live: exercise the real OCI blob-upload shape against a live
+    /// S3-compatible backend (MinIO) and prove the control/bulk client split
+    /// did not break ordinary object movement. Mirrors what
+    /// `handle_complete_upload` does: stream a part in, concatenate it into a
+    /// `.complete.` object, then `copy` that onto the final `oci-blobs/` key.
+    ///
+    ///   AK_S3_E2E=1 S3_BUCKET=ak-test S3_REGION=us-east-1 \
+    ///   S3_ENDPOINT=http://127.0.0.1:39000 S3_ACCESS_KEY_ID=... \
+    ///   S3_SECRET_ACCESS_KEY=... cargo test test_oci_blob_roundtrip_live_3180 \
+    ///   -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_oci_blob_roundtrip_live_3180() {
+        if std::env::var("AK_S3_E2E").ok().as_deref() != Some("1") {
+            println!("Skipping: set AK_S3_E2E=1 to run");
+            return;
+        }
+
+        let config = S3Config::from_env().expect("S3Config::from_env");
+        println!(
+            "bulk_timeout_secs={} control_timeout_secs={}",
+            config.bulk_timeout_secs, config.control_timeout_secs
+        );
+        let backend = S3Backend::new(config).await.expect("S3Backend::new");
+
+        let id = uuid::Uuid::new_v4();
+        let part_key = format!(
+            "oci-uploads/{}.part.2147483647.{}",
+            id,
+            uuid::Uuid::new_v4()
+        );
+        let complete_key = format!("oci-uploads/{}.complete.{}", id, uuid::Uuid::new_v4());
+        let blob_key = format!("oci-blobs/sha256:{}", "a".repeat(64));
+
+        // ~24 MiB across several chunks: enough to exercise real multipart.
+        let chunk = Bytes::from(vec![b'z'; 4 * 1024 * 1024]);
+        let expected_len = chunk.len() as u64 * 6;
+        let stream = futures::stream::iter((0..6).map(move |_| Ok(chunk.clone())));
+        let put = StorageBackendTrait::put_stream(&backend, &part_key, Box::pin(stream))
+            .await
+            .expect("part put_stream");
+        assert_eq!(put.bytes_written, expected_len);
+
+        // Concatenate the part into the completion object, as the OCI handler does.
+        let src = StorageBackendTrait::get_stream(&backend, &part_key)
+            .await
+            .expect("part get_stream");
+        let complete = StorageBackendTrait::put_stream(&backend, &complete_key, src)
+            .await
+            .expect("completion put_stream");
+        assert_eq!(complete.bytes_written, expected_len);
+
+        // Promote onto the content-addressed blob key.
+        backend.copy(&complete_key, &blob_key).await.expect("copy");
+        assert_eq!(backend.size(&blob_key).await.expect("size"), expected_len);
+
+        let read_back = StorageBackendTrait::get(&backend, &blob_key)
+            .await
+            .expect("get blob");
+        assert_eq!(read_back.len() as u64, expected_len);
+
+        for k in [&part_key, &complete_key, &blob_key] {
+            let _ = StorageBackendTrait::delete(&backend, k).await;
+        }
+        println!("#3180 live OCI blob roundtrip OK ({} bytes)", expected_len);
     }
 
     /// #1555 live: the proxy-cache handle (env-derived config with prefix
