@@ -24,6 +24,7 @@ pub mod email_dispatcher;
 pub mod email_rate_limiter;
 pub mod encryption;
 pub mod event_bus;
+pub mod federated_email;
 pub mod grype_scanner;
 pub mod helm_lint_checker;
 pub mod http_client;

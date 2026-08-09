@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
+use crate::services::federated_email::{resolve_federated_email, SAML_NO_EMAIL_DOMAIN};
 
 /// SAML configuration
 #[derive(Clone)]
@@ -969,13 +970,38 @@ impl SamlService {
                 .unwrap_or_else(|| assertion.name_id.clone())
         };
 
-        // Get email
-        let email = assertion
-            .attributes
-            .get(&self.config.email_attr)
-            .and_then(|v| v.first())
-            .cloned()
-            .unwrap_or_else(|| format!("{}@unknown", username));
+        // Get email.
+        //
+        // When the IdP asserts no email attribute we must still store
+        // something: `users.email` is `VARCHAR(255) UNIQUE NOT NULL`
+        // (`migrations/001_users.sql:8`). The placeholder used to be
+        // `{username}@unknown`, which was wrong twice over (#3167):
+        //
+        //  * It keyed on `username` — the value read off the assertion
+        //    *before* `get_or_create_user` runs it through
+        //    `generate_unique_username`. Two NameIDs whose username attribute
+        //    matched were stored as `alice` and `alice_1`, but both derived
+        //    `alice@unknown`, so the second provisioning died on
+        //    `users_email_key`. `username` is also attacker-influenced at any
+        //    IdP that lets a user set the attribute it is read from, which
+        //    makes a username-keyed placeholder targetable rather than merely
+        //    unlucky.
+        //  * `unknown` is a resolvable TLD, so the address could collide with
+        //    a real mailbox.
+        //
+        // Key on the NameID instead. It is the SAML subject, and it is already
+        // what `get_or_create_user` stores in `users.external_id` and looks
+        // the account up by — so the synthetic address is unique and stable in
+        // exactly the same cases the account row itself is, and no more.
+        let email = resolve_federated_email(
+            assertion
+                .attributes
+                .get(&self.config.email_attr)
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            &assertion.name_id,
+            SAML_NO_EMAIL_DOMAIN,
+        );
 
         // Get display name
         let display_name = assertion
@@ -2303,8 +2329,26 @@ mod tests {
         };
 
         let user_info = service.extract_user_info(&assertion).unwrap();
-        // No email attribute => default email is "{username}@unknown"
-        assert_eq!(user_info.email, "jdoe@unknown");
+
+        // This test used to pin the literal `jdoe@unknown` — it asserted the
+        // #3167 bug rather than a requirement, which is a large part of why
+        // the bug survived. What actually matters about the placeholder is
+        // that it is derived from the NameID, non-empty, and non-routable; the
+        // collision and stability properties are pinned by the dedicated
+        // #3167 tests at the end of this module.
+        assert!(!user_info.email.trim().is_empty());
+        assert!(
+            user_info.email.starts_with("jdoe."),
+            "placeholder should stay recognizable to an operator reading the \
+             users table: {}",
+            user_info.email
+        );
+        assert!(
+            user_info.email.ends_with("@no-email.saml.invalid"),
+            "placeholder must sit in an RFC 2606 reserved domain, not the old \
+             resolvable `@unknown`: {}",
+            user_info.email
+        );
     }
 
     #[tokio::test]
@@ -3917,5 +3961,275 @@ mod tests {
         )
         .await;
         assert!(again.is_err(), "state must be single-use");
+    }
+
+    // =======================================================================
+    // #3167: placeholder address for an assertion with no email attribute
+    //
+    // `users.email` is VARCHAR(255) UNIQUE NOT NULL
+    // (migrations/001_users.sql:8). The old placeholder was
+    // `format!("{}@unknown", username)`, built from the username read off the
+    // assertion -- i.e. BEFORE `get_or_create_user` runs it through
+    // `generate_unique_username`. Two NameIDs whose username attribute
+    // matched therefore got distinct usernames but the identical placeholder
+    // address, and the second provisioning died on `users_email_key`.
+    // =======================================================================
+
+    /// A service whose username comes from an attribute rather than the NameID.
+    ///
+    /// This is load-bearing for the tests below. With the default
+    /// `username_attr = "NameID"` the username *is* the NameID, so every
+    /// fixture would co-vary and a username-keyed derivation would satisfy the
+    /// whole suite -- which is exactly how the OIDC twin (#3161) came to ship
+    /// with nine tests its own bug could pass. Reading the username from `uid`
+    /// forces subject and username apart, so these tests can actually tell the
+    /// two derivations apart.
+    fn saml_service_keyed_on_uid() -> SamlService {
+        let mut config = make_test_saml_config();
+        config.username_attr = "uid".to_string();
+        SamlService::with_config(
+            PgPool::connect_lazy("postgres://invalid:invalid@localhost/invalid").unwrap(),
+            config,
+        )
+    }
+
+    /// Build an assertion carrying only the attributes these tests care about.
+    fn assertion_with(name_id: &str, uid: &str, email: Option<&str>) -> SamlAssertion {
+        let mut attributes = HashMap::new();
+        attributes.insert("uid".to_string(), vec![uid.to_string()]);
+        if let Some(email) = email {
+            attributes.insert("email".to_string(), vec![email.to_string()]);
+        }
+        SamlAssertion {
+            id: "_assertion".to_string(),
+            issuer: "https://idp.example.com".to_string(),
+            name_id: name_id.to_string(),
+            name_id_format: None,
+            recipient: None,
+            session_index: None,
+            not_before: None,
+            not_on_or_after: None,
+            audiences: Vec::new(),
+            attributes,
+        }
+    }
+
+    fn user_info(name_id: &str, uid: &str, email: Option<&str>) -> SamlUserInfo {
+        saml_service_keyed_on_uid()
+            .extract_user_info(&assertion_with(name_id, uid, email))
+            .expect("assertion yields user info")
+    }
+
+    /// The #3167 shape exactly: two people in one directory whose username
+    /// attribute happens to match, distinct NameIDs, neither assertion
+    /// carrying an email attribute.
+    #[tokio::test]
+    async fn two_name_ids_sharing_a_username_attribute_get_distinct_emails() {
+        let first = user_info("urn:idp:nameid:alice-0001", "alice", None);
+        let second = user_info("urn:idp:nameid:alice-0002", "alice", None);
+
+        assert_eq!(
+            first.username, second.username,
+            "fixture guard: both assertions must present the SAME username \
+             attribute, or this test is not exercising the collision"
+        );
+        assert_ne!(
+            first.name_id, second.name_id,
+            "fixture guard: the two identities must differ by NameID"
+        );
+
+        assert!(!first.email.trim().is_empty(), "must store something");
+        assert_ne!(
+            first.email, second.email,
+            "two distinct NameIDs must never derive the same placeholder \
+             address: users.email is UNIQUE NOT NULL, so the second user's \
+             INSERT dies on users_email_key and the login fails outright"
+        );
+    }
+
+    /// The derivation must key on the NameID, not on the username.
+    ///
+    /// Covers the converse of the test above: keep the subject fixed and let
+    /// the username attribute change, as it does whenever the directory
+    /// renames someone. A username-keyed derivation hands that user a brand
+    /// new address, and since re-login writes `email` back to the row, the
+    /// address would churn on every rename.
+    ///
+    /// Taken together the two tests pin the key: substituting the username
+    /// fails this one, and substituting anything per-login fails the
+    /// stability test below.
+    #[tokio::test]
+    async fn derivation_keys_on_name_id_not_username() {
+        let before = user_info("urn:idp:nameid:stable-0007", "old_uid", None).email;
+        let after = user_info("urn:idp:nameid:stable-0007", "new_uid", None).email;
+
+        assert_eq!(
+            before, after,
+            "one NameID must keep one address even when the username \
+             attribute changes between logins"
+        );
+        assert!(
+            !before.contains("old_uid") && !before.contains("new_uid"),
+            "the address must not embed the username attribute at all: it is \
+             self-settable at any IdP that maps it from a user-editable \
+             directory field, which would make the collision targetable \
+             rather than merely unlucky -- got {}",
+            before
+        );
+    }
+
+    /// Re-login writes `email` back to the row (see `get_or_create_user`). An
+    /// unstable value would rewrite the user on every login, and on the
+    /// provisioning path would mint a new account each time -- orphaning that
+    /// user's uploads, quota and permissions.
+    #[tokio::test]
+    async fn same_name_id_gets_the_same_address_across_logins() {
+        let first = user_info("urn:idp:nameid:frank-0006", "frank", None).email;
+        let second = user_info("urn:idp:nameid:frank-0006", "frank", None).email;
+
+        assert!(!first.trim().is_empty());
+        assert_eq!(first, second);
+    }
+
+    /// Positive control: the fix must not disturb IdPs that DO assert email.
+    #[tokio::test]
+    async fn provider_supplied_email_attribute_is_stored_verbatim() {
+        let user = user_info(
+            "urn:idp:nameid:carol-0003",
+            "carol",
+            Some("carol@example.com"),
+        );
+        assert_eq!(user.email, "carol@example.com");
+    }
+
+    /// Some IdPs assert the attribute with an empty value rather than omitting
+    /// it. That collides exactly the same way a missing one does.
+    #[tokio::test]
+    async fn blank_email_attribute_is_treated_as_missing() {
+        let blank = user_info("urn:idp:nameid:dave-0004", "dave", Some("   "));
+        let absent = user_info("urn:idp:nameid:erin-0005", "erin", None);
+
+        assert!(!blank.email.trim().is_empty());
+        assert_ne!(blank.email, absent.email);
+        assert_eq!(
+            blank.email,
+            user_info("urn:idp:nameid:dave-0004", "dave", None).email,
+            "a blank attribute must fall back to the same address the absent \
+             case derives for that NameID"
+        );
+    }
+
+    /// A NameID is opaque: IdPs emit long, non-ASCII, punctuation-heavy
+    /// values, and transient formats emit URL-ish ones.
+    #[tokio::test]
+    async fn synthetic_address_fits_the_column_and_is_non_routable() {
+        let hostile = format!("{}@evil.example/ unicode-\u{fc}\u{ef}", "x".repeat(400));
+        let email = user_info(&hostile, "hostile", None).email;
+
+        assert!(
+            email.len() <= 255,
+            "must fit users.email VARCHAR(255), got {} chars: {}",
+            email.len(),
+            email
+        );
+        assert_eq!(email.matches('@').count(), 1, "exactly one @: {}", email);
+        assert!(
+            email.ends_with("@no-email.saml.invalid"),
+            "must land in a reserved, never-resolving domain rather than the \
+             old resolvable `@unknown`: {}",
+            email
+        );
+    }
+
+    /// Sanitizing the NameID is lossy; the digest of the raw value is what
+    /// keeps distinct subjects mapped to distinct addresses.
+    #[tokio::test]
+    async fn name_ids_that_sanitize_alike_still_differ() {
+        assert_ne!(
+            user_info("a b", "u1", None).email,
+            user_info("a/b", "u2", None).email
+        );
+    }
+
+    /// The default deployment reads the username straight off the NameID. The
+    /// fix must hold there too -- and there the old code looks correct, which
+    /// is why the bug survived review.
+    #[tokio::test]
+    async fn default_name_id_username_config_still_gets_distinct_addresses() {
+        let svc = make_test_saml_service();
+        let one = svc
+            .extract_user_info(&assertion_with("urn:idp:nameid:g-1", "ignored", None))
+            .expect("user info");
+        let two = svc
+            .extract_user_info(&assertion_with("urn:idp:nameid:g-2", "ignored", None))
+            .expect("user info");
+
+        assert_eq!(one.username, "urn:idp:nameid:g-1", "fixture guard");
+        assert_ne!(one.email, two.email);
+    }
+
+    /// End-to-end against a real database, the shape from the issue: two SAML
+    /// identities that collide on the username attribute and assert no email
+    /// both provision.
+    ///
+    /// Before the fix the second `get_or_create_user` failed with
+    ///   duplicate key value violates unique constraint "users_email_key"
+    /// DB-backed; no-ops without `DATABASE_URL`.
+    #[tokio::test]
+    async fn two_saml_users_sharing_a_username_attribute_both_provision() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let mut config = make_test_saml_config();
+        config.username_attr = "uid".to_string();
+        let svc = SamlService::with_config(pool.clone(), config);
+
+        // Namespaced per run so concurrent/repeat runs cannot collide with
+        // each other -- and so cleanup below can never touch a real user.
+        let run = Uuid::new_v4();
+        let shared_uid = format!("collide_{}", run.simple());
+
+        let mut created = Vec::new();
+        for n in 1..=2 {
+            let info = svc
+                .extract_user_info(&assertion_with(
+                    &format!("urn:idp:nameid:{}-{}", run.simple(), n),
+                    &shared_uid,
+                    None,
+                ))
+                .expect("user info");
+            assert_eq!(info.username, shared_uid, "fixture guard: same username");
+
+            match svc.get_or_create_user(&info).await {
+                Ok(user) => created.push(user),
+                Err(e) => {
+                    for user in &created {
+                        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+                            .execute(&pool)
+                            .await;
+                    }
+                    panic!(
+                        "provisioning SAML user {} of 2 with no email attribute failed: {}",
+                        n, e
+                    );
+                }
+            }
+        }
+
+        // The usernames diverge exactly as the issue describes...
+        assert_ne!(created[0].id, created[1].id);
+        assert_ne!(
+            created[0].username, created[1].username,
+            "generate_unique_username must have suffixed the second user"
+        );
+        // ...and the addresses must diverge with them, which is the fix.
+        assert_ne!(created[0].email, created[1].email);
+
+        for user in &created {
+            sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 }

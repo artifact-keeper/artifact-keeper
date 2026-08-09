@@ -8,23 +8,14 @@ use std::sync::Arc;
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
+use crate::services::federated_email::OIDC_NO_EMAIL_DOMAIN;
 use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
-
-/// Domain for the synthetic address stored when the IdP releases no usable
-/// `email` claim. `.invalid` is reserved by RFC 2606 and can never resolve, so
-/// the address cannot be confused with — or collide against — a real mailbox.
-const NO_EMAIL_DOMAIN: &str = "no-email.oidc.invalid";
-
-/// Longest sanitized subject prefix kept in the synthetic local-part. Bounds the
-/// result well inside `users.email VARCHAR(255)` for arbitrarily long subjects.
-const MAX_SYNTHETIC_LOCAL_PREFIX: usize = 48;
 
 /// Resolve the address to store in `users.email` for a federated (OIDC) user.
 ///
@@ -36,42 +27,16 @@ const MAX_SYNTHETIC_LOCAL_PREFIX: usize = 48;
 /// (issue #3119).
 ///
 /// When the claim is absent — or present but blank, which some IdPs send for
-/// machine identities — derive a per-subject synthetic address instead. This
-/// mirrors what the SAML (`saml_service.rs`) and LDAP (`ldap_service.rs`) paths
-/// already do with `{username}@unknown`, but keys off the OIDC subject, which is
-/// the stable per-user identifier this service already provisions against.
-pub(crate) fn resolve_federated_email(claim: Option<&str>, sub: &str) -> String {
-    match claim.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(email) => email.to_string(),
-        None => synthetic_email_for_sub(sub),
-    }
-}
-
-/// Build a stable, unique, non-routable address for a subject with no email.
+/// machine identities — derive a per-subject synthetic address instead, keyed
+/// off the OIDC subject: the stable per-user identifier this service already
+/// provisions `external_id` against.
 ///
-/// The subject is opaque: it may contain characters that are invalid in an
-/// address local-part and may be longer than the column allows. Keep a
-/// sanitized, human-recognizable prefix for operators, then append a digest of
-/// the *raw* subject so two distinct subjects can never sanitize down to the
-/// same address.
-fn synthetic_email_for_sub(sub: &str) -> String {
-    let fingerprint = hex::encode(&Sha256::digest(sub.as_bytes())[..8]);
-
-    let sanitized: String = sub
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .take(MAX_SYNTHETIC_LOCAL_PREFIX)
-        .collect();
-    let prefix = sanitized.trim_matches(|c| matches!(c, '.' | '-' | '_'));
-    let prefix = if prefix.is_empty() { "user" } else { prefix };
-
-    format!("{}.{}@{}", prefix, fingerprint, NO_EMAIL_DOMAIN)
+/// The derivation itself lives in `services::federated_email` because the SAML
+/// path needs the identical guarantees; see that module for why each of them
+/// matters. This wrapper only pins the OIDC domain, so the addresses it returns
+/// are byte-identical to the ones #3161 shipped.
+pub(crate) fn resolve_federated_email(claim: Option<&str>, sub: &str) -> String {
+    crate::services::federated_email::resolve_federated_email(claim, sub, OIDC_NO_EMAIL_DOMAIN)
 }
 
 /// OIDC provider configuration
@@ -1431,7 +1396,7 @@ mod tests {
     /// The derivation must key on `sub`, not on the username.
     ///
     /// In every other test here sub and username co-vary, so substituting
-    /// `synthetic_email_for_sub(&username)` at both call sites leaves the
+    /// `synthetic_email_for_subject(&username, ..)` at both call sites leaves the
     /// whole module green -- while reintroducing the collision for two
     /// subjects that share a `preferred_username`. That is worse than the
     /// original bug: `preferred_username` is self-settable at many IdPs, so it
