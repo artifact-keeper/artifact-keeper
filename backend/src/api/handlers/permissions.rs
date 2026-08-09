@@ -99,6 +99,19 @@ impl From<PermissionRow> for PermissionResponse {
 /// appends its own `WHERE`/`ORDER BY`/pagination clause (or, for the CTE
 /// callers, prefixes a `WITH p AS (...)`) via `format!`. Centralizing this
 /// keeps the principal/target CASE+JOIN logic in exactly one place.
+///
+/// #2826: the `users` join is intentionally NOT guarded by
+/// `is_service_account`. Between migration 057 (Feb 2026, the column's
+/// introduction) and #2499 (Jul 2026, `principal_type = 'service_account'`
+/// first honored by resolvers), the only working way to grant a service
+/// account fine-grained access was `principal_type = 'user'` + the SA's
+/// `users.id`. No migration re-types those rows, `validate_principal`
+/// (#2503) only guards new writes, and `query_actions`
+/// (`permission_service.rs`) still matches such rows by bare `principal_id`,
+/// so they remain live, enforced grants today. A type guard here would hide
+/// exactly the rows a still-effective grant empowers. Because the join keys
+/// on the `users` primary key, dropping the guard can never attach the
+/// WRONG name to a row -- only a previously-missing one.
 fn hydrate_select(from_clause: &str) -> String {
     format!(
         r#"
@@ -112,9 +125,8 @@ fn hydrate_select(from_clause: &str) -> String {
                    WHEN p.target_type = 'repository' THEN r.name
                END as target_name
         FROM {from_clause}
-        LEFT JOIN users u ON p.principal_id = u.id
-                         AND ((p.principal_type = 'user' AND u.is_service_account = FALSE)
-                           OR (p.principal_type = 'service_account' AND u.is_service_account = TRUE))
+        LEFT JOIN users u ON p.principal_type IN ('user', 'service_account')
+                         AND p.principal_id = u.id
         LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
         LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
         "#
@@ -616,8 +628,18 @@ mod tests {
         tdh::cleanup(pool, repo_id, admin_id).await;
     }
 
+    /// The `mismatched_permission` fixture below seeds `principal_type =
+    /// 'service_account'` naming a human admin's `users.id` -- a row shape
+    /// that never occurs from `validate_principal`-gated writes (#2503), but
+    /// can exist from data seeded before that gate, or a legacy row exactly
+    /// like the one #2826's regression test below covers in the other
+    /// direction. It still asserts a real username, not `null`: the join is
+    /// keyed by `users.id`, and `query_actions` (`permission_service.rs`)
+    /// enforces this row by bare `principal_id` regardless of the declared
+    /// `principal_type`, so it is a live grant an admin needs to be able to
+    /// identify. See `hydrate_select`'s doc comment for the full rationale.
     #[tokio::test]
-    async fn list_and_get_hydrate_type_guarded_principal_names() {
+    async fn list_and_get_hydrate_principal_names_by_id_regardless_of_type_mismatch() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
@@ -663,7 +685,9 @@ mod tests {
             service_account_name
         );
         assert_eq!(find(group_permission)["principal_name"], group_name);
-        assert!(find(mismatched_permission)["principal_name"].is_null());
+        // Mismatched principal_type, still enforced by bare principal_id: named,
+        // not null (see the doc comment above this test).
+        assert_eq!(find(mismatched_permission)["principal_name"], admin_name);
         assert!(items.iter().all(|item| item["target_name"] == repo_name));
 
         let fetched_human = response_json(
@@ -698,11 +722,57 @@ mod tests {
 
         let fetched_mismatch =
             response_json(state, auth, tdh::get(format!("/{mismatched_permission}"))).await;
-        assert!(fetched_mismatch["principal_name"].is_null());
+        assert_eq!(fetched_mismatch["principal_name"], admin_name);
         assert_eq!(fetched_mismatch["target_name"], repo_name);
 
         cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[group_id])
             .await;
+    }
+
+    /// #2826 hardening: between migration 057 (Feb 2026, `is_service_account`
+    /// introduced) and #2499 (Jul 2026, `principal_type = 'service_account'`
+    /// first honored by resolvers), the only working way to grant a service
+    /// account fine-grained access was `principal_type = 'user'` + the SA's
+    /// `users.id`. No migration re-types those rows, `validate_principal`
+    /// (#2503) only guards new writes, and `query_actions`
+    /// (`permission_service.rs`) still matches such legacy rows by bare
+    /// `principal_id` -- they are live, enforced grants today. Pin that a
+    /// legacy `principal_type = 'user'` row naming a service account still
+    /// hydrates the SA's username (list AND get), not `null`.
+    #[tokio::test]
+    async fn legacy_user_typed_grant_naming_a_service_account_hydrates_its_username() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (service_account_id, service_account_name) = tdh::create_service_account(&pool).await;
+        let (repo_id, repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        let legacy_permission =
+            seed_permission(&pool, "user", service_account_id, "repository", repo_id).await;
+
+        let listed = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/?target_id={repo_id}")),
+        )
+        .await;
+        let items = listed["items"].as_array().expect("permission items");
+        let listed_legacy = items
+            .iter()
+            .find(|item| item["id"] == legacy_permission.to_string())
+            .expect("legacy permission in list");
+        assert_eq!(listed_legacy["principal_name"], service_account_name);
+        assert_eq!(listed_legacy["target_name"], repo_name);
+
+        let fetched_legacy =
+            response_json(state, auth, tdh::get(format!("/{legacy_permission}"))).await;
+        assert_eq!(fetched_legacy["principal_name"], service_account_name);
+        assert_eq!(fetched_legacy["target_name"], repo_name);
+
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[service_account_id], &[]).await;
     }
 
     #[tokio::test]
