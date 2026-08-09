@@ -23149,3 +23149,556 @@ mod virtual_member_visibility_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #3177 / #3178: virtual-repository member AUTHORIZATION
+// ---------------------------------------------------------------------------
+//
+// Both issues are the same root cause wearing two names: `can_access_repo` --
+// the caller's TOKEN SCOPE -- used where repository VISIBILITY was meant.
+// `can_access_repo` returns `true` for every repository in the instance
+// whenever the principal is unscoped, which is every browser JWT session.
+//
+//   * #3178 (read/bytes) -- `proxy_helpers::resolve_virtual_download` takes no
+//     caller at all, so `GET /{key}/download/*path` and
+//     `GET /{key}/artifacts/*path` stream a PRIVATE member's bytes to anyone
+//     who can see the virtual parent, including anonymous callers when the
+//     parent is public. The one predicate that does exist,
+//     `proxy_helpers::caller_can_read_member`, gates on
+//     `can_access_repo(member.id)` and then falls OPEN (`Ok(false) => true`)
+//     when the member carries no fine-grained permission rows.
+//   * #3177 (write) -- `authorize_virtual_member_mutation` checks the member
+//     being attached with `require_repo_access`, a two-line wrapper over the
+//     same `can_access_repo`. A repo-admin on their OWN virtual can therefore
+//     attach any private repository in the instance, then read it through the
+//     hole above.
+//
+// The correct predicate in both places is `require_visible`'s composition:
+//
+//     is_public OR (in_scope AND (is_admin OR grants))
+//
+// Every fixture below is shaped so that each denial assertion ships with a
+// POSITIVE CONTROL in the SAME fixture -- an entitled caller still gets the
+// bytes, an admin still sees everything, a public member is still reachable.
+// A "fix" that denied everyone would fail those controls.
+#[cfg(test)]
+mod virtual_member_authz_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::auth::AuthExtension;
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+    use sqlx::PgPool;
+
+    /// Bytes only an entitled caller may ever see.
+    const SECRET_BYTES: &[u8] = b"VICTIM-CROWN-JEWELS";
+    /// Bytes of the PUBLIC member -- the positive control. Every caller,
+    /// including anonymous, must keep getting these.
+    const OPEN_BYTES: &[u8] = b"PUBLIC-MEMBER-CONTROL";
+    const SECRET_PATH: &str = "vm/secret.bin";
+    const OPEN_PATH: &str = "vm/open.bin";
+
+    /// A virtual parent with one PRIVATE and one PUBLIC member, plus the four
+    /// principals every assertion is made as.
+    ///
+    /// * `virt`   -- the virtual parent, private. `viewer` and `insider` hold a
+    ///   grant on it; `outsider` holds nothing.
+    /// * `secret` -- PRIVATE member holding [`SECRET_BYTES`]. Only `insider`
+    ///   (and the global admin) may read it. `viewer`'s direct `GET` 404s.
+    /// * `open`   -- PUBLIC member holding [`OPEN_BYTES`]. Readable by anyone,
+    ///   which is what makes it a usable control.
+    struct Fx {
+        pool: PgPool,
+        state: SharedState,
+        virt_id: Uuid,
+        virt_key: String,
+        secret_id: Uuid,
+        secret_key: String,
+        open_id: Uuid,
+        open_key: String,
+        dirs: Vec<std::path::PathBuf>,
+        owner: (Uuid, String),
+        viewer: (Uuid, String),
+        insider: (Uuid, String),
+        outsider: (Uuid, String),
+        admin: (Uuid, String),
+    }
+
+    async fn link_member(pool: &PgPool, virt: Uuid, member: Uuid, priority: i32) {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virt)
+        .bind(member)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("link virtual member");
+    }
+
+    impl Fx {
+        async fn setup() -> Option<Fx> {
+            let pool = tdh::try_pool().await?;
+            let (virt_id, virt_key, virt_dir) = tdh::create_repo(&pool, "virtual", "generic").await;
+            let (secret_id, secret_key, secret_dir) =
+                tdh::create_repo(&pool, "local", "generic").await;
+            let (open_id, open_key, open_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+                .bind(open_id)
+                .execute(&pool)
+                .await
+                .expect("publish the public member");
+
+            link_member(&pool, virt_id, secret_id, 1).await;
+            link_member(&pool, virt_id, open_id, 2).await;
+
+            let owner = tdh::create_user(&pool).await;
+            let viewer = tdh::create_user(&pool).await;
+            let insider = tdh::create_user(&pool).await;
+            let outsider = tdh::create_user(&pool).await;
+            let admin = tdh::create_user(&pool).await;
+
+            // `viewer` sees the virtual PARENT only. `insider` additionally
+            // holds a grant on the private member, so the member is genuinely
+            // readable by them -- that is the positive control.
+            tdh::grant_repo_access(&pool, virt_id, viewer.0).await;
+            tdh::grant_repo_access(&pool, virt_id, insider.0).await;
+            tdh::grant_repo_access(&pool, secret_id, insider.0).await;
+            tdh::grant_repo_access(&pool, virt_id, owner.0).await;
+
+            let state = tdh::build_state(pool.clone(), virt_dir.to_str().unwrap());
+
+            let secret_info =
+                tdh::make_repo_info(secret_id, &secret_key, &secret_dir, "local", None);
+            tdh::seed_artifact(
+                &state,
+                &pool,
+                &secret_info,
+                &format!("vma/{}.bin", Uuid::new_v4()),
+                SECRET_PATH,
+                "secret",
+                "1.0.0",
+                "application/octet-stream",
+                Bytes::from_static(SECRET_BYTES),
+                owner.0,
+            )
+            .await;
+
+            let open_info = tdh::make_repo_info(open_id, &open_key, &open_dir, "local", None);
+            tdh::seed_artifact(
+                &state,
+                &pool,
+                &open_info,
+                &format!("vma/{}.bin", Uuid::new_v4()),
+                OPEN_PATH,
+                "open",
+                "1.0.0",
+                "application/octet-stream",
+                Bytes::from_static(OPEN_BYTES),
+                owner.0,
+            )
+            .await;
+
+            Some(Fx {
+                pool,
+                state,
+                virt_id,
+                virt_key,
+                secret_id,
+                secret_key,
+                open_id,
+                open_key,
+                dirs: vec![virt_dir, secret_dir, open_dir],
+                owner,
+                viewer,
+                insider,
+                outsider,
+                admin,
+            })
+        }
+
+        fn session(&self, who: &(Uuid, String)) -> AuthExtension {
+            tdh::make_auth(who.0, &who.1)
+        }
+
+        fn admin_session(&self) -> AuthExtension {
+            tdh::admin_auth(self.admin.0, &self.admin.1)
+        }
+
+        /// Both byte-serving virtual routes live here: `/:key/download/*path`
+        /// is in `download_router()`, `/:key/artifacts/*path` in `router()`.
+        fn byte_routes() -> Router<SharedState> {
+            super::router().merge(super::download_router())
+        }
+
+        async fn fetch_as(&self, uri: String, auth: Option<AuthExtension>) -> (StatusCode, Bytes) {
+            let router = match auth {
+                Some(a) => tdh::router_with_auth(Self::byte_routes(), self.state.clone(), a),
+                None => tdh::router_anon(Self::byte_routes(), self.state.clone()),
+            };
+            tdh::send(router, tdh::get(uri)).await
+        }
+
+        async fn make_virt_public(&self) {
+            sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+                .bind(self.virt_id)
+                .execute(&self.pool)
+                .await
+                .expect("publish virtual parent");
+        }
+
+        async fn teardown(&self) {
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                .bind(self.virt_id)
+                .execute(&self.pool)
+                .await;
+            for (repo, user) in [
+                (self.virt_id, self.owner.0),
+                (self.secret_id, self.viewer.0),
+                (self.open_id, self.insider.0),
+            ] {
+                tdh::cleanup(&self.pool, repo, user).await;
+            }
+            for u in [&self.outsider, &self.admin] {
+                tdh::cleanup_user(&self.pool, u.0).await;
+            }
+            for d in &self.dirs {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    /// #3178, `/download/*path`: a caller who can see the virtual PARENT but
+    /// holds no grant on a PRIVATE member must not receive that member's bytes
+    /// through the virtual.
+    ///
+    /// Controls in the same fixture: `insider` (grant on the member) and the
+    /// global admin must both still get [`SECRET_BYTES`], and `viewer` must
+    /// still get the public member's [`OPEN_BYTES`]. Denying everyone fails.
+    #[tokio::test]
+    async fn test_3178_virtual_download_denies_unentitled_caller() {
+        let Some(fx) = Fx::setup().await else {
+            return;
+        };
+
+        // Ground truth: `viewer` genuinely cannot see the member directly.
+        let (direct, _) = fx
+            .fetch_as(
+                format!("/{}/download/{}", fx.secret_key, SECRET_PATH),
+                Some(fx.session(&fx.viewer)),
+            )
+            .await;
+        assert_eq!(
+            direct,
+            StatusCode::NOT_FOUND,
+            "precondition: viewer's DIRECT read of the private member must 404"
+        );
+
+        // THE LEAK.
+        let (status, body) = fx
+            .fetch_as(
+                format!("/{}/download/{}", fx.virt_key, SECRET_PATH),
+                Some(fx.session(&fx.viewer)),
+            )
+            .await;
+        assert_ne!(
+            &body[..],
+            SECRET_BYTES,
+            "#3178: virtual /download/ served a PRIVATE member's bytes to a caller \
+             whose direct GET of that member 404s (status {status})"
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "#3178: unentitled caller must get 404 from the virtual download path"
+        );
+
+        // POSITIVE CONTROL 1: the entitled caller still gets the bytes.
+        let (ok_status, ok_body) = fx
+            .fetch_as(
+                format!("/{}/download/{}", fx.virt_key, SECRET_PATH),
+                Some(fx.session(&fx.insider)),
+            )
+            .await;
+        assert_eq!(
+            ok_status,
+            StatusCode::OK,
+            "control: a caller granted on the member must still resolve it"
+        );
+        assert_eq!(
+            &ok_body[..],
+            SECRET_BYTES,
+            "control: entitled caller must still receive the member's bytes"
+        );
+
+        // POSITIVE CONTROL 2: a global admin still sees everything.
+        let (admin_status, admin_body) = fx
+            .fetch_as(
+                format!("/{}/download/{}", fx.virt_key, SECRET_PATH),
+                Some(fx.admin_session()),
+            )
+            .await;
+        assert_eq!(admin_status, StatusCode::OK, "control: admin must resolve");
+        assert_eq!(
+            &admin_body[..],
+            SECRET_BYTES,
+            "control: admin must still receive the member's bytes"
+        );
+
+        // POSITIVE CONTROL 3: the PUBLIC member stays reachable for `viewer`.
+        let (pub_status, pub_body) = fx
+            .fetch_as(
+                format!("/{}/download/{}", fx.virt_key, OPEN_PATH),
+                Some(fx.session(&fx.viewer)),
+            )
+            .await;
+        assert_eq!(
+            pub_status,
+            StatusCode::OK,
+            "control: a PUBLIC member must stay reachable through the virtual"
+        );
+        assert_eq!(&pub_body[..], OPEN_BYTES, "control: public member bytes");
+
+        fx.teardown().await;
+    }
+
+    /// #3178, `/artifacts/*path`: the sibling byte route through
+    /// `get_artifact_metadata`'s Virtual branch has the same hole.
+    #[tokio::test]
+    async fn test_3178_virtual_artifacts_path_denies_unentitled_caller() {
+        let Some(fx) = Fx::setup().await else {
+            return;
+        };
+
+        let (status, body) = fx
+            .fetch_as(
+                format!("/{}/artifacts/{}", fx.virt_key, SECRET_PATH),
+                Some(fx.session(&fx.viewer)),
+            )
+            .await;
+        assert_ne!(
+            &body[..],
+            SECRET_BYTES,
+            "#3178: virtual /artifacts/ served a PRIVATE member's bytes to an \
+             unentitled caller (status {status})"
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "#3178: unentitled caller must get 404 from the virtual artifacts path"
+        );
+
+        // POSITIVE CONTROLS in the same fixture.
+        let (ok_status, ok_body) = fx
+            .fetch_as(
+                format!("/{}/artifacts/{}", fx.virt_key, SECRET_PATH),
+                Some(fx.session(&fx.insider)),
+            )
+            .await;
+        assert_eq!(ok_status, StatusCode::OK, "control: entitled caller");
+        assert_eq!(&ok_body[..], SECRET_BYTES, "control: entitled caller bytes");
+
+        let (pub_status, pub_body) = fx
+            .fetch_as(
+                format!("/{}/artifacts/{}", fx.virt_key, OPEN_PATH),
+                Some(fx.session(&fx.viewer)),
+            )
+            .await;
+        assert_eq!(pub_status, StatusCode::OK, "control: public member");
+        assert_eq!(&pub_body[..], OPEN_BYTES, "control: public member bytes");
+
+        fx.teardown().await;
+    }
+
+    /// #3178, the worst shape: a PUBLIC virtual with a PRIVATE member served
+    /// [`SECRET_BYTES`] to a request carrying NO credentials at all.
+    #[tokio::test]
+    async fn test_3178_public_virtual_denies_anonymous_private_member_bytes() {
+        let Some(fx) = Fx::setup().await else {
+            return;
+        };
+        fx.make_virt_public().await;
+
+        let (status, body) = fx
+            .fetch_as(format!("/{}/download/{}", fx.virt_key, SECRET_PATH), None)
+            .await;
+        assert_ne!(
+            &body[..],
+            SECRET_BYTES,
+            "#3178: an ANONYMOUS request read a private member's bytes through a \
+             public virtual (status {status})"
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "#3178: anonymous caller must get 404 for a private member"
+        );
+
+        // POSITIVE CONTROL: anonymous must still get the PUBLIC member, which
+        // is the whole point of a public virtual.
+        let (pub_status, pub_body) = fx
+            .fetch_as(format!("/{}/download/{}", fx.virt_key, OPEN_PATH), None)
+            .await;
+        assert_eq!(
+            pub_status,
+            StatusCode::OK,
+            "control: anonymous must still reach the PUBLIC member"
+        );
+        assert_eq!(&pub_body[..], OPEN_BYTES, "control: public member bytes");
+
+        // POSITIVE CONTROL: the entitled caller is unaffected by the parent
+        // flipping public.
+        let (ok_status, ok_body) = fx
+            .fetch_as(
+                format!("/{}/download/{}", fx.virt_key, SECRET_PATH),
+                Some(fx.session(&fx.insider)),
+            )
+            .await;
+        assert_eq!(ok_status, StatusCode::OK, "control: entitled caller");
+        assert_eq!(&ok_body[..], SECRET_BYTES, "control: entitled caller bytes");
+
+        fx.teardown().await;
+    }
+
+    /// #3177: a repo-admin on their OWN virtual repository must not be able to
+    /// attach a private repository they cannot see.
+    ///
+    /// `outsider` is given a virtual of their own plus `repository:admin` on
+    /// it -- everything the mutation gate legitimately requires -- and holds
+    /// nothing at all on `secret`.
+    ///
+    /// Controls in the same fixture: the same caller may still attach a PUBLIC
+    /// repository and a repository they hold a grant on, and a global admin may
+    /// still attach `secret`.
+    #[tokio::test]
+    async fn test_3177_member_attach_requires_member_visibility() {
+        let Some(fx) = Fx::setup().await else {
+            return;
+        };
+        let (own_id, own_key, own_dir) = tdh::create_repo(&fx.pool, "virtual", "generic").await;
+        tdh::grant_repo_access(&fx.pool, own_id, fx.outsider.0).await;
+        tdh::grant_repo_admin(&fx.pool, own_id, fx.outsider.0).await;
+
+        // A private repo the attacker DOES hold a grant on -- the control that
+        // proves the fix did not simply deny every attach.
+        let (granted_id, granted_key, granted_dir) =
+            tdh::create_repo(&fx.pool, "local", "generic").await;
+        tdh::grant_repo_access(&fx.pool, granted_id, fx.outsider.0).await;
+
+        let attach = |auth: AuthExtension, virt: String, member: String| {
+            let state = fx.state.clone();
+            async move {
+                let router = tdh::router_with_auth(super::router(), state, auth);
+                tdh::send(
+                    router,
+                    tdh::post(
+                        format!("/{virt}/members"),
+                        "application/json",
+                        Bytes::from(format!(r#"{{"member_key":"{member}"}}"#)),
+                    ),
+                )
+                .await
+            }
+        };
+
+        let member_row_exists = |virt: Uuid, member: Uuid| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM virtual_repo_members \
+                     WHERE virtual_repo_id = $1 AND member_repo_id = $2",
+                )
+                .bind(virt)
+                .bind(member)
+                .fetch_one(&pool)
+                .await
+                .expect("count membership rows")
+                    > 0
+            }
+        };
+
+        // Ground truth: the attacker genuinely cannot see `secret`.
+        let (direct, _) = fx
+            .fetch_as(
+                format!("/{}/download/{}", fx.secret_key, SECRET_PATH),
+                Some(fx.session(&fx.outsider)),
+            )
+            .await;
+        assert_eq!(
+            direct,
+            StatusCode::NOT_FOUND,
+            "precondition: attacker's DIRECT read of the victim repo must 404"
+        );
+
+        // THE ESCALATION.
+        let (status, body) = attach(
+            fx.session(&fx.outsider),
+            own_key.clone(),
+            fx.secret_key.clone(),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "#3177: a repo-admin attached a PRIVATE repository they cannot see as a \
+             virtual member: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            !member_row_exists(own_id, fx.secret_id).await,
+            "#3177: the membership row was persisted despite the caller having no \
+             visibility on the member"
+        );
+
+        // POSITIVE CONTROL 1: a PUBLIC repository still attaches.
+        let (pub_status, pub_body) = attach(
+            fx.session(&fx.outsider),
+            own_key.clone(),
+            fx.open_key.clone(),
+        )
+        .await;
+        assert_eq!(
+            pub_status,
+            StatusCode::OK,
+            "control: attaching a PUBLIC repository must still succeed: {}",
+            String::from_utf8_lossy(&pub_body)
+        );
+
+        // POSITIVE CONTROL 2: a private repository the caller IS granted on
+        // still attaches.
+        let (granted_status, granted_body) = attach(
+            fx.session(&fx.outsider),
+            own_key.clone(),
+            granted_key.clone(),
+        )
+        .await;
+        assert_eq!(
+            granted_status,
+            StatusCode::OK,
+            "control: attaching a repository the caller holds a grant on must still \
+             succeed: {}",
+            String::from_utf8_lossy(&granted_body)
+        );
+
+        // POSITIVE CONTROL 3: a global admin may still attach anything.
+        let (admin_status, admin_body) =
+            attach(fx.admin_session(), own_key.clone(), fx.secret_key.clone()).await;
+        assert_eq!(
+            admin_status,
+            StatusCode::OK,
+            "control: a global admin must still be able to attach any member: {}",
+            String::from_utf8_lossy(&admin_body)
+        );
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(own_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, own_id, fx.outsider.0).await;
+        tdh::cleanup(&fx.pool, granted_id, fx.outsider.0).await;
+        let _ = std::fs::remove_dir_all(&own_dir);
+        let _ = std::fs::remove_dir_all(&granted_dir);
+        fx.teardown().await;
+    }
+}
