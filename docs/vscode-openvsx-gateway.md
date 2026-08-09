@@ -44,6 +44,52 @@ the item and latest-version templates. Gallery queries are POSTs beneath the
 service root; AK rewrites returned asset URLs so VSIX and gallery-asset
 delivery remain on AK.
 
+## Age gate / cooldown review
+
+The gateway uses Artifact Keeper's existing repository age-gate policy and
+review queue. It does not add a VS Code publisher or extension allowlist.
+Configure the public Remote repository through the existing repository
+age-gate API/UI, for example:
+
+```sh
+curl --request PUT "$AK_URL/api/v1/repositories/$AK_REPO/age-gate" \
+  --header "Authorization: Bearer $AK_ADMIN_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{"enabled":true,"min_age_days":14,"mode":"upstream_publish_time"}'
+```
+
+VS Code supports both existing basis modes. `upstream_publish_time` uses Open
+VSX gallery `lastUpdated` as RFC3339 publish-time evidence; a missing or
+malformed timestamp is withheld, never treated as old enough. `first_seen`
+records the first time AK positively observes the exact Open VSX coordinate,
+ignoring upstream timestamps. An unknown request cannot start that clock until
+the raw gallery lookup proves the coordinate exists.
+
+The review coordinate is normalized as lowercased `publisher.extension` plus
+the target platform in the version field, for example
+`redhat.vscode-yaml` and `1.24.0@linux-x64`. Blank/missing platforms are
+`universal`. Platform variants therefore age and receive manual decisions
+independently. Use the ordinary age-gate review endpoints/UI to approve or
+reject the exact pending coordinate.
+
+When enabled, AK filters held/rejected versions from `POST extensionquery` and
+both latest aliases before rewriting URLs. It removes extensions with no
+eligible versions and reconciles result counts; a latest lookup with none is a
+`404`. If the policy or age-gate service cannot be evaluated, metadata fails
+closed instead of leaking versions.
+
+Every VSIX and generic gallery-asset request re-queries raw Open VSX metadata
+for the exact version/platform before AK reads its asset cache or fetches
+upstream bytes. Direct URLs and warm cache hits therefore cannot bypass a
+review. A held exact delivery returns the structured HTTP `451`
+`age_gate_blocked` response with its real `review_id`. This prototype does not
+substitute a last-known-good VSIX: platform, engine, and channel compatibility
+make that unsafe.
+
+This remains only an age/review gate. Custom publisher/extension allowlists,
+Microsoft Marketplace, private-gallery authentication, and Virtual gallery
+aggregation are outside the prototype scope.
+
 ## Configure a client
 
 Set `AK_URL` and `AK_REPO` below to your public AK origin and repository key.

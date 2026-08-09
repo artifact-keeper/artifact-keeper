@@ -22,6 +22,7 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
@@ -226,6 +227,34 @@ fn normal_target_platform(platform: Option<&str>) -> &str {
     platform
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(DEFAULT_TARGET_PLATFORM)
+}
+
+/// Identity used by the shared age-gate policy. Gallery publisher and
+/// extension names are case-insensitive, while Open VSX platform variants are
+/// independently immutable coordinates. Keep the platform in the version
+/// field because that is the shared review/first-seen key shape.
+fn vscode_age_gate_package(publisher: &str, name: &str) -> String {
+    format!("{}.{}", publisher, name).to_ascii_lowercase()
+}
+
+fn vscode_age_gate_version(version: &str, target_platform: Option<&str>) -> String {
+    format!(
+        "{}@{}",
+        version,
+        normal_target_platform(target_platform).to_ascii_lowercase()
+    )
+}
+
+/// `lastUpdated` is Open VSX gallery's publish-time evidence. Deliberately
+/// return `None` for absent or malformed values: upstream-publish-time mode
+/// treats no evidence as ineligible, while first-seen ignores it and uses the
+/// positive existence evidence supplied by the containing gallery document.
+fn gallery_last_updated(version: &serde_json::Value) -> Option<DateTime<Utc>> {
+    version
+        .get("lastUpdated")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
 }
 
 /// Gallery coordinates become both upstream URL components and cache-key
@@ -434,6 +463,266 @@ async fn fetch_gallery_query(
     })
 }
 
+fn gallery_extension_identity(
+    extension: &serde_json::Value,
+) -> Result<(String, String, String), Response> {
+    let publisher = extension
+        .get("publisher")
+        .and_then(|publisher| publisher.get("publisherName"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid_gallery_response)?;
+    let name = extension
+        .get("extensionName")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid_gallery_response)?;
+    validate_gallery_response_segment(publisher)?;
+    validate_gallery_response_segment(name)?;
+    Ok((
+        publisher.to_string(),
+        name.to_string(),
+        vscode_age_gate_package(publisher, name),
+    ))
+}
+
+fn gallery_version_coordinate(version: &serde_json::Value) -> Result<String, Response> {
+    let name = version
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid_gallery_response)?;
+    let platform = normal_target_platform(
+        version
+            .get("targetPlatform")
+            .and_then(serde_json::Value::as_str),
+    );
+    validate_gallery_response_segment(name)?;
+    validate_gallery_response_segment(platform)?;
+    Ok(vscode_age_gate_version(name, Some(platform)))
+}
+
+/// Reconcile the gallery's per-result count after age-gate filtering. Gallery
+/// `TotalCount` is the total number of matching extensions across every page,
+/// not the length of this response page, so subtract only extensions removed
+/// entirely. Some adapters omit result metadata; preserve that shape.
+fn reconcile_gallery_result_count(result: &mut serde_json::Value, removed: usize) {
+    let Some(metadata) = result
+        .get_mut("resultMetadata")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in metadata {
+        if entry
+            .get("metadataType")
+            .and_then(serde_json::Value::as_str)
+            != Some("ResultCount")
+        {
+            continue;
+        }
+        let Some(items) = entry
+            .get_mut("metadataItems")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for item in items {
+            if item.get("name").and_then(serde_json::Value::as_str) == Some("TotalCount") {
+                let Some(count) = item.get("count").and_then(serde_json::Value::as_u64) else {
+                    continue;
+                };
+                item["count"] = serde_json::json!(count.saturating_sub(removed as u64));
+            }
+        }
+    }
+}
+
+/// Apply the shared age-gate listing semantics to every returned extension
+/// identity before asset URLs are rewritten. This is intentionally separate
+/// from `fetch_gallery_query`: delivery must be able to fetch raw gallery
+/// metadata as exact existence evidence without recursively filtering it.
+async fn filter_gallery_response_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    response: &mut serde_json::Value,
+) -> Result<(), Response> {
+    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+
+    let params = resolve_repo_params(&state.db, repo.id)
+        .await
+        .map_err(|error| error.into_response())?;
+    if !AgeGateService::gating_requested(&params) {
+        return Ok(());
+    }
+    AgeGateService::require_enforceable(&params).map_err(|error| error.into_response())?;
+    let service = state.age_gate_service.as_deref().ok_or_else(|| {
+        proxy_helpers::age_gate_unavailable_response(&params.key, "VS Code gallery metadata")
+    })?;
+
+    let results = response
+        .get_mut("results")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(invalid_gallery_response)?;
+    let mut filtered_any = false;
+    for result in results {
+        let extensions = result
+            .get_mut("extensions")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(invalid_gallery_response)?;
+        let extension_count_before = extensions.len();
+        for extension in extensions.iter_mut() {
+            let (_, _, package) = gallery_extension_identity(extension)?;
+            let versions = extension
+                .get_mut("versions")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or_else(invalid_gallery_response)?;
+            let candidates = versions
+                .iter()
+                .map(|version| {
+                    Ok((
+                        gallery_version_coordinate(version)?,
+                        gallery_last_updated(version),
+                    ))
+                })
+                .collect::<Result<Vec<_>, Response>>()?;
+            let blocked = service
+                .evaluate_versions_batch(&params, &package, &candidates)
+                .await
+                .map_err(|error| error.into_response())?;
+            if !blocked.is_empty() {
+                filtered_any = true;
+                let original = std::mem::take(versions);
+                *versions = original
+                    .into_iter()
+                    .filter_map(|version| {
+                        let coordinate = gallery_version_coordinate(&version).ok()?;
+                        (!blocked.contains(&coordinate)).then_some(version)
+                    })
+                    .collect();
+            }
+        }
+        extensions.retain(|extension| {
+            extension
+                .get("versions")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|versions| !versions.is_empty())
+        });
+        let removed_extensions = extension_count_before.saturating_sub(extensions.len());
+        reconcile_gallery_result_count(result, removed_extensions);
+    }
+    if filtered_any {
+        crate::services::metrics_service::record_age_gate_filtered_metadata(&params.key, "vscode");
+    }
+    Ok(())
+}
+
+/// Locate one platform-qualified version in an unfiltered Open VSX gallery
+/// response. `Some(None)` means it exists but lacks trustworthy publish-time
+/// evidence; callers must pass that through to the shared fail-closed seam.
+fn find_gallery_exact_version(
+    response: &serde_json::Value,
+    package: &str,
+    version: &str,
+    target_platform: &str,
+) -> Option<Option<DateTime<Utc>>> {
+    let target = normal_target_platform(Some(target_platform)).to_ascii_lowercase();
+    for result in response.get("results")?.as_array()? {
+        for extension in result.get("extensions")?.as_array()? {
+            let publisher = extension.get("publisher")?.get("publisherName")?.as_str()?;
+            let name = extension.get("extensionName")?.as_str()?;
+            if vscode_age_gate_package(publisher, name) != package {
+                continue;
+            }
+            for candidate in extension.get("versions")?.as_array()? {
+                let candidate_version = candidate.get("version")?.as_str()?;
+                let candidate_platform = normal_target_platform(
+                    candidate
+                        .get("targetPlatform")
+                        .and_then(serde_json::Value::as_str),
+                )
+                .to_ascii_lowercase();
+                if candidate_version == version && candidate_platform == target {
+                    return Some(gallery_last_updated(candidate));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Re-resolve exact gallery metadata before every cache lookup or upstream
+/// byte fetch. The raw query is deliberately not passed through the listing
+/// filter, which avoids recursive policy evaluation and gives first-seen mode
+/// positive existence evidence for precisely the requested platform variant.
+async fn enforce_gallery_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    publisher: &str,
+    name: &str,
+    version: &str,
+    target_platform: &str,
+) -> Result<(), Response> {
+    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+
+    let params = resolve_repo_params(&state.db, repo.id)
+        .await
+        .map_err(|error| error.into_response())?;
+    if !AgeGateService::gating_requested(&params) {
+        return Ok(());
+    }
+    AgeGateService::require_enforceable(&params).map_err(|error| error.into_response())?;
+    let service = state.age_gate_service.as_deref().ok_or_else(|| {
+        proxy_helpers::age_gate_unavailable_response(&params.key, "VS Code gallery asset")
+    })?;
+    let package = vscode_age_gate_package(publisher, name);
+    let coordinate = vscode_age_gate_version(version, Some(target_platform));
+    let query = serde_json::json!({
+        "filters": [{
+            "criteria": [{ "filterType": 7, "value": package }],
+            "pageNumber": 1,
+            "pageSize": 1,
+            "sortBy": 0,
+            "sortOrder": 0,
+        }],
+        "flags": 511,
+    });
+    let raw = fetch_gallery_query(
+        state,
+        repo,
+        repo_key,
+        Bytes::from(serde_json::to_vec(&query).expect("gallery query serializes")),
+    )
+    .await?;
+    let published_at = find_gallery_exact_version(&raw.value, &package, version, target_platform)
+        .ok_or_else(|| {
+        (StatusCode::NOT_FOUND, "Extension version not found").into_response()
+    })?;
+    let basis = service
+        .download_basis(&params, &package, &coordinate, published_at, true)
+        .await
+        .map_err(|error| error.into_response())?;
+    // The shared seam returns an LKG for protocols that can safely substitute
+    // one. VS Code cannot: platform/engine/channel compatibility matters, so
+    // convert that outcome back to the same structured terminal 451 as Go.
+    if let Some(blocked) = proxy_helpers::enforce_age_gate(
+        state.age_gate_service.as_deref(),
+        &params,
+        &package,
+        &coordinate,
+        basis,
+    )
+    .await?
+    {
+        return Err(proxy_helpers::age_gate_blocked_response(
+            blocked.review_id,
+            &package,
+            &coordinate,
+            params.age_gate_min_age_days,
+            basis.map(|time| AgeGateService::package_age_days(time, Utc::now())),
+        ));
+    }
+    Ok(())
+}
+
 fn build_gallery_manifest(base_url: &RequestBaseUrl, repo_key: &str) -> serde_json::Value {
     let gallery = gallery_base_url(base_url, repo_key);
     let item = format!(
@@ -507,6 +796,7 @@ async fn gallery_extension_query(
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     let mut response = fetch_gallery_query(&state, &repo, &repo_key, body).await?;
+    filter_gallery_response_age_gate(&state, &repo, &mut response.value).await?;
     rewrite_gallery_asset_urls(&mut response.value, &base_url, &repo_key)?;
     Ok(json_response(&response.value))
 }
@@ -540,6 +830,7 @@ async fn gallery_latest_version(
         Bytes::from(serde_json::to_vec(&query).expect("gallery query serializes")),
     )
     .await?;
+    filter_gallery_response_age_gate(&state, &repo, &mut response.value).await?;
     rewrite_gallery_asset_urls(&mut response.value, &base_url, &repo_key)?;
     // `ExtensionLatestVersionUriTemplate` is consumed by VS Code as a
     // single raw gallery extension, unlike the POST extensionquery envelope.
@@ -596,6 +887,10 @@ async fn gallery_vspackage(
         &state,
         &repo,
         &repo_key,
+        &publisher,
+        &name,
+        &version,
+        target_platform,
         &upstream_asset_url,
         &cache_path,
         "application/vsix",
@@ -646,6 +941,10 @@ async fn gallery_asset(
         &state,
         &repo,
         &repo_key,
+        &publisher,
+        &name,
+        &version,
+        target_platform,
         &upstream_url,
         &cache_path,
         "application/octet-stream",
@@ -657,10 +956,27 @@ async fn proxy_gallery_asset(
     state: &SharedState,
     repo: &RepoInfo,
     repo_key: &str,
+    publisher: &str,
+    name: &str,
+    version: &str,
+    target_platform: &str,
     upstream_url: &str,
     cache_path: &str,
     default_content_type: &str,
 ) -> Result<Response, Response> {
+    // The raw exact-metadata query and shared gate run before ProxyService can
+    // inspect its cache, so a direct AK asset URL or a warm cache entry never
+    // bypasses a newly enabled policy or manual review decision.
+    enforce_gallery_age_gate(
+        state,
+        repo,
+        repo_key,
+        publisher,
+        name,
+        version,
+        target_platform,
+    )
+    .await?;
     let proxy = state.proxy_service.as_deref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -958,7 +1274,6 @@ async fn publish_extension(
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty VSIX file").into_response());
     }
-
     // Extract publisher/name/version from VSIX headers or require them as query params.
     // For simplicity, extract from the Content-Disposition header or require metadata headers.
     let publisher = headers
@@ -1209,6 +1524,417 @@ fn build_vscode_publish_response(publisher: &str, name: &str, version: &str) -> 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn gallery_age_gate_coordinates_are_casefolded_and_platform_qualified() {
+        assert_eq!(
+            vscode_age_gate_package("RedHat", "VSCode-YAML"),
+            "redhat.vscode-yaml"
+        );
+        assert_eq!(
+            vscode_age_gate_version("1.24.0", Some("linux-x64")),
+            "1.24.0@linux-x64"
+        );
+        assert_eq!(
+            vscode_age_gate_version("1.24.0", Some("WIN32-X64")),
+            "1.24.0@win32-x64"
+        );
+        assert_eq!(
+            vscode_age_gate_version("1.24.0", Some("")),
+            "1.24.0@universal"
+        );
+        assert_eq!(vscode_age_gate_version("1.24.0", None), "1.24.0@universal");
+    }
+
+    #[test]
+    fn gallery_publish_time_evidence_is_rfc3339_or_missing() {
+        let old = serde_json::json!({ "lastUpdated": "2024-01-02T03:04:05Z" });
+        assert!(gallery_last_updated(&old).is_some());
+        assert!(gallery_last_updated(&serde_json::json!({})).is_none());
+        assert!(gallery_last_updated(&serde_json::json!({ "lastUpdated": "yesterday" })).is_none());
+    }
+
+    #[test]
+    fn exact_gallery_lookup_keeps_platform_variants_independent() {
+        let response = serde_json::json!({
+            "results": [{ "extensions": [{
+                "publisher": { "publisherName": "RedHat" },
+                "extensionName": "VSCode-YAML",
+                "versions": [
+                    { "version": "1.24.0", "targetPlatform": "linux-x64", "lastUpdated": "2024-01-02T03:04:05Z" },
+                    { "version": "1.24.0", "targetPlatform": "win32-x64", "lastUpdated": "not-a-time" },
+                    { "version": "1.24.0", "lastUpdated": "2024-01-02T03:04:05Z" }
+                ]
+            }] }]
+        });
+        assert!(
+            find_gallery_exact_version(&response, "redhat.vscode-yaml", "1.24.0", "linux-x64")
+                .flatten()
+                .is_some()
+        );
+        assert_eq!(
+            find_gallery_exact_version(&response, "redhat.vscode-yaml", "1.24.0", "win32-x64"),
+            Some(None)
+        );
+        assert!(find_gallery_exact_version(
+            &response,
+            "redhat.vscode-yaml",
+            "1.24.0",
+            "darwin-arm64"
+        )
+        .is_none());
+        assert!(
+            find_gallery_exact_version(&response, "redhat.vscode-yaml", "1.24.0", "")
+                .flatten()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn gallery_result_count_reconciles_after_age_filtering() {
+        let mut result = serde_json::json!({
+            "extensions": [],
+            "resultMetadata": [{
+                "metadataType": "ResultCount",
+                "metadataItems": [{ "name": "TotalCount", "count": 99 }]
+            }]
+        });
+        reconcile_gallery_result_count(&mut result, 2);
+        assert_eq!(result["resultMetadata"][0]["metadataItems"][0]["count"], 97);
+    }
+
+    async fn rewire_remote_gallery_with_age_gate(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        gallery_url: &str,
+        mode: &str,
+        min_age_days: i32,
+    ) -> (SharedState, tempfile::TempDir) {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        sqlx::query(
+            "UPDATE repositories
+             SET upstream_url = $1, age_gate_enabled = true,
+                 age_gate_mode = $2, age_gate_min_age_days = $3
+             WHERE id = $4",
+        )
+        .bind(gallery_url)
+        .bind(mode)
+        .bind(min_age_days)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure VS Code age gate");
+        let cache = tempfile::tempdir().expect("cache directory");
+        let proxy = tdh::build_proxy_service_with_fs(
+            fx.pool.clone(),
+            cache.path().to_str().expect("UTF-8 cache path"),
+        );
+        let state = tdh::build_state_with_proxy_and_age_gate(
+            fx.pool.clone(),
+            cache.path().to_str().expect("UTF-8 cache path"),
+            proxy,
+        );
+        (state, cache)
+    }
+
+    fn gallery_extension_response(versions: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "results": [{
+                "extensions": [{
+                    "publisher": { "publisherName": "RedHat" },
+                    "extensionName": "VSCode-YAML",
+                    "versions": versions
+                }],
+                "resultMetadata": [{
+                    "metadataType": "ResultCount",
+                    "metadataItems": [{ "name": "TotalCount", "count": 1 }]
+                }]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn gallery_age_gate_filters_young_missing_and_malformed_versions_before_rewrite() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let old = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        let young = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        Mock::given(method("POST"))
+            .and(path("/vscode/gallery/extensionquery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gallery_extension_response(
+                serde_json::json!([
+                    { "version": "1.0.0", "targetPlatform": "linux-x64", "lastUpdated": old, "assetUri": "https://upstream/old" },
+                    { "version": "2.0.0", "targetPlatform": "linux-x64", "lastUpdated": young, "assetUri": "https://upstream/young" },
+                    { "version": "3.0.0", "targetPlatform": "linux-x64", "assetUri": "https://upstream/missing" },
+                    { "version": "4.0.0", "targetPlatform": "linux-x64", "lastUpdated": "not-rfc3339", "assetUri": "https://upstream/malformed" }
+                ]),
+            )))
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) =
+            rewire_remote_gallery_with_age_gate(&fx, &gallery_root, "upstream_publish_time", 30)
+                .await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from_static(b"{\"filters\":[],\"flags\":511}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = response["results"][0]["extensions"][0]["versions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["version"], "1.0.0");
+        assert_eq!(
+            response["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"],
+            1
+        );
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn gallery_latest_returns_not_found_when_age_filter_leaves_no_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("POST"))
+            .and(path("/vscode/gallery/extensionquery"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(gallery_extension_response(
+                    serde_json::json!([{
+                        "version": "1.0.0",
+                        "targetPlatform": "linux-x64",
+                        "lastUpdated": (Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
+                        "assetUri": "https://upstream/young"
+                    }]),
+                )),
+            )
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) =
+            rewire_remote_gallery_with_age_gate(&fx, &gallery_root, "upstream_publish_time", 30)
+                .await;
+        for path in [
+            format!("/{}/gallery/RedHat/VSCode-YAML/latest", fx.repo_key),
+            format!("/{}/gallery/vscode/RedHat/VSCode-YAML/latest", fx.repo_key),
+        ] {
+            let (status, _) = tdh::send(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(path),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn gallery_age_gate_first_seen_observes_the_platform_qualified_coordinate() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("POST"))
+            .and(path("/vscode/gallery/extensionquery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gallery_extension_response(
+                serde_json::json!([
+                    { "version": "1.0.0", "targetPlatform": "linux-x64", "assetUri": "https://upstream/linux" },
+                    { "version": "1.0.0", "targetPlatform": "win32-x64", "assetUri": "https://upstream/windows" }
+                ]),
+            )))
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) =
+            rewire_remote_gallery_with_age_gate(&fx, &gallery_root, "first_seen", 30).await;
+        let query = || {
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from_static(b"{\"filters\":[],\"flags\":511}"),
+            )
+        };
+        let (initial_status, initial_body) =
+            tdh::send(tdh::router_anon(super::router(), state.clone()), query()).await;
+        assert_eq!(initial_status, StatusCode::OK);
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&initial_body).unwrap()["results"][0]
+                ["extensions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // Age only Linux's observation. Windows must remain withheld even
+        // though it shares publisher, extension, and version text.
+        sqlx::query(
+            "UPDATE age_gate_version_observations
+             SET first_seen_at = NOW() - INTERVAL '31 days'
+             WHERE repository_id = $1 AND package_name = 'redhat.vscode-yaml'
+               AND package_version = '1.0.0@linux-x64'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let (aged_status, aged_body) =
+            tdh::send(tdh::router_anon(super::router(), state), query()).await;
+        assert_eq!(aged_status, StatusCode::OK);
+        let versions = serde_json::from_slice::<serde_json::Value>(&aged_body).unwrap()["results"]
+            [0]["extensions"][0]["versions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["targetPlatform"], "linux-x64");
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn gallery_delivery_age_gate_blocks_before_cache_then_honors_manual_review() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let young = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        Mock::given(method("POST"))
+            .and(path("/vscode/gallery/extensionquery"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(gallery_extension_response(
+                    serde_json::json!([{
+                        "version": "1.0.0",
+                        "targetPlatform": "linux-x64",
+                        "lastUpdated": young
+                    }]),
+                )),
+            )
+            .mount(&server)
+            .await;
+        let bytes = b"reviewed-vsix";
+        Mock::given(method("GET"))
+            .and(path(
+                "/vscode/gallery/publishers/RedHat/vsextensions/VSCode-YAML/1.0.0/vspackage",
+            ))
+            .and(query_param("targetPlatform", "linux-x64"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            // First request is 451, second fills the cache after approval,
+            // and the final rejected request must be stopped before this
+            // cache entry is read or this upstream endpoint is retried.
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, cache) =
+            rewire_remote_gallery_with_age_gate(&fx, &gallery_root, "upstream_publish_time", 30)
+                .await;
+        let request = || {
+            tdh::get(format!(
+                "/{}/gallery/publishers/RedHat/vsextensions/VSCode-YAML/1.0.0/vspackage?targetPlatform=linux-x64",
+                fx.repo_key
+            ))
+        };
+        let (blocked_status, blocked_body) =
+            tdh::send(tdh::router_anon(super::router(), state.clone()), request()).await;
+        assert_eq!(blocked_status, StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        let blocked: serde_json::Value = serde_json::from_slice(&blocked_body).unwrap();
+        assert_eq!(blocked["error"], "age_gate_blocked");
+        assert_eq!(blocked["package"], "redhat.vscode-yaml");
+        assert_eq!(blocked["version"], "1.0.0@linux-x64");
+        let review_id: uuid::Uuid = serde_json::from_value(blocked["review_id"].clone()).unwrap();
+        state
+            .age_gate_service
+            .as_ref()
+            .unwrap()
+            .approve(review_id, fx.user_id, Some("reviewed"))
+            .await
+            .unwrap();
+
+        let (allowed_status, allowed_body) =
+            tdh::send(tdh::router_anon(super::router(), state.clone()), request()).await;
+        assert_eq!(allowed_status, StatusCode::OK);
+        assert_eq!(&allowed_body[..], bytes);
+        tdh::wait_for_cache_commit(cache.path(), bytes.len() as u64).await;
+        state
+            .age_gate_service
+            .as_ref()
+            .unwrap()
+            .reject(review_id, fx.user_id, Some("rejected"))
+            .await
+            .unwrap();
+        let (rejected_status, rejected_body) =
+            tdh::send(tdh::router_anon(super::router(), state), request()).await;
+        assert_eq!(rejected_status, StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rejected_body).unwrap()["review_id"],
+            review_id.to_string()
+        );
+        drop(server);
+        fx.teardown().await;
+    }
+    #[tokio::test]
+    async fn gallery_age_gate_without_service_fails_closed_for_metadata_and_delivery() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        sqlx::query(
+            "UPDATE repositories
+             SET upstream_url = 'https://open-vsx.example/vscode/gallery',
+                 age_gate_enabled = true, age_gate_mode = 'upstream_publish_time'
+             WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        // State intentionally has no AgeGateService. Delivery checks this
+        // before cache/proxy construction.
+        let app = fx.router_anon(super::router());
+        let (delivery_status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/gallery/publishers/publisher/vsextensions/extension/1.0.0/vspackage",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(delivery_status, StatusCode::SERVICE_UNAVAILABLE);
+        let repo = resolve_vscode_repo(&fx.pool, &fx.repo_key).await.unwrap();
+        let mut metadata = gallery_extension_response(serde_json::json!([{
+            "version": "1.0.0",
+            "lastUpdated": "2024-01-01T00:00:00Z"
+        }]));
+        let metadata_error = filter_gallery_response_age_gate(&fx.state, &repo, &mut metadata)
+            .await
+            .expect_err("configured gallery metadata cannot fail open without the service");
+        assert_eq!(metadata_error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        fx.teardown().await;
+    }
 
     #[test]
     fn gallery_manifest_uses_vscode_resource_wire_shape() {
