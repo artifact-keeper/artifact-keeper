@@ -23,12 +23,21 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::http::{header, Method};
+use axum::http::{header, HeaderName, Method};
 use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use rand::Rng;
+
+// Gallery clients identify themselves and, when telemetry is enabled, carry a
+// per-machine/session identifier. CORS_ORIGINS remains the authority for which
+// browser origins may call the API.
+const X_MARKET_CLIENT_ID: HeaderName = HeaderName::from_static("x-market-client-id");
+const X_MARKET_USER_ID: HeaderName = HeaderName::from_static("x-market-user-id");
+const VSCODE_SESSION_ID: HeaderName = HeaderName::from_static("vscode-sessionid");
+const X_MARKET_SEARCH_ACTIVITY_ID: HeaderName =
+    HeaderName::from_static("x-market-search-activity-id");
 
 use artifact_keeper_backend::{
     api,
@@ -1019,6 +1028,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                         header::AUTHORIZATION,
                         header::ACCEPT,
                         header::COOKIE,
+                        X_MARKET_CLIENT_ID,
+                        X_MARKET_USER_ID,
+                        VSCODE_SESSION_ID,
+                        X_MARKET_SEARCH_ACTIVITY_ID,
                     ])
                     .allow_credentials(true)
             } else {
@@ -1045,6 +1058,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                             header::CONTENT_TYPE,
                             header::AUTHORIZATION,
                             header::ACCEPT,
+                            X_MARKET_CLIENT_ID,
+                            X_MARKET_USER_ID,
+                            VSCODE_SESSION_ID,
+                            X_MARKET_SEARCH_ACTIVITY_ID,
                         ])
                 }
             }

@@ -2066,6 +2066,48 @@ impl UpstreamClient {
         Self::read_upstream_response_capped(response, url, max).await
     }
 
+    /// Send an uncached JSON POST to a configured upstream and buffer its
+    /// response under `max`. Gallery-style APIs use request bodies for search
+    /// and paging, so treating these as cacheable artifact GETs would both
+    /// collide requests and make policy-aware invalidation unexpectedly hard.
+    ///
+    /// This deliberately shares the normal upstream-auth, custom User-Agent,
+    /// HTTP-client, redirect, and bounded-read behaviour with GET metadata
+    /// fetches. The shared client supplies the connect-time and per-redirect
+    /// SSRF protections; the repository's configured Basic/Bearer credentials
+    /// remain scoped to its configured upstream.
+    async fn post_json_buffered(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        body: Bytes,
+        max: usize,
+    ) -> Result<UpstreamResponse> {
+        let diagnostic_url = redact_url_for_diagnostics(url);
+        tracing::info!("Posting JSON metadata to upstream: {}", diagnostic_url);
+
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let custom_ua = self.get_custom_user_agent(repo_id).await;
+
+        let mut request = self
+            .http_client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json;api-version=3.0-preview.1")
+            .body(body);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+        request = apply_custom_ua(request, custom_ua.as_deref());
+
+        let response = request.send().await.map_err(|e| {
+            classify_send_error(e, &format!("POST JSON to upstream {}", diagnostic_url))
+        })?;
+
+        Self::read_upstream_response_capped(response, url, max).await
+    }
+
     /// Extract content, content-type, etag, effective URL, and Link header from
     /// an upstream HTTP response, buffering the body under a hard `max`-byte
     /// ceiling (#1608 Phase 4b / #2181). Callers are responsible for handling
@@ -2698,6 +2740,60 @@ impl ProxyService {
             .fetch_artifact_capped_with_encoding(repo, path, max)
             .await?;
         Ok((content, content_type))
+    }
+
+    /// POST a JSON metadata request to a Remote repository without reading or
+    /// writing the proxy cache. This is for protocols whose query identity is
+    /// the request body (for example VS Code gallery `extensionquery`), where
+    /// the GET-oriented cache key cannot safely distinguish searches, paging,
+    /// or caller flags.
+    pub async fn post_json_uncached_capped(
+        &self,
+        repo: &Repository,
+        path: &str,
+        body: Bytes,
+        max: usize,
+    ) -> Result<(Bytes, Option<String>)> {
+        let upstream_url = Self::remote_target(repo)?;
+        Self::validate_relative_post_endpoint(path)?;
+        let full_url = Self::build_upstream_url(upstream_url, path);
+        let resp = self
+            .upstream_client
+            .post_json_buffered(&full_url, repo.id, body, max)
+            .await?;
+        Ok((resp.content, resp.content_type))
+    }
+
+    /// JSON POST callers are limited to a clean, non-rooted relative endpoint
+    /// beneath the configured upstream. Unlike artifact GETs, this primitive
+    /// always attaches repository credentials; accepting an absolute path,
+    /// rooted path, or dot-segment escape here would let a future caller send
+    /// those credentials outside the configured upstream root.
+    fn validate_relative_post_endpoint(path: &str) -> Result<()> {
+        let valid = !path.is_empty()
+            && !path.starts_with('/')
+            && !path.starts_with('\\')
+            && reqwest::Url::parse(path).is_err()
+            && path.split('/').all(|segment| {
+                if segment.is_empty() || segment == "." || segment == ".." {
+                    return false;
+                }
+                let Ok(decoded) = urlencoding::decode(segment) else {
+                    return false;
+                };
+                decoded != "."
+                    && decoded != ".."
+                    && !decoded.contains('/')
+                    && !decoded.contains('\\')
+                    && !decoded.contains('?')
+                    && !decoded.contains('#')
+            });
+        if !valid {
+            return Err(AppError::Validation(
+                "JSON proxy POST endpoint must be relative to the configured upstream".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Buffered capped fetch that also reports the upstream `Content-Encoding`,
@@ -5905,6 +6001,33 @@ pub(crate) fn build_stale_cache_headers() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_post_endpoint_accepts_only_clean_non_rooted_relative_targets() {
+        for endpoint in [
+            "",
+            "https://credentials.example/collect",
+            "http://credentials.example/collect",
+            "//credentials.example/collect",
+            "/extensionquery",
+            "\\extensionquery",
+            "./extensionquery",
+            "../extensionquery",
+            "gallery/../extensionquery",
+            "gallery//extensionquery",
+            "%2e%2e/extensionquery",
+            "gallery/%2Fetc%2Fpasswd",
+            "extensionquery?redirect=https://credentials.example",
+            "extensionquery#fragment",
+        ] {
+            assert!(
+                ProxyService::validate_relative_post_endpoint(endpoint).is_err(),
+                "{endpoint} must not be able to receive repository credentials"
+            );
+        }
+        assert!(ProxyService::validate_relative_post_endpoint("extensionquery").is_ok());
+        assert!(ProxyService::validate_relative_post_endpoint("nested/endpoint").is_ok());
+    }
 
     // -----------------------------------------------------------------------
     // Transport-error classifier: egress-proxy SSRF block diagnostics (#2570)

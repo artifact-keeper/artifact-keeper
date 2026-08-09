@@ -680,6 +680,37 @@ pub async fn proxy_fetch_capped_budgeted(
     Ok((content, content_type, permit))
 }
 
+/// POST a JSON metadata request without using the proxy cache, while reserving
+/// the caller-declared whole-request working set against the shared
+/// buffered-metadata budget. Protocols such as the VS Code gallery key
+/// discovery and paging in a POST body, so caching them under a URL-only key
+/// would be incorrect.
+pub async fn proxy_post_json_uncached_capped_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    body: Bytes,
+    max: usize,
+    reservation_bytes: usize,
+) -> Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response> {
+    // Some callers parse and reserialize the buffered response before sending
+    // it on. Reserve their declared whole-request working-set allowance, not
+    // merely the wire cap, so the shared budget remains a real resident-memory
+    // bound under concurrent adversarial requests.
+    let permit = proxy_metadata_budget()
+        .reserve(reservation_bytes.max(max))
+        .await;
+    let content = with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .post_json_uncached_capped(&repo, path, body, max)
+            .await
+    })
+    .await?;
+    Ok((content.0, content.1, permit))
+}
+
 /// As [`proxy_fetch_capped_budgeted`], but also reports the upstream
 /// `Content-Encoding` for handlers that forward the buffered bytes to the client
 /// and must declare the coding — see

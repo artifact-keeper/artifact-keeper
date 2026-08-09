@@ -221,6 +221,11 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // packages are version-pinned — both immutable.
         RepositoryFormat::Rpm => classify_rpm(&lower),
 
+        // The VS Code gateway owns this version- and target-platform-qualified
+        // cache layout. It is the only Vscode cache path safe to retain
+        // forever; hosted and future metadata paths stay mutable by default.
+        RepositoryFormat::Vscode => classify_vscode_gallery_asset(&lower),
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -428,6 +433,23 @@ fn classify_rpm(lower: &str) -> Mutability {
     }
     // Unknown path: revalidate.
     Mutability::mutable_default()
+}
+
+/// Open VSX gallery assets are immutable only for the two exact AK-owned
+/// cache-key shapes. Every other VS Code path remains mutable conservatively.
+fn classify_vscode_gallery_asset(lower: &str) -> Mutability {
+    let segments: Vec<&str> = lower.split('/').collect();
+    let is_gallery_asset = segments.len() == 6
+        && segments[0] == "gallery"
+        && segments[..5].iter().all(|segment| !segment.is_empty())
+        && segments[3] != "latest"
+        && (segments[5] == "vspackage" || segments[5].starts_with("asset-"))
+        && !segments[5].trim_start_matches("asset-").is_empty();
+    if is_gallery_asset {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
 }
 
 /// The final path segment (after the last `/`), or the whole string.
@@ -690,6 +712,26 @@ mod tests {
         // An unrecognized Maven leaf must NOT be misclassified immutable.
         assert!(!classify(&RepositoryFormat::Maven, "com/example/app/").is_immutable());
         assert!(!classify(&RepositoryFormat::Cargo, "weird/index/path").is_immutable());
+    }
+
+    #[test]
+    fn classify_vscode_only_immutable_for_versioned_platform_gallery_assets() {
+        use RepositoryFormat::Vscode;
+
+        for path in [
+            "gallery/publisher/extension/1.2.3/linux-x64/vspackage",
+            "gallery/publisher/extension/1.2.3/universal/asset-deadbeef",
+        ] {
+            assert!(classify(&Vscode, path).is_immutable(), "{path}");
+        }
+        for path in [
+            "gallery/publisher/extension/1.2.3/linux-x64",
+            "gallery/publisher/extension/1.2.3/linux-x64/other-asset",
+            "gallery/publisher/extension/latest/linux-x64/vspackage",
+            "extensions/publisher/extension/1.2.3/download",
+        ] {
+            assert!(!classify(&Vscode, path).is_immutable(), "{path}");
+        }
     }
 
     #[test]

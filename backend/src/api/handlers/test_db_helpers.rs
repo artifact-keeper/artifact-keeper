@@ -44,6 +44,52 @@ pub async fn try_pool() -> Option<PgPool> {
     crate::testing::try_pool_with(3).await
 }
 
+/// Serializes the narrowly-scoped SSRF allowlist mutation used by handler
+/// tests that need a wiremock upstream. Production correctly blocks loopback,
+/// so the mock listens on the host's non-loopback address and only that /32 or
+/// /128 is allowlisted for the lifetime of the guard.
+static SSRF_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub struct SsrfTestAllowlistGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    previous: Option<String>,
+}
+
+impl Drop for SsrfTestAllowlistGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", value),
+            None => std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+        }
+    }
+}
+
+/// Start wiremock on a non-loopback interface accepted by the upstream SSRF
+/// policy, returning a guard that restores the process environment on drop.
+pub async fn non_loopback_mock_server() -> (wiremock::MockServer, SsrfTestAllowlistGuard) {
+    let lock = SSRF_TEST_ENV_LOCK.lock().await;
+    let previous = std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok();
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind route probe");
+    probe.connect("8.8.8.8:80").expect("connect route probe");
+    let bind_ip = probe.local_addr().expect("read route probe address").ip();
+    std::env::set_var(
+        "AK_SSRF_ALLOW_PRIVATE_CIDRS",
+        format!("{bind_ip}/{}", if bind_ip.is_ipv4() { 32 } else { 128 }),
+    );
+    let listener = std::net::TcpListener::bind((bind_ip, 0)).expect("bind wiremock listener");
+    let server = wiremock::MockServer::builder()
+        .listener(listener)
+        .start()
+        .await;
+    (
+        server,
+        SsrfTestAllowlistGuard {
+            _lock: lock,
+            previous,
+        },
+    )
+}
+
 /// Open a dedicated Postgres session and take `pg_advisory_lock(lock_key)`,
 /// blocking until the lock is free. Returns `None` — which the `*_serial_lock`
 /// guards below surface as an inert guard — when no database is configured or

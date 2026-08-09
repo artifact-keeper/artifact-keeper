@@ -267,6 +267,7 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[Installation](https://artifactkeeper.com/docs/getting-started/installation/)** — Docker Compose, Windows Service (beta), or build from source
 - **[Configuration](https://artifactkeeper.com/docs/getting-started/configuration/)** — Environment variables reference
 - **[Package Formats](https://artifactkeeper.com/docs/package-formats/)** — All 45+ supported formats
+- **[VS Code/Open VSX gateway dogfood](docs/vscode-openvsx-gateway.md)** — Slice 1 client setup and verification
 - **[Docker Deployment](https://artifactkeeper.com/docs/deployment/docker/)** — Production setup guide
 
 ## Project Structure
