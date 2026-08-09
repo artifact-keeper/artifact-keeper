@@ -5030,6 +5030,47 @@ pub async fn serve_local_artifact(
     ))
 }
 
+/// Streaming-path counterpart to [`serve_local_artifact`]'s gate call (#3143):
+/// enforce quarantine + scan policy on an already-resolved
+/// [`StreamingFetchResult`], then record the download.
+///
+/// [`local_fetch_by_path`] and friends only apply `check_quarantine_row` — the
+/// raw quarantine predicate — so a handler that resolves bytes through them and
+/// streams the result skips the scan policy that `serve_local_artifact` (the
+/// buffered sibling) enforces. Callers on a **terminal** download path use this
+/// to get the same contract.
+///
+/// Deliberately NOT called from inside `local_lookup_artifact`, even though
+/// that would cover every caller at once: the same helpers back the per-member
+/// `local_fetch` closures passed to [`resolve_virtual_download`], where an
+/// `Err` means "this member does not have it, try the next one". A gate
+/// rejection raised there would be swallowed as a member miss and resolution
+/// would continue to another member or upstream — converting a policy block
+/// into a silent fallback rather than a 403. The gate therefore belongs at the
+/// terminal call sites, which is where this helper is used.
+///
+/// `artifact_id: None` (a proxy/remote cache hit with no `artifacts` row) is a
+/// no-op, preserving the existing behaviour for upstream-served bytes.
+///
+/// Takes the id rather than `&StreamingFetchResult` deliberately:
+/// `StreamingFetchResult` holds a `BoxStream`, which is `Send` but not `Sync`,
+/// so holding a reference to it across this `.await` would make the calling
+/// handler's future non-`Send` and fail axum's `Handler` bound.
+pub async fn gate_and_record_streamed_local(
+    db: &PgPool,
+    artifact_id: Option<Uuid>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<(), Response> {
+    let Some(artifact_id) = artifact_id else {
+        return Ok(());
+    };
+    crate::services::quarantine_service::enforce_download_gate(db, artifact_id)
+        .await
+        .map_err(|e| e.into_response())?;
+    crate::services::artifact_service::record_download(db, artifact_id, ctx).await;
+    Ok(())
+}
+
 /// Build a 200 OK download response from proxied content.
 pub(crate) fn build_download_response(
     content: Bytes,
