@@ -24,7 +24,8 @@ fn block_unscanned_violated(block_unscanned: bool, scan_state: ScanState) -> boo
 /// rows.
 #[derive(Debug, PartialEq, Eq)]
 struct PostScanGates {
-    /// The newest scan row (any status) is `failed`, so `block_on_fail` may fire.
+    /// At least one scanner's LATEST row is a genuine failure, so
+    /// `block_on_fail` may fire (#3142).
     block_on_fail_applies: bool,
     /// Findings are on record for this artifact, so the `max_severity`
     /// threshold check must run.
@@ -35,11 +36,23 @@ struct PostScanGates {
 ///
 /// The two gates deliberately read DIFFERENT inputs:
 ///
-/// * `block_on_fail` is about the most recent attempt, so it keys on the newest
-///   row's status.
+/// * `block_on_fail` is about whether any engine's most recent attempt crashed,
+///   so it keys on the latest row PER `scan_type` (#3142).
 /// * `max_severity` is about the findings on record, so it keys on whether
 ///   there is anything on record to grade — not on "the newest row happens to
 ///   be completed".
+///
+/// #3142: `block_on_fail` used to key on a single `ORDER BY created_at DESC
+/// LIMIT 1` across ALL `scan_type`s. With more than one engine enabled that is
+/// a fail-open: scanner A crashes and writes `failed`, scanner B then finishes
+/// clean, the global newest row reads `completed`, and `block_on_fail` never
+/// fires. `classify_scan_state` is any-completed-wins, so `block_unscanned`
+/// stays quiet too, and an artifact with a crashed scanner is served as fully
+/// vetted with `block_on_fail` explicitly enabled. Keying per `scan_type` means
+/// a later clean scan by a DIFFERENT engine can no longer mask engine A's
+/// crash, while a genuine `completed` RESCAN by engine A itself still clears
+/// it. Mirrors `scan_result_service::recalculate_score`'s `has_failed_scan`
+/// window, which already had the right shape.
 ///
 /// Both used to read the single newest row of any status, which made the
 /// severity gate silently inert whenever the newest row was not `completed`.
@@ -66,12 +79,12 @@ struct PostScanGates {
 /// query returns zero when no finding meets the policy's severity.
 /// Pure / unit-testable.
 fn post_scan_gates(
-    latest_status: Option<&str>,
+    any_scanner_failed: bool,
     has_completed_scan: bool,
     has_unacknowledged_findings: bool,
 ) -> PostScanGates {
     PostScanGates {
-        block_on_fail_applies: latest_status == Some("failed"),
+        block_on_fail_applies: any_scanner_failed,
         severity_applies: has_completed_scan || has_unacknowledged_findings,
     }
 }
@@ -161,13 +174,11 @@ impl PolicyService {
 
         let mut violations = Vec::new();
 
-        // Post-scan gate inputs, in one round trip. `latest_status` is the newest
-        // row of ANY status (drives `block_on_fail`); `has_completed_scan` is an
-        // existence check (drives `max_severity`). See [`post_scan_gates`] for
-        // why these two must not share a single "newest row" lookup.
+        // Post-scan gate inputs. `has_completed_scan` is an existence check
+        // (drives `max_severity`). See [`post_scan_gates`] for why these gates
+        // must not share a single "newest row" lookup.
         #[derive(sqlx::FromRow)]
         struct ScanGateRow {
-            latest_status: Option<String>,
             has_completed_scan: bool,
             has_unacknowledged_findings: bool,
         }
@@ -175,11 +186,6 @@ impl PolicyService {
         let gate_row: ScanGateRow = sqlx::query_as(
             r#"
             SELECT
-                (SELECT status
-                   FROM scan_results
-                  WHERE artifact_id = $1
-                  ORDER BY created_at DESC
-                  LIMIT 1) AS latest_status,
                 EXISTS (
                     SELECT 1
                       FROM scan_results
@@ -199,8 +205,18 @@ impl PolicyService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // #3142: `block_on_fail` reads the latest row PER `scan_type`, not one
+        // global newest row, so a clean scan by engine B cannot mask engine A's
+        // crash. "Not applicable" rows are excluded by `any_scanner_failed`.
+        let latest_per_scan_type: Vec<crate::services::scan_state::ScanStateRow> =
+            sqlx::query_as(crate::services::scan_state::LATEST_PER_SCAN_TYPE_SQL)
+                .bind(artifact_id)
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
         let gates = post_scan_gates(
-            gate_row.latest_status.as_deref(),
+            crate::services::scan_state::any_scanner_failed(&latest_per_scan_type),
             gate_row.has_completed_scan,
             gate_row.has_unacknowledged_findings,
         );
@@ -532,17 +548,17 @@ mod tests {
         // normal shape for an asynchronous/external scanner — therefore turned
         // the max_severity download gate off entirely, and an artifact with
         // critical findings on record was served with a 200.
-        for newest in ["pending", "running", "not_applicable"] {
-            let gates = post_scan_gates(Some(newest), true, false);
-            assert!(
-                gates.severity_applies,
-                "a newer '{newest}' row must NOT disable severity blocking while a completed scan exists"
-            );
-            assert!(
-                !gates.block_on_fail_applies,
-                "'{newest}' is not a failure, so block_on_fail must stay quiet"
-            );
-        }
+        // No scanner's latest row is a genuine failure, so block_on_fail stays
+        // quiet while severity still grades the completed scan's findings.
+        let gates = post_scan_gates(false, true, false);
+        assert!(
+            gates.severity_applies,
+            "a newer non-completed row must NOT disable severity blocking while a completed scan exists"
+        );
+        assert!(
+            !gates.block_on_fail_applies,
+            "no scanner failed, so block_on_fail must stay quiet"
+        );
     }
 
     #[test]
@@ -554,10 +570,11 @@ mod tests {
         // Keying the gate on `completed` alone reproduces the very fail-open
         // this module is fixing, one layer down: an unacknowledged critical on
         // record, served 200.
-        for newest in [None, Some("pending"), Some("running"), Some("failed")] {
+        for any_scanner_failed in [false, true] {
             assert!(
-                post_scan_gates(newest, false, true).severity_applies,
-                "findings on record must be graded even with no completed scan (newest={newest:?})"
+                post_scan_gates(any_scanner_failed, false, true).severity_applies,
+                "findings on record must be graded even with no completed scan \
+                 (any_scanner_failed={any_scanner_failed})"
             );
         }
     }
@@ -567,29 +584,59 @@ mod tests {
         // Nothing completed AND nothing on record -> nothing to grade, so the
         // severity gate must not fire. `block_unscanned` is the gate that
         // covers this case.
-        for newest in [None, Some("pending"), Some("running"), Some("failed")] {
+        for any_scanner_failed in [false, true] {
             assert!(
-                !post_scan_gates(newest, false, false).severity_applies,
-                "no completed scan and no findings -> severity gate must not fire (newest={newest:?})"
+                !post_scan_gates(any_scanner_failed, false, false).severity_applies,
+                "no completed scan and no findings -> severity gate must not fire \
+                 (any_scanner_failed={any_scanner_failed})"
             );
         }
     }
 
+    /// #3142: `block_on_fail` keys on whether ANY scanner's latest row failed,
+    /// not on a single global newest row.
+    ///
+    /// This test replaces `test_block_on_fail_keys_on_the_newest_row_only`,
+    /// which asserted the defect: it pinned
+    /// `!post_scan_gates(Some("completed"), true, false).block_on_fail_applies`
+    /// — i.e. "a global newest row of `completed` means block_on_fail must not
+    /// fire" — which is exactly the fail-open where a clean scan by engine B
+    /// masks engine A's crash. The old test passed both before and after the
+    /// bug was introduced, so it could never have caught it.
+    ///
+    /// The decision now lives in `scan_state::any_scanner_failed`, which is
+    /// tested there against the per-`scan_type` row shape; this pins the
+    /// remaining wiring in `post_scan_gates`.
     #[test]
-    fn test_block_on_fail_keys_on_the_newest_row_only() {
-        assert!(post_scan_gates(Some("failed"), false, false).block_on_fail_applies);
-        // A failed rescan on top of an older completed scan still trips
-        // block_on_fail, and severity now ALSO evaluates against the completed
-        // scan's findings rather than being skipped — strictly safer.
-        let gates = post_scan_gates(Some("failed"), true, false);
-        assert!(gates.block_on_fail_applies);
+    fn test_block_on_fail_fires_when_any_scanner_failed_3142() {
+        assert!(
+            post_scan_gates(true, false, false).block_on_fail_applies,
+            "a failed scanner with no completed scan must trip block_on_fail"
+        );
+
+        // A crashed scanner alongside a completed one still trips the gate, and
+        // severity ALSO evaluates against the completed scan's findings rather
+        // than being skipped. This is the #3142 shape: pre-fix the completed
+        // row won the single global newest-row lookup and the gate went quiet.
+        let gates = post_scan_gates(true, true, false);
+        assert!(
+            gates.block_on_fail_applies,
+            "a clean scan by another engine must NOT mask a crashed scanner"
+        );
         assert!(
             gates.severity_applies,
             "a crashed rescan must not clear an artifact's finding history"
         );
-        assert!(!post_scan_gates(Some("completed"), true, false).block_on_fail_applies);
+
+        // Positive control for the inverse: with no failed scanner the gate
+        // stays quiet, so the assertions above cannot pass by blocking
+        // unconditionally.
         assert!(
-            !post_scan_gates(None, false, false).block_on_fail_applies,
+            !post_scan_gates(false, true, false).block_on_fail_applies,
+            "all scanners healthy -> block_on_fail must not fire"
+        );
+        assert!(
+            !post_scan_gates(false, false, false).block_on_fail_applies,
             "an artifact with no scan rows has nothing to fail"
         );
     }
@@ -789,6 +836,242 @@ mod tests {
         };
         assert!(!result.allowed);
         assert_eq!(result.violations.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3142: block_on_fail across multiple scan engines (end-to-end vs Postgres)
+    // -----------------------------------------------------------------------
+
+    /// Seed a `scan_results` row. Mirrors the production writers: both
+    /// `complete_scan` and `fail_scan` stamp `completed_at`, while
+    /// `pending`/`running` rows leave it NULL.
+    #[cfg(test)]
+    async fn seed_scan_3142(
+        pool: &PgPool,
+        artifact_id: Uuid,
+        repo_id: Uuid,
+        scan_type: &str,
+        status: &str,
+        age_seconds: i64,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (
+                id, artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                completed_at, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, 0, 0, 0, 0, 0, 0,
+                    CASE WHEN $5 IN ('completed', 'failed', 'not_applicable')
+                         THEN NOW() - make_interval(secs => $6::double precision)
+                    END,
+                    NOW() - make_interval(secs => $6::double precision))
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(artifact_id)
+        .bind(repo_id)
+        .bind(scan_type)
+        .bind(status)
+        .bind(age_seconds as f64)
+        .execute(pool)
+        .await
+        .expect("insert scan_result");
+    }
+
+    /// End-to-end regression test for the `block_on_fail` fail-open (#3142).
+    ///
+    /// Drives the real `evaluate_artifact` against Postgres, because the bug
+    /// lived in the SQL that feeds the gate, not in the pure helper — the
+    /// pre-existing pure tests passed with the defect in place.
+    ///
+    /// Shape: scanner A (`dependency`) crashes, scanner B (`grype`) then completes
+    /// clean. Pre-fix the single `ORDER BY created_at DESC LIMIT 1` across all
+    /// scan_types read `completed`, `block_on_fail` never fired, and because
+    /// `classify_scan_state` is any-completed-wins `block_unscanned` stayed
+    /// quiet too — the artifact was served as fully vetted.
+    #[tokio::test]
+    async fn test_block_on_fail_spans_all_scanners_3142() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        // block_unscanned OFF and max_severity at 'critical' with zero findings
+        // anywhere, so block_on_fail is provably the ONLY gate that can block.
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', false, true, true)",
+        )
+        .bind(format!("gate-3142-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert block_on_fail policy");
+
+        let svc = PolicyService::new(fx.pool.clone());
+
+        // (1) THE BUG: `dependency` crashed, `grype` then completed clean and newer.
+        let masked = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "com/example/masked/1.0/masked-1.0.jar",
+            "com/example/masked/1.0/masked-1.0.jar",
+            "masked",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+        seed_scan_3142(&fx.pool, masked, fx.repo_id, "dependency", "failed", 3600).await;
+        seed_scan_3142(&fx.pool, masked, fx.repo_id, "grype", "completed", 60).await;
+        let masked_result = svc.evaluate_artifact(masked, fx.repo_id).await;
+
+        // (2) Positive control that the gate works at all: only a failed row.
+        let lone_fail = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "com/example/lonefail/1.0/lonefail-1.0.jar",
+            "com/example/lonefail/1.0/lonefail-1.0.jar",
+            "lonefail",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+        seed_scan_3142(
+            &fx.pool,
+            lone_fail,
+            fx.repo_id,
+            "dependency",
+            "failed",
+            3600,
+        )
+        .await;
+        let lone_fail_result = svc.evaluate_artifact(lone_fail, fx.repo_id).await;
+
+        // (3) Negative control — must NOT over-block: both engines clean.
+        let clean = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "com/example/clean/1.0/clean-1.0.jar",
+            "com/example/clean/1.0/clean-1.0.jar",
+            "clean",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+        seed_scan_3142(&fx.pool, clean, fx.repo_id, "dependency", "completed", 3600).await;
+        seed_scan_3142(&fx.pool, clean, fx.repo_id, "grype", "completed", 60).await;
+        let clean_result = svc.evaluate_artifact(clean, fx.repo_id).await;
+
+        // (4) Negative control — a genuine RESCAN by the SAME engine that
+        // succeeds must still clear the earlier failure. This is what keys the
+        // window per scan_type rather than simply "any failed row ever".
+        let rescanned = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "com/example/rescan/1.0/rescan-1.0.jar",
+            "com/example/rescan/1.0/rescan-1.0.jar",
+            "rescan",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+        seed_scan_3142(
+            &fx.pool,
+            rescanned,
+            fx.repo_id,
+            "dependency",
+            "failed",
+            3600,
+        )
+        .await;
+        seed_scan_3142(
+            &fx.pool,
+            rescanned,
+            fx.repo_id,
+            "dependency",
+            "completed",
+            60,
+        )
+        .await;
+        let rescanned_result = svc.evaluate_artifact(rescanned, fx.repo_id).await;
+
+        // (5) Negative control — a scanner that does not apply to the format is
+        // not a crash. Without the `is_not_applicable` exclusion, widening the
+        // gate to "any scanner" would block every artifact in every repo where
+        // an enabled engine simply does not apply.
+        let na = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "com/example/na/1.0/na-1.0.jar",
+            "com/example/na/1.0/na-1.0.jar",
+            "na",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+        seed_scan_3142(&fx.pool, na, fx.repo_id, "dependency", "completed", 3600).await;
+        seed_scan_3142(&fx.pool, na, fx.repo_id, "openscap", "not_applicable", 60).await;
+        let na_result = svc.evaluate_artifact(na, fx.repo_id).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        let masked_result = masked_result.expect("evaluate masked");
+        assert!(
+            !masked_result.allowed,
+            "#3142: a crashed `dependency` scan masked by a later clean `grype` scan must still \
+             trip block_on_fail, got allowed={} violations={:?}",
+            masked_result.allowed, masked_result.violations
+        );
+
+        let lone_fail_result = lone_fail_result.expect("evaluate lone_fail");
+        assert!(
+            !lone_fail_result.allowed,
+            "positive control: a lone failed scan must trip block_on_fail"
+        );
+
+        let clean_result = clean_result.expect("evaluate clean");
+        assert!(
+            clean_result.allowed,
+            "negative control: two clean scans must download, got violations={:?}",
+            clean_result.violations
+        );
+
+        let rescanned_result = rescanned_result.expect("evaluate rescanned");
+        assert!(
+            rescanned_result.allowed,
+            "negative control: a successful rescan by the SAME engine must clear its earlier \
+             failure, got violations={:?}",
+            rescanned_result.violations
+        );
+
+        let na_result = na_result.expect("evaluate not-applicable");
+        assert!(
+            na_result.allowed,
+            "negative control: a scanner that does not apply to the format is not a crash, \
+             got violations={:?}",
+            na_result.violations
+        );
     }
 
     #[test]

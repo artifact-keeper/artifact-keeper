@@ -1294,9 +1294,41 @@ impl CacheStore {
                                 cache_key = %cache_key,
                                 pinned_etag = %pinned,
                                 current_etag = %current,
-                                "proxy cache multipart ETag mismatch on fast-path revalidation; falling back to existence check (#2120)"
+                                "proxy cache multipart ETag mismatch on fast-path revalidation; falling back to length check (#2120/#3147)"
                             );
-                            return matches!(self.storage.exists(cache_key).await, Ok(true));
+                            // #3147: the fallback used to be a bare
+                            // `exists()`, which is true for an object that was
+                            // written and then rejected, for a half-published
+                            // entry, and for anything written to the bucket
+                            // out-of-band. A `true` from here authorizes the
+                            // caller to hand out a presigned 302 pointing
+                            // straight at those bytes, with nothing left in the
+                            // request path to re-verify them.
+                            //
+                            // The sidecar records the exact length of the
+                            // object it vouches for, so require that instead.
+                            // #2120's tolerance is preserved in full — a
+                            // multipart mismatch is still inconclusive and
+                            // still does not force the slow path — but the
+                            // object now has to be the one the sidecar
+                            // describes, which is also what the caller's own
+                            // `Content-Length` already claims it is.
+                            return match self.storage.size(cache_key).await {
+                                Ok(len) => len == metadata.size_bytes as u64,
+                                Err(e) => {
+                                    // Includes NotFound (object gone). Not
+                                    // fresh: the slow path re-fetches and
+                                    // self-heals, which is strictly safer than
+                                    // presigning a URL for an object we could
+                                    // not measure.
+                                    tracing::debug!(
+                                        cache_key = %cache_key,
+                                        error = %e,
+                                        "proxy cache size probe failed during multipart fallback; treating as not fresh"
+                                    );
+                                    false
+                                }
+                            };
                         }
                         tracing::warn!(
                             cache_key = %cache_key,
@@ -3744,24 +3776,81 @@ impl ProxyService {
             return Err(upstream_err);
         }
 
-        // Transient failure: serve the stale body if we still hold one. The
-        // sidecar (if present) carries the content-type / size for the headers;
-        // a missing sidecar falls back to no content-type and an unknown length.
+        // Transient failure: serve the stale body, but ONLY when a valid
+        // positive sidecar still vouches for it (#3147).
+        //
+        // This used to open the body FIRST and then load the sidecar
+        // best-effort, with `unwrap_or(None)` collapsing "absent" and
+        // "unreadable" into "serve it anyway with unknown headers". That made
+        // this reader the reason a rejected proxy-cache write could not protect
+        // itself by merely skipping the sidecar — it also had to delete the
+        // object, because anything sitting on the content key was servable
+        // through here.
+        //
+        // Gating on the sidecar does not weaken stale-if-error, whose purpose
+        // is to serve something when upstream is down. Every successful cache
+        // write publishes body-then-sidecar, so a legitimately cached entry
+        // always has one, and RFC 5861's whole point — ignore TTL here — is
+        // untouched: `expires_at` is still not consulted. What stops being
+        // servable is an object that NOTHING vouches for, which by construction
+        // is a write that was rejected (empty / truncated / over-quota), an
+        // entry left half-published by a crash between the two writes, or an
+        // out-of-band write to the bucket. None of those are cache entries this
+        // server ever committed.
+        let metadata = match self.load_cache_metadata(metadata_key).await {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => {
+                tracing::warn!(
+                    cache_key = %cache_key,
+                    error = %upstream_err,
+                    "streaming upstream fetch failed and the cached object has no metadata \
+                     sidecar vouching for it; refusing to serve it (stale-if-error, #3147)"
+                );
+                return Err(upstream_err);
+            }
+            Err(e) => {
+                // "Unreadable" tells us nothing about the object, so it cannot
+                // be treated as "no objection, serve it".
+                tracing::warn!(
+                    cache_key = %cache_key,
+                    error = %e,
+                    "streaming upstream fetch failed and the cache metadata sidecar is \
+                     unreadable; refusing to serve the cached object (stale-if-error, #3147)"
+                );
+                return Err(upstream_err);
+            }
+        };
+
+        // A negative-cache marker (#1611) records an upstream 404. It vouches
+        // for no body at all — `size_bytes` is 0 and `checksum_sha256` is empty
+        // — so a body surviving underneath one must not be served.
+        if metadata.negative_cached_until.is_some() {
+            tracing::warn!(
+                cache_key = %cache_key,
+                "streaming upstream fetch failed and the cache entry is a negative-cache \
+                 marker; refusing to serve the leftover body (stale-if-error, #3147)"
+            );
+            return Err(upstream_err);
+        }
+
+        // Package Age Policy (#1770 / #2075): the fresh hit path and the
+        // `ServeStaleIfError` revalidation arm both apply this before streaming
+        // a cached body. Applying it here too stops a held entry being handed
+        // out precisely because upstream happened to be unreachable.
+        check_quarantine_until(metadata.quarantine_until)?;
+
         if let Ok(body) = self.storage.get_stream(cache_key).await {
-            let metadata = self.load_cache_metadata(metadata_key).await.unwrap_or(None);
             tracing::warn!(
                 cache_key = %cache_key,
                 error = %upstream_err,
                 "streaming upstream fetch failed; serving stale cached copy (stale-if-error)"
             );
             let headers = StreamHeaders {
-                content_type: metadata.as_ref().and_then(|m| m.content_type.clone()),
-                content_length: metadata.as_ref().map(|m| m.size_bytes as u64),
-                etag: metadata.as_ref().and_then(|m| m.upstream_etag.clone()),
-                content_encoding: metadata.as_ref().and_then(|m| m.content_encoding.clone()),
-                commit_sha: metadata
-                    .as_ref()
-                    .and_then(|m| m.upstream_commit_sha.clone()),
+                content_type: metadata.content_type.clone(),
+                content_length: Some(metadata.size_bytes as u64),
+                etag: metadata.upstream_etag.clone(),
+                content_encoding: metadata.content_encoding.clone(),
+                commit_sha: metadata.upstream_commit_sha.clone(),
             };
             return Ok(StreamHandle { body, headers });
         }
@@ -7713,24 +7802,38 @@ mod tests {
     /// Lets each test wire up just enough behavior:
     ///   * `metadata` is the JSON bytes returned by `get(metadata_key)`,
     ///     or `None` to simulate a missing sidecar (`AppError::NotFound`).
-    ///   * `content_exists` is what `exists(content_key)` returns.
+    ///   * `content_exists` is what `exists(content_key)` returns, and
+    ///     whether `size(content_key)` resolves at all.
+    ///   * `content_len` is the byte length `size(content_key)` reports when
+    ///     the object exists. It defaults to the `size_bytes` recorded by
+    ///     [`fresh_metadata_bytes`] so "object present" means "object present
+    ///     AND as long as the sidecar says", which is what the #3147
+    ///     multipart-fallback gate checks. Tests that need a leaked /
+    ///     truncated object set it explicitly.
     ///   * `head_etag_value` is what `head_etag(content_key)` returns;
     ///     `Some(Ok(...))` returns the inner result, `None` returns
     ///     `Ok(None)`. Used by #1051 revalidation tests to drive
     ///     match / mismatch / error / missing paths.
     ///   * `get_calls` records every `get(...)` call so tests can assert
     ///     the body was never downloaded.
-    ///   * `exists_calls` / `head_etag_calls` let revalidation tests
-    ///     verify that the ETag fast-path short-circuits the redundant
-    ///     `exists()` call.
+    ///   * `exists_calls` / `size_calls` / `head_etag_calls` let revalidation
+    ///     tests verify that the ETag fast-path short-circuits the redundant
+    ///     object probe.
     struct CacheFreshMock {
         metadata: Option<Bytes>,
         content_exists: bool,
+        content_len: u64,
         head_etag_value: HeadEtagBehavior,
         get_calls: AtomicUsize,
         exists_calls: AtomicUsize,
+        size_calls: AtomicUsize,
         head_etag_calls: AtomicUsize,
     }
+
+    /// `size_bytes` recorded by [`fresh_metadata_bytes`]; the default object
+    /// length for [`CacheFreshMock`] so a "present" object agrees with its
+    /// sidecar unless a test deliberately makes it disagree.
+    const FRESH_METADATA_SIZE_BYTES: u64 = 42;
 
     /// What the mock's `head_etag` should return per call. Variant
     /// names deliberately avoid `None` / `Some` / `Err` so callsite
@@ -7757,12 +7860,31 @@ mod tests {
             content_exists: bool,
             head_etag_value: HeadEtagBehavior,
         ) -> Self {
+            Self::with_head_etag_and_len(
+                metadata,
+                content_exists,
+                FRESH_METADATA_SIZE_BYTES,
+                head_etag_value,
+            )
+        }
+
+        /// As [`Self::with_head_etag`] but with an explicit stored-object
+        /// length, so a test can model an object that is present yet does not
+        /// match the length its sidecar recorded (#3147).
+        fn with_head_etag_and_len(
+            metadata: Option<Bytes>,
+            content_exists: bool,
+            content_len: u64,
+            head_etag_value: HeadEtagBehavior,
+        ) -> Self {
             Self {
                 metadata,
                 content_exists,
+                content_len,
                 head_etag_value,
                 get_calls: AtomicUsize::new(0),
                 exists_calls: AtomicUsize::new(0),
+                size_calls: AtomicUsize::new(0),
                 head_etag_calls: AtomicUsize::new(0),
             }
         }
@@ -7815,8 +7937,19 @@ mod tests {
         async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
             Ok(())
         }
-        async fn size(&self, _key: &str) -> Result<u64> {
-            Ok(0)
+        async fn size(&self, key: &str) -> Result<u64> {
+            self.size_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if key.ends_with("__content__") {
+                if self.content_exists {
+                    Ok(self.content_len)
+                } else {
+                    Err(AppError::NotFound(key.to_string()))
+                }
+            } else if self.metadata.is_some() {
+                Ok(0)
+            } else {
+                Err(AppError::NotFound(key.to_string()))
+            }
         }
     }
 
@@ -8284,8 +8417,10 @@ mod tests {
     async fn test_is_cache_fresh_true_when_multipart_pin_vs_singlepart_current_and_present() {
         // Pinned ETag is multipart-shaped; current HEAD returns a different,
         // single-part value. Because the pin is multipart the mismatch is
-        // inconclusive and we fall back to an existence check — object present
-        // → fresh (no thrash). #2120.
+        // inconclusive and we fall back to a length check against the sidecar
+        // — object present AND the length the sidecar recorded → fresh (no
+        // thrash). #2120, with the #3147 fallback strengthened from `exists()`
+        // to a length match; the anti-thrash guarantee is unchanged.
         let mock = Arc::new(CacheFreshMock::with_head_etag(
             Some(fresh_metadata_bytes_with_storage_etag(Some(
                 "\"d41d8cd98f00b204e9800998ecf8427e-4\"".to_string(),
@@ -8307,9 +8442,15 @@ mod tests {
             "still HEADs exactly once"
         );
         assert_eq!(
-            mock.exists_calls.load(AtomicOrdering::SeqCst),
+            mock.size_calls.load(AtomicOrdering::SeqCst),
             1,
-            "multipart mismatch path falls back to a single exists() probe"
+            "multipart mismatch path falls back to a single object-length probe"
+        );
+        assert_eq!(
+            mock.exists_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "the length probe replaces the bare exists() check (#3147); a size() \
+             that resolves already proves existence"
         );
     }
 
@@ -8353,6 +8494,47 @@ mod tests {
         assert!(
             !fresh,
             "multipart mismatch with missing content must still yield not-fresh"
+        );
+    }
+
+    /// #3147 reader 3: the multipart-ETag fallback must not accept a bare
+    /// "an object is there".
+    ///
+    /// #2120 correctly decided that a multipart-vs-multipart ETag mismatch is
+    /// *inconclusive* — two replicas re-uploading byte-identical content mint
+    /// different multipart ETags — and must not force the slow path. But the
+    /// fallback it chose was `exists()`, which is true for an object that was
+    /// written and then rejected (empty / truncated / over-quota), for a
+    /// half-published entry, and for anything written to the bucket
+    /// out-of-band. `is_cache_fresh` returning `true` is what authorizes the
+    /// caller to hand the client a presigned 302 straight at those bytes, with
+    /// nothing left in the path to re-verify them.
+    ///
+    /// The sidecar records the exact length of the object it vouches for, so
+    /// require that instead: same "mismatch is inconclusive" tolerance, but
+    /// the object has to actually be the one the sidecar describes.
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_multipart_mismatch_and_object_length_disagrees() {
+        let mock = Arc::new(CacheFreshMock::with_head_etag_and_len(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"d41d8cd98f00b204e9800998ecf8427e-4\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            // Sidecar says 42 bytes; the object on the key is empty — exactly
+            // what a rejected streaming write used to leave behind.
+            /* content_len = */
+            0,
+            HeadEtagBehavior::Present("\"d41d8cd98f00b204e9800998ecf8427e-7\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "an object whose length disagrees with its sidecar must NOT be \
+             reported fresh: the caller turns `true` into a presigned 302 and \
+             nothing downstream re-verifies the bytes (#3147)"
         );
     }
 
@@ -9236,6 +9418,330 @@ mod tests {
             "a prior positive body MUST be dropped when the negative marker is \
              written, otherwise a read can serve it alongside the marker"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3147: proxy-cache READS that reach `__content__` without the sidecar.
+    //
+    // The cache's safety model assumes readers gate on `__cache_meta__.json`,
+    // which is why a rejected write can protect itself by simply not writing
+    // one. `handle_streaming_leader_upstream_error` broke that assumption: it
+    // opened the body FIRST and then loaded the sidecar best-effort, with
+    // `unwrap_or(None)` collapsing "absent" and "unreadable" into "serve it
+    // anyway with unknown headers". That is why the reject arms also had to
+    // DELETE the object — the sidecar skip alone was not protection.
+    //
+    // #3153 made the streaming WRITE path publish through a private staging
+    // key, so `tee_stream` itself can no longer strand an unvalidated object on
+    // the live key. These tests cover the READ side, which still has to hold
+    // for objects that reach the live key another way: the >5 GiB
+    // `S3Backend::copy` restream carve-out #3153 documents, a crash between
+    // the body write and the sidecar write, or any out-of-band write to the
+    // bucket.
+    // -----------------------------------------------------------------------
+
+    /// Storage double with real object semantics: `get` / `get_stream` /
+    /// `exists` / `size` are backed by an actual key -> bytes map.
+    ///
+    /// `TeeRecordingBackend::get()` returns `NotFound` unconditionally, which
+    /// is precisely why the tee test module cannot express "the object is
+    /// present but the sidecar is not" — the shape of every #3147 leak.
+    struct CacheObjectBackend {
+        objects: tokio::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+        /// Keys whose reads fail with a non-`NotFound` (transport) error,
+        /// modelling an unreadable sidecar rather than an absent one.
+        unreadable: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl CacheObjectBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                objects: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                unreadable: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            })
+        }
+
+        async fn put_object(&self, key: &str, bytes: &'static [u8]) {
+            self.objects
+                .lock()
+                .await
+                .insert(key.to_string(), Bytes::from_static(bytes));
+        }
+
+        async fn put_sidecar(&self, key: &str, metadata: &CacheMetadata) {
+            self.objects.lock().await.insert(
+                key.to_string(),
+                Bytes::from(serde_json::to_vec(metadata).unwrap()),
+            );
+        }
+
+        async fn make_unreadable(&self, key: &str) {
+            self.unreadable.lock().await.insert(key.to_string());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceStorageBackend for CacheObjectBackend {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.objects.lock().await.insert(key.to_string(), content);
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            if self.unreadable.lock().await.contains(key) {
+                return Err(AppError::Storage(format!(
+                    "simulated read failure on {key}"
+                )));
+            }
+            self.objects
+                .lock()
+                .await
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            Ok(self.objects.lock().await.contains_key(key))
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.objects.lock().await.remove(key);
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, key: &str) -> Result<u64> {
+            self.objects
+                .lock()
+                .await
+                .get(key)
+                .map(|b| b.len() as u64)
+                .ok_or_else(|| AppError::NotFound(key.to_string()))
+        }
+    }
+
+    /// Drain a stream handle's body into bytes.
+    async fn drain_body(body: BoxStream<'static, Result<Bytes>>) -> Vec<u8> {
+        let mut body = body;
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            out.extend_from_slice(&chunk.expect("body chunk"));
+        }
+        out
+    }
+
+    /// Run the stale-if-error arm and return whatever bytes it served, or
+    /// `None` when it refused and propagated the upstream error.
+    ///
+    /// `slug` gives each test its own cache coordinate: `load_cache_metadata`
+    /// reads through the process-global `PROXY_METADATA_LRU`, so tests that
+    /// shared a metadata key would contaminate each other.
+    async fn serve_stale_if_error(
+        backend: Arc<CacheObjectBackend>,
+        slug: &str,
+    ) -> std::result::Result<Vec<u8>, AppError> {
+        let content_key = format!("proxy-cache/npm-proxy/{slug}/__content__");
+        let metadata_key = format!("proxy-cache/npm-proxy/{slug}/__cache_meta__.json");
+        let proxy = build_proxy_service_with_storage(backend);
+        match proxy
+            .handle_streaming_leader_upstream_error(
+                slug,
+                &content_key,
+                &metadata_key,
+                // A transient upstream failure — the only class that reaches
+                // the stale-if-error arm (a 404 negative-caches instead).
+                AppError::BadGateway("upstream 502".to_string()),
+            )
+            .await
+        {
+            Ok(handle) => Ok(drain_body(handle.body).await),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Build a positive sidecar for a body of `size_bytes`, already past its
+    /// TTL — the normal state of an entry that reaches stale-if-error.
+    fn stale_positive_sidecar(size_bytes: i64) -> CacheMetadata {
+        CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at: Utc::now() - chrono::Duration::hours(2),
+            upstream_etag: Some("\"upstream-etag\"".to_string()),
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+            content_type: Some("application/gzip".to_string()),
+            size_bytes,
+            checksum_sha256: "b".repeat(64),
+        }
+    }
+
+    /// #3147 reader 1, the reproduction: an object on the live content key
+    /// with NO sidecar is served verbatim when upstream fails.
+    ///
+    /// Nothing else in the request path re-verifies it — `open_cached_stream`
+    /// is not involved, `CacheStore::get`'s SHA-256 check is not involved, and
+    /// the response goes out with whatever headers can be guessed.
+    #[tokio::test]
+    async fn test_stale_if_error_refuses_a_body_with_no_sidecar() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object(
+                "proxy-cache/npm-proxy/3147-no-sidecar/__content__",
+                b"UNVALIDATED-BYTES",
+            )
+            .await;
+        // Deliberately no sidecar at the metadata key.
+
+        let served = serve_stale_if_error(backend, "3147-no-sidecar").await;
+
+        match served {
+            Err(AppError::BadGateway(_)) => {}
+            Err(other) => panic!("expected the upstream error to propagate, got {other:?}"),
+            Ok(bytes) => panic!(
+                "stale-if-error served {} bytes off the content key with NO sidecar \
+                 vouching for them: {:?} (#3147)",
+                bytes.len(),
+                String::from_utf8_lossy(&bytes)
+            ),
+        }
+    }
+
+    /// Same leak, reached through the OTHER half of `unwrap_or(None)`: the
+    /// sidecar exists but cannot be read. "Unreadable" is not "no hold, serve
+    /// it" — we know nothing about the object, so we must not serve it.
+    #[tokio::test]
+    async fn test_stale_if_error_refuses_a_body_whose_sidecar_is_unreadable() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object(
+                "proxy-cache/npm-proxy/3147-unreadable/__content__",
+                b"UNVALIDATED-BYTES",
+            )
+            .await;
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/3147-unreadable/__cache_meta__.json",
+                &stale_positive_sidecar(17),
+            )
+            .await;
+        backend
+            .make_unreadable("proxy-cache/npm-proxy/3147-unreadable/__cache_meta__.json")
+            .await;
+
+        let served = serve_stale_if_error(backend, "3147-unreadable").await;
+
+        match served {
+            Err(AppError::BadGateway(_)) => {}
+            Err(other) => panic!("expected the upstream error to propagate, got {other:?}"),
+            Ok(bytes) => panic!(
+                "stale-if-error served {} bytes while its sidecar was unreadable (#3147)",
+                bytes.len()
+            ),
+        }
+    }
+
+    /// POSITIVE CONTROL for the two guards above, and the whole reason
+    /// stale-if-error exists: when upstream is down and we DO hold a
+    /// legitimately-cached body, we must still serve it.
+    ///
+    /// This is what makes the guard a gate rather than a removal. Every
+    /// successful cache write publishes body-then-sidecar, so a real cache
+    /// entry always has one; RFC 5861 explicitly ignores TTL here, so the
+    /// sidecar being long expired must not matter. Without this test,
+    /// replacing the stale arm with a bare `Err(upstream_err)` would pass.
+    #[tokio::test]
+    async fn test_stale_if_error_still_serves_a_body_with_a_valid_sidecar() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object(
+                "proxy-cache/npm-proxy/3147-valid/__content__",
+                b"STALE-BUT-REAL",
+            )
+            .await;
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/3147-valid/__cache_meta__.json",
+                &stale_positive_sidecar(14),
+            )
+            .await;
+
+        let served = serve_stale_if_error(backend, "3147-valid")
+            .await
+            .expect("stale-if-error MUST still serve a body its sidecar vouches for");
+
+        assert_eq!(
+            served, b"STALE-BUT-REAL",
+            "an expired-but-real cache entry is exactly what stale-if-error is for"
+        );
+    }
+
+    /// A negative-cache marker (#1611) records an upstream 404 and vouches for
+    /// no body at all — its `size_bytes` is 0 and its `checksum_sha256` is
+    /// empty. Requiring "a sidecar" without requiring a POSITIVE one would let
+    /// a surviving body be served underneath a marker that says the artifact
+    /// does not exist upstream, with `Content-Length: 0` headers.
+    #[tokio::test]
+    async fn test_stale_if_error_refuses_a_body_under_a_negative_cache_marker() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object(
+                "proxy-cache/npm-proxy/3147-negative/__content__",
+                b"LEFTOVER-BYTES",
+            )
+            .await;
+        let mut marker = stale_positive_sidecar(0);
+        marker.negative_cached_until = Some(Utc::now() + chrono::Duration::minutes(5));
+        marker.checksum_sha256 = String::new();
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/3147-negative/__cache_meta__.json",
+                &marker,
+            )
+            .await;
+
+        let served = serve_stale_if_error(backend, "3147-negative").await;
+
+        match served {
+            Err(AppError::BadGateway(_)) => {}
+            Err(other) => panic!("expected the upstream error to propagate, got {other:?}"),
+            Ok(bytes) => panic!(
+                "stale-if-error served {} bytes under a negative-cache marker (#3147)",
+                bytes.len()
+            ),
+        }
+    }
+
+    /// Package Age Policy parity (#1770 / #2075). The fresh hit path and the
+    /// `ServeStaleIfError` revalidation arm both run `check_quarantine_until`
+    /// before streaming a cached body; this arm did not, so a held entry was
+    /// handed out precisely when upstream happened to be unreachable.
+    #[tokio::test]
+    async fn test_stale_if_error_respects_an_active_package_age_hold() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object("proxy-cache/npm-proxy/3147-held/__content__", b"HELD-BYTES")
+            .await;
+        let mut held = stale_positive_sidecar(10);
+        held.quarantine_until = Some(Utc::now() + chrono::Duration::hours(6));
+        backend
+            .put_sidecar("proxy-cache/npm-proxy/3147-held/__cache_meta__.json", &held)
+            .await;
+
+        let served = serve_stale_if_error(backend, "3147-held").await;
+
+        match served {
+            Err(AppError::Conflict(_)) | Err(AppError::Authorization(_)) => {}
+            Err(other) => panic!("expected the age-policy hold to surface, got {other:?}"),
+            Ok(bytes) => panic!(
+                "stale-if-error handed out {} bytes of a held entry (#1770/#3147)",
+                bytes.len()
+            ),
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -1441,12 +1441,18 @@ impl ArtifactService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
-        // Check quarantine status before serving the artifact
-        crate::services::quarantine_service::check_download_allowed(
-            artifact.quarantine_status.as_deref(),
-            artifact.quarantine_until,
-            chrono::Utc::now(),
-        )?;
+        // Enforce quarantine AND the repository's scan policy before serving.
+        //
+        // #3143: this called the raw `check_download_allowed` predicate, which
+        // is quarantine only — so `block_unscanned` / `block_on_fail` /
+        // `max_severity` were skipped on both the buffered (`download`) and
+        // streaming (`download_stream`) generic paths, unlike the per-format
+        // handlers that go through `enforce_download_gate`. Routing through the
+        // shared choke point (#2954) makes the scan policy apply here too.
+        //
+        // A repo with no enabled scan policy is unaffected: `evaluate_artifact`
+        // returns `allowed` when no policy matches.
+        crate::services::quarantine_service::enforce_download_gate(&self.db, artifact.id).await?;
 
         // Trigger BeforeDownload hooks - validators can reject the download
         let artifact_info = ArtifactInfo::from(&artifact);
