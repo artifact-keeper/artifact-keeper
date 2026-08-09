@@ -1253,9 +1253,27 @@ jobs:
         run: docker compose -f docker-compose.test.yml --profile smoke down -v --remove-orphans
 
   # ════════════════════════════════════════════════════════════════════════════
-  # CONTAINER BUILDS (PR only, path-filtered, parallel)
+  # CONTAINER BUILDS (push + PR, path-filtered, parallel)
   # ════════════════════════════════════════════════════════════════════════════
 
+  # Until #3166 this job carried `if: github.event_name == 'push'`, while the
+  # section header above claimed "PR only". The header was the aspiration and
+  # the `if` was the behaviour, so the whole chain hanging off this job --
+  # `build-backend-image`, `build-openscap-image`, and `smoke-e2e` via the
+  # image -- never ran on a pull request. All three reported `skipped`, and
+  # `ci-complete`'s `allow_skip` passes a skip, so a PR could break the
+  # container build or the smoke suite and still show green; the breakage
+  # surfaced only after merge, on a `main` push that blocks nothing. Same
+  # failure mode as #3124/#3165, different jobs.
+  #
+  # `dorny/paths-filter` supports `pull_request` natively -- it reads the
+  # changed-file list from the API (hence `pull-requests: read`) rather than
+  # from git history -- so dropping the `if` is the whole fix. Push behaviour
+  # is unchanged: the same filters, evaluated the same way.
+  #
+  # The PR arm is deliberately ADVISORY in `ci-complete` rather than blocking.
+  # See the container-chain block there for the measured reasoning and the
+  # criteria for promoting it to blocking.
   detect-changes:
     name: 🔍 Detect Changes
     runs-on: ubuntu-latest
@@ -1263,7 +1281,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    if: github.event_name == 'push'
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       openscap: ${{ steps.filter.outputs.openscap }}
@@ -1275,10 +1292,19 @@ jobs:
           filters: |
             backend:
               - 'docker/Dockerfile.backend'
+              # Covers backend/src/**, backend/migrations/** and
+              # backend/.sqlx/** (the crate-local query cache; the root
+              # '.sqlx/**' below is the workspace one).
               - 'backend/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.sqlx/**'
+              # So a change to this gate exercises the gate -- the same
+              # reasoning the `changes` job states for its own backend arm.
+              # Without this, a ci.yml-only PR (this one included) leaves the
+              # entire container chain skipped, which is precisely how #3166
+              # went unnoticed: the jobs were never observed NOT running.
+              - '.github/workflows/ci.yml'
             openscap:
               - 'docker/Dockerfile.openscap'
               - 'scripts/openscap-wrapper.py'
@@ -1479,6 +1505,16 @@ jobs:
           # Conditionally-required jobs are legitimately skipped in some events
           # (no backend changes, PR-only skips). A skip passes, but a failure or
           # cancellation fails so an aborted upstream job is never masked.
+          #
+          # #3166 asked, for every allow_skip call site: can this job be skipped
+          # for a reason that should NOT pass? Current answers:
+          #   - integration-tests: YES, and that is handled below (#3124) --
+          #     on a backend-touching PR a skip is a hard failure.
+          #   - smoke-e2e / build-backend-image / build-openscap-image: the
+          #     skip itself is legitimate (nothing container-shaped changed).
+          #     The bug was never the skip semantics; it was that the jobs had
+          #     no way to run on a PR at all. #3166 fixes that in
+          #     `detect-changes`.
           allow_skip() {
             local name="$1" result="$2"
             if [[ "$result" == "success" ]]; then
@@ -1491,12 +1527,25 @@ jobs:
             fi
           }
 
+          # Reports a real result without blocking. Distinct from allow_skip:
+          # a failure is surfaced loudly in the summary but does not set
+          # `failed`. Used only for the container chain on pull requests.
+          advisory() {
+            local name="$1" result="$2"
+            if [[ "$result" == "success" ]]; then
+              echo "✅ $name" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$result" == "skipped" ]]; then
+              echo "⏭️ $name (skipped)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "⚠️ $name: ${result:-missing} (advisory — not blocking)" \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
           require_success "check-rust" "$RESULT_CHECK_RUST"
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
           require_success "security-audit" "$RESULT_SECURITY"
-
-          allow_skip "smoke-e2e" "$RESULT_SMOKE"
 
           # Integration tests are REQUIRED on a pull request that touches
           # backend code (#3124). A skip there is precisely the hole that let
@@ -1516,8 +1565,54 @@ jobs:
             allow_skip "integration-tests" "$RESULT_INTEGRATION"
           fi
 
-          allow_skip "build-backend-image" "$RESULT_BUILD_BACKEND"
-          allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
+          # Container chain (build-backend-image -> smoke-e2e, plus the
+          # OpenSCAP image). As of #3166 these finally RUN on pull requests.
+          # On a PR they are ADVISORY; on push they keep the blocking
+          # allow_skip semantics they have always had, so nothing about the
+          # `main` signal is weakened.
+          #
+          # Why advisory first, rather than making them required immediately:
+          # `build-backend-image` and `build-openscap-image` run on
+          # `ak-ci-runners`, a self-hosted pool that is already the binding
+          # constraint on this repo's CI. Measured over the last 37 runs of
+          # this workflow, queue wait (job created -> job started) on that
+          # pool is:
+          #
+          #     check-rust                median  66m   p90 316m   max 416m
+          #     coverage                  median  53m   p90 289m   max 453m
+          #     test-backend-unit         median  25m   p90 276m   max 412m
+          #     test-backend-integration  median   0m   p90  74m   max 342m
+          #
+          # The pool already carries check-rust, test-backend-unit, coverage,
+          # test-backend-integration (added to every backend PR by #3165) and
+          # build-windows-dev, and is shared with docker-publish.yml. The
+          # image build itself is not slow -- 14.9m / 14.9m / 17.4m over its
+          # last three successful runs, well inside its 45m timeout, and
+          # smoke-e2e is ~2m on a GitHub-hosted runner -- but adding a ~15m
+          # job to that queue on every backend-touching PR, and then making a
+          # PR unmergeable until it clears a queue whose p90 wait is over five
+          # hours, is how a well-intentioned gate becomes a merge-queue jam.
+          #
+          # Advisory still fixes the reported defect: the jobs run, and a
+          # broken container build or smoke suite is now visible ON THE PR
+          # instead of being discovered after merge. What it does not yet do
+          # is block.
+          #
+          # Promote to blocking by deleting the `pull_request` branch below
+          # (one line) once EITHER holds:
+          #   1. ak-ci-runners p90 queue wait is under ~15m for a sustained
+          #      week, or
+          #   2. build-backend-image moves off ak-ci-runners onto a
+          #      GitHub-hosted runner, where it competes with nothing.
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            advisory "smoke-e2e" "$RESULT_SMOKE"
+            advisory "build-backend-image" "$RESULT_BUILD_BACKEND"
+            advisory "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
+          else
+            allow_skip "smoke-e2e" "$RESULT_SMOKE"
+            allow_skip "build-backend-image" "$RESULT_BUILD_BACKEND"
+            allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
+          fi
 
           # Coverage is non-blocking.
           if [[ "$RESULT_COVERAGE" == "success" ]]; then
