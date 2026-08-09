@@ -1617,7 +1617,7 @@ mod tests {
 
         sqlx::query(
             "UPDATE repositories
-             SET upstream_url = $1, age_gate_enabled = true,
+             SET upstream_url = $1, is_public = true, age_gate_enabled = true,
                  age_gate_mode = $2, age_gate_min_age_days = $3
              WHERE id = $4",
         )
