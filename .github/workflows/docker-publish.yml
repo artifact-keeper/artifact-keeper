@@ -581,18 +581,52 @@ jobs:
           # backend-alpine digest output skipped while alpine builds are suspended.
 
       # --- Trivy CVE scanning ---
-      # These scans ENFORCE (#2609): a CRITICAL or HIGH CVE with an available
-      # fix fails this job, and the merge-* jobs `need` this job, so no tag is
-      # published from a failing scan. The exception paths, in order:
+      # TWO PASSES PER IMAGE (#3122). This is the structure the comments here
+      # have always described; until #3122 it did not actually exist, and the
+      # single combined pass silently gated on every severity.
+      #
+      #   Pass 1 - VISIBILITY: `format: sarif`, `exit-code: '0'`. Never blocks.
+      #     Feeds the GitHub code-scanning Security tab with findings at ALL
+      #     severities. It deliberately declares no `severity:` — trivy-action
+      #     throws that input away for SARIF (see below), so writing one there
+      #     only creates the illusion of a filter.
+      #
+      #   Pass 2 - GATE: `format: 'table'`, `severity: 'CRITICAL,HIGH'`,
+      #     `exit-code: '1'`. This is the control that ENFORCES (#2609): a
+      #     CRITICAL or HIGH CVE with an available fix fails this job, and the
+      #     merge-* jobs `need` this job, so no tag is published from a failing
+      #     scan. Table format is load-bearing, not cosmetic — it is what keeps
+      #     the severity filter alive.
+      #
+      # WHY THE SPLIT (#3122): `aquasecurity/trivy-action` runs
+      # `unset TRIVY_SEVERITY` whenever the format is SARIF and
+      # `limit-severities-for-sarif` is not exactly "true"
+      # (entrypoint.sh:75-83 at the pinned SHA; it logs the giveaway line
+      # "Building SARIF report with all severities"). The old single pass was
+      # SARIF + `severity: CRITICAL,HIGH` + `exit-code: '1'`, so the filter was
+      # discarded and the gate failed on a fixable CVE of ANY severity. #3121
+      # was a LOW (`security-severity: 3.1`) that blocked all publishing from
+      # `main` for days while this file and the step summary both claimed
+      # CRITICAL/HIGH-only. Setting `limit-severities-for-sarif: true` would
+      # also fix the gate, but it truncates the SARIF to CRITICAL/HIGH and
+      # costs the Security-tab view of everything below that. Splitting keeps
+      # full visibility AND an honest gate.
+      # Guarded against regression by scripts/ci/check-trivy-gate-severity.sh.
+      #
+      # The exception paths on the GATE pass, in order:
       #   * --ignore-unfixed: CVEs with no released fix (typically UBI base
-      #     image CVEs that are Red Hat's responsibility) are reported in
-      #     SARIF for visibility but do not block publication.
+      #     image CVEs that are Red Hat's responsibility) do not block
+      #     publication. Note they are filtered out of the SARIF pass too, so
+      #     they are not surfaced in the Security tab either — dropping
+      #     `ignore-unfixed` from pass 1 would surface them, at the cost of a
+      #     large volume of base-image noise. Deliberately left as-is.
       #   * .trivyignore: per-CVE accepted exceptions, each justified in that
       #     file. This is the documented way to unblock a publish while a fix
-      #     is pending.
-      # All three scan steps run to completion (`if: always()` on the later
-      # ones) so a failing image never hides findings in the others, and the
-      # SARIF uploads below also run on failure.
+      #     is pending. Applied to both passes so the Security tab and the gate
+      #     agree on what has been accepted.
+      # All scan steps run to completion (`if: always()`) so a failing image
+      # never hides findings in the others, and the SARIF uploads below also
+      # run on failure.
       # NOTE: trivy binary extracted from official GHCR image because the
       # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
       #
@@ -683,18 +717,21 @@ jobs:
           pull_with_retry "${{ steps.refs.outputs.openscap }}"
           pull_with_retry "${{ steps.refs.outputs.scanner-adapter }}"
 
-      - name: Trivy scan - Backend
+      # ---- Pass 1: SARIF visibility (all severities, never blocks) ----
+
+      - name: Trivy SARIF - Backend
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: ${{ steps.refs.outputs.backend }}
           format: 'sarif'
           output: 'backend-trivy.sarif'
-          severity: 'CRITICAL,HIGH'
+          # No `severity:` here on purpose — trivy-action unsets it for SARIF
+          # (#3122). All severities are reported; the gate pass below filters.
           ignore-unfixed: true
           # Suppress residual CVEs in the bundled trivy/grype CLI binaries that
           # have no fixed tool release yet (justified per-CVE in .trivyignore).
           trivyignores: '.trivyignore'
-          exit-code: '1'
+          exit-code: '0'
           skip-setup-trivy: true
           # DB caching is owned by the explicit steps above.
           cache: 'false'
@@ -702,29 +739,64 @@ jobs:
           # DB was pre-fetched (with retry) above; never download mid-scan.
           TRIVY_SKIP_DB_UPDATE: 'true'
 
-      - name: Trivy scan - OpenSCAP
+      - name: Trivy SARIF - OpenSCAP
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: always()
         with:
           image-ref: ${{ steps.refs.outputs.openscap }}
           format: 'sarif'
           output: 'openscap-trivy.sarif'
-          severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
-          exit-code: '1'
+          exit-code: '0'
           skip-setup-trivy: true
           cache: 'false'
         env:
           TRIVY_SKIP_DB_UPDATE: 'true'
 
-      - name: Trivy scan - Scanner Adapter
+      - name: Trivy SARIF - Scanner Adapter
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: always()
         with:
           image-ref: ${{ steps.refs.outputs.scanner-adapter }}
           format: 'sarif'
           output: 'scanner-adapter-trivy.sarif'
+          ignore-unfixed: true
+          trivyignores: '.trivyignore'
+          exit-code: '0'
+          skip-setup-trivy: true
+          cache: 'false'
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'
+
+      # Alpine scan skipped while alpine builds are suspended.
+      - name: Trivy SARIF - Backend Alpine
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        if: false
+        with:
+          image-ref: ${{ steps.refs.outputs.backend-alpine }}
+          format: 'sarif'
+          output: 'backend-alpine-trivy.sarif'
+          ignore-unfixed: true
+          trivyignores: '.trivyignore'
+          exit-code: '0'
+          skip-setup-trivy: true
+          cache: 'false'
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'
+
+      # ---- Pass 2: the gate (CRITICAL/HIGH, fixed only — blocks publish) ----
+      # `format: 'table'` is what keeps `severity:` alive; do not change it to
+      # sarif without setting `limit-severities-for-sarif: true` (#3122).
+      # Every image is gated with `if: always()` so one blocking image does not
+      # hide another's CRITICAL/HIGH findings.
+
+      - name: Trivy gate - Backend
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        if: always()
+        with:
+          image-ref: ${{ steps.refs.outputs.backend }}
+          format: 'table'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
@@ -734,14 +806,43 @@ jobs:
         env:
           TRIVY_SKIP_DB_UPDATE: 'true'
 
-      # Alpine scan skipped while alpine builds are suspended.
-      - name: Trivy scan - Backend Alpine
+      - name: Trivy gate - OpenSCAP
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        if: always()
+        with:
+          image-ref: ${{ steps.refs.outputs.openscap }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          trivyignores: '.trivyignore'
+          exit-code: '1'
+          skip-setup-trivy: true
+          cache: 'false'
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'
+
+      - name: Trivy gate - Scanner Adapter
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        if: always()
+        with:
+          image-ref: ${{ steps.refs.outputs.scanner-adapter }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          trivyignores: '.trivyignore'
+          exit-code: '1'
+          skip-setup-trivy: true
+          cache: 'false'
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'
+
+      # Alpine gate skipped while alpine builds are suspended.
+      - name: Trivy gate - Backend Alpine
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: false
         with:
           image-ref: ${{ steps.refs.outputs.backend-alpine }}
-          format: 'sarif'
-          output: 'backend-alpine-trivy.sarif'
+          format: 'table'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
@@ -861,7 +962,8 @@ jobs:
           # `exit-code: 1` and every merge-* job `needs` this job, so a
           # CRITICAL/HIGH fixable finding fails the scan and no tag is
           # published. Keep this text and that wiring in sync.
-          echo "- **Scope**: CRITICAL and HIGH severity, fixed CVEs only (\`.trivyignore\` documents accepted exceptions)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Gate scope**: CRITICAL and HIGH severity, fixed CVEs only (\`.trivyignore\` documents accepted exceptions)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Report scope**: the SARIF uploaded to the Security tab carries **all** severities, fixed CVEs only — a LOW/MEDIUM alert there does *not* block publication (#3122)" >> $GITHUB_STEP_SUMMARY
           echo "- **Policy**: enforced — a CRITICAL/HIGH CVE with an available fix fails this job, and the merge jobs depend on it, so publication is blocked" >> $GITHUB_STEP_SUMMARY
           echo "- **Backend**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **OpenSCAP**: $([ -f openscap-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY

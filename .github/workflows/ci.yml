@@ -503,6 +503,15 @@ jobs:
       - name: dtrack-init regression test
         run: bash docker/test-init-dtrack.sh
 
+      # Container CVE gate honesty (#3122): a Trivy step that BLOCKS a publish
+      # must actually apply the severity filter it declares. trivy-action
+      # silently `unset`s TRIVY_SEVERITY when the format is SARIF, which turned
+      # the documented "CRITICAL,HIGH only" gate into one that failed on a
+      # fixable CVE of ANY severity — a LOW blocked all publishing from `main`
+      # for days (#3121). Pure YAML inspection, no network, runs in ~1s.
+      - name: Check Trivy gate severity filter
+        run: ./scripts/ci/check-trivy-gate-severity.sh
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners

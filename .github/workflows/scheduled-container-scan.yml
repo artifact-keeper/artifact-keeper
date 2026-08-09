@@ -47,7 +47,9 @@ jobs:
           image-ref: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
           format: 'sarif'
           output: 'backend-trivy.sarif'
-          severity: 'CRITICAL,HIGH'
+          # No `severity:` — this is a visibility-only scan (exit-code '0') and
+          # trivy-action unsets the severity input for SARIF anyway (#3122).
+          # All severities are reported to the Security tab; nothing is gated.
           ignore-unfixed: true
           # Suppress residual CVEs in the bundled trivy/grype CLI binaries that
           # have no fixed tool release yet (justified per-CVE in .trivyignore).
@@ -62,7 +64,6 @@ jobs:
           image-ref: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:latest
           format: 'sarif'
           output: 'openscap-trivy.sarif'
-          severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
           exit-code: '0'

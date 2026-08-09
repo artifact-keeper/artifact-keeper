@@ -30,10 +30,21 @@
 #   automatically when the tools ship a release rebuilt against the fixed
 #   dependency — re-evaluate this whole file on every scanner bump.
 #
-# * CI scans with `ignore-unfixed: true` and `severity: CRITICAL,HIGH`, so
-#   the genuinely no-fix-available and MEDIUM/LOW entries below already don't
-#   alert; they are listed for completeness so future maintainers see the
-#   full residual set in one place.
+# * The CI publish GATE scans with `ignore-unfixed: true` and
+#   `severity: CRITICAL,HIGH`, so the genuinely no-fix-available and
+#   MEDIUM/LOW entries below do not block a publish; they are listed for
+#   completeness so future maintainers see the full residual set in one place.
+#
+#   Read that as of #3122 only. BEFORE #3122 the gate discarded its severity
+#   filter (trivy-action unsets TRIVY_SEVERITY for SARIF output) and failed on
+#   a fixable CVE of ANY severity, so "MEDIUM/LOW doesn't gate" was NOT true
+#   for most of this file's history — which is why entries accumulated here
+#   that were really just a way to unblock a publish. Anything below justified
+#   solely as "MEDIUM/LOW so it doesn't alert anyway" is now inert for gating
+#   and should be re-evaluated on the next scanner bump rather than inherited.
+#   A separate, non-blocking SARIF pass still reports ALL severities to the
+#   code-scanning Security tab, so an entry removed from here becomes visible
+#   there without gating.
 #
 # Grype tracker: https://github.com/anchore/grype/releases
 # Trivy tracker: ghcr.io/aquasecurity/trivy tags (GitHub repo has no releases)
@@ -106,12 +117,19 @@ CVE-2026-56852
 # bundled trivy CLI, not in the adapter's own binary (no dependencies) and not
 # in the backend or openscap images (0 findings, no bundled trivy, #1544).
 #
-# Note on severity, learned the hard way on the v1.6.4 cut: this CVE exports
-# to SARIF as UNKNOWN/note, so it looks non-gating in the code-scanning UI.
-# It DOES gate. Trivy filters on the vendor severity, not the NVD one, and
-# logs "Using severities from other vendors for some vulnerabilities"; under
-# `severity: CRITICAL,HIGH` this entry still failed the scan. Do not assume an
-# UNKNOWN/note alert is harmless: check whether the scan step actually failed.
+# Note on severity: CORRECTED by #3122. The previous note here recorded that
+# this CVE exports to SARIF as UNKNOWN/note yet still failed the scan under
+# `severity: CRITICAL,HIGH`, and concluded that "Trivy filters on the vendor
+# severity, not the NVD one". That conclusion was wrong. The severity filter
+# was never applied at all: trivy-action ran `unset TRIVY_SEVERITY` because the
+# format was SARIF, so the scan gated on every severity and this UNKNOWN entry
+# failed it along with everything else.
+#
+# Verified directly while fixing #3122: with every other finding suppressed,
+# this CVE alone fails the old SARIF-format gate (exit 1) and passes the
+# corrected table-format gate carrying the same `severity: CRITICAL,HIGH`
+# (exit 0). It is UNKNOWN severity and does not gate. Kept here because it is
+# still a vendored-binary finding with no fixed tool release.
 CVE-2026-46600
 
 # ---------------------------------------------------------------------------
