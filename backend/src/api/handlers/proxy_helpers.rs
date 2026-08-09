@@ -17,8 +17,8 @@ use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
 use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
-use crate::services::proxy_service::ProxyService;
 pub use crate::services::proxy_service::StreamingFetchResult;
+use crate::services::proxy_service::{DirectUpstreamBody, ProxyService};
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
 // #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
 pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
@@ -1719,13 +1719,18 @@ pub async fn proxy_fetch_uncached(
 }
 
 /// Fetch from upstream directly, preserving the upstream `Link` header.
+///
+/// Returns the whole [`DirectUpstreamBody`], including the upstream
+/// `Content-Encoding` (#3193). Callers must handle the coding explicitly:
+/// forward it if they pass `content` through verbatim, or strip it with
+/// [`crate::util::content_coding::strip_content_coding`] before parsing.
 pub async fn proxy_fetch_uncached_with_link(
     proxy_service: &ProxyService,
     repo_id: Uuid,
     repo_key: &str,
     upstream_url: &str,
     path: &str,
-) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+) -> Result<DirectUpstreamBody, Response> {
     with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
         proxy_service
             .fetch_upstream_direct_with_link(&repo, path)

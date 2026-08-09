@@ -1035,6 +1035,30 @@ impl CacheKeys {
 /// replayed to the client — see [`UpstreamResponse::content_encoding`].
 pub(crate) type CachedBody = (Bytes, Option<String>, Option<String>);
 
+/// An uncached, straight-from-upstream buffered read — the result of
+/// [`ProxyService::fetch_upstream_direct_with_link`].
+///
+/// Named fields, not a tuple. This value carries three `Option<String>`s that a
+/// positional destructure cannot tell apart, and #3193 is precisely what that
+/// costs: the PyPI PEP 658 handler read the old triple's third slot as the
+/// content coding (which is where the coding sits on [`CachedBody`]) when it was
+/// actually the `Link` header, so a coded `.metadata` reached pip as
+/// undeclared binary labelled `text/plain`.
+pub struct DirectUpstreamBody {
+    pub content: Bytes,
+    /// Upstream `Content-Type`. Handlers that pin their own media type (PEP 658
+    /// metadata is always `text/plain`) deliberately ignore this rather than
+    /// echo a hostile upstream's type back under this origin.
+    pub content_type: Option<String>,
+    /// Upstream `Content-Encoding` — see [`UpstreamResponse::content_encoding`].
+    /// A handler that forwards `content` verbatim MUST re-declare this; a
+    /// handler that parses `content` must instead strip it first with
+    /// [`crate::util::content_coding::strip_content_coding`].
+    pub content_encoding: Option<String>,
+    /// Upstream `Link` header, for OCI tag-pagination continuation cursors.
+    pub link: Option<String>,
+}
+
 pub(crate) struct CacheStore {
     storage: Arc<StorageService>,
 }
@@ -2853,6 +2877,13 @@ impl ProxyService {
     /// PyPI hosts files on a different domain) but the caller wants a stable,
     /// locally-computed cache key so that subsequent requests can hit the
     /// cache without rediscovering the upstream URL.
+    ///
+    /// DROPS the upstream `Content-Encoding`, and is exactly equivalent to
+    /// [`Self::fetch_artifact_with_cache_path_capped`] at
+    /// [`DEFAULT_METADATA_MAX_BYTES`] otherwise. A caller that forwards the
+    /// buffered body verbatim, or that PARSES it (a coded body is not a
+    /// parseable zip/tar/JSON — #3193), must use the capped form and handle the
+    /// coding, or it reproduces #3149.
     pub async fn fetch_artifact_with_cache_path(
         &self,
         repo: &Repository,
@@ -3837,18 +3868,37 @@ impl ProxyService {
     /// OCI tag pagination relies on the upstream continuation cursor when the
     /// registry enforces its own page-size cap. Callers that need to reconstruct
     /// pagination accurately should use this instead of [`fetch_upstream_direct`].
+    ///
+    /// Returns a named [`DirectUpstreamBody`] rather than the
+    /// `(Bytes, Option<String>, Option<String>)` triple it used to (#3193). The
+    /// coding was not in the old return type at all, so the PyPI PEP 658
+    /// `.metadata` caller could not forward it — and, worse, the triple's third
+    /// slot was the `Link` header while *looking* exactly like the coding slot
+    /// on the sibling `CachedBody` triple, so that caller's `Ok((content, _ct,
+    /// _))` read as "coding deliberately dropped" when it was in fact "coding
+    /// never available". Widening in place, and to named fields rather than a
+    /// fourth positional `Option<String>`, is deliberate: it breaks every caller
+    /// at compile time and forces each to say whether it forwards the bytes
+    /// verbatim (must declare [`DirectUpstreamBody::content_encoding`]) or
+    /// parses them (must DECODE first — see `util::content_coding`), and it
+    /// makes the three same-typed optionals impossible to transpose.
     pub async fn fetch_upstream_direct_with_link(
         &self,
         repo: &Repository,
         path: &str,
-    ) -> Result<(Bytes, Option<String>, Option<String>)> {
+    ) -> Result<DirectUpstreamBody> {
         let upstream_url = Self::remote_target(repo)?;
 
         let full_url = Self::build_upstream_url(upstream_url, path);
         let resp = self
             .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
             .await?;
-        Ok((resp.content, resp.content_type, resp.link))
+        Ok(DirectUpstreamBody {
+            content: resp.content,
+            content_type: resp.content_type,
+            content_encoding: resp.content_encoding,
+            link: resp.link,
+        })
     }
 
     /// Invalidate cached artifact
@@ -13764,12 +13814,77 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
         let repo = wiremock_remote_repo("s8-link", &server.uri(), tmp.to_str().unwrap());
 
-        let (_body, _ct, link) = proxy
+        let upstream = proxy
             .fetch_upstream_direct_with_link(&repo, "v2/_catalog")
             .await
             .expect("direct-with-link fetch must succeed");
         let _ = std::fs::remove_dir_all(&tmp);
-        assert_eq!(link.as_deref(), Some("</v2/_catalog?last=z>; rel=\"next\""));
+        assert_eq!(
+            upstream.link.as_deref(),
+            Some("</v2/_catalog?last=z>; rel=\"next\"")
+        );
+        // Negative control for #3193: an upstream that declared no coding must
+        // not acquire one on the way through the primitive, or every handler
+        // downstream mislabels an ordinary uncoded body.
+        assert_eq!(
+            upstream.content_encoding, None,
+            "an uncoded upstream must report no Content-Encoding"
+        );
+    }
+
+    /// #3193: `fetch_upstream_direct_with_link` must report the upstream
+    /// `Content-Encoding`. It previously did not carry it AT ALL — the third
+    /// slot of its triple was the `Link` header — so the PyPI PEP 658 handler
+    /// could not forward a coding it never received.
+    ///
+    /// The fixture is `deflate`, never gzip: a gzip fixture cannot distinguish
+    /// "reports the upstream's coding" from "hardcodes gzip". It also asserts
+    /// the primitive does NOT decode — the bytes must arrive still coded, since
+    /// the verbatim-forwarding caller declares the coding and passes them on.
+    #[tokio::test]
+    async fn test_fetch_upstream_direct_with_link_reports_upstream_content_encoding() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (plain, coded) = tdh::coded_fixture("deflate", b"direct-upstream-");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coded"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "deflate")
+                    .set_body_bytes(coded.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-coding-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-coding", &server.uri(), tmp.to_str().unwrap());
+
+        let upstream = proxy
+            .fetch_upstream_direct_with_link(&repo, "coded")
+            .await
+            .expect("direct-with-link fetch must succeed");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            upstream.content_encoding.as_deref(),
+            Some("deflate"),
+            "the UPSTREAM's coding must reach the caller; `gzip` here would mean \
+             it is hardcoded, `None` means #3193 is live"
+        );
+        assert_eq!(
+            upstream.content.as_ref(),
+            coded.as_slice(),
+            "the primitive must not decode on the caller's behalf"
+        );
+        assert_eq!(tdh::inflate_deflate(&upstream.content), plain);
     }
 
     // -- fetch_stream + read_upstream_response_streaming ---------------------

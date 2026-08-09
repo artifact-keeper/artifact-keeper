@@ -1506,29 +1506,41 @@ pub async fn rewire_remote_proxy(
 ///
 /// Use a NON-gzip coding in at least one test per builder.
 pub fn coded_fixture(encoding: &str, seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    use flate2::write::{DeflateEncoder, GzEncoder};
-    use flate2::Compression;
-    use std::io::Write;
-
     let plain = seed.repeat(64);
-    let coded = match encoding {
-        "gzip" => {
-            let mut e = GzEncoder::new(Vec::new(), Compression::default());
-            e.write_all(&plain).expect("gzip encode");
-            e.finish().expect("gzip finish")
-        }
-        "deflate" => {
-            let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
-            e.write_all(&plain).expect("deflate encode");
-            e.finish().expect("deflate finish")
-        }
-        other => panic!("unsupported test coding {other}"),
-    };
+    let coded = code_bytes(encoding, &plain);
     assert_ne!(
         coded, plain,
         "fixture must actually be coded or the test proves nothing"
     );
     (plain, coded)
+}
+
+/// Apply `encoding` to arbitrary bytes.
+///
+/// [`coded_fixture`] builds its own repetitive plaintext, which is right when
+/// the payload is opaque. Tests whose payload has to be a *specific* artifact —
+/// a real wheel zip whose METADATA the server then extracts (#3193) — need to
+/// code bytes they already have, so the encoder block lives here and both entry
+/// points share it rather than each suite growing a copy (the jscpd duplication
+/// gate scores changed files).
+pub fn code_bytes(encoding: &str, plain: &[u8]) -> Vec<u8> {
+    use flate2::write::{DeflateEncoder, GzEncoder};
+    use flate2::Compression;
+    use std::io::Write;
+
+    match encoding {
+        "gzip" => {
+            let mut e = GzEncoder::new(Vec::new(), Compression::default());
+            e.write_all(plain).expect("gzip encode");
+            e.finish().expect("gzip finish")
+        }
+        "deflate" => {
+            let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
+            e.write_all(plain).expect("deflate encode");
+            e.finish().expect("deflate finish")
+        }
+        other => panic!("unsupported test coding {other}"),
+    }
 }
 
 /// Decode a `deflate` body, so a test can assert the client receives BYTES it

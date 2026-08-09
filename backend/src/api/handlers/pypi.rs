@@ -2023,17 +2023,30 @@ async fn serve_remote_metadata(
         .fetch_upstream_direct_with_link(&remote_repo, &target.fetch_path)
         .await
     {
-        Ok((content, _content_type, _)) => {
+        Ok(upstream) => {
             // The content-type is fixed, never relayed from upstream: a PEP 658
             // metadata resource is always the plain-text METADATA file, so a
             // hostile or misconfigured upstream labelling it `text/html` must
             // not get that type echoed back under this origin. Matches the
             // wheel-extraction arm below.
-            Ok(Response::builder()
+            //
+            // The content *coding* is the opposite case (#3193). These bytes are
+            // forwarded VERBATIM, and the shared HTTP client no longer lets
+            // reqwest decode upstream bodies, so a `.metadata` from a gzipping
+            // CDN or an object-store upstream arrives here still coded. Pinning
+            // the type while dropping the coding is the worst of both: pip gets
+            // compressed bytes labelled `text/plain; charset=utf-8` with no
+            // coding declared, and PEP 658 metadata parsing fails. Declare what
+            // the bytes actually are. `None` upstream means the header stays
+            // ABSENT — manufacturing a coding would mislabel every ordinary
+            // uncoded serve, which is the common case.
+            let mut builder = Response::builder()
                 .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from(content))
-                .unwrap())
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8");
+            if let Some(enc) = upstream.content_encoding.as_deref() {
+                builder = builder.header(CONTENT_ENCODING, enc);
+            }
+            Ok(builder.body(Body::from(upstream.content)).unwrap())
         }
         Err(AppError::NotFound(_)) => {
             let wheel_target = resolve_pypi_remote_fetch_target(
@@ -2052,17 +2065,51 @@ async fn serve_remote_metadata(
                 &wheel_target.fetch_base,
                 RepositoryFormat::Pypi,
             );
-            let (wheel, _) = proxy
-                .fetch_artifact_with_cache_path(
+            // Unlike the arm above, this one PARSES the upstream bytes: it
+            // opens the wheel as a zip to read `*.dist-info/METADATA`. A coded
+            // wheel is not a parseable zip, so before #3193 a perfectly valid
+            // wheel behind a gzipping intermediary answered "Metadata not
+            // available" — forwarding a header would not have helped, the bytes
+            // have to be DECODED before the parser sees them.
+            //
+            // `_capped` at `DEFAULT_METADATA_MAX_BYTES` is the same ceiling the
+            // uncapped `fetch_artifact_with_cache_path` already delegates with,
+            // so the byte budget is unchanged; the capped form is used because
+            // it is the variant that reports the coding (#3184).
+            let (wheel, _content_type, wheel_encoding) = proxy
+                .fetch_artifact_with_cache_path_capped(
                     &wheel_repo,
                     &wheel_target.fetch_path,
                     &wheel_target.cache_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await
                 .map_err(|e| e.into_response())?;
+            // Decode and parse under ONE extraction permit: both halves are
+            // CPU work on upstream-controlled bytes, so they are admission-
+            // controlled together, and the decode is bounded by the same
+            // decompression-bomb budget the zip walk uses.
             let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
-                extract_metadata_from_wheel(&wheel)
+                match crate::util::content_coding::strip_content_coding(
+                    &wheel,
+                    wheel_encoding.as_deref(),
+                ) {
+                    Ok(crate::util::content_coding::Decoded::Bytes(bytes)) => {
+                        Ok(extract_metadata_from_wheel(&bytes))
+                    }
+                    // A coding this build cannot strip (`br`) degrades to the
+                    // pre-existing "not available" answer rather than a hard
+                    // upstream error: pip recovers from that by downloading the
+                    // wheel itself, which succeeds because the download path
+                    // forwards the coding for the client to strip (#3176).
+                    Ok(crate::util::content_coding::Decoded::Unsupported) => Ok(None),
+                    // A supported coding that will not decode is a corrupt or
+                    // bomb stream; surface it rather than reporting it as a
+                    // missing resource.
+                    Err(e) => Err(e),
+                }
             })
+            .map_err(|e| e.into_response())?
             .map_err(|e| e.into_response())?
             .ok_or_else(|| {
                 AppError::NotFound("Metadata not available".to_string()).into_response()
@@ -10188,6 +10235,215 @@ mod tests {
             &body[..],
             metadata,
             "served metadata must be the wheel's METADATA bytes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3193: `serve_remote_metadata` and content codings. Two independent bugs,
+    // one per arm, needing opposite remediations:
+    //
+    //   arm 1 (upstream serves `.metadata`) forwards the bytes VERBATIM, so it
+    //         must re-declare the upstream `Content-Encoding`;
+    //   arm 2 (upstream 404s, extract METADATA from the wheel) PARSES the
+    //         bytes, so it must DECODE them first — forwarding a header would
+    //         do nothing for a zip reader handed a deflate stream.
+    //
+    // Every fixture below is `deflate`, never gzip. #3176 shipped fourteen
+    // tests that all stayed green when the forwarded value was replaced with a
+    // hardcoded `"gzip"`, because every fixture WAS gzip: they pinned "a coding
+    // is declared", not "the UPSTREAM's coding is declared". `tdh::gzip_fixture`
+    // is for the GET/HEAD parity arms and is deliberately not used here.
+    //
+    // These run the real router end to end, so they fail against the handler
+    // itself rather than against a response-builder helper.
+    // -----------------------------------------------------------------------
+
+    /// Fixed coordinates for the `.metadata` end-to-end cases below.
+    const CODING_PROJECT: &str = "demo";
+    const CODING_WHEEL: &str = "demo-1.0-py3-none-any.whl";
+
+    /// Drive one PEP 658 `.metadata` request end to end against a mock upstream
+    /// that answers `<wheel>.metadata` with `metadata_response` and `<wheel>`
+    /// with `wheel_response`.
+    ///
+    /// Returns `None` when no database is available (the suite's standing
+    /// skip), otherwise the served status, body and headers. Shared by the
+    /// three cases so the fixture/mock/rewire scaffolding is written once.
+    async fn serve_remote_metadata_e2e(
+        metadata_response: wiremock::ResponseTemplate,
+        wheel_response: wiremock::ResponseTemplate,
+    ) -> Option<(StatusCode, Bytes, axum::http::HeaderMap)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::Mock;
+
+        let fx = tdh::Fixture::setup("remote", "pypi").await?;
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{CODING_PROJECT}/")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(pep658_index_html(CODING_WHEEL)),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{CODING_WHEEL}.metadata")))
+            .respond_with(metadata_response)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{CODING_WHEEL}")))
+            .respond_with(wheel_response)
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let served = tdh::send_with_headers(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{CODING_PROJECT}/{CODING_WHEEL}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+        Some(served)
+    }
+
+    /// Arm 1, positive. A `deflate`-coded upstream `.metadata` must be served
+    /// with `Content-Encoding: deflate`, and the served bytes must decode under
+    /// that declared coding.
+    ///
+    /// Before #3193 the handler pinned `text/plain; charset=utf-8` and declared
+    /// no coding at all — `fetch_upstream_direct_with_link`'s third tuple slot
+    /// was the `Link` header, not the coding — so pip received compressed bytes
+    /// labelled as plain text.
+    ///
+    /// Fails if the coding is dropped (asserts the header is present), and
+    /// fails if it is hardcoded to `"gzip"` (asserts `deflate`, and decodes the
+    /// body with a deflate decoder).
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_forwards_upstream_deflate_coding() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let (plain, coded) = tdh::coded_fixture("deflate", b"Metadata-Version: 2.1\n");
+        let Some((status, body, headers)) = serve_remote_metadata_e2e(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-encoding", "deflate")
+                .set_body_bytes(coded.clone()),
+            wiremock::ResponseTemplate::new(404),
+        )
+        .await
+        else {
+            return;
+        };
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tdh::header_str(&headers, CONTENT_ENCODING).as_deref(),
+            Some("deflate"),
+            "the served `.metadata` must declare the UPSTREAM's coding; \
+             `gzip` means the value is hardcoded, `None` means #3193 is live"
+        );
+        // The proxy must not decode on pip's behalf: the wire bytes stay coded,
+        // which is the whole reason the header has to be declared.
+        assert_eq!(
+            &body[..],
+            coded.as_slice(),
+            "coded upstream bytes must be forwarded verbatim"
+        );
+        assert_eq!(
+            tdh::inflate_deflate(&body),
+            plain,
+            "the served body must decode under the coding the response declares"
+        );
+    }
+
+    /// Arm 1, negative control. An UNCODED upstream `.metadata` must be served
+    /// with NO `Content-Encoding`.
+    ///
+    /// This is the overwhelmingly common case — most indexes serve `.metadata`
+    /// uncoded — so a header emitted unconditionally would break the default
+    /// path, not an edge case: pip would try to inflate plain text. Fails if
+    /// the header is set unconditionally.
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_omits_coding_when_upstream_uncoded() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let plain: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+        let Some((status, body, headers)) = serve_remote_metadata_e2e(
+            wiremock::ResponseTemplate::new(200).set_body_bytes(plain),
+            wiremock::ResponseTemplate::new(404),
+        )
+        .await
+        else {
+            return;
+        };
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], plain);
+        assert_eq!(
+            tdh::header_str(&headers, CONTENT_ENCODING),
+            None,
+            "an uncoded upstream must be served with NO Content-Encoding; \
+             manufacturing one makes pip try to inflate plain text"
+        );
+    }
+
+    /// Arm 2. When upstream 404s the `.metadata`, a `deflate`-coded WHEEL must
+    /// still yield its METADATA.
+    ///
+    /// This arm needs decode-before-parse, not header forwarding:
+    /// `extract_metadata_from_wheel` opens the bytes as a zip, and a coded wheel
+    /// is not a parseable zip, so before #3193 a present and perfectly valid
+    /// wheel answered 404 "Metadata not available". The served response carries
+    /// no coding of its own — the extracted METADATA is freshly built plaintext,
+    /// not the upstream bytes — so this also pins that the arm-1 header is not
+    /// leaking across arms.
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_extracts_from_deflate_coded_wheel() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+        let wheel = wheel_with_metadata("demo-1.0", metadata);
+        let coded_wheel = tdh::code_bytes("deflate", &wheel);
+        assert_ne!(
+            coded_wheel, wheel,
+            "the wheel fixture must actually be coded or the test proves nothing"
+        );
+
+        let Some((status, body, headers)) = serve_remote_metadata_e2e(
+            wiremock::ResponseTemplate::new(404),
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-encoding", "deflate")
+                .set_body_bytes(coded_wheel),
+        )
+        .await
+        else {
+            return;
+        };
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a deflate-coded wheel is still a valid wheel; its METADATA must be \
+             extracted rather than 404'd as unavailable; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "served metadata must be the coded wheel's METADATA bytes"
+        );
+        assert_eq!(
+            tdh::header_str(&headers, CONTENT_ENCODING),
+            None,
+            "the extracted METADATA is freshly built plaintext, so the upstream \
+             wheel's coding must NOT be echoed onto it"
         );
     }
 

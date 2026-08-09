@@ -8666,7 +8666,7 @@ async fn fetch_upstream_tags_page(
     })?;
 
     let upstream_path = format!("v2/{}/{}", ctx.image, build_remote_tags_list_path(n, last));
-    let (content, _ct, link) = proxy_helpers::proxy_fetch_uncached_with_link(
+    let upstream = proxy_helpers::proxy_fetch_uncached_with_link(
         proxy,
         ctx.repo_id,
         ctx.repo_key,
@@ -8687,6 +8687,34 @@ async fn fetch_upstream_tags_page(
         ),
     })?;
 
+    // This arm PARSES the upstream body (it rebuilds the tag page rather than
+    // forwarding bytes), so the upstream coding must come OFF here rather than
+    // be forwarded: `serde_json::from_slice` over a gzipped tags document fails
+    // and the page 502s. Reachable because the shared HTTP client no longer
+    // decodes upstream bodies and object stores return a stored
+    // `Content-Encoding` regardless of `Accept-Encoding` (#3193; same
+    // decode-before-parse class as the PyPI wheel fallback, surfaced by the
+    // `fetch_upstream_direct_with_link` widening that made the coding visible
+    // to callers at all).
+    let content = match crate::util::content_coding::strip_content_coding(
+        &upstream.content,
+        upstream.content_encoding.as_deref(),
+    ) {
+        Ok(crate::util::content_coding::Decoded::Bytes(bytes)) => bytes,
+        Ok(crate::util::content_coding::Decoded::Unsupported) | Err(_) => {
+            warn!(
+                "Upstream tags/list response for {} used a content coding this build \
+                 cannot decode ({:?})",
+                ctx.image, upstream.content_encoding
+            );
+            return Err(oci_error(
+                StatusCode::BAD_GATEWAY,
+                "UNKNOWN",
+                "invalid upstream tags response",
+            ));
+        }
+    };
+    let link = upstream.link;
     let parsed = serde_json::from_slice::<serde_json::Value>(&content).map_err(|e| {
         warn!(
             "Invalid upstream tags/list response for {}: {}",
@@ -26799,6 +26827,59 @@ mod content_encoding_forwarding_tests {
         );
         let (_s, body, _h) = tdh::collect_response(resp).await;
         assert_eq!(&body[..], &coded[..], "layer bytes must pass through");
+    }
+
+    /// #3193, the OTHER caller of the widened
+    /// `fetch_upstream_direct_with_link`. Tag pagination PARSES the upstream
+    /// body (it rebuilds the page rather than forwarding bytes), so it is the
+    /// mirror image of the blob arm above: the coding must come OFF, not be
+    /// forwarded.
+    ///
+    /// Before the widening the coding was not in the primitive's return type at
+    /// all, so a `deflate`-coded tags document reached `serde_json::from_slice`
+    /// still compressed and the whole tag listing 502'd. Fixture is `deflate`,
+    /// never gzip, for the same reason as everywhere else in this class.
+    #[tokio::test]
+    async fn test_upstream_tags_page_decodes_coded_body_before_parsing() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let page = br#"{"name":"myimage","tags":["v1","v2"]}"#;
+        let coded = tdh::code_bytes("deflate", page);
+        assert_ne!(
+            &coded[..],
+            &page[..],
+            "fixture must actually be coded or the test proves nothing"
+        );
+
+        Mock::given(method("GET"))
+            .and(wm_path("/v2/myimage/tags/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "deflate")
+                    .set_body_bytes(coded),
+            )
+            .mount(&server)
+            .await;
+
+        let upstream_url = server.uri();
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream_url).await;
+        let ctx = super::TagsFetchCtx {
+            state: &state,
+            repo_id: fx.repo_id,
+            repo_key: &fx.repo_key,
+            upstream_url: &upstream_url,
+            image: "myimage",
+        };
+        let result = super::fetch_upstream_tags_page(&ctx, 10, None).await;
+
+        fx.teardown().await;
+
+        let page = result
+            .map_err(|r| r.status())
+            .expect("a deflate-coded tags/list document must be decoded before parsing, not 502'd");
+        assert_eq!(page.tags, vec!["v1".to_string(), "v2".to_string()]);
     }
 
     /// Negative control: no upstream coding, no manufactured header, and a
