@@ -37,7 +37,7 @@ use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
-use crate::formats::pypi_name::NormalizedProjectName;
+use crate::formats::pypi_name::{NormalizedProjectName, PEP508_NAME_PATTERN};
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::age_gate_service::AgeGateService;
 use crate::services::upstream_metadata::metadata_http_client;
@@ -3889,7 +3889,50 @@ async fn upload(
         );
     }
 
-    let normalized = PypiHandler::normalize_name(&pkg_name);
+    // PEP 508 validation on the upload channel (#3198).
+    //
+    // #3196 validated every routed `:project` segment, but twine takes the
+    // project name from a multipart form field, so it never reaches
+    // `parse_project_segment`. What flowed in here instead was
+    // `PypiHandler::normalize_name`, which coerces rather than validates: it
+    // maps every non-ASCII-alphanumeric character to `-`, skips leading
+    // separators and pops one trailing hyphen. So `acme sdk`, `acme!sdk` and
+    // `acme<U+212A>sdk` all published into the namespace of `acme-sdk` -- a
+    // real, valid, possibly someone else's project -- and `---` published under
+    // the EMPTY name, which is stored and charged to quota but reachable at no
+    // URL, because `/simple//` is not a route.
+    //
+    // Deliberately the same constructor as the read paths, not a second
+    // validator: two implementations that must agree about names is the exact
+    // shape of #3186 / #3077 / #3179 / #3183.
+    //
+    // This is NOT a rename for well-formed names. For every PEP 508-valid name
+    // the canonical form and `PypiHandler::normalize_name` agree byte for byte
+    // -- a valid name draws only on `[A-Za-z0-9._-]`, so nothing is dropped,
+    // and it begins and ends alphanumeric, so neither the leading-separator
+    // skip nor the trailing-hyphen pop fires. That equivalence is asserted in
+    // `formats::pypi_name::tests::all_three_normalizers_agree_on_every_valid_name`,
+    // which is what makes this substitution storage-compatible: no existing
+    // artifact path, cache key or index entry changes.
+    //
+    // 400, not the 404 the read paths give: a path segment that is not a
+    // project name names no resource, but an upload that declares one is a
+    // malformed request, and the publisher is the party who can fix it. The
+    // message therefore carries the pattern -- but never the rejected name,
+    // which would make the error a reflection sink for exactly the characters
+    // `normalize_pep503` exists to strip (#1377).
+    let normalized_project = NormalizedProjectName::parse(&pkg_name).ok_or_else(|| {
+        debug!(
+            "rejecting PyPI upload whose 'name' field is not a PEP 508 name (len {})",
+            pkg_name.len()
+        );
+        AppError::Validation(format!(
+            "Invalid project name: a PyPI project name must match the PEP 508 pattern {}",
+            PEP508_NAME_PATTERN
+        ))
+        .into_response()
+    })?;
+    let normalized = normalized_project.as_str().to_string();
 
     // SHA-256 was computed incrementally while the body was spooled to disk.
     let computed_sha256 = digests.sha256.clone();
@@ -4897,7 +4940,22 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(content);
         let sha256 = format!("{:x}", hasher.finalize());
-        let boundary = format!("ak-pypi-test-{}", project.replace('-', "_"));
+        // The boundary must not be derived verbatim from `project`: RFC 2046
+        // §5.1.1 restricts boundary characters, so a project name carrying a
+        // space, a `/` or a non-ASCII character produced a body the multipart
+        // parser rejected outright. That mattered once #3198 started feeding
+        // this helper deliberately-invalid names -- every such case failed with
+        // "Invalid `boundary` for `multipart/form-data` request" before the
+        // handler ever saw the name, which is a 400 for the wrong reason.
+        // Mapping to `_` keeps the boundary byte-identical for the plain
+        // `a-b` names the older tests pass.
+        let boundary = format!(
+            "ak-pypi-test-{}",
+            project
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>()
+        );
         let fields = [
             (":action", "file_upload"),
             ("protocol_version", "1"),
@@ -4965,6 +5023,19 @@ mod tests {
     /// ordinary "Package not found" / "File not found" 404 -- which is the
     /// failure mode that would let an over-rejecting fix look like it passes.
     const PROJECT_REJECTED_MESSAGE: &str = "Invalid project name";
+
+    /// The PEP 508 *Names* pattern, as it must appear in the body of a rejected
+    /// upload (#3198).
+    ///
+    /// A literal here rather than a reference to the production constant, on
+    /// purpose and for the same reason as [`PROJECT_REJECTED_MESSAGE`] above:
+    /// the test must still COMPILE against a tree with the fix reverted, so
+    /// that reverting proves the assertion fails rather than that the crate
+    /// stops building. It also makes the message a contract — the pattern is
+    /// what tells a publisher how to spell the name, so silently dropping it
+    /// from the message fails a test.
+    const UPLOAD_NAME_REJECTED_MESSAGE: &str =
+        r"^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$";
 
     /// PEP 508-valid names, weighted towards the unusual-but-legal.
     ///
@@ -5406,6 +5477,193 @@ mod tests {
             after_control > 0,
             "control failed: a VALID name made no upstream request either, so the \
              zero-request assertion above proves nothing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3198 — the upload channel
+    // -----------------------------------------------------------------------
+
+    /// PEP 508-invalid names, as they arrive on the *upload* channel.
+    ///
+    /// Deliberately a separate list from [`invalid_route_names`], for two
+    /// reasons. Nothing here is percent-encoded — a twine upload carries the
+    /// project name in a multipart form field, not a path segment, so there is
+    /// no URL layer to encode for. And every entry is a raw field value that a
+    /// `multipart/form-data` body can actually carry, which rules out the CR/LF
+    /// cases: a bare newline in a field value is a *multipart framing* problem,
+    /// so a rejection would prove the parser works rather than that name
+    /// validation does.
+    ///
+    /// Each entry carries the name `PypiHandler::normalize_name` coerces it to,
+    /// which is what the unvalidated upload path stored it under. That column
+    /// is the point of the issue: the coercion is silent, and it is not the
+    /// name the publisher asked for.
+    fn invalid_upload_names() -> Vec<(&'static str, &'static str)> {
+        vec![
+            // The motivating case. `acme sdk` is not a project name, but the
+            // upload path coerced it into the namespace of `acme-sdk`, which
+            // IS one — so the publisher silently squats a different project.
+            ("acme sdk", "acme-sdk"),
+            ("acme!sdk", "acme-sdk"),
+            ("acme@sdk", "acme-sdk"),
+            ("acme/sdk", "acme-sdk"),
+            // Non-ASCII. `normalize_name` keys on `is_ascii_alphanumeric`, so
+            // the `é` is coerced to a separator and swallows the `-` after it:
+            // `acmé-sdk` lands under `acm-sdk`, a third distinct project.
+            ("acmé-sdk", "acm-sdk"),
+            ("acme\u{212A}sdk", "acme-sdk"),
+            // PEP 508 requires an alphanumeric at both ends. `normalize_name`
+            // skips leading separators and pops one trailing hyphen, so these
+            // are silently renamed rather than refused.
+            ("_leading", "leading"),
+            ("-leading", "leading"),
+            (".leading", "leading"),
+            ("trailing_", "trailing"),
+            ("trailing-", "trailing"),
+            // Names made only of separators coerce to the EMPTY string. This is
+            // the shape the issue titles: stored at path `/<version>/<file>`,
+            // counted against quota, and unreachable at any URL, because
+            // `/simple//` is not a route.
+            ("---", ""),
+            ("...", ""),
+            ("", ""),
+            // The stored-XSS payload `normalize_pep503` drops characters for.
+            ("<script>", "script"),
+        ]
+    }
+
+    /// The canonical, PEP 508-valid name every case in this test is measured
+    /// against. It carries a separator on purpose: on a separator-free fixture
+    /// such as `demo` the two legacy coercions cannot diverge, so the squatting
+    /// assertion below would pass on the unfixed tree and report a false all-clear.
+    const UPLOAD_CONTROL_PROJECT: &str = "acme-sdk";
+    const UPLOAD_CONTROL_WHEEL: &str = "acme_sdk-1.0.0-py3-none-any.whl";
+
+    /// The upload path must reject a project name that is not a PEP 508 name,
+    /// with 400 — and a valid one must still publish and resolve.
+    ///
+    /// Three claims in one fixture, because separately each is satisfiable by
+    /// the bug:
+    ///
+    /// 1. **400 on upload.** PEP 508 (*Names*) gives the pattern; an upload
+    ///    naming something outside it is a malformed request, not a missing
+    ///    resource, so it is 400 here and not the 404 the read routes give a
+    ///    path segment (#3196).
+    /// 2. **No squatting.** Rejecting is only half the fix: what made this worth
+    ///    closing is *where the bytes went*. `PypiHandler::normalize_name` maps
+    ///    every non-alphanumeric to `-`, so `acme sdk` was stored under
+    ///    `acme-sdk` — a real, valid, possibly-someone-else's project. The
+    ///    canonical index must not list a distribution uploaded under any of
+    ///    these names.
+    /// 3. **The positive control, in the same fixture and the same response.**
+    ///    `acme-sdk` itself must upload with 200 and be listed by its own simple
+    ///    index. Without it, claim 2 would be satisfied by a repo that serves
+    ///    nothing at all — the failure mode that made an earlier security test
+    ///    on #3179 green while the vulnerability was live.
+    #[tokio::test]
+    async fn pep508_invalid_upload_name_is_rejected_and_cannot_squat_a_valid_project() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+
+        // Positive control first: publish the canonical project for real.
+        let (content_type, body) = pypi_upload_multipart(
+            UPLOAD_CONTROL_PROJECT,
+            "1.0.0",
+            UPLOAD_CONTROL_WHEEL,
+            b"fake-wheel-bytes-control",
+            "pep508 upload control",
+            ">=3.8",
+        );
+        let app = fx.router_with_auth(super::router());
+        let (control_status, control_body) = tdh::send(
+            app,
+            tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+        )
+        .await;
+        if control_status != StatusCode::OK {
+            failures.push(format!(
+                "control upload of {UPLOAD_CONTROL_PROJECT:?} must succeed, got {control_status}; \
+                 body: {}",
+                String::from_utf8_lossy(&control_body)
+            ));
+        }
+
+        // Every PEP 508-invalid name must be refused with 400, and the refusal
+        // must name the pattern so the publisher can act on it.
+        for (index, (raw, coerced_to)) in invalid_upload_names().into_iter().enumerate() {
+            let filename = format!("squatted_{index}-9.9.9-py3-none-any.whl");
+            let (content_type, body) = pypi_upload_multipart(
+                raw,
+                "9.9.9",
+                &filename,
+                b"fake-wheel-bytes-squat",
+                "pep508 upload rejection",
+                ">=3.8",
+            );
+            let app = fx.router_with_auth(super::router());
+            let (status, body) = tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            )
+            .await;
+            let body = String::from_utf8_lossy(&body).into_owned();
+
+            if status != StatusCode::BAD_REQUEST {
+                failures.push(format!(
+                    "upload named {raw:?} (coerces to {coerced_to:?}): expected 400, got {status}; \
+                     body: {body}"
+                ));
+            } else if !body.contains(UPLOAD_NAME_REJECTED_MESSAGE) {
+                // A 400 alone is not proof — a malformed body, a missing field
+                // or a digest mismatch all produce one. The pattern in the
+                // message is what shows name validation produced it.
+                failures.push(format!(
+                    "upload named {raw:?}: 400 but not from PEP 508 validation; body: {body}"
+                ));
+            }
+        }
+
+        // The canonical index must list its own wheel and nothing that was
+        // uploaded under an invalid name.
+        let app = fx.router_with_auth(super::router());
+        let (index_status, index_body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/simple/{UPLOAD_CONTROL_PROJECT}/", fx.repo_key)),
+        )
+        .await;
+        let index_body = String::from_utf8_lossy(&index_body).into_owned();
+
+        fx.teardown().await;
+
+        if index_status != StatusCode::OK {
+            failures.push(format!(
+                "control index /simple/{UPLOAD_CONTROL_PROJECT}/ must be 200, got {index_status}; \
+                 body: {index_body}"
+            ));
+        }
+        if !index_body.contains(UPLOAD_CONTROL_WHEEL) {
+            failures.push(format!(
+                "control index does not list {UPLOAD_CONTROL_WHEEL}, so the \
+                 'no squatted distribution' assertion below proves nothing; body: {index_body}"
+            ));
+        }
+        if index_body.contains("squatted_") {
+            failures.push(format!(
+                "a distribution uploaded under a PEP 508-invalid name is listed in the \
+                 index of {UPLOAD_CONTROL_PROJECT}; body: {index_body}"
+            ));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "PyPI upload name validation (#3198) failed:\n{}",
+            failures.join("\n")
         );
     }
 
