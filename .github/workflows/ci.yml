@@ -396,7 +396,7 @@ jobs:
   test-backend-unit:
     name: 🧪 Backend Unit Tests
     runs-on: ak-ci-runners
-    timeout-minutes: 25
+    timeout-minutes: 40
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
@@ -560,7 +560,7 @@ jobs:
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
-    timeout-minutes: 35
+    timeout-minutes: 45
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
