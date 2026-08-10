@@ -761,10 +761,17 @@ fn normalize_package_name(raw: &str) -> String {
 
 /// Validate a decoded npm package name.
 ///
-/// Rejects non-ASCII names, path traversal sequences, null bytes, and names
-/// that violate the handler's existing shape rules (empty, too long, leading
-/// dot/underscore). Called after URL decoding to catch percent-encoded attacks
-/// like `%2e%2e%2f` and percent-encoded Unicode homoglyphs.
+/// Rejects path traversal sequences, null bytes, and names that violate the
+/// handler's existing shape rules (empty, too long, leading dot/underscore).
+/// Called after URL decoding to catch percent-encoded attacks like `%2e%2e%2f`.
+///
+/// This is the shared validator for read *and* write routes, so it deliberately
+/// does **not** reject non-ASCII names: `download_tarball`, `get_metadata` and
+/// the `dist-tags` routes all run through here for local, virtual and remote
+/// repositories, and a name-shape rule applied here would make an already
+/// published package — or a legacy upstream package reached through a remote
+/// repo — permanently unreadable. The ASCII rule belongs to the publish
+/// boundary only; see [`assert_publishable_package_name`].
 #[allow(clippy::result_large_err)]
 fn validate_package_name(name: &str) -> Result<(), Response> {
     if name.is_empty() {
@@ -775,12 +782,6 @@ fn validate_package_name(name: &str) -> Result<(), Response> {
     }
     if name.len() > 214 {
         return Err(map_status(StatusCode::BAD_REQUEST, "Package name too long"));
-    }
-    if !name.is_ascii() {
-        return Err(map_status(
-            StatusCode::BAD_REQUEST,
-            "Package name must contain only ASCII characters",
-        ));
     }
     if name.contains('\0') {
         return Err(map_status(
@@ -821,10 +822,30 @@ fn validate_package_name(name: &str) -> Result<(), Response> {
     Ok(())
 }
 
+/// Publish-only name rule: a *new* npm package name must be ASCII.
+///
+/// npm's own `validate-npm-package-name` rejects names containing characters
+/// outside its URL-safe set for new packages while grandfathering names that
+/// predate the rule, so this is applied at the write boundary and nowhere else.
+/// Enforcing it here — rather than inside [`validate_package_name`] — keeps
+/// homoglyph impersonation such as `nｕmpy` from being created without making
+/// existing or upstream-proxied packages unreadable (#3007).
+#[allow(clippy::result_large_err)]
+fn assert_publishable_package_name(name: &str) -> Result<(), Response> {
+    if !name.is_ascii() {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Package name must contain only ASCII characters",
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_publish_package_name(raw: &str) -> Result<String, Response> {
     let package = normalize_package_name(raw);
     validate_package_name(&package)?;
+    assert_publishable_package_name(&package)?;
     Ok(package)
 }
 
@@ -837,6 +858,7 @@ fn validate_scoped_publish_package_name(
     let package = normalize_package_name(raw_package);
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
+    assert_publishable_package_name(&full_name)?;
     Ok(full_name)
 }
 
@@ -6248,6 +6270,33 @@ mod tests {
             validate_scoped_publish_package_name("Scope", "Package").unwrap(),
             "@Scope/Package"
         );
+    }
+
+    /// The ASCII rule is a *publish* rule. `validate_package_name` is the shared
+    /// validator behind `get_metadata`, `download_tarball` and the `dist-tags`
+    /// routes for local, virtual and remote repositories, so putting the rule
+    /// there would 400 every read of an already published package and every
+    /// proxied pull of a legacy upstream name. This is the guard against that
+    /// regression: if someone moves the `is_ascii` check back into the shared
+    /// validator, this test fails (#3007).
+    #[test]
+    fn test_non_ascii_names_remain_readable_on_the_shared_validator() {
+        for name in ["nｕmpy", "@ｓcope/package", "@scope/pａckage", "日本語"] {
+            assert!(
+                validate_package_name(name).is_ok(),
+                "read path must still resolve {name}; the ASCII rule is publish-only"
+            );
+        }
+    }
+
+    /// Positive control for the test above: the same names the read path
+    /// accepts must still be rejected at the publish boundary. Without this,
+    /// deleting the publish-side check would leave the pair passing.
+    #[test]
+    fn test_same_names_are_still_blocked_at_publish() {
+        assert!(validate_publish_package_name("nｕmpy").is_err());
+        assert!(validate_scoped_publish_package_name("ｓcope", "package").is_err());
+        assert!(validate_scoped_publish_package_name("scope", "pａckage").is_err());
     }
 
     // -----------------------------------------------------------------------
