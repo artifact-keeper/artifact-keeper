@@ -293,10 +293,46 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      # PRIVATE PER-JOB CARGO_HOME (#3154). The ARC runner pods set
+      # CARGO_HOME=/cache/cargo-home, a hostPath volume SHARED by up to six
+      # concurrent runner pods on the node — but two things treat that
+      # registry as private, mutable state:
+      #   1. Swatinem/rust-cache: its restore tar-extracts registry files
+      #      (unlink+rewrite) over the live shared copy, and its post-save
+      #      clean DELETES registry/src for non `-sys` crates and prunes
+      #      registry/cache and index caches down to the saving job's own
+      #      package set (see cleanRegistry in the pinned rust-cache src).
+      #   2. cargo itself: whenever those files go missing it re-extracts
+      #      them (rm_rf + rewrite) under a package-cache lock that sibling
+      #      pods' COMPILE phases do not hold.
+      # Any job compiling while another pod restores, saves, or re-extracts
+      # reads half-written or deleted sources. Observed as: aws-lc-sys cc
+      # "unterminated #ifndef" on a truncated vendored header, "could not
+      # execute process ... (os error 2)" (spawn cwd = deleted registry src
+      # dir), and "could not parse/generate dep info ... No such file or
+      # directory" cascades — the #3154 flake family. All failing jobs had
+      # RUSTC_WRAPPER="" (sccache was NOT involved).
+      #
+      # RUNNER_TEMP is on the pod-local emptyDir work volume and the pods
+      # are ephemeral (one job each), so this makes every job's cargo home
+      # private and self-consistent. Warm-path cost is unchanged for jobs
+      # with rust-cache (the tarball already contains registry index+cache
+      # and restores into the private path). Tool binaries are unaffected:
+      # the runner image bakes them into /usr/local/cargo/bin, which stays
+      # on PATH regardless of CARGO_HOME (ak-runner-rust Dockerfile).
+      - name: Isolate CARGO_HOME per job (#3154)
+        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
       # Cache the dependency build so only the workspace crate recompiles.
       # ~635 deps are byte-identical run-to-run; cold compile was ~9m.
+      #
+      # prefix-key bumped v0->v1 (#3154): pre-existing tarballs archived the
+      # old shared /cache/cargo-home with absolute paths, so restoring one
+      # under an old key would write into the shared volume again and leave
+      # the private CARGO_HOME cold. A fresh namespace repopulates cleanly.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          prefix-key: v1-rust
           shared-key: clippy
 
       - name: Check formatting
@@ -403,10 +439,19 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      # Shield this job from concurrent mutation of the shared registry —
+      # see the #3154 comment on the same step in check-rust. A dep-info
+      # ENOENT instance of that flake hit THIS job on 2026-08-10
+      # (job 93341706470, PR #3237).
+      - name: Isolate CARGO_HOME per job (#3154)
+        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
       # Separate cache key from check-rust: same target dir but a different
       # build profile (test vs clippy), so they must not share a cache.
+      # prefix-key: see the #3154 note in check-rust.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          prefix-key: v1-rust
           shared-key: unit
 
       # Catch migration-slot collisions before they reach the e2e/nightly job.
@@ -585,13 +630,25 @@ jobs:
             echo "### Coverage: skipped (no Rust source changes in this PR)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Shield this job from concurrent mutation of the shared registry —
+      # see the #3154 comment on the same step in check-rust. This job is
+      # the most frequent victim: its instrumented build is the longest in
+      # CI, so its compile phase overlaps other jobs' cache restores/saves
+      # most often (observed 2026-08-07 twice as aws-lc-sys cc failures,
+      # 2026-08-09 twice as dep-info ENOENT, both pods within seconds).
+      - name: Isolate CARGO_HOME per job (#3154)
+        if: steps.detect.outputs.rust_changed == 'true'
+        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
       # Distinct cache key: the instrumented coverage build is incompatible
       # with the clippy/unit profiles, and cargo-llvm-cov builds into
       # target/llvm-cov-target, so point rust-cache there or it caches an
       # empty target/ and silently no-ops.
+      # prefix-key: see the #3154 note in check-rust.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: steps.detect.outputs.rust_changed == 'true'
         with:
+          prefix-key: v1-rust
           shared-key: coverage
           workspaces: ". -> target/llvm-cov-target"
 
@@ -604,6 +661,30 @@ jobs:
         run: sqlx migrate run --source backend/migrations
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+
+      # Build the instrumented test binaries as a step of their own, so a
+      # BUILD failure is visibly distinct from a coverage-gate failure
+      # (#3154's "masquerading" half). Before this split, an aws-lc-sys /
+      # dep-info build flake surfaced as "Code Coverage: fail", which reads
+      # as "your new code is under the 70% threshold" and sends people off
+      # to write tests they do not need. The only tell was the job duration
+      # (~1-2 min vs ~14 min for a real gate run), which is not
+      # discoverable. The ::error:: annotation below shows up directly on
+      # the PR checks page.
+      - name: Build instrumented test binaries
+        if: steps.detect.outputs.rust_changed == 'true'
+        env:
+          SQLX_OFFLINE: true
+          RUSTC_WRAPPER: ""
+        # The explicit `clean --workspace` keeps the implicit-clean
+        # semantics the single `cargo llvm-cov nextest` invocation had.
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          if ! cargo nextest run --workspace --lib --no-run; then
+            echo "::error title=Coverage BUILD failed — not a coverage-gate failure::cargo could not build the instrumented test binaries, so no coverage was measured; the 70% new-code gate, the 50% floor, and the jscpd duplication gate never ran. A genuine compile error will also fail Check Rust / Backend Unit Tests on this commit; if those are green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job."
+            exit 1
+          fi
 
       - name: Generate coverage report
         if: steps.detect.outputs.rust_changed == 'true'
@@ -634,13 +715,13 @@ jobs:
         # of cargo-llvm-cov's default one-.profraw-per-test-process: with
         # ~12k test processes the per-process files cost tens of GB of write
         # I/O per run, while the pool online-merges the same counters into at
-        # most 32 files (~92MB) with byte-equal coverage aggregates. The
-        # explicit `clean --workspace` keeps the implicit-clean semantics the
-        # single `cargo llvm-cov nextest` invocation had.
+        # most 32 files (~92MB) with byte-equal coverage aggregates.
+        #
+        # NO `cargo llvm-cov clean` here: it ran in the build step above and
+        # must not run again between build and test execution.
         run: |
           source <(cargo llvm-cov show-env --sh)
           export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
-          cargo llvm-cov clean --workspace
           cargo nextest run --workspace --lib --test-threads 8
           cargo llvm-cov report --lcov --output-path lcov.info
 
@@ -1000,6 +1081,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Shield this job from concurrent mutation of the shared registry —
+      # see the #3154 comment on the same step in check-rust. The
+      # "stale/truncated crates.io index" failure documented on the fetch
+      # step below is the same corruption class (a sibling pod rewriting
+      # the shared registry index mid-read). This job carries no
+      # rust-cache, so a private CARGO_HOME means it now downloads the
+      # dependency graph from crates.io each run instead of reading the
+      # shared warm registry; CARGO_NET_RETRY and the fetch retry below
+      # already absorb network hiccups, and correctness beats the ~1-2
+      # minutes of download.
+      - name: Isolate CARGO_HOME per job (#3154)
+        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
       # Resolve and download the dependency graph in its own step, ahead of the
       # test steps, with a retry.
@@ -1654,6 +1748,13 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Shield this job from concurrent mutation of the shared registry —
+      # see the #3154 comment on the same step in check-rust. No rust-cache
+      # here either (cf. the integration job note): the graph is downloaded
+      # per run, which this main-push-only job can afford.
+      - name: Isolate CARGO_HOME per job (#3154)
+        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
       - name: Build Windows binary (cross-compile)
         env:
