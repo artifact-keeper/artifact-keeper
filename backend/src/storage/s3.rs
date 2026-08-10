@@ -737,6 +737,23 @@ fn anonymous_s3_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the store built by [`S3Backend::build_store_with_timeout`] will sign
+/// its requests, mirroring that function's credential branch exactly.
+///
+/// It is `false` only on the one arm that calls `with_skip_signature(true)`:
+/// no explicit key pair from any source, and `S3_ALLOW_ANONYMOUS` set. Kept
+/// beside [`anonymous_s3_enabled`] so the two stay in step — the hand-rolled
+/// `UploadPartCopy` path signs its own request and must refuse when this is
+/// `false` (see [`S3Backend::sign_requests`]).
+fn s3_requests_are_signed(access_key: Option<&str>, secret_key: Option<&str>) -> bool {
+    let explicit_pair = (access_key.is_some() && secret_key.is_some())
+        || (std::env::var("S3_ACCESS_KEY_ID").is_ok()
+            && std::env::var("S3_SECRET_ACCESS_KEY").is_ok())
+        || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+            && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok());
+    explicit_pair || !anonymous_s3_enabled()
+}
+
 /// Classify an `object_store::Error` from S3 into a human-readable
 /// diagnostic. Used by both the runtime `health_check` and the boot
 /// `startup_probe` so the operator sees the same actionable message in
@@ -884,6 +901,16 @@ pub struct S3Backend {
     /// native `CopyObject`; larger ones use multipart `UploadPartCopy` with
     /// parts of this size.
     max_single_copy_bytes: u64,
+    /// False when the store was built unsigned (`S3_ALLOW_ANONYMOUS` with no
+    /// credentials — `build_store` calls `with_skip_signature(true)`).
+    ///
+    /// The hand-rolled `UploadPartCopy` path signs its own request, so it
+    /// cannot honour `skip_signature`: `signed_url` and
+    /// `credentials().get_credential()` both resolve credentials
+    /// unconditionally, and with nothing configured object_store's chain falls
+    /// through to the IMDS provider. Recording the decision here lets the
+    /// multipart copy refuse legibly instead of stalling on a link-local probe.
+    sign_requests: bool,
     prefix: Option<String>,
     redirect_downloads: bool,
     cloudfront: Option<CloudFrontConfig>,
@@ -1211,6 +1238,7 @@ impl S3Backend {
                 .then(|| Duration::from_secs(config.bulk_timeout_secs)),
             raw_http,
             max_single_copy_bytes: Self::effective_single_copy_ceiling(&config),
+            sign_requests: s3_requests_are_signed(None, None),
             prefix: config.prefix,
             redirect_downloads: config.redirect_downloads,
             cloudfront: config.cloudfront,
@@ -1942,18 +1970,43 @@ impl S3Backend {
     /// earlier failure aborts the upload and leaves an existing `dest`
     /// object untouched.
     async fn multipart_server_side_copy(&self, source: &str, dest: &str, size: u64) -> Result<()> {
-        let ranges = copy_part_ranges(size, self.max_single_copy_bytes);
-        if ranges.len() > S3_MULTIPART_MAX_PARTS {
+        // `UploadPartCopy` is signed per request: the method and every `x-amz-*`
+        // header go into the SigV4 canonical request, so an anonymous store has
+        // nothing to sign with. `build_store` sets `with_skip_signature(true)`
+        // when no credentials are configured, but object_store still populates
+        // its credential chain, which falls through to the IMDS provider — so
+        // reaching the signing path on an anonymous store stalls on a
+        // link-local probe (up to the 180s retry_timeout) and then fails with
+        // an error naming 169.254.169.254, which reads like a network fault
+        // rather than a configuration one. Refuse legibly instead.
+        if !self.sign_requests {
+            return Err(AppError::Storage(format!(
+                "Server-side copy of '{source}' ({size} bytes) exceeds the \
+                 single-copy ceiling and requires S3 credentials to sign an \
+                 UploadPartCopy request, but this backend is running \
+                 unsigned (S3_ALLOW_ANONYMOUS). Configure credentials, or \
+                 lower S3_MAX_SINGLE_COPY_BYTES so this object copies with a \
+                 single unsigned CopyObject."
+            )));
+        }
+
+        // Bound the part count BEFORE materialising the range vector. `size`
+        // comes from a HEAD Content-Length, so an S3-compatible endpoint
+        // reporting a bogus length would otherwise have us push one 16-byte
+        // tuple per part first: `copy_part_ranges(u64::MAX/2, 5 GiB)` builds
+        // 1.7e9 ranges (~27 GiB resident) and completes rather than erroring.
+        // The ceiling is clamped to >= 5 MiB at construction, so it is never 0.
+        let part_count = size.div_ceil(self.max_single_copy_bytes);
+        if part_count > S3_MULTIPART_MAX_PARTS as u64 {
             // Unreachable for real S3 (5 TiB object ceiling / 5 GiB parts =
             // 1,024), but fail fast rather than opaquely at part 10,001 if an
             // S3-compatible provider reports a larger object.
             return Err(AppError::Storage(format!(
                 "Multipart copy of '{}' would need {} parts, exceeding S3's {}-part limit",
-                source,
-                ranges.len(),
-                S3_MULTIPART_MAX_PARTS,
+                source, part_count, S3_MULTIPART_MAX_PARTS,
             )));
         }
+        let ranges = copy_part_ranges(size, self.max_single_copy_bytes);
         let copy_source = s3_copy_source_value(&self.bucket, &self.full_key(source));
         let dest_path: ObjectPath = self.full_key(dest).into();
 
@@ -3770,6 +3823,7 @@ mod tests {
             bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
             raw_http: reqwest::Client::new(),
             max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            sign_requests: true,
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
@@ -4048,6 +4102,7 @@ mod tests {
                     .then(|| Duration::from_secs(config.bulk_timeout_secs)),
                 raw_http: reqwest::Client::new(),
                 max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+                sign_requests: true,
                 prefix: None,
                 redirect_downloads: false,
                 cloudfront: None,
@@ -4127,6 +4182,7 @@ mod tests {
                 .then(|| Duration::from_secs(config.bulk_timeout_secs)),
             raw_http: reqwest::Client::new(),
             max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            sign_requests: true,
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
