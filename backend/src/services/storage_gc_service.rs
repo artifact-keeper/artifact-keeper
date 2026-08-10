@@ -1332,69 +1332,11 @@ impl StorageGcService {
         let grace_hours = clamp_grace_hours(grace_hours);
 
         // Aggregate 1: global totals + dedup-aware physical bytes + aged
-        // figures, all in one pass.
-        //
-        // Physical identity mirrors [`BLOB_PROTECTED_BY_REFS_SQL`] (and
-        // `StorageRegistry::backend_is_repo_isolated`): on shared backends
-        // (anything other than 'filesystem') the content-addressed key
-        // `oci-blobs/<digest>` resolves to ONE object per backend, so a
-        // digest counts once per backend; on 'filesystem' every repository
-        // roots its own tree at `storage_path`, so the same digest under
-        // two paths is two real files and must count twice. `per_object`
-        // therefore groups by (digest, backend, path-if-filesystem);
-        // `size_bytes` is MAX within a group (rows for the same digest
-        // share a size) and `first_seen` is the group's oldest row.
-        // `distinct_digests` stays digest-level (content identities),
-        // independent of how many physical copies exist; counting it over
-        // `per_object` equals counting over `oci_blobs` directly (the NOT
-        // NULL `repository_id` FK means the join drops no rows) and saves
-        // a fourth scan of the table.
-        //
-        // DELIBERATE: rows with `pending_delete_at IS NOT NULL` (the
-        // mark-and-sweep marker, migration 141) are INCLUDED in every
-        // figure — marked-but-not-yet-swept bytes are still physically on
-        // disk, and this is a footprint view. Do not "fix" by excluding
-        // them.
-        //
-        // `grace_hours` binds as int8, but `make_interval` only defines int4
-        // named parameters, so the SQL must cast `$1::int` or Postgres
-        // rejects the call outright (#2626). Safe: clamp_grace_hours caps
-        // the value at 8760. The SUM(...) columns need `::BIGINT` because
-        // SUM over bigint yields NUMERIC, which the i64 decodes below
-        // reject — and a failed decode is a hard error (propagated), never
-        // a silent zero.
-        let totals_sql = r#"
-            WITH per_object AS (
-                SELECT ob.digest,
-                       MAX(ob.size_bytes) AS size_bytes,
-                       MIN(ob.created_at) AS first_seen
-                FROM oci_blobs ob
-                JOIN repositories r ON r.id = ob.repository_id
-                GROUP BY ob.digest,
-                         r.storage_backend,
-                         CASE WHEN r.storage_backend = 'filesystem'
-                              THEN r.storage_path ELSE '' END
-            )
-            SELECT
-                (SELECT COUNT(*) FROM oci_blobs)                       AS total_blob_rows,
-                (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
-                   FROM oci_blobs)                                     AS logical_bytes,
-                COUNT(DISTINCT digest)                                 AS distinct_digests,
-                COALESCE(SUM(size_bytes), 0)::BIGINT                   AS physical_bytes,
-                COUNT(DISTINCT digest) FILTER (
-                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
-                )                                                      AS aged_distinct_digests,
-                COALESCE(SUM(size_bytes) FILTER (
-                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
-                ), 0)::BIGINT                                          AS aged_physical_bytes
-            FROM per_object
-        "#;
-
-        let totals = sqlx::query(totals_sql)
-            .bind(grace_hours)
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        // figures, all in one pass. The production report is always
+        // cluster-wide (`digest_scope: None`); see
+        // [`Self::fetch_blob_footprint_totals`] for the semantics and for
+        // why a scoped mode exists at all.
+        let totals = self.fetch_blob_footprint_totals(grace_hours, None).await?;
 
         // Aggregate 2: per-repository logical footprint, biggest first.
         let per_repo_sql = r#"
@@ -1424,20 +1366,109 @@ impl StorageGcService {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let totals = BlobFootprintTotals {
+        Ok(assemble_blob_footprint_report(
+            totals,
+            grace_hours,
+            per_repository,
+        ))
+    }
+
+    /// Fetch the totals block of the OCI blob footprint report.
+    ///
+    /// Physical identity mirrors [`BLOB_PROTECTED_BY_REFS_SQL`] (and
+    /// `StorageRegistry::backend_is_repo_isolated`): on shared backends
+    /// (anything other than 'filesystem') the content-addressed key
+    /// `oci-blobs/<digest>` resolves to ONE object per backend, so a
+    /// digest counts once per backend; on 'filesystem' every repository
+    /// roots its own tree at `storage_path`, so the same digest under
+    /// two paths is two real files and must count twice. `per_object`
+    /// therefore groups by (digest, backend, path-if-filesystem);
+    /// `size_bytes` is MAX within a group (rows for the same digest
+    /// share a size) and `first_seen` is the group's oldest row.
+    /// `distinct_digests` stays digest-level (content identities),
+    /// independent of how many physical copies exist; counting it over
+    /// `per_object` equals counting over the scoped rows directly (the
+    /// NOT NULL `repository_id` FK means the join drops no rows) and
+    /// saves a fourth scan of the table.
+    ///
+    /// DELIBERATE: rows with `pending_delete_at IS NOT NULL` (the
+    /// mark-and-sweep marker, migration 141) are INCLUDED in every
+    /// figure — marked-but-not-yet-swept bytes are still physically on
+    /// disk, and this is a footprint view. Do not "fix" by excluding
+    /// them.
+    ///
+    /// `grace_hours` binds as int8, but `make_interval` only defines int4
+    /// named parameters, so the SQL must cast `$1::int` or Postgres
+    /// rejects the call outright (#2626). Safe: [`clamp_grace_hours`] caps
+    /// the value at 8760 (callers pass the already-clamped value). The
+    /// SUM(...) columns need `::BIGINT` because SUM over bigint yields
+    /// NUMERIC, which the i64 decodes below reject — and a failed decode
+    /// is a hard error (propagated), never a silent zero.
+    ///
+    /// `digest_scope`: `None` aggregates the whole cluster — the only
+    /// mode the production report uses. `Some(digests)` restricts every
+    /// figure to rows whose digest is in the given set. The scoped mode
+    /// exists for the DB-backed regression test (#3129): the test
+    /// database is shared by the entire `cargo nextest` run
+    /// (process-per-test), so a before/after delta over cluster-wide
+    /// totals races every concurrent suite that inserts or deletes
+    /// `oci_blobs` rows. Scoping to the test's own UUID-derived
+    /// (collision-free) digests makes the expected figures exact and
+    /// deterministic while still exercising this very statement — the
+    /// scoped and unscoped paths share ONE SQL string, so the grouping,
+    /// dedup and age logic the test pins is the logic the report ships.
+    async fn fetch_blob_footprint_totals(
+        &self,
+        grace_hours: i64,
+        digest_scope: Option<&[String]>,
+    ) -> Result<BlobFootprintTotals> {
+        let totals_sql = r#"
+            WITH scoped AS (
+                SELECT digest, size_bytes, created_at, repository_id
+                FROM oci_blobs
+                WHERE $2::text[] IS NULL OR digest = ANY($2)
+            ),
+            per_object AS (
+                SELECT ob.digest,
+                       MAX(ob.size_bytes) AS size_bytes,
+                       MIN(ob.created_at) AS first_seen
+                FROM scoped ob
+                JOIN repositories r ON r.id = ob.repository_id
+                GROUP BY ob.digest,
+                         r.storage_backend,
+                         CASE WHEN r.storage_backend = 'filesystem'
+                              THEN r.storage_path ELSE '' END
+            )
+            SELECT
+                (SELECT COUNT(*) FROM scoped)                          AS total_blob_rows,
+                (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
+                   FROM scoped)                                        AS logical_bytes,
+                COUNT(DISTINCT digest)                                 AS distinct_digests,
+                COALESCE(SUM(size_bytes), 0)::BIGINT                   AS physical_bytes,
+                COUNT(DISTINCT digest) FILTER (
+                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
+                )                                                      AS aged_distinct_digests,
+                COALESCE(SUM(size_bytes) FILTER (
+                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
+                ), 0)::BIGINT                                          AS aged_physical_bytes
+            FROM per_object
+        "#;
+
+        let totals = sqlx::query(totals_sql)
+            .bind(grace_hours)
+            .bind(digest_scope)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(BlobFootprintTotals {
             total_blob_rows: decode_report_i64(&totals, "total_blob_rows")?,
             distinct_digests: decode_report_i64(&totals, "distinct_digests")?,
             logical_bytes: decode_report_i64(&totals, "logical_bytes")?,
             physical_bytes: decode_report_i64(&totals, "physical_bytes")?,
             aged_distinct_digests: decode_report_i64(&totals, "aged_distinct_digests")?,
             aged_physical_bytes: decode_report_i64(&totals, "aged_physical_bytes")?,
-        };
-
-        Ok(assemble_blob_footprint_report(
-            totals,
-            grace_hours,
-            per_repository,
-        ))
+        })
     }
 
     async fn cleanup_abandoned_oci_uploads(
@@ -3054,7 +3085,7 @@ fn repo_scope_clause(column: &str, param: usize, repo_scope: Option<Uuid>) -> St
 /// Decoded global aggregate values for the OCI blob footprint report.
 ///
 /// This is the row-free intermediate between the `totals_sql` query in
-/// [`StorageGcService::oci_blob_footprint_report`] and the final
+/// `StorageGcService::fetch_blob_footprint_totals` and the final
 /// [`OciBlobFootprintReport`]. Splitting it out lets the report-assembly
 /// logic (which is pure arithmetic/struct shuffling, not I/O) be unit
 /// tested without a live database.
@@ -7440,14 +7471,23 @@ mod tests {
     ///    files (counted per `storage_path`), while a digest shared by two
     ///    repos on a shared backend is ONE object.
     /// 3. The age filter is genuinely exercised: backdating a blob past the
-    ///    grace window must move the `aged_*` figures by that blob. A
-    ///    vacuous filter (always true or always false) yields a zero delta
-    ///    either way and fails.
+    ///    grace window must move the `aged_*` figures by exactly that blob.
+    ///    A vacuous filter (always true or always false) fails either the
+    ///    aged==0 assertion before the backdate or the aged==300 one after.
     ///
-    /// Global totals are asserted as before/after DELTAS with `>=`:
-    /// `oci_blobs` is cluster-wide and other DB-backed suites seed it
-    /// concurrently (their inserts only inflate the deltas). Per-repository
-    /// rows are keyed by our own repo ids and asserted exactly.
+    /// The model assertions run against `fetch_blob_footprint_totals`
+    /// scoped to the seeded digests — the SAME statement the unscoped
+    /// production report executes — so every figure is EXACT (`==`), not a
+    /// cluster-wide before/after delta. The previous delta form raced every
+    /// concurrent suite that deletes `oci_blobs` rows (`cargo nextest` is
+    /// process-per-test against one shared database) and was flaky in CI
+    /// (#3129). The digests are locally generated UUIDs, so no concurrent
+    /// test can add or remove matching rows. The unscoped report itself is
+    /// still called and pinned by race-free ABSOLUTE lower bounds (our rows
+    /// exist for the whole test, so cluster totals can never be below our
+    /// contribution), which also proves the `None` scope arm filters
+    /// nothing out. Per-repository rows are keyed by our own repo ids and
+    /// asserted exactly, as before.
     #[tokio::test]
     async fn test_oci_blob_footprint_report_executes_dedups_and_ages() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -7466,14 +7506,6 @@ mod tests {
         ));
         let svc = StorageGcService::new(pool.clone(), registry);
 
-        // On main this call errors with `function make_interval(hours =>
-        // bigint) does not exist` before returning any row.
-        let r0 = svc
-            .oci_blob_footprint_report(24)
-            .await
-            .expect("baseline footprint report must execute (#2626)");
-        assert_eq!(r0.grace_hours, 24);
-
         // Fixture: a digest shared by two filesystem repos (distinct
         // storage_path => two physical files), a digest unique to repo_a,
         // and a digest shared by two repos on a shared backend ('s3': one
@@ -7487,42 +7519,65 @@ mod tests {
         let repo_c = seed_footprint_repo(&pool, "s3", &[(&shared_cloud, 700)]).await;
         let repo_d = seed_footprint_repo(&pool, "s3", &[(&shared_cloud, 700)]).await;
 
+        let digests = [shared_fs.clone(), only_a.clone(), shared_cloud.clone()];
+
+        // Totals scoped to exactly the seeded digests: deterministic under
+        // any concurrent suite, so every figure is exact.
+        let t1 = svc
+            .fetch_blob_footprint_totals(24, Some(&digests))
+            .await
+            .expect("scoped footprint totals must execute (#2626)");
+        assert_eq!(t1.total_blob_rows, 5, "five rows seeded across four repos");
+        assert_eq!(t1.distinct_digests, 3, "three content identities seeded");
+        assert_eq!(
+            t1.logical_bytes, 3_700,
+            "1000+300+1000 fs + 700+700 cloud rows seeded"
+        );
+        // Filesystem copies count per storage_path (1000 + 1000 + 300) and
+        // the cloud digest counts once (700). Global per-digest dedup would
+        // report 2000 here; per-path-everywhere counting would report
+        // 3700. Both MUST fail this.
+        assert_eq!(
+            t1.physical_bytes, 3_000,
+            "fs digest per path + cloud digest once"
+        );
+        // Every seeded row is seconds old: nothing crosses the 24h grace
+        // window yet. An always-true age filter reports 3000 here.
+        assert_eq!(t1.aged_distinct_digests, 0);
+        assert_eq!(t1.aged_physical_bytes, 0);
+
+        // The production (unscoped) report must EXECUTE (#2626) and share
+        // the same statement. Our rows exist for the whole test and no
+        // other suite can delete them, so cluster totals at this snapshot
+        // are at least our contribution — an absolute lower bound that
+        // holds regardless of concurrent inserts/deletes elsewhere (no
+        // before/after delta, which is what made this test flaky, #3129).
+        // A `None` digest scope that wrongly filtered rows out would
+        // report 0 here and fail.
         let r1 = svc
             .oci_blob_footprint_report(24)
             .await
-            .expect("footprint report must execute after seeding");
-
-        assert!(r1.total_blob_rows - r0.total_blob_rows >= 5);
-        assert!(r1.distinct_digests - r0.distinct_digests >= 3);
-        let logical_delta = r1.logical_bytes - r0.logical_bytes;
-        let physical_delta = r1.physical_bytes - r0.physical_bytes;
+            .expect("footprint report must execute after seeding (#2626)");
+        assert_eq!(r1.grace_hours, 24);
         assert!(
-            logical_delta >= 3_700,
-            "1000+300+1000 fs + 700+700 cloud rows seeded, got {logical_delta}"
+            r1.total_blob_rows >= 5,
+            "cluster row count can never be below our 5 live rows, got {}",
+            r1.total_blob_rows
         );
-        // Filesystem copies count per storage_path (2000 + 300) and the
-        // cloud digest counts once (700). Global per-digest dedup would
-        // report only 2000 here and MUST fail this.
         assert!(
-            physical_delta >= 3_000,
-            "fs digest per path + cloud digest once, got {physical_delta}"
+            r1.distinct_digests >= 3,
+            "cluster digest count can never be below our 3 live digests, got {}",
+            r1.distinct_digests
         );
-        // The cloud pair is the only sharing we introduced whose copies
-        // dedup away: logical exceeds physical by that one 700-byte copy.
-        // Per-path-everywhere counting would make our contribution to this
-        // difference 0 and MUST fail this.
-        assert!(
-            logical_delta - physical_delta >= 700,
-            "exactly one cloud copy dedups away, got {}",
-            logical_delta - physical_delta
-        );
+        // Snapshot-internal invariants (computed in one statement, so
+        // consistent even mid-churn).
         assert!(r1.logical_bytes >= r1.physical_bytes);
         assert!(r1.aged_physical_bytes <= r1.physical_bytes);
 
         // Backdate the unique digest past the 24h grace window: the aged
-        // figures must move by at least that blob (all our other rows are
+        // figures must move by exactly that blob (all our other rows are
         // seconds old). A filter that ignores `first_seen` in either
-        // direction produces a ~0 delta here.
+        // direction fails these exact assertions.
         sqlx::query(
             "UPDATE oci_blobs SET created_at = NOW() - INTERVAL '48 hours' \
              WHERE repository_id = $1 AND digest = $2",
@@ -7533,21 +7588,26 @@ mod tests {
         .await
         .expect("backdate blob");
 
-        let r2 = svc
-            .oci_blob_footprint_report(24)
+        let t2 = svc
+            .fetch_blob_footprint_totals(24, Some(&digests))
             .await
-            .expect("footprint report must execute after backdating");
-        assert!(
-            r2.aged_physical_bytes - r1.aged_physical_bytes >= 300,
-            "backdated 300-byte blob crossed the grace window: {} -> {}",
-            r1.aged_physical_bytes,
-            r2.aged_physical_bytes
+            .expect("scoped footprint totals must execute after backdating");
+        assert_eq!(
+            t2.aged_distinct_digests, 1,
+            "exactly the backdated digest crossed the grace window"
         );
-        assert!(r2.aged_distinct_digests - r1.aged_distinct_digests >= 1);
-        assert!(r2.aged_physical_bytes <= r2.physical_bytes);
+        assert_eq!(
+            t2.aged_physical_bytes, 300,
+            "backdated 300-byte blob crossed the grace window: {} -> {}",
+            t1.aged_physical_bytes, t2.aged_physical_bytes
+        );
+        // The backdate must not disturb the non-aged figures.
+        assert_eq!(t2.total_blob_rows, 5);
+        assert_eq!(t2.logical_bytes, 3_700);
+        assert_eq!(t2.physical_bytes, 3_000);
 
         // Per-repo rows are isolated to our repos and exact.
-        let by_repo: std::collections::HashMap<Uuid, (i64, i64)> = r2
+        let by_repo: std::collections::HashMap<Uuid, (i64, i64)> = r1
             .per_repository
             .iter()
             .map(|r| (r.repository_id, (r.blob_rows, r.logical_bytes)))
