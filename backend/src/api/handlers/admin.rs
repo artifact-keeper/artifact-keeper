@@ -796,6 +796,8 @@ pub struct SystemStats {
     pub total_repositories: i64,
     /// Rows in `artifacts` (for OCI repositories that is manifests only —
     /// layer/config blobs are content-addressed objects, not artifacts).
+    /// Unlike the byte total, this count still includes legacy backfilled
+    /// `proxy-cache/%` rows.
     pub total_artifacts: i64,
     /// All stored bytes, summed from `repository_usage_ledger`
     /// (`hosted_bytes + proxy_bytes + oci_bytes`) — the same source the
@@ -2105,6 +2107,14 @@ mod tests {
                  proxy delta {proxy_delta} (expected {CACHED}); retrying"
             );
         }
+        // Clean up the fixture repositories BEFORE asserting, so a failing
+        // run does not leak them into the shared test database.
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(&repo_ids[..])
+            .execute(&pool)
+            .await
+            .expect("cleanup repos");
+
         assert!(
             matched,
             "get_system_stats never reflected the seeded storage: expected \
@@ -2113,12 +2123,6 @@ mod tests {
              {HOSTED_PLAIN} + cached {CACHED}, legacy proxy-cache/% row {LEGACY} excluded) \
              and proxy_storage_bytes +{CACHED} +/- {SLACK}"
         );
-
-        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
-            .bind(&repo_ids[..])
-            .execute(&pool)
-            .await
-            .expect("cleanup repos");
     }
 
     /// DB-backed (skips without `DATABASE_URL`): the #3134 ledger aggregate
