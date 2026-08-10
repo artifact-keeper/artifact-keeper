@@ -518,6 +518,23 @@ impl OidcService {
 
     /// Get or create a user from OIDC information
     pub async fn get_or_create_user(&self, oidc_user: &OidcUserInfo) -> Result<User> {
+        // #3204 (OIDC arm): `sub` is the account key — it is stored in
+        // `users.external_id` and looked up by below. OIDC Core 1.0 §2
+        // REQUIRES a non-empty `sub`, but nothing upstream enforces that a
+        // misbehaving IdP sent one: an empty `sub` deserializes fine and
+        // both the ID-token and userinfo extraction paths pass it through.
+        // Two users resolving to `external_id = ''` would then silently
+        // merge into one account, exactly like the SAML empty-NameID
+        // collapse. Reject before the key can reach the lookup.
+        if oidc_user.sub.trim().is_empty() {
+            return Err(AppError::Authentication(
+                "refusing to resolve an OIDC user with an empty 'sub' claim: the \
+                 subject is the account key (users.external_id), and an empty key \
+                 would collapse distinct federated identities into a single account"
+                    .into(),
+            ));
+        }
+
         // Check if user already exists by external_id (sub)
         let existing_user = sqlx::query_as!(
             User,
@@ -1610,5 +1627,78 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// #3204 (OIDC arm): `sub` is the account key (`users.external_id`), and
+    /// OIDC Core 1.0 §2 requires it to be non-empty — but nothing upstream
+    /// enforces that. The extraction path deliberately passes an empty `sub`
+    /// through (asserted below as a fixture guard), so `get_or_create_user`
+    /// must refuse it before the `WHERE external_id = $1` lookup can collapse
+    /// two such users into one account. DB-backed; no-ops without DATABASE_URL.
+    #[tokio::test]
+    async fn empty_sub_never_reaches_the_external_id_lookup() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = OidcService::with_config(pool.clone(), test_oidc_config());
+        let run = Uuid::new_v4().simple().to_string();
+
+        // Fixture guard: the real ID-token extraction path yields an empty
+        // sub rather than rejecting it — which is exactly why the lookup
+        // layer must be the one to refuse the key.
+        let mut evil = user_from_token("", &format!("sub3204_{run}_evil"), None);
+        assert_eq!(evil.sub, "", "fixture guard: extraction passed '' through");
+        // The email placeholder derives from the sub; make it unique so this
+        // test cannot trip over users_email_key instead of the guard.
+        evil.email = format!("sub3204_{run}_evil@no-email.oidc.invalid");
+
+        let result = svc.get_or_create_user(&evil).await;
+
+        // Cleanup before asserting, in case the guard is absent and the row
+        // was created (scoped to this run's username prefix).
+        sqlx::query!(
+            "DELETE FROM users WHERE auth_provider = 'oidc' AND username LIKE $1",
+            format!("sub3204\\_{}\\_%", run)
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_err(),
+            "an empty OIDC 'sub' must never be used as external_id: the first \
+             such login provisions the '' row every later empty-sub login \
+             resolves to (identity collapse)"
+        );
+
+        // Positive control: two distinct subs provision two distinct accounts.
+        let alice = svc
+            .get_or_create_user(&user_from_token(
+                &format!("sub-{run}-alice"),
+                &format!("sub3204_{run}_alice"),
+                None,
+            ))
+            .await
+            .expect("a real sub must still provision");
+        let bob = svc
+            .get_or_create_user(&user_from_token(
+                &format!("sub-{run}-bob"),
+                &format!("sub3204_{run}_bob"),
+                None,
+            ))
+            .await
+            .expect("a second, distinct sub must still provision");
+        let collapsed = alice.id == bob.id;
+
+        for id in [alice.id, bob.id] {
+            let _ = sqlx::query!("DELETE FROM users WHERE id = $1", id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert!(
+            !collapsed,
+            "distinct subs must resolve to distinct accounts"
+        );
     }
 }

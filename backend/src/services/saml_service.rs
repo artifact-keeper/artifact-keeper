@@ -20,6 +20,13 @@ use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 use crate::services::federated_email::{resolve_federated_email, SAML_NO_EMAIL_DOMAIN};
 
+/// The SAML 2.0 transient NameID format URI (SAML 2.0 Core §8.3.8).
+///
+/// A transient NameID "SHOULD be treated as an opaque and temporary value by
+/// the relying party" — it is a per-session handle, not a stable identifier,
+/// so it can never serve as `users.external_id` (see `extract_user_info`).
+const TRANSIENT_NAME_ID_FORMAT: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:transient";
+
 /// SAML configuration
 #[derive(Clone)]
 pub struct SamlConfig {
@@ -958,6 +965,47 @@ impl SamlService {
 
     /// Extract user information from assertion
     fn extract_user_info(&self, assertion: &SamlAssertion) -> Result<SamlUserInfo> {
+        // The NameID is the account key: `get_or_create_user` stores it in
+        // `users.external_id` and looks accounts up by it. An empty (or
+        // missing, or whitespace-only — the parser trims text nodes) NameID
+        // therefore is not "a user with no identifier", it is THE SAME
+        // lookup key for every such assertion: the first login provisions a
+        // row with `external_id = ''` and every later empty-NameID login —
+        // any other person at the same IdP — silently resolves to that row
+        // (#3204). Reject at the parse boundary, before any identity is
+        // derived from the assertion.
+        if assertion.name_id.trim().is_empty() {
+            return Err(AppError::Authentication(
+                "SAML assertion has an empty or missing NameID. The NameID is the \
+                 federated account key, so an empty value cannot identify a user; \
+                 configure the IdP to release a stable NameID (persistent or \
+                 emailAddress format)"
+                    .into(),
+            ));
+        }
+
+        // A transient-format NameID is, per SAML 2.0 Core §8.3.8, "an
+        // identifier with transient semantics and SHOULD be treated as an
+        // opaque and temporary value by the relying party". A temporary
+        // per-session value cannot key the durable `users.external_id` row:
+        // at best every login provisions a fresh orphan account, and reuse of
+        // a handle across its validity windows resolves to whichever user
+        // happened to log in under it first. Reject it with a configuration
+        // error instead of provisioning garbage. Absent/unspecified formats
+        // stay accepted: §8.3.1 leaves their interpretation "to individual
+        // implementations", and AK's own AuthnRequest NameIDPolicy requests
+        // the unspecified format.
+        if assertion.name_id_format.as_deref() == Some(TRANSIENT_NAME_ID_FORMAT) {
+            return Err(AppError::Authentication(
+                "SAML assertion NameID uses the transient format \
+                 (urn:oasis:names:tc:SAML:2.0:nameid-format:transient), which is a \
+                 temporary per-session value (SAML 2.0 Core §8.3.8) and cannot be \
+                 used as a stable account identifier; configure the IdP to release \
+                 a persistent or emailAddress NameID"
+                    .into(),
+            ));
+        }
+
         // Get username from configured attribute or NameID
         let username = if self.config.username_attr == "NameID" {
             assertion.name_id.clone()
@@ -1031,6 +1079,21 @@ impl SamlService {
 
     /// Get or create a user from SAML information
     pub async fn get_or_create_user(&self, saml_user: &SamlUserInfo) -> Result<User> {
+        // Defense in depth for #3204: `extract_user_info` already rejects an
+        // empty NameID at the parse boundary, but this method is `pub` and is
+        // the layer where the collapse would actually happen — an empty
+        // `external_id` matches (or provisions) the SAME row for every caller,
+        // merging distinct federated identities into one account. Never let an
+        // empty key reach the lookup.
+        if saml_user.name_id.trim().is_empty() {
+            return Err(AppError::Authentication(
+                "refusing to resolve a SAML user with an empty NameID: the NameID \
+                 is the account key (users.external_id), and an empty key would \
+                 collapse distinct federated identities into a single account"
+                    .into(),
+            ));
+        }
+
         // Check if user already exists by external_id (NameID)
         let existing_user = sqlx::query_as!(
             User,
@@ -4231,5 +4294,247 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    // =======================================================================
+    // #3204: an empty NameID must never become the account key
+    // =======================================================================
+
+    /// An empty or whitespace-only NameID is rejected at the parse boundary
+    /// (`extract_user_info`), before any identity is derived. The positive
+    /// control in the same fixture proves a normal assertion still extracts —
+    /// a "fix" that rejected every assertion would fail here too.
+    #[tokio::test]
+    async fn empty_name_id_rejected_at_extraction() {
+        let svc = make_test_saml_service();
+
+        for bad in ["", "   ", "\t\n"] {
+            let result = svc.extract_user_info(&assertion_with(bad, "eve", None));
+            let err = result.expect_err(&format!(
+                "an assertion whose NameID is {bad:?} must be rejected: it would \
+                 become external_id = '' and collapse identities"
+            ));
+            assert!(
+                err.to_string().contains("NameID"),
+                "rejection must name the NameID so operators can act on it: {err}"
+            );
+        }
+
+        // Positive control: the same fixture with a real NameID extracts fine.
+        let ok = svc
+            .extract_user_info(&assertion_with("urn:idp:nameid:real-user", "eve", None))
+            .expect("a normal assertion must still extract");
+        assert_eq!(ok.name_id, "urn:idp:nameid:real-user");
+    }
+
+    /// The three XML shapes that all left `name_id` as `""` in the parsed
+    /// assertion — element absent, element empty, element self-closing — must
+    /// each fail extraction. Parsed through the real parser so the guard sees
+    /// exactly what a live response produces.
+    #[tokio::test]
+    async fn empty_name_id_xml_shapes_all_rejected() {
+        let svc = make_test_saml_service();
+        let real = r#"<saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">john.doe@example.com</saml:NameID>"#;
+        let base = valid_saml_response_xml(Some("_req"));
+        assert!(base.contains(real), "fixture guard: NameID line present");
+
+        for (shape, replacement) in [
+            ("empty element", "<saml:NameID></saml:NameID>"),
+            ("self-closing element", "<saml:NameID/>"),
+            ("whitespace only", "<saml:NameID>   </saml:NameID>"),
+            ("element absent", ""),
+        ] {
+            let xml = base.replace(real, replacement);
+            let assertion = svc
+                .parse_saml_response(&xml)
+                .expect("response parses")
+                .assertion
+                .expect("assertion present");
+            assert!(
+                assertion.name_id.trim().is_empty(),
+                "fixture guard ({shape}): parser must yield an empty name_id, \
+                 or this variant is not exercising the bug"
+            );
+            assert!(
+                svc.extract_user_info(&assertion).is_err(),
+                "{shape}: an assertion with no usable NameID must not extract"
+            );
+        }
+
+        // Positive control: the unmodified response still extracts.
+        let assertion = svc
+            .parse_saml_response(&base)
+            .expect("response parses")
+            .assertion
+            .expect("assertion present");
+        let info = svc
+            .extract_user_info(&assertion)
+            .expect("the unmodified fixture must still extract");
+        assert_eq!(info.name_id, "john.doe@example.com");
+    }
+
+    /// A transient-format NameID is "an opaque and temporary value"
+    /// (SAML 2.0 Core §8.3.8) — a per-session handle that cannot key the
+    /// durable `users.external_id` row. It must be rejected with an error
+    /// naming the format. Persistent (§8.3.7), emailAddress, and absent
+    /// formats (§8.3.1 leaves unspecified "to individual implementations",
+    /// and AK's own NameIDPolicy requests unspecified) all stay accepted.
+    #[tokio::test]
+    async fn transient_name_id_format_rejected_stable_formats_accepted() {
+        let svc = make_test_saml_service();
+
+        let with_format = |format: Option<&str>| SamlAssertion {
+            name_id_format: format.map(String::from),
+            ..assertion_with("urn:idp:nameid:someone", "someone", None)
+        };
+
+        let err = svc
+            .extract_user_info(&with_format(Some(
+                "urn:oasis:names:tc:SAML:2.0:nameid-format:transient",
+            )))
+            .expect_err("a transient NameID is not a stable account identifier");
+        assert!(
+            err.to_string().contains("transient"),
+            "rejection must name the transient format: {err}"
+        );
+
+        // Positive controls: every stable format still extracts.
+        for ok_format in [
+            Some("urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"),
+            Some("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"),
+            Some("urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"),
+            None,
+        ] {
+            svc.extract_user_info(&with_format(ok_format))
+                .unwrap_or_else(|e| panic!("format {ok_format:?} must extract: {e}"));
+        }
+    }
+
+    /// The lookup-layer guard: `get_or_create_user` is `pub` and is where the
+    /// collapse physically happens (`WHERE external_id = $1`), so it must
+    /// refuse an empty key even when handed a `SamlUserInfo` that bypassed
+    /// `extract_user_info`. Before the fix this test provisioned a row with
+    /// `external_id = ''` and a second empty-NameID "user" resolved to the
+    /// SAME row — identity collapse. DB-backed; no-ops without DATABASE_URL.
+    #[tokio::test]
+    async fn empty_name_id_never_reaches_the_external_id_lookup() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = SamlService::with_config(pool.clone(), make_test_saml_config());
+        let run = Uuid::new_v4().simple().to_string();
+
+        let info_with = |name_id: &str, tag: &str| SamlUserInfo {
+            name_id: name_id.to_string(),
+            name_id_format: None,
+            session_index: None,
+            username: format!("nameid3204_{run}_{tag}"),
+            email: format!("nameid3204_{run}_{tag}@no-email.saml.invalid"),
+            display_name: None,
+            groups: Vec::new(),
+            attributes: HashMap::new(),
+        };
+
+        // Two DIFFERENT people whose assertions both lost their NameID.
+        let first = svc.get_or_create_user(&info_with("", "first")).await;
+        let second = svc.get_or_create_user(&info_with("  ", "second")).await;
+
+        // Cleanup before asserting, in case the guard is absent and rows were
+        // created (scoped to this run's username prefix, never a real user).
+        sqlx::query!(
+            "DELETE FROM users WHERE auth_provider = 'saml' AND username LIKE $1",
+            format!("nameid3204\\_{}\\_%", run)
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            first.is_err(),
+            "an empty NameID must never be used as external_id: the first such \
+             login provisions the '' row every later empty-NameID login resolves to"
+        );
+        assert!(
+            second.is_err(),
+            "a whitespace-only NameID is the same empty key and must be rejected"
+        );
+
+        // Positive control: two DISTINCT NameIDs provision two DISTINCT
+        // accounts — a guard that simply rejected everything fails here.
+        let alice = svc
+            .get_or_create_user(&info_with(&format!("urn:idp:nameid:{run}-a"), "alice"))
+            .await
+            .expect("a real NameID must still provision");
+        let bob = svc
+            .get_or_create_user(&info_with(&format!("urn:idp:nameid:{run}-b"), "bob"))
+            .await
+            .expect("a second, distinct NameID must still provision");
+        let collapsed = alice.id == bob.id;
+
+        for id in [alice.id, bob.id] {
+            let _ = sqlx::query!("DELETE FROM users WHERE id = $1", id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert!(
+            !collapsed,
+            "distinct NameIDs must resolve to distinct accounts"
+        );
+    }
+
+    /// End to end through the real login path (`authenticate`): a response
+    /// whose assertion carries an empty NameID must fail after the
+    /// InResponseTo session is validated — proving the rejection comes from
+    /// the NameID guard, not from session machinery — and a normal response
+    /// on a second session must still succeed. DB-backed.
+    #[tokio::test]
+    async fn authenticate_rejects_empty_name_id_end_to_end() {
+        use crate::api::handlers::test_db_helpers as db_helpers;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let service = make_db_saml_service(pool.clone());
+        let real = r#"<saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">john.doe@example.com</saml:NameID>"#;
+
+        // Attack arm: valid session, empty NameID.
+        let request_id = format!("_id{}", Uuid::new_v4());
+        crate::services::auth_config_service::AuthConfigService::create_sso_session_with_state(
+            &pool,
+            "saml",
+            Uuid::new_v4(),
+            &request_id,
+        )
+        .await
+        .expect("create sso session");
+        let xml =
+            valid_saml_response_xml(Some(&request_id)).replace(real, "<saml:NameID></saml:NameID>");
+        assert!(!xml.contains("john.doe"), "fixture guard: NameID emptied");
+        let err = service
+            .authenticate(&base64_encode(xml.as_bytes()))
+            .await
+            .expect_err("an assertion with an empty NameID must not authenticate");
+        assert!(
+            err.to_string().contains("NameID"),
+            "failure must be the NameID guard, not session machinery: {err}"
+        );
+
+        // Positive control: a normal response on a fresh session still logs in.
+        let request_id2 = format!("_id{}", Uuid::new_v4());
+        crate::services::auth_config_service::AuthConfigService::create_sso_session_with_state(
+            &pool,
+            "saml",
+            Uuid::new_v4(),
+            &request_id2,
+        )
+        .await
+        .expect("create second sso session");
+        let ok = service
+            .authenticate(&base64_encode(
+                valid_saml_response_xml(Some(&request_id2)).as_bytes(),
+            ))
+            .await
+            .expect("a normal federated login must still succeed");
+        assert_eq!(ok.name_id, "john.doe@example.com");
     }
 }
