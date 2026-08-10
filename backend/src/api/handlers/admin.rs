@@ -1872,11 +1872,21 @@ mod tests {
     }
 
     /// DB-backed (skips without `DATABASE_URL`): the proxy-cache aggregate
-    /// must COALESCE `SUM(size_bytes)` to 0 — not NULL — over an empty table,
+    /// must COALESCE `SUM(size_bytes)` to 0 — not NULL — over an empty set,
     /// since the handler decodes the column as a non-nullable BIGINT
-    /// (`"size!"`). The shared test database can hold rows from concurrent
-    /// tests, so the empty-table shape is forced inside a transaction: the
-    /// DELETE is rolled back and never observed by other tests.
+    /// (`"size!"`). Without the COALESCE, `SUM` yields SQL NULL and the
+    /// `(i64, i64)` decode below is a hard error, so this test fails.
+    ///
+    /// #3277: the empty set is a SCOPED subset, not the whole table. The
+    /// suite runs process-per-test against a SHARED database, and the
+    /// previous shape (DELETE everything + cluster-wide aggregate inside a
+    /// rolled-back transaction) raced concurrent tests: READ COMMITTED lets
+    /// the SELECT see rows other tests commit after the DELETE. Filtering on
+    /// a freshly generated `repository_id` gives a subset the FK to
+    /// `repositories` guarantees is empty — `SUM` over zero rows is NULL
+    /// either way, so the COALESCE contract is exercised identically with no
+    /// global assumption. Same approach as #3242 for the storage-GC
+    /// footprint test.
     #[tokio::test]
     async fn test_proxy_cache_stats_query_empty_table_coalesces_to_zero_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -1885,24 +1895,22 @@ mod tests {
             return;
         };
 
-        let mut tx = pool.begin().await.expect("begin transaction");
-        sqlx::query("DELETE FROM proxy_cache_artifacts")
-            .execute(&mut *tx)
-            .await
-            .expect("clear proxy cache rows inside transaction");
+        // Never inserted into `repositories`, so the FK guarantees no
+        // `proxy_cache_artifacts` row can carry it: a deterministically
+        // empty subset regardless of concurrent suite activity.
+        let unused_repo_id = Uuid::new_v4();
+
         let (count, size): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)::BIGINT FROM proxy_cache_artifacts",
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)::BIGINT \
+             FROM proxy_cache_artifacts WHERE repository_id = $1",
         )
-        .fetch_one(&mut *tx)
+        .bind(unused_repo_id)
+        .fetch_one(&pool)
         .await
-        .expect("aggregate over empty proxy cache table");
-        tx.rollback().await.expect("rollback");
+        .expect("aggregate over empty proxy cache subset");
 
         assert_eq!(count, 0);
-        assert_eq!(
-            size, 0,
-            "COALESCE must map SUM's NULL to 0 on an empty table"
-        );
+        assert_eq!(size, 0, "COALESCE must map SUM's NULL to 0 on an empty set");
     }
 
     /// DB-backed regression for #3134: the dashboard `total_storage_bytes`
@@ -2127,10 +2135,15 @@ mod tests {
 
     /// DB-backed (skips without `DATABASE_URL`): the #3134 ledger aggregate
     /// must COALESCE `SUM(...)` to 0 — not NULL — over an empty
-    /// `repository_usage_ledger` (a fresh install's dashboard), since the
-    /// handler decodes both columns as non-nullable BIGINT (`"total!"`,
-    /// `"proxy!"`). Same shape-forcing pattern as the proxy-cache test above:
-    /// the DELETE happens inside a rolled-back transaction.
+    /// `repository_usage_ledger` set (a fresh install's dashboard), since
+    /// the handler decodes both columns as non-nullable BIGINT (`"total!"`,
+    /// `"proxy!"`). Without the COALESCE, `SUM` yields SQL NULL and the
+    /// `(i64, i64)` decode is a hard error, so this test fails.
+    ///
+    /// #3277: same scoped-empty-subset shape as the proxy-cache test above —
+    /// the previous DELETE-then-aggregate-in-a-rolled-back-transaction raced
+    /// concurrent tests under READ COMMITTED (this table is written by the
+    /// migration-182 triggers on every artifact insert suite-wide).
     #[tokio::test]
     async fn test_ledger_totals_query_empty_table_coalesces_to_zero_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -2139,20 +2152,19 @@ mod tests {
             return;
         };
 
-        let mut tx = pool.begin().await.expect("begin transaction");
-        sqlx::query("DELETE FROM repository_usage_ledger")
-            .execute(&mut *tx)
-            .await
-            .expect("clear ledger rows inside transaction");
+        // Never inserted into `repositories`; the ledger PK/FK guarantees an
+        // empty subset for it.
+        let unused_repo_id = Uuid::new_v4();
+
         let (total, proxy): (i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(hosted_bytes + proxy_bytes + oci_bytes), 0)::BIGINT, \
                     COALESCE(SUM(proxy_bytes), 0)::BIGINT \
-             FROM repository_usage_ledger",
+             FROM repository_usage_ledger WHERE repository_id = $1",
         )
-        .fetch_one(&mut *tx)
+        .bind(unused_repo_id)
+        .fetch_one(&pool)
         .await
-        .expect("aggregate over empty ledger");
-        tx.rollback().await.expect("rollback");
+        .expect("aggregate over empty ledger subset");
 
         assert_eq!(total, 0, "COALESCE must map SUM's NULL to 0");
         assert_eq!(proxy, 0, "COALESCE must map SUM's NULL to 0");
