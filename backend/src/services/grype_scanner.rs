@@ -361,6 +361,17 @@ fn parse_grype_output(
 /// `pub(crate)` so `ImageScanner::registry_url` reuses the same host-resolution
 /// logic when telling the Harbor scanner-adapter which registry to pull from.
 pub(crate) fn resolve_registry_host() -> String {
+    configured_registry_host().unwrap_or_else(|| normalize_registry_host("http://localhost:8080"))
+}
+
+/// The *explicitly configured* registry host, if any: `AK_GRYPE_REGISTRY_HOST`
+/// then `PEER_PUBLIC_ENDPOINT`, normalized to `host[:port]`. Returns `None`
+/// when neither is set, i.e. the caller would be on the `localhost:8080` dev
+/// fallback. Split out of [`resolve_registry_host`] so `ImageScanner` can tell
+/// "operator chose this host" apart from "dev fallback" — the fallback is only
+/// correct for pullers that share the backend's network namespace (grype execs
+/// in-process; the scanner-adapter does not — #3169).
+pub(crate) fn configured_registry_host() -> Option<String> {
     let raw = std::env::var("AK_GRYPE_REGISTRY_HOST")
         .ok()
         .filter(|s| !s.is_empty())
@@ -368,9 +379,13 @@ pub(crate) fn resolve_registry_host() -> String {
             std::env::var("PEER_PUBLIC_ENDPOINT")
                 .ok()
                 .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "http://localhost:8080".to_string());
+        })?;
+    Some(normalize_registry_host(&raw))
+}
 
+/// Strip scheme, trailing `/`, and any embedded `user[:pass]@` credentials
+/// from a registry endpoint so it can be used as a bare `host[:port]`.
+fn normalize_registry_host(raw: &str) -> String {
     let no_scheme = raw
         .trim_end_matches('/')
         .trim_start_matches("https://")

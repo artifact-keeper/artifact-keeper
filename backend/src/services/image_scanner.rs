@@ -260,6 +260,89 @@ pub(crate) fn build_adapter_scan_artifact(
     })
 }
 
+/// `host[:port]` of a URL-ish string (scheme optional). IPv6 hosts keep their
+/// brackets. Pure fn.
+fn url_host_port(url: &str) -> Option<(String, u16)> {
+    let candidate = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("http://{}", url)
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    Some((host, port))
+}
+
+/// True when `host` (with or without IPv6 brackets) is a loopback name or
+/// address. Loopback is per-network-namespace: it never names this backend
+/// from inside a different container. Pure fn.
+fn host_is_loopback(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// The local IP this host would use to reach `host:port`, via a connected UDP
+/// socket (route lookup only — no packet is sent). `None` when the host does
+/// not resolve or no route exists.
+fn local_ip_toward(host: &str, port: u16) -> Option<std::net::IpAddr> {
+    use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let addrs: Vec<SocketAddr> = (bare, port).to_socket_addrs().ok()?.collect();
+    for addr in addrs {
+        let bind = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        if let Ok(sock) = UdpSocket::bind(bind) {
+            if sock.connect(addr).is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    return Some(local.ip());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// This backend's own listening port, from `BIND_ADDRESS` (`host:port`,
+/// default `0.0.0.0:8080` — mirrors `Config::from_env`).
+fn own_listen_port() -> u16 {
+    std::env::var("BIND_ADDRESS")
+        .ok()
+        .and_then(|addr| addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok()))
+        .unwrap_or(8080)
+}
+
+/// Registry URL for a *remote* scanner adapter when no registry endpoint is
+/// configured: this backend's own address as routed toward the adapter, with
+/// the backend's listening port. Returns `None` (caller keeps the loopback
+/// dev fallback) when the adapter itself is loopback — i.e. it shares this
+/// network namespace, where `localhost` is correct — or when the adapter host
+/// cannot be resolved/routed.
+fn adapter_visible_registry_url(adapter_url: &str) -> Option<String> {
+    let (host, port) = url_host_port(adapter_url)?;
+    if host_is_loopback(&host) {
+        return None;
+    }
+    let ip = local_ip_toward(&host, port)?;
+    if ip.is_loopback() {
+        // The adapter name resolved to a loopback alias after all; a loopback
+        // registry URL is then no worse than the substitution.
+        return None;
+    }
+    let own_port = own_listen_port();
+    Some(match ip {
+        std::net::IpAddr::V4(v4) => format!("http://{}:{}", v4, own_port),
+        std::net::IpAddr::V6(v6) => format!("http://[{}]:{}", v6, own_port),
+    })
+}
+
 /// Container image scanner that delegates to a Harbor Pluggable Scanner API v1
 /// adapter (e.g. `harbor-scanner-trivy`) over HTTP.
 ///
@@ -340,14 +423,57 @@ impl ImageScanner {
         crate::services::scanner_service::is_oci_image_artifact(artifact)
     }
 
-    /// Registry base URL the adapter should pull from. Host comes from the
-    /// shared `grype_scanner::resolve_registry_host` (AK_GRYPE_REGISTRY_HOST /
-    /// PEER_PUBLIC_ENDPOINT / `localhost:8080`), which strips any scheme and
-    /// embedded credentials; we re-add an `http://` scheme for the adapter's
-    /// registry client.
-    fn registry_url() -> String {
-        let host = crate::services::grype_scanner::resolve_registry_host();
-        format!("http://{}", host)
+    /// Registry base URL the adapter should pull from, in precedence order:
+    ///
+    /// 1. `TRIVY_ADAPTER_REGISTRY_URL` — dedicated override for the adapter
+    ///    path (full URL, scheme preserved; a bare `host[:port]` gets
+    ///    `http://`). Lets operators point the adapter at a different endpoint
+    ///    (e.g. a TLS edge) without re-pointing grype.
+    /// 2. The shared grype chain (`AK_GRYPE_REGISTRY_HOST` /
+    ///    `PEER_PUBLIC_ENDPOINT`) when *explicitly configured* — scheme and
+    ///    credentials stripped, `http://` re-added, exactly as before.
+    /// 3. Nothing configured: the historical `http://localhost:8080` dev
+    ///    fallback is only correct when the adapter shares this process's
+    ///    network namespace (`cargo run` + local adapter). In the documented
+    ///    compose topology the adapter is a SEPARATE container that itself
+    ///    listens on `:8080` (`SCANNER_ADAPTER_ADDR`), so handing it a
+    ///    loopback registry URL makes trivy dial the adapter *itself* and
+    ///    every image scan fails with "unable to find the specified image"
+    ///    (#3169). When the adapter host is non-loopback, advertise this
+    ///    backend's own address on the interface that routes toward the
+    ///    adapter instead.
+    fn registry_url(&self) -> String {
+        if let Some(explicit) = std::env::var("TRIVY_ADAPTER_REGISTRY_URL")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return if explicit.starts_with("http://") || explicit.starts_with("https://") {
+                explicit
+            } else {
+                format!("http://{}", explicit)
+            };
+        }
+
+        if let Some(host) = crate::services::grype_scanner::configured_registry_host() {
+            return format!("http://{}", host);
+        }
+
+        match adapter_visible_registry_url(&self.adapter_url) {
+            Some(url) => {
+                info!(
+                    "No registry endpoint configured (TRIVY_ADAPTER_REGISTRY_URL / \
+                     AK_GRYPE_REGISTRY_HOST / PEER_PUBLIC_ENDPOINT); scanner adapter at {} \
+                     is remote, so advertising this backend as {} for image pulls",
+                    self.adapter_url, url
+                );
+                url
+            }
+            None => format!(
+                "http://{}",
+                crate::services::grype_scanner::resolve_registry_host()
+            ),
+        }
     }
 
     /// Mint the `registry.authorization` value for a scan request, or `None`
@@ -611,7 +737,7 @@ impl ImageScanner {
         // BadGateway rather than mid-stream.
         self.check_adapter_health().await?;
 
-        let registry_url = Self::registry_url();
+        let registry_url = self.registry_url();
         // Mint a per-repository scoped pull token only when we know which repo
         // is being scanned (the repository-aware `scan_target` path). The
         // legacy keyless `scan` path pulls anonymously as before.
@@ -1421,5 +1547,253 @@ mod tests {
         assert!(dbody["artifact"].get("tag").is_none());
         // No minter -> no authorization field.
         assert!(dbody["registry"].get("authorization").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // #3169: the registry URL handed to the adapter
+    //
+    // The adapter is a separate container that itself listens on :8080, so the
+    // historical `http://localhost:8080` dev fallback made trivy dial the
+    // adapter instead of this registry and every image scan failed with
+    // "unable to find the specified image". These tests pin the URL the
+    // adapter actually receives.
+    // -----------------------------------------------------------------------
+
+    /// Serializes the env-mutating registry-URL tests (process-global env).
+    /// nextest runs each test in its own process, but keep `cargo test` safe
+    /// within this module too.
+    static REGISTRY_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Snapshot + clear every env var `registry_url` consults; restore on drop.
+    struct RegistryEnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl RegistryEnvGuard {
+        const VARS: [&'static str; 4] = [
+            "TRIVY_ADAPTER_REGISTRY_URL",
+            "AK_GRYPE_REGISTRY_HOST",
+            "PEER_PUBLIC_ENDPOINT",
+            "BIND_ADDRESS",
+        ];
+
+        fn new() -> Self {
+            let lock = REGISTRY_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+            let saved = Self::VARS
+                .iter()
+                .map(|&k| {
+                    let v = std::env::var(k).ok();
+                    std::env::remove_var(k);
+                    (k, v)
+                })
+                .collect();
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for RegistryEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Mount a full happy-path adapter (ready + submit + report) and run a
+    /// scan, returning the captured `POST /api/v1/scan` body and the scan
+    /// result. The report carries one finding so the same fixture doubles as
+    /// the positive control: a legitimately-addressed scan still completes.
+    async fn run_scan_and_capture_request(
+        scanner: &ImageScanner,
+        server: &wiremock::MockServer,
+    ) -> (serde_json::Value, Result<ScanOutput>) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        mount_ready_and_submit(server, "scan-registry-url").await;
+        let report = serde_json::json!({
+            "scanner": {"name": "Trivy", "version": "0.71.2"},
+            "vulnerabilities": [{
+                "id": "CVE-2026-0001",
+                "package": "openssl",
+                "version": "3.1.0",
+                "severity": "High"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/scan/.+/report$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(report))
+            .mount(server)
+            .await;
+
+        let result = scanner
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock request recording enabled");
+        let submit = requests
+            .iter()
+            .find(|r| r.url.path() == "/api/v1/scan")
+            .expect("scan submit request was sent");
+        let body: serde_json::Value =
+            serde_json::from_slice(&submit.body).expect("submit body is JSON");
+        (body, result)
+    }
+
+    /// #3169 REVERT-PROOF ANCHOR: with `TRIVY_ADAPTER_REGISTRY_URL` set, the
+    /// adapter must receive exactly that registry URL — never the loopback
+    /// dev fallback. On the pre-fix tree the env var is ignored and the body
+    /// carries `http://localhost:8080`, so this fails at the assertion.
+    /// The same fixture proves the positive control: the scan completes with
+    /// findings, so the override does not break a legitimate scan.
+    #[tokio::test]
+    async fn test_scan_request_registry_url_honors_adapter_registry_override() {
+        let _env = RegistryEnvGuard::new();
+        std::env::set_var("TRIVY_ADAPTER_REGISTRY_URL", "http://ak-backend:8080");
+
+        let server = wiremock::MockServer::start().await;
+        let scanner = ImageScanner::new(server.uri());
+        let (body, result) = run_scan_and_capture_request(&scanner, &server).await;
+
+        assert_eq!(
+            body["registry"]["url"], "http://ak-backend:8080",
+            "the adapter must be told to pull from the configured registry URL, \
+             not the loopback dev fallback (#3169)"
+        );
+        let out = result.expect("positive control: a correctly-addressed scan completes");
+        assert_eq!(out.findings.len(), 1);
+    }
+
+    /// Same-netns control: with nothing configured and a LOOPBACK adapter
+    /// (the wiremock server), the dev fallback is still advertised unchanged —
+    /// loopback is correct when the adapter shares this network namespace.
+    #[tokio::test]
+    async fn test_scan_request_registry_url_defaults_loopback_for_loopback_adapter() {
+        let _env = RegistryEnvGuard::new();
+
+        let server = wiremock::MockServer::start().await;
+        let scanner = ImageScanner::new(server.uri());
+        let (body, result) = run_scan_and_capture_request(&scanner, &server).await;
+
+        assert_eq!(
+            body["registry"]["url"], "http://localhost:8080",
+            "a loopback (same-netns) adapter keeps the historical dev fallback"
+        );
+        assert!(result.is_ok());
+    }
+
+    /// Explicit override shapes: bare host gets `http://`, full URLs keep
+    /// their scheme (incl. https) and lose only a trailing slash.
+    #[test]
+    fn test_registry_url_override_shapes() {
+        let _env = RegistryEnvGuard::new();
+        let scanner = ImageScanner::new("http://scanner-adapter:8080".to_string());
+
+        std::env::set_var("TRIVY_ADAPTER_REGISTRY_URL", "backend:8080");
+        assert_eq!(scanner.registry_url(), "http://backend:8080");
+
+        std::env::set_var("TRIVY_ADAPTER_REGISTRY_URL", "https://ak.example.com/");
+        assert_eq!(scanner.registry_url(), "https://ak.example.com");
+    }
+
+    /// The explicitly-configured grype chain keeps winning exactly as before:
+    /// scheme + credentials stripped, `http://` re-added. No substitution.
+    #[test]
+    fn test_registry_url_grype_chain_when_configured() {
+        let _env = RegistryEnvGuard::new();
+        let scanner = ImageScanner::new("http://scanner-adapter:8080".to_string());
+
+        std::env::set_var("AK_GRYPE_REGISTRY_HOST", "http://backend:8080");
+        assert_eq!(scanner.registry_url(), "http://backend:8080");
+        std::env::remove_var("AK_GRYPE_REGISTRY_HOST");
+
+        std::env::set_var("PEER_PUBLIC_ENDPOINT", "https://primary.example.com");
+        assert_eq!(scanner.registry_url(), "http://primary.example.com");
+    }
+
+    /// With nothing configured and a REMOTE (non-loopback) adapter, the
+    /// backend must not advertise a loopback registry URL: inside the adapter
+    /// container loopback is the adapter itself (`SCANNER_ADAPTER_ADDR=:8080`),
+    /// which is exactly the #3169 failure. The advertised URL carries this
+    /// host's route-facing IP and the backend's own BIND_ADDRESS port.
+    /// Skipped (vacuously) only when the environment offers no route at all.
+    #[test]
+    fn test_registry_url_remote_adapter_substitutes_own_address() {
+        let _env = RegistryEnvGuard::new();
+        std::env::set_var("BIND_ADDRESS", "0.0.0.0:18080");
+
+        // TEST-NET-1 (RFC 5737): never loopback; a UDP connect performs only a
+        // route lookup, no packet is sent.
+        let Some(ip) = local_ip_toward("192.0.2.1", 8080) else {
+            // No default route in this environment — derivation is documented
+            // to fall back to the historical loopback URL.
+            let scanner = ImageScanner::new("http://192.0.2.1:8080".to_string());
+            assert_eq!(scanner.registry_url(), "http://localhost:8080");
+            return;
+        };
+        assert!(!ip.is_loopback());
+
+        let scanner = ImageScanner::new("http://192.0.2.1:8080".to_string());
+        let expected = match ip {
+            std::net::IpAddr::V4(v4) => format!("http://{}:18080", v4),
+            std::net::IpAddr::V6(v6) => format!("http://[{}]:18080", v6),
+        };
+        assert_eq!(
+            scanner.registry_url(),
+            expected,
+            "a remote adapter must be handed this backend's routable address, \
+             never loopback (#3169)"
+        );
+    }
+
+    /// An unresolvable adapter host degrades to the historical fallback
+    /// rather than failing the scan before it starts.
+    #[test]
+    fn test_registry_url_unresolvable_adapter_keeps_fallback() {
+        let _env = RegistryEnvGuard::new();
+        let scanner = ImageScanner::new("http://no-such-host.invalid:8080".to_string());
+        assert_eq!(scanner.registry_url(), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_host_is_loopback() {
+        assert!(host_is_loopback("localhost"));
+        assert!(host_is_loopback("LOCALHOST"));
+        assert!(host_is_loopback("127.0.0.1"));
+        assert!(host_is_loopback("127.1.2.3"));
+        assert!(host_is_loopback("[::1]"));
+        assert!(!host_is_loopback("backend"));
+        assert!(!host_is_loopback("192.0.2.1"));
+        assert!(!host_is_loopback("[2001:db8::1]"));
+    }
+
+    #[test]
+    fn test_url_host_port() {
+        assert_eq!(
+            url_host_port("http://scanner-adapter:8080"),
+            Some(("scanner-adapter".to_string(), 8080))
+        );
+        // Scheme-less input and known-default ports.
+        assert_eq!(
+            url_host_port("scanner-adapter:8080"),
+            Some(("scanner-adapter".to_string(), 8080))
+        );
+        assert_eq!(
+            url_host_port("https://ak.example.com"),
+            Some(("ak.example.com".to_string(), 443))
+        );
+        // IPv6 hosts keep brackets.
+        assert_eq!(
+            url_host_port("http://[::1]:8090"),
+            Some(("[::1]".to_string(), 8090))
+        );
+        assert_eq!(url_host_port(""), None);
     }
 }

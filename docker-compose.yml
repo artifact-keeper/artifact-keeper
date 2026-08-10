@@ -255,6 +255,13 @@ services:
       # (adapter >= 1.2.0), taking precedence over TRIVY_URL there. Uncomment
       # this line and the `scanner-adapter` service block below to enable it.
       # TRIVY_ADAPTER_URL: http://scanner-adapter:8080
+      #
+      # Registry endpoint the adapter pulls images from (#3169). When unset,
+      # the backend advertises its own compose-network address automatically,
+      # which is correct for this file's topology. Set it explicitly when the
+      # adapter must reach the registry through a different endpoint (e.g. a
+      # TLS edge or a non-default network):
+      # TRIVY_ADAPTER_REGISTRY_URL: http://backend:8080
       OPENSCAP_URL: http://openscap:8091
       SCAN_WORKSPACE_PATH: /scan-workspace
       OPENSEARCH_URL: http://opensearch:9200
@@ -371,7 +378,12 @@ services:
   #     # network's plain HTTP. Leave true on the internal network.
   #     SCANNER_TRIVY_INSECURE: "true"
   #   volumes:
-  #     - trivy_cache:/home/scanner/.cache/trivy
+  #     # Dedicated cache volume — do NOT reuse `trivy_cache`: that volume is
+  #     # owned by root (the trivy *server* above runs as root and mounts it at
+  #     # /root/.cache/trivy), while the adapter runs as UID 1001, so sharing it
+  #     # fails with `permission denied` on fanal/fanal.db (#3169). Uncomment
+  #     # the matching `scanner_adapter_cache:` entry under `volumes:` below.
+  #     - scanner_adapter_cache:/home/scanner/.cache/trivy
   #     - scan_workspace:/scan-workspace:ro
   #   restart: unless-stopped
 
@@ -534,6 +546,10 @@ volumes:
     driver: local
   trivy_cache:
     driver: local
+  # Uncomment together with the `scanner-adapter` service (its trivy cache;
+  # kept separate from the root-owned `trivy_cache`, see #3169):
+  # scanner_adapter_cache:
+  #   driver: local
   opensearch_data:
     driver: local
   scan_workspace:
