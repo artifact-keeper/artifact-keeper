@@ -455,14 +455,20 @@ fn oci_scopes_grant(scopes: &Option<Vec<String>>, required: &str) -> bool {
 
 /// Build a 403 Forbidden response when an API-token scope check fails on
 /// an OCI write/delete path. See GHSA-vvc3-h39c-mrq5.
+///
+/// Uses the OCI error envelope (#3110): the distribution-spec "Error Codes"
+/// section requires any JSON body on a 4XX to be
+/// `{"errors":[{"code","message","detail"}]}`, and a bare-string body is
+/// opaque to conforming clients (docker/podman surface `errors[0].message`).
+/// `DENIED` is the registered code (code-12, "requested access to the
+/// resource is denied"). The legacy message text is preserved verbatim
+/// inside the envelope so operators/scripts that match on it keep working.
 fn oci_forbidden_scope(required: &str) -> Response {
-    Response::builder()
-        .status(StatusCode::FORBIDDEN)
-        .body(Body::from(format!(
-            "Token does not have required scope: {}",
-            required
-        )))
-        .unwrap()
+    oci_error(
+        StatusCode::FORBIDDEN,
+        "DENIED",
+        &format!("Token does not have required scope: {}", required),
+    )
 }
 
 /// Build a 403 Forbidden response when a caller is authenticated but lacks
@@ -7404,7 +7410,9 @@ async fn handle_head_manifest(
     )
     .await
     {
-        return resp;
+        // #3110: re-shape the shared gate's REST-style body into the OCI
+        // error envelope this surface is contractually required to emit.
+        return oci_curation_deny_response(resp.status(), &repo.image);
     }
 
     // Reference can be a tag or a digest. Resolve locally first: a surviving
@@ -7880,6 +7888,25 @@ fn oci_manifest_synthetic_artifact(
     }
 }
 
+/// Map the shared curation gate's deny response onto the OCI error envelope
+/// (#3110). `proxy_helpers::enforce_curation_lookup` builds a REST-shaped
+/// `{"error":"curation_blocked",...}` body shared by every proxy format; on
+/// the `/v2` surface that shape violates the distribution-spec "Error Codes"
+/// MUST (a 4XX JSON body must be `{"errors":[...]}`) and docker clients
+/// cannot render it. Status is preserved; the `curation_blocked` marker is
+/// kept inside the message so existing oracles/scripts that grep for it
+/// still match. Sibling of [`oci_scan_deny_response`].
+fn oci_curation_deny_response(status: StatusCode, image: &str) -> Response {
+    oci_error(
+        status,
+        "DENIED",
+        &format!(
+            "curation_blocked: pull of {} is blocked by this repository's curation policy",
+            image
+        ),
+    )
+}
+
 /// Map the shared gate's deny response onto the OCI error body shape docker
 /// clients surface. Status is preserved: 403 = cached/inline vulnerable
 /// verdict, 423 = inconclusive under fail-closed (scan pending/failed —
@@ -8269,7 +8296,9 @@ async fn handle_get_manifest(
     )
     .await
     {
-        return resp;
+        // #3110: re-shape the shared gate's REST-style body into the OCI
+        // error envelope this surface is contractually required to emit.
+        return oci_curation_deny_response(resp.status(), &repo.image);
     }
 
     // Resolve locally first: a surviving tag row, or — for a digest this hosted
@@ -10792,16 +10821,54 @@ mod tests {
 
     #[tokio::test]
     async fn test_oci_forbidden_scope_status_and_body() {
-        // The body string is part of the contract; clients (and clients of
-        // clients) parse it to know whether they hit an auth wall.
+        // #3110: on the /v2 surface the error body is contractually the OCI
+        // error envelope (distribution-spec "Error Codes": a 4XX JSON body
+        // MUST be `{"errors":[{"code","message","detail"}]}` with a
+        // registered code). Assert the PARSED structure, not a substring —
+        // a substring match would pass on the pre-#3110 bare-string body.
         let resp = oci_forbidden_scope("write");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "OCI error responses must be application/json"
+        );
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        let s = String::from_utf8_lossy(&body);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("OCI error body must be valid JSON");
+        assert_eq!(
+            parsed["errors"][0]["code"].as_str(),
+            Some("DENIED"),
+            "scope denial must use the registered DENIED code (code-12): {parsed}"
+        );
+        // The legacy message text is preserved verbatim inside the envelope
+        // (test-ghsa-vvc3-scope-checks.sh greps the raw body for it).
         assert!(
-            s.contains("Token does not have required scope: write"),
-            "unexpected body: {}",
-            s
+            parsed["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Token does not have required scope: write"),
+            "unexpected message: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_curation_deny_response_is_oci_error_envelope() {
+        // #3110: the shared curation gate's `{"error":"curation_blocked"}`
+        // REST shape must never reach the /v2 wire; the OCI mapping keeps the
+        // status and re-shapes the body into the spec envelope.
+        let resp = oci_curation_deny_response(StatusCode::FORBIDDEN, "someimage");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("OCI error body must be valid JSON");
+        assert_eq!(parsed["errors"][0]["code"].as_str(), Some("DENIED"));
+        let message = parsed["errors"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("curation_blocked") && message.contains("someimage"),
+            "message must keep the curation_blocked marker and name the image: {parsed}"
         );
     }
 
@@ -29454,5 +29521,237 @@ mod oci_read_authz_tests {
             String::from_utf8_lossy(&granted_private_body).contains(MANIFEST_MARKER),
             "the granted principal's 200 must carry the private manifest bytes"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OCI error-envelope conformance through the router (#3110).
+//
+// The distribution-spec "Error Codes" section pins the error body contract:
+// a 4XX response body that is JSON MUST be
+// `{"errors":[{"code","message","detail"}]}` with `code` drawn from the
+// registered set. Two /v2 deny paths violated it: the GHSA-vvc3 API-token
+// scope gate returned a bare-string 403, and the shared curation gate
+// returned the REST-shaped `{"error":"curation_blocked",...}` body. These
+// tests drive both through the real router and assert the PARSED envelope
+// (never a substring, which the malformed shapes would also satisfy), each
+// with a positive control in the same fixture so an over-blocking gate
+// cannot satisfy the deny assertion by failing everything.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod oci_error_envelope_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const IMAGE_MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:3110311031103110311031103110311031103110311031103110311031103110","size":4},"layers":[]}"#;
+
+    async fn send(app: Router, request: Request<Body>) -> (StatusCode, serde_json::Value, Bytes) {
+        let resp = app.oneshot(request).await.expect("oneshot");
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        let parsed = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, parsed, body)
+    }
+
+    fn assert_oci_envelope(parsed: &serde_json::Value, raw: &Bytes, expected_code: &str) {
+        let code = parsed["errors"][0]["code"].as_str();
+        assert_eq!(
+            code,
+            Some(expected_code),
+            "body must be the OCI error envelope with code {expected_code}; got: {}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+
+    /// GHSA-vvc3 scope gate: a read-scoped API token on `docker push`'s
+    /// manifest PUT must be refused with the OCI envelope (403 DENIED), and
+    /// a wildcard-scoped token on the byte-identical request must succeed.
+    #[tokio::test]
+    async fn scope_denied_manifest_put_returns_oci_error_envelope() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read", "write"]).await;
+        let auth_service = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let (read_token, _) = auth_service
+            .generate_api_token(
+                fx.user_id,
+                "envelope-read",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("generate read-scoped API token");
+        let (full_token, _) = auth_service
+            .generate_api_token(fx.user_id, "envelope-full", vec!["*".to_string()], None)
+            .await
+            .expect("generate wildcard API token");
+
+        let uri = format!("/{}/image/manifests/v3110", fx.repo_key);
+        let put = |token: String, uri: String| {
+            Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header(
+                    AUTHORIZATION,
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode(format!("{}:{}", fx.username, token))
+                    ),
+                )
+                .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(IMAGE_MANIFEST))
+                .expect("build request")
+        };
+
+        let (denied_status, denied_json, denied_raw) = send(
+            router().with_state(fx.state.clone()),
+            put(read_token, uri.clone()),
+        )
+        .await;
+
+        let (allowed_status, _allowed_json, allowed_raw) = send(
+            router().with_state(fx.state.clone()),
+            put(full_token, uri.clone()),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await;
+        for table in ["oci_manifest_refs", "manifest_blob_refs", "oci_tags"] {
+            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
+                .bind(fx.repo_id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            denied_status,
+            StatusCode::FORBIDDEN,
+            "read-scoped token must be refused on manifest PUT: {}",
+            String::from_utf8_lossy(&denied_raw)
+        );
+        assert_oci_envelope(&denied_json, &denied_raw, "DENIED");
+        assert!(
+            denied_json["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Token does not have required scope"),
+            "envelope message must carry the scope-denial text: {denied_json}"
+        );
+        // Positive control, same fixture, byte-identical request: the gate
+        // must open for a token that HAS the scope — otherwise the deny
+        // assertion above would also be satisfied by a gate that rejects
+        // everything.
+        assert_eq!(
+            allowed_status,
+            StatusCode::CREATED,
+            "wildcard-scoped token must complete the same PUT: {}",
+            String::from_utf8_lossy(&allowed_raw)
+        );
+    }
+
+    /// Curation block on a proxy pull: the manifest GET for a blocked image
+    /// must return the OCI envelope (403 DENIED, message carrying the
+    /// `curation_blocked` marker), while a non-blocked image on the same
+    /// repository falls through the gate (and its miss is itself the
+    /// spec-shaped 404 MANIFEST_UNKNOWN envelope).
+    #[tokio::test]
+    async fn curation_blocked_manifest_get_returns_oci_error_envelope() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, curation_default_action = 'allow' \
+             WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable curation on fixture repo");
+        sqlx::query(
+            "INSERT INTO curation_rules \
+                 (staging_repo_id, package_pattern, version_constraint, architecture, \
+                  action, priority, reason, enabled, created_by) \
+             VALUES ($1, 'blockedimg*', '*', '*', 'block', 10, 'blocked by test rule', true, $2)",
+        )
+        .bind(fx.repo_id)
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert curation block rule");
+
+        let auth_service = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let (api_token, _) = auth_service
+            .generate_api_token(fx.user_id, "envelope-curation", vec!["*".to_string()], None)
+            .await
+            .expect("generate API token");
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", fx.username, api_token))
+        );
+        let get = |image: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{}/{}/manifests/latest", fx.repo_key, image))
+                .header(AUTHORIZATION, basic.clone())
+                .body(Body::empty())
+                .expect("build request")
+        };
+
+        let (blocked_status, blocked_json, blocked_raw) =
+            send(router().with_state(fx.state.clone()), get("blockedimg")).await;
+        let (allowed_status, allowed_json, allowed_raw) =
+            send(router().with_state(fx.state.clone()), get("goodimg")).await;
+
+        let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "curation-blocked image pull must be 403: {}",
+            String::from_utf8_lossy(&blocked_raw)
+        );
+        assert_oci_envelope(&blocked_json, &blocked_raw, "DENIED");
+        assert!(
+            blocked_json["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("curation_blocked"),
+            "envelope message must keep the curation_blocked marker: {blocked_json}"
+        );
+        // Positive control, same fixture: the non-matching image must NOT be
+        // caught by the gate. Its upstream miss (no reachable upstream in
+        // this fixture) is the spec-shaped MANIFEST_UNKNOWN 404 — which also
+        // pins the 404 arm's envelope.
+        assert_eq!(
+            allowed_status,
+            StatusCode::NOT_FOUND,
+            "non-blocked image must pass the curation gate: {}",
+            String::from_utf8_lossy(&allowed_raw)
+        );
+        assert_oci_envelope(&allowed_json, &allowed_raw, "MANIFEST_UNKNOWN");
     }
 }
