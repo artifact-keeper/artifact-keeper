@@ -326,9 +326,21 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    // Gate 3: Honor quarantine on the primary. A quarantined primary
+    // Gate 3: Honor the primary's full download gate. A quarantined primary
     // means the whole GAV is gated; do not leak its companion files.
+    //
+    // #3220: the scan-policy half (`block_unscanned` / `block_on_fail` /
+    // `max_severity`) is applied here too, for the same reason the quarantine
+    // half is. The companions have no artifact row of their own, so the anchor
+    // primary's verdict is the only verdict there is — and without this a
+    // policy-blocked jar's `.pom` / `-sources.jar` / checksums stayed
+    // downloadable, on the direct hosted route as well as through a virtual.
+    // This mirrors `proxy_helpers::local_lookup_artifact`, which applies the
+    // same two halves to rows that DO exist.
     check_quarantine_row(&primary)?;
+    crate::services::quarantine_service::enforce_scan_policy_gate(db, primary.id, repo_id)
+        .await
+        .map_err(|e| e.into_response())?;
 
     // Gates passed — read the secondary bytes from storage. A storage
     // backend error (transient S3 5xx, network) is mapped to a real
@@ -693,6 +705,92 @@ mod tests {
         }
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3220: Gate 3 must honour the anchor primary's SCAN POLICY, not only its
+    /// quarantine state.
+    ///
+    /// A row-less companion (`.pom`, `-sources.jar`, `.sha1`, …) has no artifact
+    /// row of its own, so the anchor primary's verdict is the only verdict
+    /// available. Gate 3 called `check_quarantine_row` alone, so a jar that the
+    /// download routes 403 still had its whole companion set served — through a
+    /// virtual repo and on the direct hosted route alike.
+    ///
+    /// POSITIVE CONTROL in the same fixture: the identical fetch serves the
+    /// companion bytes before the policy exists and again after it is removed.
+    #[tokio::test]
+    async fn test_storage_fallback_applies_anchor_scan_policy_3220() {
+        let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        let _primary = insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            "com/example/foo/1.0/foo-1.0.jar",
+            "maven/com/example/foo/1.0/foo-1.0.jar",
+        )
+        .await;
+        let pom_path = "com/example/foo/1.0/foo-1.0.pom";
+        let pom = Bytes::from_static(b"<project>gate-3220-pom</project>");
+        put_artifact_bytes(&state, &repo, &format!("maven/{pom_path}"), pom.clone())
+            .await
+            .expect("put companion");
+        let location = repo.storage_location();
+
+        // POSITIVE CONTROL: no policy -> the companion serves.
+        let before =
+            maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, pom_path)
+                .await
+                .expect("positive control: companion must serve with no scan policy");
+        let before_bytes = before.collect().await.expect("collect companion bytes");
+
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-3220-maven-{repo_id}"))
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("insert block_unscanned policy");
+
+        let blocked =
+            maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, pom_path)
+                .await
+                .err()
+                .map(|resp| resp.status());
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        // NEGATIVE CONTROL: policy removed -> the companion serves again.
+        let after = maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, pom_path)
+            .await
+            .map(|_| ())
+            .map_err(|resp| resp.status());
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(
+            &before_bytes[..],
+            &pom[..],
+            "positive control: companion bytes"
+        );
+        assert_eq!(
+            blocked,
+            Some(StatusCode::FORBIDDEN),
+            "#3220: a row-less companion must be refused while its anchor primary is \
+             blocked by the repository's scan policy"
+        );
+        assert_eq!(
+            after,
+            Ok(()),
+            "negative control: removing the policy must restore the companion serve"
+        );
     }
 
     #[tokio::test]

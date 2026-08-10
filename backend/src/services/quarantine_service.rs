@@ -655,6 +655,31 @@ pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()>
     check_download_allowed(status.as_deref(), until, Utc::now())?;
 
     // Scan-policy gate. No-op (allowed) when no enabled policy matches the repo.
+    enforce_scan_policy_gate(db, artifact_id, repository_id).await
+}
+
+/// The scan-policy half of [`enforce_download_gate`], for callers that have
+/// ALREADY applied the quarantine half from a row they hold (#3220).
+///
+/// `proxy_helpers::local_lookup_artifact` selects `quarantine_status` /
+/// `quarantine_until` in the same round trip that resolves the artifact, so it
+/// evaluates quarantine in-process via `check_quarantine_row` and only needs
+/// this half — calling the whole of [`enforce_download_gate`] there would
+/// re-read the quarantine columns it already has, once per probed virtual
+/// member. Splitting it (rather than open-coding `PolicyService` at the second
+/// call site) keeps ONE implementation of "what the scan policy decides and how
+/// a block is rendered": the hand-repeated variant is exactly what left the
+/// virtual-member paths quarantine-only while the direct paths were gated.
+///
+/// `repository_id` must be the artifact's owning repository. Both callers
+/// satisfy this by construction: [`enforce_download_gate`] reads it from the
+/// artifact row, and `local_lookup_artifact` passes the `repository_id` its own
+/// `WHERE` clause matched on.
+pub async fn enforce_scan_policy_gate(
+    db: &PgPool,
+    artifact_id: Uuid,
+    repository_id: Uuid,
+) -> Result<()> {
     let policy_result = crate::services::policy_service::PolicyService::new(db.clone())
         .evaluate_artifact(artifact_id, repository_id)
         .await?;

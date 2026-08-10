@@ -2680,6 +2680,20 @@ async fn serve_file(
                         Ok(response) => {
                             return Ok(response);
                         }
+                        // #3220: this member HAS the distribution and its
+                        // download gate (quarantine hold / scan policy) refuses
+                        // to serve it. Fail closed — falling through would try
+                        // the member's own upstream, or the next member, and
+                        // serve the blocked file with a 200, which is how the
+                        // direct hosted route's 403 was bypassable through any
+                        // virtual listing that repo. Note this deliberately
+                        // differs from the per-member curation skip above: a
+                        // curation rule says "this member must not supply this
+                        // package" (a sibling still may), whereas the download
+                        // gate says "these bytes must not be served".
+                        Err(e) if proxy_helpers::is_member_policy_block_response(&e) => {
+                            return Err(e);
+                        }
                         Err(e) => {
                             debug!(
                                 member_key = %member.key,
@@ -12798,6 +12812,144 @@ mod tests {
                 "vulnerable-via-virtual pypi serve must be 403"
             ),
         }
+    }
+
+    /// Buffer a `serve_file` outcome (Ok or Err) into (status, body) for the
+    /// #3220 gate assertions below.
+    async fn collect_serve_3220(r: Result<Response, Response>) -> (StatusCode, Bytes) {
+        let resp = match r {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        };
+        let (status, body, _) = crate::api::handlers::test_db_helpers::collect_response(resp).await;
+        (status, body)
+    }
+
+    /// #3220: `serve_file`'s virtual-member loop must apply the resolving
+    /// member's DOWNLOAD gate (quarantine + scan policy) to the bytes it serves
+    /// from that member's local row, and must fail closed when it blocks.
+    ///
+    /// Two independent defects met on this path. `local_fetch_or_redirect_by_suffix`
+    /// applied only the raw quarantine predicate, so `block_unscanned` /
+    /// `block_on_fail` / `max_severity` were never consulted. And the loop's
+    /// `Err(e) => debug!(...)` arm treated any failure as "this member does not
+    /// have it", so even once the gate existed its 403 would have fallen through
+    /// to the member's own upstream — which happily returns the wheel.
+    ///
+    /// The upstream mock therefore serves DIFFERENT bytes from the cached copy:
+    /// a fall-through is observable as a 200 carrying the upstream bytes, not
+    /// merely as "not a 403". The positive control (no policy -> 200 with the
+    /// CACHED bytes) is in the same fixture, so a change that blocks everything,
+    /// or that stops resolving the member at all, fails this test.
+    #[tokio::test]
+    async fn test_virtual_serve_file_applies_member_download_gate_3220() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "gatepkg";
+        let version = "1.0.0";
+        let filename = "gatepkg-1.0.0-py3-none-any.whl";
+        // Distinct from `seed_member_wheel`'s cached payload on purpose.
+        let upstream_wheel: &[u8] = b"PK\x03\x04 gatepkg-from-UPSTREAM-not-cache";
+        let cached_wheel: &[u8] = b"PK\x03\x04 virtual-member-wheel";
+
+        let upstream = MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, upstream_wheel).await;
+
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        seed_member_wheel(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            member_id,
+            &member_key,
+            &member_dir,
+            &upstream.uri(),
+            project,
+            version,
+            filename,
+        )
+        .await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let project_name = proj(project);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let serve = || {
+            super::serve_file(
+                &state,
+                &virtual_info,
+                &fx.repo_key,
+                &project_name,
+                filename,
+                None,
+                &ctx,
+            )
+        };
+
+        // POSITIVE CONTROL: no policy -> the cached member copy is served.
+        let (before_status, before_body) = collect_serve_3220(serve().await).await;
+
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-3220-pypi-{member_id}"))
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert block_unscanned policy");
+
+        let (blocked_status, blocked_body) = collect_serve_3220(serve().await).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await;
+
+        // NEGATIVE CONTROL: policy removed -> serving resumes.
+        let (after_status, after_body) = collect_serve_3220(serve().await).await;
+
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            before_status,
+            StatusCode::OK,
+            "positive control: with no scan policy the virtual member must serve"
+        );
+        assert_eq!(
+            &before_body[..],
+            cached_wheel,
+            "positive control: the member's cached copy is what serves"
+        );
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "#3220: an unscanned wheel under block_unscanned must be refused with 403 \
+             through the virtual repo, got {blocked_status}"
+        );
+        assert_ne!(
+            &blocked_body[..],
+            cached_wheel,
+            "#3220: the blocked wheel's bytes must not be served"
+        );
+        assert_ne!(
+            &blocked_body[..],
+            upstream_wheel,
+            "#3220: the block must not fall through to the member's upstream — that is the \
+             silent fallback that turns a policy block into a 200"
+        );
+        assert_eq!(
+            after_status,
+            StatusCode::OK,
+            "negative control: removing the policy must restore the download"
+        );
+        assert_eq!(&after_body[..], cached_wheel);
     }
 
     /// Clean via virtual -> 200 (no over-block).

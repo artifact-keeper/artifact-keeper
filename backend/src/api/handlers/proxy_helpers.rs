@@ -810,7 +810,7 @@ pub async fn proxy_fetch_streaming_with_disposition(
 /// produce. Builds a ready-to-serve [`Response`]; errors are mapped to a
 /// [`Response`] exactly as [`proxy_fetch_streaming_with_disposition`] does, so
 /// the streaming virtual-download path can detect a quarantine block via
-/// [`is_quarantine_block_response`].
+/// [`is_member_policy_block_response`].
 async fn proxy_fetch_streaming_member(
     proxy_service: &ProxyService,
     member: &Repository,
@@ -1818,11 +1818,29 @@ pub(crate) enum MemberCacheClass {
 pub(crate) enum MemberResolveOutcome<T, E> {
     /// The member produced the artifact.
     Hit(T),
-    /// The member returned a deliberate Package-Age-Policy quarantine block
-    /// (409/403, #1770) that must surface rather than fall through.
+    /// The member refused to serve: a Package-Age-Policy quarantine block
+    /// (409/403, #1770), or — since #3220 — the member's own download gate
+    /// (quarantine hold / scan policy) rejecting an artifact it *does* hold.
+    /// Either way it must surface rather than fall through to another member.
     Quarantine(E),
     /// The member does not have the artifact; try the next by priority.
     Miss,
+}
+
+impl<T, E> MemberResolveOutcome<T, E> {
+    /// Transform the success payload, leaving `Quarantine` / `Miss` untouched.
+    ///
+    /// Lets a resolver reuse the shared `classify_*` helpers (which produce a
+    /// bare payload) when its own `T` is a tuple carrying extra per-member data
+    /// — e.g. `resolve_virtual_download_streaming` threading the resolved local
+    /// `artifact_id` alongside the built `Response` for #2260 accounting.
+    pub(crate) fn map_hit<U>(self, f: impl FnOnce(T) -> U) -> MemberResolveOutcome<U, E> {
+        match self {
+            MemberResolveOutcome::Hit(t) => MemberResolveOutcome::Hit(f(t)),
+            MemberResolveOutcome::Quarantine(e) => MemberResolveOutcome::Quarantine(e),
+            MemberResolveOutcome::Miss => MemberResolveOutcome::Miss,
+        }
+    }
 }
 
 /// Indices of the members that must be resolved against upstream in Pass 2,
@@ -1873,7 +1891,19 @@ pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
 /// Pass 1 calls `probe` on members in priority order, stopping at the first
 /// [`MemberCacheClass::DefiniteHit`] (a cache hit or local artifact). `probe`
 /// must NOT contact upstream — it returns the member's [`MemberCacheClass`]
-/// together with the already-built success payload for a `DefiniteHit`.
+/// together with the already-resolved [`MemberResolveOutcome`] for a
+/// `DefiniteHit`.
+///
+/// That outcome is a full `MemberResolveOutcome`, not just a success payload,
+/// so Pass 1 can express **"this member holds the artifact and refuses to serve
+/// it"** ([`MemberResolveOutcome::Quarantine`]) as distinct from "this member
+/// does not have it" ([`MemberCacheClass::DefiniteMiss`]) — the distinction
+/// #3220 needs for the local download gate. A Pass-1 `Quarantine` is classified
+/// `DefiniteHit`, which is exactly the fail-closed semantic wanted: Pass 1 stops
+/// there, members ranked BELOW it are never probed (so a lower-priority member's
+/// copy of the same coordinate cannot be substituted for a blocked one), and
+/// only members ranked ABOVE it — which legitimately outrank it — can still win
+/// in Pass 2.
 /// Members ranked below the first hit are never probed: they can never win
 /// (`upstream_candidate_indices` only considers members above the first hit),
 /// so this preserves the old sequential loop's warm-path short-circuit —
@@ -1921,7 +1951,7 @@ pub(crate) async fn resolve_members_two_phase<'a, T, E, P, PFut, U, UFut>(
 ) -> Option<MemberResolveOutcome<T, E>>
 where
     P: Fn(&'a Repository) -> PFut,
-    PFut: std::future::Future<Output = (MemberCacheClass, Option<T>)> + 'a,
+    PFut: std::future::Future<Output = (MemberCacheClass, Option<MemberResolveOutcome<T, E>>)> + 'a,
     U: Fn(&'a Repository) -> UFut,
     UFut: std::future::Future<Output = MemberResolveOutcome<T, E>> + 'a,
 {
@@ -1931,7 +1961,7 @@ where
     // so probing the rest would be wasted work (and, for the streaming/metadata
     // resolvers, wasted storage round-trips / body reads on the warm path).
     let mut classes: Vec<MemberCacheClass> = Vec::with_capacity(members.len());
-    let mut pass1_hits: Vec<Option<T>> = Vec::with_capacity(members.len());
+    let mut pass1_hits: Vec<Option<MemberResolveOutcome<T, E>>> = Vec::with_capacity(members.len());
     for member in members {
         let (class, hit) = probe(member).await;
         let is_definite_hit = class == MemberCacheClass::DefiniteHit;
@@ -1942,13 +1972,12 @@ where
         }
     }
 
-    // The highest-priority Pass-1 cache hit is the fallback winner used when
-    // every upstream candidate misses. By construction every candidate index is
-    // higher priority than (below) the first DefiniteHit, so any candidate hit
+    // The highest-priority Pass-1 outcome (a cache hit, or a #3220 terminal
+    // policy rejection) is the fallback winner used when every upstream
+    // candidate misses. By construction every candidate index is higher
+    // priority than (below) the first DefiniteHit, so any candidate hit
     // outranks this fallback.
-    let pass1_winner: Option<MemberResolveOutcome<T, E>> = pass1_hits
-        .into_iter()
-        .find_map(|hit| hit.map(MemberResolveOutcome::Hit));
+    let pass1_winner: Option<MemberResolveOutcome<T, E>> = pass1_hits.into_iter().flatten().next();
 
     let candidates = upstream_candidate_indices(&classes);
     let Some((&first, rest)) = candidates.split_first() else {
@@ -2038,11 +2067,14 @@ where
 /// (A transient sidecar read/parse error is mapped to `Ok(None)` upstream of
 /// this in `read_cached_with_revalidation_streaming`, so it falls through to an
 /// upstream fetch rather than being suppressed here.)
-pub(crate) fn classify_cache_probe<T>(
+pub(crate) fn classify_cache_probe<T, E>(
     probe: Result<Option<T>, crate::error::AppError>,
-) -> (MemberCacheClass, Option<T>) {
+) -> (MemberCacheClass, Option<MemberResolveOutcome<T, E>>) {
     match probe {
-        Ok(Some(hit)) => (MemberCacheClass::DefiniteHit, Some(hit)),
+        Ok(Some(hit)) => (
+            MemberCacheClass::DefiniteHit,
+            Some(MemberResolveOutcome::Hit(hit)),
+        ),
         Ok(None) => (MemberCacheClass::NeedsUpstream, None),
         // A quarantine block must surface (#1770): re-resolve in Pass 2.
         Err(e) if is_quarantine_block(&e) => (MemberCacheClass::NeedsUpstream, None),
@@ -2079,14 +2111,20 @@ pub(crate) fn classify_streaming_cache_probe(
     probe: Result<Option<StreamingFetchResult>, crate::error::AppError>,
     default_content_type: &str,
     content_disposition_filename: Option<&str>,
-) -> (MemberCacheClass, Option<Response>) {
+) -> (
+    MemberCacheClass,
+    Option<MemberResolveOutcome<Response, Response>>,
+) {
     match probe {
         Ok(Some(result)) => match build_streaming_response_with_disposition(
             result,
             default_content_type,
             content_disposition_filename,
         ) {
-            Ok(response) => (MemberCacheClass::DefiniteHit, Some(response)),
+            Ok(response) => (
+                MemberCacheClass::DefiniteHit,
+                Some(MemberResolveOutcome::Hit(response)),
+            ),
             Err(_) => (MemberCacheClass::NeedsUpstream, None),
         },
         Ok(None) => (MemberCacheClass::NeedsUpstream, None),
@@ -2099,23 +2137,43 @@ pub(crate) fn classify_streaming_cache_probe(
 /// Classify a Local/Staging member's buffered fetch for the streaming resolver
 /// (#2069): build the streaming response on a hit (or serve a 500 if header
 /// building fails — that member still "wins" with an error), else a miss.
+///
+/// #3220: a 403/409 from `local_fetch` is the member's own download gate
+/// (quarantine hold or scan policy) refusing an artifact it DOES hold — see
+/// [`local_lookup_artifact`]. That is terminal, not a miss: classifying it
+/// `DefiniteMiss` would let resolution continue to a lower-priority member or
+/// upstream and serve the very bytes the policy blocked, with no 403 anywhere
+/// in the response. It is returned as [`MemberResolveOutcome::Quarantine`]
+/// under `DefiniteHit` so Pass 1 stops here and the block surfaces.
 pub(crate) fn classify_streaming_local(
     fetched: Result<StreamingFetchResult, Response>,
     default_content_type: &str,
     content_disposition_filename: Option<&str>,
-) -> (MemberCacheClass, Option<Response>) {
+) -> (
+    MemberCacheClass,
+    Option<MemberResolveOutcome<Response, Response>>,
+) {
     match fetched {
         Ok(result) => match build_streaming_response_with_disposition(
             result,
             default_content_type,
             content_disposition_filename,
         ) {
-            Ok(response) => (MemberCacheClass::DefiniteHit, Some(response)),
+            Ok(response) => (
+                MemberCacheClass::DefiniteHit,
+                Some(MemberResolveOutcome::Hit(response)),
+            ),
             Err(e) => (
                 MemberCacheClass::DefiniteHit,
-                Some((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+                Some(MemberResolveOutcome::Hit(
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                )),
             ),
         },
+        Err(resp) if is_member_policy_block_response(&resp) => (
+            MemberCacheClass::DefiniteHit,
+            Some(MemberResolveOutcome::Quarantine(resp)),
+        ),
         Err(_) => (MemberCacheClass::DefiniteMiss, None),
     }
 }
@@ -2128,7 +2186,9 @@ pub(crate) fn classify_streaming_upstream(
 ) -> MemberResolveOutcome<Response, Response> {
     match result {
         Ok(response) => MemberResolveOutcome::Hit(response),
-        Err(resp) if is_quarantine_block_response(&resp) => MemberResolveOutcome::Quarantine(resp),
+        Err(resp) if is_member_policy_block_response(&resp) => {
+            MemberResolveOutcome::Quarantine(resp)
+        }
         Err(_) => MemberResolveOutcome::Miss,
     }
 }
@@ -2254,7 +2314,20 @@ where
             ) {
                 VirtualMemberFetchStrategy::Local => {
                     match local_fetch(member.id, member.storage_location()).await {
-                        Ok(result) => (MemberCacheClass::DefiniteHit, Some(result)),
+                        Ok(result) => (
+                            MemberCacheClass::DefiniteHit,
+                            Some(MemberResolveOutcome::Hit(result)),
+                        ),
+                        // #3220: the member's own download gate (quarantine /
+                        // scan policy) refused an artifact it HOLDS. Terminal,
+                        // not a miss — otherwise the block silently falls
+                        // through to the next member or upstream and the client
+                        // gets the bytes anyway. Fail closed on the member that
+                        // would have served.
+                        Err(resp) if is_member_policy_block_response(&resp) => (
+                            MemberCacheClass::DefiniteHit,
+                            Some(MemberResolveOutcome::Quarantine(resp)),
+                        ),
                         Err(_) => (MemberCacheClass::DefiniteMiss, None),
                     }
                 }
@@ -2307,12 +2380,23 @@ fn is_quarantine_block(e: &crate::error::AppError) -> bool {
     )
 }
 
-/// `Response`-level sibling of [`is_quarantine_block`] for the streaming
-/// virtual-download path, where the member fetch has already mapped its
-/// [`AppError`] to a [`Response`] (#1770). A 409 Conflict (held) or 403
-/// Forbidden (rejected) is a quarantine block that must surface from
-/// virtual-repo resolution rather than fall through to the next member.
-fn is_quarantine_block_response(resp: &Response) -> bool {
+/// `Response`-level sibling of [`is_quarantine_block`]: does this member-fetch
+/// failure mean "the member refuses to serve" rather than "the member does not
+/// have it"?
+///
+/// A 409 Conflict (Package Age Policy hold / quarantine hold) or a 403 Forbidden
+/// (quarantine rejected, or — since #3220 — the repository's scan policy) is a
+/// deliberate block that MUST surface from virtual-repo resolution rather than
+/// fall through to the next member. Every other failure is a miss: a 404 from
+/// the row lookup, a 500 from storage or the database, a 507 from the
+/// coordinated-retry hydration path. `local_lookup_artifact` produces 403/409
+/// from the download gate ALONE — the surrounding steps map their failures to
+/// 400/404/500/507 (see `map_storage_err`) — so this cannot mistake an outage
+/// for a policy decision.
+///
+/// Used by both two-phase resolvers and by the hand-rolled member loops in
+/// `helm::download_chart_via_index` and `pypi::serve_file`.
+pub(crate) fn is_member_policy_block_response(resp: &Response) -> bool {
     matches!(resp.status(), StatusCode::CONFLICT | StatusCode::FORBIDDEN)
 }
 
@@ -2418,12 +2502,19 @@ where
                     // Capture the local artifact id before `fetched` is consumed
                     // into a Response by `classify_streaming_local`.
                     let artifact_id = fetched.as_ref().ok().and_then(|r| r.artifact_id);
-                    let (class, hit) = classify_streaming_local(
+                    let (class, outcome) = classify_streaming_local(
                         fetched,
                         default_content_type,
                         content_disposition_filename,
                     );
-                    (class, hit.map(|resp| (resp, artifact_id)))
+                    // #3220: `classify_streaming_local` may return a terminal
+                    // Quarantine here (the member's download gate refusing an
+                    // artifact it holds); `map_hit` threads the artifact id onto
+                    // the success arm only, leaving that rejection intact.
+                    (
+                        class,
+                        outcome.map(|o| o.map_hit(|resp| (resp, artifact_id))),
+                    )
                 }
                 VirtualMemberFetchStrategy::Proxy => match proxy_service {
                     Some(proxy) => {
@@ -2434,14 +2525,17 @@ where
                             try_member_cache_redirect(state, proxy, member, path).await
                         {
                             // Remote proxy-cache serve: not our artifact (#1278).
-                            (MemberCacheClass::DefiniteHit, Some((redirect, None)))
+                            (
+                                MemberCacheClass::DefiniteHit,
+                                Some(MemberResolveOutcome::Hit((redirect, None))),
+                            )
                         } else {
-                            let (class, hit) = classify_streaming_cache_probe(
+                            let (class, outcome) = classify_streaming_cache_probe(
                                 proxy.streaming_cached_artifact_by_path(member, path).await,
                                 default_content_type,
                                 content_disposition_filename,
                             );
-                            (class, hit.map(|resp| (resp, None)))
+                            (class, outcome.map(|o| o.map_hit(|resp| (resp, None))))
                         }
                     }
                     None => (MemberCacheClass::DefiniteMiss, None),
@@ -2539,7 +2633,10 @@ where
             // than served raw. A fresh hit is transformed into the response.
             match proxy.cached_metadata_if_servable(member, path).await {
                 Ok(Some((bytes, _ct, _enc))) => match transform(bytes, member.key.clone()).await {
-                    Ok(response) => (MemberCacheClass::DefiniteHit, Some(response)),
+                    Ok(response) => (
+                        MemberCacheClass::DefiniteHit,
+                        Some(MemberResolveOutcome::Hit(response)),
+                    ),
                     // The cached bytes failed to transform (e.g. corrupt cached
                     // metadata). Don't treat the member as a definite miss —
                     // fall through to an upstream re-fetch in Pass 2 so a good
@@ -3012,9 +3109,48 @@ impl LocalLookup<'_> {
 }
 
 /// Shared skeleton step 1: resolve the artifact row for `lookup`, enforce the
-/// quarantine policy, and resolve the repo's storage backend. Returns the row
+/// FULL download gate, and resolve the repo's storage backend. Returns the row
 /// and storage so callers can either read bytes or short-circuit (e.g. the
 /// presigned redirect in [`local_fetch_or_redirect`]) before reading.
+///
+/// # The gate (#3220)
+///
+/// This applies both halves of `quarantine_service::enforce_download_gate` —
+/// quarantine AND the repository's scan policy (`block_unscanned` /
+/// `block_on_fail` / `max_severity`). Until #3220 it applied only
+/// [`check_quarantine_row`], the raw quarantine predicate. Since every
+/// `local_fetch_*` helper funnels through here, and those helpers are the
+/// per-member `local_fetch` closures for the ~24 formats that aggregate hosted
+/// repositories behind a Virtual repo, the scan policy was enforced on the
+/// DIRECT hosted route and skipped on the virtual-member route: an artifact
+/// that 403s at `/<format>/hosted/...` was served with a 200 at
+/// `/<format>/virtual/...` whenever the virtual listed that hosted repo as a
+/// member.
+///
+/// It is gated HERE, in the one helper they share, rather than at each of the
+/// ~24 member arms. A hand-repeated check is what produced the gap in the first
+/// place (#3143 closed two arms by hand and the other ~24 stayed open), and a
+/// per-arm check silently omits itself again for the next format added.
+///
+/// The two halves are applied separately rather than by calling
+/// `enforce_download_gate`: [`LocalLookup::select_sql`] already returns the
+/// quarantine columns, so `check_quarantine_row` costs no query, and
+/// `enforce_scan_policy_gate` is the identical policy half `enforce_download_gate`
+/// runs. `repo_id` is the artifact's owning repository — it is the value this
+/// lookup's own `WHERE repository_id = $1` matched on.
+///
+/// # Callers must not swallow the rejection
+///
+/// A gate rejection is a 403 (scan policy / rejected) or 409 (quarantine hold),
+/// distinguishable from a miss (404) or an infrastructure failure (500/507) by
+/// [`is_member_policy_block_response`]. Virtual-member resolution treats an
+/// `Err` from `local_fetch` as "this member does not have it, try the next
+/// one", so a caller that iterates members MUST classify a policy block as a
+/// terminal outcome; otherwise the block degrades into a silent fallback to
+/// another member or to upstream, which serves the bytes anyway and surfaces
+/// nothing. [`resolve_virtual_download_from_members`],
+/// [`resolve_virtual_download_streaming`] and the two hand-rolled member loops
+/// (`helm::download_chart_via_index`, `pypi::serve_file`) all do this.
 async fn local_lookup_artifact(
     db: &PgPool,
     state: &AppState,
@@ -3030,6 +3166,9 @@ async fn local_lookup_artifact(
 > {
     let artifact = lookup.fetch_row(db, repo_id).await?;
     check_quarantine_row(&artifact)?;
+    crate::services::quarantine_service::enforce_scan_policy_gate(db, artifact.id, repo_id)
+        .await
+        .map_err(|e| e.into_response())?;
     let storage = state.storage_for_repo_or_500(location)?;
     Ok((artifact, storage))
 }
@@ -6090,7 +6229,10 @@ mod tests {
             &members,
             |m| {
                 let class = if m.key == "m0" {
-                    (MemberCacheClass::DefiniteHit, Some("cache0".to_string()))
+                    (
+                        MemberCacheClass::DefiniteHit,
+                        Some(MemberResolveOutcome::Hit("cache0".to_string())),
+                    )
                 } else {
                     (MemberCacheClass::NeedsUpstream, None)
                 };
@@ -6122,7 +6264,10 @@ mod tests {
                 let class = if m.key == "m0" {
                     (MemberCacheClass::NeedsUpstream, None)
                 } else {
-                    (MemberCacheClass::DefiniteHit, Some("cache1".to_string()))
+                    (
+                        MemberCacheClass::DefiniteHit,
+                        Some(MemberResolveOutcome::Hit("cache1".to_string())),
+                    )
                 };
                 async move { class }
             },
@@ -6144,7 +6289,10 @@ mod tests {
                 let class = if m.key == "m0" {
                     (MemberCacheClass::NeedsUpstream, None)
                 } else {
-                    (MemberCacheClass::DefiniteHit, Some("cache1".to_string()))
+                    (
+                        MemberCacheClass::DefiniteHit,
+                        Some(MemberResolveOutcome::Hit("cache1".to_string())),
+                    )
                 };
                 async move { class }
             },
@@ -6289,7 +6437,12 @@ mod tests {
             &members,
             move |_m| {
                 p.fetch_add(1, Ordering::SeqCst);
-                async move { (MemberCacheClass::DefiniteHit, Some("hit0".to_string())) }
+                async move {
+                    (
+                        MemberCacheClass::DefiniteHit,
+                        Some(MemberResolveOutcome::Hit("hit0".to_string())),
+                    )
+                }
             },
             move |_m| {
                 u.fetch_add(1, Ordering::SeqCst);
@@ -6384,26 +6537,28 @@ mod tests {
     #[test]
     fn classify_cache_probe_maps_hit_miss_negative() {
         use crate::error::AppError;
-        let (class, hit) = classify_cache_probe::<i32>(Ok(Some(7)));
+        let (class, hit) = classify_cache_probe::<i32, String>(Ok(Some(7)));
         assert_eq!(class, MemberCacheClass::DefiniteHit);
-        assert_eq!(hit, Some(7));
+        assert!(matches!(hit, Some(MemberResolveOutcome::Hit(7))));
 
-        let (class, hit) = classify_cache_probe::<i32>(Ok(None));
+        let (class, hit) = classify_cache_probe::<i32, String>(Ok(None));
         assert_eq!(class, MemberCacheClass::NeedsUpstream);
         assert!(hit.is_none());
 
         // A negative-cached 404 surfaces as Err -> definite miss (no re-fetch).
-        let (class, hit) = classify_cache_probe::<i32>(Err(AppError::NotFound("neg".into())));
+        let (class, hit) =
+            classify_cache_probe::<i32, String>(Err(AppError::NotFound("neg".into())));
         assert_eq!(class, MemberCacheClass::DefiniteMiss);
         assert!(hit.is_none());
 
         // A quarantine block (#1770) from a *cached* held entry must NOT be
         // dropped: it is re-resolved in Pass 2 (which surfaces the 409/403),
         // so it classifies NeedsUpstream, not DefiniteMiss.
-        let (class, _) = classify_cache_probe::<i32>(Err(AppError::Conflict("held".into())));
+        let (class, _) =
+            classify_cache_probe::<i32, String>(Err(AppError::Conflict("held".into())));
         assert_eq!(class, MemberCacheClass::NeedsUpstream);
         let (class, _) =
-            classify_cache_probe::<i32>(Err(AppError::Authorization("rejected".into())));
+            classify_cache_probe::<i32, String>(Err(AppError::Authorization("rejected".into())));
         assert_eq!(class, MemberCacheClass::NeedsUpstream);
     }
 
@@ -6459,12 +6614,65 @@ mod tests {
         let (class, resp) =
             classify_streaming_local(Ok(empty_stream_result()), "application/json", Some("f.bin"));
         assert_eq!(class, MemberCacheClass::DefiniteHit);
-        assert!(resp.is_some());
+        assert!(matches!(resp, Some(MemberResolveOutcome::Hit(_))));
 
         let miss = Err((StatusCode::NOT_FOUND, "missing").into_response());
         let (class, resp) = classify_streaming_local(miss, "application/json", None);
         assert_eq!(class, MemberCacheClass::DefiniteMiss);
         assert!(resp.is_none());
+    }
+
+    /// #3220: a local member's download-gate rejection is a TERMINAL outcome,
+    /// not a member miss.
+    ///
+    /// The distinction is the whole fix: `DefiniteMiss` means "try the next
+    /// member / upstream", which converts a 403 into a silent fallback that
+    /// serves the blocked bytes anyway. `DefiniteHit` + `Quarantine` stops
+    /// Pass 1 (so no lower-priority member is even probed) and surfaces the
+    /// status the gate produced.
+    ///
+    /// The 404/500 arms are the control: they must STAY `DefiniteMiss`, or a
+    /// member that genuinely lacks the artifact would fail the whole virtual
+    /// request instead of deferring to a sibling that has it.
+    #[test]
+    fn classify_streaming_local_policy_block_is_terminal_3220() {
+        for status in [StatusCode::FORBIDDEN, StatusCode::CONFLICT] {
+            let blocked = Err((status, "blocked by policy").into_response());
+            let (class, outcome) = classify_streaming_local(blocked, "application/json", None);
+            assert_eq!(
+                class,
+                MemberCacheClass::DefiniteHit,
+                "#3220: a {status} download-gate block must stop Pass 1, not read as a miss"
+            );
+            match outcome {
+                Some(MemberResolveOutcome::Quarantine(resp)) => assert_eq!(
+                    resp.status(),
+                    status,
+                    "#3220: the gate's own status must be the one surfaced"
+                ),
+                other => panic!("#3220: expected a terminal Quarantine outcome, got {other:?}"),
+            }
+        }
+
+        // Controls: a real miss and a real infrastructure failure must still
+        // defer to the next member.
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INSUFFICIENT_STORAGE,
+        ] {
+            let (class, outcome) = classify_streaming_local(
+                Err((status, "not a policy decision").into_response()),
+                "application/json",
+                None,
+            );
+            assert_eq!(
+                class,
+                MemberCacheClass::DefiniteMiss,
+                "a {status} is not a policy block and must remain a member miss"
+            );
+            assert!(outcome.is_none());
+        }
     }
 
     #[test]
@@ -6621,7 +6829,7 @@ mod tests {
             ),
         );
         assert_eq!(resp.status(), StatusCode::CONFLICT);
-        assert!(is_quarantine_block_response(&resp));
+        assert!(is_member_policy_block_response(&resp));
     }
 
     #[test]
@@ -6632,7 +6840,7 @@ mod tests {
             crate::error::AppError::Authorization("Artifact was rejected".into()),
         );
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert!(is_quarantine_block_response(&resp));
+        assert!(is_member_policy_block_response(&resp));
     }
 
     #[test]
@@ -6643,7 +6851,7 @@ mod tests {
             crate::error::AppError::Storage("connection reset".into()),
         );
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        assert!(!is_quarantine_block_response(&resp));
+        assert!(!is_member_policy_block_response(&resp));
     }
 
     // ── promotion_only direct-upload gate ───────────────────────────
@@ -11861,6 +12069,326 @@ mod tests {
         assert_eq!(
             recorded, 1,
             "a virtual-member local resolve must record exactly one download"
+        );
+    }
+
+    // ── #3220: the download gate on virtual-member local serves ─────────
+
+    /// Seed `content` into a member repo's storage and insert its `artifacts`
+    /// row. Returns the artifact id.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_member_artifact_3220(
+        state: &crate::api::SharedState,
+        pool: &PgPool,
+        member_id: Uuid,
+        member_key: &str,
+        member_dir: &std::path::Path,
+        path: &str,
+        content: &'static [u8],
+        user_id: Uuid,
+    ) -> Uuid {
+        let info = crate::api::handlers::test_db_helpers::make_repo_info(
+            member_id, member_key, member_dir, "local", None,
+        );
+        let storage_key = format!("{member_key}/{path}");
+        put_artifact_bytes(state, &info, &storage_key, Bytes::from_static(content))
+            .await
+            .expect("seed member payload on disk");
+        insert_artifact(
+            pool,
+            NewArtifact {
+                repository_id: member_id,
+                path,
+                name: "gate3220",
+                version: "1.0.0",
+                size_bytes: content.len() as i64,
+                checksum_sha256: "test-3220",
+                content_type: "application/octet-stream",
+                storage_key: &storage_key,
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("seed member artifact row")
+    }
+
+    /// Enable `block_unscanned` on `repo_id`. Seeded artifacts have no
+    /// `scan_results` rows at all, so they are unscanned and the policy blocks
+    /// them — the same policy shape #3143 used for the direct routes.
+    async fn enable_block_unscanned_3220(pool: &PgPool, repo_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-3220-{repo_id}"))
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("insert block_unscanned policy");
+    }
+
+    async fn drop_scan_policies_3220(pool: &PgPool, repo_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Resolve `path` through the buffered virtual-download resolver exactly as
+    /// the ~24 format handlers do — `local_fetch_by_path` as the per-member
+    /// `local_fetch` closure, `proxy_service: None` so only Local members can
+    /// win. Returns the served status and body.
+    async fn virtual_download_3220(
+        state: &crate::api::SharedState,
+        pool: &PgPool,
+        virtual_id: Uuid,
+        path: &str,
+    ) -> (StatusCode, Bytes) {
+        let db = pool.clone();
+        let st = state.clone();
+        let p = path.to_string();
+        let resolved = resolve_virtual_download(
+            pool,
+            crate::api::handlers::test_db_helpers::admin_auth_ext().as_ref(),
+            None,
+            virtual_id,
+            path,
+            move |mid, loc| {
+                let db = db.clone();
+                let st = st.clone();
+                let p = p.clone();
+                async move { local_fetch_by_path(&db, &st, mid, &loc, &p).await }
+            },
+        )
+        .await;
+        let response = match resolved {
+            Ok(result) => match stream_fetch_result(result, "application/octet-stream", None) {
+                Ok(r) => r,
+                Err(e) => e,
+            },
+            Err(e) => e,
+        };
+        let (status, body, _) =
+            crate::api::handlers::test_db_helpers::collect_response(response).await;
+        (status, body)
+    }
+
+    /// #3220: a virtual repo must apply its resolving member's scan policy to
+    /// the bytes it serves on that member's behalf.
+    ///
+    /// `local_lookup_artifact` — the helper every `local_fetch_*` funnels
+    /// through, and hence every virtual-member arm across ~24 formats — applied
+    /// only `check_quarantine_row`, the raw quarantine predicate.
+    /// `block_unscanned` / `block_on_fail` / `max_severity` were never
+    /// consulted, so an artifact the direct hosted route 403s was served with a
+    /// 200 through any virtual repo that listed its repository as a member.
+    ///
+    /// POSITIVE CONTROLS, both in this fixture:
+    ///   * the identical request serves 200 with the real bytes BEFORE the
+    ///     policy exists, and again AFTER it is removed — so the 403 is
+    ///     attributable to the policy, not to a resolver that stopped working;
+    ///   * a sibling member with NO policy keeps serving its own artifact with
+    ///     a 200 while the block is in force — so a "fix" that fails the whole
+    ///     virtual, or blocks unconditionally, fails this test.
+    #[tokio::test]
+    async fn test_virtual_member_download_applies_scan_policy_3220() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (virtual_id, _vkey, _vdir) = db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (gated_id, gated_key, gated_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        let (clean_id, clean_key, clean_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        db_helpers::link_member(&pool, virtual_id, gated_id, 0).await;
+        db_helpers::link_member(&pool, virtual_id, clean_id, 1).await;
+
+        let state = db_helpers::build_state(pool.clone(), gated_dir.to_str().unwrap());
+        let clean_state = db_helpers::build_state(pool.clone(), clean_dir.to_str().unwrap());
+
+        let gated_bytes: &[u8] = b"#3220 gated member payload";
+        let clean_bytes: &[u8] = b"#3220 sibling member payload";
+        let gated_path = "gate3220/gate3220-1.0.0.bin";
+        let clean_path = "gate3220/sibling-1.0.0.bin";
+        seed_member_artifact_3220(
+            &state,
+            &pool,
+            gated_id,
+            &gated_key,
+            &gated_dir,
+            gated_path,
+            gated_bytes,
+            user_id,
+        )
+        .await;
+        seed_member_artifact_3220(
+            &clean_state,
+            &pool,
+            clean_id,
+            &clean_key,
+            &clean_dir,
+            clean_path,
+            clean_bytes,
+            user_id,
+        )
+        .await;
+
+        // POSITIVE CONTROL: no policy anywhere -> the virtual serves the bytes.
+        let (before_status, before_body) =
+            virtual_download_3220(&state, &pool, virtual_id, gated_path).await;
+
+        enable_block_unscanned_3220(&pool, gated_id).await;
+
+        let (blocked_status, blocked_body) =
+            virtual_download_3220(&state, &pool, virtual_id, gated_path).await;
+        // POSITIVE CONTROL, policy in force: the un-policied sibling still serves.
+        let (sibling_status, sibling_body) =
+            virtual_download_3220(&clean_state, &pool, virtual_id, clean_path).await;
+
+        drop_scan_policies_3220(&pool, gated_id).await;
+
+        // NEGATIVE CONTROL: removing the policy restores the download.
+        let (after_status, after_body) =
+            virtual_download_3220(&state, &pool, virtual_id, gated_path).await;
+
+        db_helpers::cleanup(&pool, gated_id, user_id).await;
+        db_helpers::cleanup(&pool, clean_id, user_id).await;
+        db_helpers::cleanup(&pool, virtual_id, user_id).await;
+
+        assert_eq!(
+            before_status,
+            StatusCode::OK,
+            "positive control: with no scan policy the virtual member must serve"
+        );
+        assert_eq!(
+            before_body.as_ref(),
+            gated_bytes,
+            "positive control: the served bytes must be the seeded artifact"
+        );
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "#3220: an unscanned artifact under block_unscanned must be refused with 403 \
+             through the virtual repo, got {blocked_status} body={:?}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        assert_ne!(
+            blocked_body.as_ref(),
+            gated_bytes,
+            "#3220: the blocked artifact's bytes must not be served"
+        );
+        assert_eq!(
+            sibling_status,
+            StatusCode::OK,
+            "positive control: a member with no policy must keep serving while another \
+             member's artifact is blocked"
+        );
+        assert_eq!(sibling_body.as_ref(), clean_bytes);
+        assert_eq!(
+            after_status,
+            StatusCode::OK,
+            "negative control: removing the policy must restore the download"
+        );
+        assert_eq!(after_body.as_ref(), gated_bytes);
+    }
+
+    /// #3220, the fall-through half: a policy block on the winning member must
+    /// FAIL CLOSED, not silently resolve to a lower-priority member's copy of
+    /// the same coordinate.
+    ///
+    /// This is the shape the bypass actually took. `resolve_virtual_download`'s
+    /// Pass-1 probe mapped every `Err` from `local_fetch` to `DefiniteMiss` —
+    /// "this member does not have it, try the next one" — so gating inside
+    /// `local_lookup_artifact` without also giving the resolver a terminal
+    /// outcome would have converted the 403 into a silent fallback: the client
+    /// still gets bytes, and nothing surfaces the block.
+    ///
+    /// The pre-fix behaviour here is a 200 carrying the FALLBACK member's
+    /// bytes, so this assertion cannot be satisfied by a change that merely
+    /// makes everything fail — and the positive control (same fixture, no
+    /// policy) pins that the higher-priority member is the one that wins.
+    #[tokio::test]
+    async fn test_virtual_member_policy_block_does_not_fall_through_3220() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (virtual_id, _vkey, _vdir) = db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (top_id, top_key, top_dir) = db_helpers::create_repo(&pool, "local", "generic").await;
+        let (fallback_id, fallback_key, fallback_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        // Same coordinate held by BOTH members; `top` outranks `fallback`.
+        db_helpers::link_member(&pool, virtual_id, top_id, 0).await;
+        db_helpers::link_member(&pool, virtual_id, fallback_id, 1).await;
+
+        let top_state = db_helpers::build_state(pool.clone(), top_dir.to_str().unwrap());
+        let fallback_state = db_helpers::build_state(pool.clone(), fallback_dir.to_str().unwrap());
+
+        let path = "gate3220/shared-1.0.0.bin";
+        let top_bytes: &[u8] = b"#3220 blocked copy from the top member";
+        let fallback_bytes: &[u8] = b"#3220 unblocked copy from the fallback member";
+        seed_member_artifact_3220(
+            &top_state, &pool, top_id, &top_key, &top_dir, path, top_bytes, user_id,
+        )
+        .await;
+        seed_member_artifact_3220(
+            &fallback_state,
+            &pool,
+            fallback_id,
+            &fallback_key,
+            &fallback_dir,
+            path,
+            fallback_bytes,
+            user_id,
+        )
+        .await;
+
+        // POSITIVE CONTROL: with no policy the higher-priority member wins.
+        let (before_status, before_body) =
+            virtual_download_3220(&top_state, &pool, virtual_id, path).await;
+
+        // Block ONLY the winning member. The fallback stays freely servable, so
+        // a resolver that treats the block as a miss will happily serve it.
+        enable_block_unscanned_3220(&pool, top_id).await;
+
+        let (blocked_status, blocked_body) =
+            virtual_download_3220(&top_state, &pool, virtual_id, path).await;
+
+        drop_scan_policies_3220(&pool, top_id).await;
+
+        db_helpers::cleanup(&pool, top_id, user_id).await;
+        db_helpers::cleanup(&pool, fallback_id, user_id).await;
+        db_helpers::cleanup(&pool, virtual_id, user_id).await;
+
+        assert_eq!(
+            before_status,
+            StatusCode::OK,
+            "positive control: with no policy the virtual must resolve this coordinate"
+        );
+        assert_eq!(
+            before_body.as_ref(),
+            top_bytes,
+            "positive control: the higher-priority member must be the one that wins"
+        );
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "#3220: a policy block on the winning member must fail closed with 403, \
+             got {blocked_status} body={:?}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        assert_ne!(
+            blocked_body.as_ref(),
+            fallback_bytes,
+            "#3220: the block must NOT silently fall through to a lower-priority member's \
+             copy of the same coordinate — that is the bypass, with a 200 and no signal"
+        );
+        assert_ne!(
+            blocked_body.as_ref(),
+            top_bytes,
+            "#3220: the blocked member's own bytes must not be served either"
         );
     }
 

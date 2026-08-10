@@ -531,7 +531,7 @@ async fn download_chart_via_index(
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 // Hosted / staging member: check local storage.
-                if let Ok(result) = proxy_helpers::local_fetch_by_path_suffix(
+                match proxy_helpers::local_fetch_by_path_suffix(
                     &state.db,
                     state,
                     member.id,
@@ -540,12 +540,25 @@ async fn download_chart_via_index(
                 )
                 .await
                 {
-                    return proxy_helpers::stream_fetch_result(
-                        result,
-                        content_type,
-                        Some(filename),
-                    )
-                    .map(Some);
+                    Ok(result) => {
+                        return proxy_helpers::stream_fetch_result(
+                            result,
+                            content_type,
+                            Some(filename),
+                        )
+                        .map(Some);
+                    }
+                    // #3220: this member HAS the chart and its download gate
+                    // (quarantine hold / scan policy) refuses to serve it. Fail
+                    // closed — `continue`ing would fall through to another
+                    // member or upstream and serve the blocked chart with a 200,
+                    // which is how the direct `/helm/<hosted>/charts/<f>` route's
+                    // 403 was bypassable through any virtual listing that repo.
+                    Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
+                        return Err(resp);
+                    }
+                    // Ordinary miss (404) or infrastructure failure: next member.
+                    Err(_) => {}
                 }
                 continue;
             }
@@ -1650,6 +1663,132 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
             StatusCode::OK,
             "negative control: removing the policy must restore the download"
         );
+    }
+
+    /// #3220: the VIRTUAL-member arm of the Helm download must apply the
+    /// resolving member's scan policy, exactly as the direct hosted route does
+    /// (pinned by `test_hosted_chart_download_already_applies_scan_policy_3143`
+    /// immediately above).
+    ///
+    /// `download_chart_via_index` walks members by hand and resolved hosted
+    /// ones through `local_fetch_by_path_suffix` under `if let Ok(..)`, so both
+    /// halves of the bug are exercised here: the helper applied no scan policy,
+    /// and the loop's `continue` would have swallowed the rejection as "this
+    /// member does not have the chart".
+    ///
+    /// The same request against the same member repository is a 403 on
+    /// `/helm/<member>/charts/<f>` — so this test is the bypass in one file:
+    /// direct route refuses, virtual route serves.
+    ///
+    /// POSITIVE CONTROLS in this fixture: the virtual route serves 200 with the
+    /// real chart bytes before the policy exists and again after it is removed.
+    #[tokio::test]
+    async fn test_virtual_member_chart_download_applies_scan_policy_3220() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let blob = bytes::Bytes::from_static(b"helm-virtual-gate-chart-bytes");
+        let filename = "vgatechart-0.2.0.tgz";
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &f.repo_info("local", None),
+            filename,
+            filename,
+            "vgatechart",
+            "0.2.0",
+            "application/gzip",
+            blob.clone(),
+            f.user_id,
+        )
+        .await;
+
+        // A virtual Helm repo whose only member is the fixture's hosted repo.
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&f.pool, "virtual", "helm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_id)
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("link virtual member");
+
+        // `download_chart_via_index` early-returns when no proxy service is
+        // wired, so the member loop would never run on the bare fixture state.
+        let storage_path = f.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(f.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(f.pool.clone(), &storage_path, proxy);
+        let app = || tdh::router_anon(super::router(), state.clone());
+
+        let virtual_uri = format!("/{}/charts/{}", virtual_key, filename);
+        let direct_uri = format!("/{}/charts/{}", f.repo_key, filename);
+
+        // POSITIVE CONTROL: no policy -> the virtual route serves the chart.
+        let (before_status, before_body) = tdh::send(app(), tdh::get(virtual_uri.clone())).await;
+
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-3220-helm-{}", f.repo_id))
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("insert block_unscanned policy");
+
+        let (virtual_blocked, virtual_blocked_body) =
+            tdh::send(app(), tdh::get(virtual_uri.clone())).await;
+        // The direct route on the SAME repository, under the SAME policy: this
+        // is the comparison the bug is defined by.
+        let (direct_blocked, _) = tdh::send(app(), tdh::get(direct_uri)).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
+
+        // NEGATIVE CONTROL: policy removed -> the virtual route serves again.
+        let (after_status, after_body) = tdh::send(app(), tdh::get(virtual_uri)).await;
+
+        tdh::cleanup(&f.pool, virtual_id, f.user_id).await;
+        f.teardown().await;
+
+        assert_eq!(
+            before_status,
+            StatusCode::OK,
+            "positive control: with no scan policy the virtual route must serve the chart"
+        );
+        assert_eq!(
+            &before_body[..],
+            &blob[..],
+            "positive control: the virtual route must serve the seeded chart bytes"
+        );
+        assert_eq!(
+            direct_blocked,
+            StatusCode::FORBIDDEN,
+            "control: the direct hosted route must refuse under this policy"
+        );
+        assert_eq!(
+            virtual_blocked,
+            StatusCode::FORBIDDEN,
+            "#3220: the virtual-member route must refuse the same chart under the same \
+             policy, got {virtual_blocked} body={:?}",
+            String::from_utf8_lossy(&virtual_blocked_body)
+        );
+        assert_ne!(
+            &virtual_blocked_body[..],
+            &blob[..],
+            "#3220: the blocked chart's bytes must not be served through the virtual repo"
+        );
+        assert_eq!(
+            after_status,
+            StatusCode::OK,
+            "negative control: removing the policy must restore the virtual download"
+        );
+        assert_eq!(&after_body[..], &blob[..]);
     }
 
     /// Regression guard for #3150: OCI manifest rows written into a classic
