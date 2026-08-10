@@ -120,7 +120,12 @@ impl AnalyticsService {
                 CURRENT_DATE,
                 (SELECT COUNT(*) FROM repositories),
                 (SELECT COUNT(*) FROM artifacts WHERE is_deleted = false),
-                (SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts WHERE is_deleted = false),
+                -- #3134: same source as `GET /api/v1/admin/stats`
+                -- (`repository_usage_ledger`, trigger-maintained), so the
+                -- snapshot trend does not diverge from the dashboard total
+                -- by OCI blob and proxy-cached bytes.
+                (SELECT COALESCE(SUM(hosted_bytes + proxy_bytes + oci_bytes), 0)
+                 FROM repository_usage_ledger),
                 (SELECT COUNT(*) FROM download_statistics),
                 (SELECT COUNT(*) FROM users)
             ON CONFLICT (snapshot_date) DO UPDATE SET
