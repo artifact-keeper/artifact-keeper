@@ -219,7 +219,23 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 /// every live GAV companion (and every checksum sidecar of one) read as
 /// unreferenced and was purged by the sweep while its parent artifact was
 /// still serving it (#3156).
+///
+/// Guards 3, 4 and 5 likewise take their sidecar-suffix regex from
+/// [`crate::services::maven_flat_attribution::GUARDED_SIDECAR_SUFFIXES`] rather
+/// than an inline `(md5|sha1|sha256|sha512)` alternation. The inline copies
+/// omitted `.asc`, which the READ path resolves to its base
+/// (`strip_checksum_suffix`) and which migrations 163 and 170 step (3') both
+/// backfill into `maven_flat_object_owner` -- so a `<base>.asc` the server was
+/// still serving matched neither the verbatim guards (nothing references a
+/// sidecar by name) nor the sidecar arms (the regex did not recognise it as a
+/// sidecar), read as orphan, and was reclaimed while its base stayed live
+/// (#3197). The rollup guard shares
+/// [`crate::services::maven_flat_attribution::is_metadata_rollup_key_sql`] /
+/// [`crate::services::maven_flat_attribution::metadata_rollup_dir_prefix_sql`]
+/// with the repository-delete collector for the same anti-drift reason.
 static ORPHAN_MAVEN_FLAT_PREDICATE_SQL: Lazy<String> = Lazy::new(|| {
+    use crate::services::maven_flat_attribution as mfa;
+    let sidecar_base = mfa::sidecar_base_key_sql("o.storage_key");
     format!(
         r#"
 o.storage_key LIKE 'maven/%'
@@ -240,42 +256,33 @@ AND NOT EXISTS (
 AND NOT EXISTS (
     SELECT 1 FROM artifacts a2
     JOIN repositories r2 ON r2.id = a2.repository_id
-    WHERE regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', '')
-            LIKE '%/maven-metadata.xml'
+    WHERE {is_rollup}
       AND r2.storage_backend = o.storage_backend
       AND a2.is_deleted = false
-      AND a2.storage_key LIKE substr(
-            regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', ''),
-            1,
-            length(regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', ''))
-              - length('maven-metadata.xml')
-          ) || '%'
+      AND a2.storage_key LIKE {rollup_dir} || '%'
 )
 AND NOT EXISTS (
     SELECT 1 FROM artifacts ab
     JOIN repositories rb ON rb.id = ab.repository_id
-    WHERE o.storage_key ~ '\.(md5|sha1|sha256|sha512)$'
-      AND ab.storage_key = regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', '')
+    WHERE {is_sidecar}
+      AND ab.storage_key = {sidecar_base}
       AND rb.storage_backend = o.storage_backend
 )
 AND NOT EXISTS (
     SELECT 1 FROM artifact_metadata am2
     JOIN artifacts pa2 ON pa2.id = am2.artifact_id
     JOIN repositories pr2 ON pr2.id = pa2.repository_id
-    WHERE o.storage_key ~ '\.(md5|sha1|sha256|sha512)$'
+    WHERE {is_sidecar}
       AND pr2.storage_backend = o.storage_backend
       AND {sidecar_base_files_match}
 )
 "#,
-        files_match = crate::services::maven_flat_attribution::metadata_files_name_key_sql(
-            "am.metadata->'files'",
-            "o.storage_key",
-        ),
+        files_match = mfa::metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key"),
+        is_rollup = mfa::is_metadata_rollup_key_sql("o.storage_key"),
+        rollup_dir = mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
+        is_sidecar = mfa::is_sidecar_key_sql("o.storage_key"),
         sidecar_base_files_match =
-            crate::services::maven_flat_attribution::metadata_files_name_key_sql(
-                "am2.metadata->'files'",
-                r"regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', '')",
-            ),
+            mfa::metadata_files_name_key_sql("am2.metadata->'files'", &sidecar_base),
     )
 });
 
@@ -4017,30 +4024,74 @@ mod tests {
     // #2668: row-less Maven sidecar + metadata reclamation
     // -----------------------------------------------------------------------
 
-    /// The sidecar suffix list and the regex alternation embedded (three
-    /// times) in [`ORPHAN_MAVEN_FLAT_PREDICATE_SQL`] must not drift: a suffix
-    /// missing from the SQL would silently exempt that sidecar class from the
-    /// flat-object sweep.
+    /// The sidecar suffix regex embedded (three times) in
+    /// [`ORPHAN_MAVEN_FLAT_PREDICATE_SQL`] must be the one the delete guards
+    /// share — `GUARDED_SIDECAR_SUFFIXES`, not `MAVEN_SIDECAR_SUFFIXES`. A
+    /// suffix missing from the SQL silently exempts that sidecar class from
+    /// guards 3/4/5, and an exempt sidecar in a `NOT EXISTS` guard is a
+    /// PURGED one.
+    ///
+    /// The two lists point in opposite directions and pinning the wrong one is
+    /// how #3197 happened: the predicate was pinned to `MAVEN_SIDECAR_SUFFIXES`
+    /// (the four suffixes GC *derives for deletion*), so `.asc` — which the read
+    /// path resolves to its base and which migrations 163/170 backfill into the
+    /// attribution table — was never recognised as a sidecar here at all.
+    ///
+    /// This is the only check on the `.asc` gap that runs WITHOUT a database;
+    /// `test_orphan_maven_flat_scan_spares_asc_signature_of_live_base_3197`
+    /// skips silently when `DATABASE_URL` is unset.
     #[test]
     fn test_maven_sidecar_suffixes_match_flat_predicate_sql() {
-        for suffix in MAVEN_SIDECAR_SUFFIXES {
+        use crate::services::maven_flat_attribution::GUARDED_SIDECAR_SUFFIXES;
+        for suffix in GUARDED_SIDECAR_SUFFIXES {
             let bare = suffix.trim_start_matches('.');
             assert!(
                 ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(bare),
-                "ORPHAN_MAVEN_FLAT_PREDICATE_SQL is missing sidecar suffix {suffix}"
+                "ORPHAN_MAVEN_FLAT_PREDICATE_SQL is missing guarded sidecar \
+                 suffix {suffix}: keys ending in it are not recognised as \
+                 sidecars, so guards 4/5 never fire and the object is purged \
+                 while its base is still served (#3197)"
             );
         }
         let expected_alternation = format!(
             "({})",
-            MAVEN_SIDECAR_SUFFIXES
+            GUARDED_SIDECAR_SUFFIXES
                 .map(|s| s.trim_start_matches('.'))
                 .join("|")
         );
         assert!(
             ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(&expected_alternation),
             "the SQL sidecar regex alternation must be built from \
-             MAVEN_SIDECAR_SUFFIXES; expected {expected_alternation}"
+             GUARDED_SIDECAR_SUFFIXES; expected {expected_alternation}"
         );
+        // ...and every suffix GC derives for deletion must be in there too.
+        // `guarded_sidecar_suffixes_are_a_superset_of_the_gc_derived_list`
+        // pins the containment; this states the consequence for the SQL.
+        for suffix in MAVEN_SIDECAR_SUFFIXES {
+            assert!(
+                GUARDED_SIDECAR_SUFFIXES.contains(&suffix),
+                "{suffix} is derived for deletion but not guarded"
+            );
+        }
+    }
+
+    /// Guard 3 (the `maven-metadata.xml` rollup anchor) must be built from the
+    /// fragments the repository-delete collector also uses, so the two delete
+    /// paths cannot disagree about which keys are rollups or which directory a
+    /// rollup covers — the divergence #3197 reported in the other direction.
+    #[test]
+    fn test_flat_predicate_rollup_guard_uses_shared_fragments() {
+        use crate::services::maven_flat_attribution as mfa;
+        for fragment in [
+            mfa::is_metadata_rollup_key_sql("o.storage_key"),
+            mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
+        ] {
+            assert!(
+                ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(&fragment),
+                "the rollup guard must use the shared fragment `{fragment}`, \
+                 not an inline copy"
+            );
+        }
     }
 
     /// #3156: a live parent artifact's metadata `files[]` must anchor its
@@ -4125,6 +4176,97 @@ mod tests {
             collected.contains(&orphan_key),
             "positive control: a key no parent references must still be \
              collected for purge; collected: {collected:?}"
+        );
+    }
+
+    /// #3197: the flat-object sweep must not reclaim a `.asc` signature whose
+    /// base object is still anchored.
+    ///
+    /// Guards 3/4/5 tested `\.(md5|sha1|sha256|sha512)$` — the list GC derives
+    /// keys to DELETE from — while the read path resolves `.asc` to its base
+    /// (`strip_checksum_suffix`) and migrations 163 / 170 step (3') backfill
+    /// `.asc` rows into `maven_flat_object_owner`. So a `.asc` matched neither
+    /// the verbatim guards (nothing references a sidecar by name) nor the
+    /// sidecar arms (it was not recognised as a sidecar), read as orphan, and
+    /// was collected while the server was still serving it.
+    ///
+    /// Both anchoring shapes the `.asc` gap reaches are covered: guard 4 (base
+    /// with a live `artifacts` row) and guard 3 (a `maven-metadata.xml` rollup
+    /// whose subtree is still live).
+    ///
+    /// TWO positive controls keep the fix honest — a `.asc` whose base is
+    /// genuinely unreferenced, and a rollup `.asc` over an empty subtree.
+    /// Without them, sparing every key ending in `.asc` would pass.
+    #[tokio::test]
+    async fn test_orphan_maven_flat_scan_spares_asc_signature_of_live_base_3197() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let uid = Uuid::new_v4().simple().to_string();
+
+        // Guard 4: a live base object; its `.asc` and `.sha1` are row-less.
+        let pom = format!("maven/gav3197/{uid}/lib/1.0/lib-1.0.pom");
+        let pom_asc = format!("{pom}.asc");
+        let pom_sha1 = format!("{pom}.sha1");
+        // Guard 3: the rollup over that still-live subtree, signed.
+        let live_rollup_asc = format!("maven/gav3197/{uid}/lib/maven-metadata.xml.asc");
+        // Positive controls: nothing anchors either of these.
+        let orphan_asc = format!("maven/gav3197/{uid}/lib/9.9.9/gone-9.9.9.pom.asc");
+        let dead_rollup_asc = format!("maven/gav3197/{uid}/dead/maven-metadata.xml.asc");
+
+        insert_maven_artifact_row(&fixture.pool, fixture.repo_id, fixture.user_id, &pom, false)
+            .await;
+        for key in [
+            &pom_asc,
+            &pom_sha1,
+            &live_rollup_asc,
+            &orphan_asc,
+            &dead_rollup_asc,
+        ] {
+            insert_flat_attribution_row(&fixture.pool, fixture.repo_id, key, 2).await;
+        }
+
+        let rows = service
+            .select_orphan_maven_flat_objects(Some(fixture.repo_id))
+            .await;
+        let collected: Vec<String> = rows
+            .expect("scan succeeds")
+            .iter()
+            .map(|r| r.get::<String, _>("storage_key"))
+            .collect();
+        fixture.teardown().await;
+
+        assert!(
+            !collected.contains(&pom_asc),
+            "guard 4: the `.asc` signature of a base with a live artifacts row \
+             must NOT be collected — the read path still serves it off that \
+             base (#3197); collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&pom_sha1),
+            "the `.sha1` of the same base must keep being spared too; \
+             collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&live_rollup_asc),
+            "guard 3: the `.asc` of a maven-metadata.xml whose subtree is still \
+             live must NOT be collected — losing it breaks signature \
+             verification of the document that resolves version ranges \
+             (#3197); collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&orphan_asc),
+            "positive control: a `.asc` whose BASE nothing anchors is a genuine \
+             orphan and must still be collected — otherwise sparing every \
+             `.asc` unconditionally would pass; collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_rollup_asc),
+            "positive control: a rollup `.asc` over a subtree with no live \
+             artifact must still be collected; collected: {collected:?}"
         );
     }
 

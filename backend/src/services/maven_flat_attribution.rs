@@ -159,6 +159,41 @@ pub(crate) fn sidecar_base_key_sql(key_expr: &str) -> String {
     format!(r"regexp_replace({key_expr}, '\.({alt})$', '')")
 }
 
+/// Trailing filename of a Maven rollup document. The `maven-metadata.xml` at a
+/// group/artifact/version directory is what resolves version ranges and the
+/// `LATEST`/`RELEASE` markers (Maven repository metadata spec, "Repository
+/// Metadata" — `maven-metadata.xml` is the only file name the layout defines
+/// for it), so losing one breaks *resolution*, not merely verification.
+const MAVEN_METADATA_FILENAME: &str = "maven-metadata.xml";
+
+/// SQL predicate: does `key_expr` name a `maven-metadata.xml` rollup document,
+/// or a checksum/signature sidecar of one?
+///
+/// The sidecar suffix is stripped first ([`sidecar_base_key_sql`]), so
+/// `.../maven-metadata.xml.sha1` and `.../maven-metadata.xml.asc` answer the
+/// same as the document itself — a rollup and its sidecars stand or fall
+/// together, which is the #3192 invariant applied to the rollup.
+pub(crate) fn is_metadata_rollup_key_sql(key_expr: &str) -> String {
+    let base = sidecar_base_key_sql(key_expr);
+    format!("{base} LIKE '%/{MAVEN_METADATA_FILENAME}'")
+}
+
+/// SQL expression yielding the directory prefix a `maven-metadata.xml` rollup
+/// summarises (`maven/g/a/` for `maven/g/a/maven-metadata.xml`), for use as the
+/// left operand of a `LIKE ... || '%'` anchor test. Only meaningful for keys
+/// [`is_metadata_rollup_key_sql`] accepts — always gate on it.
+///
+/// The rollup is anchored (spared) while ANY live artifact remains under that
+/// prefix: the document describes the whole groupId/artifactId subtree, so it
+/// is still being served as long as one member of the subtree is. The `LIKE`
+/// operand is a stored key, so SQL wildcards inside it can only make the
+/// pattern match a SUPERSET — i.e. this test can only ever over-PROTECT, which
+/// is the safe direction for a `NOT EXISTS` delete guard.
+pub(crate) fn metadata_rollup_dir_prefix_sql(key_expr: &str) -> String {
+    let base = sidecar_base_key_sql(key_expr);
+    format!("substr({base}, 1, length({base}) - length('{MAVEN_METADATA_FILENAME}'))")
+}
+
 /// Distinct owning repositories of a live parent artifact whose metadata
 /// `files[]` array lists this key (legacy GAV-grouped uploads whose companion
 /// files have no row of their own), restricted to repositories on `$2`. LIMIT 2

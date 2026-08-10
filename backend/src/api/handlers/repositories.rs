@@ -4197,7 +4197,32 @@ async fn purge_storage_object_keys(
 /// condition present on a sidecar arm but absent from the guard it shadows
 /// re-creates this same bug for the rows it excludes, by letting a base be
 /// spared while its sidecar is collected.
+///
+/// The final guard is the `maven-metadata.xml` rollup anchor (#3197). The GC
+/// sweep has carried it since #2668 (`ORPHAN_MAVEN_FLAT_PREDICATE_SQL` guard 3)
+/// and this collector never grew it, so GC spared a rollup another repository
+/// was still serving while a repository delete purged it -- and, since the
+/// rollup is what resolves version ranges and `LATEST`/`RELEASE`, that breaks
+/// *resolution* for the surviving repository, not merely checksum verification.
+/// It is a missing BASE guard, not a missing sidecar arm: the shared
+/// `is_metadata_rollup_key_sql` strips the sidecar suffix first, so the
+/// document and its `.sha1`/`.asc` are anchored together and the #3192
+/// invariant already holds here.
+///
+/// Two deliberate asymmetries with GC's copy of that guard, both in the
+/// over-PROTECT direction (the safe one for a `NOT EXISTS` purge list):
+///
+/// * `mb.repository_id <> $1`, like every other guard here. This collector runs
+///   BEFORE the repository row and its cascading `artifacts` rows are deleted,
+///   so without the scoping the repository's own doomed artifacts would anchor
+///   its own rollup and the object would leak forever.
+/// * No `is_deleted` test, matching the four guards above. A foreign
+///   soft-deleted artifact under the prefix therefore spares the rollup; that
+///   is a temporary leak, not a leak forever, because the GC sweep's copy of
+///   the guard *does* test `is_deleted` and reclaims the key once those rows
+///   are hard-deleted. A leak GC later collects is recoverable; a purge is not.
 async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
+    use crate::services::maven_flat_attribution as mfa;
     let sql = format!(
         "SELECT o.storage_key \
          FROM maven_flat_object_owner o \
@@ -4233,17 +4258,24 @@ async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec
                  AND spa.repository_id <> $1 \
                  AND spr.storage_backend = o.storage_backend \
                  AND {sidecar_files_match} \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM artifacts mb \
+               JOIN repositories mrb ON mrb.id = mb.repository_id \
+               WHERE {is_rollup} \
+                 AND mb.repository_id <> $1 \
+                 AND mrb.storage_backend = o.storage_backend \
+                 AND mb.storage_key LIKE {rollup_dir} || '%' \
            )",
-        files_match = crate::services::maven_flat_attribution::metadata_files_name_key_sql(
-            "am.metadata->'files'",
-            "o.storage_key",
-        ),
-        is_sidecar = crate::services::maven_flat_attribution::is_sidecar_key_sql("o.storage_key"),
-        base_key = crate::services::maven_flat_attribution::sidecar_base_key_sql("o.storage_key"),
-        sidecar_files_match = crate::services::maven_flat_attribution::metadata_files_name_key_sql(
+        files_match = mfa::metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key"),
+        is_sidecar = mfa::is_sidecar_key_sql("o.storage_key"),
+        base_key = mfa::sidecar_base_key_sql("o.storage_key"),
+        sidecar_files_match = mfa::metadata_files_name_key_sql(
             "sam.metadata->'files'",
-            &crate::services::maven_flat_attribution::sidecar_base_key_sql("o.storage_key"),
+            &mfa::sidecar_base_key_sql("o.storage_key"),
         ),
+        is_rollup = mfa::is_metadata_rollup_key_sql("o.storage_key"),
+        rollup_dir = mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
     );
     sqlx::query_scalar(&sql)
         .bind(repo_id)
@@ -21804,6 +21836,109 @@ mod apt_validation_tests {
              collected: {collected:?}"
         );
     }
+    /// #3197: deleting a repository must not purge the `maven-metadata.xml`
+    /// rollup (or its sidecars) of a subtree ANOTHER repository is still
+    /// serving.
+    ///
+    /// The GC sweep has carried this anchor since #2668; this collector never
+    /// grew it, so the two delete paths disagreed: GC spared the rollup, the
+    /// repository delete purged it. The rollup is what resolves version ranges
+    /// and `LATEST`/`RELEASE`, so losing it breaks resolution for the surviving
+    /// repository, not merely checksum verification.
+    ///
+    /// The `.sha1` and `.asc` are asserted alongside the document: the shared
+    /// `is_metadata_rollup_key_sql` strips the sidecar suffix before testing,
+    /// so a base-only fix that left the sidecars behind would still leave the
+    /// other repository serving a rollup whose checksum 404s.
+    ///
+    /// TWO positive controls keep the fix honest. The first is the `<> $1`
+    /// scoping: the doomed repository's OWN live artifact under a directory
+    /// must not anchor that directory's rollup, or the object leaks forever.
+    /// The second is a plain unreferenced key. Without them a guard that
+    /// spared every `maven-metadata.xml` would pass.
+    #[tokio::test]
+    async fn collect_repo_maven_flat_keys_spares_rollup_of_foreign_live_subtree_3197() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_repo, _, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (other_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let uid = Uuid::new_v4().simple().to_string();
+
+        // Another repository is still serving this subtree...
+        seed_flat_artifact_row(
+            &pool,
+            other_repo,
+            &format!("maven/gav3197/{uid}/lib/1.0/lib-1.0.jar"),
+        )
+        .await;
+        let rollup = format!("maven/gav3197/{uid}/lib/maven-metadata.xml");
+        let rollup_sidecars: Vec<String> = [".sha1", ".md5", ".sha256", ".sha512", ".asc"]
+            .iter()
+            .map(|s| format!("{rollup}{s}"))
+            .collect();
+
+        // ...while the repository being deleted holds only its OWN doomed
+        // artifact under this second directory, so its rollup is collectable.
+        seed_flat_artifact_row(
+            &pool,
+            owner_repo,
+            &format!("maven/gav3197/{uid}/own/1.0/own-1.0.jar"),
+        )
+        .await;
+        let own_rollup = format!("maven/gav3197/{uid}/own/maven-metadata.xml");
+        let own_rollup_sha1 = format!("{own_rollup}.sha1");
+        let orphan_key = format!("maven/gav3197/{uid}/own/1.0/gone-9.9.9.pom");
+
+        // Every claim belongs to the repository being deleted.
+        for key in [&rollup, &own_rollup, &own_rollup_sha1, &orphan_key]
+            .into_iter()
+            .chain(rollup_sidecars.iter())
+        {
+            seed_flat_claim(&pool, owner_repo, key).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let collected = collect_repo_maven_flat_keys(&state, owner_repo).await;
+
+        tdh::cleanup(&pool, other_repo, Uuid::nil()).await;
+        tdh::cleanup(&pool, owner_repo, Uuid::nil()).await;
+
+        assert!(
+            !collected.contains(&rollup),
+            "the maven-metadata.xml of a subtree another repository still has a \
+             live artifact in must NOT be purged by this repository's delete -- \
+             it is what resolves version ranges and LATEST/RELEASE for that \
+             repository (#3197); collected: {collected:?}"
+        );
+        for sidecar in &rollup_sidecars {
+            assert!(
+                !collected.contains(sidecar),
+                "the rollup's sidecars must be spared with it, or the surviving \
+                 repository serves a maven-metadata.xml whose checksum 404s \
+                 (#3197); collected: {collected:?}"
+            );
+        }
+        assert!(
+            collected.contains(&own_rollup),
+            "positive control: only the DOOMED repository's own artifacts sit \
+             under this directory, so its rollup must still be collected -- \
+             otherwise the anchor is unscoped and every rollup leaks forever; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&own_rollup_sha1),
+            "positive control: the sidecar of a collectable rollup is collected \
+             with it; collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&orphan_key),
+            "positive control: a key no repository references must still be \
+             collected for purge; collected: {collected:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // #3081: a virtual repository's storage total must not disclose the byte
     // size of member repositories the caller cannot read. Both aggregation
