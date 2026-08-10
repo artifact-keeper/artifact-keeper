@@ -576,6 +576,148 @@ async fn require_oci_repo_write_access(
     }
 }
 
+/// The `permissions` action an OCI pull requires. Matches what
+/// `middleware::auth::action_for_method` maps `GET`/`HEAD` to, so the OCI read
+/// gate asks the permission service the same question the native-protocol
+/// middleware asks.
+const OCI_READ_ACTION: &str = "read";
+
+/// 503 for an authorization lookup that could not be completed. Reads fail
+/// CLOSED: an unreachable permission store must not serve a private image.
+fn oci_authorization_unavailable() -> Response {
+    oci_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "DENIED",
+        "repository authorization temporarily unavailable",
+    )
+}
+
+/// OCI v2 **read** authorization — parity with the native-protocol read gate
+/// (#3261).
+///
+/// `/v2` is mounted OUTSIDE `repo_visibility_middleware`: `routes.rs` nests it
+/// before `.merge(format_routes)`, and the middleware is layered on
+/// `format_routes` only. So no middleware ever authorizes an OCI pull. Before
+/// this gate the only check on the read path was `is_anon && !repo.is_public`
+/// — *anonymity*, not authorization — and every authenticated principal could
+/// pull every private image by name and digest. The neighbouring scope gates
+/// do not close it: `enforce_token_repo_scope` is `None`-unrestricted for a
+/// JWT session, and `require_scope` is satisfied unconditionally by
+/// `scopes: None` (#3236). `AuthExtension::can_access_repo` is a token-scope
+/// ceiling (`AccessScope::Admin => true`), never a visibility check.
+///
+/// This reproduces the decision `repo_visibility_middleware` makes for a read,
+/// through the same predicates, so the two surfaces cannot answer differently:
+///
+/// * a global admin bypasses (as the middleware's `!ext.is_admin` guard does);
+/// * a scanner-scoped pull token bypasses — see below;
+/// * a **public** repository confers a read baseline that fine-grained rules
+///   must not take away from an authenticated caller (#2329,
+///   [`public_read_satisfies_acl`]), otherwise an authenticated user would end
+///   up with *less* access than an anonymous one on the same repository;
+/// * a **private** repository *with* fine-grained rules requires the `read`
+///   action (or `admin`, which implies it, #827) → otherwise 403 `DENIED`;
+/// * a **private** repository with *no* rules requires a role assignment
+///   scoped to it (or a global one) → otherwise the existence-hiding 404
+///   `NAME_UNKNOWN`, byte-identical to the response a nonexistent repository
+///   key produces in `resolve_repo_inner`. This mirrors the middleware's
+///   rules-less branch (`not_found_response`) and REST `require_visible`.
+///
+/// **Protocol**: the 401 + `WWW-Authenticate: Bearer` challenge is deliberately
+/// NOT reused here. The caller has already authenticated, so re-challenging
+/// would send Docker/Podman back to `/v2/token` for a credential it already
+/// holds and loop. The OCI distribution spec defines `DENIED` as "requested
+/// access to the resource is denied" (`spec.md`, Error Codes), which is the
+/// correct terminal answer for an authenticated-but-unauthorized pull; the
+/// anonymous arm above still returns the 401 challenge unchanged, so the
+/// challenge → token-exchange → retry handshake is untouched.
+///
+/// **Scanner exemption**: `_ak_scanner` (migration 138) is a NON-admin service
+/// account seeded with no role assignments, no permission rules and no API
+/// token *by design* — its only credential is the ephemeral, single-repository
+/// token minted per scan (`AuthService::generate_scan_token`). Running the
+/// grant check against it would break scanning of every private repository.
+/// The `scan_pull_repo` claim is therefore accepted as the authorization it
+/// is: it was minted by this backend for exactly one repository key, and
+/// [`enforce_scan_pull_scope`] — which MUST run before this helper — has
+/// already rejected the token if that key is not this repository.
+async fn require_oci_repo_read_access(
+    state: &SharedState,
+    claims: &crate::services::auth_service::Claims,
+    repo: &OciRepoInfo,
+) -> Result<(), Response> {
+    if claims.is_admin || claims.scan_pull_repo.is_some() {
+        return Ok(());
+    }
+
+    // #2329: never leave an authenticated caller below the anonymous read
+    // baseline a public repository already grants.
+    if crate::api::middleware::auth::public_read_satisfies_acl(repo.is_public, OCI_READ_ACTION) {
+        return Ok(());
+    }
+
+    let has_rules = match state
+        .permission_service
+        .has_any_rules_for_target("repository", repo.id)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("OCI repository read authorization lookup failed: {}", e);
+            return Err(oci_authorization_unavailable());
+        }
+    };
+
+    if has_rules {
+        let allowed = state
+            .permission_service
+            .check_permission(claims.sub, "repository", repo.id, OCI_READ_ACTION, false)
+            .await
+            .unwrap_or(false)
+            || state
+                .permission_service
+                .check_permission(claims.sub, "repository", repo.id, "admin", false)
+                .await
+                .unwrap_or(false);
+        return if allowed {
+            Ok(())
+        } else {
+            Err(oci_denied_repo_access())
+        };
+    }
+
+    // Rules-less private repository: a role assignment is required. Same
+    // predicate as the middleware's rules-less branch and
+    // `RepositoryService::user_can_access_repo`. `query_scalar` (not the
+    // macro) so no new sqlx offline-query cache entry is needed.
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM role_assignments ra \
+             WHERE ra.user_id = $1 \
+               AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
+         )",
+    )
+    .bind(claims.sub)
+    .bind(repo.id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(true) => Ok(()),
+        // Existence-hiding: identical to the `resolve_repo_inner` 404 for an
+        // unknown key, so 403-vs-404 cannot be used to probe which private
+        // repositories exist.
+        Ok(false) => Err(oci_error(
+            StatusCode::NOT_FOUND,
+            "NAME_UNKNOWN",
+            &format!("repository not found: {}", repo.key),
+        )),
+        Err(e) => {
+            tracing::error!("OCI repository read access check failed: {}", e);
+            Err(oci_authorization_unavailable())
+        }
+    }
+}
+
 /// Build a Docker/OCI scope string for a repository resource.
 fn pull_scope(image_name: &str) -> String {
     format!("repository:{}:pull", image_name)
@@ -4432,6 +4574,13 @@ async fn handle_head_blob(
         if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
             return resp;
         }
+        // #3261: authentication is not authorization. `/v2` is mounted outside
+        // `repo_visibility_middleware`, so this is the ONLY read gate on the
+        // OCI surface; without it any authenticated principal could pull any
+        // private image.
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+            return resp;
+        }
     }
 
     // Check oci_blobs table. Look up by the canonical digest so an upper-case
@@ -4608,6 +4757,13 @@ async fn handle_get_blob(
         // read-side parity of the REST #504 scope gate. No-op for unscoped
         // tokens (allowed_repo_ids == None).
         if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+            return resp;
+        }
+        // #3261: authentication is not authorization. `/v2` is mounted outside
+        // `repo_visibility_middleware`, so this is the ONLY read gate on the
+        // OCI surface; without it any authenticated principal could pull any
+        // private image.
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
             return resp;
         }
     }
@@ -7137,6 +7293,13 @@ async fn handle_head_manifest(
         if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
             return resp;
         }
+        // #3261: authentication is not authorization. `/v2` is mounted outside
+        // `repo_visibility_middleware`, so this is the ONLY read gate on the
+        // OCI surface; without it any authenticated principal could pull any
+        // private image.
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+            return resp;
+        }
     }
 
     // Curation enforcement (#2930): mirror the GET-manifest gate so a HEAD probe
@@ -7982,6 +8145,13 @@ async fn handle_get_manifest(
         if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
             return resp;
         }
+        // #3261: authentication is not authorization. `/v2` is mounted outside
+        // `repo_visibility_middleware`, so this is the ONLY read gate on the
+        // OCI surface; without it any authenticated principal could pull any
+        // private image.
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+            return resp;
+        }
     }
 
     // Curation enforcement (#2930): a `block` rule on this remote/virtual repo
@@ -8607,14 +8777,18 @@ async fn handle_tags_list(
     let scope = pull_scope(image_name);
     // #1776: mirror handle_head_manifest — anonymous tokens are allowed past the
     // auth gate so a public repository's tags can be listed without credentials.
+    // #3261: bind the claims instead of discarding them — the tag list of a
+    // private repository is readable content and needs the same read gate the
+    // manifest/blob handlers apply.
     let is_anon = is_anonymous_token(headers);
-    if !is_anon
-        && authenticate_oci(&state.db, &state.config, headers)
-            .await
-            .is_err()
-    {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
+    let claims = if is_anon {
+        None
+    } else {
+        match authenticate_oci(&state.db, &state.config, headers).await {
+            Ok(c) => Some(c),
+            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+        }
+    };
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
@@ -8624,6 +8798,15 @@ async fn handle_tags_list(
     // Anonymous tokens may only list tags on public repositories.
     if is_anon && !repo.is_public {
         return unauthorized_challenge_with_scope(base_url, Some(&scope));
+    }
+
+    // #3261: authentication is not authorization — an authenticated principal
+    // with no grant on a private repository must not be able to enumerate its
+    // tags either.
+    if let Some(claims) = &claims {
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+            return resp;
+        }
     }
 
     let (n, last) = match parse_pagination_params(query) {
@@ -28390,6 +28573,428 @@ mod remote_pull_through_cache_tests {
             "a tag-addressed manifest must stay mutable (tags move); got \
              {tag_manifest_ttl}s — this negative control keeps the immutable \
              assertions honest"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OCI `/v2` READ authorization (#3261).
+//
+// `/v2` is mounted outside `repo_visibility_middleware`, so before this gate
+// the only check on the pull path was `is_anon && !repo.is_public` — any
+// authenticated account could pull any private image. These tests drive the
+// real router (the same dispatch a `docker pull` takes) and assert BOTH
+// directions in one fixture: an ungranted authenticated principal is refused,
+// while the granted member, the admin, and the anonymous public pull still
+// succeed. Without those positive controls a fix that denied everyone would
+// pass. DB-backed: the decision reads `permissions` / `role_assignments`.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod oci_read_authz_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+
+    const MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:c0ffeec0ffee","size":2},"layers":[]}"#;
+    const LAYER_BODY: &[u8] = b"ak-3261 private layer bytes";
+    const IMAGE: &str = "app";
+    const TAG: &str = "v1";
+    /// A marker that appears in the manifest bytes only. Asserting its ABSENCE
+    /// proves the refused response carried no image content, not merely a
+    /// non-200 status.
+    const MANIFEST_MARKER: &str = "c0ffeec0ffee";
+
+    /// Insert a user and backdate the credential/privilege watermarks by 60s.
+    /// A bearer minted immediately after an `INSERT` can otherwise lose the
+    /// race against `privileges_changed_at` (migration 131), which the DB
+    /// server stamps with its own clock.
+    async fn new_user(pool: &PgPool, is_admin: bool) -> Uuid {
+        let (id, _) = tdh::create_user(pool).await;
+        sqlx::query(
+            "UPDATE users SET is_admin = $2, \
+                              password_changed_at = NOW() - INTERVAL '60 seconds', \
+                              privileges_changed_at = NOW() - INTERVAL '60 seconds' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(is_admin)
+        .execute(pool)
+        .await
+        .expect("backdate user watermarks");
+        id
+    }
+
+    struct ReadFixture {
+        pool: PgPool,
+        state: SharedState,
+        repo_id: Uuid,
+        repo_key: String,
+        storage_dir: std::path::PathBuf,
+        member_id: Uuid,
+        blob_digest: String,
+        extra_users: Vec<Uuid>,
+    }
+
+    impl ReadFixture {
+        /// A PRIVATE (`is_public = false`, the column default) hosted docker
+        /// repository holding one tagged manifest and one layer blob, plus a
+        /// member holding a repo-scoped role assignment.
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+            let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let storage = state
+                .storage_for_repo(&crate::storage::StorageLocation {
+                    backend: "filesystem".to_string(),
+                    path: storage_dir.to_string_lossy().into_owned(),
+                })
+                .expect("storage");
+
+            let manifest_digest = compute_sha256(MANIFEST_BODY);
+            storage
+                .put(
+                    &manifest_storage_key(&manifest_digest),
+                    Bytes::from(MANIFEST_BODY.to_vec()),
+                )
+                .await
+                .expect("put manifest");
+            sqlx::query(
+                "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+                 VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')",
+            )
+            .bind(repo_id)
+            .bind(IMAGE)
+            .bind(TAG)
+            .bind(&manifest_digest)
+            .execute(&pool)
+            .await
+            .expect("seed tag");
+
+            let blob_digest = compute_sha256(LAYER_BODY);
+            storage
+                .put(
+                    &blob_storage_key(&blob_digest),
+                    Bytes::from(LAYER_BODY.to_vec()),
+                )
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(repo_id)
+            .bind(&blob_digest)
+            .bind(LAYER_BODY.len() as i64)
+            .bind(blob_storage_key(&blob_digest))
+            .execute(&pool)
+            .await
+            .expect("seed blob");
+
+            let member_id = new_user(&pool, false).await;
+            tdh::grant_repo_access(&pool, repo_id, member_id).await;
+
+            Some(Self {
+                pool,
+                state,
+                repo_id,
+                repo_key,
+                storage_dir,
+                member_id,
+                blob_digest,
+                extra_users: Vec::new(),
+            })
+        }
+
+        async fn set_public(&self, is_public: bool) {
+            sqlx::query("UPDATE repositories SET is_public = $2 WHERE id = $1")
+                .bind(self.repo_id)
+                .bind(is_public)
+                .execute(&self.pool)
+                .await
+                .expect("set is_public");
+        }
+
+        async fn add_user(&mut self, is_admin: bool) -> Uuid {
+            let id = new_user(&self.pool, is_admin).await;
+            self.extra_users.push(id);
+            id
+        }
+
+        async fn bearer(&self, user_id: Uuid) -> String {
+            tdh::bearer_for(&self.state, user_id).await
+        }
+
+        fn manifest_path(&self) -> String {
+            format!("/{}/{}/manifests/{}", self.repo_key, IMAGE, TAG)
+        }
+
+        fn blob_path(&self) -> String {
+            format!("/{}/{}/blobs/{}", self.repo_key, IMAGE, self.blob_digest)
+        }
+
+        fn tags_path(&self) -> String {
+            format!("/{}/{}/tags/list", self.repo_key, IMAGE)
+        }
+
+        /// Send one OCI request through the real `/v2` router.
+        async fn call(
+            &self,
+            method: &str,
+            path: String,
+            authorization: &str,
+        ) -> (StatusCode, Bytes) {
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("build request");
+            tdh::send(router().with_state(self.state.clone()), req).await
+        }
+
+        async fn teardown(&self) {
+            for table in ["oci_tags", "oci_blobs"] {
+                let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
+                    .bind(self.repo_id)
+                    .execute(&self.pool)
+                    .await;
+            }
+            for user_id in &self.extra_users {
+                tdh::cleanup_user(&self.pool, *user_id).await;
+            }
+            tdh::cleanup(&self.pool, self.repo_id, self.member_id).await;
+            let _ = std::fs::remove_dir_all(&self.storage_dir);
+        }
+    }
+
+    /// THE BUG (#3261): a second authenticated account with no grant and no
+    /// role assignment on a private repository pulled its manifest and layer
+    /// bytes with 200. Every OCI read verb is asserted, and the same fixture
+    /// carries the positive controls (granted member + admin still pull 200)
+    /// so a gate that denied everyone could not satisfy it.
+    #[tokio::test]
+    async fn private_repo_reads_denied_for_ungranted_authenticated_principal() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let outsider = f.add_user(false).await;
+        let admin = f.add_user(true).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let member_bearer = f.bearer(f.member_id).await;
+        let admin_bearer = f.bearer(admin).await;
+
+        let (get_manifest, manifest_body) =
+            f.call("GET", f.manifest_path(), &outsider_bearer).await;
+        let (get_blob, blob_body) = f.call("GET", f.blob_path(), &outsider_bearer).await;
+        let (head_manifest, _) = f.call("HEAD", f.manifest_path(), &outsider_bearer).await;
+        let (head_blob, _) = f.call("HEAD", f.blob_path(), &outsider_bearer).await;
+        let (tags, _) = f.call("GET", f.tags_path(), &outsider_bearer).await;
+
+        // Positive controls, same fixture: the content IS servable.
+        let (member_manifest, member_body) = f.call("GET", f.manifest_path(), &member_bearer).await;
+        let (member_blob, member_blob_body) = f.call("GET", f.blob_path(), &member_bearer).await;
+        let (admin_manifest, _) = f.call("GET", f.manifest_path(), &admin_bearer).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            get_manifest,
+            StatusCode::NOT_FOUND,
+            "an ungranted authenticated principal must not pull a private manifest"
+        );
+        assert!(
+            !String::from_utf8_lossy(&manifest_body).contains(MANIFEST_MARKER),
+            "the refused response must carry no manifest content"
+        );
+        assert_eq!(
+            get_blob,
+            StatusCode::NOT_FOUND,
+            "an ungranted authenticated principal must not pull a private layer blob"
+        );
+        assert!(
+            !String::from_utf8_lossy(&blob_body).contains("private layer bytes"),
+            "the refused response must carry no layer bytes"
+        );
+        assert_eq!(head_manifest, StatusCode::NOT_FOUND, "HEAD manifest too");
+        assert_eq!(head_blob, StatusCode::NOT_FOUND, "HEAD blob too");
+        assert_eq!(
+            tags,
+            StatusCode::NOT_FOUND,
+            "an ungranted principal must not enumerate a private repo's tags"
+        );
+
+        assert_eq!(
+            member_manifest,
+            StatusCode::OK,
+            "the granted member must still pull the manifest"
+        );
+        assert!(
+            String::from_utf8_lossy(&member_body).contains(MANIFEST_MARKER),
+            "the member's 200 must carry the real manifest bytes"
+        );
+        assert_eq!(
+            member_blob,
+            StatusCode::OK,
+            "the granted member must still pull the layer"
+        );
+        assert_eq!(
+            member_blob_body.as_ref(),
+            LAYER_BODY,
+            "the member's layer bytes must be served verbatim"
+        );
+        assert_eq!(
+            admin_manifest,
+            StatusCode::OK,
+            "a global admin must still pull the manifest"
+        );
+    }
+
+    /// The public-repository contract is unchanged: the anonymous pull token a
+    /// logged-out Docker client presents still gets 200, and an authenticated
+    /// principal with no grant is never left BELOW that anonymous baseline
+    /// (#2329).
+    #[tokio::test]
+    async fn public_repo_reads_unchanged_for_anonymous_and_ungranted() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        f.set_public(true).await;
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+
+        let (anon_manifest, anon_body) = f.call("GET", f.manifest_path(), &anon).await;
+        let (anon_blob, _) = f.call("GET", f.blob_path(), &anon).await;
+        let (outsider_manifest, _) = f.call("GET", f.manifest_path(), &outsider_bearer).await;
+        let (outsider_tags, _) = f.call("GET", f.tags_path(), &outsider_bearer).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            anon_manifest,
+            StatusCode::OK,
+            "anonymous pull of a PUBLIC repo must be unchanged"
+        );
+        assert!(
+            String::from_utf8_lossy(&anon_body).contains(MANIFEST_MARKER),
+            "the anonymous 200 must still carry the manifest bytes"
+        );
+        assert_eq!(anon_blob, StatusCode::OK, "anonymous blob pull unchanged");
+        assert_eq!(
+            outsider_manifest,
+            StatusCode::OK,
+            "an authenticated caller must not get LESS than the anonymous \
+             read baseline on a public repo (#2329)"
+        );
+        assert_eq!(outsider_tags, StatusCode::OK, "public tags/list unchanged");
+    }
+
+    /// When fine-grained `permissions` rules exist for the repository, the
+    /// read decision is the rule — matching `repo_visibility_middleware`'s read
+    /// branch (`has_any_rules_for_target` + `check_permission`). A principal
+    /// holding `write` but not `read` is refused with the OCI `DENIED` code;
+    /// a principal holding `read` pulls.
+    #[tokio::test]
+    async fn fine_grained_rules_decide_private_reads() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let reader = f.add_user(false).await;
+        let writer = f.add_user(false).await;
+        tdh::grant_repo_actions(&f.pool, f.repo_id, reader, &["read"]).await;
+        tdh::grant_repo_actions(&f.pool, f.repo_id, writer, &["write"]).await;
+        let reader_bearer = f.bearer(reader).await;
+        let writer_bearer = f.bearer(writer).await;
+
+        let (reader_status, reader_body) = f.call("GET", f.manifest_path(), &reader_bearer).await;
+        let (writer_status, writer_body) = f.call("GET", f.manifest_path(), &writer_bearer).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            reader_status,
+            StatusCode::OK,
+            "a principal holding the read action must pull"
+        );
+        assert!(
+            String::from_utf8_lossy(&reader_body).contains(MANIFEST_MARKER),
+            "the reader's 200 must carry the manifest bytes"
+        );
+        assert_eq!(
+            writer_status,
+            StatusCode::FORBIDDEN,
+            "a write-only rule must not confer read on a private repo"
+        );
+        assert!(
+            String::from_utf8_lossy(&writer_body).contains("DENIED"),
+            "the 403 must carry the OCI DENIED error code; got: {}",
+            String::from_utf8_lossy(&writer_body)
+        );
+    }
+
+    /// Regression guard for the fix itself: `_ak_scanner` (migration 138) is a
+    /// non-admin service account seeded with NO role assignments and NO
+    /// permission rules, and its only credential is the per-scan token pinned
+    /// to one repository. Subjecting it to the grant check would break
+    /// vulnerability scanning of every private image, so a `scan_pull_repo`
+    /// token for THIS repository must still pull.
+    #[tokio::test]
+    async fn scanner_scoped_pull_token_still_reads_private_repo() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let scanner = f.add_user(false).await;
+        let auth_service = AuthService::new(f.state.db.clone(), Arc::new(f.state.config.clone()));
+        let user = sqlx::query_as::<_, User>(
+            r#"SELECT id, username, email, password_hash, display_name, auth_provider,
+                      external_id, is_admin, is_active, is_service_account, must_change_password,
+                      totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                      failed_login_attempts, locked_until, last_failed_login_at,
+                      password_changed_at, last_login_at, created_at, updated_at
+               FROM users WHERE id = $1"#,
+        )
+        .bind(scanner)
+        .fetch_one(&f.pool)
+        .await
+        .expect("load scanner user");
+        let scoped = format!(
+            "Bearer {}",
+            auth_service
+                .generate_scan_token(&user, &f.repo_key, 300)
+                .expect("mint scan token")
+        );
+        // Same identity, but pinned to a DIFFERENT repository key: the #2093
+        // gate must still reject it, so this test cannot pass by disabling the
+        // scan-token path altogether.
+        let foreign = format!(
+            "Bearer {}",
+            auth_service
+                .generate_scan_token(&user, "some-other-repo", 300)
+                .expect("mint scan token")
+        );
+
+        let (scoped_status, scoped_body) = f.call("GET", f.manifest_path(), &scoped).await;
+        let (foreign_status, _) = f.call("GET", f.manifest_path(), &foreign).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            scoped_status,
+            StatusCode::OK,
+            "a scan token minted for THIS repo must still pull it (#2093)"
+        );
+        assert!(
+            String::from_utf8_lossy(&scoped_body).contains(MANIFEST_MARKER),
+            "the scanner's 200 must carry the manifest bytes"
+        );
+        assert_eq!(
+            foreign_status,
+            StatusCode::FORBIDDEN,
+            "a scan token pinned to another repo must still be rejected"
         );
     }
 }
