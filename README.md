@@ -222,7 +222,15 @@ flowchart LR
 > network namespace (#3169). When nothing is configured the backend now
 > advertises its own container address automatically; set
 > `TRIVY_ADAPTER_REGISTRY_URL` (or the shared `AK_GRYPE_REGISTRY_HOST`) to
-> override, e.g. `http://backend:8080`. Give the adapter its **own** trivy
+> override, e.g. `http://backend:8080`. The automatic derivation is skipped
+> when the adapter's own URL is a loopback address, because that normally means
+> the adapter shares this network namespace (`cargo run` next to a local
+> adapter, or `network_mode: host`). It is **not** skipped correctly for an
+> adapter container published on loopback (`docker run -p 127.0.0.1:8081:8080
+> …scanner-adapter`): there the backend reaches the adapter over loopback but
+> the adapter cannot reach the backend that way, so set
+> `TRIVY_ADAPTER_REGISTRY_URL` explicitly. The backend logs which fallback it
+> took on every scan. Give the adapter its **own** trivy
 > cache volume — reusing the trivy server's root-owned `trivy_cache` fails
 > with `permission denied` on `fanal/fanal.db` because the adapter runs
 > unprivileged (UID 1001).
