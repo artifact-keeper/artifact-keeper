@@ -5488,6 +5488,34 @@ pub fn age_gate_blocked_response(
         .into_response()
 }
 
+/// The structured facts behind a curation `block` verdict (#3110).
+///
+/// The enforcement seam used to hand callers an already-rendered `Response`,
+/// which made the rule's `reason` unreachable to any caller that needs to
+/// serve a different body shape. The OCI `/v2` surface is exactly that case:
+/// it must emit the distribution-spec error envelope, and the spec provides
+/// `detail` ("OPTIONAL and MAY contain arbitrary JSON data providing
+/// information the client can use to resolve the issue", `spec.md` "Error
+/// Codes") for precisely this payload. Every non-OCI format renders this
+/// through [`CurationBlock::into_rest_response`], so their wire body is
+/// byte-identical to before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurationBlock {
+    /// The package identity the rule matched (npm name, OCI image,
+    /// `groupId:artifactId`, crate name, nuget id, …).
+    pub package: String,
+    /// Human-readable statement of which rule fired, from
+    /// `CurationService::evaluate_pep503_package`.
+    pub reason: String,
+}
+
+impl CurationBlock {
+    /// The shared REST-shaped 403 body every non-OCI proxy format serves.
+    pub fn into_rest_response(&self) -> Response {
+        curation_blocked_response(&self.package, &self.reason)
+    }
+}
+
 /// 403 response for a curation-rule block on a proxy request.
 pub fn curation_blocked_response(package: &str, reason: &str) -> Response {
     let body = serde_json::json!({
@@ -5558,6 +5586,22 @@ pub async fn enforce_curation<'a>(
     package: &str,
     version: Option<&str>,
 ) -> Result<(), Response> {
+    evaluate_curation(db, target, package, version)
+        .await
+        .map_err(|block| block.into_rest_response())
+}
+
+/// [`enforce_curation`] without the rendering step: yields the structured
+/// [`CurationBlock`] so a caller whose surface has its own error contract
+/// (the OCI `/v2` envelope, #3110) can carry the package and the rule
+/// `reason` into that shape instead of losing them inside an opaque
+/// `Response`.
+pub async fn evaluate_curation<'a>(
+    db: &PgPool,
+    target: impl Into<CurationTarget<'a>>,
+    package: &str,
+    version: Option<&str>,
+) -> Result<(), CurationBlock> {
     let target = target.into();
     if !target.curation_enabled || !matches!(target.repo_type, "remote" | "virtual") {
         return Ok(());
@@ -5578,7 +5622,10 @@ pub async fn enforce_curation<'a>(
         .ok();
     if let Some(eval) = eval {
         if eval.action == "block" {
-            return Err(curation_blocked_response(package, &eval.reason));
+            return Err(CurationBlock {
+                package: package.to_string(),
+                reason: eval.reason,
+            });
         }
     }
     Ok(())
@@ -5603,6 +5650,22 @@ pub async fn enforce_curation_lookup(
     package: &str,
     version: Option<&str>,
 ) -> Result<(), Response> {
+    evaluate_curation_lookup(db, repo_id, repo_key, repo_type, package, version)
+        .await
+        .map_err(|block| block.into_rest_response())
+}
+
+/// [`enforce_curation_lookup`] without the rendering step — see
+/// [`evaluate_curation`]. The OCI `/v2` manifest GET/HEAD seams call this so
+/// the rule `reason` survives into the spec envelope's `detail` (#3110).
+pub async fn evaluate_curation_lookup(
+    db: &PgPool,
+    repo_id: Uuid,
+    repo_key: &str,
+    repo_type: &str,
+    package: &str,
+    version: Option<&str>,
+) -> Result<(), CurationBlock> {
     if !matches!(repo_type, "remote" | "virtual") {
         return Ok(());
     }
@@ -5641,7 +5704,7 @@ pub async fn enforce_curation_lookup(
         curation_enabled,
         default_action: &default_action,
     };
-    enforce_curation(db, target, package, version).await
+    evaluate_curation(db, target, package, version).await
 }
 
 /// On-demand curation INGESTION for pypi/npm (#2955 Stage 2).
@@ -6225,6 +6288,28 @@ pub(crate) async fn gate_proxy_scan_serve(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // ── Curation block rendering (#2930 body, #3110 structured verdict) ──
+    //
+    // Splitting the curation seam into `evaluate_*` (structured
+    // [`CurationBlock`]) + `enforce_*` (rendered `Response`) so the OCI `/v2`
+    // surface can build its own spec envelope must NOT move the shared REST
+    // body every other proxy format serves. `curation-multiformat-enforce`'s
+    // npm arm reads `.error` out of exactly these bytes.
+    #[tokio::test]
+    async fn curation_block_rest_body_is_unchanged() {
+        let block = CurationBlock {
+            package: "left-pad".to_string(),
+            reason: "#2930 tier block".to_string(),
+        };
+        let resp = block.into_rest_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            r##"{"error":"curation_blocked","package":"left-pad","reason":"#2930 tier block"}"##
+        );
+    }
 
     // ── Stricter-of-two virtual scan policy (#3023) ──────────────────
     //

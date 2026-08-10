@@ -14,6 +14,7 @@ use std::sync::{
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body, HttpBody};
+use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -58,11 +59,27 @@ struct OciErrorEntry {
 }
 
 fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
+    oci_error_detail(status, code, message, None)
+}
+
+/// [`oci_error`] with the spec's OPTIONAL `detail` member populated.
+///
+/// distribution-spec `spec.md` "Error Codes": *"The `detail` field is
+/// OPTIONAL and MAY contain arbitrary JSON data providing information the
+/// client can use to resolve the issue."* It is serialized only when
+/// present (`skip_serializing_if`), so a `None` body is byte-identical to
+/// what [`oci_error`] emitted before this helper existed.
+fn oci_error_detail(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    detail: Option<serde_json::Value>,
+) -> Response {
     let body = OciErrorResponse {
         errors: vec![OciErrorEntry {
             code: code.to_string(),
             message: message.to_string(),
-            detail: None,
+            detail,
         }],
     };
     let json = serde_json::to_string(&body).unwrap_or_default();
@@ -4134,9 +4151,35 @@ async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response
 async fn token(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Query(query): Query<TokenQuery>,
-    body: Bytes,
+    query: Result<Query<TokenQuery>, QueryRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    // #3110: these two extractors are the only FALLIBLE ones on the /v2
+    // surface, and axum renders its own rejections as `text/plain` — a
+    // repeated `?service=` yields "400 Failed to deserialize query string:
+    // duplicate field `service`" (the same serde_urlencoded mechanism
+    // documented on `TokenQuery::scope` above), and a request body over
+    // TOKEN_REQUEST_BODY_LIMIT_BYTES yields a plaintext 413. Neither is a
+    // spec VIOLATION — distribution-spec "Error Codes" says a 4XX "MAY
+    // return a body in any format" — but they are the last bare-string 4XX
+    // bodies a docker client can meet on this router, so they are re-shaped
+    // into the envelope here. The rejection's own status and text are
+    // preserved; `UNSUPPORTED` (code-14, "The operation is unsupported.") is
+    // the closest registered code, as the spec's closed table has no
+    // malformed-request entry.
+    let Query(query) = match query {
+        Ok(q) => q,
+        Err(rejection) => {
+            return oci_error(rejection.status(), "UNSUPPORTED", &rejection.body_text());
+        }
+    };
+    let body = match body {
+        Ok(b) => b,
+        Err(rejection) => {
+            return oci_error(rejection.status(), "UNSUPPORTED", &rejection.body_text());
+        }
+    };
+
     // Per the OCI Distribution token spec, clients must request a token
     // scoped to the same `service` the server advertises. Reject mismatches
     // with 400 DENIED. Allow a missing `service` so curl-style and older
@@ -7400,7 +7443,7 @@ async fn handle_head_manifest(
     // Curation enforcement (#2930): mirror the GET-manifest gate so a HEAD probe
     // (which many clients issue before the GET) is blocked identically. No-op
     // for hosted repos / curation off.
-    if let Err(resp) = proxy_helpers::enforce_curation_lookup(
+    if let Err(block) = proxy_helpers::evaluate_curation_lookup(
         &state.db,
         repo.id,
         &repo.key,
@@ -7410,9 +7453,10 @@ async fn handle_head_manifest(
     )
     .await
     {
-        // #3110: re-shape the shared gate's REST-style body into the OCI
-        // error envelope this surface is contractually required to emit.
-        return oci_curation_deny_response(resp.status(), &repo.image);
+        // #3110: this surface is contractually required to emit the OCI error
+        // envelope, so it renders the verdict itself rather than forwarding the
+        // shared gate's REST-shaped body — carrying the rule reason through.
+        return oci_curation_deny_response(&block);
     }
 
     // Reference can be a tag or a digest. Resolve locally first: a surviving
@@ -7888,22 +7932,39 @@ fn oci_manifest_synthetic_artifact(
     }
 }
 
-/// Map the shared curation gate's deny response onto the OCI error envelope
-/// (#3110). `proxy_helpers::enforce_curation_lookup` builds a REST-shaped
-/// `{"error":"curation_blocked",...}` body shared by every proxy format; on
-/// the `/v2` surface that shape violates the distribution-spec "Error Codes"
-/// MUST (a 4XX JSON body must be `{"errors":[...]}`) and docker clients
-/// cannot render it. Status is preserved; the `curation_blocked` marker is
-/// kept inside the message so existing oracles/scripts that grep for it
-/// still match. Sibling of [`oci_scan_deny_response`].
-fn oci_curation_deny_response(status: StatusCode, image: &str) -> Response {
-    oci_error(
-        status,
+/// Render a curation `block` verdict as the OCI error envelope (#3110).
+///
+/// `proxy_helpers`' shared curation seam renders a REST-shaped
+/// `{"error":"curation_blocked","package":…,"reason":…}` body for every proxy
+/// format; on the `/v2` surface that shape violates the distribution-spec
+/// "Error Codes" MUST (a 4XX JSON body must be `{"errors":[...]}`) and docker
+/// clients cannot render it. This is the OCI seam's own rendering of the same
+/// verdict, built from the structured [`proxy_helpers::CurationBlock`] so no
+/// information is lost in the translation:
+///
+/// * `code` is the registered `DENIED` (code-12).
+/// * `message` keeps the `curation_blocked` marker (existing operator scripts
+///   grep for it) and names both the image and the rule reason, because
+///   `errors[0].message` is what `docker pull` prints to the operator.
+/// * `detail` carries the package and reason as structured JSON, which is
+///   what `spec.md` provides that member for — parity with the `reason` every
+///   non-OCI format already reports.
+///
+/// The status is fixed at 403: the shared seam's only block verdict is
+/// `curation_blocked_response`, which is unconditionally `FORBIDDEN`.
+/// Sibling of [`oci_scan_deny_response`].
+fn oci_curation_deny_response(block: &proxy_helpers::CurationBlock) -> Response {
+    oci_error_detail(
+        StatusCode::FORBIDDEN,
         "DENIED",
         &format!(
-            "curation_blocked: pull of {} is blocked by this repository's curation policy",
-            image
+            "curation_blocked: pull of {} is blocked by this repository's curation policy: {}",
+            block.package, block.reason
         ),
+        Some(serde_json::json!({
+            "package": block.package,
+            "reason": block.reason,
+        })),
     )
 }
 
@@ -8286,7 +8347,7 @@ async fn handle_get_manifest(
     // per-blob check. The image name is the curation identity; the reference
     // (tag or digest) is not passed as a version. No-op for hosted repos /
     // curation off.
-    if let Err(resp) = proxy_helpers::enforce_curation_lookup(
+    if let Err(block) = proxy_helpers::evaluate_curation_lookup(
         &state.db,
         repo.id,
         &repo.key,
@@ -8296,9 +8357,10 @@ async fn handle_get_manifest(
     )
     .await
     {
-        // #3110: re-shape the shared gate's REST-style body into the OCI
-        // error envelope this surface is contractually required to emit.
-        return oci_curation_deny_response(resp.status(), &repo.image);
+        // #3110: this surface is contractually required to emit the OCI error
+        // envelope, so it renders the verdict itself rather than forwarding the
+        // shared gate's REST-shaped body — carrying the rule reason through.
+        return oci_curation_deny_response(&block);
     }
 
     // Resolve locally first: a surviving tag row, or — for a digest this hosted
@@ -10857,9 +10919,13 @@ mod tests {
     #[tokio::test]
     async fn test_oci_curation_deny_response_is_oci_error_envelope() {
         // #3110: the shared curation gate's `{"error":"curation_blocked"}`
-        // REST shape must never reach the /v2 wire; the OCI mapping keeps the
-        // status and re-shapes the body into the spec envelope.
-        let resp = oci_curation_deny_response(StatusCode::FORBIDDEN, "someimage");
+        // REST shape must never reach the /v2 wire; the OCI seam renders the
+        // same verdict as the spec envelope, keeping the 403 and — per the
+        // review of this PR — the rule `reason` that the first cut dropped.
+        let resp = oci_curation_deny_response(&proxy_helpers::CurationBlock {
+            package: "someimage".to_string(),
+            reason: "blocked by test rule".to_string(),
+        });
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let parsed: serde_json::Value =
@@ -10869,6 +10935,43 @@ mod tests {
         assert!(
             message.contains("curation_blocked") && message.contains("someimage"),
             "message must keep the curation_blocked marker and name the image: {parsed}"
+        );
+        // The rule reason must be reachable both to a human reading the
+        // docker CLI output (`errors[0].message`) and to a machine reading
+        // the spec's structured `detail` member. Parsed field lookups, not
+        // substring matches on the body: the REST shape carries `reason` at
+        // the top level and would satisfy a whole-body substring test.
+        assert!(
+            message.contains("blocked by test rule"),
+            "message must name the rule that fired (docker prints message): {parsed}"
+        );
+        assert_eq!(
+            parsed["errors"][0]["detail"]["reason"].as_str(),
+            Some("blocked by test rule"),
+            "detail must carry the curation rule reason: {parsed}"
+        );
+        assert_eq!(
+            parsed["errors"][0]["detail"]["package"].as_str(),
+            Some("someimage"),
+            "detail must carry the blocked package: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_error_omits_detail_when_absent() {
+        // Positive control for the `detail` plumbing: `oci_error` must remain
+        // byte-identical to its pre-#3110 output, i.e. no `detail` key at all
+        // (`skip_serializing_if`), so adding the member to the curation body
+        // cannot have changed every other error on the surface.
+        let resp = oci_error(
+            StatusCode::NOT_FOUND,
+            "MANIFEST_UNKNOWN",
+            "manifest not found",
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest not found"}]}"#
         );
     }
 
@@ -29572,6 +29675,68 @@ mod oci_error_envelope_db_tests {
         );
     }
 
+    /// `/v2/token` is the only route on this router with FALLIBLE extractors
+    /// (`Query<TokenQuery>` + `Bytes`), so it was the one place a docker
+    /// client could still be handed a bare `text/plain` 4XX: a repeated
+    /// `?service=` makes serde_urlencoded reject with "duplicate field
+    /// `service`". The rejection must now be the spec envelope, with the
+    /// status and axum's own explanatory text preserved — and the
+    /// single-`service` request in the same fixture must still mint a token,
+    /// so the assertion cannot be satisfied by a route that rejects
+    /// everything.
+    #[tokio::test]
+    async fn token_query_rejection_returns_oci_error_envelope() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let get = |uri: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("build request")
+        };
+        let (rejected_status, rejected_json, rejected_raw) = send(
+            router().with_state(fx.state.clone()),
+            get("/token?service=a&service=b"),
+        )
+        .await;
+        let (ok_status, ok_json, ok_raw) = send(
+            router().with_state(fx.state.clone()),
+            get("/token?service=artifact-keeper"),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            rejected_status,
+            StatusCode::BAD_REQUEST,
+            "a duplicate query field must stay a 400: {}",
+            String::from_utf8_lossy(&rejected_raw)
+        );
+        assert_oci_envelope(&rejected_json, &rejected_raw, "UNSUPPORTED");
+        assert!(
+            rejected_json["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("duplicate field"),
+            "axum's own rejection text must survive into the envelope: {}",
+            String::from_utf8_lossy(&rejected_raw)
+        );
+        // Positive control, same fixture: the well-formed request still works.
+        assert_eq!(
+            ok_status,
+            StatusCode::OK,
+            "single-service token request must still succeed: {}",
+            String::from_utf8_lossy(&ok_raw)
+        );
+        assert!(
+            ok_json["token"].as_str().is_some_and(|t| !t.is_empty()),
+            "token response must carry a token: {}",
+            String::from_utf8_lossy(&ok_raw)
+        );
+    }
+
     /// GHSA-vvc3 scope gate: a read-scoped API token on `docker push`'s
     /// manifest PUT must be refused with the OCI envelope (403 DENIED), and
     /// a wildcard-scoped token on the byte-identical request must succeed.
@@ -29741,6 +29906,23 @@ mod oci_error_envelope_db_tests {
                 .unwrap_or_default()
                 .contains("curation_blocked"),
             "envelope message must keep the curation_blocked marker: {blocked_json}"
+        );
+        // The rule's `reason` must survive the REST -> OCI translation, end to
+        // end through the real gate (the rule row above sets it to 'blocked by
+        // test rule'). Parsed field lookups: the pre-#3110 REST body carried
+        // `reason` at the TOP level, so a whole-body substring check for the
+        // text would pass on the shape this PR removes.
+        assert_eq!(
+            blocked_json["errors"][0]["detail"]["reason"].as_str(),
+            Some("blocked by test rule"),
+            "detail.reason must name the curation rule that fired: {}",
+            String::from_utf8_lossy(&blocked_raw)
+        );
+        assert_eq!(
+            blocked_json["errors"][0]["detail"]["package"].as_str(),
+            Some("blockedimg"),
+            "detail.package must name the blocked image: {}",
+            String::from_utf8_lossy(&blocked_raw)
         );
         // Positive control, same fixture: the non-matching image must NOT be
         // caught by the gate. Its upstream miss (no reachable upstream in
