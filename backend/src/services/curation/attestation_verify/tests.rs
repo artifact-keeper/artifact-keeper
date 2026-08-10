@@ -11,6 +11,14 @@
 //! forged inclusion proofs (it skips Rekor inclusion). The verdict shows the
 //! crate's crypto check passing while OUR Rekor glue rejects — so both are
 //! mandatory, exactly as the issue requires.
+//!
+//! Which row proves which mechanism matters, because three of the four reject at
+//! different depths. Rows 4c and 4f mangle the checkpoint envelope as well as the
+//! proof, so the glue rejects them at checkpoint *decode*; only **row 4d** (proof
+//! hashes rewritten, checkpoint intact) exercises the RFC 6962 Merkle
+//! recomputation, and only **row 4e** (rootHash rewritten, checkpoint intact)
+//! exercises the checkpoint↔proof root binding. Those two assert on the specific
+//! error so they cannot be satisfied by an incidental parse failure.
 
 use super::*;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -214,6 +222,17 @@ async fn row4d_forged_merkle_path_rejected_by_glue() {
         has(&v, Check::CryptoAndChain) && !has(&v, Check::RekorInclusion),
         "{v:?}"
     );
+    // Pin the MECHANISM, not just the check that failed. This fixture keeps the
+    // checkpoint intact and rewrites only the proof hashes, so the rejection must
+    // come from the RFC 6962 recomputation disagreeing with the signed root — not
+    // from an incidental parse error. Rows 4c/4f also mangle the checkpoint
+    // envelope, so they are rejected at checkpoint decode; this row and 4e are the
+    // ones that actually exercise the Merkle arithmetic.
+    let e = v.error.as_deref().unwrap();
+    assert!(
+        e.contains("Inclusion Proof error") && e.contains("MismatchedRoot"),
+        "expected an RFC 6962 inclusion-proof root mismatch, got: {e}"
+    );
 }
 
 #[tokio::test]
@@ -223,6 +242,15 @@ async fn row4e_roothash_vs_checkpoint_mismatch_rejected_by_glue() {
     assert!(
         has(&v, Check::CryptoAndChain) && !has(&v, Check::RekorInclusion),
         "{v:?}"
+    );
+    // This fixture rewrites ONLY the proof's rootHash, leaving the signed
+    // checkpoint alone, so the rejection must come from `is_valid_for_proof`
+    // binding the proof's root to the log's signed root. Anything else would mean
+    // the checkpoint is not actually pinning the tree the proof claims.
+    let e = v.error.as_deref().unwrap();
+    assert!(
+        e.contains("Consistency proof error") && e.contains("MismatchedRoot"),
+        "expected the signed checkpoint to reject the proof's root hash, got: {e}"
     );
 }
 
@@ -441,4 +469,122 @@ fn npm_never_overclaims() {
     assert!(!v.is_verified());
     assert_eq!(v.state, AttestationState::Failed);
     assert!(v.error.as_deref().unwrap().contains("npm sha512"));
+}
+
+// ============================================== npm FAILS SAFE, not silently ==
+
+const NPM_BUNDLE: &str = include_str!("testdata/npm-sigstore-5.0.0-slsa-bundle-v0.3.json");
+const NPM_ATTESTATIONS: &str = include_str!("testdata/npm-sigstore-5.0.0-attestations.json");
+
+/// npm's real, genuinely-signed SLSA provenance must FAIL SAFE — it must not be
+/// silently treated as verified, and it must not be reachable by the only code
+/// path that can mint a `Verified` verdict.
+///
+/// `verify_npm_unsupported` above only proves that a hardcoded stub returns
+/// `Failed`; it says nothing about the real material, which is what an operator
+/// actually has. This drives the captured `sigstore@5.0.0` npm bundle through
+/// every door into the verifier and asserts none of them opens.
+#[tokio::test]
+async fn npm_real_bundle_cannot_reach_a_verified_state() {
+    let al = allowlist();
+    let t = trust();
+
+    // POSITIVE CONTROL, same fixture harness: the PyPI bundle DOES verify here.
+    // Without this the assertions below are satisfied by any breakage that makes
+    // everything fail (a bad trust root, an unloadable fixture directory).
+    let control = verify_default(&good_bundle()).await;
+    assert!(
+        control.is_verified(),
+        "control must verify or the negative assertions below prove nothing: {control:?}"
+    );
+
+    // The premise: npm binds its subject with sha512 and names it by purl, so
+    // there is no sha256 for the artifact digest to bind against. Assert the
+    // fixture really has that shape, so this test cannot pass because the file
+    // is simply malformed.
+    let npm_bundle: Value = load(NPM_BUNDLE);
+    let stmt = bundle_convert::statement_of(&npm_bundle).expect("npm statement decodes");
+    let subject = &stmt["subject"][0];
+    assert!(
+        subject["digest"]["sha512"].is_string(),
+        "fixture must carry the sha512 subject binding: {subject}"
+    );
+    assert!(
+        subject["digest"]["sha256"].is_null(),
+        "fixture must NOT carry a sha256 subject: {subject}"
+    );
+
+    // Door 1 — the bundle path, against several artifact byte strings. No input
+    // can make it verify, because the statement never binds a sha256.
+    for (label, bytes) in [("whl", WHL), ("sdist", SDIST), ("empty", b"" as &[u8])] {
+        let v = verify_pypi_bundle(
+            &npm_bundle,
+            &inp(bytes, "sigstore-5.0.0.tgz", "sigstore/sigstore-js", &al),
+            &t,
+        )
+        .await;
+        assert!(
+            !v.is_verified(),
+            "npm bundle verified against {label}: {v:?}"
+        );
+        assert_eq!(v.state, AttestationState::Failed, "{label}");
+        assert!(
+            !has(&v, Check::SubjectDigestBound),
+            "npm must die at the sha256 subject binding ({label}): {v:?}"
+        );
+        // The load-bearing consequence: no marker means the evaluation loop
+        // cannot inject trust, so the publisher stays unverified.
+        assert!(
+            verified_marker(&v).is_none(),
+            "a non-verified verdict must never produce a marker ({label}): {v:?}"
+        );
+    }
+
+    // Door 2 — the provenance-document path. npm's attestations document uses
+    // `attestations[]`, not PEP 740's `attestation_bundles[]`, so the converter
+    // yields nothing and the verdict is a failure, never an empty success.
+    let atts: Value = load(NPM_ATTESTATIONS);
+    assert!(
+        bundle_convert::provenance_to_bundles(&atts).is_empty(),
+        "npm attestations must not convert to PEP 740 bundles"
+    );
+    let v = verify_pypi_provenance(&atts, WHL, "sigstore-5.0.0.tgz", &al, &t).await;
+    assert!(!v.is_verified(), "{v:?}");
+    assert_eq!(v.state, AttestationState::Failed);
+    assert!(verified_marker(&v).is_none());
+}
+
+/// End-to-end: an npm package whose registry document advertises sigstore
+/// provenance is labeled `Attestation` but never `verified`, so
+/// `publisher_trust match:attestation` keeps it on the fail-safe review path.
+#[test]
+fn npm_provenance_ingestion_never_yields_a_verified_publisher() {
+    use crate::services::curation::publisher_source::{
+        extract_publisher, PublisherSource, VERIFICATION_MARKER,
+    };
+    use crate::services::curation_sync::build_npm_curation_entry;
+
+    let packument: Value = load(include_str!("testdata/npm-sigstore-packument.json"));
+    let version_doc = &packument["versions"]["5.0.0"];
+    assert!(
+        !version_doc["dist"]["attestations"].is_null(),
+        "fixture must advertise provenance or this proves nothing"
+    );
+
+    let entry = build_npm_curation_entry("sigstore", "5.0.0", version_doc).expect("npm entry");
+    assert!(
+        entry.metadata.get(VERIFICATION_MARKER).is_none(),
+        "the ingestion builder must not carry a verification marker"
+    );
+
+    let id = extract_publisher("npm", &entry.metadata).expect("npm publisher extracted");
+    assert_eq!(
+        id.source,
+        PublisherSource::Attestation,
+        "provenance presence is a labeling signal"
+    );
+    assert!(
+        !id.verified,
+        "npm provenance presence must never equal verification: {id:?}"
+    );
 }

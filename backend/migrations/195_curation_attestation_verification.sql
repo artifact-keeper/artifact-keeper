@@ -1,10 +1,24 @@
--- 193_curation_attestation_verification.sql
+-- 195_curation_attestation_verification.sql
 -- #2955: persist the result of cryptographic attestation verification for
--- `publisher_trust match:attestation`. A successful record is the ONLY thing
--- that lets `publisher_source::extract_publisher` emit verified=true; absence of
--- a record reproduces exactly the pre-#2955 fail-safe behaviour (Flag).
+-- `publisher_trust match:attestation`.
 --
--- Renumber at PR-open if upstream has moved past 192 (standing convention).
+-- These columns are an AUDIT RECORD, not the enforcement gate. The trust
+-- decision is made in-memory in the same scheduler tick that runs the verifier:
+-- `evaluate_ondemand_curation` injects `publisher_source::VERIFICATION_MARKER`
+-- from the live `AttestationVerdict`, and `extract_publisher` reads that marker.
+-- Nothing reads these columns back (`CurationPackage` does not even carry the
+-- fields), so a later re-evaluation of the same row does NOT inherit
+-- `verified=true` — it falls back to the pre-#2955 fail-safe Flag. See the
+-- follow-up issue for making the persisted record authoritative.
+--
+-- Renumber at PR-open if upstream has moved past the previous slot (standing
+-- convention). Renumbered 193 -> 195 during review: main took 193 and 194
+-- (193_oci_blobs_storage_key_index, 194_oci_cleanup_keys_pending_delete) after
+-- this branch was cut. Two files at the same version are not a textual merge
+-- conflict, so nothing catches it at merge time: sqlx `resolve` sorts by version
+-- without deduping, and both entries take the `apply` arm on a fresh database
+-- (duplicate key on `_sqlx_migrations.version`) or trip `VersionMismatch` on an
+-- existing one — either way the backend aborts at startup.
 --
 -- CONCURRENTLY N/A: ADD COLUMN with a constant/NULL default is a fast,
 -- catalog-only change on modern Postgres (no table rewrite, no long lock).

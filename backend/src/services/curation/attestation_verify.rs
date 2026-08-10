@@ -28,6 +28,26 @@
 //! Both `verify_digest` **and** the Rekor inclusion glue must pass. A structural
 //! guard ([`AttestationVerdict::from_mask`]) makes "every check actually ran" an
 //! asserted property of *our* code, not an assumption about the crate's.
+//!
+//! # Known residual: `integratedTime` is not authenticated
+//!
+//! The Signed Entry Timestamp is the field that binds a Rekor entry's
+//! `integratedTime`, and nothing verifies it — `verify_digest` skips it
+//! (`TODO(tnytown) SET verification` in 0.14.0) and the inclusion glue does not
+//! cover it either, because the SET is not part of `canonicalizedBody` and not
+//! part of the Merkle leaf. So the `integratedTime` that
+//! [`Check::CryptoAndChain`] compares against the certificate's validity window
+//! is a value the bundle's author chose, and that comparison is trivially
+//! satisfiable.
+//!
+//! This is not a practical bypass: satisfying it still requires a Fulcio leaf
+//! certificate whose SAN and source-repository extensions name the claimed
+//! publisher, which is the property [`Check::PublisherOwnerBound`] actually
+//! turns on. What it does mean is that the "cert was valid when it signed"
+//! check is corroborating evidence rather than an independent guarantee — do not
+//! describe it as a verified timestamp. Closing it means verifying the SET
+//! against the Rekor log key, which the crate does not expose primitives for;
+//! tracked as a follow-up.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};

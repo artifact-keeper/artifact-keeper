@@ -1972,6 +1972,20 @@ async fn evaluate_ondemand_curation(
 
     for pkg in pending {
         let mut eval_metadata = pkg.metadata.clone();
+        // The marker below is a trusted server-side assertion: `extract_publisher`
+        // short-circuits on it and returns `verified = true`. Clear whatever the
+        // stored row carried BEFORE deciding whether to inject one, so the only
+        // way to reach the verified arm is this tick's own `AttestationVerdict`.
+        // Without this the loop inserts on success but never removes, so on the
+        // failure and npm paths a stale or planted marker survives into the
+        // evaluation untouched.
+        if publisher_source::strip_verification_marker(&mut eval_metadata) {
+            tracing::warn!(
+                package = %pkg.package_name,
+                version = %pkg.version,
+                "curation eval: dropped a pre-existing attestation-verification marker from stored metadata"
+            );
+        }
 
         match format {
             "pypi" => {
@@ -2078,14 +2092,34 @@ async fn verify_pypi_curation_row(
         return AttestationVerdict::unverified();
     }
 
+    // The package name, version and filename on this row are parsed straight out
+    // of a proxy request path (`normalize_pep503` / `version_from_pypi_filename`)
+    // and are interpolated below into URLs fetched WITH the repository's upstream
+    // credentials. `version_from_pypi_filename` returns whatever sits between the
+    // dashes, so without this gate a distribution named `foo-1.0?x-py3-none-any.whl`
+    // injects a query string and `foo-..-py3-none-any.whl` traverses a path
+    // segment (`Url::parse` normalises `..` away), turning the enrichment fetch
+    // into a credentialed request-forgery primitive against arbitrary paths on an
+    // internal mirror. Reject rather than encode: every value that can legitimately
+    // appear here is already within these character sets (PEP 503 §"Normalized
+    // Names" for the name, PEP 440 §"Appendix: Parsing version strings" for the
+    // version, PEP 427/625 for the distribution filename), so a value outside them
+    // is not a package we can verify anyway.
+    if !is_safe_upstream_path_segment(&pkg.package_name)
+        || !is_safe_upstream_path_segment(&pkg.version)
+        || !is_safe_upstream_path_segment(&filename)
+    {
+        return AttestationVerdict::failure(
+            "attestation lookup skipped: package name, version or filename contains characters that are not valid in a PyPI path segment".to_string(),
+        );
+    }
+
     // The PyPI base (strip a trailing `/simple[/]` from a simple-index upstream).
     let base = pypi_base_url(upstream_url);
 
-    // Enrich: fetch the JSON metadata (for the dist download URL) and the PEP 740
-    // provenance. If the row already carries provenance + a dist URL, reuse it.
-    let json_url = format!("{base}/pypi/{}/{}/json", pkg.package_name, pkg.version);
-    let pypi_json = bounded_get_json(client, upstream_auth, &json_url).await;
-
+    // Enrich: fetch the PEP 740 provenance first — it is absent for the
+    // overwhelming majority of distributions, and returning early on that miss
+    // saves the JSON round-trip entirely.
     let prov_url = format!(
         "{base}/integrity/{}/{}/{}/provenance",
         pkg.package_name, pkg.version, filename
@@ -2095,6 +2129,9 @@ async fn verify_pypi_curation_row(
         // No provenance published upstream: exactly today's behavior.
         return AttestationVerdict::unverified();
     };
+
+    let json_url = format!("{base}/pypi/{}/{}/json", pkg.package_name, pkg.version);
+    let pypi_json = bounded_get_json(client, upstream_auth, &json_url).await;
 
     // Build a full entry (dist URL + merged provenance) from whatever we fetched.
     let entry = pypi_json.as_ref().and_then(|j| {
@@ -2113,13 +2150,55 @@ async fn verify_pypi_curation_row(
         );
     };
 
-    let Some(bytes) = bounded_download(client, upstream_auth, &dist_url).await else {
+    // `dist_url` is copied verbatim out of the upstream's own JSON document
+    // (`urls[].url`), so a hostile or compromised mirror chooses it. Send the
+    // repository's configured upstream credentials ONLY when it stays on the
+    // configured upstream's origin — same rule as the NuGet remote-search fix
+    // (#3130/#2925). Network-level SSRF is already refused at connect time by the
+    // shared DNS guard; this is specifically about not handing an operator's
+    // Basic/token header to whatever public host the mirror names.
+    let dist_auth = if same_upstream_origin(upstream_url, &dist_url) {
+        upstream_auth.clone()
+    } else {
+        None
+    };
+    let Some(bytes) = bounded_download(client, &dist_auth, &dist_url).await else {
         return AttestationVerdict::failure(format!(
             "could not fetch distribution `{filename}` for attestation verification"
         ));
     };
 
     verify_pypi_provenance(&provenance, &bytes, &filename, allowlist, trust).await
+}
+
+/// Characters permitted in a PyPI path segment we build a credentialed upstream
+/// URL from. Covers PEP 503 normalized names (`[a-z0-9-]`), PEP 440 versions
+/// (which add `.`, `_`, `+`, `!`) and PEP 427/625 distribution filenames (which
+/// add nothing else). Everything that could change the shape of the request —
+/// `/`, `?`, `#`, `%`, `:`, `@`, whitespace, control characters — is refused.
+fn is_safe_upstream_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.len() <= 512
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '+' | '!'))
+}
+
+/// True when `resource_url` is on the same host and port as `upstream_url`.
+/// Anything unparseable is treated as a different origin (fail closed).
+fn same_upstream_origin(upstream_url: &str, resource_url: &str) -> bool {
+    match (
+        reqwest::Url::parse(upstream_url),
+        reqwest::Url::parse(resource_url),
+    ) {
+        (Ok(up), Ok(res)) => {
+            up.host_str().map(str::to_ascii_lowercase)
+                == res.host_str().map(str::to_ascii_lowercase)
+                && up.port_or_known_default() == res.port_or_known_default()
+        }
+        _ => false,
+    }
 }
 
 /// Normalize a pypi remote's upstream URL to the API base by trimming a trailing
@@ -2221,6 +2300,109 @@ fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #2955 — guards on the credentialed attestation-enrichment fetches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safe_path_segment_admits_real_pypi_identifiers() {
+        // Real PEP 503 names, PEP 440 versions and PEP 427/625 filenames must
+        // pass, or the guard silently switches attestation verification off for
+        // legitimate packages — a false negative is as bad as a false positive
+        // here, it just fails quietly instead of loudly.
+        for ok in [
+            "sigstore",
+            "zope-interface",
+            "ruamel-yaml-clib",
+            "4.5.0",
+            "1.0.0rc1",
+            "2!1.0.dev4",
+            "1.0.0+local.1",
+            "0.1.0.post1",
+            "sigstore-4.5.0-py3-none-any.whl",
+            "sigstore-4.5.0.tar.gz",
+            "ruamel.yaml.clib-0.2.8-cp312-cp312-manylinux_2_17_x86_64.whl",
+        ] {
+            assert!(is_safe_upstream_path_segment(ok), "must admit {ok:?}");
+        }
+    }
+
+    #[test]
+    fn safe_path_segment_refuses_anything_that_reshapes_the_request() {
+        // These are reachable: `version_from_pypi_filename` returns whatever sits
+        // between the dashes of a request-path filename, with no charset check,
+        // and the result is interpolated into a URL fetched with the repository's
+        // upstream credentials.
+        for bad in [
+            "",                    // empty segment collapses the path
+            ".",                   // no-op segment
+            "..",                  // `Url::parse` normalises this away — traversal
+            "1.0?x=y",             // query injection
+            "1.0#frag",            // fragment truncation
+            "1.0%2f..%2fadmin",    // encoded traversal
+            "a/b",                 // literal path separator
+            "user:pass@evil.test", // userinfo
+            "1.0 0",               // whitespace
+            "1.0\n",               // control character
+            "1.0\u{0}",            // NUL
+            "café",                // non-ASCII (IDNA/percent-encoding ambiguity)
+        ] {
+            assert!(!is_safe_upstream_path_segment(bad), "must refuse {bad:?}");
+        }
+        // Length bound.
+        assert!(!is_safe_upstream_path_segment(&"a".repeat(513)));
+        assert!(is_safe_upstream_path_segment(&"a".repeat(512)));
+    }
+
+    #[test]
+    fn same_upstream_origin_gates_credentials_to_the_configured_host() {
+        // On-origin: credentials travel (the common case — pypi.org serves its
+        // distributions from files.pythonhosted.org, which is NOT the same origin,
+        // so public PyPI simply gets an unauthenticated download; that is correct).
+        assert!(same_upstream_origin(
+            "https://mirror.internal/simple/",
+            "https://mirror.internal/packages/sigstore-4.5.0-py3-none-any.whl"
+        ));
+        // Scheme-default ports count as equal.
+        assert!(same_upstream_origin(
+            "https://mirror.internal:443/simple/",
+            "https://mirror.internal/x.whl"
+        ));
+        // Host case is not significant.
+        assert!(same_upstream_origin(
+            "https://Mirror.Internal/simple/",
+            "https://mirror.internal/x.whl"
+        ));
+
+        // Off-origin: a hostile mirror naming any other host must not receive the
+        // operator's configured upstream credentials.
+        assert!(!same_upstream_origin(
+            "https://mirror.internal/simple/",
+            "https://attacker.example/x.whl"
+        ));
+        assert!(!same_upstream_origin(
+            "https://mirror.internal/simple/",
+            "https://mirror.internal.attacker.example/x.whl"
+        ));
+        assert!(!same_upstream_origin(
+            "https://mirror.internal/simple/",
+            "https://mirror.internal:8443/x.whl"
+        ));
+        assert!(!same_upstream_origin(
+            "https://pypi.org/simple/",
+            "https://files.pythonhosted.org/packages/x.whl"
+        ));
+        // Unparseable on either side fails closed.
+        assert!(!same_upstream_origin(
+            "not a url",
+            "https://mirror.internal/x"
+        ));
+        assert!(!same_upstream_origin(
+            "https://mirror.internal/",
+            "not a url"
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // #2556 — bounded upstream-index decompression

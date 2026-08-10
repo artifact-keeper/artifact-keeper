@@ -1694,39 +1694,6 @@ async fn download_or_metadata(
     )
     .await?;
 
-    // #2955 on-demand curation ingestion: when a proxy first serves a real pypi
-    // distribution, enqueue a pending curation row (name+version+filename) for
-    // any staging repo curating this proxy. Best-effort and spawned so the
-    // download latency is untouched; the scheduler enriches it from the upstream
-    // (PEP 740 provenance) and runs attestation verification off this hot path.
-    if repo.repo_type == RepositoryType::Remote && !filename.ends_with(".metadata") {
-        if let Some(version) = requested_version.clone() {
-            let entry = crate::services::curation_sync::CurationPackageEntry {
-                format: "pypi".to_string(),
-                package_name: normalized.clone(),
-                version: version.clone(),
-                release: None,
-                architecture: None,
-                checksum_sha256: None,
-                upstream_path: distribution.to_string(),
-                metadata: serde_json::json!({
-                    "name": normalized,
-                    "version": version,
-                    "_ak_dist": { "filename": distribution },
-                }),
-                primary_metadata: None,
-            };
-            let db = state.db.clone();
-            let proxy_id = repo.id;
-            tokio::spawn(async move {
-                crate::api::handlers::proxy_helpers::enqueue_curation_on_demand(
-                    &db, proxy_id, "remote", entry,
-                )
-                .await;
-            });
-        }
-    }
-
     // PEP 658: serve metadata from the remote upstream when possible. If the
     // upstream advertises metadata but returns 404, fall back to extracting it
     // from the wheel so clients do not see the hard failure that motivated
@@ -1806,7 +1773,7 @@ async fn download_or_metadata(
     // fix, now enforced by the type system: `serve_file` no longer accepts a
     // `&str`, so the gates it runs and the upstream fetch it performs cannot
     // key on different strings.
-    serve_file(
+    let response = serve_file(
         &state,
         &repo,
         &repo_key,
@@ -1815,7 +1782,69 @@ async fn download_or_metadata(
         auth.as_ref(),
         &ctx,
     )
-    .await
+    .await?;
+
+    // #2955 on-demand curation ingestion: when a proxy serves a real pypi
+    // distribution, enqueue a pending curation row (name+version+filename) for
+    // any staging repo curating this proxy. Best-effort and spawned so the
+    // download latency is untouched; the scheduler enriches it from the upstream
+    // (PEP 740 provenance) and runs attestation verification off this hot path.
+    //
+    // Deliberately placed AFTER `serve_file` returns success. `download_or_metadata`
+    // does no authorization of its own — `resolve_pypi_repo` is a bare key lookup
+    // and `enforce_pypi_curation` is a content gate, not an access gate; the
+    // repository access check lives inside `serve_file`. Enqueuing before that
+    // call let an unauthenticated caller write a row for a package that does not
+    // exist (the name and version are parsed straight out of the request path
+    // and never contacted upstream), for a staging repo belonging to another
+    // tenant, with no cap — unbounded catalog inflation plus a poisoned review
+    // queue. Gating on a served 2xx/3xx means the distribution provably resolved
+    // and the caller was allowed to have it. npm's seam is already shaped this
+    // way: it enqueues only after a version document resolves out of a real
+    // packument.
+    //
+    // 3xx counts because #1555 answers a fresh proxy-cache hit on a remote member
+    // with a 307 to a presigned URL (`presigned_downloads_enabled`); gating on
+    // `is_success()` alone would silently switch ingestion off for every operator
+    // running object-storage downloads. Both shapes mean the same thing here: the
+    // access check inside `serve_file` passed and the artifact resolved.
+    let served = response.status().is_success() || response.status().is_redirection();
+    if served && repo.repo_type == RepositoryType::Remote && !filename.ends_with(".metadata") {
+        if let Some(version) = requested_version.clone() {
+            // `normalized.as_str()` (#3186): the catalog row must key on the same
+            // validated, PEP 503-canonical name every gate above and `serve_file`
+            // used. Taking the raw `project` segment here would reintroduce the
+            // gate-on-one-string / record-another divergence the newtype exists to
+            // make unrepresentable — and the curation catalog is a gate input, so
+            // it is exactly the kind of fourth code path #3186 was written for.
+            let catalog_name = normalized.as_str().to_string();
+            let entry = crate::services::curation_sync::CurationPackageEntry {
+                format: "pypi".to_string(),
+                package_name: catalog_name.clone(),
+                version: version.clone(),
+                release: None,
+                architecture: None,
+                checksum_sha256: None,
+                upstream_path: distribution.to_string(),
+                metadata: serde_json::json!({
+                    "name": catalog_name,
+                    "version": version,
+                    "_ak_dist": { "filename": distribution },
+                }),
+                primary_metadata: None,
+            };
+            let db = state.db.clone();
+            let proxy_id = repo.id;
+            tokio::spawn(async move {
+                crate::api::handlers::proxy_helpers::enqueue_curation_on_demand(
+                    &db, proxy_id, "remote", entry,
+                )
+                .await;
+            });
+        }
+    }
+
+    Ok(response)
 }
 
 /// Resolve a PEP 658 metadata request through a virtual repository's members.

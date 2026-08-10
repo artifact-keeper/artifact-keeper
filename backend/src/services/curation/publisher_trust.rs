@@ -154,9 +154,16 @@ pub fn evaluate(
         ));
     }
 
-    let signal_label = match publisher.source {
-        PublisherSource::Attestation => "attestation (present, not cryptographically verified)",
-        PublisherSource::Metadata => "self-asserted metadata (unverified)",
+    // #2955: now that verification is real, do not tell an operator that a
+    // cryptographically verified attestation is unverified. Reachable via the
+    // watch-mode (`action: flag`) arm below, which reports the signal for a
+    // trusted publisher.
+    let signal_label = match (publisher.source, publisher.verified) {
+        (PublisherSource::Attestation, true) => "cryptographically verified attestation",
+        (PublisherSource::Attestation, false) => {
+            "attestation (present, not cryptographically verified)"
+        }
+        (PublisherSource::Metadata, _) => "self-asserted metadata (unverified)",
     };
 
     match (action, is_trusted) {

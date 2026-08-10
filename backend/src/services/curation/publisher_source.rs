@@ -113,10 +113,30 @@ pub fn extract_publisher(format: &str, metadata: &Value) -> Option<PublisherIden
 /// Metadata-context key under which the evaluation loop injects a successful
 /// attestation-verification record (#2955). This is NOT part of the registry
 /// blob — it is added by trusted server code after `attestation_verify` returns
-/// `verified`, carrying the certificate-bound owner. A package's own metadata
-/// can never set it: the loop overwrites/derives it from the verification
-/// record, and a `state != "verified"` marker is ignored here (fail-safe).
+/// `verified`, carrying the certificate-bound owner.
+///
+/// **The marker is a server-side assertion and reading it is equivalent to
+/// trusting it**, so no untrusted document may ever carry the key. That is
+/// enforced by [`strip_verification_marker`], called on both chokepoints: every
+/// blob persisted through `CurationService::upsert_package`, and the evaluation
+/// context built in `evaluate_ondemand_curation`. Do not rely on the ingestion
+/// builders' key allowlists for this — they are a distant invariant, and a future
+/// ingestion path that stores richer upstream metadata would silently turn into
+/// an attestation-forgery bypass.
 pub const VERIFICATION_MARKER: &str = "_ak_attestation_verification";
+
+/// Remove [`VERIFICATION_MARKER`] from a metadata blob sourced from anywhere
+/// other than this process's own verifier — a registry document, an upstream
+/// index, a proxied packument, a row read back out of the catalog.
+///
+/// Returns `true` if a marker was present and removed (i.e. something tried to
+/// assert its own verification), so callers can log it.
+pub fn strip_verification_marker(metadata: &mut Value) -> bool {
+    metadata
+        .as_object_mut()
+        .map(|obj| obj.remove(VERIFICATION_MARKER).is_some())
+        .unwrap_or(false)
+}
 
 /// Read a verified publisher identity from an injected verification record.
 /// Returns `Some` only for a `state == "verified"` record carrying a non-empty
@@ -452,6 +472,41 @@ mod tests {
         });
         let id = extract_publisher("pypi", &no_owner).unwrap();
         assert!(!id.verified);
+    }
+
+    #[test]
+    fn a_self_asserted_marker_is_stripped_before_it_can_be_read() {
+        // The marker is a trusted server-side record. If a registry document
+        // could carry the key itself, `extract_publisher` would hand back
+        // `verified = true` for an attacker-chosen owner and `publisher_trust
+        // match:attestation` would Allow it. Sanitization is what makes that
+        // impossible by construction rather than by a distant invariant about
+        // what the ingestion builders happen to copy.
+        let mut planted = json!({
+            "info": {"author": "NumFOCUS"},
+            VERIFICATION_MARKER: {"state": "verified", "owner": "Microsoft"}
+        });
+
+        // Without sanitization the planted blob is trusted...
+        let forged = extract_publisher("pypi", &planted).unwrap();
+        assert!(forged.verified);
+        assert_eq!(forged.name, "Microsoft");
+
+        // ...and with it, the blob falls back to the unverified extraction.
+        assert!(
+            strip_verification_marker(&mut planted),
+            "a planted marker must be reported as removed"
+        );
+        let sanitized = extract_publisher("pypi", &planted).unwrap();
+        assert!(!sanitized.verified, "{sanitized:?}");
+        assert_eq!(sanitized.name, "NumFOCUS");
+        assert_eq!(sanitized.source, PublisherSource::Metadata);
+
+        // Idempotent, and silent on a clean blob.
+        assert!(!strip_verification_marker(&mut planted));
+        // Non-object metadata must not panic.
+        let mut scalar = json!("nope");
+        assert!(!strip_verification_marker(&mut scalar));
     }
 
     #[test]

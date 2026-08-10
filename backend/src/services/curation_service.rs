@@ -559,6 +559,28 @@ impl CurationService {
         metadata: &serde_json::Value,
         primary_metadata: Option<&serde_json::Value>,
     ) -> Result<CurationPackage, sqlx::Error> {
+        // Every production write of `curation_packages.metadata` lands here, so
+        // this is the chokepoint that keeps a registry document from asserting
+        // its own attestation verification (#2955). `extract_publisher` treats
+        // the marker as a trusted server-side record; a persisted row must never
+        // carry one it did not get from our verifier.
+        let mut sanitized;
+        let metadata = if metadata
+            .get(crate::services::curation::publisher_source::VERIFICATION_MARKER)
+            .is_some()
+        {
+            sanitized = metadata.clone();
+            crate::services::curation::publisher_source::strip_verification_marker(&mut sanitized);
+            tracing::warn!(
+                %package_name,
+                %version,
+                "curation ingest: stripped a self-asserted attestation-verification marker from upstream metadata"
+            );
+            &sanitized
+        } else {
+            metadata
+        };
+
         sqlx::query_as(
             r#"INSERT INTO curation_packages
                (staging_repo_id, remote_repo_id, format, package_name, version, release,
@@ -2334,6 +2356,94 @@ mod tests {
 
         // Cleanup.
         svc.delete_rule(rule.id).await.ok();
+        sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
+            .bind(staging_id)
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup(&pool, staging_id, user).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// A registry document must not be able to assert its own attestation
+    /// verification. `upsert_package` is the single production write path for
+    /// `curation_packages.metadata`, so it is where the marker is stripped;
+    /// without that, a hostile upstream blob carrying
+    /// `_ak_attestation_verification` is persisted verbatim and
+    /// `extract_publisher` hands back `verified = true` for an attacker-chosen
+    /// owner on the very next evaluation.
+    #[tokio::test]
+    async fn test_upsert_package_strips_self_asserted_verification_marker_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::curation::publisher_source::{extract_publisher, VERIFICATION_MARKER};
+
+        let _guard = tdh::curation_global_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, _uname) = tdh::create_user(&pool).await;
+        let svc = CurationService::new(pool.clone());
+        let (remote_id, _rk, _rp) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (staging_id, _sk, _sp) = tdh::create_repo(&pool, "staging", "pypi").await;
+
+        // The blob an upstream would have to serve to forge trust — plus a real,
+        // benign field so the row is still a valid publisher record afterwards.
+        let hostile = serde_json::json!({
+            "info": {"author": "NumFOCUS"},
+            VERIFICATION_MARKER: {
+                "state": "verified",
+                "owner": "Microsoft",
+                "issuer": "https://token.actions.githubusercontent.com"
+            }
+        });
+        // Positive control: the blob really would be trusted if it survived.
+        let forged = extract_publisher("pypi", &hostile).expect("blob extracts");
+        assert!(
+            forged.verified && forged.name == "Microsoft",
+            "control: an unstripped marker must be trusted, else this proves nothing: {forged:?}"
+        );
+
+        let row = svc
+            .upsert_package(
+                staging_id,
+                remote_id,
+                "pypi",
+                "forgery-probe",
+                "1.0.0",
+                None,
+                None,
+                None,
+                "forgery_probe-1.0.0-py3-none-any.whl",
+                &hostile,
+                None,
+            )
+            .await
+            .expect("upsert");
+
+        assert!(
+            row.metadata.get(VERIFICATION_MARKER).is_none(),
+            "the persisted row must not carry a self-asserted marker: {}",
+            row.metadata
+        );
+        // Re-read from the database, not just the RETURNING value.
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM curation_packages WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read metadata");
+        assert!(stored.get(VERIFICATION_MARKER).is_none(), "{stored}");
+
+        // The rest of the blob is untouched, and the publisher falls back to the
+        // unverified self-asserted identity — today's fail-safe behaviour.
+        let id = extract_publisher("pypi", &stored).expect("publisher still extracts");
+        assert!(!id.verified, "{id:?}");
+        assert_eq!(id.name, "NumFOCUS");
+
         sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
             .bind(staging_id)
             .execute(&pool)
