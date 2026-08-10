@@ -2674,12 +2674,22 @@ impl ProxyService {
 
     /// Fetch artifact from upstream if not cached or cache expired.
     /// Returns (content, content_type) tuple.
+    ///
+    /// As [`Self::fetch_artifact_with_cache_path`], but DROPS the upstream
+    /// `Content-Encoding` (#3211). Kept for the callers that parse or rewrite
+    /// the body themselves (virtual metadata merge closures, the pub registry
+    /// JSON rewriter) rather than forwarding it verbatim. A caller that passes
+    /// the buffered bytes through to the client must use the widened
+    /// cache-path form and declare the coding, or it reproduces #3149.
     pub async fn fetch_artifact(
         &self,
         repo: &Repository,
         path: &str,
     ) -> Result<(Bytes, Option<String>)> {
-        self.fetch_artifact_with_cache_path(repo, path, path).await
+        let (content, content_type, _encoding) = self
+            .fetch_artifact_with_cache_path(repo, path, path)
+            .await?;
+        Ok((content, content_type))
     }
 
     /// Byte-ceiling-aware sibling of [`Self::fetch_artifact`] (#1608 Phase 4b /
@@ -2771,14 +2781,19 @@ impl ProxyService {
     /// Blob fetches do NOT need this (blobs are content-addressable opaque
     /// bytes), but routing them through this path with `accept = None` is
     /// a no-op so the buffered fast path stays a single function.
+    ///
+    /// DROPS the upstream `Content-Encoding` (#3211) — kept for parse-only
+    /// callers, same stance as [`Self::fetch_artifact`].
     pub async fn fetch_artifact_with_accept(
         &self,
         repo: &Repository,
         path: &str,
         accept: Option<&str>,
     ) -> Result<(Bytes, Option<String>)> {
-        self.fetch_artifact_with_cache_path_and_accept(repo, path, path, accept)
-            .await
+        let (content, content_type, _encoding) = self
+            .fetch_artifact_with_cache_path_and_accept(repo, path, path, accept)
+            .await?;
+        Ok((content, content_type))
     }
 
     /// Check whether an artifact is already present in the proxy cache
@@ -2910,18 +2925,26 @@ impl ProxyService {
     /// locally-computed cache key so that subsequent requests can hit the
     /// cache without rediscovering the upstream URL.
     ///
-    /// DROPS the upstream `Content-Encoding`, and is exactly equivalent to
+    /// Exactly equivalent to
     /// [`Self::fetch_artifact_with_cache_path_capped`] at
-    /// [`DEFAULT_METADATA_MAX_BYTES`] otherwise. A caller that forwards the
-    /// buffered body verbatim, or that PARSES it (a coded body is not a
-    /// parseable zip/tar/JSON — #3193), must use the capped form and handle the
-    /// coding, or it reproduces #3149.
+    /// [`DEFAULT_METADATA_MAX_BYTES`].
+    ///
+    /// Returns a [`CachedBody`] — `(body, content_type, content_encoding)` —
+    /// rather than the `(body, content_type)` pair it used to (#3211, the
+    /// uncapped sibling of the #3184 widening). The coding was previously
+    /// dropped right here, which is how Maven `download_root` served a coded
+    /// upstream root with no `Content-Encoding` declared. Widened IN PLACE
+    /// rather than via a `_with_encoding` sibling — deliberately, so every
+    /// caller breaks at compile time and must state whether it forwards the
+    /// bytes verbatim (must declare the coding, RFC 9110 §8.4) or
+    /// parses/transforms them (must drop it), instead of a new caller silently
+    /// reintroducing #3149.
     pub async fn fetch_artifact_with_cache_path(
         &self,
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
-    ) -> Result<(Bytes, Option<String>)> {
+    ) -> Result<CachedBody> {
         self.fetch_artifact_with_cache_path_and_accept(repo, fetch_path, cache_path, None)
             .await
     }
@@ -2932,23 +2955,25 @@ impl ProxyService {
     /// simple-index proxy requesting the PEP 691 JSON representation under a
     /// format-qualified `cache_path`. Pass `None` to preserve the buffered
     /// fetch behaviour exactly.
+    ///
+    /// Returns a [`CachedBody`] — the upstream `Content-Encoding` is part of
+    /// the result (#3211), same contract as
+    /// [`Self::fetch_artifact_with_cache_path`].
     pub async fn fetch_artifact_with_cache_path_and_accept(
         &self,
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
         accept: Option<&str>,
-    ) -> Result<(Bytes, Option<String>)> {
-        let (content, content_type, _encoding) = self
-            .fetch_artifact_with_cache_path_and_accept_capped(
-                repo,
-                fetch_path,
-                cache_path,
-                accept,
-                DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await?;
-        Ok((content, content_type))
+    ) -> Result<CachedBody> {
+        self.fetch_artifact_with_cache_path_and_accept_capped(
+            repo,
+            fetch_path,
+            cache_path,
+            accept,
+            DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await
     }
 
     /// Byte-ceiling-aware sibling of
@@ -14824,7 +14849,7 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
         let repo = wiremock_remote_repo("s8-cachepath", &server.uri(), tmp.to_str().unwrap());
 
-        let (b1, ct1) = proxy
+        let (b1, ct1, _enc1) = proxy
             .fetch_artifact_with_cache_path(&repo, "dl/pkg.tgz", "stable/pkg.tgz")
             .await
             .expect("first fetch hits upstream and caches");
@@ -14833,7 +14858,7 @@ mod tests {
 
         // Second call: upstream mock is exhausted (up_to_n_times(1)); a cache
         // hit is the only way this can succeed.
-        let (b2, _ct2) = proxy
+        let (b2, _ct2, _enc2) = proxy
             .fetch_artifact_with_cache_path(&repo, "dl/pkg.tgz", "stable/pkg.tgz")
             .await
             .expect("second fetch must be served from the proxy cache");
@@ -14988,7 +15013,7 @@ mod tests {
             Some("\"v1\""),
         );
 
-        let (body, _ct) = proxy
+        let (body, _ct, _enc) = proxy
             .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
             .await
             .expect("304 revalidation must serve the cached body");
@@ -15034,7 +15059,7 @@ mod tests {
             Some("\"v1\""),
         );
 
-        let (body, _ct) = proxy
+        let (body, _ct, _enc) = proxy
             .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
             .await
             .expect("changed upstream must refill");
@@ -15110,7 +15135,7 @@ mod tests {
             Some("\"v1\""),
         );
 
-        let (body, _ct) = proxy
+        let (body, _ct, _enc) = proxy
             .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
             .await
             .expect("stale-if-error must serve the stale body when upstream is down");
@@ -15155,14 +15180,14 @@ mod tests {
         let jar = "com/example/app/1.0.0/app-1.0.0.jar";
 
         // First fetch hits upstream once and caches with the immutable TTL.
-        let (b1, _) = proxy
+        let (b1, _, _) = proxy
             .fetch_artifact_with_cache_path(&repo, jar, jar)
             .await
             .expect("first immutable fetch hits upstream and caches forever");
         assert_eq!(&b1[..], b"jar-bytes");
 
         // Second fetch must be served from cache with ZERO upstream contact.
-        let (b2, _) = proxy
+        let (b2, _, _) = proxy
             .fetch_artifact_with_cache_path(&repo, jar, jar)
             .await
             .expect("immutable hit must serve from cache without upstream");

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -915,17 +915,15 @@ async fn download_root(
             // under the non-empty sentinel key "_root_" to satisfy the cache-
             // path validation that rejects empty strings.
             let remote = proxy_helpers::build_remote_repo(repo.id, &repo_key, upstream_url);
-            let (content, content_type) = proxy
+            let (content, content_type, content_encoding) = proxy
                 .fetch_artifact_with_cache_path(&remote, "", "_root_")
                 .await
                 .map_err(|e| e.into_response())?;
-            let ct = content_type.unwrap_or_else(|| "text/html".to_string());
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, ct)
-                .header(CONTENT_LENGTH, content.len().to_string())
-                .body(Body::from(content))
-                .unwrap());
+            return Ok(forward_root_verbatim(
+                content,
+                content_type,
+                content_encoding,
+            ));
         }
     }
 
@@ -938,17 +936,15 @@ async fn download_root(
                 {
                     let remote =
                         proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
-                    if let Ok((content, content_type)) = proxy
+                    if let Ok((content, content_type, content_encoding)) = proxy
                         .fetch_artifact_with_cache_path(&remote, "", "_root_")
                         .await
                     {
-                        let ct = content_type.unwrap_or_else(|| "text/html".to_string());
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, ct)
-                            .header(CONTENT_LENGTH, content.len().to_string())
-                            .body(Body::from(content))
-                            .unwrap());
+                        return Ok(forward_root_verbatim(
+                            content,
+                            content_type,
+                            content_encoding,
+                        ));
                     }
                 }
             }
@@ -956,6 +952,31 @@ async fn download_root(
     }
 
     Err(AppError::NotFound("Repository root not available".to_string()).into_response())
+}
+
+/// Build the response for an upstream root body that is forwarded VERBATIM.
+///
+/// The bytes are sent exactly as the upstream (or the proxy cache) produced
+/// them, so the upstream `Content-Encoding` must be re-declared when present
+/// (RFC 9110 §8.4 — the representation header describes the coding applied to
+/// the bytes as transferred), and `Content-Length` is the length of those
+/// coded bytes (RFC 9110 §8.6). Dropping the coding while keeping the coded
+/// bytes was #3211: clients stored a compressed root document as if it were
+/// plain.
+fn forward_root_verbatim(
+    content: Bytes,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+) -> Response {
+    let ct = content_type.unwrap_or_else(|| "text/html".to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, ct)
+        .header(CONTENT_LENGTH, content.len().to_string());
+    if let Some(enc) = content_encoding {
+        builder = builder.header(CONTENT_ENCODING, enc);
+    }
+    builder.body(Body::from(content)).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -4778,6 +4799,160 @@ mod tests {
 
         // cleanup (members cascade on repo delete).
         for id in [virtual_id, remote_id, local_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+    }
+
+    /// #3211: `download_root` forwards the upstream root body VERBATIM, so it
+    /// must re-declare the upstream `Content-Encoding` (RFC 9110 §8.4 — the
+    /// header describes the coding of the bytes as transferred) and its
+    /// `Content-Length` must describe the coded bytes actually sent
+    /// (RFC 9110 §8.6). Before the fix the handler copied `Content-Type` and
+    /// recomputed `Content-Length` from the coded bytes but dropped the
+    /// coding, so clients stored a compressed document as if it were plain.
+    ///
+    /// Uses a NON-gzip coding (deflate) so a handler hardcoding `"gzip"`
+    /// cannot pass, and an uncoded upstream in the SAME fixture so hardcoding
+    /// `"deflate"` cannot pass either (the control must carry no
+    /// `Content-Encoding` at all). Covers BOTH arms that had the bug: the
+    /// Remote repo arm and the Virtual-member arm.
+    #[tokio::test]
+    async fn test_download_root_forwards_upstream_content_encoding_verbatim() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (plain, coded) = tdh::coded_fixture("deflate", b"maven-root-index-3211 ");
+
+        // Coded upstream: root index served deflate-coded, coding declared.
+        let coded_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .insert_header("content-encoding", "deflate")
+                    .set_body_bytes(coded.clone()),
+            )
+            .mount(&coded_mock)
+            .await;
+
+        // Positive control in the same fixture: same document, no coding.
+        let plain_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(plain.clone()),
+            )
+            .mount(&plain_mock)
+            .await;
+
+        let (coded_id, coded_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let (plain_id, plain_key, _pdir) = tdh::create_repo(&pool, "remote", "maven").await;
+        for (id, uri) in [(coded_id, coded_mock.uri()), (plain_id, plain_mock.uri())] {
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(uri)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("point remote upstream at mock");
+        }
+
+        // Virtual repo whose only member is the coded remote — the second arm
+        // of `download_root` that dropped the coding.
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_id)
+        .bind(coded_id)
+        .execute(&pool)
+        .await
+        .expect("link coded remote as virtual member");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        async fn probe(
+            state: crate::api::SharedState,
+            key: &str,
+        ) -> (Option<String>, Option<String>, bytes::Bytes) {
+            let resp = download_root(State(state), Path(key.to_string()))
+                .await
+                .expect("root probe must proxy 200");
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            // Fully qualified (not the handler-module import) so this test
+            // compiles unchanged against the pre-fix production code.
+            let enc = resp
+                .headers()
+                .get(axum::http::header::CONTENT_ENCODING)
+                .map(|v| v.to_str().unwrap().to_string());
+            let len = resp
+                .headers()
+                .get(CONTENT_LENGTH)
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+            (enc, len, body)
+        }
+
+        // REMOTE arm, coded upstream: the UPSTREAM's coding is declared, the
+        // bytes are the coded bytes untouched, and Content-Length describes
+        // those coded bytes (§8.6).
+        let (enc, len, body) = probe(state.clone(), &coded_key).await;
+        assert_eq!(
+            enc.as_deref(),
+            Some("deflate"),
+            "remote root must re-declare the upstream Content-Encoding (#3211)"
+        );
+        assert_eq!(len.as_deref(), Some(coded.len().to_string().as_str()));
+        assert_eq!(
+            &body[..],
+            &coded[..],
+            "coded bytes must pass through verbatim"
+        );
+        assert_eq!(
+            tdh::inflate_deflate(&body),
+            plain,
+            "client must be able to decode the body with the declared coding"
+        );
+
+        // VIRTUAL arm, coded member: identical contract.
+        let (enc, len, body) = probe(state.clone(), &virtual_key).await;
+        assert_eq!(
+            enc.as_deref(),
+            Some("deflate"),
+            "virtual root must re-declare the member upstream's Content-Encoding (#3211)"
+        );
+        assert_eq!(len.as_deref(), Some(coded.len().to_string().as_str()));
+        assert_eq!(&body[..], &coded[..]);
+        assert_eq!(tdh::inflate_deflate(&body), plain);
+
+        // CONTROL, uncoded upstream: byte-identical body, NO spurious coding.
+        let (enc, len, body) = probe(state.clone(), &plain_key).await;
+        assert_eq!(
+            enc, None,
+            "an uncoded upstream must not grow a Content-Encoding header"
+        );
+        assert_eq!(len.as_deref(), Some(plain.len().to_string().as_str()));
+        assert_eq!(
+            &body[..],
+            &plain[..],
+            "uncoded body must be forwarded byte-identically"
+        );
+
+        // cleanup (members cascade on repo delete).
+        for id in [virtual_id, coded_id, plain_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
                 .bind(id)
                 .execute(&pool)
