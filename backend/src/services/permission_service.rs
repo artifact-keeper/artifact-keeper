@@ -2054,42 +2054,30 @@ mod tests {
             "the just-inserted permissions rule must be observable"
         );
 
-        // Negative: the principal the rule does NOT name is denied. This is the
-        // enforcement the warning claimed did not exist. A rule-less private
-        // repo would deny `other_user` too, so the negative alone is not proof —
-        // hence the positive control below in the SAME fixture.
-        assert!(
-            !service
-                .check_repository_action(other_user, repo_id, "write", false)
-                .await
-                .expect("write check must reach the DB"),
-            "a principal without a matching rule must be denied write (rule IS consulted)"
-        );
-        assert!(
-            !service
-                .check_permission(other_user, "repository", repo_id, "read", false)
-                .await
-                .expect("read check must reach the DB"),
-            "a principal without a matching rule must be denied read once rules exist"
-        );
-
-        // Positive control (mandatory): the granted principal succeeds in the
-        // same fixture, so the negatives above cannot be satisfied by a gate
-        // that simply denies everyone.
-        assert!(
-            service
-                .check_repository_action(granted_user, repo_id, "write", false)
-                .await
-                .expect("write check must reach the DB"),
-            "the granted principal must be allowed write (positive control)"
-        );
-        assert!(
-            service
-                .check_permission(granted_user, "repository", repo_id, "read", false)
-                .await
-                .expect("read check must reach the DB"),
-            "the granted principal must be allowed read (positive control)"
-        );
+        // Collect every verdict BEFORE tearing down, then assert after. A
+        // failing assert must not skip cleanup: this suite runs
+        // process-per-test against a SHARED database, so leaked rows surface
+        // as unrelated failures elsewhere (the #3129 class).
+        let other_write = service
+            .check_repository_action(other_user, repo_id, "write", false)
+            .await
+            .expect("write check must reach the DB");
+        let other_read = service
+            .check_permission(other_user, "repository", repo_id, "read", false)
+            .await
+            .expect("read check must reach the DB");
+        let granted_write = service
+            .check_repository_action(granted_user, repo_id, "write", false)
+            .await
+            .expect("write check must reach the DB");
+        let granted_read = service
+            .check_permission(granted_user, "repository", repo_id, "read", false)
+            .await
+            .expect("read check must reach the DB");
+        let granted_delete = service
+            .check_repository_action(granted_user, repo_id, "delete", false)
+            .await
+            .expect("delete check must reach the DB");
 
         // Scope teardown to this fixture's own rows only (#3129: no
         // cluster-wide deletes on a shared database).
@@ -2106,5 +2094,42 @@ mod tests {
             .bind(repo_id)
             .execute(&pool)
             .await;
+
+        // These two are CONTROLS, not the discriminating assertions — the
+        // comments here previously had it the other way round. `other_user`
+        // has no applicable rule, so it never takes the rule arm: it falls
+        // through to the role-assignment `ELSE` (see the `CASE` around
+        // permission_service.rs:216-224) and is denied for want of a role.
+        // Mutating the rule arm to `WHEN false` leaves BOTH of these green.
+        assert!(
+            !other_write,
+            "a principal with neither a rule nor a role must be denied write"
+        );
+        assert!(
+            !other_read,
+            "a principal with neither a rule nor a role must be denied read"
+        );
+
+        // THESE gate the claim. `granted_user` holds no role assignment, so
+        // the only way it can be allowed is if the `permissions` rule was
+        // actually consulted. Mutating the rule arm to `WHEN false` fails
+        // exactly here.
+        assert!(
+            granted_write,
+            "the granted principal must be allowed write — the rule IS consulted"
+        );
+        assert!(
+            granted_read,
+            "the granted principal must be allowed read — the rule IS consulted"
+        );
+
+        // The rule is AUTHORITATIVE for the principal it names, not merely
+        // additive: an action it does not carry is denied. Without this, a
+        // resolver returning "any applicable rule ⇒ allow" would satisfy
+        // everything above.
+        assert!(
+            !granted_delete,
+            "the granted principal holds read+write only; delete must be denied"
+        );
     }
 }
