@@ -430,6 +430,49 @@ mod tests {
         }
     }
 
+    /// Scopes the migration question #3198 raises: which names can a
+    /// deployment that ran the *unvalidated* upload path already be holding?
+    ///
+    /// The answer is narrower than it looks, and this pins it. Whatever
+    /// `PypiHandler::normalize_name` is handed, its output draws only on
+    /// `[a-z0-9-]`, it cannot begin with `-` (separators before the first
+    /// alphanumeric are skipped), and it cannot end with one (runs collapse and
+    /// the single trailing hyphen is popped). So every name it ever stored is
+    /// either a valid PEP 508 name or the EMPTY string.
+    ///
+    /// Two consequences, both stated in the PR:
+    ///
+    /// * The rows that are genuinely unreachable after #3196 are exactly the
+    ///   empty-named ones, so an operator's audit query is a cheap `name = ''`
+    ///   rather than a regex scan.
+    /// * The other invalid uploads are not unreachable, they are *misfiled* --
+    ///   sitting in some other, valid project's namespace. That is the case
+    ///   this change actually prevents, and it is why the fix is not a rename:
+    ///   a server-side rename would have to guess which project those bytes
+    ///   were meant for.
+    #[test]
+    fn legacy_upload_coercion_only_ever_produced_valid_or_empty_names() {
+        let mut saw_empty = false;
+        for name in invalid_names().into_iter().chain(valid_names()) {
+            let coerced = PypiHandler::normalize_name(name);
+            if coerced.is_empty() {
+                saw_empty = true;
+                continue;
+            }
+            assert!(
+                is_valid_project_name(&coerced),
+                "the legacy upload coercion turned {name:?} into {coerced:?}, which is \
+                 neither empty nor a valid PEP 508 name -- the migration scope in #3198 \
+                 is wider than documented"
+            );
+        }
+        assert!(
+            saw_empty,
+            "no input coerced to the empty string, so the empty case above was never \
+             exercised and the 'valid or empty' claim is only half tested"
+        );
+    }
+
     /// The pattern shown to a rejected publisher (#3198) must be the pattern
     /// actually enforced, differing only in the anchors.
     ///
