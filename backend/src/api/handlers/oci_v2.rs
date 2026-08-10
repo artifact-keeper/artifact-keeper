@@ -27362,14 +27362,12 @@ mod remote_pull_through_cache_tests {
         let raw = std::fs::read(sidecar)
             .unwrap_or_else(|e| panic!("sidecar {} must exist: {e}", sidecar.display()));
         let v: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar JSON");
-        let cached_at = chrono::DateTime::parse_from_rfc3339(
-            v["cached_at"].as_str().expect("cached_at"),
-        )
-        .expect("cached_at rfc3339");
-        let expires_at = chrono::DateTime::parse_from_rfc3339(
-            v["expires_at"].as_str().expect("expires_at"),
-        )
-        .expect("expires_at rfc3339");
+        let cached_at =
+            chrono::DateTime::parse_from_rfc3339(v["cached_at"].as_str().expect("cached_at"))
+                .expect("cached_at rfc3339");
+        let expires_at =
+            chrono::DateTime::parse_from_rfc3339(v["expires_at"].as_str().expect("expires_at"))
+                .expect("expires_at rfc3339");
         (expires_at - cached_at).num_seconds()
     }
 
@@ -27605,14 +27603,9 @@ mod remote_pull_through_cache_tests {
             (&config_digest, &config, "warm GET config blob (outage)"),
             (&layer_digest, &layer, "warm GET layer blob (outage)"),
         ] {
-            let resp = super::handle_get_blob(
-                &state,
-                &anon_headers(),
-                "http://ak.test",
-                &image,
-                digest,
-            )
-            .await;
+            let resp =
+                super::handle_get_blob(&state, &anon_headers(), "http://ak.test", &image, digest)
+                    .await;
             let (status, body, _h) = tdh::collect_response(resp).await;
             results.push((what.to_string(), status, body.to_vec(), expect.to_vec()));
         }
@@ -27683,10 +27676,7 @@ mod remote_pull_through_cache_tests {
                 .and(wm_path(path))
                 .respond_with(
                     ResponseTemplate::new(200)
-                        .insert_header(
-                            "content-type",
-                            "application/vnd.oci.image.manifest.v1+json",
-                        )
+                        .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
                         .set_body_bytes(manifest.clone()),
                 )
                 .mount(&server)
