@@ -978,11 +978,150 @@ mod tests {
         let (status_slash, _) = tdh::send(app, tdh::get(format!("/{}/api/", f.repo_key))).await;
         assert_eq!(status_slash, StatusCode::OK);
 
-        // Unknown repo must still 404 on the no-slash spelling too (the alias
-        // must not bypass repo resolution).
+        // Unknown repo: the alias must not bypass repo resolution — the
+        // handler still runs `resolve_ansible_repo` and 404s.
+        //
+        // NOTE what this does *not* claim. This router is the bare handler
+        // table; in the deployed stack `repo_visibility_middleware` runs first
+        // and answers **401** for an unknown repo key presented without a
+        // credential, because #1808 closed the 404-vs-401 repo-existence
+        // oracle (`auth.rs`, the `no_credential` arm of the "no repo found"
+        // branch). The production status for that request is pinned by
+        // `test_3137_galaxy_api_through_visibility_middleware` below; here the
+        // assertion is only that the alias is repo-scoped like every other
+        // route in this table.
         let app2 = f.router_anon(super::router());
         let (status_missing, _) = tdh::send(app2, tdh::get("/no-such-repo/api".into())).await;
         assert_eq!(status_missing, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    /// Both #3137 fixes together, through the middleware that produced the
+    /// reporter's 401 — the actual `ansible-galaxy` request shape.
+    ///
+    /// The two unit-level tests each cover one half in isolation: the router
+    /// test above uses the bare handler table (no middleware), and
+    /// `test_3137_galaxy_token_scheme_authenticates_api_token` in `auth.rs`
+    /// calls `try_resolve_auth_outcome` directly (no routing). Neither pins
+    /// the contract the user actually exercises, which is a single request:
+    /// `GET /ansible/{repo}/api` (no trailing slash) carrying
+    /// `Authorization: Token <api_key>`, through `repo_visibility_middleware`
+    /// into the Galaxy discovery handler. Either fix missing turns this 200
+    /// into the reporter's failure — 404 without the route alias, 401 without
+    /// the `Token` scheme.
+    #[tokio::test]
+    async fn test_3137_galaxy_api_through_visibility_middleware() {
+        use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
+        use crate::services::auth_service::AuthService;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        // The fixture repository is PRIVATE (`repositories.is_public` defaults
+        // to false) and the fixture user holds a `developer` role assignment
+        // on it, so the request is only served if the credential resolves.
+        let auth_service = Arc::new(AuthService::new(
+            f.pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        let (token, _tid) = auth_service
+            .generate_api_token(f.user_id, "galaxy", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+
+        let vis_state = RepoVisibilityState {
+            auth_service: auth_service.clone(),
+            db: f.pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(f.pool.clone())),
+        };
+        // Mount the real handler table under the real middleware at the real
+        // `/ansible` prefix so `extract_repo_key` sees the production path
+        // shape (`/{format}/{repo_key}/...`).
+        let app = axum::Router::new()
+            .nest("/ansible", super::router())
+            .with_state(f.state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                vis_state,
+                repo_visibility_middleware,
+            ));
+
+        let galaxy_get = |uri: String, auth: Option<String>| {
+            let mut b = axum::http::Request::builder().uri(uri);
+            if let Some(v) = auth {
+                b = b.header(axum::http::header::AUTHORIZATION, v);
+            }
+            b.body(axum::body::Body::empty()).expect("build request")
+        };
+
+        // THE user path: no trailing slash + the `Token` scheme.
+        let (status, body) = tdh::send(
+            app.clone(),
+            galaxy_get(
+                format!("/ansible/{}/api", f.repo_key),
+                Some(format!("Token {token}")),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET /ansible/{{repo}}/api with `Authorization: Token <api_key>` must \
+             serve the discovery document through repo_visibility_middleware"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["available_versions"].get("v3").is_some(),
+            "discovery must advertise v3"
+        );
+
+        // Fail-closed controls in the same fixture, so the 200 above cannot be
+        // explained by the middleware simply letting everything through.
+        //
+        // 1. Same URL, no credential -> 401 (private repo).
+        let (anon_status, _) = tdh::send(
+            app.clone(),
+            galaxy_get(format!("/ansible/{}/api", f.repo_key), None),
+        )
+        .await;
+        assert_eq!(
+            anon_status,
+            StatusCode::UNAUTHORIZED,
+            "anonymous read of a private Ansible repo must stay 401"
+        );
+
+        // 2. Same URL, a bogus credential under the `Token` scheme -> 401.
+        //    Recognizing the scheme must not fail open.
+        let (bad_status, _) = tdh::send(
+            app.clone(),
+            galaxy_get(
+                format!("/ansible/{}/api", f.repo_key),
+                Some("Token not-a-valid-credential".into()),
+            ),
+        )
+        .await;
+        assert_eq!(
+            bad_status,
+            StatusCode::UNAUTHORIZED,
+            "an invalid Token-scheme credential must stay 401"
+        );
+
+        // 3. Unknown repo key with no credential -> 401, NOT the handler's
+        //    404: #1808 closed the anonymous repo-existence oracle in
+        //    `repo_visibility_middleware`, which runs before the handler.
+        //    This is the production counterpart of the bare-router 404
+        //    asserted in `test_3137_api_discovery_without_trailing_slash`.
+        let (missing_status, _) =
+            tdh::send(app, galaxy_get("/ansible/no-such-repo/api".into(), None)).await;
+        assert_eq!(
+            missing_status,
+            StatusCode::UNAUTHORIZED,
+            "unknown repo key must return the same 401 as an existing private \
+             repo (no existence oracle, #1808)"
+        );
+
         f.teardown().await;
     }
 
