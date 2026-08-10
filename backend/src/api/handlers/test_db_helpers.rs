@@ -1705,21 +1705,48 @@ pub async fn probe_ok(app: Router, uri: String) -> (Bytes, axum::http::HeaderMap
     (body, headers)
 }
 
+/// The pair of wiremock upstreams a #3260 verbatim-forward test drives,
+/// together with the coding that was actually mounted on the coded one.
+///
+/// The coding lives ON the fixture — and every assertion reads it from here —
+/// so an assertion cannot be satisfied by a handler that emits some *other*
+/// coding. That is the whole point: the first cut of these helpers compared
+/// the served header against the literal `"deflate"`, which made all three
+/// suites pass with the production line rewritten to
+/// `builder.header(CONTENT_ENCODING, "deflate")`. See [`coded_fixture`] for
+/// why that failure mode (a `br` upstream mislabelled) is worse than the bug
+/// #3260 fixed.
+pub struct CodedUpstreams {
+    /// The coding the coded upstream declares and its body is actually coded
+    /// with. Every expectation below is derived from this field rather than
+    /// from a literal, so the suites can vary it per format.
+    pub encoding: String,
+    /// The uncoded bytes: what `encoding` must decode the served body back to.
+    pub plain: Vec<u8>,
+    /// The coded bytes the coded upstream serves, byte for byte.
+    pub coded: Vec<u8>,
+    /// Upstream that declares `encoding` on every GET.
+    pub coded_mock: wiremock::MockServer,
+    /// Upstream that declares no coding on every GET (the positive control).
+    pub plain_mock: wiremock::MockServer,
+}
+
 /// Mount a pair of wiremock upstreams for the #3260 verbatim-forward tests:
 /// the first answers every GET with `coded` and `Content-Encoding: <encoding>`
 /// declared, the second answers every GET with `plain` and no coding (the
-/// positive control), both under `content_type`. Returns
-/// `(plain, coded, coded_mock, plain_mock)`.
+/// positive control), both under `content_type`.
 ///
 /// Shared across the goproxy / rubygems / hex arms so each suite does not
 /// carry its own copy of the mock block (the jscpd duplication gate scores
 /// changed files). Uses [`coded_fixture`], so callers should pass a NON-gzip
-/// coding — see its doc for why a gzip fixture proves less.
+/// coding — see its doc for why a gzip fixture proves less — and the suites
+/// should not all pass the SAME coding, or a hardcoded literal of that one
+/// coding satisfies every assertion in the tree.
 pub async fn coded_and_plain_upstreams(
     encoding: &str,
     content_type: &str,
     seed: &[u8],
-) -> (Vec<u8>, Vec<u8>, wiremock::MockServer, wiremock::MockServer) {
+) -> CodedUpstreams {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1743,64 +1770,83 @@ pub async fn coded_and_plain_upstreams(
         )
         .mount(&plain_mock)
         .await;
-    (plain, coded, coded_mock, plain_mock)
-}
-
-/// Assert a #3260 verbatim forward of a DEFLATE-coded upstream body: the
-/// upstream's coding is re-declared (RFC 9110 §8.4), `Content-Length`
-/// describes the coded bytes actually sent (§8.6), the bytes pass through
-/// unchanged, and the declared coding actually decodes the body back to
-/// `plain` — not merely "some header is present".
-pub fn assert_coded_forward(
-    headers: &axum::http::HeaderMap,
-    body: &[u8],
-    coded: &[u8],
-    plain: &[u8],
-    what: &str,
-) {
-    assert_eq!(
-        headers
-            .get(axum::http::header::CONTENT_ENCODING)
-            .map(|v| v.to_str().unwrap()),
-        Some("deflate"),
-        "{what}: the upstream Content-Encoding must be re-declared (#3260)"
-    );
-    assert_eq!(
-        headers
-            .get(axum::http::header::CONTENT_LENGTH)
-            .map(|v| v.to_str().unwrap().to_string()),
-        Some(coded.len().to_string()),
-        "{what}: Content-Length must describe the coded bytes actually sent"
-    );
-    assert_eq!(
-        body, coded,
-        "{what}: coded bytes must pass through verbatim"
-    );
-    assert_eq!(
-        inflate_deflate(body),
+    CodedUpstreams {
+        encoding: encoding.to_string(),
         plain,
-        "{what}: the client must be able to decode the body with the declared coding"
-    );
+        coded,
+        coded_mock,
+        plain_mock,
+    }
 }
 
-/// Positive control for [`assert_coded_forward`], same fixture: an UNCODED
-/// upstream body must be forwarded byte-identically and must NOT grow a
-/// spurious `Content-Encoding` header.
-pub fn assert_plain_forward(
-    headers: &axum::http::HeaderMap,
-    body: &[u8],
-    plain: &[u8],
-    what: &str,
-) {
-    assert_eq!(
-        headers.get(axum::http::header::CONTENT_ENCODING),
-        None,
-        "{what}: an uncoded upstream must not grow a Content-Encoding header"
-    );
-    assert_eq!(
-        body, plain,
-        "{what}: uncoded body must be forwarded byte-identically"
-    );
+impl CodedUpstreams {
+    /// Assert a #3260 verbatim forward of the coded upstream's body: the
+    /// coding THIS FIXTURE mounted is the one re-declared (RFC 9110 §8.4),
+    /// `Content-Length` describes the coded bytes actually sent (§8.6), the
+    /// bytes pass through unchanged, and the declared coding actually decodes
+    /// the body back to `plain` — not merely "some header is present".
+    pub fn assert_coded_forward(&self, headers: &axum::http::HeaderMap, body: &[u8], what: &str) {
+        let served = headers
+            .get(axum::http::header::CONTENT_ENCODING)
+            .map(|v| v.to_str().unwrap());
+        assert_eq!(
+            served,
+            Some(self.encoding.as_str()),
+            "{what}: the UPSTREAM's Content-Encoding must be re-declared, not some \
+             other coding (#3260)"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .map(|v| v.to_str().unwrap().to_string()),
+            Some(self.coded.len().to_string()),
+            "{what}: Content-Length must describe the coded bytes actually sent"
+        );
+        assert_eq!(
+            body, self.coded,
+            "{what}: coded bytes must pass through verbatim"
+        );
+        // Decode with the coding the RESPONSE declared, not with the one the
+        // fixture mounted: this is what the client does, so a mislabel that
+        // slipped past the header assertion still fails here.
+        assert_eq!(
+            decode_coded(served.expect("checked above"), body),
+            self.plain,
+            "{what}: the client must be able to decode the body with the declared coding"
+        );
+    }
+
+    /// Positive control for [`CodedUpstreams::assert_coded_forward`], same
+    /// fixture: an UNCODED upstream body must be forwarded byte-identically
+    /// and must NOT grow a spurious `Content-Encoding` header.
+    pub fn assert_plain_forward(&self, headers: &axum::http::HeaderMap, body: &[u8], what: &str) {
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_ENCODING),
+            None,
+            "{what}: an uncoded upstream must not grow a Content-Encoding header"
+        );
+        assert_eq!(
+            body, self.plain,
+            "{what}: uncoded body must be forwarded byte-identically"
+        );
+    }
+
+    /// How many GETs the CODED upstream has served for `path` so far.
+    ///
+    /// The barrier for the warm-cache (`resolve_virtual_metadata` Pass 1)
+    /// probes: a second request whose count is unchanged was answered from
+    /// the proxy cache, so the assertions that follow are about the cache-hit
+    /// arm and not a second cold fan-out. Both the fixed and the broken shape
+    /// of that arm reach this barrier, so it cannot mask a regression.
+    pub async fn coded_hits(&self, path: &str) -> usize {
+        self.coded_mock
+            .received_requests()
+            .await
+            .expect("wiremock request recording is enabled")
+            .iter()
+            .filter(|r| r.url.path() == path)
+            .count()
+    }
 }
 
 /// Create a Remote repository of `format` pointed at `upstream_url`, plus a
@@ -1832,17 +1878,33 @@ pub async fn create_remote_and_virtual(
     (remote_id, remote_key, virtual_id, virtual_key)
 }
 
-/// Decode a `deflate` body, so a test can assert the client receives BYTES it
-/// can actually decode rather than only that a header is present.
-pub fn inflate_deflate(coded: &[u8]) -> Vec<u8> {
-    use flate2::read::DeflateDecoder;
+/// Decode a body coded with `encoding` — the inverse of [`code_bytes`], so a
+/// test can assert the client receives BYTES it can actually decode rather
+/// than only that a header is present.
+///
+/// Takes the coding as a parameter (rather than hardcoding one decoder) so an
+/// assertion can decode with the coding the RESPONSE declared. A decoder
+/// pinned to a single coding cannot distinguish "forwarded the upstream's
+/// coding" from "always emits that coding", which is exactly the hole the
+/// #3260 suites shipped with.
+pub fn decode_coded(encoding: &str, coded: &[u8]) -> Vec<u8> {
+    use flate2::read::{DeflateDecoder, GzDecoder};
     use std::io::Read;
 
     let mut out = Vec::new();
-    DeflateDecoder::new(coded)
-        .read_to_end(&mut out)
-        .expect("body must be decodable with the coding it declares");
+    match encoding {
+        "gzip" => GzDecoder::new(coded).read_to_end(&mut out),
+        "deflate" => DeflateDecoder::new(coded).read_to_end(&mut out),
+        other => panic!("unsupported test coding {other}"),
+    }
+    .expect("body must be decodable with the coding it declares");
     out
+}
+
+/// Decode a `deflate` body. Thin alias for [`decode_coded`] kept for the
+/// #3149 / #3184 suites that only ever mount deflate.
+pub fn inflate_deflate(coded: &[u8]) -> Vec<u8> {
+    decode_coded("deflate", coded)
 }
 
 /// Build a gzip-coded body, returning `(plain, coded)`.

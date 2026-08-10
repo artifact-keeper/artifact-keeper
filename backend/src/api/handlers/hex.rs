@@ -3991,15 +3991,19 @@ mod tests {
     /// codec and advertises `Accept-Encoding: identity`), so before the fix
     /// `mix` received coded bytes labelled as plain.
     ///
-    /// Deflate (non-gzip) coded upstream plus an uncoded control in the SAME
-    /// fixture — see `tdh::coded_fixture` for why gzip would prove less.
+    /// GZIP-coded upstream plus an uncoded control in the SAME fixture. The
+    /// coding deliberately differs from the goproxy / rubygems arms' deflate:
+    /// if every #3260 suite mounted one coding, pinning the production
+    /// builder to that literal would leave them all green — which is exactly
+    /// the hole `tdh::coded_fixture`'s doc comment was written about, and
+    /// exactly the hole this suite originally shipped with.
     #[tokio::test]
     async fn test_hex_registry_forwards_upstream_content_encoding_verbatim_db() {
         let Some(fx) = tdh::Fixture::setup("remote", "hex").await else {
             return;
         };
-        let (plain, coded, coded_mock, plain_mock) = tdh::coded_and_plain_upstreams(
-            "deflate",
+        let up = tdh::coded_and_plain_upstreams(
+            "gzip",
             "application/octet-stream",
             b"hex-registry-3260 ",
         )
@@ -4008,31 +4012,25 @@ mod tests {
         // fx repo = the coded Remote (Remote-arm probes); a second coded
         // Remote wrapped by a Virtual (Virtual-arm probe); a plain Remote +
         // Virtual pair as the uncoded control.
-        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &coded_mock.uri()).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.coded_mock.uri()).await;
         let (coded_member_id, _cm_key, virt_coded_id, virt_coded_key) =
-            tdh::create_remote_and_virtual(&fx.pool, "hex", &coded_mock.uri()).await;
+            tdh::create_remote_and_virtual(&fx.pool, "hex", &up.coded_mock.uri()).await;
         let (plain_id, plain_key, virt_plain_id, virt_plain_key) =
-            tdh::create_remote_and_virtual(&fx.pool, "hex", &plain_mock.uri()).await;
+            tdh::create_remote_and_virtual(&fx.pool, "hex", &up.plain_mock.uri()).await;
 
         // Remote arms: all three registry resources.
         for resource in ["packages/pkg3260", "names", "versions"] {
             let uri = format!("/{}/{}", fx.repo_key, resource);
             let (body, headers) =
                 tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
-            tdh::assert_coded_forward(
-                &headers,
-                &body,
-                &coded,
-                &plain,
-                &format!("remote {resource}"),
-            );
+            up.assert_coded_forward(&headers, &body, &format!("remote {resource}"));
         }
 
         // Virtual arm: `/packages/{name}` pass 3 (`resolve_virtual_metadata`).
         let uri = format!("/{}/packages/pkg3260", virt_coded_key);
         let (body, headers) =
             tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
-        tdh::assert_coded_forward(&headers, &body, &coded, &plain, "virtual packages");
+        up.assert_coded_forward(&headers, &body, "virtual packages (cold, Pass 2)");
 
         // Controls: uncoded upstream through the Remote and Virtual arms.
         for (key, resource, what) in [
@@ -4047,7 +4045,7 @@ mod tests {
             let uri = format!("/{}/{}", key, resource);
             let (body, headers) =
                 tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
-            tdh::assert_plain_forward(&headers, &body, &plain, what);
+            up.assert_plain_forward(&headers, &body, what);
         }
 
         for id in [virt_coded_id, coded_member_id, virt_plain_id, plain_id] {

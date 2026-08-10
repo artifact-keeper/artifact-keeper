@@ -1601,7 +1601,7 @@ mod db_cov_tests {
         let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
             return;
         };
-        let (plain, coded, coded_mock, plain_mock) = tdh::coded_and_plain_upstreams(
+        let up = tdh::coded_and_plain_upstreams(
             "deflate",
             "application/octet-stream",
             b"gem-meta-3260 ",
@@ -1611,17 +1611,34 @@ mod db_cov_tests {
         // fx only supplies the DB + proxy-carrying state; the probes target a
         // coded Remote wrapped by a Virtual and a plain Remote + Virtual pair
         // as the uncoded control.
-        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &coded_mock.uri()).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.coded_mock.uri()).await;
         let (coded_member_id, _cm_key, virt_coded_id, virt_coded_key) =
-            tdh::create_remote_and_virtual(&fx.pool, "rubygems", &coded_mock.uri()).await;
+            tdh::create_remote_and_virtual(&fx.pool, "rubygems", &up.coded_mock.uri()).await;
         let (plain_id, _plain_key, virt_plain_id, virt_plain_key) =
-            tdh::create_remote_and_virtual(&fx.pool, "rubygems", &plain_mock.uri()).await;
+            tdh::create_remote_and_virtual(&fx.pool, "rubygems", &up.plain_mock.uri()).await;
 
-        // `gem_info` Virtual arm.
+        // `gem_info` Virtual arm, COLD (`resolve_virtual_metadata` Pass 2).
         let uri = format!("/{}/api/v1/gems/pkg3260.json", virt_coded_key);
         let (body, headers) =
             tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
-        tdh::assert_coded_forward(&headers, &body, &coded, &plain, "virtual gem_info");
+        up.assert_coded_forward(&headers, &body, "virtual gem_info (cold, Pass 2)");
+
+        // `gem_info` Virtual arm, WARM: same URI again, now served by
+        // `resolve_virtual_metadata` Pass 1 (`cached_metadata_if_servable`),
+        // which reads the coding off the cache sidecar. The unchanged
+        // upstream hit count is the barrier proving it was a cache hit; both
+        // the fixed and the coding-dropping shape of Pass 1 reach it.
+        let upstream_path = "/api/v1/gems/pkg3260.json";
+        let hits_before = up.coded_hits(upstream_path).await;
+        let uri = format!("/{}/api/v1/gems/pkg3260.json", virt_coded_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        assert_eq!(
+            up.coded_hits(upstream_path).await,
+            hits_before,
+            "second probe must be served from the proxy cache (Pass 1), not refetched"
+        );
+        up.assert_coded_forward(&headers, &body, "virtual gem_info (warm, Pass 1)");
 
         // `quick_spec` Virtual arm.
         let uri = format!(
@@ -1630,20 +1647,22 @@ mod db_cov_tests {
         );
         let (body, headers) =
             tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
-        tdh::assert_coded_forward(&headers, &body, &coded, &plain, "virtual quick_spec");
+        up.assert_coded_forward(&headers, &body, "virtual quick_spec");
 
-        // Controls: the same two arms over an uncoded member.
-        let uri = format!("/{}/api/v1/gems/pkg3260.json", virt_plain_key);
-        let (body, headers) =
-            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
-        tdh::assert_plain_forward(&headers, &body, &plain, "control gem_info");
+        // Controls: the same two arms over an uncoded member, cold and warm.
+        for what in ["control gem_info (cold)", "control gem_info (warm)"] {
+            let uri = format!("/{}/api/v1/gems/pkg3260.json", virt_plain_key);
+            let (body, headers) =
+                tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+            up.assert_plain_forward(&headers, &body, what);
+        }
         let uri = format!(
             "/{}/quick/Marshal.4.8/pkg3260-1.0.0.gemspec.rz",
             virt_plain_key
         );
         let (body, headers) =
             tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
-        tdh::assert_plain_forward(&headers, &body, &plain, "control quick_spec");
+        up.assert_plain_forward(&headers, &body, "control quick_spec");
 
         for id in [virt_coded_id, coded_member_id, virt_plain_id, plain_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")

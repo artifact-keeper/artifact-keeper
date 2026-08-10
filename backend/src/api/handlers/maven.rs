@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -954,7 +954,12 @@ async fn download_root(
     Err(AppError::NotFound("Repository root not available".to_string()).into_response())
 }
 
-/// Build the response for an upstream root body that is forwarded VERBATIM.
+/// Build the response for an upstream root body that is forwarded VERBATIM
+/// (#3211). Thin alias for the shared
+/// [`proxy_helpers::forward_verbatim_metadata`] (#3260) with Maven's root
+/// default `Content-Type`: the general form was extracted from this function,
+/// so keeping a second copy here would be the duplicate the extraction exists
+/// to remove (the jscpd duplication gate scores changed files).
 ///
 /// The bytes are sent exactly as the upstream (or the proxy cache) produced
 /// them, so the upstream `Content-Encoding` must be re-declared when present
@@ -968,15 +973,7 @@ fn forward_root_verbatim(
     content_type: Option<String>,
     content_encoding: Option<String>,
 ) -> Response {
-    let ct = content_type.unwrap_or_else(|| "text/html".to_string());
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, ct)
-        .header(CONTENT_LENGTH, content.len().to_string());
-    if let Some(enc) = content_encoding {
-        builder = builder.header(CONTENT_ENCODING, enc);
-    }
-    builder.body(Body::from(content)).unwrap()
+    proxy_helpers::forward_verbatim_metadata(content, content_type, "text/html", content_encoding)
 }
 
 // ---------------------------------------------------------------------------

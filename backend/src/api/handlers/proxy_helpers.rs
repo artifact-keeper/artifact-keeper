@@ -2713,6 +2713,12 @@ where
 /// bytes it emits are no longer the bytes the coding describes. Before #3260
 /// this helper dropped the coding unconditionally, which mislabeled every
 /// coded upstream response its (all verbatim-forwarding) callers served.
+///
+/// The member's `Content-TYPE` is still dropped (both passes bind it `_ct`),
+/// so the verbatim-forwarding callers each hardcode a literal and can
+/// disagree with the Remote arm of the same endpoint. Pre-existing and NOT
+/// addressed by #3260 — tracked in #3281, which widens this seam once more
+/// rather than twice.
 pub async fn resolve_virtual_metadata<F, Fut>(
     db: &PgPool,
     proxy_service: Option<&ProxyService>,
