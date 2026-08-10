@@ -3934,6 +3934,41 @@ async fn upload(
     })?;
     let normalized = normalized_project.as_str().to_string();
 
+    // Distribution/metadata consistency (#3107).
+    //
+    // `PypiHandler::validate` held name/version-vs-metadata checks but had no
+    // call site, so a wheel/sdist whose embedded METADATA/PKG-INFO named a
+    // DIFFERENT project (or version) than the twine `name`/`version` fields was
+    // published into the declared project's namespace unchecked — the bytes and
+    // the identity they resolve under could disagree. Bind them here.
+    //
+    // The body was streamed to a bounded scratch file (up to
+    // `max_upload_size_bytes`, 10 GiB by default); re-open that file and read
+    // only the metadata entry rather than buffering the whole distribution.
+    // ZIP/tar parsing is blocking, so it runs on the blocking pool.
+    {
+        let staged_path = staged_content.path().to_path_buf();
+        let expected_name = normalized.clone();
+        let expected_version = pkg_version.clone();
+        let dist_filename = filename.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&staged_path).map_err(|e| {
+                AppError::Internal(format!("re-open staged upload for validation: {e}"))
+            })?;
+            PypiHandler::validate_upload_file(
+                &expected_name,
+                &expected_version,
+                &dist_filename,
+                file,
+            )
+        })
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("upload validation task failed: {e}")).into_response()
+        })?
+        .map_err(|e| e.into_response())?;
+    }
+
     // SHA-256 was computed incrementally while the body was spooled to disk.
     let computed_sha256 = digests.sha256.clone();
 
@@ -5663,6 +5698,255 @@ mod tests {
         assert!(
             failures.is_empty(),
             "PyPI upload name validation (#3198) failed:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3107 -- distribution/metadata consistency on the upload channel
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal but *real* wheel (a ZIP carrying `.dist-info/METADATA`)
+    /// whose declared `Name`/`Version` are `meta_name`/`meta_version`. Used to
+    /// drive the #3107 consistency check, which reads the archive's real
+    /// metadata rather than trusting the multipart form fields.
+    fn build_test_wheel(meta_name: &str, meta_version: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file(
+                format!("{meta_name}-{meta_version}.dist-info/METADATA"),
+                options,
+            )
+            .expect("start METADATA");
+            write!(
+                zip,
+                "Metadata-Version: 2.1\nName: {meta_name}\nVersion: {meta_version}\n"
+            )
+            .expect("write METADATA");
+            zip.finish().expect("finish wheel zip");
+        }
+        cursor.into_inner()
+    }
+
+    /// Build a minimal but *real* sdist (a gzip'd tar carrying `PKG-INFO`) whose
+    /// declared `Name`/`Version` are `meta_name`/`meta_version`.
+    fn build_test_sdist(meta_name: &str, meta_version: &str) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let pkg_info =
+            format!("Metadata-Version: 2.1\nName: {meta_name}\nVersion: {meta_version}\n");
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header
+            .set_path(format!("{meta_name}-{meta_version}/PKG-INFO"))
+            .expect("set PKG-INFO path");
+        header.set_size(pkg_info.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder
+            .append(&header, pkg_info.as_bytes())
+            .expect("append PKG-INFO");
+        let tar_bytes = tar_builder.into_inner().expect("finish tar");
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_bytes).expect("gzip write");
+        encoder.finish().expect("gzip finish")
+    }
+
+    /// `PypiHandler::validate` (formats/pypi.rs) held name/version-vs-metadata
+    /// checks but had no call site, so a distribution whose embedded metadata
+    /// named a *different* project or version than the twine `name`/`version`
+    /// fields published unchecked into the declared namespace (#3107). Wiring
+    /// the check must:
+    ///
+    /// 1. **Positive control, same fixture.** A wheel and an sdist whose
+    ///    metadata matches the declared identity upload with 200 and are listed
+    ///    by their own simple index — without this a validator that rejects
+    ///    everything would satisfy every negative assertion below (the #3179
+    ///    failure mode).
+    /// 2. **Reject name confusion.** A wheel/sdist whose `METADATA`/`PKG-INFO`
+    ///    `Name` disagrees with the declared project is 400 and never lands in
+    ///    that project's index.
+    /// 3. **Reject version confusion.** A wheel whose `METADATA` `Version`
+    ///    disagrees with the declared version is 400.
+    /// 4. **PEP 440 equivalence is not a mismatch.** Declaring `1.0` for a wheel
+    ///    whose metadata says `1.0.0` still succeeds — the guard must not
+    ///    over-reject versions PEP 440 considers equal.
+    ///
+    /// The 400s must carry the word `mismatch`: a 400 alone proves nothing
+    /// (a malformed body, a missing field or a digest error all produce one).
+    #[tokio::test]
+    async fn pypi_upload_rejects_distribution_metadata_mismatch_but_allows_consistent_ones() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+
+        // Helper: POST an upload, return (status, body).
+        async fn upload(
+            fx: &tdh::Fixture,
+            project: &str,
+            version: &str,
+            filename: &str,
+            content: &[u8],
+        ) -> (StatusCode, String) {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let (content_type, body) = pypi_upload_multipart(
+                project,
+                version,
+                filename,
+                content,
+                "#3107 consistency",
+                ">=3.8",
+            );
+            let app = fx.router_with_auth(super::router());
+            let (status, body) = tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            )
+            .await;
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        // Helper: GET a project's simple index, return (status, body).
+        async fn simple_index(fx: &tdh::Fixture, project: &str) -> (StatusCode, String) {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let app = fx.router_with_auth(super::router());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/simple/{project}/", fx.repo_key))).await;
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        // (1) Positive control: a consistent wheel publishes and resolves.
+        let good_wheel = "goodpkg-1.0.0-py3-none-any.whl";
+        let (st, body) = upload(
+            &fx,
+            "goodpkg",
+            "1.0.0",
+            good_wheel,
+            &build_test_wheel("goodpkg", "1.0.0"),
+        )
+        .await;
+        if st != StatusCode::OK {
+            failures.push(format!(
+                "consistent wheel must upload (200), got {st}; body: {body}"
+            ));
+        }
+        let (st, body) = simple_index(&fx, "goodpkg").await;
+        if st != StatusCode::OK || !body.contains(good_wheel) {
+            failures.push(format!(
+                "consistent wheel must be listed at /simple/goodpkg/ (200 + lists {good_wheel}); \
+                 got {st}; body: {body}"
+            ));
+        }
+
+        // (1) Positive control: a consistent sdist publishes and resolves.
+        let good_sdist = "goodsdist-2.0.0.tar.gz";
+        let (st, body) = upload(
+            &fx,
+            "goodsdist",
+            "2.0.0",
+            good_sdist,
+            &build_test_sdist("goodsdist", "2.0.0"),
+        )
+        .await;
+        if st != StatusCode::OK {
+            failures.push(format!(
+                "consistent sdist must upload (200), got {st}; body: {body}"
+            ));
+        }
+        let (st, body) = simple_index(&fx, "goodsdist").await;
+        if st != StatusCode::OK || !body.contains(good_sdist) {
+            failures.push(format!(
+                "consistent sdist must be listed at /simple/goodsdist/; got {st}; body: {body}"
+            ));
+        }
+
+        // (4) PEP 440 equivalence: declared `1.0` vs metadata `1.0.0` -> 200.
+        let canon_wheel = "canonpkg-1.0-py3-none-any.whl";
+        let (st, body) = upload(
+            &fx,
+            "canonpkg",
+            "1.0",
+            canon_wheel,
+            &build_test_wheel("canonpkg", "1.0.0"),
+        )
+        .await;
+        if st != StatusCode::OK {
+            failures.push(format!(
+                "PEP 440-equivalent version (declared 1.0, metadata 1.0.0) must NOT be rejected; \
+                 got {st}; body: {body}"
+            ));
+        }
+
+        // (2) Name confusion in a wheel -> 400 mismatch, and nothing squats.
+        let (st, body) = upload(
+            &fx,
+            "realclaim",
+            "1.0.0",
+            "realclaim-1.0.0-py3-none-any.whl",
+            &build_test_wheel("evilpkg", "1.0.0"),
+        )
+        .await;
+        if st != StatusCode::BAD_REQUEST || !body.to_lowercase().contains("mismatch") {
+            failures.push(format!(
+                "wheel whose metadata names a different project must be 400 with 'mismatch'; \
+                 got {st}; body: {body}"
+            ));
+        }
+        let (_st, body) = simple_index(&fx, "realclaim").await;
+        if body.contains("realclaim-1.0.0-py3-none-any.whl") {
+            failures.push(format!(
+                "a name-mismatched wheel must not land in /simple/realclaim/; body: {body}"
+            ));
+        }
+
+        // (3) Version confusion in a wheel -> 400 mismatch.
+        let (st, body) = upload(
+            &fx,
+            "verpkg",
+            "1.0.0",
+            "verpkg-1.0.0-py3-none-any.whl",
+            &build_test_wheel("verpkg", "9.9.9"),
+        )
+        .await;
+        if st != StatusCode::BAD_REQUEST || !body.to_lowercase().contains("mismatch") {
+            failures.push(format!(
+                "wheel whose metadata version disagrees must be 400 with 'mismatch'; \
+                 got {st}; body: {body}"
+            ));
+        }
+
+        // (2) Name confusion in an sdist -> 400 mismatch.
+        let (st, body) = upload(
+            &fx,
+            "sdistclaim",
+            "1.0.0",
+            "sdistclaim-1.0.0.tar.gz",
+            &build_test_sdist("othersdist", "1.0.0"),
+        )
+        .await;
+        if st != StatusCode::BAD_REQUEST || !body.to_lowercase().contains("mismatch") {
+            failures.push(format!(
+                "sdist whose metadata names a different project must be 400 with 'mismatch'; \
+                 got {st}; body: {body}"
+            ));
+        }
+
+        fx.teardown().await;
+
+        assert!(
+            failures.is_empty(),
+            "PyPI upload metadata-consistency (#3107) failed:\n{}",
             failures.join("\n")
         );
     }

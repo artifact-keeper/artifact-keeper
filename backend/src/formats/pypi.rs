@@ -8,12 +8,18 @@ use bytes::Bytes;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek};
 use tar::Archive;
 
 use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
 use crate::models::repository::RepositoryFormat;
+
+/// Upper bound on the bytes read from a wheel `METADATA` / sdist `PKG-INFO`
+/// entry (#3107). Those files are a few KiB in practice; capping the read keeps
+/// a hostile archive whose metadata entry is a decompression bomb from turning
+/// the upload-time consistency check into an unbounded read.
+const MAX_PKG_INFO_BYTES: u64 = 4 * 1024 * 1024;
 
 /// PyPI format handler
 pub struct PypiHandler;
@@ -300,24 +306,36 @@ impl PypiHandler {
 
     /// Extract metadata from PKG-INFO or METADATA file in sdist
     pub fn extract_sdist_metadata(content: &[u8]) -> Result<PkgInfo> {
-        let gz = GzDecoder::new(content);
+        Self::extract_sdist_metadata_reader(content)
+    }
+
+    /// Streaming variant of [`Self::extract_sdist_metadata`] that reads the
+    /// gzip'd tar straight from any [`Read`] (e.g. the staged upload scratch
+    /// file) instead of a fully-buffered slice, so a multi-gigabyte body is
+    /// never held in memory (#3107). The `PKG-INFO` read is capped at
+    /// [`MAX_PKG_INFO_BYTES`].
+    pub fn extract_sdist_metadata_reader<R: Read>(reader: R) -> Result<PkgInfo> {
+        let gz = GzDecoder::new(reader);
         let mut archive = Archive::new(gz);
 
         for entry in archive
             .entries()
             .map_err(|e| AppError::Validation(format!("Invalid tarball: {}", e)))?
         {
-            let mut entry =
+            let entry =
                 entry.map_err(|e| AppError::Validation(format!("Invalid tarball entry: {}", e)))?;
 
-            let path = entry
-                .path()
-                .map_err(|e| AppError::Validation(format!("Invalid path in tarball: {}", e)))?;
-
             // Look for PKG-INFO in the root of the package
-            if path.ends_with("PKG-INFO") {
+            let is_pkg_info = {
+                let path = entry
+                    .path()
+                    .map_err(|e| AppError::Validation(format!("Invalid path in tarball: {}", e)))?;
+                path.ends_with("PKG-INFO")
+            };
+            if is_pkg_info {
                 let mut content = String::new();
                 entry
+                    .take(MAX_PKG_INFO_BYTES)
                     .read_to_string(&mut content)
                     .map_err(|e| AppError::Validation(format!("Failed to read PKG-INFO: {}", e)))?;
 
@@ -332,13 +350,20 @@ impl PypiHandler {
 
     /// Extract METADATA from wheel file
     pub fn extract_wheel_metadata(content: &[u8]) -> Result<PkgInfo> {
-        // Wheels are ZIP files
-        let cursor = std::io::Cursor::new(content);
-        let mut archive = zip::ZipArchive::new(cursor)
+        Self::extract_wheel_metadata_reader(std::io::Cursor::new(content))
+    }
+
+    /// Streaming variant of [`Self::extract_wheel_metadata`]. A wheel is a ZIP,
+    /// so the reader must be [`Seek`]: the ZIP central directory lives at the
+    /// end of the file and only the single `METADATA` entry is inflated, so
+    /// this reads a bounded amount regardless of the (up to 10 GiB) body size
+    /// (#3107). The `METADATA` read is capped at [`MAX_PKG_INFO_BYTES`].
+    pub fn extract_wheel_metadata_reader<R: Read + Seek>(reader: R) -> Result<PkgInfo> {
+        let mut archive = zip::ZipArchive::new(reader)
             .map_err(|e| AppError::Validation(format!("Invalid wheel file: {}", e)))?;
 
         for i in 0..archive.len() {
-            let mut file = archive
+            let file = archive
                 .by_index(i)
                 .map_err(|e| AppError::Validation(format!("Failed to read wheel entry: {}", e)))?;
 
@@ -347,7 +372,8 @@ impl PypiHandler {
             // Look for METADATA file in .dist-info directory
             if name.contains(".dist-info/") && name.ends_with("METADATA") {
                 let mut content = String::new();
-                file.read_to_string(&mut content)
+                file.take(MAX_PKG_INFO_BYTES)
+                    .read_to_string(&mut content)
                     .map_err(|e| AppError::Validation(format!("Failed to read METADATA: {}", e)))?;
 
                 return Self::parse_pkg_info(&content);
@@ -357,6 +383,108 @@ impl PypiHandler {
         Err(AppError::Validation(
             "METADATA not found in wheel file".to_string(),
         ))
+    }
+
+    /// Enforce that a distribution's embedded `METADATA`/`PKG-INFO` agrees with
+    /// the name (and, for wheels, version) it is being published under.
+    ///
+    /// Shared by [`FormatHandler::validate`] (buffered) and
+    /// [`Self::validate_upload_file`] (streaming) so the two entry points can
+    /// never disagree about what a match is — the recurring failure mode when
+    /// PyPI name/version logic is duplicated (#3077 / #3179 / #3183 / #3186).
+    ///
+    /// * Names are compared in PEP 503 normalized form (`expected_name` is
+    ///   already normalized; the metadata name is normalized here).
+    /// * Versions match on either byte equality or PEP 440 equivalence
+    ///   ([`Self::canonical_version`]), so `1.0` and `1.0.0`, or a metadata
+    ///   `1.0+abc` and its filename-escaped form, are not spuriously rejected.
+    fn enforce_declared_identity(
+        expected_name: Option<&str>,
+        expected_version: Option<&str>,
+        pkg_info: &PkgInfo,
+    ) -> Result<()> {
+        if let Some(expected_name) = expected_name {
+            let metadata_name = Self::normalize_name(&pkg_info.name);
+            if metadata_name != expected_name {
+                return Err(AppError::Validation(format!(
+                    "Package name mismatch: declared '{}' but distribution metadata says '{}'",
+                    expected_name, pkg_info.name
+                )));
+            }
+        }
+
+        if let Some(expected_version) = expected_version {
+            if !Self::versions_match(&pkg_info.version, expected_version) {
+                return Err(AppError::Validation(format!(
+                    "Version mismatch: declared '{}' but distribution metadata says '{}'",
+                    expected_version, pkg_info.version
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Two PyPI versions are the same iff they are byte-equal or PEP 440 equal.
+    fn versions_match(a: &str, b: &str) -> bool {
+        a == b
+            || matches!(
+                (Self::canonical_version(a), Self::canonical_version(b)),
+                (Some(x), Some(y)) if x == y
+            )
+    }
+
+    /// Validate an uploaded PyPI distribution against the name/version it is
+    /// being published under, reading the archive metadata directly from the
+    /// staged scratch file (#3107).
+    ///
+    /// This is the check `FormatHandler::validate` was written for but which had
+    /// no call site. It is expressed over a streaming [`Read`]/[`Seek`] rather
+    /// than `&Bytes` because a twine upload body can be up to
+    /// `max_upload_size_bytes` (10 GiB by default) and is spooled to disk, never
+    /// buffered — so the trait's `&Bytes` signature cannot be the literal call
+    /// site. Both paths funnel through [`Self::enforce_declared_identity`].
+    ///
+    /// A body that does not parse as the declared archive type carries no
+    /// metadata to contradict its declared identity, so it is passed through
+    /// here: malformed content is the scan/quarantine pipeline's concern, and
+    /// rejecting it is a separate policy from this name/version-consistency
+    /// gate. Only a distribution that *does* carry metadata and disagrees with
+    /// its declared name/version is rejected.
+    ///
+    /// Specs: wheel filename + `.dist-info/METADATA` (PEP 427), sdist filename +
+    /// `PKG-INFO` (PEP 625 / PEP 643), name normalization (PEP 503), version
+    /// equivalence (PEP 440).
+    pub fn validate_upload_file<R: Read + Seek>(
+        expected_name: &str,
+        expected_version: &str,
+        filename: &str,
+        reader: R,
+    ) -> Result<()> {
+        if filename.ends_with(".whl") {
+            match Self::extract_wheel_metadata_reader(reader) {
+                Ok(pkg_info) => Self::enforce_declared_identity(
+                    Some(expected_name),
+                    Some(expected_version),
+                    &pkg_info,
+                ),
+                // Unparseable / metadata-less wheel: nothing to contradict.
+                Err(_) => Ok(()),
+            }
+        } else if filename.ends_with(".tar.gz") {
+            match Self::extract_sdist_metadata_reader(reader) {
+                // Sdist filenames do not carry a build/python tag, but the
+                // PKG-INFO version is authoritative; the name is the field a
+                // confusion upload gets wrong, so — matching the historical
+                // `validate()` behaviour — the sdist path checks the name.
+                Ok(pkg_info) => {
+                    Self::enforce_declared_identity(Some(expected_name), None, &pkg_info)
+                }
+                Err(_) => Ok(()),
+            }
+        } else {
+            Ok(())
+        }
     }
 
     /// Parse PKG-INFO or METADATA content (RFC 822 format)
@@ -811,46 +939,17 @@ impl FormatHandler for PypiHandler {
 
         // Validate package files
         if let Some(filename) = info.filename.as_ref().filter(|_| !content.is_empty()) {
-            // Validate wheel files
+            // Wheels carry a name and a version to check; sdists carry a name.
             if filename.ends_with(".whl") {
                 let pkg_info = Self::extract_wheel_metadata(content)?;
-
-                // Verify name matches
-                if let Some(path_name) = &info.name {
-                    let normalized_pkg_name = Self::normalize_name(&pkg_info.name);
-                    if &normalized_pkg_name != path_name {
-                        return Err(AppError::Validation(format!(
-                            "Package name mismatch: path says '{}' but metadata says '{}'",
-                            path_name, pkg_info.name
-                        )));
-                    }
-                }
-
-                // Verify version matches
-                if let Some(path_version) = &info.version {
-                    if &pkg_info.version != path_version {
-                        return Err(AppError::Validation(format!(
-                            "Version mismatch: path says '{}' but metadata says '{}'",
-                            path_version, pkg_info.version
-                        )));
-                    }
-                }
-            }
-
-            // Validate sdist files
-            if filename.ends_with(".tar.gz") {
+                Self::enforce_declared_identity(
+                    info.name.as_deref(),
+                    info.version.as_deref(),
+                    &pkg_info,
+                )?;
+            } else if filename.ends_with(".tar.gz") {
                 let pkg_info = Self::extract_sdist_metadata(content)?;
-
-                // Verify name matches
-                if let Some(path_name) = &info.name {
-                    let normalized_pkg_name = Self::normalize_name(&pkg_info.name);
-                    if &normalized_pkg_name != path_name {
-                        return Err(AppError::Validation(format!(
-                            "Package name mismatch: path says '{}' but metadata says '{}'",
-                            path_name, pkg_info.name
-                        )));
-                    }
-                }
+                Self::enforce_declared_identity(info.name.as_deref(), None, &pkg_info)?;
             }
         }
 
