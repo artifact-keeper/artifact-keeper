@@ -583,7 +583,11 @@ pub struct ScanConfigResponse {
     pub scan_enabled: bool,
     pub scan_on_upload: bool,
     pub scan_on_proxy: bool,
+    /// Persisted and returned, but not currently consulted by any enforcement
+    /// gate — blocking is configured via scan policies instead (#3144/#3246).
     pub block_on_policy_violation: bool,
+    /// Persisted and returned, but not currently consulted by any enforcement
+    /// gate (#3243).
     pub severity_threshold: String,
     /// #2954: fail-open (default) / fail-closed action for the inline proxy
     /// scan-on-fetch.

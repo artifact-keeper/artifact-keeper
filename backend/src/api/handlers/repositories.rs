@@ -6515,6 +6515,17 @@ async fn list_artifacts_grouped_by_docker_tag(
 ///    plus a failed incus scan now surfaces as `partial`, not
 ///    `completed`.
 ///
+/// `not_applicable` rows are neutral (#3144): a scanner that declined an
+/// artifact it does not cover (the #2324 degrade path — e.g. OpenSCAP on
+/// anything that is not a container/rpm/deb) neither completes nor fails
+/// the rollup, mirroring how `PolicyService::evaluate_artifact` (#3142)
+/// and the #2471 scan-list collapse treat the status. Pre-#3144 the
+/// status fell into the unknown bucket, so the default shape for most
+/// formats — completed grype + `not_applicable` OpenSCAP — rendered as
+/// `partial`. A set that is *entirely* `not_applicable` collapses to
+/// `not_applicable` (no configured scanner covered the artifact; calling
+/// that `completed` would overstate coverage).
+///
 /// Unknown status strings are pessimistically treated as a failure for
 /// the all-completed check (they will not collapse to `completed`).
 pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
@@ -6526,6 +6537,7 @@ pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
     let mut has_pending = false;
     let mut has_completed = false;
     let mut has_failed = false;
+    let mut has_not_applicable = false;
     let mut has_unknown = false;
 
     for s in statuses {
@@ -6534,6 +6546,7 @@ pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
             "pending" => has_pending = true,
             "completed" => has_completed = true,
             "failed" => has_failed = true,
+            "not_applicable" => has_not_applicable = true,
             _ => has_unknown = true,
         }
     }
@@ -6549,6 +6562,9 @@ pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
     }
     if has_failed && !has_completed && !has_unknown {
         return Some("failed".to_string());
+    }
+    if has_not_applicable && !has_completed && !has_failed && !has_unknown {
+        return Some("not_applicable".to_string());
     }
     Some("partial".to_string())
 }
@@ -12473,6 +12489,65 @@ mod tests {
         // future scanner that writes a status value the rollup does not
         // yet know about.
         let statuses = vec![s("completed"), s("weird-state")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_completed_plus_not_applicable_is_completed() {
+        // #3144: the default shape for most formats — grype completed plus an
+        // OpenSCAP `not_applicable` row (the #2324 degrade path) — must roll
+        // up as `completed`, not `partial`. Pre-fix `not_applicable` fell into
+        // the unknown bucket and blocked the all-completed collapse.
+        let statuses = vec![s("completed"), s("not_applicable")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_failed_plus_not_applicable_is_failed() {
+        // #3144: a declined scanner must not soften a hard failure to
+        // `partial` — every scanner that actually ran errored out.
+        let statuses = vec![s("failed"), s("not_applicable")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_only_not_applicable_stays_not_applicable() {
+        // #3144: when every configured scanner declined, nothing was
+        // scanned. Surfacing `completed` would overstate coverage; the
+        // truthful label is `not_applicable`.
+        let statuses = vec![s("not_applicable"), s("not_applicable")];
+        assert_eq!(
+            rollup_scan_status(&statuses).as_deref(),
+            Some("not_applicable")
+        );
+    }
+
+    #[test]
+    fn test_rollup_scan_status_not_applicable_does_not_mask_mixed_terminal() {
+        // Positive control for #3144: a genuinely mixed terminal set (one
+        // green, one red) still rolls up as `partial` when a neutral
+        // `not_applicable` row is also present — the neutral arm must not
+        // accidentally collapse real disagreement.
+        let statuses = vec![s("completed"), s("failed"), s("not_applicable")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_not_applicable_loses_to_in_flight() {
+        // #3144: precedence unchanged — in-flight still beats everything,
+        // including the new neutral arm.
+        let statuses = vec![s("not_applicable"), s("running")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("running"));
+
+        let statuses = vec![s("not_applicable"), s("pending")];
+        assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn test_rollup_scan_status_not_applicable_plus_unknown_is_partial() {
+        // #3144: the neutral arm must not extend to unrecognized statuses —
+        // an unknown string alongside `not_applicable` stays pessimistic.
+        let statuses = vec![s("not_applicable"), s("weird-state")];
         assert_eq!(rollup_scan_status(&statuses).as_deref(), Some("partial"));
     }
 

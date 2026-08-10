@@ -45,8 +45,11 @@ pub struct UpsertScanConfigRequest {
     pub scan_on_upload: Option<bool>,
     #[serde(default)]
     pub scan_on_proxy: Option<bool>,
+    /// Accepted and persisted, but consulted by no gate — enforcement is the
+    /// `scan_policies` table's job (#3144; disposition tracked in #3246).
     #[serde(default)]
     pub block_on_policy_violation: Option<bool>,
+    /// Accepted and persisted, but consulted by no production gate (#3243).
     #[serde(default)]
     pub severity_threshold: Option<String>,
     /// #2954: `'fail_open'` (default) | `'fail_closed'` for the inline proxy

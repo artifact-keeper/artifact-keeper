@@ -151,7 +151,13 @@ pub struct ScanConfig {
     pub scan_enabled: bool,
     pub scan_on_upload: bool,
     pub scan_on_proxy: bool,
+    /// Persisted and round-tripped through the API, but consulted by NO gate:
+    /// enforcement is driven by the separate `scan_policies` table
+    /// (`PolicyService::evaluate_artifact`). Wiring this up either direction is
+    /// a policy change (see #3144); disposition tracked in #3246.
     pub block_on_policy_violation: bool,
+    /// Persisted but consulted by no production gate (the inline proxy scan
+    /// gate deliberately blocks on ANY finding) — see #3243 before wiring up.
     pub severity_threshold: String,
     /// #2954: fail-open (default) vs fail-closed action for the inline proxy
     /// scan-on-fetch. `'fail_open'` | `'fail_closed'`.
