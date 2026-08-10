@@ -47,7 +47,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer};
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -362,28 +362,60 @@ impl Drop for MultipartAbortGuard {
     }
 }
 
-/// Cross-check a streamed large-object copy against the source content.
+/// Inclusive byte ranges for a server-side multipart copy (#3164).
 ///
-/// The `>5 GiB` copy path streams the source through [`S3Backend::put_stream`],
-/// which returns the SHA-256 of the bytes it wrote. `put_stream`'s result is
-/// otherwise discarded, so a truncated or corrupted transfer would go unnoticed.
-/// This compares that digest against the SHA-256 computed independently over the
-/// source stream and rejects any mismatch. Pure so the mismatch branch is
-/// unit-testable without S3.
-fn ensure_copy_digest_matches(
-    source: &str,
-    dest: &str,
-    source_sha256: &str,
-    result: &PutStreamResult,
-) -> Result<()> {
-    if result.checksum_sha256 != source_sha256 {
-        return Err(AppError::Storage(format!(
-            "S3 streamed copy of '{}' -> '{}' failed integrity check: source SHA-256 {} \
-             but copied object hashed to {}",
-            source, dest, source_sha256, result.checksum_sha256
-        )));
+/// Each range becomes one `UploadPartCopy`'s `x-amz-copy-source-range` header,
+/// which the S3 API Reference (UploadPartCopy, `x-amz-copy-source-range`)
+/// defines as "the form bytes=first-last, where the first and last are the
+/// zero-based byte offsets to copy". Every part is
+/// [`S3_MULTIPART_MAX_PART_SIZE`] (5 GiB, S3's per-part ceiling) except a
+/// shorter final part; maximal parts keep the count minimal — S3's 5 TiB
+/// object ceiling needs 1,024 parts, far under [`S3_MULTIPART_MAX_PARTS`].
+/// Every non-final part is 5 GiB, so the 5 MiB minimum-part-size rule is
+/// trivially satisfied for the `> 5 GiB` objects this path handles.
+fn copy_part_ranges(size: u64) -> Vec<(u64, u64)> {
+    let mut ranges = Vec::new();
+    let mut start = 0u64;
+    while start < size {
+        let end = (start + S3_MULTIPART_MAX_PART_SIZE).min(size) - 1;
+        ranges.push((start, end));
+        start = end + 1;
     }
-    Ok(())
+    ranges
+}
+
+/// Build the `x-amz-copy-source` header value: "the name of the source bucket
+/// and key of the source object, separated by a slash (/). ... The value must
+/// be URL-encoded" (S3 API Reference, UploadPartCopy). Each key segment is
+/// percent-encoded; the `/` separators are structural and stay literal.
+fn s3_copy_source_value(bucket: &str, full_key: &str) -> String {
+    let encoded: Vec<String> = full_key
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect();
+    format!("{}/{}", bucket, encoded.join("/"))
+}
+
+/// Extract the part ETag from an `UploadPartCopy` response body.
+///
+/// A successful response is `<CopyPartResult><ETag>...</ETag></CopyPartResult>`
+/// (S3 API Reference, UploadPartCopy response syntax). S3 copy operations can
+/// return `200 OK` with an embedded `<Error>` document instead, so a 200
+/// status alone is not success — only a parseable ETag is. The ETag's XML
+/// entity escapes are undone (S3 wraps ETags in `&quot;`).
+fn parse_copy_part_etag(body: &str) -> Option<String> {
+    if body.contains("<Error") {
+        return None;
+    }
+    let start = body.find("<ETag>")? + "<ETag>".len();
+    let end = body[start..].find("</ETag>")? + start;
+    let etag = body[start..end]
+        .trim()
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    (!etag.is_empty()).then_some(etag)
 }
 
 /// S3 storage backend configuration
@@ -790,6 +822,18 @@ pub struct S3Backend {
     /// payloads instead of the control-plane cliff. Used only by `get`/`put`,
     /// `get_stream`/`put_stream`, and `copy`.
     bulk_store: AmazonS3,
+    /// Bucket name, kept for the `x-amz-copy-source` header of hand-rolled
+    /// `UploadPartCopy` requests (#3164).
+    bucket: String,
+    /// Region used to SigV4-sign hand-rolled requests.
+    region: String,
+    /// Bulk-transfer request timeout, applied per-request to hand-rolled
+    /// part-copy calls (mirrors `bulk_store`'s ceiling). `None` = disabled.
+    bulk_timeout: Option<Duration>,
+    /// Plain HTTP client for hand-rolled S3 API calls that `object_store`
+    /// does not expose (ranged `UploadPartCopy`, #3164). Built with the same
+    /// custom-CA / insecure-TLS options as the object_store clients.
+    raw_http: reqwest::Client,
     prefix: Option<String>,
     redirect_downloads: bool,
     cloudfront: Option<CloudFrontConfig>,
@@ -829,6 +873,32 @@ impl S3Backend {
         let timeout =
             (config.bulk_timeout_secs > 0).then(|| Duration::from_secs(config.bulk_timeout_secs));
         Self::build_store_with_timeout(config, access_key, secret_key, timeout)
+    }
+
+    /// HTTP client for hand-rolled S3 API calls that `object_store` does not
+    /// expose (ranged `UploadPartCopy`, #3164). Honors the same custom-CA and
+    /// insecure-TLS options as the object_store clients; each request is
+    /// SigV4-signed per-call with [`AwsAuthorizer`], reusing the store's
+    /// credential chain.
+    fn build_raw_http_client(config: &S3Config) -> Result<reqwest::Client> {
+        let mut builder = reqwest::Client::builder();
+        if let Some(ca_path) = &config.ca_cert_path {
+            let pem = std::fs::read(ca_path).map_err(|e| {
+                AppError::Config(format!("Failed to read CA cert '{}': {}", ca_path, e))
+            })?;
+            let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+                AppError::Config(format!("Invalid CA cert PEM '{}': {}", ca_path, e))
+            })?;
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        if config.insecure_tls {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        builder
+            .build()
+            .map_err(|e| AppError::Config(format!("Failed to build raw S3 HTTP client: {}", e)))
     }
 
     fn build_store_with_timeout(
@@ -1067,9 +1137,16 @@ impl S3Backend {
             );
         }
 
+        let raw_http = Self::build_raw_http_client(&config)?;
+
         Ok(Self {
             store,
             bulk_store,
+            bucket: config.bucket.clone(),
+            region: config.region.clone(),
+            bulk_timeout: (config.bulk_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.bulk_timeout_secs)),
+            raw_http,
             prefix: config.prefix,
             redirect_downloads: config.redirect_downloads,
             cloudfront: config.cloudfront,
@@ -1757,39 +1834,9 @@ impl S3Backend {
                 source = %source,
                 dest = %dest,
                 size,
-                "S3 source is too large for CopyObject; streaming through multipart upload"
+                "S3 source is too large for CopyObject; copying server-side via UploadPartCopy"
             );
-            let stream = <Self as super::StorageBackend>::get_stream(self, source).await?;
-
-            // Hash the source bytes as they stream past so the copied object's
-            // digest (returned by `put_stream`) can be cross-checked end-to-end
-            // instead of silently discarded. The hasher is shared with the
-            // stream adapter and read back after the transfer completes.
-            let source_hasher = std::sync::Arc::new(std::sync::Mutex::new(Sha256::new()));
-            let tap = source_hasher.clone();
-            let hashing_stream = stream
-                .map(move |chunk| {
-                    if let Ok(ref bytes) = chunk {
-                        tap.lock()
-                            .expect("source hash mutex poisoned")
-                            .update(bytes);
-                    }
-                    chunk
-                })
-                .boxed();
-
-            let result =
-                <Self as super::StorageBackend>::put_stream(self, dest, hashing_stream).await?;
-            let source_sha256 = format!(
-                "{:x}",
-                source_hasher
-                    .lock()
-                    .expect("source hash mutex poisoned")
-                    .clone()
-                    .finalize()
-            );
-            ensure_copy_digest_matches(source, dest, &source_sha256, &result)?;
-            return Ok(());
+            return self.multipart_server_side_copy(source, dest, size).await;
         }
 
         let source_key = self.full_key(source);
@@ -1804,6 +1851,211 @@ impl S3Backend {
 
         tracing::debug!(source = %source, dest = %dest, "S3 copy object successful");
         Ok(())
+    }
+
+    /// Copy an object larger than [`S3_MAX_SINGLE_COPY_SIZE`] entirely
+    /// server-side via multipart `UploadPartCopy` (#3164).
+    ///
+    /// AWS caps single copies at 5 GiB: "You create a copy of your object up
+    /// to 5 GB in size in a single atomic action using this API. However, to
+    /// copy an object greater than 5 GB, you must use the multipart upload
+    /// Upload Part - Copy (UploadPartCopy) API" (Amazon S3 API Reference,
+    /// CopyObject). The previous fallback restreamed the object through the
+    /// application (`get_stream` -> `put_stream`) and only compared digests
+    /// *after* `put_stream` had already completed the multipart upload — by
+    /// the time a mismatch could be detected, the corrupt bytes were live at
+    /// `dest`, and #3153 deliberately rules out a reactive delete (it could
+    /// clobber a concurrent writer's just-published good object).
+    ///
+    /// Copying server-side removes both problems at once: no payload byte
+    /// passes through the application, and `dest` is not touched until
+    /// `CompleteMultipartUpload` — every part must have been copied
+    /// successfully (S3 validates the supplied part ETags at completion)
+    /// before the destination becomes visible, matching the atomicity the
+    /// native `CopyObject` already gives objects below the threshold. Any
+    /// earlier failure aborts the upload and leaves an existing `dest`
+    /// object untouched.
+    async fn multipart_server_side_copy(&self, source: &str, dest: &str, size: u64) -> Result<()> {
+        let ranges = copy_part_ranges(size);
+        if ranges.len() > S3_MULTIPART_MAX_PARTS {
+            // Unreachable for real S3 (5 TiB object ceiling / 5 GiB parts =
+            // 1,024), but fail fast rather than opaquely at part 10,001 if an
+            // S3-compatible provider reports a larger object.
+            return Err(AppError::Storage(format!(
+                "Multipart copy of '{}' would need {} parts, exceeding S3's {}-part limit",
+                source,
+                ranges.len(),
+                S3_MULTIPART_MAX_PARTS,
+            )));
+        }
+        let copy_source = s3_copy_source_value(&self.bucket, &self.full_key(source));
+        let dest_path: ObjectPath = self.full_key(dest).into();
+
+        let upload_id = self.store.create_multipart(&dest_path).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to start multipart copy of '{}' -> '{}': {}",
+                source, dest, e
+            ))
+        })?;
+        // Aborts the upload if this future is dropped mid-copy, mirroring
+        // `put_stream`; defused on completion or by the inline aborts below.
+        let mut abort_guard =
+            MultipartAbortGuard::new(self.store.clone(), dest_path.clone(), dest.to_string());
+        abort_guard.arm(upload_id.clone());
+
+        let mut parts = Vec::with_capacity(ranges.len());
+        for (part_idx, range) in ranges.iter().enumerate() {
+            match self
+                .upload_part_copy(&copy_source, &dest_path, &upload_id, part_idx, *range)
+                .await
+            {
+                Ok(part) => parts.push(part),
+                Err(e) => {
+                    abort_guard.abort_now().await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // CompleteMultipartUpload is the publish point: `dest` only becomes
+        // visible here, after every server-side part copy succeeded. It rides
+        // the bulk client because S3 assembles the object server-side and can
+        // hold the connection well past the control-plane cliff (#3180).
+        if let Err(e) = self
+            .bulk_store
+            .complete_multipart(&dest_path, &upload_id, parts)
+            .await
+        {
+            abort_guard.abort_now().await;
+            return Err(AppError::Storage(format!(
+                "Failed to complete multipart copy of '{}' -> '{}': {}",
+                source, dest, e
+            )));
+        }
+        abort_guard.disarm();
+
+        tracing::debug!(
+            source = %source,
+            dest = %dest,
+            size,
+            parts = ranges.len(),
+            "S3 server-side multipart copy successful"
+        );
+        Ok(())
+    }
+
+    /// Issue one server-side `UploadPartCopy` request.
+    ///
+    /// `object_store` 0.13 does not expose ranged `UploadPartCopy`, so this is
+    /// a hand-rolled request against the S3 REST API
+    /// (`PUT /{key}?partNumber=N&uploadId=ID` with `x-amz-copy-source` and
+    /// `x-amz-copy-source-range`), signed with the crate's own SigV4 signer
+    /// ([`AwsAuthorizer`]) and the store's credential chain, so IRSA /
+    /// container credentials keep working. The URL shape (path-style vs
+    /// virtual-hosted, custom endpoints) is derived from the configured store
+    /// via [`object_store::signer::Signer::signed_url`] rather than rebuilt
+    /// here. "All headers with the `x-amz-` prefix, including
+    /// `x-amz-copy-source`, must be signed" (S3 API Reference,
+    /// UploadPartCopy), which header-based SigV4 does and a presigned URL
+    /// cannot.
+    async fn upload_part_copy(
+        &self,
+        copy_source: &str,
+        dest_path: &ObjectPath,
+        upload_id: &str,
+        part_idx: usize,
+        range: (u64, u64),
+    ) -> Result<PartId> {
+        use object_store::signer::Signer;
+
+        let display = dest_path.as_ref();
+        // "Part number of part being copied. This is a positive integer
+        // between 1 and 10,000" (S3 API Reference, UploadPartCopy).
+        let part_number = part_idx + 1;
+
+        let mut url = self
+            .store
+            .signed_url(http::Method::PUT, dest_path, Duration::from_secs(300))
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to build UploadPartCopy URL for '{}': {}",
+                    display, e
+                ))
+            })?;
+        url.set_query(None);
+        url.query_pairs_mut()
+            .append_pair("partNumber", &part_number.to_string())
+            .append_pair("uploadId", upload_id);
+
+        let credential = self
+            .bulk_store
+            .credentials()
+            .get_credential()
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to resolve S3 credentials for UploadPartCopy of '{}': {}",
+                    display, e
+                ))
+            })?;
+
+        // "The range value must use the form bytes=first-last, where the
+        // first and last are the zero-based byte offsets to copy" (S3 API
+        // Reference, UploadPartCopy, x-amz-copy-source-range). Inclusive.
+        let range_value = format!("bytes={}-{}", range.0, range.1);
+        let mut request = http::Request::builder()
+            .method(http::Method::PUT)
+            .uri(url.as_str())
+            .header("x-amz-copy-source", copy_source)
+            .header("x-amz-copy-source-range", &range_value)
+            .body(object_store::client::HttpRequestBody::empty())
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to build UploadPartCopy request for '{}': {}",
+                    display, e
+                ))
+            })?;
+        AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
+
+        let mut send = self
+            .raw_http
+            .put(url.as_str())
+            .headers(request.headers().clone());
+        if let Some(timeout) = self.bulk_timeout {
+            // A 5 GiB server-side copy is bulk work: give it the bulk
+            // ceiling, not reqwest's unbounded default.
+            send = send.timeout(timeout);
+        }
+        let response = send.send().await.map_err(|e| {
+            AppError::Storage(format!(
+                "UploadPartCopy part {} for '{}' failed to send: {}",
+                part_number, display, e
+            ))
+        })?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AppError::Storage(format!(
+                "UploadPartCopy part {} for '{}' failed: {} {}: {}",
+                part_number,
+                display,
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                body
+            )));
+        }
+        let etag = parse_copy_part_etag(&body).ok_or_else(|| {
+            AppError::Storage(format!(
+                "UploadPartCopy part {} for '{}' returned {} without a CopyPartResult ETag: {}",
+                part_number,
+                display,
+                status.as_u16(),
+                body
+            ))
+        })?;
+        Ok(PartId { content_id: etag })
     }
 
     /// Get content size without fetching full content
@@ -3447,6 +3699,10 @@ mod tests {
         S3Backend {
             store,
             bulk_store,
+            bucket: config.bucket.clone(),
+            region: config.region.clone(),
+            bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
+            raw_http: reqwest::Client::new(),
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
@@ -3719,6 +3975,11 @@ mod tests {
                 store: S3Backend::build_store(&config, Some("AKIA"), Some("secret")).unwrap(),
                 bulk_store: S3Backend::build_bulk_store(&config, Some("AKIA"), Some("secret"))
                     .unwrap(),
+                bucket: config.bucket.clone(),
+                region: config.region.clone(),
+                bulk_timeout: (config.bulk_timeout_secs > 0)
+                    .then(|| Duration::from_secs(config.bulk_timeout_secs)),
+                raw_http: reqwest::Client::new(),
                 prefix: None,
                 redirect_downloads: false,
                 cloudfront: None,
@@ -3792,6 +4053,11 @@ mod tests {
         let backend = S3Backend {
             store: S3Backend::build_store(&config, Some("AKIA"), Some("secret")).unwrap(),
             bulk_store: S3Backend::build_bulk_store(&config, Some("AKIA"), Some("secret")).unwrap(),
+            bucket: config.bucket.clone(),
+            region: config.region.clone(),
+            bulk_timeout: (config.bulk_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.bulk_timeout_secs)),
+            raw_http: reqwest::Client::new(),
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
@@ -4072,25 +4338,31 @@ mod tests {
         );
     }
 
+    // ---- #3164: >5 GiB copies must be server-side UploadPartCopy, and the
+    // destination must never be published before the copy fully succeeds ----
+
+    /// A copy of an object over `S3_MAX_SINGLE_COPY_SIZE` must be performed
+    /// entirely server-side: CreateMultipartUpload, one ranged
+    /// `UploadPartCopy` per 5 GiB slice, CompleteMultipartUpload — and no
+    /// payload byte through the application. No GET mock is mounted, so a
+    /// regression to the restream shape fails immediately on the source read.
     #[tokio::test]
-    async fn test_copy_streams_large_source_instead_of_single_copy_object() {
+    async fn test_copy_over_5gib_is_server_side_upload_part_copy() {
         use wiremock::matchers::{method, query_param, query_param_is_missing};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 10 GiB + 1 byte -> exactly three parts: two full 5 GiB slices and a
+        // final 1-byte slice. Never materialized; only a Content-Length.
+        let size = 2 * 5_u64 * 1024 * 1024 * 1024 + 1;
 
         let server = MockServer::start().await;
         Mock::given(method("HEAD"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .insert_header(
-                        "Content-Length",
-                        (5_u64 * 1024 * 1024 * 1024 + 1).to_string(),
-                    )
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
                     .insert_header("ETag", "\"large-source\""),
             )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::from(&b"large-copy"[..])))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -4100,70 +4372,264 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        Mock::given(method("PUT"))
+        let part_copy_guard = Mock::given(method("PUT"))
             .and(query_param("uploadId", "copy-upload-id"))
-            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"copy-part\""))
-            .mount(&server)
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&quot;part-copy-etag&quot;</ETag></CopyPartResult>",
+            ))
+            .mount_as_scoped(&server)
             .await;
-        Mock::given(method("POST"))
+        let complete_guard = Mock::given(method("POST"))
             .and(query_param("uploadId", "copy-upload-id"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 "<CompleteMultipartUploadResult><ETag>\"complete-copy\"</ETag></CompleteMultipartUploadResult>",
             ))
-            .mount(&server)
+            .mount_as_scoped(&server)
             .await;
 
         let backend = mock_s3_backend(&server.uri(), false).await;
         S3Backend::copy(&backend, "source-object", "dest-object")
             .await
-            .expect("large copy should stream through multipart upload");
+            .expect("#3164: a >5 GiB copy must succeed via server-side UploadPartCopy");
 
         let requests = server.received_requests().await.unwrap_or_default();
         assert!(
-            requests
-                .iter()
-                .any(|request| request.method.as_str() == "GET"
-                    && request.url.path().ends_with("/source-object")),
-            "large copy should read the source as a stream"
+            !requests.iter().any(|r| r.method.as_str() == "GET"),
+            "#3164: a >5 GiB copy must not read the source back through the \
+             application (no GET restream)"
         );
-        assert!(
-            requests.iter().any(|request| request
-                .url
+
+        // Every part must be a ranged server-side copy: empty body (no bytes
+        // through the app), the copy-source header, and 1-based part numbers
+        // whose ranges exactly partition [0, size-1] in 5 GiB slices.
+        let mut part_requests = part_copy_guard.received_requests().await;
+        part_requests.sort_by_key(|r| {
+            r.url
                 .query_pairs()
-                .any(|(key, value)| key == "uploadId" && value == "copy-upload-id")),
-            "large copy should write the destination via multipart upload"
+                .find_map(|(k, v)| (k == "partNumber").then(|| v.parse::<usize>().unwrap()))
+                .expect("UploadPartCopy must carry partNumber")
+        });
+        let observed: Vec<(usize, String, String, usize)> = part_requests
+            .iter()
+            .map(|r| {
+                let part_number = r
+                    .url
+                    .query_pairs()
+                    .find_map(|(k, v)| (k == "partNumber").then(|| v.parse().unwrap()))
+                    .unwrap();
+                let source = r
+                    .headers
+                    .get("x-amz-copy-source")
+                    .expect("part copy must name its server-side source")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let range = r
+                    .headers
+                    .get("x-amz-copy-source-range")
+                    .expect("part copy must be ranged")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                (part_number, source, range, r.body.len())
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                (
+                    1,
+                    "test-bucket/source-object".to_string(),
+                    "bytes=0-5368709119".to_string(),
+                    0
+                ),
+                (
+                    2,
+                    "test-bucket/source-object".to_string(),
+                    "bytes=5368709120-10737418239".to_string(),
+                    0
+                ),
+                (
+                    3,
+                    "test-bucket/source-object".to_string(),
+                    "bytes=10737418240-10737418240".to_string(),
+                    0
+                ),
+            ],
+            "#3164: the copy must be exactly three ranged, bodyless \
+             UploadPartCopy requests partitioning the object"
+        );
+        assert_eq!(
+            complete_guard.received_requests().await.len(),
+            1,
+            "the multipart copy must be completed exactly once"
+        );
+    }
+
+    /// The integrity half of #3164: with the old restream shape, `dest` was
+    /// already fully published (multipart upload completed) before any
+    /// verification could run. With server-side part copies the publish point
+    /// is CompleteMultipartUpload, so a failed part copy must surface as an
+    /// error, abort the upload, and never complete it — the destination keeps
+    /// whatever it held before.
+    ///
+    /// The fixture deliberately lets the OLD shape succeed end to end (the
+    /// source GET and un-ranged part PUTs are all mocked green), so on the
+    /// unfixed code `copy()` returns Ok and publishes dest — this test can
+    /// only pass when the publish is actually gated on the part copies.
+    #[tokio::test]
+    async fn test_copy_over_5gib_failed_part_copy_never_publishes_dest() {
+        use wiremock::matchers::{header, method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 5 GiB + 1 byte -> two parts; the second (1-byte) part copy fails.
+        let size = 5_u64 * 1024 * 1024 * 1024 + 1;
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("ETag", "\"large-source\""),
+            )
+            .mount(&server)
+            .await;
+        // Keep the pre-fix path viable so the test discriminates: the source
+        // is readable...
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"restream-bytes".to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>copy-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        // The second ranged part copy fails server-side.
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .and(header(
+                "x-amz-copy-source-range",
+                "bytes=5368709120-5368709120",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_string("InternalError"))
+            .mount(&server)
+            .await;
+        // ...and every other part upload succeeds, whether it is the first
+        // ranged copy (fixed shape) or an un-ranged data PUT (old shape reads
+        // the ETag header; new shape parses the CopyPartResult body).
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"part-etag\"")
+                    .set_body_string(
+                        "<CopyPartResult><ETag>&quot;part-etag&quot;</ETag></CopyPartResult>",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let complete_guard = Mock::given(method("POST"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"complete-copy\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .mount_as_scoped(&server)
+            .await;
+        let abort_guard = Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        let result = S3Backend::copy(&backend, "source-object", "dest-object").await;
+
+        assert!(
+            result.is_err(),
+            "#3164: a failed server-side part copy must fail the whole copy \
+             (the old restream shape returned Ok here)"
+        );
+        assert_eq!(
+            complete_guard.received_requests().await.len(),
+            0,
+            "#3164: dest must never be published (CompleteMultipartUpload) \
+             when a part copy failed — bad bytes must not go live"
+        );
+        assert_eq!(
+            abort_guard.received_requests().await.len(),
+            1,
+            "a failed part copy must abort the pending multipart upload"
+        );
+    }
+
+    /// Positive control for #3164: copies at or below the 5 GiB threshold must
+    /// keep using the single atomic `CopyObject` ("You create a copy of your
+    /// object up to 5 GB in size in a single atomic action using this API" —
+    /// S3 API Reference, CopyObject), whose atomicity is itself the integrity
+    /// guarantee: a failure never touches `dest`. A "fix" that pushed the
+    /// common path into multipart machinery or a restream fails these counts.
+    #[tokio::test]
+    async fn test_copy_at_or_under_threshold_stays_single_native_copy_object() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Exactly the 5 GiB boundary: the largest size the atomic path serves.
+        let size = 5_u64 * 1024 * 1024 * 1024;
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("ETag", "\"small-source\""),
+            )
+            .mount(&server)
+            .await;
+        let copy_guard = Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyObjectResult><ETag>\"copy-dst-etag\"</ETag></CopyObjectResult>",
+            ))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        S3Backend::copy(&backend, "source-object", "dest-object")
+            .await
+            .expect("a copy at the 5 GiB boundary must still succeed");
+
+        let puts = copy_guard.received_requests().await;
+        assert_eq!(
+            puts.len(),
+            1,
+            "an at-threshold copy must be exactly one native CopyObject"
+        );
+        let put = &puts[0];
+        assert!(
+            put.headers.contains_key("x-amz-copy-source"),
+            "the single PUT must be a server-side CopyObject"
         );
         assert!(
-            !requests
-                .iter()
-                .any(|request| request.headers.contains_key("x-amz-copy-source")),
-            "large copy must not use single-request S3 CopyObject"
+            !put.headers.contains_key("x-amz-copy-source-range"),
+            "a native CopyObject is not ranged"
         );
-    }
-
-    // ---- ensure_copy_digest_matches (pure large-copy integrity check) ----
-
-    #[test]
-    fn test_ensure_copy_digest_matches_ok_when_equal() {
-        let result = PutStreamResult {
-            checksum_sha256: "deadbeef".to_string(),
-            bytes_written: 42,
-        };
-        ensure_copy_digest_matches("src", "dst", "deadbeef", &result)
-            .expect("matching digests must pass the integrity check");
-    }
-
-    #[test]
-    fn test_ensure_copy_digest_matches_errors_on_mismatch() {
-        let result = PutStreamResult {
-            checksum_sha256: "0000".to_string(),
-            bytes_written: 42,
-        };
-        let err = ensure_copy_digest_matches("src", "dst", "ffff", &result)
-            .expect_err("a digest mismatch must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("integrity check"), "unexpected error: {msg}");
-        assert!(msg.contains("ffff") && msg.contains("0000"), "err: {msg}");
+        assert!(
+            !put.url.query_pairs().any(|(k, _)| k == "uploadId"),
+            "an at-threshold copy must not open a multipart upload"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "GET"),
+            "an at-threshold copy must not restream the source"
+        );
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "POST"),
+            "an at-threshold copy must not touch the multipart API"
+        );
     }
 
     // ---- MultipartAbortGuard (abort-on-drop for cancelled multipart copies) ----
