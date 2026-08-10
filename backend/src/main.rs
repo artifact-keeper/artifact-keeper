@@ -256,26 +256,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let peer_id = init_peer_identity(&db_pool, &config).await?;
     tracing::info!("Peer identity: {} ({})", config.peer_instance_name, peer_id);
 
-    // Warn when permission rules exist but enforcement is not yet active (#794).
-    // This makes the gap visible in server logs so administrators do not
-    // assume their rules are protecting anything.
-    match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permissions")
-        .fetch_one(&db_pool)
-        .await
-    {
-        Ok(count) if count > 0 => {
-            tracing::warn!(
-                permission_rules = count,
-                "Found {} permission rule(s) in the database, but enforcement is NOT active. \
-                 Permission rules created via /api/v1/permissions are stored but not consulted \
-                 during request authorization. This will be addressed in a future release. \
-                 See https://github.com/artifact-keeper/artifact-keeper/issues/794",
-                count,
-            );
-        }
-        Ok(_) => {}  // no rules, nothing to warn about
-        Err(_) => {} // table may not exist on old schema, ignore
-    }
+    // Note: a startup warning claiming "permission rules are stored but not
+    // consulted during request authorization (#794)" used to live here. That
+    // gap was closed — fine-grained `permissions` rules are now enforced on
+    // both the native-protocol path (`repo_visibility_middleware` in
+    // `api/middleware/auth.rs`, via `PermissionService::check_repository_action`
+    // for writes and `has_any_rules_for_target`/`check_permission` for reads)
+    // and the REST path (`require_repo_action` in `api/handlers/repositories.rs`).
+    // `/api/v1/system/config` reports `enforcement_enabled: true` accordingly.
+    // The warning was left behind after #817/#824/#826/#827/#819/#2603 landed and
+    // was misleading operators (#3185), so it has been removed. The regression
+    // test `permission_service::tests::permission_rule_is_consulted_during_authorization`
+    // pins the enforcement so this message and the behaviour cannot drift apart
+    // again.
 
     // Initialize WASM plugin system (T068)
     let plugins_dir =
