@@ -309,11 +309,21 @@ fn invalid_gallery_response() -> Response {
         .into_response()
 }
 
-/// Rewrite all gallery asset references to AK. We do not retain an upstream
-/// absolute URL in the response: Open VSX's gallery adapter has stable sibling
-/// `/vscode/asset/...` endpoints, so delivery can reconstruct the upstream
+/// Rewrite every gallery **asset-delivery** reference to AK — `assetUri`,
+/// `fallbackAssetUri`, and each `files[].source`. Those are the fields VS Code
+/// composes install and update fetches from, and none of them retains an
+/// upstream absolute URL afterwards: Open VSX's gallery adapter has stable
+/// sibling `/vscode/asset/...` endpoints, so delivery reconstructs the upstream
 /// target from repository configuration instead of treating metadata as an
 /// arbitrary fetch capability.
+///
+/// Non-asset URLs the gallery carries elsewhere — `versions[].properties[]`
+/// entries such as `Microsoft.VisualStudio.Services.Links.Source` or
+/// `Microsoft.VisualStudio.Code.SponsorLink`, and `publisher.domain` — are
+/// passed through unchanged. They are display/navigation links the client
+/// opens in a browser, not part of the install path, so they are out of scope
+/// for egress control here. Do not read this function as "no upstream URL
+/// survives anywhere in the document".
 #[allow(clippy::result_large_err)]
 fn rewrite_gallery_asset_urls(
     response: &mut serde_json::Value,
@@ -548,6 +558,13 @@ fn reconcile_gallery_result_count(result: &mut serde_json::Value, removed: usize
 /// identity before asset URLs are rewritten. This is intentionally separate
 /// from `fetch_gallery_query`: delivery must be able to fetch raw gallery
 /// metadata as exact existence evidence without recursively filtering it.
+// `Response` is the error type across this whole module's `Result`s, which is
+// what every other fallible helper here already allows. Newer clippy also
+// applies `result_large_err` to the inner `.map(|version| ...)` closure that
+// collects into `Result<Vec<_>, Response>`, which is why this sits on the
+// function rather than only on the module's `#[allow(clippy::result_large_err)]`
+// helpers — without it `cargo clippy -- -D warnings` fails on stable 1.97.
+#[allow(clippy::result_large_err)]
 async fn filter_gallery_response_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
@@ -706,6 +723,10 @@ async fn enforce_gallery_age_gate(
         .ok_or_else(|| {
         (StatusCode::NOT_FOUND, "Extension version not found").into_response()
     })?;
+    // The parsed gallery document has served its purpose. Release its share of
+    // the shared buffered-metadata budget before the age-gate DB round-trips
+    // below rather than holding 32× the wire cap across them.
+    drop(raw);
     let basis = service
         .download_basis(&params, &package, &coordinate, published_at, true)
         .await
@@ -869,17 +890,18 @@ async fn gallery_vspackage(
     ] {
         validate_gallery_request_segment(segment)?;
     }
+    // Send the SAME normalized platform the cache key is built from. Deriving
+    // the upstream query from the raw `Option` instead made "no targetPlatform"
+    // and "targetPlatform=universal" two different upstream URLs sharing one
+    // cache path — and `classify_vscode_gallery_asset` marks that path shape
+    // Immutable, so whichever arrived first would define the bytes served to
+    // the other forever. `openvsx_asset_url` already always sends the param.
     let upstream_path = format!(
-        "publishers/{}/vsextensions/{}/{}/vspackage{}",
+        "publishers/{}/vsextensions/{}/{}/vspackage?targetPlatform={}",
         urlencoding::encode(&publisher),
         urlencoding::encode(&name),
         urlencoding::encode(&version),
-        query
-            .target_platform
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| format!("?targetPlatform={}", urlencoding::encode(value)))
-            .unwrap_or_default(),
+        urlencoding::encode(target_platform),
     );
     let cache_path = format!(
         "gallery/{}/{}/{}/{}/vspackage",
@@ -968,6 +990,23 @@ async fn proxy_gallery_asset(
     coordinate: &GalleryAssetCoordinate<'_>,
     source: &GalleryAssetSource<'_>,
 ) -> Result<Response, Response> {
+    // Curation is the operator's allowlist / emergency-deny control and it is
+    // enforced by the handler on every other curated proxy download path (npm
+    // `serve_tarball`, pypi `serve_file`, cargo `download`, nuget, oci). The
+    // shared streaming helper below takes no `db` and therefore cannot apply
+    // it, so a gateway that omits this call leaves an enabled curation rule
+    // silently inert — the #3235 class. Run it before the age gate so a denied
+    // publisher costs no upstream metadata round-trip.
+    //
+    // The package identity is the same casefolded `publisher.extension` the
+    // age gate uses, so one rule written by the operator governs both gates.
+    proxy_helpers::enforce_curation(
+        &state.db,
+        repo,
+        &vscode_age_gate_package(coordinate.publisher, coordinate.name),
+        Some(coordinate.version),
+    )
+    .await?;
     // The raw exact-metadata query and shared gate run before ProxyService can
     // inspect its cache, so a direct AK asset URL or a warm cache entry never
     // bypasses a newly enabled policy or manual review decision.
@@ -1047,16 +1086,22 @@ fn openvsx_asset_url(
 async fn gallery_item(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    base_url: RequestBaseUrl,
+    // Extracted but intentionally unused: the redirect below is relative on
+    // purpose (see the comment there). Keep the extractor so the route's
+    // signature stays uniform with its siblings.
+    _base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     gallery_upstream(&state.db, &repo).await?;
-    Ok(Redirect::temporary(&format!(
-        "{}/repositories/{}",
-        base_url.as_str().trim_end_matches('/'),
-        urlencoding::encode(&repo_key)
-    ))
-    .into_response())
+    // Deliberately relative. `RequestBaseUrl` falls back to `X-Forwarded-Host`
+    // / `Host` when `AK_EXTERNAL_URL` is unset, which is fine for a
+    // self-referential URL inside a JSON body but becomes a header-controlled
+    // open redirect the moment it lands in a `Location` a browser follows.
+    // A relative target reaches the same page and cannot leave the origin.
+    Ok(
+        Redirect::temporary(&format!("/repositories/{}", urlencoding::encode(&repo_key)))
+            .into_response(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,6 +1178,25 @@ async fn query_extensions(
 // GET /vscode/{repo_key}/extensions/{publisher}/{name}/{version}/download
 // ---------------------------------------------------------------------------
 
+/// Refuse the legacy `/extensions/.../download` proxy pull-through while the
+/// repository's publish-age gate is enabled.
+///
+/// `AgeGateService::gating_requested` is `repo_type == Remote && age_gate_enabled`;
+/// this mirrors it off [`RepoInfo`], which already carries both columns, so no
+/// extra query is needed. The response is the shared `age_gate_unavailable`
+/// fail-closed shape — "the gate is enabled but could not be evaluated" is
+/// exactly the situation, and clients already understand that status here.
+#[allow(clippy::result_large_err)]
+fn reject_ungateable_legacy_pull_through(repo: &RepoInfo) -> Result<(), Response> {
+    if repo.repo_type == RepositoryType::Remote && repo.age_gate_enabled {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &repo.key,
+            "VS Code legacy extension download (use the /gallery/... routes)",
+        ));
+    }
+    Ok(())
+}
+
 async fn download_vsix(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1165,6 +1229,17 @@ async fn download_vsix(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
+            // This legacy route synthesizes an upstream download path; it has no
+            // gallery document to resolve publish time from and no platform in
+            // its coordinate, so it cannot evaluate the age gate. Before this
+            // change `vscode` was not in the age-gate matrix at all, so that was
+            // harmless — now that a `vscode` repository can have the gate turned
+            // on, an ungated pull-through here would be a one-URL bypass of the
+            // gallery gate on the same repository. Refuse while the gate is on,
+            // using the shared fail-closed response; `/gallery/...` is the gated
+            // route. Locally-hosted artifacts (the `Ok` arm) are unaffected —
+            // the gate governs proxy pull-through only.
+            reject_ungateable_legacy_pull_through(&repo)?;
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
@@ -1934,7 +2009,7 @@ mod tests {
         // State intentionally has no AgeGateService. Delivery checks this
         // before cache/proxy construction.
         let app = fx.router_anon(super::router());
-        let (delivery_status, _) = tdh::send(
+        let (delivery_status, delivery_body) = tdh::send(
             app,
             tdh::get(format!(
                 "/{}/gallery/publishers/publisher/vsextensions/extension/1.0.0/vspackage",
@@ -1943,6 +2018,16 @@ mod tests {
         )
         .await;
         assert_eq!(delivery_status, StatusCode::SERVICE_UNAVAILABLE);
+        // `fx.state` also has no ProxyService, and "Proxy service is
+        // unavailable" is ALSO a 503 — so the status alone cannot distinguish
+        // "failed closed on the age gate" from "fell through the age gate and
+        // then tripped over the missing proxy". Assert the structured body,
+        // which only the fail-closed seam produces.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&delivery_body).unwrap()["error"],
+            "age_gate_unavailable",
+            "delivery must fail closed ON THE AGE GATE, before proxy construction"
+        );
         let repo = resolve_vscode_repo(&fx.pool, &fx.repo_key).await.unwrap();
         let mut metadata = gallery_extension_response(serde_json::json!([{
             "version": "1.0.0",
@@ -2150,12 +2235,21 @@ mod tests {
     #[tokio::test]
     async fn gallery_extensionquery_rejects_malformed_client_json_without_proxying() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use wiremock::MockServer;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
             return;
         };
         let server = MockServer::start().await;
+        // `expect(0)` is what makes the `without_proxying` half of this test's
+        // name an assertion rather than a claim: without it a 400 produced
+        // AFTER an upstream round-trip would still be green.
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
         // Gallery endpoints require a gallery-root upstream even though this
         // malformed body must be rejected before any upstream request.
         let gallery_root = format!("{}/vscode/gallery", server.uri());
@@ -2192,8 +2286,18 @@ mod tests {
                 ),
             ] {
                 let app = fx.router_anon(super::router());
-                let (status, _) = tdh::send(app, request).await;
+                let (status, body) = tdh::send(app, request).await;
                 assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{repo_type}");
+                // `unsupported_gallery_repo` emits 501 for BOTH the non-Remote
+                // and the non-public check, and `create_repo` leaves
+                // `is_public` at its `false` default — so the status alone is
+                // satisfied by either guard. Pin the discriminating clause.
+                assert!(
+                    String::from_utf8_lossy(&body).contains("gallery access requires Remote"),
+                    "{repo_type}: must be rejected by the repo-type guard, not incidentally by \
+                     the public-only guard: {}",
+                    String::from_utf8_lossy(&body)
+                );
             }
             fx.teardown().await;
         }
@@ -2535,6 +2639,17 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(&format!("/vscode/{}/asset/", fx.repo_key)));
+        // The upstream also carries `fallbackAssetUri`. Checking `assetUri`
+        // alone leaves the most-used route green while leaking a CDN URL to the
+        // client, so scan the whole serialized body — the same egress assertion
+        // `test_openvsx_extensionquery_posts_and_rewrites_every_asset_url` makes.
+        for host in [b"upstream.example".as_slice(), b"cdn.example".as_slice()] {
+            assert!(
+                !body.windows(host.len()).any(|window| window == host),
+                "latest-version response must not retain an upstream host: {}",
+                String::from_utf8_lossy(host)
+            );
+        }
 
         let (code_server_status, code_server_body) = tdh::send(
             tdh::router_anon(super::router(), state),
@@ -2614,6 +2729,234 @@ mod tests {
         assert_eq!(&warm_body[..], &linux);
         // Each mock has expect(1): the final Linux request must use the
         // completed cache entry rather than refetching the binary upstream.
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// `/item` is the only format-handler route that emits a `Location` a
+    /// browser follows. Building it from `RequestBaseUrl` — which falls back to
+    /// `X-Forwarded-Host` when `AK_EXTERNAL_URL` is unset — would make it a
+    /// header-controlled open redirect, so the target must stay relative.
+    #[tokio::test]
+    async fn gallery_item_redirect_ignores_a_forged_forwarded_host() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+
+        let mut request = tdh::get(format!("/{}/item", fx.repo_key));
+        request.headers_mut().insert(
+            "x-forwarded-host",
+            "evil.example".parse().expect("valid header"),
+        );
+        request
+            .headers_mut()
+            .insert("x-forwarded-proto", "https".parse().expect("valid header"));
+        let response = {
+            use tower::ServiceExt;
+            tdh::router_anon(super::router(), state)
+                .oneshot(request)
+                .await
+                .expect("router responds")
+        };
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect carries a Location")
+            .to_str()
+            .expect("ASCII Location");
+        assert!(
+            !location.contains("evil.example"),
+            "Location must not echo a client-supplied host: {location}"
+        );
+        // Positive control: the redirect still points at the right page, so the
+        // assertion above cannot be satisfied by an empty or broken Location.
+        assert_eq!(location, format!("/repositories/{}", fx.repo_key));
+        fx.teardown().await;
+    }
+
+    /// Insert a curation `block` rule for `pattern` on the fixture repository
+    /// and switch curation on. Mirrors `proxy_helpers::tests::seed_curated_repo`.
+    async fn enable_curation_block(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        pattern: &str,
+    ) {
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, \
+             curation_default_action = 'allow' WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable curation");
+        sqlx::query(
+            "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+             architecture, action, priority, reason, created_by) \
+             VALUES ($1, $2, '*', '*', 'block', 100, 'gallery curation test', $3)",
+        )
+        .bind(fx.repo_id)
+        .bind(pattern)
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert curation block rule");
+    }
+
+    async fn drop_curation_rules(fx: &crate::api::handlers::test_db_helpers::Fixture) {
+        let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+    }
+
+    /// A curation `block` rule must stop a gallery VSIX/asset serve, and must
+    /// stop it BEFORE any upstream byte fetch. The allowed extension in the
+    /// same fixture is the positive control: without it, a fixture in which
+    /// every request fails for an unrelated reason would satisfy the negative
+    /// assertion on its own.
+    #[tokio::test]
+    async fn gallery_delivery_honors_curation_block_before_upstream_fetch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let allowed_bytes = b"allowed-vsix";
+        // Only the ALLOWED extension has an upstream mock. The blocked one has
+        // none, and any stray request would 404 rather than 200 — but the
+        // `expect(1)` below is the real proof that exactly one fetch happened.
+        Mock::given(method("GET"))
+            // The upstream path keeps the caller's casing; only the curation /
+            // age-gate identity is casefolded.
+            .and(path(
+                "/vscode/gallery/publishers/Other/vsextensions/extension/1.0.0/vspackage",
+            ))
+            // The client sends NO `targetPlatform`, and the cache key it lands
+            // on is the normalized `universal` one — so the upstream request
+            // must carry `targetPlatform=universal` too. Deriving the upstream
+            // query from the raw option instead put two different upstream URLs
+            // behind one permanently-immutable cache key.
+            .and(query_param("targetPlatform", "universal"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(allowed_bytes))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        enable_curation_block(&fx, "blocked.extension").await;
+
+        let vspackage = |publisher: &str| {
+            tdh::get(format!(
+                "/{}/gallery/publishers/{publisher}/vsextensions/extension/1.0.0/vspackage",
+                fx.repo_key
+            ))
+        };
+
+        // Negative: the curated coordinate is refused with the shared 403.
+        let (blocked_status, blocked_body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            vspackage("Blocked"),
+        )
+        .await;
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "a curation block rule must stop the gallery download"
+        );
+        let blocked: serde_json::Value = serde_json::from_slice(&blocked_body).unwrap();
+        assert_eq!(blocked["error"], "curation_blocked");
+        // Casefolded `publisher.extension` — one operator rule governs the
+        // curation gate and the age gate alike.
+        assert_eq!(blocked["package"], "blocked.extension");
+
+        // Positive control, same fixture, same curation-enabled repository: a
+        // non-matching extension still serves its bytes.
+        let (allowed_status, allowed_body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            vspackage("Other"),
+        )
+        .await;
+        assert_eq!(allowed_status, StatusCode::OK);
+        assert_eq!(&allowed_body[..], allowed_bytes);
+
+        // `expect(1)` on the single mounted mock: the blocked request never
+        // reached upstream, and the allowed one did exactly once.
+        drop(server);
+        drop_curation_rules(&fx).await;
+        fx.teardown().await;
+    }
+
+    /// The legacy `/extensions/{publisher}/{name}/{version}/download` route
+    /// cannot evaluate the age gate, so it must not remain a pull-through while
+    /// the gate is enabled — otherwise it is a one-URL bypass of the gallery
+    /// gate on the same repository.
+    #[tokio::test]
+    async fn legacy_remote_download_refuses_while_age_gate_is_enabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        // Plain loopback wiremock, exactly as the sibling
+        // `test_remote_vsix_download_streams_upstream_blob_1608` uses for this
+        // same route.
+        let server = MockServer::start().await;
+        let vsix = b"legacy-upstream-vsix";
+        Mock::given(method("GET"))
+            .and(path("/extensions/publisher/extension/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vsix))
+            // Exactly one serve: the gated request must not reach upstream, the
+            // ungated positive control must.
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let request = || {
+            tdh::get(format!(
+                "/{}/extensions/publisher/extension/1.0.0/download",
+                fx.repo_key
+            ))
+        };
+
+        // Positive control FIRST, with the gate off: the route really does
+        // proxy, so the negative assertion below cannot be satisfied by a
+        // fixture that was broken all along.
+        let (open_status, open_body) =
+            tdh::send(tdh::router_anon(super::router(), state.clone()), request()).await;
+        assert_eq!(open_status, StatusCode::OK);
+        assert_eq!(&open_body[..], vsix);
+
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, \
+             age_gate_mode = 'upstream_publish_time', age_gate_min_age_days = 30 WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable the age gate");
+
+        let (gated_status, gated_body) =
+            tdh::send(tdh::router_anon(super::router(), state), request()).await;
+        assert_eq!(
+            gated_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the ungateable legacy route must fail closed while the gate is on"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&gated_body).unwrap()["error"],
+            "age_gate_unavailable"
+        );
         drop(server);
         fx.teardown().await;
     }

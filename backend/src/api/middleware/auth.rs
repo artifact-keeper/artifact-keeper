@@ -1559,11 +1559,16 @@ fn is_write_method(method: &Method) -> bool {
 ///   state, and a public gallery must permit it anonymously for VSCodium and
 ///   code-server to search extensions.
 ///
-/// These exact paths are classified as reads for visibility purposes. That
-/// deliberately lets an anonymous caller use the gallery query against a
-/// *public* Remote repository, while private repositories still require
-/// authentication. Actual mutation endpoints remain subject to the `#508`
-/// write-auth requirement.
+/// These paths are classified as reads for the *permission* check only. The
+/// `#508` write-auth requirement (writes require authentication; anonymous
+/// callers get 401) still applies to them independently, so this exemption
+/// never loosens the anonymous contract — it only routes the *authenticated*
+/// caller through the read/visibility path instead of the deny-by-default
+/// write choke-point.
+///
+/// The narrower question "may an ANONYMOUS caller issue this POST against a
+/// public repository?" is answered by [`is_anonymous_readable_format_post`],
+/// which is deliberately a strict subset.
 fn is_non_mutating_format_post(path: &str) -> bool {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
@@ -1583,6 +1588,37 @@ fn is_non_mutating_format_post(path: &str) -> bool {
                 && segments.next() == Some("authenticate")
                 && segments.next().is_none()
         }
+        // /vscode/<repo_key>/gallery/extensionquery
+        Some("vscode") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("gallery")
+                && segments.next() == Some("extensionquery")
+                && segments.next().is_none()
+        }
+        _ => false,
+    }
+}
+
+/// The strict subset of [`is_non_mutating_format_post`] that a **public**
+/// repository must also serve to an **anonymous** caller, i.e. the paths that
+/// are exempt from the `#508` anonymous-write 401.
+///
+/// * **VS Code gallery query** — `POST /vscode/<repo_key>/gallery/extensionquery`
+///   is the gallery protocol's *search* verb. VSCodium and code-server issue it
+///   with no credential (the client has no way to configure one for a gallery),
+///   so a public Remote gallery is unusable without this. It neither uploads nor
+///   changes AK state, and the handler is public-Remote-only regardless.
+///
+/// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
+/// here. `batch` is an upload *and* download negotiation whose upload arm mints
+/// object hrefs, and `authenticate` is a credential exchange that requires a
+/// credential to be useful; both keep the `#508` contract of answering 401 to an
+/// anonymous caller. Widening that is a separate decision from shipping a
+/// gallery, and would need its own tests.
+fn is_anonymous_readable_format_post(path: &str) -> bool {
+    let trimmed = path.trim_start_matches('/');
+    let mut segments = trimmed.split('/');
+    match segments.next() {
         // /vscode/<repo_key>/gallery/extensionquery
         Some("vscode") => {
             matches!(segments.next(), Some(k) if !k.is_empty())
@@ -1843,10 +1879,14 @@ pub async fn repo_visibility_middleware(
     };
 
     let is_public = repo.is_public;
-    // Some protocol-mandated POSTs are safe read operations. Classify them
-    // before the anonymous write gate so public VS Code gallery search works.
+    // The VS Code gallery query is a protocol-mandated POST that is purely a
+    // metadata search, so it must be reachable anonymously on a public repo.
+    // Only that strict subset skips the #508 anonymous-write gate: git-lfs
+    // batch and conan authenticate stay write-gated for anonymous callers
+    // exactly as before, and are exempted only from the *permission* check
+    // further down (`non_mutating_post`).
     let non_mutating_post = is_non_mutating_format_post(&path);
-    let is_write = is_write_method(request.method()) && !non_mutating_post;
+    let is_write = is_write_method(request.method()) && !is_anonymous_readable_format_post(&path);
 
     // Perform optional auth (shared with optional_auth_middleware). Conda
     // token channels carry the credential in the URL path, so fall back to it
@@ -5738,6 +5778,71 @@ mod tests {
             .unwrap();
         let resp = run_through_visibility(state, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_lfs_batch_no_auth_still_returns_401() {
+        // Regression guard for the #508 anonymous-write contract. The gallery
+        // exemption must be a strict subset of `is_non_mutating_format_post`:
+        // widening `is_write` by that whole predicate would ALSO let an
+        // anonymous caller reach the git-lfs batch negotiation (whose upload
+        // arm mints object hrefs) on any public repository. `batch` is exempt
+        // from the *permission* check only, never from the anonymous 401.
+        let key = "publfs";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/lfs/publfs/objects/batch")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_conan_authenticate_no_auth_still_returns_401() {
+        // Same contract for the other `is_non_mutating_format_post` member: a
+        // credential exchange presented with no credential is a 401 from the
+        // middleware, not a pass-through to the handler.
+        let key = "pubconan";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/conan/pubconan/v2/users/authenticate")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_anonymous_readable_format_post_is_a_strict_subset() {
+        // Positive: the gallery query is anonymously readable AND non-mutating.
+        assert!(is_anonymous_readable_format_post(
+            "/vscode/openvsx/gallery/extensionquery"
+        ));
+        assert!(is_non_mutating_format_post(
+            "/vscode/openvsx/gallery/extensionquery"
+        ));
+        // Strict subset: these are non-mutating for the permission check but
+        // NOT anonymously readable.
+        for path in [
+            "/lfs/myrepo/objects/batch",
+            "/conan/myrepo/v2/users/authenticate",
+        ] {
+            assert!(is_non_mutating_format_post(path), "{path}");
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+        }
+        // Neither, for the publish route and near-miss shapes.
+        for path in [
+            "/vscode/openvsx/api/extensions",
+            "/vscode/openvsx/gallery/extensionquery/trailing",
+            "/vscode//gallery/extensionquery",
+        ] {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+        }
     }
 
     #[tokio::test]

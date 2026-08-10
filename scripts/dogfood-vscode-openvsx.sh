@@ -106,7 +106,13 @@ assert_ak_urls() {
       [
         .results[].extensions[].versions[]? |
         .assetUri?, .fallbackAssetUri?, (.files[]?.source?)
-      ] | length > 0 and all(startswith($prefix))
+      ]
+      # `.assetUri?` on an object that LACKS the key yields null (the `?`
+      # suppresses type errors, not missing keys), and `null | startswith(_)`
+      # is a jq runtime error -> non-zero exit -> a "retains a non-AK asset
+      # URL" failure that is the opposite of the truth. Drop nulls first.
+      | map(select(. != null))
+      | length > 0 and all(startswith($prefix))
     ' "$file" >/dev/null || fail 'gallery response retains a non-AK asset URL'
 }
 
