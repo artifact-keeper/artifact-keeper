@@ -193,8 +193,24 @@ pub struct PermissionListResponse {
 )]
 pub async fn list_permissions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListPermissionsQuery>,
 ) -> Result<Json<PermissionListResponse>> {
+    // #3229: the ACL table is admin-only in BOTH directions. Before this gate
+    // the handler took no `AuthExtension` at all, so any authenticated
+    // principal -- including a read-scoped service-account token -- could page
+    // the entire `permissions` table (usernames, group names, repository
+    // names, action arrays) and learn which principals hold `admin` on which
+    // repositories. Symmetric with create/update/delete: scope check first,
+    // then `require_admin`, before any DB work. There is no per-caller
+    // filtering model on this endpoint today, and its only shipped consumers
+    // (the web settings screen and the CLI `permission` command) are admin
+    // surfaces, so admin-only is the contract.
+    let auth = require_auth(auth)?;
+    auth.require_scope("read")?;
+    auth.require_admin()?;
+    let _ = auth;
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -411,8 +427,17 @@ pub async fn create_permission(
 )]
 pub async fn get_permission(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PermissionResponse>> {
+    // #3229: same admin-only gate as list_permissions above -- this handler
+    // previously extracted no `AuthExtension` at all, so any authenticated
+    // principal could read any ACL row by id.
+    let auth = require_auth(auth)?;
+    auth.require_scope("read")?;
+    auth.require_admin()?;
+    let _ = auth;
+
     // Check if permissions table exists first
     let table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'permissions')",
@@ -542,6 +567,15 @@ pub async fn delete_permission(
     // remove permission rows belonging to other principals.
     let auth = require_auth(auth)?;
     auth.require_scope("delete")?;
+    // #3229: `require_scope` alone is NOT an authorization gate for
+    // session-authenticated callers -- `has_scope` returns `true`
+    // unconditionally when `scopes` is `None`, and interactive/JWT sessions
+    // carry `scopes: None` ("JWT sessions are not scope-restricted", see
+    // create_permission). That is exactly why #1438 added `require_admin()`
+    // on top of the scope check for create/update; delete never got the same
+    // treatment, so any logged-in non-admin could remove arbitrary permission
+    // rows. Match create/update: admin only.
+    auth.require_admin()?;
     let _ = auth;
 
     let result = sqlx::query("DELETE FROM permissions WHERE id = $1")
@@ -1080,6 +1114,171 @@ mod tests {
         );
 
         tdh::cleanup_user(&pool, admin_id).await;
+    }
+
+    fn delete_req(uri: String) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("delete request")
+    }
+
+    async fn permission_row_count(pool: &sqlx::PgPool, id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permissions WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("count permission row")
+    }
+
+    /// #3229 (read half): `GET /` and `GET /{id}` previously extracted no
+    /// `AuthExtension` at all, so ANY authenticated principal -- a non-admin
+    /// JWT session or a read-scoped service-account token -- could page the
+    /// whole ACL table. Both must now be admin-only, and the admin positive
+    /// control in the same fixture proves the gate denies the right callers
+    /// rather than everyone.
+    #[tokio::test]
+    async fn list_and_get_permissions_are_admin_only() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (user_id, user_name) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let admin = tdh::admin_auth(admin_id, &admin_name);
+        // The exact bypass shapes from the issue: an interactive non-admin JWT
+        // session (`scopes: None`, which satisfies every scope check), and a
+        // read-scoped service-account token (which satisfies the "read" scope
+        // check). Only `require_admin` can stop either.
+        let non_admin_jwt = tdh::make_auth(user_id, &user_name);
+        let read_scoped_sa = read_only_token();
+
+        let permission_id = seed_permission(&pool, "user", admin_id, "repository", repo_id).await;
+
+        for (label, caller) in [
+            ("non-admin JWT", non_admin_jwt),
+            ("read-scoped SA token", read_scoped_sa),
+        ] {
+            let (status, body) = tdh::send(
+                permission_app(state.clone(), caller.clone()),
+                tdh::get("/".to_string()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{label} must not list the ACL table: {}",
+                String::from_utf8_lossy(&body)
+            );
+
+            let (status, body) = tdh::send(
+                permission_app(state.clone(), caller),
+                tdh::get(format!("/{permission_id}")),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{label} must not read an ACL row by id: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // Positive control, same fixture: an admin still lists and gets the
+        // seeded row. Without this, a gate that denies everyone would pass
+        // the 403 assertions above.
+        let listed = response_json(
+            state.clone(),
+            admin.clone(),
+            tdh::get(format!("/?target_id={repo_id}")),
+        )
+        .await;
+        assert!(
+            listed["items"]
+                .as_array()
+                .expect("permission items")
+                .iter()
+                .any(|item| item["id"] == permission_id.to_string()),
+            "admin list must still return the seeded row"
+        );
+
+        let fetched = response_json(state, admin, tdh::get(format!("/{permission_id}"))).await;
+        assert_eq!(fetched["id"], permission_id.to_string());
+
+        tdh::cleanup_user(&pool, user_id).await;
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[], &[]).await;
+    }
+
+    /// #3229 (delete half): `delete_permission` checked only
+    /// `require_scope("delete")`, and `scopes: None` (interactive JWT
+    /// sessions) satisfies every scope check unconditionally -- so any
+    /// logged-in non-admin could delete arbitrary permission rows. The row
+    /// must survive the denied attempt, and the admin positive control in the
+    /// same fixture must still delete it (a blanket-deny "fix" would fail
+    /// there).
+    #[tokio::test]
+    async fn delete_permission_requires_admin_not_just_delete_scope() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (user_id, user_name) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_name, _storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let admin = tdh::admin_auth(admin_id, &admin_name);
+        // Non-admin interactive JWT: `scopes: None` passes the "delete" scope
+        // check, so before the fix this caller reached the DELETE statement.
+        let non_admin_jwt = tdh::make_auth(user_id, &user_name);
+
+        let permission_id = seed_permission(&pool, "user", admin_id, "repository", repo_id).await;
+
+        let (status, body) = tdh::send(
+            permission_app(state.clone(), non_admin_jwt),
+            delete_req(format!("/{permission_id}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin JWT must not delete a permission row: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            permission_row_count(&pool, permission_id).await,
+            1,
+            "the denied delete must leave the row in place"
+        );
+
+        // Positive control, same fixture: an admin still deletes the row.
+        let (status, body) = tdh::send(
+            permission_app(state.clone(), admin.clone()),
+            delete_req(format!("/{permission_id}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin delete must still succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            permission_row_count(&pool, permission_id).await,
+            0,
+            "the admin delete must actually remove the row"
+        );
+
+        // And the now-missing id maps to 404 for the admin, not a 500.
+        let (status, _body) = tdh::send(
+            permission_app(state, admin),
+            delete_req(format!("/{permission_id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        tdh::cleanup_user(&pool, user_id).await;
+        cleanup_permission_fixtures(&pool, repo_id, admin_id, &[], &[]).await;
     }
 
     // -----------------------------------------------------------------------
