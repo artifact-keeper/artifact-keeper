@@ -149,6 +149,15 @@ impl IntoResponse for DownloadResponse {
 ///
 /// This helper checks if the storage backend supports redirects and returns
 /// either a 302 redirect to a presigned URL or streams the content directly.
+///
+/// **Method-unaware (#3209).** It has no request context, so it cannot tell a
+/// `GET` from a `HEAD`, and a presigned URL is signed for ONE method (the
+/// method is the first line of the SigV4 canonical request). A caller on a
+/// route registered `get(..)` only — where axum answers `HEAD` by running the
+/// GET handler — must therefore gate the call on `DownloadContext::is_head`
+/// itself, or use a helper that takes the context
+/// ([`try_presigned_redirect`]'s callers in `proxy_helpers` do). This helper
+/// currently has no callers anywhere in the workspace.
 pub async fn serve_from_storage<S: StorageBackend + ?Sized>(
     storage: &S,
     key: &str,
@@ -185,7 +194,10 @@ pub async fn serve_from_storage<S: StorageBackend + ?Sized>(
     })
 }
 
-/// Serve content with custom expiry for presigned URLs
+/// Serve content with custom expiry for presigned URLs.
+///
+/// Method-unaware, with the same #3209 caveat as [`serve_from_storage`]; it too
+/// currently has no callers anywhere in the workspace.
 pub async fn serve_from_storage_with_expiry<S: StorageBackend + ?Sized>(
     storage: &S,
     key: &str,

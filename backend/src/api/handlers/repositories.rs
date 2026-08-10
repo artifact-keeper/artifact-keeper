@@ -8087,7 +8087,17 @@ pub async fn download_artifact(
     // redirect setting, which controls supports_redirect()).
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let presigned_enabled = state.config.presigned_downloads_enabled && storage.supports_redirect();
-    if presigned_enabled {
+    // #3209 (sibling of #3181): a presigned URL is signed for ONE HTTP method —
+    // the method is the FIRST line of the SigV4 canonical request ("Create a
+    // canonical request", AWS SigV4 reference: `HTTPMethod\nCanonicalURI\n…`),
+    // so a URL signed for GET is rejected with 403 when the client re-issues it
+    // as HEAD. This route is registered `get(..)` only (both as the generic REST
+    // download and as the Generic format route `/general/{key}/*path`), so axum
+    // answers a HEAD by running this GET handler. Handing that HEAD a 302 to a
+    // GET-signed URL hands the client a URL it cannot use. Skip the redirect and
+    // fall through to the streamed path below, which already builds the correct
+    // headers with an empty body for a HEAD.
+    if presigned_enabled && !is_head {
         // Get artifact metadata first using query_as for runtime checking
         #[derive(sqlx::FromRow)]
         struct ArtifactRow {
@@ -17349,6 +17359,135 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/x-test"),
             "HEAD must carry the same Content-Type as GET"
+        );
+    }
+
+    /// #3209 (systemic sibling of #3181): a HEAD must never be answered with a
+    /// presigned 302.
+    ///
+    /// A presigned URL is signed for exactly ONE HTTP method — the method is the
+    /// first line of the SigV4 canonical request ("Create a canonical request":
+    /// `HTTPMethod\nCanonicalURI\n…`, where `HTTPMethod` is documented as "The
+    /// HTTP method, such as GET, PUT, HEAD, and DELETE") — so an object store
+    /// rejects a HEAD issued against a GET signature. `download_artifact` is
+    /// registered `get(..)` only, both here and as the Generic format route
+    /// `/general/{key}/*path`, so axum answers a HEAD by running it; before this
+    /// fix that HEAD got a 302 to a URL the client could not use.
+    ///
+    /// The GET arm is the negative control and runs against the SAME router: it
+    /// must still 302 to a signed URL, so a "fix" that simply turned presigning
+    /// off fails here.
+    #[tokio::test]
+    async fn test_download_artifact_head_is_not_presigned_redirect_3209() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories              SET storage_backend = 's3', storage_path = key, is_public = true              WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, _mem) = tdh::build_state_with_presigning_cloud(pool.clone(), "s3");
+
+        let blob = Bytes::from_static(b"#3209 generic presigned HEAD marker bytes");
+        let path = "head3209/probe.bin";
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        // The seeding handle must be the SAME cloud backend the handler will
+        // resolve from the repository row, or the bytes land somewhere the
+        // download path cannot see.
+        let repo = crate::api::handlers::proxy_helpers::RepoInfo {
+            storage_backend: "s3".to_string(),
+            storage_path: repo_key.clone(),
+            ..tdh::make_repo_info(
+                repo_id,
+                &repo_key,
+                std::path::Path::new("/tmp/ak-3209-unused"),
+                "local",
+                None,
+            )
+        };
+        tdh::seed_artifact(
+            &state,
+            &pool,
+            &repo,
+            &storage_key,
+            path,
+            "probe",
+            "1.0.0",
+            "application/x-test",
+            blob.clone(),
+            user_id,
+        )
+        .await;
+
+        let router =
+            tdh::router_with_auth(download_router(), state, tdh::make_auth(user_id, &username));
+
+        // Negative control FIRST: presigning really is active on this router, so
+        // the HEAD assertions below cannot pass for the trivial reason.
+        let (get_status, _get_body, get_headers) = tdh::send_with_headers(
+            router.clone(),
+            tdh::get(format!("/{repo_key}/download/{path}")),
+        )
+        .await;
+        let (head_status, head_body, head_headers) =
+            tdh::send_with_headers(router, tdh::head(format!("/{repo_key}/download/{path}"))).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+
+        assert_eq!(
+            get_status,
+            axum::http::StatusCode::FOUND,
+            "GET must still redirect to the presigned URL"
+        );
+        let location = get_headers
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            location.contains("X-Amz-Signature"),
+            "GET must redirect to a signed URL, got {location}"
+        );
+
+        assert_ne!(
+            head_status,
+            axum::http::StatusCode::FOUND,
+            "#3209: HEAD must not be answered with a 302 to a method-scoped \
+             presigned URL — the signature is bound to GET and the object store \
+             403s the HEAD the client re-issues against it"
+        );
+        assert_eq!(
+            head_status,
+            axum::http::StatusCode::OK,
+            "HEAD must answer with the artifact's metadata"
+        );
+        assert!(
+            head_headers.get(header::LOCATION).is_none(),
+            "HEAD must carry no Location header"
+        );
+        assert_eq!(
+            head_headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(blob.len().to_string().as_str()),
+            "HEAD must advertise the artifact's real Content-Length"
+        );
+        assert_eq!(
+            head_headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-test"),
+            "HEAD must advertise the artifact's Content-Type"
+        );
+        assert!(
+            head_body.is_empty(),
+            "a HEAD response carries no body, got {} bytes",
+            head_body.len()
         );
     }
 

@@ -856,7 +856,20 @@ async fn try_member_cache_redirect(
     proxy: &ProxyService,
     member: &Repository,
     path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Option<Response> {
+    // #3209 (sibling of #3181): a presigned URL is signed for ONE HTTP method —
+    // the method is the FIRST line of the SigV4 canonical request
+    // (`HTTPMethod\nCanonicalURI\n…`), so a URL signed for GET is refused with
+    // 403 when the client re-issues it as HEAD. Every virtual-download route
+    // reaching here is registered `get(..)` only, so axum answers a HEAD by
+    // running the GET handler. Declining routes the HEAD onto the streaming
+    // cache probe, which answers with the cached entry's real
+    // `Content-Type`/`Content-Length`; a HEAD response's body is dropped
+    // unpolled, so no bytes are transferred.
+    if ctx.is_head {
+        return None;
+    }
     if !state.config.presigned_downloads_enabled {
         return None;
     }
@@ -994,6 +1007,8 @@ pub fn stream_fetch_result(
 /// Format handlers can use this as a drop-in replacement for [`proxy_fetch`]
 /// when they want to take advantage of presigned redirects for cached proxy
 /// content.
+///
+/// A `HEAD` is never redirected (#3209) — see the guard below.
 pub async fn proxy_fetch_or_redirect(
     proxy_service: &ProxyService,
     state: &AppState,
@@ -1001,11 +1016,23 @@ pub async fn proxy_fetch_or_redirect(
     repo_key: &str,
     upstream_url: &str,
     path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let cache_key = ProxyService::cache_storage_key(repo_key, path)
         .map_err(|e| map_proxy_error(repo_key, path, e))?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
-    let presigned_enabled = state.config.presigned_downloads_enabled;
+    // #3209 (sibling of #3181): a presigned URL is signed for ONE HTTP method —
+    // the method is the FIRST line of the SigV4 canonical request
+    // (`HTTPMethod\nCanonicalURI\n…`), so a GET-signed URL 403s the HEAD a
+    // client re-issues against it. Any route adopting this helper is registered
+    // `get(..)` only, so axum would run it for a HEAD. Suppressing presigning
+    // for a HEAD routes it onto the buffered fetch below, which answers with the
+    // real `Content-Type`/`Content-Length`; the body is dropped unpolled.
+    //
+    // This helper currently has no production caller — it is kept because it is
+    // the documented drop-in for [`proxy_fetch`], and the guard is what stops
+    // the next handler that adopts it from re-opening #3181/#3209.
+    let presigned_enabled = state.config.presigned_downloads_enabled && !ctx.is_head;
 
     // Fast path (#1018): if presigned downloads are enabled and the proxy
     // cache is already fresh, redirect to the signed URL without ever
@@ -2431,7 +2458,7 @@ where
                         // backend is served as a presigned redirect, never
                         // streamed through the backend.
                         if let Some(redirect) =
-                            try_member_cache_redirect(state, proxy, member, path).await
+                            try_member_cache_redirect(state, proxy, member, path, ctx).await
                         {
                             // Remote proxy-cache serve: not our artifact (#1278).
                             (MemberCacheClass::DefiniteHit, Some((redirect, None)))
@@ -3332,6 +3359,27 @@ pub async fn local_fetch_or_redirect(
     // serves those for redirect-capable virtual members, so gate on the key.
     if !ProxyService::is_proxy_cache_key(&artifact.storage_key) {
         crate::services::artifact_service::record_download(db, artifact.id, ctx).await;
+    }
+
+    // #3209 (sibling of #3181): a presigned URL is signed for ONE HTTP method —
+    // the method is the FIRST line of the SigV4 canonical request
+    // (`HTTPMethod\nCanonicalURI\n…`, AWS SigV4 "Create a canonical request"),
+    // so a URL signed for GET is refused with 403 when the client re-issues it
+    // as HEAD. Every route reaching this helper is registered `get(..)` only, so
+    // axum answers a HEAD by running the GET handler and the client would be
+    // handed a signature it cannot use.
+    //
+    // Answer the HEAD from the artifact row instead: `read_local_stream` carries
+    // the row's `content_type` and `size_bytes`, so the response advertises the
+    // same `Content-Type`/`Content-Length` the GET would. The body is opened but
+    // never polled — axum drops a HEAD response's body — so this costs a
+    // metadata round trip rather than a transfer, and (unlike falling through to
+    // the buffered `read_local_content` path below) it never pulls a multi-GiB
+    // artifact into memory just to answer a probe. Status parity with GET is
+    // preserved: a storage miss still errors here exactly as it would for a GET.
+    if ctx.is_head {
+        let result = read_local_stream(db, &artifact, &*storage).await?;
+        return stream_fetch_result(result, &artifact.content_type, None);
     }
 
     // Try presigned redirect before reading content into memory
@@ -11097,6 +11145,119 @@ mod tests {
         db_helpers::cleanup(&pool, member_id, Uuid::nil()).await;
     }
 
+    /// #3209 (systemic sibling of #3181): the virtual-member presigned fast path
+    /// (`try_member_cache_redirect`, inside `resolve_virtual_download_streaming`)
+    /// must never answer a HEAD with a 302.
+    ///
+    /// A presigned URL is signed for exactly ONE HTTP method: the method is the
+    /// first line of the SigV4 canonical request ("Create a canonical request":
+    /// `HTTPMethod\nCanonicalURI\n…`), so an object store refuses a HEAD issued
+    /// against a GET signature. Every format route that funnels here through
+    /// `try_remote_or_virtual_download` is registered `get(..)` only, so axum
+    /// answers a HEAD by running the GET handler.
+    ///
+    /// Both arms run against the SAME proxy-cache double, so the GET arm is a
+    /// negative control in the strong sense: it must still 302 AND sign exactly
+    /// once, and the HEAD must leave that count untouched — proving the decline
+    /// happens before the signer rather than the redirect merely being disabled.
+    #[tokio::test]
+    async fn test_virtual_member_head_is_not_presigned_redirect_3209() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        let (virtual_id, _, _) = db_helpers::create_repo(&pool, "virtual", "pypi").await;
+        let (member_id, _member_key, _) = db_helpers::create_repo(&pool, "remote", "pypi").await;
+        db_helpers::link_member(&pool, virtual_id, member_id, 0).await;
+
+        // A fresh, non-held cache entry on a redirect-capable backend that
+        // counts every presign attempt.
+        let cache = StdArc::new(QuarantineRedirectStorage::new(/* quarantine = */ None));
+        let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let state =
+            db_helpers::build_state_presigned(pool.clone(), "s3-test", registry_storage.clone());
+        let proxy = ProxyService::new(
+            pool.clone(),
+            StdArc::new(crate::services::storage_service::StorageService::new(
+                cache.clone(),
+            )),
+        );
+        // Per-test coordinate isolates the process-global metadata LRU (#2758).
+        let path = format!("pkg/pkg-{}-py3-none-any.whl", Uuid::new_v4());
+
+        let get_resp = resolve_virtual_download_streaming(
+            &state,
+            crate::api::handlers::test_db_helpers::admin_auth_ext().as_ref(),
+            Some(&proxy),
+            virtual_id,
+            &path,
+            "application/octet-stream",
+            None,
+            &crate::api::middleware::download_telemetry::DownloadContext {
+                is_head: false,
+                ..Default::default()
+            },
+            |_id, _loc| async {
+                panic!("local_fetch must NOT run: the redirect fast path should win");
+                #[allow(unreachable_code)]
+                Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            },
+        )
+        .await;
+        let presign_after_get = cache.presign_calls.load(Ordering::SeqCst);
+
+        let head_outcome = resolve_virtual_download_streaming(
+            &state,
+            crate::api::handlers::test_db_helpers::admin_auth_ext().as_ref(),
+            Some(&proxy),
+            virtual_id,
+            &path,
+            "application/octet-stream",
+            None,
+            &crate::api::middleware::download_telemetry::DownloadContext {
+                is_head: true,
+                ..Default::default()
+            },
+            |_id, _loc| async {
+                // A Remote member never reaches the local fetch on either arm.
+                Err(StatusCode::NOT_FOUND.into_response())
+            },
+        )
+        .await;
+        let presign_after_head = cache.presign_calls.load(Ordering::SeqCst);
+
+        db_helpers::cleanup(&pool, virtual_id, Uuid::nil()).await;
+        db_helpers::cleanup(&pool, member_id, Uuid::nil()).await;
+
+        let get_resp = get_resp.expect("a fresh cache hit must resolve on the GET arm");
+        assert_eq!(
+            get_resp.status(),
+            StatusCode::FOUND,
+            "GET on a fresh proxy-cache hit must still be a presigned 302 (#1555)"
+        );
+        assert_eq!(
+            presign_after_get, 1,
+            "the GET arm must actually sign, or the HEAD assertion proves nothing"
+        );
+
+        let head_status = match head_outcome {
+            Ok(resp) => resp.status(),
+            Err(resp) => resp.status(),
+        };
+        assert_ne!(
+            head_status,
+            StatusCode::FOUND,
+            "#3209: HEAD must not be answered with a 302 to a method-scoped \
+             presigned URL — the signature is bound to GET and the object store \
+             403s the HEAD the client re-issues against it"
+        );
+        assert_eq!(
+            presign_after_head, 1,
+            "the HEAD must decline BEFORE the signer: still exactly one presign, \
+             the GET's"
+        );
+    }
+
     /// Redirect-capable proxy-cache backend for the #2075 quarantine-gate
     /// tests. Serves a single fresh, positive cache entry whose sidecar carries
     /// the supplied Package Age Policy hold (`quarantine_until`), and records
@@ -11221,6 +11382,7 @@ mod tests {
             &repo_key,
             "https://upstream.example.test",
             "lodash",
+            &Default::default(),
         )
         .await
         .expect_err("a held cache entry must not resolve to a redirect");
@@ -11258,6 +11420,7 @@ mod tests {
             &repo_key,
             "https://upstream.example.test",
             "lodash",
+            &Default::default(),
         )
         .await
         .expect("a fresh, non-held entry must resolve to a redirect");
@@ -11271,6 +11434,97 @@ mod tests {
             fresh.presign_calls.load(Ordering::SeqCst),
             1,
             "the non-held fast path must sign exactly once"
+        );
+    }
+
+    /// #3209: `proxy_fetch_or_redirect` — the documented drop-in replacement for
+    /// [`proxy_fetch`] when a handler wants presigned redirects — must not sign
+    /// for a HEAD.
+    ///
+    /// A presigned URL is signed for exactly ONE HTTP method (the method is the
+    /// first line of the SigV4 canonical request), and any route adopting this
+    /// helper is registered `get(..)` only, so axum would run it for a HEAD. The
+    /// helper has no production caller today; this guard is what stops the next
+    /// handler that adopts it from re-opening #3181/#3209.
+    ///
+    /// GET runs first on the SAME backend double as the negative control: it
+    /// must sign exactly once, and the HEAD must leave that count untouched.
+    #[tokio::test]
+    async fn test_proxy_fetch_or_redirect_head_never_presigns_3209() {
+        // A REAL pool, unlike the #2075 siblings above: only the GET arm stops
+        // at the redirect fast path. The HEAD arm falls through to
+        // `proxy_fetch`, which touches the database, and against the lazy
+        // fake-pool those siblings use that costs a 30s connect timeout.
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let fresh = StdArc::new(QuarantineRedirectStorage::new(/* quarantine = */ None));
+        let proxy = ProxyService::new(
+            pool.clone(),
+            StdArc::new(crate::services::storage_service::StorageService::new(
+                fresh.clone(),
+            )),
+        );
+        let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let state = db_helpers::build_state_presigned(pool, "s3-test", registry_storage.clone());
+
+        // Per-test coordinate isolates the process-global metadata LRU (#2758).
+        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
+
+        let get_status = super::proxy_fetch_or_redirect(
+            &proxy,
+            &state,
+            Uuid::nil(),
+            &repo_key,
+            // Unroutable: the HEAD fall-through must fail FAST (connection
+            // refused) instead of waiting out a DNS/TLS timeout.
+            "http://127.0.0.1:1",
+            "lodash",
+            &crate::api::middleware::download_telemetry::DownloadContext {
+                is_head: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|r| r.status())
+        .expect("a fresh, non-held entry must resolve to a redirect on GET");
+        let presign_after_get = fresh.presign_calls.load(Ordering::SeqCst);
+
+        let head_status = super::proxy_fetch_or_redirect(
+            &proxy,
+            &state,
+            Uuid::nil(),
+            &repo_key,
+            // Unroutable: the HEAD fall-through must fail FAST (connection
+            // refused) instead of waiting out a DNS/TLS timeout.
+            "http://127.0.0.1:1",
+            "lodash",
+            &crate::api::middleware::download_telemetry::DownloadContext {
+                is_head: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_or_else(|e| e.status(), |r| r.status());
+
+        assert_eq!(
+            get_status,
+            StatusCode::FOUND,
+            "GET on a fresh, non-held entry must still 302 to the presigned URL"
+        );
+        assert_eq!(
+            presign_after_get, 1,
+            "the GET arm must actually sign, or the HEAD assertion proves nothing"
+        );
+        assert_ne!(
+            head_status,
+            StatusCode::FOUND,
+            "#3209: HEAD must not be answered with a 302 to a GET-scoped signature"
+        );
+        assert_eq!(
+            fresh.presign_calls.load(Ordering::SeqCst),
+            1,
+            "the HEAD must never reach the signer: still exactly one presign, the GET's"
         );
     }
 
@@ -12468,6 +12722,115 @@ mod tests {
 
         assert!(out.is_none(), "feature disabled must stream, not 302");
         assert_eq!(presign_calls, 0, "no presign when the feature is off");
+    }
+
+    /// #3209 (systemic sibling of #3181): `local_fetch_or_redirect` — the shared
+    /// hosted/virtual-member local serve used by the PyPI file route among
+    /// others — must never answer a HEAD with a presigned 302.
+    ///
+    /// A presigned URL is signed for exactly ONE HTTP method: the method is the
+    /// first line of the SigV4 canonical request ("Create a canonical request":
+    /// `HTTPMethod\nCanonicalURI\n…`), so an object store refuses a HEAD issued
+    /// against a GET signature. Every route reaching this helper is registered
+    /// `get(..)` only, so axum answers HEAD by running the GET handler.
+    ///
+    /// The GET arm is the negative control on the SAME storage double: it must
+    /// still 302 to a signed URL, and the presign counter must show the HEAD
+    /// never reached the signer at all.
+    #[tokio::test]
+    async fn local_fetch_or_redirect_head_is_not_presigned_redirect_3209() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _key, _dir) = db_helpers::create_repo(&pool, "local", "pypi").await;
+
+        let path = "packages/demo-1.0.0-py3-none-any.whl";
+        let storage_key = "artifact-keeper/cas/ab/cd/demo-1.0.0.whl";
+        let _artifact_id = seed_blob_artifact(&pool, repo_id, user_id, path, storage_key).await;
+
+        // One storage double for BOTH arms, so the presign counter measures the
+        // difference between them rather than two unrelated fixtures.
+        let storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let state = db_helpers::build_state_presigned(pool.clone(), "s3-test", storage.clone());
+        let location = crate::storage::StorageLocation {
+            backend: "s3-test".to_string(),
+            path: String::new(),
+        };
+
+        let get_resp = super::local_fetch_or_redirect(
+            &pool,
+            &state,
+            repo_id,
+            &location,
+            path,
+            &ctx_for(user_id, /* is_head = */ false),
+        )
+        .await;
+        let presign_after_get = storage.presigned_calls.load(Ordering::SeqCst);
+
+        let head_resp = super::local_fetch_or_redirect(
+            &pool,
+            &state,
+            repo_id,
+            &location,
+            path,
+            &ctx_for(user_id, /* is_head = */ true),
+        )
+        .await;
+        let presign_after_head = storage.presigned_calls.load(Ordering::SeqCst);
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+
+        let get_resp = get_resp.expect("GET on a hosted artifact must resolve");
+        assert_eq!(
+            get_resp.status(),
+            StatusCode::FOUND,
+            "GET must still be served as a presigned 302"
+        );
+        assert_eq!(
+            presign_after_get, 1,
+            "the GET arm must actually sign, or the HEAD assertion proves nothing"
+        );
+
+        let head_resp = head_resp.expect("HEAD on a hosted artifact must resolve");
+        assert_ne!(
+            head_resp.status(),
+            StatusCode::FOUND,
+            "#3209: HEAD must not be answered with a 302 to a method-scoped \
+             presigned URL — the signature is bound to GET and the object store \
+             403s the HEAD the client re-issues against it"
+        );
+        assert_eq!(
+            head_resp.status(),
+            StatusCode::OK,
+            "HEAD must answer with the artifact's metadata"
+        );
+        assert!(
+            head_resp.headers().get("location").is_none(),
+            "HEAD must carry no Location header"
+        );
+        assert_eq!(
+            head_resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/java-archive"),
+            "HEAD must advertise the artifact row's Content-Type"
+        );
+        assert_eq!(
+            head_resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
+            Some("9"),
+            "HEAD must advertise the artifact row's size_bytes as Content-Length"
+        );
+        assert_eq!(
+            presign_after_head, 1,
+            "the HEAD must decline BEFORE the signer: still exactly one presign, \
+             the GET's"
+        );
     }
 
     // ── Cross-format curation enforcement (#2930) ────────────────────────
