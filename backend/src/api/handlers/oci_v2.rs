@@ -4618,15 +4618,28 @@ async fn handle_get_blob(
     if !oci_pull_is_scan_scoped(&claims) {
         let scan_cfg =
             crate::services::scan_config_service::ScanConfigService::new(state.db.clone());
+        // #3105 (Bug 2): the blob re-block must honor `scan_on_proxy` for
+        // PROXY-served content. Before this, the EXISTS check ran
+        // unconditionally, so a blob belonging to an image flagged vulnerable
+        // ONCE stayed 403 forever even after an operator set
+        // `scan_on_proxy: false` -- while the manifest for the same image served
+        // again (`maybe_gate_remote_manifest_scan` short-circuits on the same
+        // flag), leaving the image un-pullable but not "blocked", with no
+        // non-DB recourse.
+        //
+        // The knob is applied per REPOSITORY THAT OWNS THE REFS, not as one
+        // whole-request boolean -- see `blob_reblock_applies` for why hosted
+        // refs must NOT be gated on it.
+        //
         // #3023: for a Virtual repo the `manifest_blob_refs` are recorded under
-        // the resolving MEMBER (the virtual owns no refs), so BOTH the
-        // scan-enabled check and the blocklist span the virtual's member set. A
-        // direct Remote/Local repo keeps the single-id check. If the members
-        // cannot be enumerated we cannot prove the blob is safe -> fail closed
-        // (same posture as an unreadable verdict store below).
-        let member_ids: Option<Vec<Uuid>> = if repo.repo_type == RepositoryType::Virtual {
-            match proxy_helpers::fetch_virtual_members(&state.db, repo.id).await {
-                Ok(members) => Some(members.iter().map(|m| m.id).collect()),
+        // the resolving MEMBER (the virtual owns no refs), so the blocklist
+        // spans the virtual's member set. A direct repo keeps the single-id
+        // check. If the members cannot be enumerated we cannot prove the blob
+        // is safe -> fail closed (same posture as an unreadable verdict store
+        // below).
+        let blocklist = if repo.repo_type == RepositoryType::Virtual {
+            let members = match proxy_helpers::fetch_virtual_members(&state.db, repo.id).await {
+                Ok(members) => members,
                 Err(_) => {
                     tracing::warn!(
                         repo = %repo.key, digest = %lookup_digest,
@@ -4638,75 +4651,57 @@ async fn handle_get_blob(
                         "blob scan status is unavailable; retry shortly",
                     );
                 }
-            }
-        } else {
-            None
-        };
-
-        // #3105 (Bug 2): the blob re-block must honor `scan_on_proxy`, exactly as
-        // the manifest gate does (`maybe_gate_remote_manifest_scan` short-circuits
-        // when `is_proxy_scan_enabled` is false). Before this, the EXISTS check
-        // ran unconditionally, so a blob belonging to an image flagged vulnerable
-        // ONCE stayed 403 forever even after an operator set `scan_on_proxy: false`
-        // -- while the manifest for the same image served again, leaving the image
-        // un-pullable but not "blocked" with no non-DB recourse. For a Virtual
-        // repo the effective policy is enabled iff the virtual OR ANY member
-        // enables it (#3023/#3025 OR-of-both-sides), matching
-        // `effective_virtual_scan_policy`. Fails CLOSED on a config-read fault:
-        // `is_proxy_scan_enabled` returns Ok(false) only for an absent row and Err
-        // for a real DB error, so `unwrap_or(true)` keeps the block on a fault.
-        let scan_active = match &member_ids {
-            Some(ids) => {
-                let mut active = scan_cfg
-                    .is_proxy_scan_enabled(repo.id)
-                    .await
-                    .unwrap_or(true);
-                for id in ids {
-                    if active {
-                        break;
-                    }
-                    active = scan_cfg.is_proxy_scan_enabled(*id).await.unwrap_or(true);
-                }
-                active
-            }
-            None => scan_cfg
+            };
+            // #3025 OR-of-both-sides: `scan_on_proxy` on the VIRTUAL itself
+            // keeps the gate on across the whole member set (the stricter
+            // direction, matching `stricter_scan_policy`). Otherwise each
+            // member's own refs are gated by that member's own policy, so a
+            // virtual with proxy scanning off cannot become a bypass route
+            // around a hosted member's enforcement.
+            let virtual_enabled = scan_cfg
                 .is_proxy_scan_enabled(repo.id)
                 .await
-                .unwrap_or(true),
+                .unwrap_or(true);
+            let mut gated_ids: Vec<Uuid> = Vec::with_capacity(members.len());
+            for m in &members {
+                if virtual_enabled
+                    || blob_reblock_applies(&scan_cfg, m.repo_type.as_str(), m.id).await
+                {
+                    gated_ids.push(m.id);
+                }
+            }
+            blob_belongs_to_vulnerable_image_any(state, &gated_ids, &lookup_digest).await
+        } else if blob_reblock_applies(&scan_cfg, &repo.repo_type, repo.id).await {
+            blob_belongs_to_vulnerable_image(state, repo.id, &lookup_digest).await
+        } else {
+            Ok(false)
         };
-
-        if scan_active {
-            let blocklist = match &member_ids {
-                Some(ids) => blob_belongs_to_vulnerable_image_any(state, ids, &lookup_digest).await,
-                None => blob_belongs_to_vulnerable_image(state, repo.id, &lookup_digest).await,
-            };
-            match blocklist {
-                Ok(true) => {
-                    tracing::warn!(
-                        repo = %repo.key, digest = %lookup_digest,
-                        "blocking blob pull: blob belongs to an image with a vulnerable scan verdict"
-                    );
-                    return oci_error(
-                        StatusCode::FORBIDDEN,
-                        "DENIED",
-                        "blob belongs to an image blocked by scan policy: vulnerabilities found",
-                    );
-                }
-                Ok(false) => {}
-                // Fail CLOSED on a control-plane error: we cannot show this blob
-                // is safe to serve, and this is the same posture the manifest gate
-                // takes for an unreadable verdict store.
-                Err(e) => {
-                    tracing::warn!(
-                        repo = %repo.key, digest = %lookup_digest, error = %e,
-                        "blob scan-verdict lookup failed; withholding rather than serving"
-                    );
-                    return oci_error(
-                        StatusCode::LOCKED,
-                        "DENIED",
-                        "blob scan status is unavailable; retry shortly",
-                    );
-                }
+        match blocklist {
+            Ok(true) => {
+                tracing::warn!(
+                    repo = %repo.key, digest = %lookup_digest,
+                    "blocking blob pull: blob belongs to an image with a vulnerable scan verdict"
+                );
+                return oci_error(
+                    StatusCode::FORBIDDEN,
+                    "DENIED",
+                    "blob belongs to an image blocked by scan policy: vulnerabilities found",
+                );
+            }
+            Ok(false) => {}
+            // Fail CLOSED on a control-plane error: we cannot show this blob
+            // is safe to serve, and this is the same posture the manifest gate
+            // takes for an unreadable verdict store.
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo.key, digest = %lookup_digest, error = %e,
+                    "blob scan-verdict lookup failed; withholding rather than serving"
+                );
+                return oci_error(
+                    StatusCode::LOCKED,
+                    "DENIED",
+                    "blob scan status is unavailable; retry shortly",
+                );
             }
         }
     }
@@ -7533,6 +7528,44 @@ async fn blob_belongs_to_vulnerable_image_any(
     .bind(proxy_helpers::PROXY_SCAN_TYPE)
     .fetch_one(&state.db)
     .await
+}
+
+/// Does the #3003 blob re-block still apply to the `manifest_blob_refs`
+/// recorded under `repo_id`?
+///
+/// `scan_configs.scan_on_proxy` is a **proxy-only** knob. Every other consumer
+/// reads it on a proxy serve path, and the manifest half of this very gate
+/// (`maybe_gate_remote_manifest_scan`) is itself `Remote`-only. Critically,
+/// [`ScanConfigService::is_proxy_scan_enabled`] returns `Ok(false)` for an
+/// **absent** `scan_configs` row, and hosted repositories normally have no such
+/// row and no workflow that creates one — so honoring the flag on hosted refs
+/// would not "unblock a proxy pull" (#3105 Bug 2), it would switch the blob
+/// re-block **off by default for every hosted OCI repository**, silently
+/// removing the only blob-level scan enforcement those repositories have.
+/// Hosted (`Local`/`Staging`) refs therefore stay in the blocklist
+/// unconditionally, exactly as before #3105's fix; only proxy-served
+/// (`Remote`/`Virtual`) refs honor the flag.
+///
+/// Hosted repositories also pay no extra query here: the `Local`/`Staging` arm
+/// short-circuits without touching `scan_configs`.
+///
+/// Fails **closed** on a fault: `is_proxy_scan_enabled` maps every sqlx error
+/// to `Err` and only a missing row to `Ok(false)`, so `unwrap_or(true)` keeps
+/// the block on when the control plane is unreadable.
+async fn blob_reblock_applies(
+    scan_cfg: &crate::services::scan_config_service::ScanConfigService,
+    repo_type: &str,
+    repo_id: Uuid,
+) -> bool {
+    // Hosted content: `scan_on_proxy` says nothing about it, so the re-block
+    // stays on unconditionally -- and costs no query.
+    if repo_type == RepositoryType::Local || repo_type == RepositoryType::Staging {
+        return true;
+    }
+    scan_cfg
+        .is_proxy_scan_enabled(repo_id)
+        .await
+        .unwrap_or(true)
 }
 
 /// True when the authenticated claims are a scanner-scoped pull token
@@ -24952,6 +24985,21 @@ mod proxy_scan_block_tests {
         )
     }
 
+    /// Fixture bytes that cannot collide with another test's.
+    ///
+    /// `proxy_scan_results` is keyed on the content digest ALONE and
+    /// `cleanup_proxy_scan_row` deletes by that key GLOBALLY, so two tests
+    /// built from identical `image_manifest` bytes share one verdict row.
+    /// Under nextest's concurrent execution against one database, one test's
+    /// teardown then deletes the row another test is mid-assertion on —
+    /// measured at 3 failures in 9 runs, always presenting as "the gate did
+    /// not block", the worst possible shape for a flake on a security gate.
+    /// Deriving each fixture's bytes from a fresh UUID makes the digests, and
+    /// therefore the verdict rows, disjoint.
+    fn unique_fixture_bytes(label: &str) -> Vec<u8> {
+        format!("{label}-{}", Uuid::new_v4()).into_bytes()
+    }
+
     fn index_manifest() -> Bytes {
         let index = serde_json::json!({
             "schemaVersion": 2,
@@ -26088,9 +26136,14 @@ mod proxy_scan_block_tests {
         // always is when a `vulnerable` verdict could have been recorded).
         enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
 
-        let (vuln_manifest, vuln_config, vuln_layer) = image_manifest(b"bad-cfg", b"bad-layer");
+        let vuln_cfg_bytes = unique_fixture_bytes("bad-cfg");
+        let vuln_layer_bytes = unique_fixture_bytes("bad-layer");
+        let clean_cfg_bytes = unique_fixture_bytes("good-cfg");
+        let clean_layer_bytes = unique_fixture_bytes("good-layer");
+        let (vuln_manifest, vuln_config, vuln_layer) =
+            image_manifest(&vuln_cfg_bytes, &vuln_layer_bytes);
         let (clean_manifest, clean_config, clean_layer) =
-            image_manifest(b"good-cfg", b"good-layer");
+            image_manifest(&clean_cfg_bytes, &clean_layer_bytes);
         let vuln_digest = compute_sha256(&vuln_manifest);
         let clean_digest = compute_sha256(&clean_manifest);
 
@@ -26113,10 +26166,10 @@ mod proxy_scan_block_tests {
             })
             .expect("storage");
         for (d, bytes) in [
-            (&vuln_config, b"bad-cfg".to_vec()),
-            (&vuln_layer, b"bad-layer".to_vec()),
-            (&clean_config, b"good-cfg".to_vec()),
-            (&clean_layer, b"good-layer".to_vec()),
+            (&vuln_config, vuln_cfg_bytes.clone()),
+            (&vuln_layer, vuln_layer_bytes.clone()),
+            (&clean_config, clean_cfg_bytes.clone()),
+            (&clean_layer, clean_layer_bytes.clone()),
         ] {
             let key = blob_storage_key(d);
             storage
@@ -26217,12 +26270,16 @@ mod proxy_scan_block_tests {
         );
     }
 
-    /// #3105 (Bug 2): the blob-level re-block MUST honor `scan_on_proxy`, the
-    /// same way the manifest gate does. A blob belonging to an image with a
-    /// stored `vulnerable` verdict is re-blocked ONLY while scanning is enabled;
-    /// after an operator sets `scan_on_proxy: false` the block is lifted, so
-    /// disabling scanning is not left as a half-measure that unblocks the
-    /// manifest but strands the image's blobs at 403 forever.
+    /// #3105 (Bug 2): on a PROXY (Remote) repository the blob-level re-block
+    /// MUST honor `scan_on_proxy`, the same way the manifest gate does. A blob
+    /// belonging to an image with a stored `vulnerable` verdict is re-blocked
+    /// ONLY while scanning is enabled; after an operator sets
+    /// `scan_on_proxy: false` the block is lifted, so disabling scanning is not
+    /// left as a half-measure that unblocks the manifest but strands the
+    /// image's blobs at 403 forever.
+    ///
+    /// The hosted counterpart — where `scan_on_proxy` must NOT gate anything —
+    /// is pinned by `test_hosted_blob_reblock_ignores_absent_scan_config`.
     ///
     /// The same fixture carries the two positive controls the negative assertion
     /// needs (per the pipeline's "a negative assertion needs a positive control"
@@ -26239,8 +26296,14 @@ mod proxy_scan_block_tests {
             .await
             .expect("make repo public");
 
-        let (vuln_manifest, vuln_config, vuln_layer) = image_manifest(b"bad-cfg", b"bad-layer");
-        let (clean_manifest, clean_config, clean_layer) = image_manifest(b"ok-cfg", b"ok-layer");
+        let vuln_cfg_bytes = unique_fixture_bytes("reblock-bad-cfg");
+        let vuln_layer_bytes = unique_fixture_bytes("reblock-bad-layer");
+        let clean_cfg_bytes = unique_fixture_bytes("reblock-ok-cfg");
+        let clean_layer_bytes = unique_fixture_bytes("reblock-ok-layer");
+        let (vuln_manifest, vuln_config, vuln_layer) =
+            image_manifest(&vuln_cfg_bytes, &vuln_layer_bytes);
+        let (clean_manifest, clean_config, clean_layer) =
+            image_manifest(&clean_cfg_bytes, &clean_layer_bytes);
         let vuln_digest = compute_sha256(&vuln_manifest);
         let clean_digest = compute_sha256(&clean_manifest);
 
@@ -26260,10 +26323,10 @@ mod proxy_scan_block_tests {
             })
             .expect("storage");
         for (d, bytes) in [
-            (&vuln_config, b"bad-cfg".to_vec()),
-            (&vuln_layer, b"bad-layer".to_vec()),
-            (&clean_config, b"ok-cfg".to_vec()),
-            (&clean_layer, b"ok-layer".to_vec()),
+            (&vuln_config, vuln_cfg_bytes.clone()),
+            (&vuln_layer, vuln_layer_bytes.clone()),
+            (&clean_config, clean_cfg_bytes.clone()),
+            (&clean_layer, clean_layer_bytes.clone()),
         ] {
             let key = blob_storage_key(d);
             storage
@@ -26346,6 +26409,158 @@ mod proxy_scan_block_tests {
             vuln_when_disabled,
             StatusCode::OK,
             "#3105 Bug 2: with scan_on_proxy disabled, the previously-flagged blob must serve again"
+        );
+    }
+
+    /// #3245 review, B1: `scan_on_proxy` must NOT gate the re-block on a
+    /// HOSTED (Local) repository.
+    ///
+    /// `ScanConfigService::is_proxy_scan_enabled` returns `Ok(false)` for an
+    /// ABSENT `scan_configs` row, and a hosted repository normally has none —
+    /// so gating hosted refs on that flag would not "unblock a proxy pull"
+    /// (#3105 Bug 2), it would switch the #3003 blob re-block OFF BY DEFAULT
+    /// for every hosted OCI repository on the instance. The verdict join is
+    /// deliberately global by content digest (see
+    /// `test_blob_block_scoping_shared_digest_vs_shared_layer`), so an image
+    /// graded vulnerable through a proxy also blocks the copy that lives in a
+    /// hosted repo — and `handle_get_blob` is the ONLY blob-level enforcement
+    /// those repositories have (`maybe_gate_remote_manifest_scan` is
+    /// Remote-only and there is no blob quarantine seam).
+    ///
+    /// This fixture deliberately creates NO `scan_configs` row at all — the
+    /// production default — so it fails if the flag is ever consulted here.
+    /// The clean image in the same fixture is the positive control: a fix that
+    /// simply blocked every hosted blob cannot satisfy it.
+    #[tokio::test]
+    async fn test_hosted_blob_reblock_ignores_absent_scan_config() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+        // NOTE: no `enable_proxy_scan` — a hosted repo has no scan_configs row.
+
+        let vuln_cfg_bytes = unique_fixture_bytes("hosted-bad-cfg");
+        let vuln_layer_bytes = unique_fixture_bytes("hosted-bad-layer");
+        let clean_cfg_bytes = unique_fixture_bytes("hosted-ok-cfg");
+        let clean_layer_bytes = unique_fixture_bytes("hosted-ok-layer");
+        let (vuln_manifest, vuln_config, vuln_layer) =
+            image_manifest(&vuln_cfg_bytes, &vuln_layer_bytes);
+        let (clean_manifest, clean_config, clean_layer) =
+            image_manifest(&clean_cfg_bytes, &clean_layer_bytes);
+        let vuln_digest = compute_sha256(&vuln_manifest);
+        let clean_digest = compute_sha256(&clean_manifest);
+
+        for (mdigest, body) in [
+            (&vuln_digest, &vuln_manifest),
+            (&clean_digest, &clean_manifest),
+        ] {
+            record_manifest_blob_refs(&fx.pool, fx.repo_id, mdigest, body)
+                .await
+                .expect("record blob refs");
+        }
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for (d, bytes) in [
+            (&vuln_config, vuln_cfg_bytes.clone()),
+            (&vuln_layer, vuln_layer_bytes.clone()),
+            (&clean_config, clean_cfg_bytes.clone()),
+            (&clean_layer, clean_layer_bytes.clone()),
+        ] {
+            let key = blob_storage_key(d);
+            storage
+                .put(&key, Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(d)
+            .bind(bytes.len() as i64)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+
+        // The verdict is content-addressed; it does not matter which repo
+        // produced it. Only the first image is vulnerable.
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                vuln_digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "vulnerable",
+                2,
+                1,
+                1,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let get_blob = |d: String| {
+            let state = fx.state.clone();
+            let key = fx.repo_key.clone();
+            async move {
+                let app = tdh::router_anon(router(), state);
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{key}/app/blobs/{d}"))
+                    .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.expect("oneshot").status()
+            }
+        };
+
+        let vuln_cfg_status = get_blob(vuln_config.clone()).await;
+        let vuln_layer_status = get_blob(vuln_layer.clone()).await;
+        let clean_layer_status = get_blob(clean_layer.clone()).await;
+
+        // Confirm the precondition the whole test rests on: the fixture really
+        // has no scan config, so `is_proxy_scan_enabled` would return false.
+        let cfg_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_configs WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count scan_configs");
+
+        cleanup_proxy_scan_row(&fx.pool, vuln_digest.strip_prefix("sha256:").unwrap()).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            cfg_rows, 0,
+            "fixture precondition: a hosted repo must have NO scan_configs row"
+        );
+        assert_eq!(
+            vuln_cfg_status,
+            StatusCode::FORBIDDEN,
+            "hosted: the CONFIG blob of a vulnerable image must stay blocked with no scan_configs row (#3245 B1)"
+        );
+        assert_eq!(
+            vuln_layer_status,
+            StatusCode::FORBIDDEN,
+            "hosted: the LAYER blob of a vulnerable image must stay blocked with no scan_configs row (#3245 B1)"
+        );
+        assert_eq!(
+            clean_layer_status,
+            StatusCode::OK,
+            "positive control: a clean image's blob in the same hosted repo must still serve"
         );
     }
 
@@ -26541,21 +26756,40 @@ mod virtual_scan_gate_tests {
         )
     }
 
-    async fn insert_remote_member(pool: &sqlx::PgPool, upstream_url: &str) -> (Uuid, String) {
+    /// Fixture bytes that cannot collide with another test's — see
+    /// `proxy_scan_block_tests::unique_fixture_bytes` for why
+    /// (`proxy_scan_results` is keyed on the digest alone and cleaned up
+    /// globally, so shared bytes make concurrent tests race).
+    fn unique_fixture_bytes(label: &str) -> Vec<u8> {
+        format!("{label}-{}", Uuid::new_v4()).into_bytes()
+    }
+
+    /// Insert a member repository of the given `repo_type` (`"remote"` or
+    /// `"local"`). Remote members carry an upstream; hosted ones do not.
+    async fn insert_member(
+        pool: &sqlx::PgPool,
+        repo_type: &str,
+        upstream_url: Option<&str>,
+    ) -> (Uuid, String) {
         let id = Uuid::new_v4();
-        let key = format!("vsg-rem-{}", &id.to_string()[..8]);
+        let key = format!("vsg-{}-{}", &repo_type[..3], &id.to_string()[..8]);
         sqlx::query(
             "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
-             VALUES ($1, $2, $2, $3, 'remote', 'docker'::repository_format, $4, true)",
+             VALUES ($1, $2, $2, $3, $5::repository_type, 'docker'::repository_format, $4, true)",
         )
         .bind(id)
         .bind(&key)
         .bind(format!("/tmp/vsg-{id}"))
         .bind(upstream_url)
+        .bind(repo_type)
         .execute(pool)
         .await
-        .expect("insert remote member");
+        .expect("insert member");
         (id, key)
+    }
+
+    async fn insert_remote_member(pool: &sqlx::PgPool, upstream_url: &str) -> (Uuid, String) {
+        insert_member(pool, "remote", Some(upstream_url)).await
     }
 
     async fn insert_virtual(pool: &sqlx::PgPool) -> (Uuid, String) {
@@ -26928,77 +27162,98 @@ mod virtual_scan_gate_tests {
         );
     }
 
-    // ── Blob seam: member-spanning blocklist blocks a vulnerable image's ────
-    //    config/layer blob pulled by digest through the virtual, but not a
-    //    clean sibling's (cold path: refs recorded under the member).
-    #[tokio::test]
-    async fn blob_via_virtual_blocks_vulnerable_but_not_clean() {
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        let tmp = std::env::temp_dir().join(format!("vsg-bvv-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).expect("tmp");
-        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
-        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+    // ── Blob seam: the member-spanning blocklist, and the `scan_on_proxy` ──
+    //    OR that decides which members' refs it spans (#3023 / #3105 / #3245).
 
-        let (member_id, _) = insert_remote_member(&pool, "https://unused.example.test").await;
-        // Point the member's storage at tmp so a served blob resolves locally.
-        sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
-            .bind(tmp.to_str().unwrap())
-            .bind(member_id)
-            .execute(&pool)
-            .await
-            .expect("member storage");
-        let (virt_id, virt_key) = insert_virtual(&pool).await;
-        link_member(&pool, virt_id, member_id).await;
-        // #3105 (Bug 2): the blob re-block now honors `scan_on_proxy`; for a
-        // virtual it applies iff the virtual OR any member enables scanning.
-        // Enable it on the member (its refs carry the vulnerable image).
-        enable_proxy_scan(&pool, member_id, "fail_open").await;
+    /// A virtual repo with exactly one member that owns the refs of a
+    /// vulnerable image and of a clean sibling, with both images' config blobs
+    /// on disk under the member's storage so a non-blocked pull really 200s.
+    ///
+    /// Shared by every blob-seam case below so the ~90 lines of staging exist
+    /// once; the cases differ only in the member's type and in which
+    /// `scan_configs` rows they create.
+    struct VirtualBlobFixture {
+        pool: sqlx::PgPool,
+        state: SharedState,
+        tmp: std::path::PathBuf,
+        virt_id: Uuid,
+        virt_key: String,
+        member_id: Uuid,
+        vuln_cfg: String,
+        clean_cfg: String,
+        vuln_mdigest: String,
+        clean_mdigest: String,
+    }
 
-        let (vuln_manifest, vuln_cfg, _vuln_layer) = image_manifest(b"bad-cfg", b"bad-layer");
-        let (clean_manifest, clean_cfg, _clean_layer) = image_manifest(b"ok-cfg", b"ok-layer");
-        let vuln_mdigest = compute_sha256(&vuln_manifest);
-        let clean_mdigest = compute_sha256(&clean_manifest);
+    impl VirtualBlobFixture {
+        /// `member_type` is `"remote"` (proxy member) or `"local"` (hosted
+        /// member). `label` keeps each test's content digests disjoint.
+        async fn setup(member_type: &str, label: &str) -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let tmp = std::env::temp_dir().join(format!("vsg-bvv-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&tmp).expect("tmp");
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+            let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
 
-        for (m, body) in [
-            (&vuln_mdigest, &vuln_manifest),
-            (&clean_mdigest, &clean_manifest),
-        ] {
-            record_manifest_blob_refs(&pool, member_id, m, body)
+            let upstream = (member_type == "remote").then_some("https://unused.example.test");
+            let (member_id, _) = insert_member(&pool, member_type, upstream).await;
+            // Point the member's storage at tmp so a served blob resolves locally.
+            sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
+                .bind(tmp.to_str().unwrap())
+                .bind(member_id)
+                .execute(&pool)
                 .await
-                .expect("record refs under member");
-        }
-        // Put the actual blobs into the member's storage so a non-blocked pull 200s.
-        let storage = state
-            .storage_for_repo(&crate::storage::StorageLocation {
-                backend: "filesystem".to_string(),
-                path: tmp.to_string_lossy().into_owned(),
-            })
-            .expect("storage");
-        for (d, bytes) in [
-            (&vuln_cfg, b"bad-cfg".to_vec()),
-            (&clean_cfg, b"ok-cfg".to_vec()),
-        ] {
-            let key = blob_storage_key(d);
-            storage
-                .put(&key, Bytes::from(bytes.clone()))
+                .expect("member storage");
+            let (virt_id, virt_key) = insert_virtual(&pool).await;
+            link_member(&pool, virt_id, member_id).await;
+
+            let vuln_cfg_bytes = unique_fixture_bytes(&format!("{label}-bad-cfg"));
+            let clean_cfg_bytes = unique_fixture_bytes(&format!("{label}-ok-cfg"));
+            let (vuln_manifest, vuln_cfg, _vuln_layer) = image_manifest(
+                &vuln_cfg_bytes,
+                &unique_fixture_bytes(&format!("{label}-bad-lyr")),
+            );
+            let (clean_manifest, clean_cfg, _clean_layer) = image_manifest(
+                &clean_cfg_bytes,
+                &unique_fixture_bytes(&format!("{label}-ok-lyr")),
+            );
+            let vuln_mdigest = compute_sha256(&vuln_manifest);
+            let clean_mdigest = compute_sha256(&clean_manifest);
+
+            for (m, body) in [
+                (&vuln_mdigest, &vuln_manifest),
+                (&clean_mdigest, &clean_manifest),
+            ] {
+                record_manifest_blob_refs(&pool, member_id, m, body)
+                    .await
+                    .expect("record refs under member");
+            }
+            let storage = state
+                .storage_for_repo(&crate::storage::StorageLocation {
+                    backend: "filesystem".to_string(),
+                    path: tmp.to_string_lossy().into_owned(),
+                })
+                .expect("storage");
+            for (d, bytes) in [(&vuln_cfg, vuln_cfg_bytes), (&clean_cfg, clean_cfg_bytes)] {
+                let key = blob_storage_key(d);
+                storage
+                    .put(&key, Bytes::from(bytes.clone()))
+                    .await
+                    .expect("put blob");
+                sqlx::query(
+                    "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(member_id)
+                .bind(d)
+                .bind(bytes.len() as i64)
+                .bind(&key)
+                .execute(&pool)
                 .await
-                .expect("put blob");
-            sqlx::query(
-                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
-                 VALUES ($1, $2, $3, $4)",
-            )
-            .bind(member_id)
-            .bind(d)
-            .bind(bytes.len() as i64)
-            .bind(&key)
-            .execute(&pool)
-            .await
-            .expect("insert oci_blobs");
-        }
-        ProxyScanService::new(pool.clone())
-            .record_verdict(
+                .expect("insert oci_blobs");
+            }
+            let svc = ProxyScanService::new(pool.clone());
+            svc.record_verdict(
                 vuln_mdigest.strip_prefix("sha256:").unwrap(),
                 "grype",
                 "vulnerable",
@@ -27013,8 +27268,7 @@ mod virtual_scan_gate_tests {
             )
             .await
             .expect("seed vulnerable verdict");
-        ProxyScanService::new(pool.clone())
-            .record_verdict(
+            svc.record_verdict(
                 clean_mdigest.strip_prefix("sha256:").unwrap(),
                 "grype",
                 "clean",
@@ -27030,25 +27284,77 @@ mod virtual_scan_gate_tests {
             .await
             .expect("seed clean verdict");
 
-        let image = format!("{virt_key}/app");
-        let vuln_status = pull(&state, &image, "blobs", &vuln_cfg).await.status();
-        let clean_status = pull(&state, &image, "blobs", &clean_cfg).await.status();
+            Some(Self {
+                pool,
+                state,
+                tmp,
+                virt_id,
+                virt_key,
+                member_id,
+                vuln_cfg,
+                clean_cfg,
+                vuln_mdigest,
+                clean_mdigest,
+            })
+        }
 
-        drop(state);
-        cleanup(
-            &pool,
-            &[virt_id, member_id],
-            &[
-                vuln_mdigest.strip_prefix("sha256:").unwrap(),
-                clean_mdigest.strip_prefix("sha256:").unwrap(),
-            ],
-        )
-        .await;
-        let _ = sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
-            .bind(member_id)
-            .execute(&pool)
+        /// Anonymous blob-by-digest GET through the VIRTUAL, via the real router.
+        async fn get_blob(&self, digest: &str) -> StatusCode {
+            pull(
+                &self.state,
+                &format!("{}/app", self.virt_key),
+                "blobs",
+                digest,
+            )
+            .await
+            .status()
+        }
+
+        async fn teardown(self) {
+            let Self {
+                pool,
+                state,
+                tmp,
+                virt_id,
+                member_id,
+                vuln_mdigest,
+                clean_mdigest,
+                ..
+            } = self;
+            drop(state);
+            cleanup(
+                &pool,
+                &[virt_id, member_id],
+                &[
+                    vuln_mdigest.strip_prefix("sha256:").unwrap(),
+                    clean_mdigest.strip_prefix("sha256:").unwrap(),
+                ],
+            )
             .await;
-        let _ = std::fs::remove_dir_all(&tmp);
+            let _ = sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+                .bind(member_id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+
+    /// #3023: the member-spanning blocklist blocks a vulnerable image's config
+    /// blob pulled by digest through the virtual, but not a clean sibling's
+    /// (cold path: refs recorded under the member).
+    #[tokio::test]
+    async fn blob_via_virtual_blocks_vulnerable_but_not_clean() {
+        let Some(fx) = VirtualBlobFixture::setup("remote", "bvv").await else {
+            return;
+        };
+        // #3105 (Bug 2): the blob re-block honors `scan_on_proxy`; for a
+        // virtual it applies iff the virtual OR the member enables scanning.
+        // Enable it on the member (its refs carry the vulnerable image).
+        enable_proxy_scan(&fx.pool, fx.member_id, "fail_open").await;
+
+        let vuln_status = fx.get_blob(&fx.vuln_cfg).await;
+        let clean_status = fx.get_blob(&fx.clean_cfg).await;
+        fx.teardown().await;
 
         assert_eq!(
             vuln_status,
@@ -27059,6 +27365,117 @@ mod virtual_scan_gate_tests {
             clean_status,
             StatusCode::OK,
             "a clean image's blob through the virtual must still serve (no over-block)"
+        );
+    }
+
+    /// The OR, direction 1 (#3025 stricter-of-two): `scan_on_proxy` on the
+    /// VIRTUAL keeps the blob re-block on across the whole member set even
+    /// though the member that owns the refs has scanning off. The clean
+    /// sibling in the same fixture is the positive control, so an
+    /// everything-blocked mutation cannot satisfy this.
+    #[tokio::test]
+    async fn blob_via_virtual_enabled_blocks_when_member_scanning_off() {
+        let Some(fx) = VirtualBlobFixture::setup("remote", "vor1").await else {
+            return;
+        };
+        // Only the virtual enables scanning; the member has no config row.
+        enable_proxy_scan(&fx.pool, fx.virt_id, "fail_open").await;
+
+        let vuln_status = fx.get_blob(&fx.vuln_cfg).await;
+        let clean_status = fx.get_blob(&fx.clean_cfg).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            vuln_status,
+            StatusCode::FORBIDDEN,
+            "virtual-enabled scanning must keep the blob blocked even with the member's scanning off (OR, #3025)"
+        );
+        assert_eq!(
+            clean_status,
+            StatusCode::OK,
+            "positive control: the clean sibling still serves through the virtual"
+        );
+    }
+
+    /// The OR, direction 2 (#3105 Bug 2 through a virtual): with scanning off
+    /// on BOTH the virtual and its proxy member, the previously-flagged blob
+    /// serves again. The same fixture carries the positive control — the block
+    /// is observed FIRST with scanning enabled on the member — so this cannot
+    /// be satisfied by a fixture that never blocked in the first place.
+    #[tokio::test]
+    async fn blob_via_virtual_all_scanning_off_unblocks() {
+        let Some(fx) = VirtualBlobFixture::setup("remote", "vor2").await else {
+            return;
+        };
+
+        // Positive control: enabled on the member -> blocked.
+        enable_proxy_scan(&fx.pool, fx.member_id, "fail_open").await;
+        let blocked_while_enabled = fx.get_blob(&fx.vuln_cfg).await;
+
+        // Now turn it off everywhere it could apply (the virtual has no row).
+        sqlx::query("UPDATE scan_configs SET scan_on_proxy = false WHERE repository_id = $1")
+            .bind(fx.member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("disable scan_on_proxy on the member");
+        let after_disable = fx.get_blob(&fx.vuln_cfg).await;
+        let clean_after_disable = fx.get_blob(&fx.clean_cfg).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            blocked_while_enabled,
+            StatusCode::FORBIDDEN,
+            "positive control: with the member's scanning on, the virtual pull is blocked"
+        );
+        assert_eq!(
+            after_disable,
+            StatusCode::OK,
+            "#3105 Bug 2 through a virtual: scanning off on the virtual AND its proxy member must unblock the blob"
+        );
+        assert_eq!(
+            clean_after_disable,
+            StatusCode::OK,
+            "the clean sibling is unaffected"
+        );
+    }
+
+    /// #3245 review, B1 — a virtual must not become a bypass route around a
+    /// HOSTED member's enforcement. `scan_on_proxy` is a proxy knob and a
+    /// hosted repository normally has no `scan_configs` row, so a whole-request
+    /// "is scanning on anywhere?" boolean would read `false` here and serve the
+    /// blocked blob. The gate is therefore evaluated per repository that OWNS
+    /// the refs: the hosted member's refs stay in the blocklist regardless.
+    #[tokio::test]
+    async fn blob_via_virtual_still_blocks_hosted_member_refs_with_scanning_off() {
+        let Some(fx) = VirtualBlobFixture::setup("local", "vloc").await else {
+            return;
+        };
+        // No scan_configs row anywhere: not on the virtual, not on the hosted
+        // member. This is the production default for hosted content.
+
+        let vuln_status = fx.get_blob(&fx.vuln_cfg).await;
+        let clean_status = fx.get_blob(&fx.clean_cfg).await;
+        let cfg_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_configs WHERE repository_id = ANY($1)")
+                .bind(vec![fx.virt_id, fx.member_id])
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count scan_configs");
+        fx.teardown().await;
+
+        assert_eq!(
+            cfg_rows, 0,
+            "fixture precondition: neither the virtual nor the hosted member has a scan_configs row"
+        );
+        assert_eq!(
+            vuln_status,
+            StatusCode::FORBIDDEN,
+            "a hosted member's vulnerable blob must stay blocked through the virtual (#3245 B1)"
+        );
+        assert_eq!(
+            clean_status,
+            StatusCode::OK,
+            "positive control: the hosted member's clean sibling still serves"
         );
     }
 
