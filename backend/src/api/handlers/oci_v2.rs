@@ -4616,51 +4616,97 @@ async fn handle_get_blob(
     // fetch. Scanner-scoped pulls are exempt for the same reason the manifest
     // gate exempts them.
     if !oci_pull_is_scan_scoped(&claims) {
+        let scan_cfg =
+            crate::services::scan_config_service::ScanConfigService::new(state.db.clone());
         // #3023: for a Virtual repo the `manifest_blob_refs` are recorded under
-        // the resolving MEMBER (the virtual owns no refs), so the blocklist must
-        // span the virtual's member set. A direct Remote/Local repo keeps the
-        // single-id check verbatim. If the members cannot be enumerated we cannot
-        // prove the blob is safe -> fail closed (same posture as an unreadable
-        // verdict store below).
-        let blocklist = if repo.repo_type == RepositoryType::Virtual {
+        // the resolving MEMBER (the virtual owns no refs), so BOTH the
+        // scan-enabled check and the blocklist span the virtual's member set. A
+        // direct Remote/Local repo keeps the single-id check. If the members
+        // cannot be enumerated we cannot prove the blob is safe -> fail closed
+        // (same posture as an unreadable verdict store below).
+        let member_ids: Option<Vec<Uuid>> = if repo.repo_type == RepositoryType::Virtual {
             match proxy_helpers::fetch_virtual_members(&state.db, repo.id).await {
-                Ok(members) => {
-                    let ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
-                    blob_belongs_to_vulnerable_image_any(state, &ids, &lookup_digest).await
+                Ok(members) => Some(members.iter().map(|m| m.id).collect()),
+                Err(_) => {
+                    tracing::warn!(
+                        repo = %repo.key, digest = %lookup_digest,
+                        "virtual member enumeration failed during blob scan-verdict check; withholding"
+                    );
+                    return oci_error(
+                        StatusCode::LOCKED,
+                        "DENIED",
+                        "blob scan status is unavailable; retry shortly",
+                    );
                 }
-                Err(_) => Err(sqlx::Error::Protocol(
-                    "virtual member enumeration failed during blob scan-verdict check".to_string(),
-                )),
             }
         } else {
-            blob_belongs_to_vulnerable_image(state, repo.id, &lookup_digest).await
+            None
         };
-        match blocklist {
-            Ok(true) => {
-                tracing::warn!(
-                    repo = %repo.key, digest = %lookup_digest,
-                    "blocking blob pull: blob belongs to an image with a vulnerable scan verdict"
-                );
-                return oci_error(
-                    StatusCode::FORBIDDEN,
-                    "DENIED",
-                    "blob belongs to an image blocked by scan policy: vulnerabilities found",
-                );
+
+        // #3105 (Bug 2): the blob re-block must honor `scan_on_proxy`, exactly as
+        // the manifest gate does (`maybe_gate_remote_manifest_scan` short-circuits
+        // when `is_proxy_scan_enabled` is false). Before this, the EXISTS check
+        // ran unconditionally, so a blob belonging to an image flagged vulnerable
+        // ONCE stayed 403 forever even after an operator set `scan_on_proxy: false`
+        // -- while the manifest for the same image served again, leaving the image
+        // un-pullable but not "blocked" with no non-DB recourse. For a Virtual
+        // repo the effective policy is enabled iff the virtual OR ANY member
+        // enables it (#3023/#3025 OR-of-both-sides), matching
+        // `effective_virtual_scan_policy`. Fails CLOSED on a config-read fault:
+        // `is_proxy_scan_enabled` returns Ok(false) only for an absent row and Err
+        // for a real DB error, so `unwrap_or(true)` keeps the block on a fault.
+        let scan_active = match &member_ids {
+            Some(ids) => {
+                let mut active = scan_cfg
+                    .is_proxy_scan_enabled(repo.id)
+                    .await
+                    .unwrap_or(true);
+                for id in ids {
+                    if active {
+                        break;
+                    }
+                    active = scan_cfg.is_proxy_scan_enabled(*id).await.unwrap_or(true);
+                }
+                active
             }
-            Ok(false) => {}
-            // Fail CLOSED on a control-plane error: we cannot show this blob is
-            // safe to serve, and this is the same posture the manifest gate
-            // takes for an unreadable verdict store.
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo.key, digest = %lookup_digest, error = %e,
-                    "blob scan-verdict lookup failed; withholding rather than serving"
-                );
-                return oci_error(
-                    StatusCode::LOCKED,
-                    "DENIED",
-                    "blob scan status is unavailable; retry shortly",
-                );
+            None => scan_cfg
+                .is_proxy_scan_enabled(repo.id)
+                .await
+                .unwrap_or(true),
+        };
+
+        if scan_active {
+            let blocklist = match &member_ids {
+                Some(ids) => blob_belongs_to_vulnerable_image_any(state, ids, &lookup_digest).await,
+                None => blob_belongs_to_vulnerable_image(state, repo.id, &lookup_digest).await,
+            };
+            match blocklist {
+                Ok(true) => {
+                    tracing::warn!(
+                        repo = %repo.key, digest = %lookup_digest,
+                        "blocking blob pull: blob belongs to an image with a vulnerable scan verdict"
+                    );
+                    return oci_error(
+                        StatusCode::FORBIDDEN,
+                        "DENIED",
+                        "blob belongs to an image blocked by scan policy: vulnerabilities found",
+                    );
+                }
+                Ok(false) => {}
+                // Fail CLOSED on a control-plane error: we cannot show this blob
+                // is safe to serve, and this is the same posture the manifest gate
+                // takes for an unreadable verdict store.
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %repo.key, digest = %lookup_digest, error = %e,
+                        "blob scan-verdict lookup failed; withholding rather than serving"
+                    );
+                    return oci_error(
+                        StatusCode::LOCKED,
+                        "DENIED",
+                        "blob scan status is unavailable; retry shortly",
+                    );
+                }
             }
         }
     }
@@ -26037,6 +26083,10 @@ mod proxy_scan_block_tests {
             .execute(&fx.pool)
             .await
             .expect("make repo public");
+        // #3105 (Bug 2): the blob re-block now honors `scan_on_proxy`, so the
+        // block only applies while scanning is enabled. Enable it (as production
+        // always is when a `vulnerable` verdict could have been recorded).
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
 
         let (vuln_manifest, vuln_config, vuln_layer) = image_manifest(b"bad-cfg", b"bad-layer");
         let (clean_manifest, clean_config, clean_layer) =
@@ -26164,6 +26214,138 @@ mod proxy_scan_block_tests {
             clean_layer_status,
             StatusCode::OK,
             "a clean image's layer blob must still serve (no over-block)"
+        );
+    }
+
+    /// #3105 (Bug 2): the blob-level re-block MUST honor `scan_on_proxy`, the
+    /// same way the manifest gate does. A blob belonging to an image with a
+    /// stored `vulnerable` verdict is re-blocked ONLY while scanning is enabled;
+    /// after an operator sets `scan_on_proxy: false` the block is lifted, so
+    /// disabling scanning is not left as a half-measure that unblocks the
+    /// manifest but strands the image's blobs at 403 forever.
+    ///
+    /// The same fixture carries the two positive controls the negative assertion
+    /// needs (per the pipeline's "a negative assertion needs a positive control"
+    /// rule): with scanning ENABLED the vulnerable blob is 403 AND a clean blob
+    /// is 200, so a fix that blocked everything (or nothing) cannot pass.
+    #[tokio::test]
+    async fn test_blob_reblock_honors_scan_on_proxy() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+
+        let (vuln_manifest, vuln_config, vuln_layer) = image_manifest(b"bad-cfg", b"bad-layer");
+        let (clean_manifest, clean_config, clean_layer) = image_manifest(b"ok-cfg", b"ok-layer");
+        let vuln_digest = compute_sha256(&vuln_manifest);
+        let clean_digest = compute_sha256(&clean_manifest);
+
+        for (mdigest, body) in [
+            (&vuln_digest, &vuln_manifest),
+            (&clean_digest, &clean_manifest),
+        ] {
+            record_manifest_blob_refs(&fx.pool, fx.repo_id, mdigest, body)
+                .await
+                .expect("record blob refs");
+        }
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for (d, bytes) in [
+            (&vuln_config, b"bad-cfg".to_vec()),
+            (&vuln_layer, b"bad-layer".to_vec()),
+            (&clean_config, b"ok-cfg".to_vec()),
+            (&clean_layer, b"ok-layer".to_vec()),
+        ] {
+            let key = blob_storage_key(d);
+            storage
+                .put(&key, Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(d)
+            .bind(bytes.len() as i64)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+
+        // Only the first image is vulnerable.
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                vuln_digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "vulnerable",
+                2,
+                1,
+                1,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let get_blob = |d: String| {
+            let state = fx.state.clone();
+            let key = fx.repo_key.clone();
+            async move {
+                let app = tdh::router_anon(router(), state);
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{key}/app/blobs/{d}"))
+                    .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.expect("oneshot").status()
+            }
+        };
+
+        // ── scan_on_proxy ENABLED: the re-block applies (positive controls). ──
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let vuln_when_enabled = get_blob(vuln_layer.clone()).await;
+        let clean_when_enabled = get_blob(clean_layer.clone()).await;
+
+        // ── scan_on_proxy DISABLED: the re-block must NOT apply anymore. ──
+        sqlx::query("UPDATE scan_configs SET scan_on_proxy = false WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("disable scan_on_proxy");
+        let vuln_when_disabled = get_blob(vuln_layer.clone()).await;
+
+        cleanup_proxy_scan_row(&fx.pool, vuln_digest.strip_prefix("sha256:").unwrap()).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            vuln_when_enabled,
+            StatusCode::FORBIDDEN,
+            "positive control: with scan_on_proxy enabled, a vulnerable image's blob stays blocked"
+        );
+        assert_eq!(
+            clean_when_enabled,
+            StatusCode::OK,
+            "positive control: a clean image's blob serves even while scanning is enabled"
+        );
+        assert_eq!(
+            vuln_when_disabled,
+            StatusCode::OK,
+            "#3105 Bug 2: with scan_on_proxy disabled, the previously-flagged blob must serve again"
         );
     }
 
@@ -26769,6 +26951,10 @@ mod virtual_scan_gate_tests {
             .expect("member storage");
         let (virt_id, virt_key) = insert_virtual(&pool).await;
         link_member(&pool, virt_id, member_id).await;
+        // #3105 (Bug 2): the blob re-block now honors `scan_on_proxy`; for a
+        // virtual it applies iff the virtual OR any member enables scanning.
+        // Enable it on the member (its refs carry the vulnerable image).
+        enable_proxy_scan(&pool, member_id, "fail_open").await;
 
         let (vuln_manifest, vuln_cfg, _vuln_layer) = image_manifest(b"bad-cfg", b"bad-layer");
         let (clean_manifest, clean_cfg, _clean_layer) = image_manifest(b"ok-cfg", b"ok-layer");
