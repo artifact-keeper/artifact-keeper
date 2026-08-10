@@ -27,6 +27,10 @@
 //!   CopyObject (default: 1800). Control-plane calls (head/list/delete/exists)
 //!   keep a short [`S3_CONTROL_TIMEOUT`] so a wedged endpoint still fails fast.
 //!   Set to 0 to disable the bulk timeout entirely.
+//! - S3_MAX_SINGLE_COPY_BYTES: Largest object copied with one server-side
+//!   CopyObject (default: 5 GiB, AWS's cap). Larger sources are copied via
+//!   multipart UploadPartCopy in slices of this size. Clamped into
+//!   [5 MiB, 5 GiB]. Lever for S3-compatible stores with lower copy limits.
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -67,6 +71,13 @@ const S3_MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024;
 /// this regardless of how large the object is.
 const S3_MULTIPART_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 const S3_MULTIPART_MAX_IN_FLIGHT_PARTS: usize = 4;
+/// AWS's ceiling for a single copy operation (5 GiB): "You create a copy of
+/// your object up to 5 GB in size in a single atomic action using this API.
+/// However, to copy an object greater than 5 GB, you must use the multipart
+/// upload Upload Part - Copy (UploadPartCopy) API" (Amazon S3 API Reference,
+/// CopyObject). Default for the configurable
+/// [`S3Config::max_single_copy_bytes`]; also the hard upper clamp, since no
+/// single copy — `CopyObject` or one `UploadPartCopy` part — may exceed it.
 const S3_MAX_SINGLE_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// Overall HTTP request timeout for control-plane S3 calls: head, exists, list,
 /// delete, multipart create/abort. These are all small, fixed-cost round trips,
@@ -367,17 +378,19 @@ impl Drop for MultipartAbortGuard {
 /// Each range becomes one `UploadPartCopy`'s `x-amz-copy-source-range` header,
 /// which the S3 API Reference (UploadPartCopy, `x-amz-copy-source-range`)
 /// defines as "the form bytes=first-last, where the first and last are the
-/// zero-based byte offsets to copy". Every part is
-/// [`S3_MULTIPART_MAX_PART_SIZE`] (5 GiB, S3's per-part ceiling) except a
-/// shorter final part; maximal parts keep the count minimal — S3's 5 TiB
-/// object ceiling needs 1,024 parts, far under [`S3_MULTIPART_MAX_PARTS`].
-/// Every non-final part is 5 GiB, so the 5 MiB minimum-part-size rule is
-/// trivially satisfied for the `> 5 GiB` objects this path handles.
-fn copy_part_ranges(size: u64) -> Vec<(u64, u64)> {
+/// zero-based byte offsets to copy". Every part is `part_size` except a
+/// shorter final part. `part_size` is the (clamped) single-copy ceiling — each
+/// `UploadPartCopy` is itself a single copy operation bound by the same limit
+/// — so maximal parts keep the count minimal: at the default 5 GiB ceiling,
+/// S3's 5 TiB object ceiling needs 1,024 parts, far under
+/// [`S3_MULTIPART_MAX_PARTS`]. Callers guarantee `part_size >= 5 MiB`
+/// (see [`S3Backend::effective_single_copy_ceiling`]), satisfying the
+/// minimum-part-size rule for every non-final part.
+fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
     let mut ranges = Vec::new();
     let mut start = 0u64;
     while start < size {
-        let end = (start + S3_MULTIPART_MAX_PART_SIZE).min(size) - 1;
+        let end = (start + part_size).min(size) - 1;
         ranges.push((start, end));
         start = end + 1;
     }
@@ -401,8 +414,14 @@ fn s3_copy_source_value(bucket: &str, full_key: &str) -> String {
 /// A successful response is `<CopyPartResult><ETag>...</ETag></CopyPartResult>`
 /// (S3 API Reference, UploadPartCopy response syntax). S3 copy operations can
 /// return `200 OK` with an embedded `<Error>` document instead, so a 200
-/// status alone is not success — only a parseable ETag is. The ETag's XML
-/// entity escapes are undone (S3 wraps ETags in `&quot;`).
+/// status alone is not success — only a parseable ETag is.
+///
+/// The ETag's XML entity escapes are undone: implementations differ on how
+/// they escape the quotes around the ETag — AWS emits the named entity
+/// (`&quot;`), MinIO (Go's `encoding/xml`) the decimal reference (`&#34;`) —
+/// and a passed-through entity poisons `CompleteMultipartUpload` with
+/// `InvalidPart` ("the specified entity tag may not match"), caught live
+/// against MinIO by `test_large_copy_upload_part_copy_live_3164`.
 fn parse_copy_part_etag(body: &str) -> Option<String> {
     if body.contains("<Error") {
         return None;
@@ -412,6 +431,10 @@ fn parse_copy_part_etag(body: &str) -> Option<String> {
     let etag = body[start..end]
         .trim()
         .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&");
@@ -468,6 +491,15 @@ pub struct S3Config {
     /// so this stays short to fail fast on a wedged endpoint. `0` disables it.
     /// Default: [`S3_CONTROL_TIMEOUT`] (30s).
     pub control_timeout_secs: u64,
+    /// Largest object copied with a single server-side `CopyObject`; larger
+    /// sources use the multipart `UploadPartCopy` path, whose per-part slice
+    /// size is this same value (each part copy is a single copy operation
+    /// under the same ceiling). Operator lever for S3-compatible stores with
+    /// a lower single-copy limit than AWS's. Clamped at use into
+    /// [5 MiB, 5 GiB]: a range copy requires a source over 5 MB, and no
+    /// single copy may exceed AWS's 5 GiB cap. Default:
+    /// [`S3_MAX_SINGLE_COPY_SIZE`] (5 GiB).
+    pub max_single_copy_bytes: u64,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -532,6 +564,10 @@ impl S3Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(S3_CONTROL_TIMEOUT.as_secs());
+        let max_single_copy_bytes: u64 = std::env::var("S3_MAX_SINGLE_COPY_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(S3_MAX_SINGLE_COPY_SIZE);
 
         Ok(Self {
             bucket,
@@ -551,6 +587,7 @@ impl S3Config {
             pool_idle_timeout_secs,
             bulk_timeout_secs,
             control_timeout_secs,
+            max_single_copy_bytes,
         })
     }
 
@@ -616,6 +653,7 @@ impl S3Config {
             pool_idle_timeout_secs: 90,
             bulk_timeout_secs: S3_DEFAULT_BULK_TIMEOUT_SECS,
             control_timeout_secs: S3_CONTROL_TIMEOUT.as_secs(),
+            max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
         }
     }
 
@@ -677,6 +715,13 @@ impl S3Config {
     /// Override the control-plane request timeout (seconds). `0` disables it.
     pub fn with_control_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.control_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Override the single-copy ceiling in bytes (see
+    /// [`Self::max_single_copy_bytes`]). Clamped at use into [5 MiB, 5 GiB].
+    pub fn with_max_single_copy_bytes(mut self, bytes: u64) -> Self {
+        self.max_single_copy_bytes = bytes;
         self
     }
 }
@@ -834,6 +879,11 @@ pub struct S3Backend {
     /// does not expose (ranged `UploadPartCopy`, #3164). Built with the same
     /// custom-CA / insecure-TLS options as the object_store clients.
     raw_http: reqwest::Client,
+    /// Single-copy ceiling (already clamped into [5 MiB, 5 GiB], see
+    /// [`Self::effective_single_copy_ceiling`]): sources at or under it use
+    /// native `CopyObject`; larger ones use multipart `UploadPartCopy` with
+    /// parts of this size.
+    max_single_copy_bytes: u64,
     prefix: Option<String>,
     redirect_downloads: bool,
     cloudfront: Option<CloudFrontConfig>,
@@ -873,6 +923,19 @@ impl S3Backend {
         let timeout =
             (config.bulk_timeout_secs > 0).then(|| Duration::from_secs(config.bulk_timeout_secs));
         Self::build_store_with_timeout(config, access_key, secret_key, timeout)
+    }
+
+    /// Clamp the configured single-copy ceiling into what the S3 API can
+    /// honor: at least 5 MiB ("You can copy a range only if the source object
+    /// is greater than 5 MB" — S3 API Reference, UploadPartCopy — and 5 MiB
+    /// is the minimum non-final part size) and at most
+    /// [`S3_MAX_SINGLE_COPY_SIZE`] (no single copy may exceed AWS's 5 GiB
+    /// cap). Used for both the CopyObject-vs-multipart threshold and the
+    /// multipart part slice size.
+    fn effective_single_copy_ceiling(config: &S3Config) -> u64 {
+        config
+            .max_single_copy_bytes
+            .clamp(S3_MULTIPART_CHUNK_SIZE as u64, S3_MAX_SINGLE_COPY_SIZE)
     }
 
     /// HTTP client for hand-rolled S3 API calls that `object_store` does not
@@ -1147,6 +1210,7 @@ impl S3Backend {
             bulk_timeout: (config.bulk_timeout_secs > 0)
                 .then(|| Duration::from_secs(config.bulk_timeout_secs)),
             raw_http,
+            max_single_copy_bytes: Self::effective_single_copy_ceiling(&config),
             prefix: config.prefix,
             redirect_downloads: config.redirect_downloads,
             cloudfront: config.cloudfront,
@@ -1829,7 +1893,7 @@ impl S3Backend {
     /// Copy content from one key to another
     pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let size = self.size(source).await?;
-        if size > S3_MAX_SINGLE_COPY_SIZE {
+        if size > self.max_single_copy_bytes {
             tracing::debug!(
                 source = %source,
                 dest = %dest,
@@ -1853,8 +1917,10 @@ impl S3Backend {
         Ok(())
     }
 
-    /// Copy an object larger than [`S3_MAX_SINGLE_COPY_SIZE`] entirely
-    /// server-side via multipart `UploadPartCopy` (#3164).
+    /// Copy an object larger than the single-copy ceiling
+    /// ([`S3Config::max_single_copy_bytes`], default
+    /// [`S3_MAX_SINGLE_COPY_SIZE`]) entirely server-side via multipart
+    /// `UploadPartCopy` (#3164).
     ///
     /// AWS caps single copies at 5 GiB: "You create a copy of your object up
     /// to 5 GB in size in a single atomic action using this API. However, to
@@ -1876,7 +1942,7 @@ impl S3Backend {
     /// earlier failure aborts the upload and leaves an existing `dest`
     /// object untouched.
     async fn multipart_server_side_copy(&self, source: &str, dest: &str, size: u64) -> Result<()> {
-        let ranges = copy_part_ranges(size);
+        let ranges = copy_part_ranges(size, self.max_single_copy_bytes);
         if ranges.len() > S3_MULTIPART_MAX_PARTS {
             // Unreachable for real S3 (5 TiB object ceiling / 5 GiB parts =
             // 1,024), but fail fast rather than opaquely at part 10,001 if an
@@ -3703,6 +3769,7 @@ mod tests {
             region: config.region.clone(),
             bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
             raw_http: reqwest::Client::new(),
+            max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
@@ -3980,6 +4047,7 @@ mod tests {
                 bulk_timeout: (config.bulk_timeout_secs > 0)
                     .then(|| Duration::from_secs(config.bulk_timeout_secs)),
                 raw_http: reqwest::Client::new(),
+                max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
                 prefix: None,
                 redirect_downloads: false,
                 cloudfront: None,
@@ -4058,6 +4126,7 @@ mod tests {
             bulk_timeout: (config.bulk_timeout_secs > 0)
                 .then(|| Duration::from_secs(config.bulk_timeout_secs)),
             raw_http: reqwest::Client::new(),
+            max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
@@ -4372,10 +4441,13 @@ mod tests {
             ))
             .mount(&server)
             .await;
+        // MinIO-style decimal quote entities (`&#34;`); the failure-path test
+        // below uses AWS-style `&quot;` so both real-world encodings are
+        // covered (see `parse_copy_part_etag`).
         let part_copy_guard = Mock::given(method("PUT"))
             .and(query_param("uploadId", "copy-upload-id"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                "<CopyPartResult><ETag>&quot;part-copy-etag&quot;</ETag></CopyPartResult>",
+                "<CopyPartResult><ETag>&#34;part-copy-etag&#34;</ETag></CopyPartResult>",
             ))
             .mount_as_scoped(&server)
             .await;
@@ -5065,5 +5137,96 @@ mod integration_tests {
 
         let _ = StorageBackendTrait::delete(&backend, key).await;
         println!("#1555 no-prefix presign live test OK");
+    }
+
+    /// #3164 live: prove the hand-rolled, SigV4-signed `UploadPartCopy`
+    /// request is actually ACCEPTED by a real S3-compatible server (MinIO).
+    /// The wiremock suite asserts the request shape but cannot validate the
+    /// signature — a signing bug there would pass every double and then fail
+    /// in production on the first over-ceiling copy.
+    ///
+    /// Shrinks the single-copy ceiling via the `S3_MAX_SINGLE_COPY_BYTES`
+    /// env lever (the operator-facing knob this PR adds) so the multipart
+    /// path triggers on a 16 MiB object instead of a >5 GiB one, then
+    /// asserts: (1) the copy succeeds against the live server — the
+    /// signature validation; (2) destination bytes equal source bytes —
+    /// position-dependent content, so a range mix-up changes the result;
+    /// (3) the multipart path was really taken: a multipart-completed
+    /// object's ETag carries a `-<parts>` suffix (md5-of-part-md5s), while
+    /// a native `CopyObject` fallback would carry the source's plain ETag.
+    ///
+    ///   AK_S3_E2E=1 S3_BUCKET=ak-test S3_REGION=us-east-1 \
+    ///   S3_ENDPOINT=http://127.0.0.1:39164 S3_ACCESS_KEY_ID=... \
+    ///   S3_SECRET_ACCESS_KEY=... cargo test \
+    ///   test_large_copy_upload_part_copy_live_3164 -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_large_copy_upload_part_copy_live_3164() {
+        if std::env::var("AK_S3_E2E").ok().as_deref() != Some("1") {
+            println!("Skipping: set AK_S3_E2E=1 to run");
+            return;
+        }
+
+        // 6 MiB ceiling -> a 16 MiB source needs three ranged part copies
+        // (6 + 6 + 4 MiB). Set via env so this exercises the exact
+        // config-surface path an operator would use.
+        std::env::set_var("S3_MAX_SINGLE_COPY_BYTES", (6u64 * 1024 * 1024).to_string());
+        let config = S3Config::from_env().expect("S3Config::from_env");
+        let backend = S3Backend::new(config).await.expect("S3Backend::new");
+
+        let source_key = format!("large-copy-3164/src-{}", uuid::Uuid::new_v4());
+        let dest_key = format!("large-copy-3164/dst-{}", uuid::Uuid::new_v4());
+
+        // Position-dependent bytes: reassembling the parts in the wrong
+        // order, at the wrong offsets, or dropping a slice changes the
+        // content, so the equality check below validates the ranges too.
+        let len = 16 * 1024 * 1024_usize;
+        let content = Bytes::from(
+            (0..len)
+                .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+                .collect::<Vec<u8>>(),
+        );
+        StorageBackendTrait::put(&backend, &source_key, content.clone())
+            .await
+            .expect("seed source object");
+
+        // (1) Signature validation: the copy must be accepted by the live
+        // server. Every part is a hand-rolled UploadPartCopy request.
+        backend.copy(&source_key, &dest_key).await.expect(
+            "#3164: server-side multipart copy must be accepted by a real \
+             S3-compatible store (SigV4 of the hand-rolled UploadPartCopy)",
+        );
+
+        // (2) The copied bytes must equal the source bytes.
+        let copied = StorageBackendTrait::get(&backend, &dest_key)
+            .await
+            .expect("read copied object");
+        assert_eq!(copied.len(), content.len(), "copied length must match");
+        assert!(
+            copied == content,
+            "#3164: destination bytes must equal source bytes"
+        );
+
+        // (3) The multipart path must actually have been taken. 16 MiB at a
+        // 6 MiB ceiling = 3 parts -> ETag like "abc...-3". A native
+        // CopyObject fallback yields a plain single-part ETag with no
+        // dash-suffix (MD5 hex contains no '-').
+        let dest_path: ObjectPath = backend.full_key(&dest_key).into();
+        let meta = backend.store.head(&dest_path).await.expect("head dest");
+        let etag = meta.e_tag.clone().expect("dest object must have an ETag");
+        assert!(
+            etag.contains("-3"),
+            "#3164: dest ETag {:?} does not carry the 3-part multipart \
+             suffix; the copy did not take the UploadPartCopy path",
+            etag
+        );
+
+        let _ = StorageBackendTrait::delete(&backend, &source_key).await;
+        let _ = StorageBackendTrait::delete(&backend, &dest_key).await;
+        println!(
+            "#3164 live multipart copy OK: len={} dest_etag={}",
+            copied.len(),
+            etag
+        );
     }
 }
