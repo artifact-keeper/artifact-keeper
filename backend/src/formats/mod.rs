@@ -68,60 +68,7 @@ pub trait FormatHandler: Send + Sync {
     /// For core handlers, this matches the RepositoryFormat enum value.
     /// For WASM plugins, this is the custom format key from the manifest.
     fn format_key(&self) -> &str {
-        match self.format() {
-            RepositoryFormat::Maven => "maven",
-            RepositoryFormat::Gradle => "gradle",
-            RepositoryFormat::Npm => "npm",
-            RepositoryFormat::Pypi => "pypi",
-            RepositoryFormat::Nuget => "nuget",
-            RepositoryFormat::Go => "go",
-            RepositoryFormat::Rubygems => "rubygems",
-            RepositoryFormat::Docker => "docker",
-            RepositoryFormat::Helm => "helm",
-            RepositoryFormat::Rpm => "rpm",
-            RepositoryFormat::Debian => "debian",
-            RepositoryFormat::Conan => "conan",
-            RepositoryFormat::Cargo => "cargo",
-            RepositoryFormat::Generic => "generic",
-            RepositoryFormat::Podman => "podman",
-            RepositoryFormat::Buildx => "buildx",
-            RepositoryFormat::Oras => "oras",
-            RepositoryFormat::WasmOci => "wasm_oci",
-            RepositoryFormat::HelmOci => "helm_oci",
-            RepositoryFormat::Poetry => "poetry",
-            RepositoryFormat::Conda => "conda",
-            RepositoryFormat::Yarn => "yarn",
-            RepositoryFormat::Bower => "bower",
-            RepositoryFormat::Pnpm => "pnpm",
-            RepositoryFormat::Chocolatey => "chocolatey",
-            RepositoryFormat::Powershell => "powershell",
-            RepositoryFormat::Terraform => "terraform",
-            RepositoryFormat::Opentofu => "opentofu",
-            RepositoryFormat::Alpine => "alpine",
-            RepositoryFormat::CondaNative => "conda_native",
-            RepositoryFormat::Composer => "composer",
-            RepositoryFormat::Hex => "hex",
-            RepositoryFormat::Cocoapods => "cocoapods",
-            RepositoryFormat::Swift => "swift",
-            RepositoryFormat::Pub => "pub",
-            RepositoryFormat::Sbt => "sbt",
-            RepositoryFormat::Chef => "chef",
-            RepositoryFormat::Puppet => "puppet",
-            RepositoryFormat::Ansible => "ansible",
-            RepositoryFormat::Gitlfs => "gitlfs",
-            RepositoryFormat::Vscode => "vscode",
-            RepositoryFormat::Jetbrains => "jetbrains",
-            RepositoryFormat::Huggingface => "huggingface",
-            RepositoryFormat::Mlmodel => "mlmodel",
-            RepositoryFormat::Cran => "cran",
-            RepositoryFormat::Vagrant => "vagrant",
-            RepositoryFormat::Opkg => "opkg",
-            RepositoryFormat::P2 => "p2",
-            RepositoryFormat::Bazel => "bazel",
-            RepositoryFormat::Protobuf => "protobuf",
-            RepositoryFormat::Incus => "incus",
-            RepositoryFormat::Lxc => "lxc",
-        }
+        self.format().as_key()
     }
 
     /// Check if this handler is backed by a WASM plugin.
@@ -145,7 +92,7 @@ pub trait FormatHandler: Send + Sync {
 /// use the WasmFormatHandlerFactory instead.
 pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
     match format_key {
-        "maven" => Some(Box::new(maven::MavenHandler::new())),
+        "maven" | "gradle" => Some(Box::new(maven::MavenHandler::new())),
         "npm" => Some(Box::new(npm::NpmHandler::new())),
         "pypi" => Some(Box::new(pypi::PypiHandler::new())),
         "nuget" => Some(Box::new(nuget::NugetHandler::new())),
@@ -251,60 +198,133 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
 }
 
 /// List all supported core format keys.
+///
+/// Derived from [`RepositoryFormat::ALL`] rather than hand-maintained: the
+/// previous literal list had silently lost `gradle` (#3157).
 pub fn list_core_formats() -> Vec<&'static str> {
-    vec![
-        "maven",
-        "npm",
-        "pypi",
-        "nuget",
-        "go",
-        "rubygems",
-        "docker",
-        "helm",
-        "rpm",
-        "debian",
-        "conan",
-        "cargo",
-        "generic",
-        "podman",
-        "buildx",
-        "oras",
-        "wasm_oci",
-        "helm_oci",
-        "poetry",
-        "conda",
-        "yarn",
-        "bower",
-        "pnpm",
-        "chocolatey",
-        "powershell",
-        "terraform",
-        "opentofu",
-        "alpine",
-        "conda_native",
-        "composer",
-        "hex",
-        "cocoapods",
-        "swift",
-        "pub",
-        "sbt",
-        "chef",
-        "puppet",
-        "ansible",
-        "gitlfs",
-        "vscode",
-        "jetbrains",
-        "huggingface",
-        "mlmodel",
-        "cran",
-        "vagrant",
-        "opkg",
-        "p2",
-        "bazel",
-        "protobuf",
-        "incus",
-        "lxc",
-    ]
+    RepositoryFormat::ALL.iter().map(|f| f.as_key()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Compiled-in format handler registry (#3157)
+// ---------------------------------------------------------------------------
+
+/// A compiled-in ("core") format handler, as advertised by
+/// `GET /api/v1/formats`.
+///
+/// One entry per *handler*, not per format alias: `gradle` is served by the
+/// Maven handler and every OCI alias by the `oci` handler, so those collapse
+/// onto a single entry — the same granularity the `format_handlers` table is
+/// keyed by and the same granularity the enable/disable gate acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreFormatHandler {
+    /// Handler key, e.g. `"pub"`. Matches `format_handlers.format_key`.
+    pub format_key: &'static str,
+    /// Human-readable name for the API/UI.
+    pub display_name: &'static str,
+    /// One-line description of the format.
+    pub description: &'static str,
+    /// File extensions the handler recognises. Advisory/display only.
+    pub extensions: &'static [&'static str],
+}
+
+/// Every format handler compiled into this binary.
+///
+/// This is the authoritative answer to "which formats does the running
+/// backend provide?" — it is *derived* from [`RepositoryFormat::ALL`] via
+/// [`RepositoryFormat::handler_key`], so a format cannot be added to the
+/// product without appearing here. `format_handlers` rows are synchronised
+/// from this registry at startup
+/// (`WasmPluginService::sync_core_format_handlers`), which makes the table an
+/// enablement overlay on top of the registry instead of a second, hand-written
+/// copy of it. Migration 014 seeded that table once with the 13 handlers that
+/// existed at the time and it was never extended, so `GET /api/v1/formats` hid
+/// ~24 shipped handlers including `pub` (#3157).
+pub fn core_format_handlers() -> Vec<CoreFormatHandler> {
+    let mut seen = std::collections::HashSet::new();
+    let mut handlers = Vec::new();
+    for format in RepositoryFormat::ALL {
+        let key = format.handler_key();
+        if seen.insert(key) {
+            let (display_name, description, extensions) = core_handler_metadata(key);
+            handlers.push(CoreFormatHandler {
+                format_key: key,
+                display_name,
+                description,
+                extensions,
+            });
+        }
+    }
+    handlers
+}
+
+/// Presentation metadata for a core handler key.
+///
+/// Deliberately total: an unrecognised key falls back to the key itself rather
+/// than being dropped, so forgetting to add a line here can only cost a format
+/// its pretty name — never its presence in the registry. Membership is decided
+/// by [`RepositoryFormat::ALL`] alone.
+fn core_handler_metadata(
+    format_key: &'static str,
+) -> (&'static str, &'static str, &'static [&'static str]) {
+    match format_key {
+        "maven" => (
+            "Maven",
+            "Maven repository format for Java artifacts",
+            &[".jar", ".pom", ".war", ".ear"],
+        ),
+        "npm" => ("npm", "Node.js package manager", &[".tgz"]),
+        "pypi" => ("PyPI", "Python Package Index", &[".whl", ".tar.gz"]),
+        "nuget" => ("NuGet", ".NET package manager", &[".nupkg"]),
+        "cargo" => ("Cargo", "Rust package manager", &[".crate"]),
+        "go" => ("Go Modules", "Go module proxy", &[".zip", ".mod"]),
+        "oci" => ("OCI/Docker", "Container images (OCI format)", &[]),
+        "helm" => ("Helm", "Kubernetes package manager", &[".tgz"]),
+        "debian" => ("Debian", "Debian packages", &[".deb"]),
+        "rpm" => ("RPM", "Red Hat packages", &[".rpm"]),
+        "rubygems" => ("RubyGems", "Ruby gems", &[".gem"]),
+        "conan" => ("Conan", "C/C++ package manager", &[".tgz"]),
+        "generic" => ("Generic", "Generic artifact storage", &[]),
+        "terraform" => (
+            "Terraform/OpenTofu",
+            "Terraform and OpenTofu modules and providers",
+            &[".zip"],
+        ),
+        "alpine" => ("Alpine", "Alpine Linux apk packages", &[".apk"]),
+        "conda_native" => (
+            "Conda",
+            "Conda packages (native channel layout)",
+            &[".conda", ".tar.bz2"],
+        ),
+        "composer" => ("Composer", "PHP package manager", &[".zip", ".tar"]),
+        "hex" => ("Hex", "Elixir/Erlang package manager", &[".tar"]),
+        "cocoapods" => ("CocoaPods", "Swift and Objective-C dependency manager", &[]),
+        "swift" => ("Swift", "Swift Package Manager registry", &[".zip"]),
+        "pub" => ("Pub", "Dart and Flutter package registry", &[".tar.gz"]),
+        "sbt" => ("sbt", "Scala build tool plugins and artifacts", &[".jar"]),
+        "chef" => ("Chef", "Chef cookbooks", &[".tar.gz"]),
+        "puppet" => ("Puppet", "Puppet modules", &[".tar.gz"]),
+        "ansible" => ("Ansible", "Ansible collections and roles", &[".tar.gz"]),
+        "gitlfs" => ("Git LFS", "Git Large File Storage objects", &[]),
+        "vscode" => (
+            "VS Code Extensions",
+            "Visual Studio Code compatible extensions",
+            &[".vsix"],
+        ),
+        "jetbrains" => ("JetBrains Plugins", "JetBrains IDE plugins", &[".zip"]),
+        "huggingface" => ("Hugging Face", "Hugging Face models and datasets", &[]),
+        "mlmodel" => ("ML Models", "Machine-learning model artifacts", &[]),
+        "cran" => ("CRAN", "R packages", &[".tar.gz"]),
+        "vagrant" => ("Vagrant", "Vagrant boxes", &[".box"]),
+        "opkg" => ("opkg", "OpenWrt/embedded Linux packages", &[".ipk"]),
+        "p2" => ("Eclipse P2", "Eclipse P2 update sites", &[".jar"]),
+        "bazel" => ("Bazel", "Bazel modules and rulesets", &[".tar.gz"]),
+        "protobuf" => ("Protobuf", "Protocol Buffer schema registry", &[".proto"]),
+        "incus" => ("Incus/LXC", "Incus and LXC container images", &[".tar.xz"]),
+        // Total fallback -- see the doc comment. A format that reaches this
+        // arm is still listed, it just shows its raw key as the display name.
+        other => (other, "Compiled-in format handler", &[]),
+    }
 }
 
 // ---------------------------------------------------------------------------

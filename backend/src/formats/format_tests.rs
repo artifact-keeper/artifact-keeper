@@ -7,8 +7,11 @@
 mod tests {
     use bytes::Bytes;
 
-    use crate::formats::{get_core_handler, get_handler_for_format, list_core_formats};
+    use crate::formats::{
+        core_format_handlers, get_core_handler, get_handler_for_format, list_core_formats,
+    };
     use crate::models::repository::RepositoryFormat;
+    use crate::services::repository_service::parse_format_str;
 
     /// All format keys that should be resolved by get_core_handler.
     const ALL_FORMAT_KEYS: &[&str] = &[
@@ -65,59 +68,14 @@ mod tests {
     /// Additional alias keys that get_core_handler should also resolve.
     const ALIAS_FORMAT_KEYS: &[&str] = &["oci", "cursor", "windsurf", "kiro"];
 
-    /// All RepositoryFormat enum variants.
+    /// Every built-in format variant.
+    ///
+    /// Derived from `RepositoryFormat::ALL` rather than re-listed here: the
+    /// hand-written copy this replaces had drifted and was missing
+    /// `protobuf`, `incus` and `lxc`, so those three never went through any of
+    /// the handler-registry tests below (#3157).
     fn all_repository_formats() -> Vec<RepositoryFormat> {
-        vec![
-            RepositoryFormat::Maven,
-            RepositoryFormat::Gradle,
-            RepositoryFormat::Npm,
-            RepositoryFormat::Pypi,
-            RepositoryFormat::Nuget,
-            RepositoryFormat::Go,
-            RepositoryFormat::Rubygems,
-            RepositoryFormat::Docker,
-            RepositoryFormat::Helm,
-            RepositoryFormat::Rpm,
-            RepositoryFormat::Debian,
-            RepositoryFormat::Conan,
-            RepositoryFormat::Cargo,
-            RepositoryFormat::Generic,
-            RepositoryFormat::Podman,
-            RepositoryFormat::Buildx,
-            RepositoryFormat::Oras,
-            RepositoryFormat::WasmOci,
-            RepositoryFormat::HelmOci,
-            RepositoryFormat::Poetry,
-            RepositoryFormat::Conda,
-            RepositoryFormat::Yarn,
-            RepositoryFormat::Bower,
-            RepositoryFormat::Pnpm,
-            RepositoryFormat::Chocolatey,
-            RepositoryFormat::Powershell,
-            RepositoryFormat::Terraform,
-            RepositoryFormat::Opentofu,
-            RepositoryFormat::Alpine,
-            RepositoryFormat::CondaNative,
-            RepositoryFormat::Composer,
-            RepositoryFormat::Hex,
-            RepositoryFormat::Cocoapods,
-            RepositoryFormat::Swift,
-            RepositoryFormat::Pub,
-            RepositoryFormat::Sbt,
-            RepositoryFormat::Chef,
-            RepositoryFormat::Puppet,
-            RepositoryFormat::Ansible,
-            RepositoryFormat::Gitlfs,
-            RepositoryFormat::Vscode,
-            RepositoryFormat::Jetbrains,
-            RepositoryFormat::Huggingface,
-            RepositoryFormat::Mlmodel,
-            RepositoryFormat::Cran,
-            RepositoryFormat::Vagrant,
-            RepositoryFormat::Opkg,
-            RepositoryFormat::P2,
-            RepositoryFormat::Bazel,
-        ]
+        RepositoryFormat::ALL.to_vec()
     }
 
     #[test]
@@ -722,5 +680,171 @@ mod tests {
             "Conda native validate failed: {:?}",
             result.err()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Compiled-in format handler registry (#3157)
+    //
+    // `GET /api/v1/formats` reported only the 13 handlers migration 014
+    // seeded; ~24 shipped handlers including `pub` were missing, and a format
+    // with no row can never be disabled, so those were also silently exempt
+    // from the enable/disable control surface. The registry below is what the
+    // endpoint is now synchronised from, so these tests check it against
+    // sources that are NOT the registry itself: `get_core_handler` (the actual
+    // dispatch table) and `ALL_FORMAT_KEYS` (this module's own list).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_core_format_handlers_all_resolve_to_a_compiled_in_handler() {
+        // Independent oracle: get_core_handler is the real dispatch table, so
+        // a registry entry with no handler behind it would be advertising a
+        // format the backend cannot actually serve.
+        for entry in core_format_handlers() {
+            assert!(
+                get_core_handler(entry.format_key).is_some(),
+                "registry advertises '{}' but get_core_handler() has no handler for it",
+                entry.format_key
+            );
+            assert!(
+                !entry.display_name.is_empty(),
+                "registry entry '{}' has an empty display name",
+                entry.format_key
+            );
+        }
+    }
+
+    #[test]
+    fn test_core_format_handlers_cover_every_format_key() {
+        // Every format the product supports must be served by a registered
+        // handler. ALL_FORMAT_KEYS is maintained independently of the registry
+        // (it predates it), so this catches a format whose handler key never
+        // made it into the registry.
+        let registered: std::collections::HashSet<&str> = core_format_handlers()
+            .iter()
+            .map(|h| h.format_key)
+            .collect();
+
+        for key in ALL_FORMAT_KEYS.iter().chain(ALIAS_FORMAT_KEYS.iter()) {
+            // `cursor`/`windsurf`/`kiro` are client aliases of the vscode
+            // handler and are not repository formats, so they have no
+            // RepositoryFormat variant to derive an entry from.
+            if matches!(*key, "cursor" | "windsurf" | "kiro") {
+                continue;
+            }
+            let handler_key = parse_format_str(key)
+                .map(|f| f.handler_key())
+                .unwrap_or(key);
+            assert!(
+                registered.contains(handler_key),
+                "format '{}' resolves to handler '{}', which the core registry does not list",
+                key,
+                handler_key
+            );
+        }
+    }
+
+    #[test]
+    fn test_core_format_handlers_include_handlers_added_after_the_014_seed() {
+        // The 13 handlers migration 014 seeded, verbatim from
+        // `backend/migrations/014_wasm_plugins.sql`.
+        const SEEDED_BY_MIGRATION_014: &[&str] = &[
+            "maven", "npm", "pypi", "nuget", "cargo", "go", "oci", "helm", "debian", "rpm",
+            "rubygems", "conan", "generic",
+        ];
+
+        let registered: std::collections::HashSet<&str> = core_format_handlers()
+            .iter()
+            .map(|h| h.format_key)
+            .collect();
+
+        // Positive control: the originally seeded handlers are still listed,
+        // so a registry that lost everything cannot satisfy the assertions
+        // below by being empty.
+        for key in SEEDED_BY_MIGRATION_014 {
+            assert!(
+                registered.contains(key),
+                "registry lost originally seeded handler '{}'",
+                key
+            );
+        }
+
+        // The gap reported in #3157: handlers shipped after the seed. `pub`
+        // is the one the issue was raised against.
+        for key in [
+            "pub",
+            "composer",
+            "cocoapods",
+            "swift",
+            "hex",
+            "sbt",
+            "cran",
+            "terraform",
+            "alpine",
+            "protobuf",
+            "incus",
+            "conda_native",
+            "gitlfs",
+            "vscode",
+            "jetbrains",
+            "huggingface",
+            "mlmodel",
+            "vagrant",
+            "opkg",
+            "p2",
+            "bazel",
+            "chef",
+            "puppet",
+            "ansible",
+        ] {
+            assert!(
+                registered.contains(key),
+                "core format registry is missing '{}' (added after the migration 014 seed)",
+                key
+            );
+        }
+
+        assert!(
+            registered.len() > SEEDED_BY_MIGRATION_014.len(),
+            "registry has not grown past the 13 handlers seeded in 2024"
+        );
+    }
+
+    #[test]
+    fn test_core_format_handlers_are_deduplicated_by_handler() {
+        // Aliases share a handler (gradle -> maven, lxc -> incus, every OCI
+        // alias -> oci). The table is keyed by format_key, so a duplicate
+        // entry would make the startup sync fight itself.
+        let mut seen = std::collections::HashSet::new();
+        for entry in core_format_handlers() {
+            assert!(
+                seen.insert(entry.format_key),
+                "duplicate registry entry for '{}'",
+                entry.format_key
+            );
+        }
+        // The alias collapse must actually happen: `docker` and `lxc` are
+        // formats, not handlers.
+        assert!(
+            !seen.contains("docker"),
+            "'docker' should collapse onto 'oci'"
+        );
+        assert!(seen.contains("oci"));
+        assert!(!seen.contains("lxc"), "'lxc' should collapse onto 'incus'");
+        assert!(seen.contains("incus"));
+    }
+
+    #[test]
+    fn test_list_core_formats_resolves_every_key_to_a_handler() {
+        // list_core_formats() is now derived from RepositoryFormat::ALL, so
+        // this is the check that the derivation cannot advertise a format the
+        // dispatch table does not know — it is what caught `gradle` missing
+        // from get_core_handler().
+        for key in list_core_formats() {
+            assert!(
+                get_core_handler(key).is_some(),
+                "list_core_formats() advertises '{}' but get_core_handler() returns None",
+                key
+            );
+        }
     }
 }

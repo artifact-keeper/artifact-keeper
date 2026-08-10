@@ -292,6 +292,41 @@ pub async fn path_stats_serial_lock() -> PathStatsSerialGuard {
     }
 }
 
+/// Advisory-lock key for [`format_registry_serial_lock`] (#3157).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the format-registry test cluster serializes only against itself.
+const FORMAT_REGISTRY_TEST_LOCK_KEY: i64 = 0x4652_3157; // "FR" + issue #3157
+
+/// Cross-process serialization guard for the DB-backed core-format-registry
+/// tests (#3157).
+///
+/// `WasmPluginService::sync_core_format_handlers` upserts EVERY compiled-in
+/// handler row, so two of these tests running concurrently would each observe
+/// the other's rows: the test that deletes a handler row to reproduce the
+/// pre-fix state would see it reappear under a peer's sync, and the test that
+/// asserts a WASM-owned row survives a sync would race the same statement.
+/// A Postgres *session* advisory lock — mirroring [`scan_dedup_serial_lock`] —
+/// makes every such test contend for one key, so only one runs its
+/// arrange → sync → assert → restore critical section at a time. The lock
+/// releases when the guard drops (connection closes), including on panic.
+pub struct FormatRegistrySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide format-registry test lock, blocking until it is
+/// free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of a DB-backed
+/// format-registry test and bind the result for the whole test body.
+pub async fn format_registry_serial_lock() -> FormatRegistrySerialGuard {
+    FormatRegistrySerialGuard {
+        _conn: serial_lock_session(FORMAT_REGISTRY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Refresh the materialized storage stats for a test, absorbing transient
 /// cross-suite interference.
 ///

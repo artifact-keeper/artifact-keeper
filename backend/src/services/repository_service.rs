@@ -302,82 +302,16 @@ fn is_debian_flat_or_mirrorlist(url: &str) -> bool {
 /// formatting followed by `to_lowercase()` is insufficient because it
 /// drops underscores from multi-word variants (e.g., `CondaNative` becomes
 /// `"condanative"` instead of `"conda_native"`).
+///
+/// The mapping itself lives on [`RepositoryFormat::as_key`] so the format
+/// registry has one definition rather than one per consumer (#3157).
 pub(crate) fn derive_format_key(format: &RepositoryFormat) -> String {
-    match format {
-        RepositoryFormat::Maven => "maven",
-        RepositoryFormat::Gradle => "gradle",
-        RepositoryFormat::Npm => "npm",
-        RepositoryFormat::Pypi => "pypi",
-        RepositoryFormat::Nuget => "nuget",
-        RepositoryFormat::Go => "go",
-        RepositoryFormat::Rubygems => "rubygems",
-        RepositoryFormat::Docker => "docker",
-        RepositoryFormat::Helm => "helm",
-        RepositoryFormat::Rpm => "rpm",
-        RepositoryFormat::Debian => "debian",
-        RepositoryFormat::Conan => "conan",
-        RepositoryFormat::Cargo => "cargo",
-        RepositoryFormat::Generic => "generic",
-        RepositoryFormat::Podman => "podman",
-        RepositoryFormat::Buildx => "buildx",
-        RepositoryFormat::Oras => "oras",
-        RepositoryFormat::WasmOci => "wasm_oci",
-        RepositoryFormat::HelmOci => "helm_oci",
-        RepositoryFormat::Poetry => "poetry",
-        RepositoryFormat::Conda => "conda",
-        RepositoryFormat::Yarn => "yarn",
-        RepositoryFormat::Bower => "bower",
-        RepositoryFormat::Pnpm => "pnpm",
-        RepositoryFormat::Chocolatey => "chocolatey",
-        RepositoryFormat::Powershell => "powershell",
-        RepositoryFormat::Terraform => "terraform",
-        RepositoryFormat::Opentofu => "opentofu",
-        RepositoryFormat::Alpine => "alpine",
-        RepositoryFormat::CondaNative => "conda_native",
-        RepositoryFormat::Composer => "composer",
-        RepositoryFormat::Hex => "hex",
-        RepositoryFormat::Cocoapods => "cocoapods",
-        RepositoryFormat::Swift => "swift",
-        RepositoryFormat::Pub => "pub",
-        RepositoryFormat::Sbt => "sbt",
-        RepositoryFormat::Chef => "chef",
-        RepositoryFormat::Puppet => "puppet",
-        RepositoryFormat::Ansible => "ansible",
-        RepositoryFormat::Gitlfs => "gitlfs",
-        RepositoryFormat::Vscode => "vscode",
-        RepositoryFormat::Jetbrains => "jetbrains",
-        RepositoryFormat::Huggingface => "huggingface",
-        RepositoryFormat::Mlmodel => "mlmodel",
-        RepositoryFormat::Cran => "cran",
-        RepositoryFormat::Vagrant => "vagrant",
-        RepositoryFormat::Opkg => "opkg",
-        RepositoryFormat::P2 => "p2",
-        RepositoryFormat::Bazel => "bazel",
-        RepositoryFormat::Protobuf => "protobuf",
-        RepositoryFormat::Incus => "incus",
-        RepositoryFormat::Lxc => "lxc",
-    }
-    .to_string()
+    format.as_key().to_string()
 }
 
 /// Handler key a format gates on; aliases collapse to their core handler (mirrors get_handler_for_format).
 pub(crate) fn format_handler_key(format: &RepositoryFormat) -> String {
-    let key = match format {
-        RepositoryFormat::Gradle => "maven",
-        RepositoryFormat::Yarn | RepositoryFormat::Bower | RepositoryFormat::Pnpm => "npm",
-        RepositoryFormat::Poetry | RepositoryFormat::Conda => "pypi",
-        RepositoryFormat::Chocolatey | RepositoryFormat::Powershell => "nuget",
-        RepositoryFormat::Docker
-        | RepositoryFormat::Podman
-        | RepositoryFormat::Buildx
-        | RepositoryFormat::Oras
-        | RepositoryFormat::WasmOci
-        | RepositoryFormat::HelmOci => "oci",
-        RepositoryFormat::Opentofu => "terraform",
-        RepositoryFormat::Lxc => "incus",
-        other => return derive_format_key(other),
-    };
-    key.to_string()
+    format.handler_key().to_string()
 }
 
 /// Build a SQL LIKE search pattern from a user query string.

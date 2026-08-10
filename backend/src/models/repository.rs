@@ -79,6 +79,170 @@ pub enum RepositoryFormat {
     Lxc,
 }
 
+impl RepositoryFormat {
+    /// Every built-in repository format, in declaration order.
+    ///
+    /// This is the single enumeration of the variant set: `list_core_formats`,
+    /// the compiled-in format-handler registry
+    /// ([`crate::formats::core_format_handlers`]) and the test helpers all
+    /// derive from it instead of keeping their own copies. Before #3157 there
+    /// were four separate hand-written lists of formats and three of them had
+    /// silently drifted (the `format_handlers` seed in migration 014 stopped at
+    /// the original 13, `list_core_formats` was missing `gradle`, and the test
+    /// helper was missing `protobuf`/`incus`/`lxc`).
+    ///
+    /// A new variant must be added here as well. That is checked, not trusted:
+    /// `as_key`/`handler_key` are exhaustive matches (a new variant fails the
+    /// build until they are extended), and `test_all_matches_database_enum`
+    /// compares this list against `enum_range(NULL::repository_format)` — the
+    /// label set the migrations create — so an omission fails CI against an
+    /// independently maintained source rather than drifting silently.
+    pub const ALL: &'static [RepositoryFormat] = &[
+        RepositoryFormat::Maven,
+        RepositoryFormat::Gradle,
+        RepositoryFormat::Npm,
+        RepositoryFormat::Pypi,
+        RepositoryFormat::Nuget,
+        RepositoryFormat::Go,
+        RepositoryFormat::Rubygems,
+        RepositoryFormat::Docker,
+        RepositoryFormat::Helm,
+        RepositoryFormat::Rpm,
+        RepositoryFormat::Debian,
+        RepositoryFormat::Conan,
+        RepositoryFormat::Cargo,
+        RepositoryFormat::Generic,
+        RepositoryFormat::Podman,
+        RepositoryFormat::Buildx,
+        RepositoryFormat::Oras,
+        RepositoryFormat::WasmOci,
+        RepositoryFormat::HelmOci,
+        RepositoryFormat::Poetry,
+        RepositoryFormat::Conda,
+        RepositoryFormat::Yarn,
+        RepositoryFormat::Bower,
+        RepositoryFormat::Pnpm,
+        RepositoryFormat::Chocolatey,
+        RepositoryFormat::Powershell,
+        RepositoryFormat::Terraform,
+        RepositoryFormat::Opentofu,
+        RepositoryFormat::Alpine,
+        RepositoryFormat::CondaNative,
+        RepositoryFormat::Composer,
+        RepositoryFormat::Hex,
+        RepositoryFormat::Cocoapods,
+        RepositoryFormat::Swift,
+        RepositoryFormat::Pub,
+        RepositoryFormat::Sbt,
+        RepositoryFormat::Chef,
+        RepositoryFormat::Puppet,
+        RepositoryFormat::Ansible,
+        RepositoryFormat::Gitlfs,
+        RepositoryFormat::Vscode,
+        RepositoryFormat::Jetbrains,
+        RepositoryFormat::Huggingface,
+        RepositoryFormat::Mlmodel,
+        RepositoryFormat::Cran,
+        RepositoryFormat::Vagrant,
+        RepositoryFormat::Opkg,
+        RepositoryFormat::P2,
+        RepositoryFormat::Bazel,
+        RepositoryFormat::Protobuf,
+        RepositoryFormat::Incus,
+        RepositoryFormat::Lxc,
+    ];
+
+    /// The canonical snake_case key for this format.
+    ///
+    /// This is the label used by the `repository_format` Postgres enum and by
+    /// the `FormatHandler::format_key()` contract, so it is deliberately NOT
+    /// the lowercased `Debug` form: that drops the underscore in multi-word
+    /// variants (`CondaNative` would become `condanative`).
+    pub fn as_key(&self) -> &'static str {
+        match self {
+            Self::Maven => "maven",
+            Self::Gradle => "gradle",
+            Self::Npm => "npm",
+            Self::Pypi => "pypi",
+            Self::Nuget => "nuget",
+            Self::Go => "go",
+            Self::Rubygems => "rubygems",
+            Self::Docker => "docker",
+            Self::Helm => "helm",
+            Self::Rpm => "rpm",
+            Self::Debian => "debian",
+            Self::Conan => "conan",
+            Self::Cargo => "cargo",
+            Self::Generic => "generic",
+            Self::Podman => "podman",
+            Self::Buildx => "buildx",
+            Self::Oras => "oras",
+            Self::WasmOci => "wasm_oci",
+            Self::HelmOci => "helm_oci",
+            Self::Poetry => "poetry",
+            Self::Conda => "conda",
+            Self::Yarn => "yarn",
+            Self::Bower => "bower",
+            Self::Pnpm => "pnpm",
+            Self::Chocolatey => "chocolatey",
+            Self::Powershell => "powershell",
+            Self::Terraform => "terraform",
+            Self::Opentofu => "opentofu",
+            Self::Alpine => "alpine",
+            Self::CondaNative => "conda_native",
+            Self::Composer => "composer",
+            Self::Hex => "hex",
+            Self::Cocoapods => "cocoapods",
+            Self::Swift => "swift",
+            Self::Pub => "pub",
+            Self::Sbt => "sbt",
+            Self::Chef => "chef",
+            Self::Puppet => "puppet",
+            Self::Ansible => "ansible",
+            Self::Gitlfs => "gitlfs",
+            Self::Vscode => "vscode",
+            Self::Jetbrains => "jetbrains",
+            Self::Huggingface => "huggingface",
+            Self::Mlmodel => "mlmodel",
+            Self::Cran => "cran",
+            Self::Vagrant => "vagrant",
+            Self::Opkg => "opkg",
+            Self::P2 => "p2",
+            Self::Bazel => "bazel",
+            Self::Protobuf => "protobuf",
+            Self::Incus => "incus",
+            Self::Lxc => "lxc",
+        }
+    }
+
+    /// The key of the *handler* that serves this format.
+    ///
+    /// Aliases collapse onto the handler they share, mirroring
+    /// [`crate::formats::get_handler_for_format`]: `gradle` is served by the
+    /// Maven handler, every OCI alias by the `oci` handler, `lxc` by `incus`,
+    /// and so on. This is the identity the `format_handlers` table is keyed by
+    /// — the enablement gate in `RepositoryService::create` looks the row up by
+    /// this key, so it is also the correct granularity for the
+    /// enable/disable control surface.
+    pub fn handler_key(&self) -> &'static str {
+        match self {
+            Self::Gradle => "maven",
+            Self::Yarn | Self::Bower | Self::Pnpm => "npm",
+            Self::Poetry | Self::Conda => "pypi",
+            Self::Chocolatey | Self::Powershell => "nuget",
+            Self::Docker
+            | Self::Podman
+            | Self::Buildx
+            | Self::Oras
+            | Self::WasmOci
+            | Self::HelmOci => "oci",
+            Self::Opentofu => "terraform",
+            Self::Lxc => "incus",
+            other => other.as_key(),
+        }
+    }
+}
+
 /// Repository type enum
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "repository_type", rename_all = "lowercase")]

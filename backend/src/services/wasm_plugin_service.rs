@@ -189,6 +189,78 @@ impl WasmPluginService {
     // T013: Format Handler CRUD Operations
     // =========================================================================
 
+    /// Synchronise `format_handlers` with the format handlers actually
+    /// compiled into this binary (#3157).
+    ///
+    /// `format_handlers` was seeded exactly once, by migration
+    /// `014_wasm_plugins.sql`, with the 13 handlers that existed at the time.
+    /// Every format added since — `pub`, `composer`, `swift`, `hex`,
+    /// `terraform`, `protobuf`, `incus` and ~17 more — extended only the
+    /// `repository_format` enum, so `GET /api/v1/formats` under-reported the
+    /// running backend by two thirds and those formats had no row to toggle,
+    /// which silently exempted them from the enable/disable control surface
+    /// the other 13 had. Because migrations are the same on a fresh install as
+    /// on an upgrade, this was never an upgrade-only gap.
+    ///
+    /// Running the sync at startup — rather than adding another static seed
+    /// migration — makes [`crate::formats::core_format_handlers`] the source
+    /// of truth and the table an *enablement overlay* on it: whatever the
+    /// binary compiles in has a row, so the two cannot drift again.
+    ///
+    /// The upsert is deliberately narrow:
+    ///
+    /// * `is_enabled` is never written on conflict — an operator who disabled
+    ///   a handler keeps it disabled across restarts.
+    /// * rows owned by a WASM plugin (`handler_type = 'wasm'`) are left
+    ///   untouched, so a plugin that claimed a key keeps its own metadata.
+    ///
+    /// Idempotent and safe to run concurrently from several replicas.
+    pub async fn sync_core_format_handlers(&self) -> Result<u64> {
+        let mut synced = 0u64;
+        for handler in crate::formats::core_format_handlers() {
+            let extensions: Vec<String> =
+                handler.extensions.iter().map(|e| e.to_string()).collect();
+            // `generic` is the catch-all fallback handler and was seeded at
+            // priority 0 in migration 014; keep it last in the listing.
+            let priority: i32 = if handler.format_key == "generic" {
+                0
+            } else {
+                100
+            };
+
+            let result = sqlx::query(
+                r#"
+                INSERT INTO format_handlers
+                    (format_key, handler_type, display_name, description, extensions, is_enabled, priority)
+                VALUES ($1, 'core', $2, $3, $4, true, $5)
+                ON CONFLICT (format_key) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    description  = EXCLUDED.description,
+                    extensions   = EXCLUDED.extensions
+                WHERE format_handlers.handler_type = 'core'
+                "#,
+            )
+            .bind(handler.format_key)
+            .bind(handler.display_name)
+            .bind(handler.description)
+            .bind(&extensions)
+            .bind(priority)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            synced += result.rows_affected();
+        }
+
+        info!(
+            "Core format handler registry synced: {} rows written across {} compiled-in handlers",
+            synced,
+            crate::formats::core_format_handlers().len()
+        );
+
+        Ok(synced)
+    }
+
     /// List all format handlers with optional filters.
     pub async fn list_format_handlers(
         &self,
@@ -1915,6 +1987,8 @@ impl WasmPluginService {
 mod tests {
     use super::*;
 
+    use crate::models::repository::RepositoryFormat;
+
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)
     // -----------------------------------------------------------------------
@@ -2900,5 +2974,230 @@ timeout_secs = 30
     #[test]
     fn test_signature_gate_required_valid_sig_ok() {
         assert!(signature_gate(true, Some("key"), true, true).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Core format handler registry sync (#3157)
+    //
+    // `format_handlers` was seeded once by migration 014 with 13 handlers and
+    // never extended, so `GET /api/v1/formats` under-reported the running
+    // backend by ~24 handlers (including `pub`) and those handlers had no row
+    // to enable/disable. `sync_core_format_handlers` projects the compiled-in
+    // registry into the table at startup.
+    // -----------------------------------------------------------------------
+
+    /// Connect to the test database when `DATABASE_URL` is set; otherwise
+    /// return `None` so the test skips cleanly. A connect failure under
+    /// `AK_TESTS_REQUIRE_DB` panics rather than fiction-greening (#2924).
+    async fn try_pool() -> Option<PgPool> {
+        crate::testing::try_pool_with(3).await
+    }
+
+    /// Build a service bound to `pool`. The plugin registry is real but no
+    /// WASM plugin is loaded, which is exactly the shape a fresh install has.
+    fn format_sync_service(pool: PgPool) -> WasmPluginService {
+        let registry = Arc::new(PluginRegistry::new().expect("plugin registry"));
+        WasmPluginService::new(
+            pool,
+            registry,
+            std::env::temp_dir().join("ak-3157-plugins"),
+            false,
+            None,
+        )
+    }
+
+    /// Format keys present in the listing.
+    async fn listed_keys(svc: &WasmPluginService) -> std::collections::HashSet<String> {
+        svc.list_format_handlers(None, None)
+            .await
+            .expect("list format handlers")
+            .into_iter()
+            .map(|h| h.format_key)
+            .collect()
+    }
+
+    /// Restore the pre-fix state for `keys`: delete the core rows so the table
+    /// holds only what migration 014 seeded.
+    async fn delete_core_rows(pool: &PgPool, keys: &[&str]) {
+        for key in keys {
+            sqlx::query(
+                "DELETE FROM format_handlers WHERE format_key = $1 AND handler_type = 'core'",
+            )
+            .bind(key)
+            .execute(pool)
+            .await
+            .expect("delete core format handler row");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repository_format_all_matches_the_database_enum() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+
+        // Independent oracle: the `repository_format` labels are created by
+        // the migrations, a source maintained separately from the Rust enum.
+        // If a format is added to one and not the other, this fails — which is
+        // the drift that produced #3157 in the first place.
+        let db_labels: Vec<String> = sqlx::query_scalar(
+            "SELECT e.enumlabel::text FROM pg_enum e \
+             JOIN pg_type t ON t.oid = e.enumtypid \
+             WHERE t.typname = 'repository_format'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read repository_format enum labels");
+
+        let db: std::collections::HashSet<String> = db_labels.into_iter().collect();
+        let rust: std::collections::HashSet<String> = RepositoryFormat::ALL
+            .iter()
+            .map(|f| f.as_key().to_string())
+            .collect();
+
+        assert!(!db.is_empty(), "repository_format enum has no labels");
+        let missing_in_rust: Vec<_> = db.difference(&rust).collect();
+        let missing_in_db: Vec<_> = rust.difference(&db).collect();
+        assert!(
+            missing_in_rust.is_empty(),
+            "repository_format labels absent from RepositoryFormat::ALL: {:?}",
+            missing_in_rust
+        );
+        assert!(
+            missing_in_db.is_empty(),
+            "RepositoryFormat::ALL entries with no repository_format label: {:?}",
+            missing_in_db
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_core_format_handlers_lists_formats_the_014_seed_missed() {
+        let _guard = crate::api::handlers::test_db_helpers::format_registry_serial_lock().await;
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let svc = format_sync_service(pool.clone());
+
+        // Arrange: the pre-fix state — only what migration 014 seeded.
+        let after_seed = ["pub", "composer", "swift", "protobuf", "incus", "terraform"];
+        delete_core_rows(&pool, &after_seed).await;
+
+        let before = listed_keys(&svc).await;
+        // Positive control in the same fixture: the listing itself works, so
+        // the absence below is a real gap and not an empty/failing endpoint.
+        assert!(
+            before.contains("maven"),
+            "listing is broken: even the seeded 'maven' handler is missing"
+        );
+        for key in after_seed {
+            assert!(
+                !before.contains(key),
+                "fixture did not reproduce the bug: '{}' is already listed",
+                key
+            );
+        }
+
+        // Act.
+        svc.sync_core_format_handlers()
+            .await
+            .expect("sync core format handlers");
+
+        // Assert: every compiled-in handler is now listed.
+        let after = listed_keys(&svc).await;
+        for key in after_seed {
+            assert!(
+                after.contains(key),
+                "'{}' is compiled in but still missing from GET /api/v1/formats",
+                key
+            );
+        }
+        // The originally seeded handlers survive the sync.
+        for key in ["maven", "npm", "oci", "generic"] {
+            assert!(after.contains(key), "sync dropped seeded handler '{}'", key);
+        }
+        assert!(
+            after.len() >= crate::formats::core_format_handlers().len(),
+            "listing ({}) is smaller than the compiled-in registry ({})",
+            after.len(),
+            crate::formats::core_format_handlers().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_core_format_handlers_preserves_operator_disable() {
+        let _guard = crate::api::handlers::test_db_helpers::format_registry_serial_lock().await;
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let svc = format_sync_service(pool.clone());
+
+        svc.sync_core_format_handlers().await.expect("initial sync");
+
+        // A format added after the 014 seed had no row, so it could not be
+        // disabled at all. It must be togglable now...
+        let disabled = svc
+            .disable_format_handler("cran")
+            .await
+            .expect("disable a handler that the 014 seed never created");
+        assert!(!disabled.is_enabled);
+
+        // ...and the choice must survive the next restart's sync.
+        svc.sync_core_format_handlers()
+            .await
+            .expect("re-sync after disable");
+        let after = svc
+            .get_format_handler("cran")
+            .await
+            .expect("handler still present");
+        assert!(
+            !after.is_enabled,
+            "sync re-enabled a handler the operator had disabled"
+        );
+
+        // Restore.
+        svc.enable_format_handler("cran")
+            .await
+            .expect("re-enable handler");
+    }
+
+    #[tokio::test]
+    async fn test_sync_core_format_handlers_leaves_wasm_owned_rows_alone() {
+        let _guard = crate::api::handlers::test_db_helpers::format_registry_serial_lock().await;
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let svc = format_sync_service(pool.clone());
+
+        // A WASM plugin that claimed a key must keep its own metadata: the
+        // sync only owns rows it created.
+        delete_core_rows(&pool, &["hex"]).await;
+        sqlx::query(
+            "INSERT INTO format_handlers (format_key, handler_type, display_name, description, extensions, is_enabled, priority) \
+             VALUES ('hex', 'wasm', 'Plugin Hex', 'installed by a plugin', ARRAY[]::TEXT[], true, 10) \
+             ON CONFLICT (format_key) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed wasm-owned row");
+
+        svc.sync_core_format_handlers()
+            .await
+            .expect("sync core format handlers");
+
+        let row = svc.get_format_handler("hex").await.expect("hex row");
+        assert_eq!(
+            row.display_name, "Plugin Hex",
+            "sync overwrote a WASM-owned format handler row"
+        );
+        assert_eq!(row.handler_type, FormatHandlerType::Wasm);
+
+        // Restore the core row for the rest of the suite.
+        sqlx::query("DELETE FROM format_handlers WHERE format_key = 'hex'")
+            .execute(&pool)
+            .await
+            .expect("drop test row");
+        svc.sync_core_format_handlers()
+            .await
+            .expect("restore core rows");
     }
 }

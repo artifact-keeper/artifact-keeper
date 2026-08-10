@@ -1374,6 +1374,19 @@ async fn initialize_wasm_plugins(
     // Ensure plugins directory exists
     wasm_service.ensure_plugins_dir().await?;
 
+    // Project the compiled-in format handler registry into `format_handlers`
+    // so the table describes the handlers this binary actually provides
+    // (#3157). Idempotent; never overwrites an operator's enable/disable
+    // choice or a WASM plugin's own row.
+    match wasm_service.sync_core_format_handlers().await {
+        Ok(rows) => tracing::info!("Core format handlers synchronized ({} rows)", rows),
+        Err(e) => {
+            // The registry listing degrades to whatever is already in the
+            // table; that is not a reason to refuse to serve traffic.
+            tracing::error!("Failed to synchronize core format handlers: {}", e);
+        }
+    }
+
     // Load active plugins from database
     let active_plugins = load_active_plugins(&db_pool).await?;
 
