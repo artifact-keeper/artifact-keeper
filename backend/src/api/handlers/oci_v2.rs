@@ -3123,6 +3123,10 @@ pub async fn resolve_virtual_manifest(
                             &upstream_path,
                             accept,
                             proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                            // #3206 / #2069 bug 1: the member's REAL format, so
+                            // its digest-addressed manifest cache entries keep
+                            // the immutable TTL (parity with the blob arm).
+                            member.format.clone(),
                         )
                         .await
                     {
@@ -3481,6 +3485,9 @@ async fn try_upstream_fetch_with_accept(
     // `_with_accept` sibling that could forward the content-negotiation `Accept`
     // header. Blob downloads no longer flow through here: the Remote GET-blob
     // path streams via `try_upstream_fetch_streaming_blob`.
+    // #3206: pass the real Docker format so digest-addressed manifests
+    // (`v2/<image>/manifests/sha256:...`) classify immutable in the proxy
+    // cache instead of inheriting Generic's 5-minute mutable TTL.
     proxy_helpers::proxy_fetch_capped_with_accept(
         proxy,
         repo.id,
@@ -3489,6 +3496,7 @@ async fn try_upstream_fetch_with_accept(
         &upstream_path,
         accept,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        RepositoryFormat::Docker,
     )
     .await
     .ok()
@@ -27266,5 +27274,529 @@ mod content_encoding_forwarding_tests {
         );
         assert_eq!(&get_body[..], &coded[..], "GET must stream the coded layer");
         assert!(head_body.is_empty(), "HEAD must carry no body");
+    }
+}
+
+/// #3206: a Docker Remote repository must behave as a pull-through cache.
+///
+/// Three guards, matching the failure modes behind the issue:
+///
+/// * a layer blob pulled once through the proxy must be PERSISTED locally and
+///   a second pull of the same digest served from the cache without another
+///   upstream fetch (the issue's headline symptom);
+/// * a previously pulled image (manifests + config + layers) must remain
+///   retrievable when the upstream registry is DOWN (the issue's stated
+///   operational requirement);
+/// * the persisted cache entries must carry the TTL class the OCI spec
+///   implies — content-addressed blob/manifest paths immutable, tag paths
+///   mutable. The 1.5.x root cause of #3206 was exactly this classification:
+///   every handler-synthesized proxy repo was `Generic`, so
+///   `cache_classifier::classify` fell back to the 5-minute mutable TTL and
+///   every cached layer expired minutes after the pull (fixed for the
+///   streaming blob arm by #2312; the buffered manifest arm is fixed here).
+#[cfg(test)]
+mod remote_pull_through_cache_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn insert_public_remote_repo(pool: &sqlx::PgPool, upstream: &str) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("ocptc{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, \
+             upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote'::repository_type, 'docker'::repository_format, \
+             $4, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("/tmp/oci-ptc-{}", id))
+        .bind(upstream)
+        .execute(pool)
+        .await
+        .expect("insert repo");
+        (id, key)
+    }
+
+    fn anon_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer anonymous"),
+        );
+        h
+    }
+
+    fn sha_of(bytes: &[u8]) -> String {
+        format!(
+            "sha256:{}",
+            crate::api::handlers::proxy_helpers::sha256_hex(&bytes::Bytes::copy_from_slice(bytes))
+        )
+    }
+
+    async fn drain_ok(resp: Response, what: &str) -> Vec<u8> {
+        let (status, body, _h) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK, "{what} must succeed");
+        body.to_vec()
+    }
+
+    /// Bounded wait for the background cache writer to commit `sidecar`.
+    ///
+    /// Presence is polled, never asserted: BOTH the fixed and the pre-fix
+    /// code write the sidecar (they differ in its TTL / in what a later pull
+    /// does), so this barrier is reachable under either shape and a revert
+    /// fails on the claim under test, not on the barrier.
+    async fn await_sidecar(sidecar: &std::path::Path) {
+        for _ in 0..100 {
+            if sidecar.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Parse a cache sidecar and return `expires_at - cached_at` in seconds.
+    fn sidecar_ttl_secs(sidecar: &std::path::Path) -> i64 {
+        let raw = std::fs::read(sidecar)
+            .unwrap_or_else(|e| panic!("sidecar {} must exist: {e}", sidecar.display()));
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar JSON");
+        let cached_at = chrono::DateTime::parse_from_rfc3339(
+            v["cached_at"].as_str().expect("cached_at"),
+        )
+        .expect("cached_at rfc3339");
+        let expires_at = chrono::DateTime::parse_from_rfc3339(
+            v["expires_at"].as_str().expect("expires_at"),
+        )
+        .expect("expires_at rfc3339");
+        (expires_at - cached_at).num_seconds()
+    }
+
+    /// The issue's headline symptom: a pulled layer must be served from the
+    /// local cache on the next pull, without a second upstream fetch. The
+    /// mock's `.expect(1)` plus the explicit received-request count are the
+    /// positive control — a "fix" that re-fetched every time would fail here,
+    /// and a broken serve path would fail the body assertions.
+    #[tokio::test]
+    async fn remote_blob_second_pull_is_served_from_cache_without_upstream_refetch() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let layer: Vec<u8> = b"pull-through layer payload #3206. ".repeat(64);
+        let digest = sha_of(&layer);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (repo_id, repo_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        let tmp = std::env::temp_dir().join(format!("oci-ptc-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let image = format!("{repo_key}/myimage");
+
+        // First pull: cache miss, streamed from upstream (teed into the cache).
+        let first = drain_ok(
+            super::handle_get_blob(&state, &anon_headers(), "http://ak.test", &image, &digest)
+                .await,
+            "first blob pull",
+        )
+        .await;
+        assert_eq!(&first[..], &layer[..], "first pull must stream the layer");
+
+        await_sidecar(&tmp.join(format!(
+            "proxy-cache/{repo_key}/v2/myimage/blobs/{digest}/__cache_meta__.json"
+        )))
+        .await;
+
+        // Second pull of the same digest: must come from the local cache.
+        let second = drain_ok(
+            super::handle_get_blob(&state, &anon_headers(), "http://ak.test", &image, &digest)
+                .await,
+            "second blob pull",
+        )
+        .await;
+
+        let received = server.received_requests().await.unwrap_or_default();
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(&second[..], &layer[..], "second pull must serve the layer");
+        assert_eq!(
+            received.len(),
+            1,
+            "second pull must be served from the local cache without an upstream fetch"
+        );
+    }
+
+    /// The issue's operational requirement: after one full `docker pull`
+    /// (HEAD tag, GET index by tag, GET child manifest by digest, GET config
+    /// + layer blobs), the SAME pull must succeed with the upstream registry
+    /// dead — every piece served from local persistence.
+    #[tokio::test]
+    async fn full_docker_pull_survives_upstream_outage() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let layer: Vec<u8> = b"layer bytes for the outage guard. ".repeat(64);
+        let config: Vec<u8> = br#"{"architecture":"amd64","os":"linux"}"#.to_vec();
+        let layer_digest = sha_of(&layer);
+        let config_digest = sha_of(&config);
+        let child = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": layer.len(),
+            }],
+        })
+        .to_string()
+        .into_bytes();
+        let child_digest = sha_of(&child);
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": child_digest,
+                "size": child.len(),
+                "platform": {"architecture": "amd64", "os": "linux"},
+            }],
+        })
+        .to_string()
+        .into_bytes();
+
+        let server = MockServer::start().await;
+        for (path, body, ct) in [
+            (
+                "/v2/myimage/manifests/v1".to_string(),
+                index.clone(),
+                "application/vnd.oci.image.index.v1+json",
+            ),
+            (
+                format!("/v2/myimage/manifests/{child_digest}"),
+                child.clone(),
+                "application/vnd.oci.image.manifest.v1+json",
+            ),
+            (
+                format!("/v2/myimage/blobs/{config_digest}"),
+                config.clone(),
+                "application/octet-stream",
+            ),
+            (
+                format!("/v2/myimage/blobs/{layer_digest}"),
+                layer.clone(),
+                "application/octet-stream",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(wm_path(path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", ct)
+                        .set_body_bytes(body),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let (repo_id, repo_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        let tmp = std::env::temp_dir().join(format!("oci-ptc-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let image = format!("{repo_key}/myimage");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        // ---- Cold pull (upstream up), the sequence a docker client issues.
+        let head =
+            super::handle_head_manifest(&state, &anon_headers(), "http://ak.test", &image, "v1")
+                .await;
+        assert_eq!(head.status(), StatusCode::OK, "cold HEAD tag");
+        for (reference, expect, what) in [
+            ("v1", &index, "cold GET index by tag"),
+            (child_digest.as_str(), &child, "cold GET child manifest"),
+        ] {
+            let body = drain_ok(
+                super::handle_get_manifest(
+                    &state,
+                    &anon_headers(),
+                    "http://ak.test",
+                    &image,
+                    reference,
+                    &ctx,
+                )
+                .await,
+                what,
+            )
+            .await;
+            assert_eq!(&body[..], &expect[..], "{what}: bytes");
+        }
+        for (digest, expect, what) in [
+            (&config_digest, &config, "cold GET config blob"),
+            (&layer_digest, &layer, "cold GET layer blob"),
+        ] {
+            let body = drain_ok(
+                super::handle_get_blob(&state, &anon_headers(), "http://ak.test", &image, digest)
+                    .await,
+                what,
+            )
+            .await;
+            assert_eq!(&body[..], &expect[..], "{what}: bytes");
+        }
+
+        for digest in [&config_digest, &layer_digest] {
+            await_sidecar(&tmp.join(format!(
+                "proxy-cache/{repo_key}/v2/myimage/blobs/{digest}/__cache_meta__.json"
+            )))
+            .await;
+        }
+
+        // ---- Upstream outage.
+        drop(server);
+
+        // ---- Same pull again: everything must be served locally.
+        let head2 =
+            super::handle_head_manifest(&state, &anon_headers(), "http://ak.test", &image, "v1")
+                .await;
+        let mut results: Vec<(String, StatusCode, Vec<u8>, Vec<u8>)> = Vec::new();
+        for (reference, expect, what) in [
+            ("v1", &index, "warm GET index by tag (outage)"),
+            (
+                child_digest.as_str(),
+                &child,
+                "warm GET child manifest (outage)",
+            ),
+        ] {
+            let resp = super::handle_get_manifest(
+                &state,
+                &anon_headers(),
+                "http://ak.test",
+                &image,
+                reference,
+                &ctx,
+            )
+            .await;
+            let (status, body, _h) = tdh::collect_response(resp).await;
+            results.push((what.to_string(), status, body.to_vec(), expect.to_vec()));
+        }
+        for (digest, expect, what) in [
+            (&config_digest, &config, "warm GET config blob (outage)"),
+            (&layer_digest, &layer, "warm GET layer blob (outage)"),
+        ] {
+            let resp = super::handle_get_blob(
+                &state,
+                &anon_headers(),
+                "http://ak.test",
+                &image,
+                digest,
+            )
+            .await;
+            let (status, body, _h) = tdh::collect_response(resp).await;
+            results.push((what.to_string(), status, body.to_vec(), expect.to_vec()));
+        }
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            head2.status(),
+            StatusCode::OK,
+            "warm HEAD tag (outage) must resolve locally"
+        );
+        for (what, status, body, expect) in results {
+            assert_eq!(status, StatusCode::OK, "{what} must succeed");
+            assert_eq!(&body[..], &expect[..], "{what}: bytes");
+        }
+    }
+
+    /// TTL-classification pin — the root cause of #3206.
+    ///
+    /// Content-addressed cache entries (blobs and digest-addressed manifests,
+    /// OCI distribution-spec content-addressable identities) must be written
+    /// with the immutable TTL; the tag-addressed manifest must keep a short
+    /// mutable TTL (tags move — this arm is the negative control that a
+    /// blanket "everything immutable" bug cannot satisfy).
+    ///
+    /// Pre-#2312 (≤ v1.5.8) every handler-synthesized proxy repo was Generic,
+    /// so blob entries expired after 300 s and every later pull re-downloaded
+    /// every layer from the upstream — the reported behavior. The digest-
+    /// manifest arm pins the same fix on the buffered manifest path.
+    #[tokio::test]
+    async fn proxied_oci_content_addressed_entries_cache_as_immutable() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        const IMMUTABLE_FLOOR_SECS: i64 = 30 * 24 * 3600; // >= 30 days
+        const MUTABLE_CEIL_SECS: i64 = 24 * 3600; // <= 1 day
+
+        let layer: Vec<u8> = b"ttl classification layer #3206. ".repeat(64);
+        let layer_digest = sha_of(&layer);
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": sha_of(b"{}"),
+                "size": 2,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": layer.len(),
+            }],
+        })
+        .to_string()
+        .into_bytes();
+        let manifest_digest = sha_of(&manifest);
+
+        let server = MockServer::start().await;
+        for path in [
+            format!("/v2/myimage/manifests/{manifest_digest}"),
+            "/v2/myimage/manifests/v1".to_string(),
+        ] {
+            Mock::given(method("GET"))
+                .and(wm_path(path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header(
+                            "content-type",
+                            "application/vnd.oci.image.manifest.v1+json",
+                        )
+                        .set_body_bytes(manifest.clone()),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{layer_digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let (repo_id, repo_key) = insert_public_remote_repo(&pool, &server.uri()).await;
+        let tmp = std::env::temp_dir().join(format!("oci-ptc-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let image = format!("{repo_key}/myimage");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        // Digest-addressed manifest FIRST: once a tag pull has cached the
+        // manifest locally, a later by-digest GET resolves locally and never
+        // writes the proxy-cache entry under test.
+        drain_ok(
+            super::handle_get_manifest(
+                &state,
+                &anon_headers(),
+                "http://ak.test",
+                &image,
+                &manifest_digest,
+                &ctx,
+            )
+            .await,
+            "cold GET manifest by digest",
+        )
+        .await;
+        drain_ok(
+            super::handle_get_manifest(
+                &state,
+                &anon_headers(),
+                "http://ak.test",
+                &image,
+                "v1",
+                &ctx,
+            )
+            .await,
+            "cold GET manifest by tag",
+        )
+        .await;
+        drain_ok(
+            super::handle_get_blob(
+                &state,
+                &anon_headers(),
+                "http://ak.test",
+                &image,
+                &layer_digest,
+            )
+            .await,
+            "cold GET layer blob",
+        )
+        .await;
+
+        let digest_manifest_sidecar = tmp.join(format!(
+            "proxy-cache/{repo_key}/v2/myimage/manifests/{manifest_digest}/__cache_meta__.json"
+        ));
+        let tag_manifest_sidecar = tmp.join(format!(
+            "proxy-cache/{repo_key}/v2/myimage/manifests/v1/__cache_meta__.json"
+        ));
+        let blob_sidecar = tmp.join(format!(
+            "proxy-cache/{repo_key}/v2/myimage/blobs/{layer_digest}/__cache_meta__.json"
+        ));
+        for sidecar in [
+            &digest_manifest_sidecar,
+            &tag_manifest_sidecar,
+            &blob_sidecar,
+        ] {
+            await_sidecar(sidecar).await;
+        }
+
+        let digest_manifest_ttl = sidecar_ttl_secs(&digest_manifest_sidecar);
+        let tag_manifest_ttl = sidecar_ttl_secs(&tag_manifest_sidecar);
+        let blob_ttl = sidecar_ttl_secs(&blob_sidecar);
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            blob_ttl >= IMMUTABLE_FLOOR_SECS,
+            "a content-addressed blob cache entry must be immutable \
+             (OCI distribution-spec content addressability); got {blob_ttl}s — \
+             the 5-minute TTL is the ≤1.5.8 regression behind #3206"
+        );
+        assert!(
+            digest_manifest_ttl >= IMMUTABLE_FLOOR_SECS,
+            "a digest-addressed manifest cache entry must be immutable \
+             (OCI distribution-spec content addressability); got \
+             {digest_manifest_ttl}s — the buffered manifest arm still \
+             synthesizing a Generic-format repo reintroduces the #3206 class"
+        );
+        assert!(
+            tag_manifest_ttl <= MUTABLE_CEIL_SECS,
+            "a tag-addressed manifest must stay mutable (tags move); got \
+             {tag_manifest_ttl}s — this negative control keeps the immutable \
+             assertions honest"
+        );
     }
 }

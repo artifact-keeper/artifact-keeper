@@ -621,6 +621,17 @@ pub async fn proxy_fetch_capped(
 
 /// Byte-ceiling-bounded sibling of [`proxy_fetch_with_accept`] (#1608 Phase 4b /
 /// #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+///
+/// Takes the repository's real `format` (#3206, completing #2312 for the
+/// buffered arm): this helper serves the OCI manifest proxy paths, whose
+/// digest-addressed cache paths (`v2/<image>/manifests/sha256:...`) are
+/// content-addressed and classify immutable — but only when the synthesized
+/// [`Repository`] carries the real format. The pre-#2312 `Generic` synthesis
+/// made `cache_classifier::classify` fall back to the mutable 5-minute TTL,
+/// which on the (then-unthreaded) blob path was the root cause of #3206:
+/// every cached OCI layer expired 5 minutes after the pull and each later
+/// pull re-downloaded every layer from the upstream registry.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_capped_with_accept(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -629,13 +640,13 @@ pub async fn proxy_fetch_capped_with_accept(
     path: &str,
     accept: Option<&str>,
     max: usize,
+    format: RepositoryFormat,
 ) -> Result<(Bytes, Option<String>), Response> {
-    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
-        proxy_service
-            .fetch_artifact_with_accept_capped(&repo, path, accept, max)
-            .await
-    })
-    .await
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    proxy_service
+        .fetch_artifact_with_accept_capped(&repo, path, accept, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))
 }
 
 /// Budget-reserving sibling of [`proxy_fetch_capped`] (#2684).
