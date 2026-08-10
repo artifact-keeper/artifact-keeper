@@ -466,6 +466,16 @@ pub(crate) enum ExtractedToken<'a> {
 fn extract_token_from_auth_header(auth_header: &str) -> ExtractedToken<'_> {
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
         ExtractedToken::Bearer(token)
+    } else if let Some(token) = auth_header.strip_prefix("Token ") {
+        // `ansible-galaxy` authenticates Galaxy API calls with
+        // `Authorization: Token <api_key>` — ansible-core
+        // `lib/ansible/galaxy/token.py` sets `GalaxyToken.token_type = 'Token'`
+        // and builds the header as `'%s %s' % (self.token_type, self.get())`;
+        // only its Keycloak/Automation-Hub variant uses `Bearer`. Treat the
+        // `Token` scheme as Bearer-equivalent so the credential flows through
+        // the same JWT → API-token validation chain instead of being rejected
+        // as a malformed header (#3137).
+        ExtractedToken::Bearer(token)
     } else if let Some(token) = auth_header.strip_prefix("ApiKey ") {
         ExtractedToken::ApiKey(token)
     } else if let Some(creds) = auth_header
@@ -2090,6 +2100,16 @@ mod tests {
     fn test_extract_apikey_token() {
         let result = extract_token_from_auth_header("ApiKey ak_secret_key");
         assert!(matches!(result, ExtractedToken::ApiKey("ak_secret_key")));
+    }
+
+    #[test]
+    fn test_3137_extract_galaxy_token_scheme_as_bearer() {
+        // `ansible-galaxy` sends `Authorization: Token <api_key>` (ansible-core
+        // lib/ansible/galaxy/token.py, `GalaxyToken.token_type = 'Token'`).
+        // The scheme must resolve as Bearer-equivalent instead of Invalid,
+        // which surfaced as 401 on every authenticated Galaxy call (#3137).
+        let result = extract_token_from_auth_header("Token my-api-token-123");
+        assert!(matches!(result, ExtractedToken::Bearer("my-api-token-123")));
     }
 
     #[test]
@@ -4909,6 +4929,63 @@ mod tests {
             ),
             other => panic!("expected Resolved(is_api_token) on the format path, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_3137_galaxy_token_scheme_authenticates_api_token() {
+        // The `ansible-galaxy` CLI authenticates every Galaxy API call with
+        // `Authorization: Token <api_key>` (ansible-core
+        // lib/ansible/galaxy/token.py, `GalaxyToken`). Drive the exact header
+        // bytes the CLI sends through the same extract → resolve chain
+        // `repo_visibility_middleware` uses for /ansible/* requests: the
+        // credential must resolve to the token owner rather than being
+        // rejected as a malformed Authorization header (#3137).
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "galaxy", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+
+        let request = Request::builder()
+            .uri("/ansible/galaxy/api")
+            .header(AUTHORIZATION, format!("Token {token}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let outcome = try_resolve_auth_outcome(&auth_service, extract_token(&request), true).await;
+
+        // Negative control, same fixture: a bogus credential under the same
+        // scheme must stay rejected — recognizing `Token` must not fail open.
+        let bad_request = Request::builder()
+            .uri("/ansible/galaxy/api")
+            .header(AUTHORIZATION, "Token not-a-valid-credential")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let bad_outcome =
+            try_resolve_auth_outcome(&auth_service, extract_token(&bad_request), true).await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        match outcome {
+            AuthOutcome::Resolved(ext) => assert!(
+                ext.is_api_token,
+                "Token-scheme credential must resolve to the API-token owner"
+            ),
+            other => panic!("expected Resolved for `Token <valid_api_key>`, got {other:?}"),
+        }
+        assert!(
+            matches!(bad_outcome, AuthOutcome::InvalidCredential),
+            "an invalid credential under the Token scheme must stay rejected"
+        );
     }
 
     #[tokio::test]

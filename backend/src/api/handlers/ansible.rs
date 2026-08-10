@@ -3,7 +3,7 @@
 //! Implements the endpoints required for Ansible collection management.
 //!
 //! Routes are mounted at `/ansible/{repo_key}/...`:
-//!   GET  /ansible/{repo_key}/api/                                                      - API version discovery
+//!   GET  /ansible/{repo_key}/api[/]                                                    - API version discovery
 //!   GET  /ansible/{repo_key}/api/v3/                                                   - v3 service index
 //!   GET  /ansible/{repo_key}/api/v3/collections/                                      - List collections
 //!   GET  /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/                   - Collection info
@@ -13,9 +13,15 @@
 //!   POST /ansible/{repo_key}/api/v3/artifacts/collections/                             - Upload collection
 //!
 //! The discovery endpoints are required by the `ansible-galaxy` CLI: before
-//! any other call it performs `GET <server_url>/api/` to negotiate which
+//! any other call it performs `GET <server_url>/api` to negotiate which
 //! Galaxy API version to use. Without it the CLI aborts with
 //! `Error when finding available api versions (HTTP Code: 404, Message: Not Found)`.
+//!
+//! Note the discovery URL has NO trailing slash on the wire: ansible-core's
+//! `g_connect` builds it as `_urljoin(n_url, '/api/')` and `_urljoin` strips
+//! `/` from every component (`lib/ansible/galaxy/api.py`), so the client
+//! requests `<server_url>/api`. All later v3 URLs get an explicit `+ '/'`,
+//! which is why only the discovery route needs both spellings (#3137).
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
@@ -43,6 +49,13 @@ use crate::formats::ansible::AnsibleHandler;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
+        // Both spellings of the discovery endpoint: `ansible-galaxy` requests
+        // `<server>/api` WITHOUT a trailing slash (see module docs), while
+        // axum matches `/api` and `/api/` as distinct routes. Registering only
+        // the trailing-slash form 404s the CLI's version negotiation and the
+        // install/publish flow dies before reaching any collection endpoint
+        // (#3137).
+        .route("/:repo_key/api", get(api_root))
         .route("/:repo_key/api/", get(api_root))
         .route("/:repo_key/api/v3/", get(api_v3_root))
         .route("/:repo_key/api/v3/collections/", get(list_collections))
@@ -931,6 +944,45 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["current_version"], "v3");
         assert_eq!(json["available_versions"]["v3"], "v3/");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_3137_api_discovery_without_trailing_slash() {
+        // `ansible-galaxy` requests the discovery document at `<server>/api`
+        // with NO trailing slash: ansible-core's `g_connect` builds the URL as
+        // `_urljoin(n_url, '/api/')` and `_urljoin` strips `/` from every
+        // component (lib/ansible/galaxy/api.py). With only the `/api/` route
+        // registered, the CLI's version negotiation 404s and every
+        // install/publish attempt fails before touching a collection endpoint
+        // (#3137).
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(app.clone(), tdh::get(format!("/{}/api", f.repo_key))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET /api without trailing slash must serve the discovery document"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The CLI negotiates from the `available_versions` keys.
+        assert!(
+            json["available_versions"].get("v3").is_some(),
+            "discovery must advertise v3"
+        );
+
+        // Positive control, same fixture: the trailing-slash spelling that
+        // worked before this fix must keep working.
+        let (status_slash, _) = tdh::send(app, tdh::get(format!("/{}/api/", f.repo_key))).await;
+        assert_eq!(status_slash, StatusCode::OK);
+
+        // Unknown repo must still 404 on the no-slash spelling too (the alias
+        // must not bypass repo resolution).
+        let app2 = f.router_anon(super::router());
+        let (status_missing, _) = tdh::send(app2, tdh::get("/no-such-repo/api".into())).await;
+        assert_eq!(status_missing, StatusCode::NOT_FOUND);
         f.teardown().await;
     }
 
