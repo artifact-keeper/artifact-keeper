@@ -368,34 +368,37 @@ async fn try_proxy_go_metadata(
     upstream_path: &str,
     default_content_type: &str,
 ) -> Result<Response, ()> {
-    // Remote repo: proxy to upstream
+    // Remote repo: proxy to upstream. The upstream body is forwarded
+    // VERBATIM (`.info` JSON / `.mod` bytes as the upstream served them), so
+    // the upstream `Content-Encoding` must be re-declared when present
+    // (RFC 9110 §8.4, #3260) — nothing on this path decodes.
     if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
-                proxy,
-                repo.id,
-                &repo.key,
-                upstream_url,
-                upstream_path,
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await
+            if let Ok((content, content_type, content_encoding)) =
+                proxy_helpers::proxy_fetch_capped_encoded(
+                    proxy,
+                    repo.id,
+                    &repo.key,
+                    upstream_url,
+                    upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                )
+                .await
             {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| default_content_type.to_string()),
-                    )
-                    .body(Body::from(content))
-                    .unwrap());
+                return Ok(proxy_helpers::forward_verbatim_metadata(
+                    content,
+                    content_type,
+                    default_content_type,
+                    content_encoding,
+                ));
             }
         }
     }
 
-    // Virtual repo: try each member in priority order
+    // Virtual repo: try each member in priority order. Same verbatim-forward
+    // contract as the Remote arm above: the member's coding is re-declared.
     if repo.repo_type == RepositoryType::Virtual {
         let ct = default_content_type.to_string();
         if let Ok(resp) = proxy_helpers::resolve_virtual_metadata(
@@ -403,14 +406,15 @@ async fn try_proxy_go_metadata(
             state.proxy_service.as_deref(),
             repo.id,
             upstream_path,
-            |bytes, _key| {
+            |bytes, content_encoding, _key| {
                 let ct = ct.clone();
                 async move {
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, ct)
-                        .body(Body::from(bytes))
-                        .unwrap())
+                    Ok(proxy_helpers::forward_verbatim_metadata(
+                        bytes,
+                        None,
+                        &ct,
+                        content_encoding,
+                    ))
                 }
             },
         )
@@ -448,6 +452,12 @@ fn filter_version_list(body: &str, blocked: &std::collections::HashSet<String>) 
 /// source id is what the age-gate listing filter resolves policy from: for a
 /// virtual repository each member's own gate configuration governs its
 /// contribution (#2264).
+///
+/// Deliberately DROPS the upstream `Content-Encoding` (#3260): every caller
+/// PARSES the returned body (`@v/list` line filtering, `@latest` JSON) and
+/// serves a document it rebuilt itself, so the upstream coding never
+/// describes the bytes that leave the handler. Verbatim forwards go through
+/// [`try_proxy_go_metadata`] / `get_mod_file`, which re-declare the coding.
 async fn fetch_go_metadata_with_source(
     state: &SharedState,
     repo: &RepoInfo,
@@ -623,7 +633,8 @@ async fn enforce_go_zip_age_gate(
 
 /// Positive existence evidence for `module@version`: the upstream serves its
 /// `.info` document. Failures are treated as "no evidence" — the gate then
-/// blocks without starting a clock, never the reverse.
+/// blocks without starting a clock, never the reverse. The body (and hence
+/// its `Content-Encoding`, #3260) is discarded: only reachability matters.
 async fn go_version_exists_upstream(
     state: &SharedState,
     params: &crate::services::age_gate_service::AgeGateRepoParams,
@@ -878,24 +889,26 @@ async fn get_mod_file(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
+                    // Verbatim forward of the upstream go.mod bytes: the
+                    // upstream `Content-Encoding` must be re-declared when
+                    // present (RFC 9110 §8.4, #3260).
                     let upstream_path = build_go_upstream_path(module, version, "mod");
-                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
-                        proxy,
-                        repo.id,
-                        &repo.key,
-                        upstream_url,
-                        &upstream_path,
-                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "text/plain; charset=utf-8".to_string()),
+                    let (content, content_type, content_encoding) =
+                        proxy_helpers::proxy_fetch_capped_encoded(
+                            proxy,
+                            repo.id,
+                            &repo.key,
+                            upstream_url,
+                            &upstream_path,
+                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                         )
-                        .body(Body::from(content))
-                        .unwrap());
+                        .await?;
+                    return Ok(proxy_helpers::forward_verbatim_metadata(
+                        content,
+                        content_type,
+                        "text/plain; charset=utf-8",
+                        content_encoding,
+                    ));
                 }
             }
 
@@ -2581,5 +2594,78 @@ mod tests {
             mod_bytes,
             "mod endpoint must serve the go.mod artifact, not the zip (#1782)"
         );
+    }
+
+    /// #3260: goproxy forwards `.info` / `.mod` upstream bodies VERBATIM —
+    /// the Remote arm of `try_proxy_go_metadata`, `get_mod_file`'s Remote
+    /// arm, and the Virtual arm via `resolve_virtual_metadata` — so the
+    /// upstream `Content-Encoding` must be re-declared (RFC 9110 §8.4, the
+    /// header describes the coding of the bytes as transferred) and
+    /// `Content-Length` must describe the coded bytes actually sent (§8.6).
+    /// Nothing on this path decodes (`http_client::base_client_builder`
+    /// disables every codec and advertises `Accept-Encoding: identity`), so
+    /// before the fix a coded upstream module document was persisted by `go`
+    /// as if it were plain.
+    ///
+    /// Deflate (non-gzip) coded upstream plus an uncoded control in the SAME
+    /// fixture — see `tdh::coded_fixture` for why gzip would prove less.
+    #[tokio::test]
+    async fn test_go_metadata_forwards_upstream_content_encoding_verbatim_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        let (plain, coded, coded_mock, plain_mock) =
+            tdh::coded_and_plain_upstreams("deflate", "application/json", b"go-meta-3260 ").await;
+
+        // fx repo = the coded Remote (Remote-arm probes); a second coded
+        // Remote wrapped by a Virtual (Virtual-arm probe, cold cache so the
+        // upstream pass of `resolve_virtual_metadata` runs); a plain Remote +
+        // Virtual pair as the uncoded control.
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &coded_mock.uri()).await;
+        let (coded_member_id, _cm_key, virt_coded_id, virt_coded_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "go", &coded_mock.uri()).await;
+        let (plain_id, plain_key, virt_plain_id, virt_plain_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "go", &plain_mock.uri()).await;
+
+        // Remote arm, `.info` (`try_proxy_go_metadata`).
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.info", fx.repo_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        tdh::assert_coded_forward(&headers, &body, &coded, &plain, "remote .info");
+
+        // Remote arm, `.mod` (`get_mod_file`).
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.mod", fx.repo_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        tdh::assert_coded_forward(&headers, &body, &coded, &plain, "remote .mod");
+
+        // Virtual arm, `.info` (`resolve_virtual_metadata` transform).
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.info", virt_coded_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        tdh::assert_coded_forward(&headers, &body, &coded, &plain, "virtual .info");
+
+        // Controls: uncoded upstream through the same three arms.
+        for (key, what) in [
+            (&plain_key, "control remote .info"),
+            (&virt_plain_key, "control virtual .info"),
+        ] {
+            let uri = format!("/{}/example.com/coded/@v/v1.0.0.info", key);
+            let (body, headers) =
+                tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+            tdh::assert_plain_forward(&headers, &body, &plain, what);
+        }
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.mod", plain_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        tdh::assert_plain_forward(&headers, &body, &plain, "control remote .mod");
+
+        for id in [virt_coded_id, coded_member_id, virt_plain_id, plain_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
     }
 }

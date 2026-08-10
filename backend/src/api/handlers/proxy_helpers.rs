@@ -649,6 +649,66 @@ pub async fn proxy_fetch_capped_with_accept(
         .map_err(|e| map_proxy_error(repo_key, path, e))
 }
 
+/// As [`proxy_fetch_capped`], but also reports the upstream `Content-Encoding`
+/// (#3260, the plain-path sibling of
+/// [`proxy_fetch_capped_with_cache_key_encoded`]) for handlers that forward
+/// the buffered bytes to the client VERBATIM and must therefore re-declare the
+/// coding (RFC 9110 §8.4 — `Content-Encoding` describes the coding applied to
+/// the representation as transferred). The shared HTTP client neither decodes
+/// nor negotiates codings (`http_client::base_client_builder` disables every
+/// codec and advertises `Accept-Encoding: identity`), so a coding that does
+/// arrive — object stores return a stored `Content-Encoding` regardless of the
+/// request — is on the bytes the handler is about to serve.
+pub async fn proxy_fetch_capped_encoded(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_artifact_capped_with_encoding(&repo, path, max)
+            .await
+    })
+    .await
+}
+
+/// Build the 200 response for buffered upstream metadata that is forwarded
+/// VERBATIM (#3260, the shared form of Maven's #3211 `forward_root_verbatim`).
+///
+/// The body is exactly the bytes the upstream (or the proxy cache) produced,
+/// so the upstream `Content-Encoding` must be re-declared when present
+/// (RFC 9110 §8.4 — the header describes the coding applied to the bytes as
+/// transferred; nothing on this path decodes), and `Content-Length` is the
+/// length of those coded bytes (RFC 9110 §8.6). Dropping the coding while
+/// keeping the coded bytes was #3211/#3260: clients stored or parsed a
+/// compressed document as if it were plain.
+///
+/// Callers that PARSE or REWRITE the buffered body must NOT use this — the
+/// bytes they emit are not the bytes that arrived, so the upstream coding no
+/// longer describes them and must be dropped.
+pub fn forward_verbatim_metadata(
+    content: Bytes,
+    content_type: Option<String>,
+    default_content_type: &str,
+    content_encoding: Option<String>,
+) -> Response {
+    let ct = content_type.unwrap_or_else(|| default_content_type.to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, ct)
+        .header(
+            axum::http::header::CONTENT_LENGTH,
+            content.len().to_string(),
+        );
+    if let Some(enc) = content_encoding {
+        builder = builder.header(axum::http::header::CONTENT_ENCODING, enc);
+    }
+    builder.body(axum::body::Body::from(content)).unwrap()
+}
+
 /// Budget-reserving sibling of [`proxy_fetch_capped`] (#2684).
 ///
 /// Reserves `max` bytes of the process-wide [`proxy_metadata_budget`] BEFORE
@@ -2640,7 +2700,19 @@ where
 /// the raw bytes into a final HTTP response.
 ///
 /// Suitable for metadata endpoints where only one upstream response is
-/// needed (npm package info, pypi simple index, hex package, rubygems gem info).
+/// needed (go .info/.mod metadata, hex package, rubygems gem info).
+///
+/// `transform` receives `(body, content_encoding, member_key)`, where
+/// `content_encoding` is the upstream `Content-Encoding` of that body
+/// (#3260). The body is the member upstream's bytes AS TRANSFERRED — nothing
+/// on this path decodes (`http_client::base_client_builder` disables every
+/// codec and advertises `Accept-Encoding: identity`) — so a transform that
+/// forwards the bytes verbatim must re-declare the coding (RFC 9110 §8.4),
+/// e.g. via [`forward_verbatim_metadata`]. A transform that parses or
+/// rewrites the body must decode it first and drop the coding, because the
+/// bytes it emits are no longer the bytes the coding describes. Before #3260
+/// this helper dropped the coding unconditionally, which mislabeled every
+/// coded upstream response its (all verbatim-forwarding) callers served.
 pub async fn resolve_virtual_metadata<F, Fut>(
     db: &PgPool,
     proxy_service: Option<&ProxyService>,
@@ -2649,7 +2721,7 @@ pub async fn resolve_virtual_metadata<F, Fut>(
     transform: F,
 ) -> Result<Response, Response>
 where
-    F: Fn(Bytes, String) -> Fut,
+    F: Fn(Bytes, Option<String>, String) -> Fut,
     Fut: std::future::Future<Output = Result<Response, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
@@ -2678,27 +2750,29 @@ where
             // (warm path never fans out) while a held entry is skipped rather
             // than served raw. A fresh hit is transformed into the response.
             match proxy.cached_metadata_if_servable(member, path).await {
-                Ok(Some((bytes, _ct, _enc))) => match transform(bytes, member.key.clone()).await {
-                    Ok(response) => (
-                        MemberCacheClass::DefiniteHit,
-                        Some(MemberResolveOutcome::Hit(response)),
-                    ),
-                    // The cached bytes failed to transform (e.g. corrupt cached
-                    // metadata). Don't treat the member as a definite miss —
-                    // fall through to an upstream re-fetch in Pass 2 so a good
-                    // upstream copy can still recover it (parity with the old
-                    // `proxy_fetch`-then-transform path). Surface it for field
-                    // debugging.
-                    Err(_) => {
-                        tracing::warn!(
-                            member = %member.key,
-                            path = %path,
-                            "virtual metadata transform failed for cached member response; \
-                             will re-fetch upstream"
-                        );
-                        (MemberCacheClass::NeedsUpstream, None)
+                Ok(Some((bytes, _ct, enc))) => {
+                    match transform(bytes, enc, member.key.clone()).await {
+                        Ok(response) => (
+                            MemberCacheClass::DefiniteHit,
+                            Some(MemberResolveOutcome::Hit(response)),
+                        ),
+                        // The cached bytes failed to transform (e.g. corrupt cached
+                        // metadata). Don't treat the member as a definite miss —
+                        // fall through to an upstream re-fetch in Pass 2 so a good
+                        // upstream copy can still recover it (parity with the old
+                        // `proxy_fetch`-then-transform path). Surface it for field
+                        // debugging.
+                        Err(_) => {
+                            tracing::warn!(
+                                member = %member.key,
+                                path = %path,
+                                "virtual metadata transform failed for cached member response; \
+                                 will re-fetch upstream"
+                            );
+                            (MemberCacheClass::NeedsUpstream, None)
+                        }
                     }
-                },
+                }
                 // `Ok(None)` covers a cache miss AND a negative-cached 404
                 // (both collapse to `None` here). Unlike the download resolvers
                 // — which see the negative 404 as `Err` and classify it
@@ -2719,8 +2793,20 @@ where
             else {
                 return MemberResolveOutcome::Miss;
             };
-            match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
-                Ok((bytes, _ct)) => match transform(bytes, member.key.clone()).await {
+            // The cache-keyed fetch is `proxy_fetch` with `fetch_path ==
+            // cache_path`, widened to also report the upstream
+            // `Content-Encoding` (#3260) so the transform can re-declare it.
+            match proxy_fetch_with_cache_key(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                path,
+                path,
+            )
+            .await
+            {
+                Ok((bytes, _ct, enc)) => match transform(bytes, enc, member.key.clone()).await {
                     Ok(response) => MemberResolveOutcome::Hit(response),
                     Err(_) => {
                         tracing::warn!(
@@ -2767,6 +2853,13 @@ where
 ///
 /// Suitable for metadata endpoints where responses from every upstream
 /// must be combined (conda repodata, cran PACKAGES, helm index, rubygems specs).
+///
+/// Deliberately DROPS the upstream `Content-Encoding` (#3260): every `extract`
+/// closure PARSES the member body and the caller serves a merged document it
+/// built itself, so the upstream coding never describes the bytes that leave
+/// this process. A caller that wants to forward one member's bytes verbatim
+/// belongs on [`resolve_virtual_metadata`], whose transform receives the
+/// coding.
 pub async fn collect_virtual_metadata<T, F, Fut>(
     db: &PgPool,
     proxy_service: Option<&ProxyService>,

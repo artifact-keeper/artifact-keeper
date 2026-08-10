@@ -123,19 +123,22 @@ async fn gem_info(
         return Ok(super::json_response(&json));
     }
 
-    // Virtual repo: try remote members in priority order
+    // Virtual repo: try remote members in priority order. The member's body
+    // is forwarded VERBATIM, so its `Content-Encoding` is re-declared when
+    // present (RFC 9110 §8.4, #3260).
     if repo.repo_type == RepositoryType::Virtual {
         return proxy_helpers::resolve_virtual_metadata(
             &state.db,
             state.proxy_service.as_deref(),
             repo.id,
             &format!("api/v1/gems/{}.json", gem_name),
-            |bytes, _member_key| async move {
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Body::from(bytes))
-                    .unwrap())
+            |bytes, content_encoding, _member_key| async move {
+                Ok(proxy_helpers::forward_verbatim_metadata(
+                    bytes,
+                    None,
+                    "application/json",
+                    content_encoding,
+                ))
             },
         )
         .await;
@@ -797,18 +800,21 @@ async fn quick_spec(
                 }
             }
         }
-        // Otherwise proxy the upstream quick spec verbatim (already Marshal).
+        // Otherwise proxy the upstream quick spec verbatim (already Marshal),
+        // re-declaring the member's `Content-Encoding` when present
+        // (RFC 9110 §8.4, #3260).
         return proxy_helpers::resolve_virtual_metadata(
             &state.db,
             state.proxy_service.as_deref(),
             repo.id,
             &format!("quick/Marshal.4.8/{}", spec_file),
-            |bytes, _member_key| async move {
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "application/octet-stream")
-                    .body(Body::from(bytes))
-                    .unwrap())
+            |bytes, content_encoding, _member_key| async move {
+                Ok(proxy_helpers::forward_verbatim_metadata(
+                    bytes,
+                    None,
+                    "application/octet-stream",
+                    content_encoding,
+                ))
             },
         )
         .await;
@@ -1575,6 +1581,75 @@ mod db_cov_tests {
         for uri in uris {
             let app = fx.router_with_auth(super::router());
             let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
+    }
+
+    /// #3260: the Virtual arms of `gem_info` and `quick_spec` forward the
+    /// member upstream's body VERBATIM through `resolve_virtual_metadata`
+    /// (the `quick_spec` comment literally says "verbatim" — the payload is
+    /// upstream's Marshal bytes), so the upstream `Content-Encoding` must be
+    /// re-declared (RFC 9110 §8.4) and `Content-Length` must describe the
+    /// coded bytes actually sent (§8.6). Nothing on this path decodes
+    /// (`http_client::base_client_builder` disables every codec), so before
+    /// the fix `gem` received coded bytes labelled as plain.
+    ///
+    /// Deflate (non-gzip) coded member plus an uncoded control member in the
+    /// SAME fixture — see `tdh::coded_fixture` for why gzip would prove less.
+    #[tokio::test]
+    async fn test_rubygems_virtual_forwards_upstream_content_encoding_verbatim_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let (plain, coded, coded_mock, plain_mock) = tdh::coded_and_plain_upstreams(
+            "deflate",
+            "application/octet-stream",
+            b"gem-meta-3260 ",
+        )
+        .await;
+
+        // fx only supplies the DB + proxy-carrying state; the probes target a
+        // coded Remote wrapped by a Virtual and a plain Remote + Virtual pair
+        // as the uncoded control.
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &coded_mock.uri()).await;
+        let (coded_member_id, _cm_key, virt_coded_id, virt_coded_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "rubygems", &coded_mock.uri()).await;
+        let (plain_id, _plain_key, virt_plain_id, virt_plain_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "rubygems", &plain_mock.uri()).await;
+
+        // `gem_info` Virtual arm.
+        let uri = format!("/{}/api/v1/gems/pkg3260.json", virt_coded_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        tdh::assert_coded_forward(&headers, &body, &coded, &plain, "virtual gem_info");
+
+        // `quick_spec` Virtual arm.
+        let uri = format!(
+            "/{}/quick/Marshal.4.8/pkg3260-1.0.0.gemspec.rz",
+            virt_coded_key
+        );
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        tdh::assert_coded_forward(&headers, &body, &coded, &plain, "virtual quick_spec");
+
+        // Controls: the same two arms over an uncoded member.
+        let uri = format!("/{}/api/v1/gems/pkg3260.json", virt_plain_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        tdh::assert_plain_forward(&headers, &body, &plain, "control gem_info");
+        let uri = format!(
+            "/{}/quick/Marshal.4.8/pkg3260-1.0.0.gemspec.rz",
+            virt_plain_key
+        );
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        tdh::assert_plain_forward(&headers, &body, &plain, "control quick_spec");
+
+        for id in [virt_coded_id, coded_member_id, virt_plain_id, plain_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
         }
         fx.teardown().await;
     }
