@@ -29,7 +29,7 @@
 //! `ansible-galaxy collection publish` is a two-call sequence, not one upload.
 //! `GalaxyAPI.publish_collection` (`lib/ansible/galaxy/api.py`) ends with a
 //! *hard index* into the upload response — `return resp['task']` on
-//! `stable-2.17` through `stable-2.20`, and `return urljoin(self.api_server,
+//! `stable-2.17` through `stable-2.19`, and `return urljoin(self.api_server,
 //! resp['task'])` on `devel`. A response without a `task` key therefore kills
 //! the CLI with `ERROR! Unexpected Exception, this is probably a bug: 'task'`
 //! before `--no-wait` is ever consulted: `wait` is read one frame upstream, in
@@ -47,7 +47,7 @@
 //! One spelling has to satisfy both client generations, and they consume the
 //! value differently:
 //!
-//! * `stable-2.17`..`stable-2.20`: the caller in `collection/__init__.py`
+//! * `stable-2.17`..`stable-2.19`: the caller in `collection/__init__.py`
 //!   reduces the value to its **last non-empty path segment**
 //!   (`for path_segment in reversed(import_uri.split('/'))`) and
 //!   `wait_import_task(task_id)` rebuilds the URL as
@@ -55,7 +55,7 @@
 //!   Since `g_connect` has already rewritten `self.api_server` to the URL that
 //!   served `available_versions` (`self.api_server = n_url`), that is
 //!   `/ansible/{repo_key}/api/v3/imports/collections/{task_id}/`.
-//! * `devel`: `urljoin(self.api_server, resp['task'])` is passed to
+//! * `stable-2.20` and `devel`: `urljoin(self.api_server, resp['task'])` is passed to
 //!   `wait_import_task` **verbatim**, with no segment extraction. A
 //!   root-absolute reference resolves against the origin, yielding the same
 //!   URL.
@@ -63,7 +63,7 @@
 //! So a root-absolute path ending in `/{task_id}/` is correct for both — and it
 //! is the shape ansible-core itself documents as the v3 reference response:
 //! `{"task": "/api/automation-hub/v3/imports/collections/838d1308-...-7823f3806cd8/"}`.
-//! A bare id would break `devel` (relative resolution drops the last segment of
+//! A bare id would break `stable-2.20` and `devel` (relative resolution drops the last segment of
 //! `api_server`); a full path would break the stable line only if the stable
 //! line used it verbatim, which it does not.
 //!
@@ -150,7 +150,7 @@ pub fn router() -> Router<SharedState> {
 }
 
 /// The `task` value returned by `upload_collection` and the `href` echoed back
-/// by [`import_status`]. Root-absolute so `devel`'s
+/// by [`import_status`]. Root-absolute so `stable-2.20`/`devel`'s
 /// `urljoin(api_server, resp['task'])` resolves against the origin, and ending
 /// in `/{task_id}/` so the stable line's last-non-empty-segment extraction
 /// recovers the id (see the module docs).
@@ -1444,7 +1444,7 @@ mod tests {
     // back whatever the handler happens to format.
     // -----------------------------------------------------------------------
 
-    /// The path `ansible-core` polls on `stable-2.17`..`stable-2.20`.
+    /// The path `ansible-core` polls on `stable-2.17`..`stable-2.19`.
     ///
     /// `lib/ansible/galaxy/collection/__init__.py::publish_collection` reduces
     /// the response's `task` to its **last non-empty path segment**
@@ -1464,7 +1464,7 @@ mod tests {
         )
     }
 
-    /// The path `ansible-core` polls on `devel`.
+    /// The path `ansible-core` polls on `stable-2.20` and `devel`.
     ///
     /// `GalaxyAPI.publish_collection` returns `urljoin(self.api_server,
     /// resp['task'])` and `wait_import_task` fetches that **verbatim** — there
@@ -1544,16 +1544,20 @@ mod tests {
 
         // 2. Both client generations must derive the SAME reachable URL from
         //    it. This is the property that constrains the emitted shape: a
-        //    bare task id satisfies the stable line but breaks `devel`, and a
-        //    fully-qualified URL satisfies `devel` but makes the stable line's
-        //    `_urljoin` produce a doubled path.
+        //    bare task id satisfies the stable line but breaks `stable-2.20`
+        //    and `devel`, whose `urljoin` resolves it relative to the server
+        //    and drops the last path segment. A fully-qualified URL happens to
+        //    work under both — the stable line extracts the last segment
+        //    *before* any `_urljoin`, so no doubling occurs — but it hardcodes
+        //    an origin the deployment may not be reached at (proxies, split
+        //    horizon DNS), which is why the root-absolute path is emitted.
         let api_server_path = format!("/ansible/{}/api", f.repo_key);
         let stable_path = stable_line_poll_path(&api_server_path, &task);
         let devel_path = devel_poll_path(&task);
         assert_eq!(
             stable_path, devel_path,
             "the emitted `task` must resolve to one URL under both ansible-core \
-             derivations (stable-2.17..2.20 segment extraction vs devel urljoin)"
+             derivations (stable-2.17..2.19 segment extraction vs stable-2.20/devel urljoin)"
         );
 
         // 3. That URL must actually answer, and answer as a FINISHED import.
