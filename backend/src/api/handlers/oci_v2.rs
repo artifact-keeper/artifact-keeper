@@ -4933,7 +4933,12 @@ async fn handle_get_blob(
         // check. If the members cannot be enumerated we cannot prove the blob
         // is safe -> fail closed (same posture as an unreadable verdict store
         // below).
-        let blocklist = if repo.repo_type == RepositoryType::Virtual {
+        // #3259: the repositories whose refs are in scope for this decision,
+        // as `(repo_type, repo_id)`. Only consulted when EVERY referencing
+        // vulnerable verdict turns out to be stale by the manifest gate's own
+        // freshness rule -- see `stale_blob_verdicts_still_withhold`.
+        let mut ref_owners: Vec<(&str, Uuid)> = Vec::new();
+        let status = if repo.repo_type == RepositoryType::Virtual {
             let members = match proxy_helpers::fetch_virtual_members(&state.db, repo.id).await {
                 Ok(members) => members,
                 Err(_) => {
@@ -4964,13 +4969,46 @@ async fn handle_get_blob(
                     || blob_reblock_applies(&scan_cfg, m.repo_type.as_str(), m.id).await
                 {
                     gated_ids.push(m.id);
+                    ref_owners.push((m.repo_type.as_str(), m.id));
                 }
             }
-            blob_belongs_to_vulnerable_image_any(state, &gated_ids, &lookup_digest).await
+            // #3025 OR-of-both-sides, applied to the #3259 staleness release
+            // too: a fail-closed VIRTUAL keeps stale blocks on across its whole
+            // member set, so the virtual cannot become the lax route around a
+            // stricter member.
+            ref_owners.push((repo.repo_type.as_str(), repo.id));
+            blob_vulnerable_verdict_status_any(state, &gated_ids, &lookup_digest).await
         } else if blob_reblock_applies(&scan_cfg, &repo.repo_type, repo.id).await {
-            blob_belongs_to_vulnerable_image(state, repo.id, &lookup_digest).await
+            ref_owners.push((repo.repo_type.as_str(), repo.id));
+            blob_vulnerable_verdict_status(state, repo.id, &lookup_digest).await
         } else {
-            Ok(false)
+            Ok(BlobVerdictStatus::NoVerdict)
+        };
+        // #3259: a still-reusable verdict blocks exactly as before. Only a
+        // wholly-stale one reaches the policy decision, which fail-closes.
+        let blocklist = match status {
+            Ok(BlobVerdictStatus::Blocking) => Ok(true),
+            Ok(BlobVerdictStatus::NoVerdict) => Ok(false),
+            Ok(BlobVerdictStatus::StaleOnly) => {
+                let withhold = stale_blob_verdicts_still_withhold(&scan_cfg, &ref_owners).await;
+                if withhold {
+                    tracing::warn!(
+                        repo = %repo.key, digest = %lookup_digest,
+                        "blob re-block held on a STALE vulnerable verdict: this repository's \
+                         scan policy cannot serve un-reassessed bytes and the blob seam has no \
+                         image to re-scan"
+                    );
+                } else {
+                    tracing::info!(
+                        repo = %repo.key, digest = %lookup_digest,
+                        "releasing blob re-block: every referencing vulnerable verdict is stale \
+                         by the manifest gate's freshness rule, and this repository's manifest \
+                         gate would serve and re-scan asynchronously (#3259)"
+                    );
+                }
+                Ok(withhold)
+            }
+            Err(e) => Err(e),
         };
         match blocklist {
             Ok(true) => {
@@ -7788,67 +7826,237 @@ pub(crate) fn oci_manifest_requires_proxy_scan(body: &[u8]) -> bool {
 ///   image's pull, which is the fail-closed direction and is the right trade —
 ///   the alternative ("serve if *some* referencing image scanned clean") would
 ///   let a crafted clean sibling manifest unlock a known-vulnerable layer.
-async fn blob_belongs_to_vulnerable_image(
+///
+/// #3259: the join no longer answers a bare `EXISTS`. It returns the verdict
+/// PROVENANCE (`scanned_at` + `scanner_version`) of every referencing
+/// `vulnerable` row so [`classify_blob_verdicts`] can apply the SAME freshness
+/// predicate the manifest half applies
+/// ([`proxy_scan_service::verdict_is_reusable`]) — before this, a verdict the
+/// manifest gate would have re-scanned still blocked its blobs forever.
+async fn blob_vulnerable_verdict_status(
     state: &SharedState,
     repo_id: Uuid,
     blob_digest: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
+) -> Result<BlobVerdictStatus, sqlx::Error> {
+    let refs = sqlx::query_as::<_, BlobVerdictRef>(
         r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM manifest_blob_refs mbr
-            JOIN proxy_scan_results psr
-              ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
-             AND psr.scan_type = $3
-             AND psr.verdict = 'vulnerable'
-            WHERE mbr.repository_id = $1
-              AND mbr.blob_digest = $2
-        )
+        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version
+        FROM manifest_blob_refs mbr
+        JOIN proxy_scan_results psr
+          ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
+         AND psr.scan_type = $3
+         AND psr.verdict = 'vulnerable'
+        WHERE mbr.repository_id = $1
+          AND mbr.blob_digest = $2
         "#,
     )
     .bind(repo_id)
     .bind(blob_digest)
     .bind(proxy_helpers::PROXY_SCAN_TYPE)
-    .fetch_one(&state.db)
-    .await
+    .fetch_all(&state.db)
+    .await?;
+
+    let current_version = live_cve_scanner_version_for(state, &refs).await;
+    Ok(classify_blob_verdicts(
+        &refs,
+        current_version.as_deref(),
+        chrono::Utc::now(),
+    ))
 }
 
-/// Member-spanning sibling of [`blob_belongs_to_vulnerable_image`] for a
+/// Member-spanning sibling of [`blob_vulnerable_verdict_status`] for a
 /// Virtual repo (#3023). `manifest_blob_refs` are recorded under the resolving
 /// MEMBER's repo id (the virtual has none of its own), so a blob pulled through
 /// the virtual must be checked against ALL of the virtual's member ids, not the
 /// virtual's own id. The verdict join is unchanged — it is global by content
 /// digest. Widens the existing per-repository ANY-not-ALL scoping from one repo
 /// to the virtual's member set (a layer blocked by any member is blocked, the
-/// fail-closed direction). An empty `member_ids` returns `Ok(false)`.
-async fn blob_belongs_to_vulnerable_image_any(
+/// fail-closed direction). An empty `member_ids` returns
+/// [`BlobVerdictStatus::NoVerdict`].
+///
+/// #3259 applies here identically: this seam must not out-live the manifest
+/// gate's freshness rule any more than the single-repo seam does. Fixing one
+/// and leaving the other is how #3143 recurred.
+async fn blob_vulnerable_verdict_status_any(
     state: &SharedState,
     member_ids: &[Uuid],
     blob_digest: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<BlobVerdictStatus, sqlx::Error> {
     if member_ids.is_empty() {
-        return Ok(false);
+        return Ok(BlobVerdictStatus::NoVerdict);
     }
-    sqlx::query_scalar::<_, bool>(
+    let refs = sqlx::query_as::<_, BlobVerdictRef>(
         r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM manifest_blob_refs mbr
-            JOIN proxy_scan_results psr
-              ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
-             AND psr.scan_type = $3
-             AND psr.verdict = 'vulnerable'
-            WHERE mbr.repository_id = ANY($1)
-              AND mbr.blob_digest = $2
-        )
+        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version
+        FROM manifest_blob_refs mbr
+        JOIN proxy_scan_results psr
+          ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
+         AND psr.scan_type = $3
+         AND psr.verdict = 'vulnerable'
+        WHERE mbr.repository_id = ANY($1)
+          AND mbr.blob_digest = $2
         "#,
     )
     .bind(member_ids)
     .bind(blob_digest)
     .bind(proxy_helpers::PROXY_SCAN_TYPE)
-    .fetch_one(&state.db)
-    .await
+    .fetch_all(&state.db)
+    .await?;
+
+    let current_version = live_cve_scanner_version_for(state, &refs).await;
+    Ok(classify_blob_verdicts(
+        &refs,
+        current_version.as_deref(),
+        chrono::Utc::now(),
+    ))
+}
+
+/// One referencing manifest's `vulnerable` verdict, carrying exactly the
+/// provenance [`proxy_scan_service::verdict_is_reusable`] needs (#3259).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct BlobVerdictRef {
+    pub verdict: String,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+    pub scanner_version: Option<String>,
+}
+
+/// What the referencing manifests' verdicts say about serving one blob (#3259).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlobVerdictStatus {
+    /// No manifest in scope that references this blob carries a `vulnerable`
+    /// verdict. Serve.
+    NoVerdict,
+    /// At least one referencing manifest carries a `vulnerable` verdict that
+    /// the manifest gate would still REUSE. Block (403) — unchanged behavior.
+    Blocking,
+    /// Referencing `vulnerable` verdicts exist, but the manifest gate would
+    /// re-scan every one of them rather than trust it. The blob seam cannot
+    /// re-scan (a layer is not a gradeable image), so the caller decides by
+    /// policy — see [`stale_blob_verdicts_still_withhold`].
+    StaleOnly,
+}
+
+/// Probe the LIVE CVE-scanner version, but only when there is a verdict whose
+/// provenance it would be compared against — mirroring the manifest path, which
+/// probes "only when a row exists" (`gate_proxy_scan_serve`). A blob with no
+/// vulnerable referencing verdict (the overwhelmingly common case) therefore
+/// costs nothing extra.
+async fn live_cve_scanner_version_for(
+    state: &SharedState,
+    refs: &[BlobVerdictRef],
+) -> Option<String> {
+    if refs.is_empty() {
+        return None;
+    }
+    match state.scanner_service.as_deref() {
+        Some(scanner) => scanner.cve_scanner_version().await,
+        None => None,
+    }
+}
+
+/// Apply the manifest gate's OWN freshness predicate to the blob seam (#3259).
+///
+/// Before this the blob re-block was a bare `EXISTS` on `verdict =
+/// 'vulnerable'`: no TTL, no scanner-version comparison. The manifest half
+/// routes every verdict reuse through
+/// [`proxy_scan_service::verdict_is_reusable`] (TTL =
+/// [`DEDUP_TTL_DAYS`](crate::services::scanner_service::DEDUP_TTL_DAYS), plus
+/// the #2976 scanner-version comparison), so a verdict the manifest gate would
+/// have re-scanned still blocked its blobs indefinitely. That is the asymmetry
+/// this closes — the rule is SHARED, not re-derived here, so the two halves
+/// cannot drift.
+///
+/// Direction, deliberately:
+///
+/// * A verdict that is still reusable **keeps blocking**. This function cannot
+///   weaken enforcement for a current verdict; `Blocking` is returned whenever
+///   *any* referencing verdict is reusable (ANY-not-ALL, unchanged).
+/// * Only when EVERY referencing verdict is stale does this return
+///   `StaleOnly`, which is not by itself a decision to serve — the caller
+///   fail-closes on it per repository policy.
+///
+/// The `action` passed to `verdict_is_reusable` is
+/// [`ProxyScanAction::FailClosed`](proxy_scan_service::ProxyScanAction::FailClosed),
+/// the STRICTER arm. It is inert for the verdicts this seam sees — that arm's
+/// extra requirement (provably-current provenance) applies only to a `clean`
+/// verdict, and the query returns `vulnerable` rows only — but passing the
+/// strict arm means any future tightening of the fail-closed branch is
+/// inherited here automatically rather than silently skipped.
+pub(crate) fn classify_blob_verdicts(
+    refs: &[BlobVerdictRef],
+    current_version: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BlobVerdictStatus {
+    if refs.is_empty() {
+        return BlobVerdictStatus::NoVerdict;
+    }
+    let any_reusable = refs.iter().any(|r| {
+        crate::services::proxy_scan_service::verdict_is_reusable(
+            &r.verdict,
+            r.scanned_at,
+            r.scanner_version.as_deref(),
+            current_version,
+            crate::services::proxy_scan_service::ProxyScanAction::FailClosed,
+            crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
+            now,
+        )
+    });
+    if any_reusable {
+        BlobVerdictStatus::Blocking
+    } else {
+        BlobVerdictStatus::StaleOnly
+    }
+}
+
+/// Given that EVERY referencing vulnerable verdict is stale, does the blob stay
+/// withheld? (#3259.)
+///
+/// The manifest path's answer to a stale verdict is never "serve and forget":
+/// it is `decide_serve` → re-scan, and only the re-scan's outcome serves or
+/// blocks. The blob seam has nothing to re-scan — a config/layer blob is not a
+/// gradeable image, and the verdict is keyed on the MANIFEST digest — so
+/// "stale" here can only be resolved by policy. Both arms mirror the manifest
+/// path's behavior for the same repository:
+///
+/// * **Hosted refs (`Local` / `Staging`) keep the block, unconditionally.** The
+///   manifest half of this gate (`maybe_gate_remote_manifest_scan`) is
+///   proxy-only, so nothing will ever re-scan a hosted image through it: a TTL
+///   release here would be permanent and un-reassessable, not a deferral. This
+///   is the same carve-out, for the same reason, that
+///   [`blob_reblock_applies`] makes for `scan_on_proxy` — hosted content's only
+///   blob-level scan enforcement must not expire on a proxy-shaped clock.
+/// * **Proxy-served refs follow the repo's `proxy_scan_action`.**
+///   `fail_closed` withholds: on that policy the manifest gate re-scans INLINE
+///   before serving a byte and 423s an inconclusive outcome, so a blob seam
+///   that simply served would be strictly weaker than the manifest for the same
+///   image. `fail_open` releases: on that policy the manifest gate SERVES the
+///   stale image now (`ServePendingScanAsync`) and re-scans asynchronously, so
+///   continuing to 403 its layers is exactly the asymmetry #3259 reports — the
+///   manifest serves and its blobs do not.
+///
+/// Fails **closed** on a fault, matching [`blob_reblock_applies`]'s
+/// `unwrap_or(true)`: an unreadable `scan_configs` is not proof the block may
+/// be released. Likewise ANY owner that withholds withholds the whole decision
+/// (the stricter direction, matching the #3025 OR-of-both-sides scoping the
+/// virtual seam already uses).
+async fn stale_blob_verdicts_still_withhold(
+    scan_cfg: &crate::services::scan_config_service::ScanConfigService,
+    ref_owners: &[(&str, Uuid)],
+) -> bool {
+    for (repo_type, repo_id) in ref_owners {
+        if *repo_type == RepositoryType::Local || *repo_type == RepositoryType::Staging {
+            return true;
+        }
+        match scan_cfg.proxy_scan_action(*repo_id).await {
+            Ok(action) => {
+                if action.is_fail_closed() {
+                    return true;
+                }
+            }
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 /// Does the #3003 blob re-block still apply to the `manifest_blob_refs`
@@ -27106,15 +27314,17 @@ mod proxy_scan_block_tests {
         .await
         .expect("seed clean verdict");
 
-        let blocked_in_a = blob_belongs_to_vulnerable_image(&fx.state, fx.repo_id, &shared_layer)
+        let blocked_in_a = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &shared_layer)
             .await
-            .expect("lookup a");
+            .expect("lookup a")
+            == BlobVerdictStatus::Blocking;
         // Repo B references the SAME vulnerable manifest, so the shared layer
         // is blocked there too — same bytes, same image, same verdict.
         let blocked_in_b_with_same_image =
-            blob_belongs_to_vulnerable_image(&other.state, other.repo_id, &shared_layer)
+            blob_vulnerable_verdict_status(&other.state, other.repo_id, &shared_layer)
                 .await
-                .expect("lookup b");
+                .expect("lookup b")
+                == BlobVerdictStatus::Blocking;
 
         // Now drop repo B's reference to the vulnerable image. Its only
         // remaining reference to the shared layer is via the CLEAN image, so
@@ -27128,13 +27338,15 @@ mod proxy_scan_block_tests {
         .await
         .expect("drop repo b reference");
         let blocked_in_b_clean_only =
-            blob_belongs_to_vulnerable_image(&other.state, other.repo_id, &shared_layer)
+            blob_vulnerable_verdict_status(&other.state, other.repo_id, &shared_layer)
                 .await
-                .expect("lookup b again");
+                .expect("lookup b again")
+                == BlobVerdictStatus::Blocking;
         let still_blocked_in_a =
-            blob_belongs_to_vulnerable_image(&fx.state, fx.repo_id, &shared_layer)
+            blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &shared_layer)
                 .await
-                .expect("lookup a again");
+                .expect("lookup a again")
+                == BlobVerdictStatus::Blocking;
 
         for d in [&vuln_digest, &clean_digest] {
             cleanup_proxy_scan_row(&fx.pool, d.strip_prefix("sha256:").unwrap()).await;
@@ -27170,11 +27382,534 @@ mod proxy_scan_block_tests {
             return;
         };
         let unknown = format!("sha256:{}", "9".repeat(64));
-        let blocked = blob_belongs_to_vulnerable_image(&fx.state, fx.repo_id, &unknown)
+        let status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &unknown)
             .await
             .expect("lookup");
         fx.teardown().await;
-        assert!(!blocked, "an unscanned blob must not be blocked");
+        assert_eq!(
+            status,
+            BlobVerdictStatus::NoVerdict,
+            "an unscanned blob must not be blocked"
+        );
+    }
+
+    // ── #3259: the blob re-block must expire on the manifest gate's clock ───
+
+    /// Backdate a stored verdict so it is older than the manifest gate's TTL.
+    /// The verdict is otherwise untouched — same `verdict`, same
+    /// `scanner_version` — so the ONLY thing separating it from the fresh
+    /// control below is age.
+    async fn age_verdict(pool: &sqlx::PgPool, digest_hex: &str, days: i64) {
+        let n = sqlx::query(
+            "UPDATE proxy_scan_results \
+             SET scanned_at = now() - ($2 || ' days')::interval \
+             WHERE checksum_sha256 = $1",
+        )
+        .bind(digest_hex)
+        .bind(days.to_string())
+        .execute(pool)
+        .await
+        .expect("age verdict")
+        .rows_affected();
+        assert_eq!(n, 1, "fixture precondition: exactly one verdict row to age");
+    }
+
+    async fn seed_verdict(pool: &sqlx::PgPool, repo_id: Uuid, digest: &str, verdict: &str) {
+        let vulnerable = verdict == "vulnerable";
+        ProxyScanService::new(pool.clone())
+            .record_verdict(
+                digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                verdict,
+                i32::from(vulnerable),
+                i32::from(vulnerable),
+                0,
+                0,
+                0,
+                vulnerable.then_some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(repo_id),
+            )
+            .await
+            .expect("seed verdict");
+    }
+
+    /// #3259: the blob re-block was a bare `EXISTS` on `verdict = 'vulnerable'`
+    /// with no TTL and no scanner-version predicate, while the manifest half
+    /// runs every reuse through `verdict_is_reusable`
+    /// (`DEDUP_TTL_DAYS` + the #2976 version compare). A verdict the manifest
+    /// gate would have re-scanned therefore blocked its blobs forever: the
+    /// image's manifest served and its layers did not.
+    ///
+    /// The two positive controls are in THIS fixture on purpose. Asserting
+    /// only that an aged verdict stops blocking would also pass if the gate
+    /// were deleted outright, so the same run pins that a FRESH vulnerable
+    /// verdict still blocks and a CLEAN image's layer still serves.
+    #[tokio::test]
+    async fn blob_reblock_expires_on_the_manifest_gate_ttl() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+
+        let (stale_manifest, _sc, stale_layer) = image_manifest(
+            &unique_fixture_bytes("3259-stale-cfg"),
+            &unique_fixture_bytes("3259-stale-layer"),
+        );
+        let (fresh_manifest, _fc, fresh_layer) = image_manifest(
+            &unique_fixture_bytes("3259-fresh-cfg"),
+            &unique_fixture_bytes("3259-fresh-layer"),
+        );
+        let (clean_manifest, _cc, clean_layer) = image_manifest(
+            &unique_fixture_bytes("3259-clean-cfg"),
+            &unique_fixture_bytes("3259-clean-layer"),
+        );
+        let stale_digest = compute_sha256(&stale_manifest);
+        let fresh_digest = compute_sha256(&fresh_manifest);
+        let clean_digest = compute_sha256(&clean_manifest);
+
+        for (digest, manifest) in [
+            (&stale_digest, &stale_manifest),
+            (&fresh_digest, &fresh_manifest),
+            (&clean_digest, &clean_manifest),
+        ] {
+            record_manifest_blob_refs(&fx.pool, fx.repo_id, digest, manifest)
+                .await
+                .expect("record refs");
+        }
+        seed_verdict(&fx.pool, fx.repo_id, &stale_digest, "vulnerable").await;
+        seed_verdict(&fx.pool, fx.repo_id, &fresh_digest, "vulnerable").await;
+        seed_verdict(&fx.pool, fx.repo_id, &clean_digest, "clean").await;
+        // Only the first is aged past the TTL the manifest gate applies.
+        age_verdict(
+            &fx.pool,
+            stale_digest.strip_prefix("sha256:").unwrap(),
+            crate::services::scanner_service::DEDUP_TTL_DAYS as i64 + 1,
+        )
+        .await;
+
+        let stale_status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &stale_layer)
+            .await
+            .expect("stale lookup");
+        let fresh_status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &fresh_layer)
+            .await
+            .expect("fresh lookup");
+        let clean_status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &clean_layer)
+            .await
+            .expect("clean lookup");
+
+        for digest in [&stale_digest, &fresh_digest, &clean_digest] {
+            cleanup_proxy_scan_row(&fx.pool, digest.strip_prefix("sha256:").unwrap()).await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            stale_status,
+            BlobVerdictStatus::StaleOnly,
+            "#3259: a vulnerable verdict older than DEDUP_TTL_DAYS is one the manifest \
+             gate would re-scan rather than trust, so it must no longer assert a \
+             standing block on the blob seam"
+        );
+        assert_eq!(
+            fresh_status,
+            BlobVerdictStatus::Blocking,
+            "positive control: a FRESH vulnerable verdict must still block — this fix \
+             must not weaken enforcement for a current verdict"
+        );
+        assert_eq!(
+            clean_status,
+            BlobVerdictStatus::NoVerdict,
+            "positive control: a clean image's layer must still serve"
+        );
+    }
+
+    /// `StaleOnly` is NOT by itself a decision to serve. The manifest path's
+    /// answer to a stale verdict is "re-scan, then decide"; the blob seam has
+    /// no gradeable image to re-scan, so the release is gated on the policy
+    /// under which the manifest gate would itself have served.
+    #[tokio::test]
+    async fn stale_verdict_release_is_gated_on_repo_scan_policy() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let scan_cfg =
+            crate::services::scan_config_service::ScanConfigService::new(fx.pool.clone());
+
+        // Hosted refs never release on a proxy-shaped clock: the manifest half
+        // of this gate is proxy-only, so nothing would ever re-assess them.
+        let hosted_local =
+            stale_blob_verdicts_still_withhold(&scan_cfg, &[("local", fx.repo_id)]).await;
+        let hosted_staging =
+            stale_blob_verdicts_still_withhold(&scan_cfg, &[("staging", fx.repo_id)]).await;
+
+        // Proxy refs, no scan_configs row -> proxy_scan_action defaults
+        // fail-open -> the manifest gate would serve, so the blob does too.
+        let remote_no_row =
+            stale_blob_verdicts_still_withhold(&scan_cfg, &[("remote", fx.repo_id)]).await;
+
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let remote_fail_open =
+            stale_blob_verdicts_still_withhold(&scan_cfg, &[("remote", fx.repo_id)]).await;
+
+        sqlx::query(
+            "UPDATE scan_configs SET proxy_scan_action = 'fail_closed' WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("switch to fail_closed");
+        let remote_fail_closed =
+            stale_blob_verdicts_still_withhold(&scan_cfg, &[("remote", fx.repo_id)]).await;
+
+        // ANY owner that withholds withholds the whole decision (the #3025
+        // stricter direction): a fail-open member cannot unlock a fail-closed
+        // sibling's refs.
+        let mixed = stale_blob_verdicts_still_withhold(
+            &scan_cfg,
+            &[("remote", Uuid::new_v4()), ("remote", fx.repo_id)],
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert!(
+            hosted_local && hosted_staging,
+            "hosted refs must keep the block on a stale verdict: the proxy manifest gate \
+             will never re-scan them, so a TTL release would be permanent"
+        );
+        assert!(
+            !remote_no_row,
+            "a proxy repo with no scan_configs row is fail-open; its manifest gate would \
+             serve the stale image, so its blobs must serve too (#3259)"
+        );
+        assert!(
+            !remote_fail_open,
+            "an explicitly fail-open proxy repo releases a stale block"
+        );
+        assert!(
+            remote_fail_closed,
+            "a fail-closed proxy repo re-scans INLINE before serving a byte; the blob seam \
+             cannot re-scan, so it must withhold rather than serve un-reassessed bytes"
+        );
+        assert!(mixed, "one withholding owner withholds the whole decision");
+    }
+
+    /// Pure freshness classification, no database. Pins the direction of the
+    /// #3259 predicate — including that a stale sibling verdict cannot unlock
+    /// a blob a fresh one still blocks (the ANY-not-ALL property #3003 set).
+    #[test]
+    fn classify_blob_verdicts_direction() {
+        use crate::services::scanner_service::DEDUP_TTL_DAYS;
+        let now = chrono::Utc::now();
+        let mk = |age_days: i64, version: Option<&str>| BlobVerdictRef {
+            verdict: "vulnerable".to_string(),
+            scanned_at: now - chrono::Duration::days(age_days),
+            scanner_version: version.map(|v| v.to_string()),
+        };
+
+        assert_eq!(
+            classify_blob_verdicts(&[], Some("grype-1.0.0"), now),
+            BlobVerdictStatus::NoVerdict
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], Some("grype-1.0.0"), now),
+            BlobVerdictStatus::Blocking,
+            "a current verdict blocks"
+        );
+        assert_eq!(
+            classify_blob_verdicts(
+                &[mk(DEDUP_TTL_DAYS as i64 + 1, Some("grype-1.0.0"))],
+                Some("grype-1.0.0"),
+                now
+            ),
+            BlobVerdictStatus::StaleOnly,
+            "past the TTL the manifest gate would re-scan, so the blob seam must not \
+             hold a standing block"
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], Some("grype-2.0.0"), now),
+            BlobVerdictStatus::StaleOnly,
+            "#2976: a scanner-version change invalidates the verdict on this seam too"
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(1, None)], Some("grype-1.0.0"), now),
+            BlobVerdictStatus::Blocking,
+            "an unknown stored version cannot PROVE staleness; TTL alone decides, and the \
+             block stays on"
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], None, now),
+            BlobVerdictStatus::Blocking,
+            "an unreadable live version cannot prove staleness either — fail closed"
+        );
+        assert_eq!(
+            classify_blob_verdicts(
+                &[
+                    mk(DEDUP_TTL_DAYS as i64 + 1, Some("grype-1.0.0")),
+                    mk(1, Some("grype-1.0.0")),
+                ],
+                Some("grype-1.0.0"),
+                now
+            ),
+            BlobVerdictStatus::Blocking,
+            "ANY-not-ALL is preserved: one still-reusable verdict blocks, and a stale \
+             sibling must not unlock it"
+        );
+    }
+
+    /// #3259 END TO END, through the real router: a `vulnerable` verdict older
+    /// than the manifest gate's TTL must stop 403-ing the image's blobs.
+    ///
+    /// Before this fix the blob seam was a bare `EXISTS` on
+    /// `verdict = 'vulnerable'` — no TTL, no scanner-version predicate — while
+    /// the manifest seam ran every reuse through
+    /// `proxy_scan_service::verdict_is_reusable`. On a fail-open proxy repo the
+    /// manifest of a stale image therefore SERVES (and re-scans
+    /// asynchronously) while every layer it names stayed 403 forever.
+    ///
+    /// The two other images in this same fixture are the positive controls,
+    /// and they are what stop this test from being satisfied by simply
+    /// deleting the gate: a FRESH vulnerable verdict must still 403, and a
+    /// clean image's layer must still 200.
+    #[tokio::test]
+    async fn stale_vulnerable_verdict_stops_blocking_blobs_on_a_fail_open_proxy_repo() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let stale_cfg_bytes = unique_fixture_bytes("3259-http-stale-cfg");
+        let stale_layer_bytes = unique_fixture_bytes("3259-http-stale-layer");
+        let fresh_cfg_bytes = unique_fixture_bytes("3259-http-fresh-cfg");
+        let fresh_layer_bytes = unique_fixture_bytes("3259-http-fresh-layer");
+        let clean_cfg_bytes = unique_fixture_bytes("3259-http-clean-cfg");
+        let clean_layer_bytes = unique_fixture_bytes("3259-http-clean-layer");
+        let (stale_manifest, stale_config, stale_layer) =
+            image_manifest(&stale_cfg_bytes, &stale_layer_bytes);
+        let (fresh_manifest, _fresh_config, fresh_layer) =
+            image_manifest(&fresh_cfg_bytes, &fresh_layer_bytes);
+        let (clean_manifest, _clean_config, clean_layer) =
+            image_manifest(&clean_cfg_bytes, &clean_layer_bytes);
+        let stale_digest = compute_sha256(&stale_manifest);
+        let fresh_digest = compute_sha256(&fresh_manifest);
+        let clean_digest = compute_sha256(&clean_manifest);
+
+        for (mdigest, body) in [
+            (&stale_digest, &stale_manifest),
+            (&fresh_digest, &fresh_manifest),
+            (&clean_digest, &clean_manifest),
+        ] {
+            record_manifest_blob_refs(&fx.pool, fx.repo_id, mdigest, body)
+                .await
+                .expect("record blob refs");
+        }
+
+        // Cache every blob locally so a 200 is genuinely reachable — otherwise
+        // "not 403" could just be an upstream miss and the control would be
+        // vacuous.
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for (d, bytes) in [
+            (&stale_config, stale_cfg_bytes.clone()),
+            (&stale_layer, stale_layer_bytes.clone()),
+            (&fresh_layer, fresh_layer_bytes.clone()),
+            (&clean_layer, clean_layer_bytes.clone()),
+        ] {
+            let key = blob_storage_key(d);
+            storage
+                .put(&key, Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(d)
+            .bind(bytes.len() as i64)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+
+        seed_verdict(&fx.pool, fx.repo_id, &stale_digest, "vulnerable").await;
+        seed_verdict(&fx.pool, fx.repo_id, &fresh_digest, "vulnerable").await;
+        seed_verdict(&fx.pool, fx.repo_id, &clean_digest, "clean").await;
+        // Only the first verdict is older than the TTL the manifest gate uses.
+        age_verdict(
+            &fx.pool,
+            stale_digest.strip_prefix("sha256:").unwrap(),
+            crate::services::scanner_service::DEDUP_TTL_DAYS as i64 + 1,
+        )
+        .await;
+
+        let get_blob = |d: String| {
+            let state = fx.state.clone();
+            let key = fx.repo_key.clone();
+            async move {
+                let app = tdh::router_anon(router(), state);
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{key}/app/blobs/{d}"))
+                    .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.expect("oneshot").status()
+            }
+        };
+
+        let stale_config_status = get_blob(stale_config.clone()).await;
+        let stale_layer_status = get_blob(stale_layer.clone()).await;
+        let fresh_layer_status = get_blob(fresh_layer.clone()).await;
+        let clean_layer_status = get_blob(clean_layer.clone()).await;
+
+        for digest in [&stale_digest, &fresh_digest, &clean_digest] {
+            cleanup_proxy_scan_row(&fx.pool, digest.strip_prefix("sha256:").unwrap()).await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            fresh_layer_status,
+            StatusCode::FORBIDDEN,
+            "positive control: a FRESH vulnerable verdict must still 403 its layers — \
+             this fix must not weaken enforcement for a current verdict"
+        );
+        assert_eq!(
+            clean_layer_status,
+            StatusCode::OK,
+            "positive control: a clean image's layer must still serve"
+        );
+        assert_eq!(
+            stale_layer_status,
+            StatusCode::OK,
+            "#3259: past DEDUP_TTL_DAYS the manifest gate would re-scan rather than trust \
+             this verdict, and on a fail-open repo it would SERVE the manifest meanwhile — \
+             so its layers must stop being 403'd"
+        );
+        assert_eq!(
+            stale_config_status,
+            StatusCode::OK,
+            "#3259: the config blob is released on the same rule as the layer"
+        );
+    }
+
+    /// The other half of the direction: on a FAIL-CLOSED proxy repo the same
+    /// stale verdict must keep blocking. The manifest gate's answer to a stale
+    /// verdict there is "re-scan INLINE before serving a byte" (423 if the
+    /// re-scan is inconclusive), never a plain serve — and the blob seam has
+    /// no gradeable image to re-scan, so it withholds. A fix that simply
+    /// released every stale verdict would fail this test.
+    #[tokio::test]
+    async fn stale_vulnerable_verdict_keeps_blocking_blobs_on_a_fail_closed_proxy_repo() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let vuln_cfg_bytes = unique_fixture_bytes("3259-fc-vuln-cfg");
+        let vuln_layer_bytes = unique_fixture_bytes("3259-fc-vuln-layer");
+        let clean_cfg_bytes = unique_fixture_bytes("3259-fc-clean-cfg");
+        let clean_layer_bytes = unique_fixture_bytes("3259-fc-clean-layer");
+        let (vuln_manifest, _vc, vuln_layer) = image_manifest(&vuln_cfg_bytes, &vuln_layer_bytes);
+        let (clean_manifest, _cc, clean_layer) =
+            image_manifest(&clean_cfg_bytes, &clean_layer_bytes);
+        let vuln_digest = compute_sha256(&vuln_manifest);
+        let clean_digest = compute_sha256(&clean_manifest);
+
+        for (mdigest, body) in [
+            (&vuln_digest, &vuln_manifest),
+            (&clean_digest, &clean_manifest),
+        ] {
+            record_manifest_blob_refs(&fx.pool, fx.repo_id, mdigest, body)
+                .await
+                .expect("record blob refs");
+        }
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for (d, bytes) in [
+            (&vuln_layer, vuln_layer_bytes.clone()),
+            (&clean_layer, clean_layer_bytes.clone()),
+        ] {
+            let key = blob_storage_key(d);
+            storage
+                .put(&key, Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(d)
+            .bind(bytes.len() as i64)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+
+        seed_verdict(&fx.pool, fx.repo_id, &vuln_digest, "vulnerable").await;
+        seed_verdict(&fx.pool, fx.repo_id, &clean_digest, "clean").await;
+        age_verdict(
+            &fx.pool,
+            vuln_digest.strip_prefix("sha256:").unwrap(),
+            crate::services::scanner_service::DEDUP_TTL_DAYS as i64 + 1,
+        )
+        .await;
+
+        let get_blob = |d: String| {
+            let state = fx.state.clone();
+            let key = fx.repo_key.clone();
+            async move {
+                let app = tdh::router_anon(router(), state);
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{key}/app/blobs/{d}"))
+                    .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.expect("oneshot").status()
+            }
+        };
+        let stale_layer_status = get_blob(vuln_layer.clone()).await;
+        let clean_layer_status = get_blob(clean_layer.clone()).await;
+
+        for digest in [&vuln_digest, &clean_digest] {
+            cleanup_proxy_scan_row(&fx.pool, digest.strip_prefix("sha256:").unwrap()).await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            stale_layer_status,
+            StatusCode::FORBIDDEN,
+            "fail-closed: a stale verdict is ambiguity, and this seam cannot re-scan — \
+             it must withhold rather than serve un-reassessed bytes (#3259)"
+        );
+        assert_eq!(
+            clean_layer_status,
+            StatusCode::OK,
+            "positive control: a clean image's layer still serves on a fail-closed repo"
+        );
     }
 }
 
@@ -27393,7 +28128,7 @@ mod virtual_scan_gate_tests {
         assert_eq!(info.location.path, "/data/member");
     }
 
-    // ── blob_belongs_to_vulnerable_image_any: member-spanning scoping ───────
+    // ── blob_vulnerable_verdict_status_any: member-spanning scoping ────────
     #[tokio::test]
     async fn blob_any_spans_member_ids_and_empty_is_false() {
         let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
@@ -27423,36 +28158,142 @@ mod virtual_scan_gate_tests {
             .expect("seed vulnerable verdict");
 
         // Empty member set -> never blocks.
-        let empty = blob_belongs_to_vulnerable_image_any(&fx.state, &[], &config_digest)
+        let empty = blob_vulnerable_verdict_status_any(&fx.state, &[], &config_digest)
             .await
             .expect("empty ids lookup");
-        assert!(!empty, "empty member_ids must return false");
+        assert_eq!(
+            empty,
+            BlobVerdictStatus::NoVerdict,
+            "empty member_ids must not block"
+        );
 
         // A member set NOT containing the recording member -> no refs -> false.
         let other =
-            blob_belongs_to_vulnerable_image_any(&fx.state, &[Uuid::new_v4()], &config_digest)
+            blob_vulnerable_verdict_status_any(&fx.state, &[Uuid::new_v4()], &config_digest)
                 .await
                 .expect("other ids lookup");
-        assert!(
-            !other,
+        assert_eq!(
+            other,
+            BlobVerdictStatus::NoVerdict,
             "refs recorded under a different member must not match"
         );
 
         // The member set containing the recording member -> blocked.
-        let spanned = blob_belongs_to_vulnerable_image_any(
+        let spanned = blob_vulnerable_verdict_status_any(
             &fx.state,
             &[Uuid::new_v4(), member_id],
             &config_digest,
         )
         .await
         .expect("spanning lookup");
-        assert!(
+        assert_eq!(
             spanned,
+            BlobVerdictStatus::Blocking,
             "a member-owned vulnerable ref must block within the span"
         );
 
         cleanup_refs(&fx.pool, member_id, &manifest_digest).await;
         fx.teardown().await;
+    }
+
+    /// #3259 at the MEMBER-SPANNING seam. `blob_vulnerable_verdict_status_any`
+    /// is the second of the two blob query sites; fixing one and leaving the
+    /// other is exactly how #3143 recurred, so the freshness rule is pinned
+    /// here independently — with the same two positive controls in the same
+    /// fixture (a fresh vulnerable verdict still blocks across the span, a
+    /// clean image's layer still serves).
+    #[tokio::test]
+    async fn blob_any_reblock_expires_on_the_manifest_gate_ttl() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let uniq = |label: &str| format!("3259-any-{label}-{}", Uuid::new_v4()).into_bytes();
+
+        let (stale_manifest, _sc, stale_layer) =
+            image_manifest(&uniq("stale-cfg"), &uniq("stale-layer"));
+        let (fresh_manifest, _fc, fresh_layer) =
+            image_manifest(&uniq("fresh-cfg"), &uniq("fresh-layer"));
+        let (clean_manifest, _cc, clean_layer) =
+            image_manifest(&uniq("clean-cfg"), &uniq("clean-layer"));
+        let stale_digest = compute_sha256(&stale_manifest);
+        let fresh_digest = compute_sha256(&fresh_manifest);
+        let clean_digest = compute_sha256(&clean_manifest);
+
+        // Refs are recorded under the resolving MEMBER, as the virtual seam
+        // records them; the virtual owns none of its own.
+        let member_id = fx.repo_id;
+        let pss = ProxyScanService::new(fx.pool.clone());
+        for (digest, manifest, verdict) in [
+            (&stale_digest, &stale_manifest, "vulnerable"),
+            (&fresh_digest, &fresh_manifest, "vulnerable"),
+            (&clean_digest, &clean_manifest, "clean"),
+        ] {
+            record_manifest_blob_refs(&fx.pool, member_id, digest, manifest)
+                .await
+                .expect("record refs under member");
+            let vulnerable = verdict == "vulnerable";
+            pss.record_verdict(
+                digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                verdict,
+                i32::from(vulnerable),
+                i32::from(vulnerable),
+                0,
+                0,
+                0,
+                vulnerable.then_some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed verdict");
+        }
+        let aged = sqlx::query(
+            "UPDATE proxy_scan_results SET scanned_at = now() - ($2 || ' days')::interval \
+             WHERE checksum_sha256 = $1",
+        )
+        .bind(stale_digest.strip_prefix("sha256:").unwrap())
+        .bind((crate::services::scanner_service::DEDUP_TTL_DAYS as i64 + 1).to_string())
+        .execute(&fx.pool)
+        .await
+        .expect("age the stale verdict")
+        .rows_affected();
+        assert_eq!(
+            aged, 1,
+            "fixture precondition: exactly one verdict row aged"
+        );
+
+        let span = [Uuid::new_v4(), member_id];
+        let stale_status = blob_vulnerable_verdict_status_any(&fx.state, &span, &stale_layer)
+            .await
+            .expect("stale span lookup");
+        let fresh_status = blob_vulnerable_verdict_status_any(&fx.state, &span, &fresh_layer)
+            .await
+            .expect("fresh span lookup");
+        let clean_status = blob_vulnerable_verdict_status_any(&fx.state, &span, &clean_layer)
+            .await
+            .expect("clean span lookup");
+
+        for digest in [&stale_digest, &fresh_digest, &clean_digest] {
+            cleanup_refs(&fx.pool, member_id, digest).await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            stale_status,
+            BlobVerdictStatus::StaleOnly,
+            "#3259: the member-spanning seam must apply the manifest gate's TTL too"
+        );
+        assert_eq!(
+            fresh_status,
+            BlobVerdictStatus::Blocking,
+            "positive control: a fresh vulnerable verdict still blocks across the member span"
+        );
+        assert_eq!(
+            clean_status,
+            BlobVerdictStatus::NoVerdict,
+            "positive control: a clean image's layer still serves through the virtual"
+        );
     }
 
     async fn cleanup_refs(pool: &sqlx::PgPool, repo_id: Uuid, manifest_digest: &str) {
