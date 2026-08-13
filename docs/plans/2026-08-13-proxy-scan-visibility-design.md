@@ -1,10 +1,22 @@
-# Proxy Scan Visibility — Design (v3)
+# Proxy Scan Visibility — Design (v4)
 
 **Date**: 2026-08-13
-**Status**: Scoped to what is implementable against the current schema
+**Status**: Audited three rounds; converged. Ready to implement after P1.
 **Target milestone**: 1.8.0
 **Branch**: `feat/proxy-scan-visibility`
-**Supersedes**: v1 (`177e179f`), v2 (`14bf52e7`)
+**Supersedes**: v1 (`177e179f`), v2 (`14bf52e7`), v3 (`ae2123cf`)
+
+## Audit history
+
+| Round | Outcome |
+|---|---|
+| v1 | Four lenses. Of six load-bearing claims, one survived unqualified. |
+| v2 | Still unimplementable — specified UI states no query could produce. |
+| v3 | Backend sound; both prior security holes confirmed closed. All remaining findings were in the Web contract, plus two P1 corrections. |
+
+v4 folds in the round-three findings. No structural defect remains outstanding;
+the open items are two explicit product decisions, marked **Decision required**
+below.
 
 ## Revision note
 
@@ -14,13 +26,18 @@ unimplementable for the same root reason:
 > **The system persists successful verdicts, not scan attempts.**
 
 Every "why was this not scanned?" question is unanswerable from stored data.
-v1 and v2 both specified UI states that no query can produce. v3 specifies only
-what is derivable today, and names the rest as deferred with the write path each
-would require.
+v1 and v2 both specified UI states that no query can produce. This design
+specifies only what is derivable today, and names the rest as deferred with the
+write path each would require.
 
-v3 is deliberately smaller than v2. It drops the artifact-listing changes
-entirely, which removes the anonymous-exposure problem, the join plan-stability
-problem, and the `capabilities` contract problem in one move.
+It is deliberately smaller than v2, dropping the artifact-listing changes
+entirely — which removed the anonymous-exposure problem, the join
+plan-stability problem, and the `capabilities` contract problem in one move.
+
+Round three confirmed the backend model holds and that both earlier security
+holes are closed. Its findings were concentrated in the Web contract, where the
+design had been written against screens that do not exist as assumed; v4
+corrects those against the actual components.
 
 Cite symbols, not line numbers.
 
@@ -70,14 +87,50 @@ pinned scans"):
   `npm-shrinkwrap.json`.
 
 **Fix.** Dedup before `aggregate_proxy_verdict`, so severity buckets are
-corrected too, on a key of `(cve_id, normalized_component_name,
-affected_version)`. The name **must** be ecosystem-normalized: the pin uses the
-PEP 503-canonical name while a wheel's own METADATA may say `PyYAML` or
-`zope.interface`. Reuse `ExpectedComponent::normalize_name`, which exists for
-exactly this comparison. A raw-string key would pass both samples above and fail
-silently on any non-canonical distribution name. `cve_id` is `Option` and must
-be handled. The hosted path counts with the same unguarded `findings.len()` and
-should share the fix.
+corrected too, on a key of `(vuln_id, normalized_component_name,
+affected_version)`.
+
+All three `RawFinding` fields in that key are `Option`, and the naive handling
+of `None` **erases real findings**:
+
+- `cve_id` is `None` for GHSA/OSV-only advisories with no `CVE-` alias
+  (`DependencyScanner`). Two distinct advisories on the same component would
+  collapse under `(None, …)`. **Key on the advisory's native id (`source` /
+  `title`) when `cve_id` is `None`**, never on `None` itself.
+- `affected_component` can be the **empty string** when the dependency list is
+  empty. Treat `""` as `None`, and do not merge on it.
+- Grype is safe here — it always sets `cve_id`, falling back to the primary
+  GHSA id.
+
+**Merge rule: retain the maximum severity in each group**, not the first.
+`aggregate_proxy_verdict` folds multiple scanners into one row, so a keep-first
+rule would silently lower `critical_count` and `max_severity` when two scanners
+report the same vulnerability at different severities. That is harmless today
+(the gate blocks on the `vulnerable` token alone, and `severity_threshold` is
+not consulted — #3243) but becomes an enforcement bug the day thresholds go
+live.
+
+The name **must** be ecosystem-normalized: the pin uses the PEP 503-canonical
+name while a wheel's own METADATA may say `PyYAML` or `zope.interface`. Reuse
+`ExpectedComponent::normalize_name`, which is ecosystem-aware — PEP 503 for
+Python, and it preserves `@scope/name` for npm. It takes the ecosystem as an
+argument, so the call site must thread it from the repository format. Do not
+confuse it with `PypiHandler::normalize_name`, which is Python-only. A
+raw-string key would pass both samples above and fail silently on any
+non-canonical distribution name.
+
+**Residual, to be documented rather than fixed:** cross-scanner alias mismatch
+(one scanner reporting `CVE-X`, another `GHSA-Y` for the same vulnerability)
+will not merge, so over-counting is only partially corrected in Trivy-enabled
+deployments.
+
+**Bound:** dedup cannot flip `vulnerable` to `clean` — it retains at least one
+finding per group and the verdict token is `findings_count > 0`. The risk is to
+counts and severity buckets, which is precisely what this feature reports.
+
+The hosted path counts with the same unguarded `findings.len()` and should share
+the fix. It is safe there: hosted `scan_results` are per-scanner rows, so
+duplicates within one scanner carry identical severity.
 
 **P2 (`scanner_version` records the first applicable scanner rather than the
 CVE-authoritative one) is no longer a prerequisite**, because v3 does not
@@ -104,9 +157,36 @@ endpoint a cross-tenant lookup oracle; a path is inherently scoped to the
 calling repository. The join to `proxy_scan_results` happens server-side after
 the path is resolved through `proxy_cache_artifacts` for that repository.
 
+**The response must carry enforcement context**, not just the verdict:
+`scan_on_proxy` and `proxy_scan_action` for the calling repository. Without
+them `vulnerable` is ambiguous — in a scanning repository it means pulls are
+blocked; in a repository with scanning **off** displaying an inherited verdict
+it means the artifact is served anyway. Same chip, opposite operational
+meaning. This also lets `not_scanned` be read as "may have been served
+unscanned" (fail-open) versus "was withheld" (fail-closed). Both values are one
+column away and need no new write path.
+
 **Authorization** follows the `security.rs` pattern — authentication required
 unconditionally, including for public repositories, matching `list_repo_scans`
-and `get_repo_security`. Vulnerability data is not anonymously readable.
+and `get_repo_security`.
+
+Note the bar is authenticated repository *visibility*, not a dedicated
+permission: this codebase has no security-read permission concept, and every
+existing security read (`list_repo_scans`, `get_repo_security`, per-CVE
+`list_findings`) is gated the same way. This endpoint exposes strictly less than
+`list_findings` already does at that bar, so it is consistent.
+
+Precise claim: **the counts-and-detail endpoint is not anonymously readable.**
+The boolean verdict is already inherently observable by anyone who can pull —
+a 403 means vulnerable, and `X-AK-Scan: clean` is on the response — so this
+design narrows exposure but does not create a new secret.
+
+**`scanned_at` must be floored at the calling repository's own `cached_at`**
+(or quantized to date granularity). Verdicts are global by digest, so a raw
+`scanned_at` predating the caller's first pull proves another repository in the
+deployment fetched byte-identical content earlier, and when — a tenant-activity
+oracle available to any authenticated user. `repository_id` stays hidden, so
+*which* repository does not leak, but the timing does.
 
 **`list_artifacts` is not modified.** v2 proposed attaching verdicts to the
 artifact listing. That is dropped:
@@ -143,9 +223,25 @@ writers.
 
 | Reason | Derivation |
 |---|---|
-| `scanning_disabled` | `scan_configs.scan_on_proxy` is false for this repository |
+| `scanning_disabled` | `scan_configs.scan_on_proxy` is false **or the row is absent** |
 | `format_unsupported` | repository format has no proxy gate wiring |
 | `unknown` | everything else |
+
+**`scan_configs` is not guaranteed to exist.** No row is created at repository
+creation; the only production insert is the settings upsert. A repository that
+has never had its security settings saved has no row, which is the default
+state. That case must resolve to `scanning_disabled`, matching
+`is_proxy_scan_enabled`'s `unwrap_or(false)` and therefore matching what the
+gate actually does. A naive `WHERE scan_on_proxy = false` join returns nothing
+and would misfile it as `unknown`.
+
+**`format_unsupported` has no authoritative source in code.** Gate wiring is
+three inline call sites with no registry or capability function, so any
+derivation is a hardcoded list that will drift when a format gains wiring. Since
+this endpoint is scoped to PyPI and npm repositories, the reason is nearly
+vestigial. **Decision: drop `format_unsupported` from this iteration** and leave
+two reasons. If the endpoint is later mounted for all formats, introduce one
+named constant beside the gate rather than a match arm in the handler.
 
 v2 specified `exceeds_size_cap`, `identity_unestablished`, `inconclusive`, and a
 `pending` state. **All four are dropped as unimplementable.** They all write no
@@ -181,6 +277,29 @@ database. The UI must not imply otherwise. Suggested copy for a fresh clean
 verdict: *"Clean as of <date>"* — a statement about when, not a guarantee about
 now.
 
+**The signal is inverted, and this must be understood before building it.**
+Pulling through a scanning-enabled repository past the TTL causes a re-scan,
+which refreshes `scanned_at`. So `stale = true` is only reachable for digests
+**nobody has pulled in 30 days** — the dead tail of the cache. The case an
+operator would actually act on, an actively consumed artifact with an outdated
+verdict, is structurally invisible because consumption is what refreshes it.
+
+There is also no remedy: `Scan All` is deferred, per-artifact trigger 404s on
+synthetic ids, and re-pulling only refreshes when `scan_on_proxy` is on. A
+`stale` chip with no affordance is a dead end.
+
+**Decision required before implementation:** either ship `stale` as an
+informational marker on cold cache entries and say so plainly, or drop it from
+this iteration. Do not ship it implying actionability it does not have.
+
+Also note `stale` and `vulnerable` interact in a way the copy must respect: a
+stale vulnerable verdict on a fail-open repository is **not reusable**, so the
+next pull is *served*, not blocked. Copy must never imply vulnerable ⇒ blocked.
+
+Boundary: the gate's freshness test is `now < scanned_at + ttl` (strict), while
+the proposed staleness test is `scanned_at < now() - ttl`. At exact equality a
+verdict is neither fresh nor stale. The boundary unit test must pick a side.
+
 **Migration 196** — `CREATE INDEX idx_proxy_cache_repo_checksum ON
 proxy_cache_artifacts (repository_id, checksum_sha256)`, enabling an index-only
 outer scan for the summary aggregate. Collision-checked: main tops out at 195;
@@ -190,13 +309,25 @@ This is the only migration. Issue 1 is therefore not strictly "no migration" —
 v1's claim to the contrary rested on a single-row EXPLAIN of a different query
 and is withdrawn.
 
-**The join must filter `scan_type = 'grype'`.** `uq_proxy_scan` is
-`(checksum_sha256, scan_type)`, so an unfiltered join will duplicate rows the
-day a second scan type is written.
+**The join must filter on scan type**, using the existing `PROXY_SCAN_TYPE`
+constant rather than a literal. `uq_proxy_scan` is `(checksum_sha256,
+scan_type)`, so an unfiltered join will duplicate rows the day a second scan
+type is written.
 
 **Rows with `checksum_sha256 IS NULL` are excluded explicitly.**
 `record_proxy_download` upserts a placeholder before content commits; those rows
 join to nothing and must not be counted as `not_scanned`.
+
+These placeholders can persist **indefinitely** — the checksum is backfilled
+only by a successful cache commit, so an aborted tee, a client disconnect, or an
+over-cap fail-open stream leaves the row permanently NULL, and there is no
+cleanup job. Excluding them therefore makes the summary silently undercount the
+repository. Report them as a separate `pending_ingest` count so the totals
+reconcile with the artifact listing.
+
+**The staleness expression must `COALESCE` the `scanned_at` comparison**, or
+`not_scanned` rows (NULL `scanned_at`) form a spurious third group in the
+`GROUP BY`.
 
 **Deduplicate by digest in the summary.** One repository can cache the same
 digest at many paths. The summary counts **distinct digests**, not paths, and
@@ -205,18 +336,48 @@ says so in the UI label.
 **Web.**
 
 - Replace the green shield for proxy-cached artifacts with the verdict panel.
-  Note the shield and the #3344 caveat line are the *same component*, about ten
-  lines apart — this is one edit, not two.
+  The shield and the #3344 caveat line are the *same component*, a few lines
+  apart — one edit, not two.
+- **Define the unauthenticated state.** The repositories pages sit outside the
+  `(protected)` route group, and the artifact detail modal's Security tab has no
+  auth gating — it renders for anonymous users on public repositories, who are
+  the largest audience for a public registry. The endpoint 401s them by design.
+  If a failed fetch is treated as zero findings, **the green all-clear returns
+  for exactly that audience** — the bug this work exists to remove. Required
+  copy: "Sign in to view scan status." Never implied-clean. This must be a named
+  regression test, not an implementation detail.
+- **Define the unresolvable-path state.** A repository with zero catalog rows
+  falls back to storage enumeration for its listing, so a modal click there
+  produces a path the catalog-backed endpoint cannot resolve. Return a distinct
+  state and render it as unknown, not clean. Same for placeholder rows whose
+  `checksum_sha256` is NULL.
+- **Render an enforcement banner** when the repository has `scan_on_proxy` off
+  but an inherited verdict is displayed: "Scanning is disabled for this
+  repository — verdicts shown were recorded elsewhere and are not enforced
+  here." Treat it as an orthogonal flag, like `stale`.
 - The panel states that per-CVE detail is unavailable for proxy-cached content
   and names the available path (ingest into a hosted repository). Hard
   requirement: without it the feature reports a problem and offers no remedy.
-- Repository Security tab: proxy summary by state, over distinct digests.
-- The summary panel sits on the same tab as the repository security **grade**,
-  which is computed from `artifacts ⋈ scan_results ⋈ scan_findings` and
-  therefore reads **A** for a proxy repository full of blocked content. The
-  panel must be visually adjacent to the grade and the grade must be labelled as
-  covering hosted artifacts only. Otherwise this feature ships a contradiction
-  on one screen.
+- **Render the paged list, not only the summary.** The endpoint returns both.
+  Shipping only counts answers "3 vulnerable digests" but not *which ones* —
+  the operator's first question — forcing a click through every artifact modal.
+  The per-row listing badge is deferred for anonymous-exposure reasons, but that
+  rationale does not apply to a list rendered inside the authenticated view.
+- Repository Security tab: proxy summary by state, over distinct digests, plus
+  a `pending_ingest` count for NULL-checksum placeholder rows so the totals
+  reconcile with the artifact listing.
+- **Audience.** The repository Security tab is currently admin-gated and renders
+  only the scan-config form. The endpoint authorizes any authenticated user with
+  repository visibility, so as placed, non-admin developers get the per-artifact
+  panel and no summary at all. Decide explicitly: either ungate the summary for
+  non-admin readers or state that the summary is admin-only in this iteration.
+- **The security grade is not on this tab**, and for a pure proxy repository it
+  does not exist at all — `repo_security_scores` rows are written only after a
+  hosted-artifact scan, so `score` is `null` and nothing renders. The real
+  contradiction is on the admin `/security` dashboard, whose "Grade A Repos"
+  stat and scores table cover hosted artifacts only. If that page is touched,
+  label it accordingly; there is no grade adjacency to fix on the repository
+  tab.
 
 ### Deferred, with the reason
 
@@ -300,10 +461,24 @@ the per-repo key convention (#1505).
   locally.
 - **Cross-tenant verdict inheritance.** Verdicts are global by digest. A
   repository with `scan_on_proxy` off can display a verdict recorded by another
-  repository for byte-identical content. The UI must not say "this repository
-  scanned this," and the API must never expose
-  `proxy_scan_results.repository_id`. Add a source-scanning test asserting the
-  query does not select it; `security.rs` has that idiom.
+  repository for byte-identical content. Verdict-first precedence is
+  nonetheless correct — a vulnerability is a property of the bytes, and
+  suppressing it because *this* repository did not scan would re-create the
+  original bug. The mitigation is the enforcement banner above, not hiding the
+  verdict. The UI must not say "this repository scanned this."
+- **`proxy_scan_results.repository_id` must never be exposed.** The obvious
+  source-scanning test is evadable two ways: the query legitimately references
+  `repository_id` in its `WHERE` clause, so a bare "source must not contain
+  `repository_id`" assertion fails immediately and will get watered down; and
+  `SELECT *` pulls the column without the literal appearing at all. **Assert on
+  the response DTO shape instead, and ban `*` in the new query.**
+  `ProxyScanRow` already omits the column and `lookup_verdict` uses an explicit
+  column list — follow both.
+- **Tenant-activity timing oracle.** Even with `repository_id` hidden, a raw
+  `scanned_at` reveals that *someone* in the deployment pulled byte-identical
+  content earlier, and when. Mitigated by flooring `scanned_at` at the caller's
+  own `cached_at`; the residual is accepted and recorded here. Low impact in
+  single-org deployments, real in multi-tenant ones.
 - **Legacy cold caches.** A repository with zero catalog rows falls back to
   storage enumeration. That path does carry `checksum_sha256`, so it can be
   joined — v2 wrongly claimed it could not — but it is a second code path and
@@ -315,16 +490,27 @@ the per-repo key convention (#1505).
 
 ## Testing
 
-**Unit.** State mapping for all three states and all three `not_scanned`
-reasons, including `checksum_sha256 IS NULL` exclusion. Age-based staleness at
-the TTL boundary. P1 dedup: canonical-vs-non-canonical names (`PyYAML`,
-`zope.interface`), `cve_id: None`, sdist (expect no change), npm
+**Unit.** State mapping for both `not_scanned` reasons, including the
+absent-`scan_configs` case resolving to `scanning_disabled`, and
+`checksum_sha256 IS NULL` exclusion. Age-based staleness at the exact TTL
+boundary. P1 dedup: canonical-vs-non-canonical names (`PyYAML`,
+`zope.interface`), npm scoped packages (`@scope/Name`), `cve_id: None` keyed on
+the native advisory id, empty-string `affected_component`, max-severity
+retention within a merged group, sdist (expect no change), npm
 shrinkwrap∩lockfile overlap.
 
 **Integration.** Verdict written by the gate is readable through the endpoint.
-Summary counts distinct digests, not paths. `repository_id` never selected.
-Unauthenticated request rejected on a public repository. Path parameter cannot
-address a digest outside the calling repository.
+Summary counts distinct digests, not paths, and reports `pending_ingest`
+separately. Response DTO does not contain `repository_id`. `scanned_at` floored
+at the caller's `cached_at`. Response carries `scan_on_proxy` and
+`proxy_scan_action`. Unauthenticated request rejected on a public repository.
+Path parameter cannot address a digest outside the calling repository.
+Unresolvable path (legacy cold-cache repo) returns the distinct state, not a
+500.
+
+**Web regression (named, not incidental).** Anonymous viewer on a public proxy
+repository renders "Sign in to view scan status" — never a green all-clear.
+This is the bug the feature exists to fix, for its largest audience.
 
 **Performance.** Summary aggregate at representative scale with the index in
 place. v1 and v2 had no perf test, which is how the index question was missed.
@@ -356,6 +542,33 @@ block/serve decision unchanged. The #3003 identity check untouched.
 | Refusal *and* `inventory_completeness` | Mutually exclusive; pick one |
 | License policy / Dependency-Track work "for free" | Both false; the export does not exist |
 | Fix `Scan All` gating | Deferred; needs a new backend field |
+
+## Corrections from v3
+
+| v3 | v4 |
+|---|---|
+| Panel renders for all viewers | Anonymous state defined; the modal tab is unauthenticated-reachable and would have restored the green all-clear for public repos |
+| Endpoint is catalog-only | Legacy cold-cache and placeholder paths get a distinct state, not a 500 or a 404 |
+| Grade sits on the repo Security tab and reads A | The grade is not on that tab and does not exist for a pure proxy repo; the real contradiction is the admin `/security` "Grade A Repos" stat |
+| Summary on the repo Security tab | Tab is admin-gated while the endpoint is visibility-gated — audience decision required |
+| Endpoint returns summary + paged list | The list must actually render; counts alone do not say *which* digests |
+| Verdict alone | Response carries `scan_on_proxy` + `proxy_scan_action`; `vulnerable` means "blocked" or "served anyway" depending on them |
+| Three `not_scanned` reasons | Two; `format_unsupported` has no authoritative source and would drift |
+| `scan_configs` assumed present | Absent row is the default and must resolve to `scanning_disabled` |
+| `stale` shipped plainly | Signal is inverted (fires only on cold entries) and has no remedy — decision required |
+| Dedup key on `(cve_id, …)` | `cve_id: None` and empty-string component would erase distinct findings; key on native advisory id, retain max severity |
+| `repository_id` source-scan test | Evadable via `SELECT *` and by the legitimate `WHERE` reference; assert on the DTO |
+| Raw `scanned_at` displayed | Floored at the caller's `cached_at` — it is a tenant-activity oracle |
+| "Vulnerability data is not anonymously readable" | Narrowed: the *counts endpoint* is not; the boolean verdict is already observable via 403 / `X-AK-Scan` |
+| `scan_type = 'grype'` literal | Use the `PROXY_SCAN_TYPE` constant |
+
+## Decisions required before implementation
+
+1. **`stale`** — ship as an informational cold-cache marker with honest copy, or
+   drop from this iteration. It cannot be made actionable without the deferred
+   `Scan All` work.
+2. **Summary audience** — ungate for non-admin readers (matching the endpoint's
+   own authorization), or state that the summary is admin-only for now.
 
 ## Coverage and duplication gates
 
