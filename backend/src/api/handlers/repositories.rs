@@ -1730,6 +1730,40 @@ fn normalize_npm_name_patterns(raw: &[String]) -> Result<Vec<String>> {
     Ok(patterns)
 }
 
+/// Whether the create/update repository handlers should process the inline
+/// npm scope-policy fields at all (#3299). Absent fields are never processed.
+/// Present fields normally are — except that an all-*inactive* payload (empty
+/// allow-lists, `allow_unscoped` absent or `false`) submitted against a
+/// repository the policy is not configurable on is treated as absent rather
+/// than failing the whole request: released web UIs (<= 1.8.0) attach exactly
+/// that payload for an untouched scope-policy form on npm Virtual repositories
+/// (web #745), which made creating an npm virtual repository impossible. The
+/// payload configures nothing — the backend's own default (no policy stored)
+/// is the state it expresses — so skipping it loses nothing. An *active*
+/// payload (any scope/pattern entry, or an explicit `allow_unscoped: true`)
+/// on an unconsumable target still flows to `is_npm_scope_policy_configurable`
+/// and is rejected, preserving the dead-state guard (#2327). The dedicated
+/// PUT endpoint (`set_npm_scope_policy`) is intentionally unchanged: an
+/// explicit policy write against a non-Remote target remains an error.
+fn npm_scope_policy_fields_supplied(
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    allowed_scopes: Option<&[String]>,
+    allow_unscoped: Option<bool>,
+    allowed_name_patterns: Option<&[String]>,
+) -> bool {
+    if allowed_scopes.is_none() && allow_unscoped.is_none() && allowed_name_patterns.is_none() {
+        return false;
+    }
+    if is_npm_scope_policy_configurable(repo_type, format).is_ok() {
+        return true;
+    }
+    let inactive = allowed_scopes.map_or(true, |s| s.is_empty())
+        && allowed_name_patterns.map_or(true, |p| p.is_empty())
+        && allow_unscoped != Some(true);
+    !inactive
+}
+
 /// Validate every provided npm scope-policy field up-front (no persistence).
 /// Returns an error before any repository row is created so a bad glob cannot
 /// leave an orphaned repository behind — mirrors the apt_* up-front validation.
@@ -1740,7 +1774,13 @@ fn validate_npm_scope_policy_fields(
     allow_unscoped: Option<bool>,
     allowed_name_patterns: Option<&[String]>,
 ) -> Result<()> {
-    if allowed_scopes.is_none() && allow_unscoped.is_none() && allowed_name_patterns.is_none() {
+    if !npm_scope_policy_fields_supplied(
+        repo_type,
+        format,
+        allowed_scopes,
+        allow_unscoped,
+        allowed_name_patterns,
+    ) {
         return Ok(());
     }
     is_npm_scope_policy_configurable(repo_type, format)?;
@@ -2783,11 +2823,17 @@ pub async fn create_repository(
     }
 
     // Persist npm scope policy (#2424). Validation already ran up-front; the
-    // shared helper re-validates and writes only the provided keys.
-    if payload.npm_allowed_scopes.is_some()
-        || payload.npm_allow_unscoped.is_some()
-        || payload.npm_allowed_name_patterns.is_some()
-    {
+    // shared helper re-validates and writes only the provided keys. An
+    // inactive payload on a repo the policy is not configurable on was
+    // accepted as a no-op above (#3299) — skip persistence too, so it cannot
+    // leave dead config rows behind.
+    if npm_scope_policy_fields_supplied(
+        &repo.repo_type,
+        &repo.format,
+        payload.npm_allowed_scopes.as_deref(),
+        payload.npm_allow_unscoped,
+        payload.npm_allowed_name_patterns.as_deref(),
+    ) {
         apply_npm_scope_policy_config(
             &state.db,
             repo.id,
@@ -3600,11 +3646,17 @@ pub async fn update_repository(
     }
 
     // npm scope policy (#2424): validate the target is an npm Remote repo, then
-    // persist only the provided keys via the shared helper.
-    if payload.npm_allowed_scopes.is_some()
-        || payload.npm_allow_unscoped.is_some()
-        || payload.npm_allowed_name_patterns.is_some()
-    {
+    // persist only the provided keys via the shared helper. An inactive payload
+    // (empty lists, allow_unscoped false) against a repo the policy is not
+    // configurable on is a no-op, not an error (#3299): released web UIs submit
+    // exactly that when saving an untouched settings form on a virtual repo.
+    if npm_scope_policy_fields_supplied(
+        &repo.repo_type,
+        &repo.format,
+        payload.npm_allowed_scopes.as_deref(),
+        payload.npm_allow_unscoped,
+        payload.npm_allowed_name_patterns.as_deref(),
+    ) {
         is_npm_scope_policy_configurable(&repo.repo_type, &repo.format)?;
         apply_npm_scope_policy_config(
             &state.db,
@@ -10166,14 +10218,64 @@ mod tests {
             None,
         )
         .is_err());
+        // An *active* field on a remote-but-non-npm repo => rejected (an
+        // inactive `Some(false)` would be skipped, see below).
         assert!(validate_npm_scope_policy_fields(
             &RepositoryType::Remote,
             &RepositoryFormat::Maven,
             None,
+            Some(true),
+            None,
+        )
+        .is_err());
+        // #3299: an all-inactive payload — what released web UIs (<= 1.8.0)
+        // submit for an untouched scope-policy form — is treated as absent on
+        // targets the policy is not configurable on, instead of failing the
+        // whole create/update.
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Virtual,
+            &RepositoryFormat::Npm,
+            Some(&[]),
+            Some(false),
+            Some(&[]),
+        )
+        .is_ok());
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Remote,
+            &RepositoryFormat::Maven,
+            Some(&[]),
+            Some(false),
+            None,
+        )
+        .is_ok());
+        // ...but any *active* configuration on a virtual repo stays rejected:
+        // the value would be dead state with no consumer (#2327).
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Virtual,
+            &RepositoryFormat::Npm,
+            Some(&["@acme".to_string()]),
             Some(false),
             None,
         )
         .is_err());
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Virtual,
+            &RepositoryFormat::Npm,
+            None,
+            Some(true),
+            None,
+        )
+        .is_err());
+        // On an npm Remote the same inactive payload is still *supplied*
+        // (empty lists clear a stored policy on update) and still validates.
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Remote,
+            &RepositoryFormat::Npm,
+            Some(&[]),
+            Some(false),
+            Some(&[]),
+        )
+        .is_ok());
         // npm Remote with a valid glob => OK; with a bad glob => rejected.
         assert!(validate_npm_scope_policy_fields(
             &RepositoryType::Remote,
@@ -14775,6 +14877,182 @@ mod tests {
             .bind(vec![maven_id, npm_id])
             .execute(&pool)
             .await;
+    }
+
+    /// #3299: released web UIs (<= 1.8.0) attach the npm scope-policy fields to
+    /// every npm create — including Virtual repositories, where the section
+    /// should never have been offered (web #745) — and an untouched form
+    /// serialises as `npm_allowed_scopes: []`, `npm_allowed_name_patterns: []`,
+    /// `npm_allow_unscoped: false`. That payload configures nothing, so the
+    /// create/update repository handlers must treat it as absent instead of
+    /// failing the whole request with "npm scope policy is only configurable on
+    /// remote (proxy) repositories". An *active* policy on a Virtual repo must
+    /// still be rejected (dead-state guard, #2327), and a real policy on an npm
+    /// Remote must still validate and persist.
+    #[tokio::test]
+    async fn npm_virtual_create_untouched_scope_policy_form_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("npm-virt-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+
+        // 1) The reported payload: untouched scope-policy form on a Virtual
+        //    npm create (member_repos omitted = deferred population).
+        let virt_key = format!("npm-virt-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &virt_key,
+                "npm virtual",
+                "npm",
+                serde_json::json!({
+                    "repo_type": "virtual",
+                    "npm_allowed_scopes": [],
+                    "npm_allowed_name_patterns": [],
+                    "npm_allow_unscoped": false
+                }),
+            ),
+        )
+        .await
+        .expect("npm virtual create with an untouched scope-policy form must succeed");
+        assert_eq!(created.key, virt_key);
+        // The inactive payload must not leave dead policy state behind either.
+        let leftover: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repository_config WHERE repository_id = $1 AND key IN \
+             ('npm_allowed_scopes', 'npm_allow_unscoped', 'npm_allowed_name_patterns')",
+        )
+        .bind(created.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count repository_config");
+        assert_eq!(
+            leftover, 0,
+            "inactive scope-policy payload must not persist dead config rows"
+        );
+
+        // 2) The same inactive payload on the UPDATE path (web settings tab
+        //    submits it for virtual repos too) must also be a no-op, not a 400.
+        let upd: UpdateRepositoryRequest = serde_json::from_str(
+            r#"{"npm_allowed_scopes": [], "npm_allowed_name_patterns": [], "npm_allow_unscoped": false}"#,
+        )
+        .expect("deserialize update payload");
+        update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(virt_key.clone()),
+            Json(upd),
+        )
+        .await
+        .expect("inactive scope-policy payload on virtual update must succeed");
+
+        // 3) An ACTIVE policy on a Virtual repo is still rejected up-front,
+        //    with no orphaned repository row.
+        let active_key = format!("npm-virt-active-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &active_key,
+                "npm virtual active",
+                "npm",
+                serde_json::json!({
+                    "repo_type": "virtual",
+                    "npm_allowed_scopes": ["@acme"],
+                    "npm_allowed_name_patterns": [],
+                    "npm_allow_unscoped": false
+                }),
+            ),
+        )
+        .await
+        .expect_err("active scope policy on a virtual repo must still be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("remote")),
+            "expected remote-only Validation error, got {err:?}",
+        );
+        // An explicit `allow_unscoped: true` alone is an explicit configuration
+        // choice with no consumer on a virtual repo — still rejected.
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &active_key,
+                "npm virtual unscoped",
+                "npm",
+                serde_json::json!({
+                    "repo_type": "virtual",
+                    "npm_allow_unscoped": true
+                }),
+            ),
+        )
+        .await
+        .expect_err("explicit allow_unscoped=true on a virtual repo must still be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("remote")),
+            "expected remote-only Validation error, got {err:?}",
+        );
+        let orphan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&active_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(
+            orphan, 0,
+            "rejected create must not leave an orphaned repository behind"
+        );
+
+        // 4) Positive control in the same fixture: a real policy on an npm
+        //    Remote create still validates AND persists — a fix that accepts
+        //    (or skips) everything fails here.
+        let remote_key = format!("npm-remote-{}", Uuid::new_v4().simple());
+        let Json(remote) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &remote_key,
+                "npm remote",
+                "npm",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://registry.npmjs.org",
+                    "npm_allowed_scopes": ["@acme"],
+                    "npm_allowed_name_patterns": [],
+                    "npm_allow_unscoped": false
+                }),
+            ),
+        )
+        .await
+        .expect("npm remote create with a real scope policy must succeed");
+        let stored_scopes: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config \
+             WHERE repository_id = $1 AND key = 'npm_allowed_scopes'",
+        )
+        .bind(remote.id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query npm_allowed_scopes");
+        assert_eq!(stored_scopes.as_deref(), Some(r#"["@acme"]"#));
+        let stored_unscoped: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config \
+             WHERE repository_id = $1 AND key = 'npm_allow_unscoped'",
+        )
+        .bind(remote.id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query npm_allow_unscoped");
+        assert_eq!(stored_unscoped.as_deref(), Some("false"));
+
+        // Cleanup.
+        tdh::cleanup(&pool, created.id, user_id).await;
+        tdh::cleanup(&pool, remote.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     /// #2321 G2 (write): the generic REST `upload_artifact` handler enforces the
