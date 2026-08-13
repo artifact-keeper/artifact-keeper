@@ -54,12 +54,20 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 # binary's HIGH-severity Go-dependency CVEs and image size with no functional
 # loss. See issue #1544.
 #
-# Grype is pinned to v0.115.0, the latest upstream release. It is rebuilt
-# against fixed containerd/go-git/x-crypto versions (clearing those CVEs from
-# v0.114.0), but still bundles Go 1.26.3 stdlib and docker v28.5.2; those
-# residual CVEs have no fixed grype release yet and are documented/suppressed
-# in /.trivyignore rather than "bumped away". Re-evaluate on every bump (#2391).
-FROM ghcr.io/anchore/grype:v0.116.0 AS grype-bin
+# Grype is pinned to v0.117.0, the latest upstream release. Bumped from
+# v0.116.0 for #3307 (CVE-2026-71556, HIGH: go-git v5.19.1 -> v5.19.2); see the
+# fuller note in Dockerfile.backend. Kept in lockstep with the UBI backend
+# image even though the alpine build and its Trivy gate are currently suspended
+# in docker-publish.yml -- a stale pin here becomes a surprise the day they are
+# re-enabled.
+#
+# The version in this comment had already drifted from the FROM below (it said
+# v0.115.0 while the pin was v0.116.0). Keep them in sync when bumping.
+#
+# It still bundles Go 1.26.3 stdlib and docker v28.5.2; those residual CVEs have
+# no fixed grype release yet and are documented/suppressed in /.trivyignore
+# rather than "bumped away". Re-evaluate that file on every bump (#2391).
+FROM ghcr.io/anchore/grype:v0.117.0 AS grype-bin
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted

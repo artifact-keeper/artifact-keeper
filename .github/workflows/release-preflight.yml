@@ -35,6 +35,14 @@ jobs:
           ref: main
           fetch-depth: 1
 
+      # Runs first, and offline. If check 3 has regressed into a soft warn
+      # again (#3308), this fails here rather than silently blessing a cut
+      # below. The interesting case -- a MEASURED-RED Docker Publish -- is
+      # invisible whenever main happens to be green, so it has to be tested
+      # against stubs rather than waited for.
+      - name: Self-test the preflight gate
+        run: bash scripts/ci/test-release-preflight.sh
+
       - name: Run release preflight
         env:
           GH_TOKEN: ${{ github.token }}

@@ -23,14 +23,38 @@
 #      the OpenAPI info version in backend/src/api/openapi.rs, and the
 #      artifact-keeper-backend entry in Cargo.lock must all agree. A partial
 #      bump ships a stale version string (see RELEASING.md step 2).
-#   3. MAIN DOCKER-PUBLISH HEALTH (best-effort/advisory): if `gh` is available
-#      and authenticated, report whether the most recent `Docker Publish` run
-#      on main published its multi-arch manifest (i.e. Security Scan passed).
-#      A red/skipped manifest here predicts the same stall on the tag.
+#   3. MAIN DOCKER-PUBLISH HEALTH (hard, when it can be measured): whether the
+#      most recent `Docker Publish` run on main published its multi-arch
+#      manifest (i.e. Security Scan passed). A red/skipped manifest here does
+#      not merely "predict" the same stall on the tag -- it is the same job,
+#      on the same images, with the same gate. If it is red, the cut stalls.
+#
+#      This check used to `warn` and let the script exit 0, so the tool printed
+#      "a tag cut will likely stall" and "READY: ... Safe to cut the tag." in
+#      the same breath (#3308). That is worse than having no preflight, because
+#      it launders a measured red into an explicit go-ahead -- exactly the
+#      "gate failure is cosmetic, promote anyway" reasoning the release freeze
+#      was written to remove after the v1.5.8 integrity failure.
+#
+#      Note the asymmetry this fixes. Check 1 (trivyignore drift) is a PROXY
+#      for "will Security Scan pass" and catches exactly one cause: a
+#      suppression stranded on release/*. Check 3 is the DIRECT measurement.
+#      Having the proxy hard and the measurement soft was backwards, and the
+#      gap was reachable: on 2026-08-13 a newly-published advisory (#3307)
+#      failed Security Scan on main while every hard check passed clean,
+#      because the CVE affected main and the release branches equally so there
+#      was no drift to find.
+#
+#      Three outcomes, deliberately kept distinct -- "I did not look",
+#      "I could not look" and "I looked and it is red" are different claims:
+#        * not measured (skipped, or `gh` absent)      -> note, not blocking
+#        * could not measure (the gh query failed)     -> INFRA, exit 2
+#        * measured red                                -> blocking, exit 1
 #
 # Exit-code contract (mirrors scripts/ci/check-migration-ledger.sh):
 #   0  ready       -- no blocking problem found.
-#   1  NOT READY   -- a real, blocking problem (drift or version mismatch).
+#   1  NOT READY   -- a real, blocking problem (drift, version mismatch, or a
+#                     measured-red Docker Publish on main).
 #                     Fix it on main before tagging; NEVER retry it away.
 #   2  INFRA       -- tooling/network failure (git ls-remote / gh / file reads
 #                     failed); retryable, NOT a readiness verdict.
@@ -38,7 +62,14 @@
 # Env overrides:
 #   PREFLIGHT_REPO   owner/name for the `gh api` calls (default: derived from
 #                    the origin remote, else artifact-keeper/artifact-keeper).
-#   PREFLIGHT_SKIP_DOCKER_HEALTH=1  skip check 3 (the advisory gh probe).
+#   PREFLIGHT_SKIP_DOCKER_HEALTH=1  do not run check 3 at all.
+#   PREFLIGHT_ALLOW_RED_PUBLISH=1   run check 3, report a red result, but do
+#                    not block on it. Deliberately SEPARATE from
+#                    PREFLIGHT_SKIP_DOCKER_HEALTH: "do not look" and "I looked,
+#                    it is red, proceeding anyway" are different decisions and
+#                    should read differently in the transcript. Using this is a
+#                    judgement call a human makes and owns; it is never a
+#                    default, and it is not a way to make a red main green.
 #
 set -euo pipefail
 
@@ -133,28 +164,45 @@ else
 fi
 echo
 
-# --- check 3: main docker-publish health (advisory) -------------------------
-echo "3) latest main Docker Publish health (advisory)"
+# --- check 3: main docker-publish health (hard when measurable) -------------
+echo "3) latest main Docker Publish health"
 if [[ "${PREFLIGHT_SKIP_DOCKER_HEALTH:-0}" == "1" ]]; then
-  note "skipped (PREFLIGHT_SKIP_DOCKER_HEALTH=1)"
+  note "NOT MEASURED (PREFLIGHT_SKIP_DOCKER_HEALTH=1) -- this check did not run,"
+  note "which is not the same as it passing."
 elif ! command -v gh >/dev/null 2>&1; then
-  note "gh not available -- skipping advisory check"
+  note "NOT MEASURED (gh not on PATH) -- this check did not run, which is not"
+  note "the same as it passing."
 else
   run_id="$(gh run list --repo "$REPO" --workflow "Docker Publish" --branch main --limit 1 \
               --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
   if [[ -z "$run_id" ]]; then
-    warn "could not query the latest main Docker Publish run -- skipping"
+    # gh is present but the query failed (auth, network, API). We could not
+    # measure, so we must not render a readiness verdict either way.
+    echo "INFRA: could not query the latest main Docker Publish run" >&2
+    exit 2
+  fi
+  sec="$(gh run view "$run_id" --repo "$REPO" --json jobs \
+          --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?')"
+  man="$(gh run view "$run_id" --repo "$REPO" --json jobs \
+          --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?')"
+  note "run $run_id: Security Scan=$sec, Backend Multi-Arch Manifest=$man"
+  if [[ "$sec" == "?" || "$man" == "?" ]]; then
+    echo "INFRA: could not read job conclusions from run $run_id" >&2
+    exit 2
+  elif [[ "$sec" == "success" && "$man" == "success" ]]; then
+    ok "main images are publishing cleanly"
+  elif [[ "${PREFLIGHT_ALLOW_RED_PUBLISH:-0}" == "1" ]]; then
+    warn "main's last Docker Publish did NOT cleanly publish the manifest, but"
+    warn "PREFLIGHT_ALLOW_RED_PUBLISH=1 was set, so this is not blocking."
+    note "  -> whoever set that owns the stall if the cut hits the same gate."
+    note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
   else
-    sec="$(gh run view "$run_id" --repo "$REPO" --json jobs \
-            --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?')"
-    man="$(gh run view "$run_id" --repo "$REPO" --json jobs \
-            --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?')"
-    note "run $run_id: Security Scan=$sec, Backend Multi-Arch Manifest=$man"
-    if [[ "$sec" == "success" && "$man" == "success" ]]; then
-      ok "main images are publishing cleanly"
-    else
-      warn "main's last Docker Publish did NOT cleanly publish the manifest -- a tag cut will likely stall the same way. Investigate before tagging."
-    fi
+    bad "main's last Docker Publish did NOT cleanly publish the manifest -- a tag cut WILL stall on the same gate."
+    note "  -> Security Scan hard-gates every multi-arch manifest, which gates"
+    note "     resolve-candidate-digest, which gates the whole release chain."
+    note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
+    note "  -> fix it on main and let Docker Publish go green before tagging (#3039, #3307)."
+    note "  -> PREFLIGHT_ALLOW_RED_PUBLISH=1 overrides this deliberately; do not use it to retry a red away."
   fi
 fi
 echo
