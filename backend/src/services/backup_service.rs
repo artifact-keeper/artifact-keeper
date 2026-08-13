@@ -170,6 +170,33 @@ pub struct CreateBackupRequest {
     pub name: Option<String>,
 }
 
+/// The outcome of a backup run that actually executed.
+///
+/// A run that reaches a terminal state — including a FAILED one — is a fact
+/// about the *backup*, recorded on the backup row as `status` plus
+/// `error_message`. It is not a fact about the request that triggered it.
+/// [`BackupService::execute_run`] therefore returns `Ok` for a failed run and
+/// reports the failure in [`failure`](Self::failure), so a synchronous trigger
+/// can answer with the backup resource (carrying `status = failed` and the
+/// message naming what went wrong) instead of collapsing the run's outcome
+/// into a transport-level error whose body discards it (#3327).
+///
+/// `failure` is `None` only for a run that completed with every enumerated
+/// artifact's bytes captured; it is `Some` with the exact message persisted to
+/// `backups.error_message` otherwise. Callers that want the historical
+/// "a failed run is an `Err`" shape — the scheduler does, because a failed
+/// occurrence must mark its `backup_schedule_runs` row failed — keep using
+/// [`BackupService::execute`], which is a thin wrapper over this.
+#[derive(Debug)]
+pub struct BackupRun {
+    /// The backup row as persisted after the run, i.e. with its terminal
+    /// `status` and, for a failed run, its `error_message`.
+    pub backup: Backup,
+    /// `Some(message)` when the run reached a terminal FAILED state; the
+    /// message is the same one written to `backups.error_message`.
+    pub failure: Option<String>,
+}
+
 /// Backup service
 pub struct BackupService {
     db: PgPool,
@@ -573,8 +600,30 @@ impl BackupService {
         Ok((backups, total))
     }
 
-    /// Execute a backup
+    /// Execute a backup, treating a failed run as an `Err`.
+    ///
+    /// Kept for callers whose own bookkeeping keys off the `Result` — the
+    /// scheduler marks its `backup_schedule_runs` occurrence failed from this
+    /// `Err` — so their behavior is byte-for-byte unchanged. Callers that need
+    /// to report the run's outcome rather than react to it use
+    /// [`execute_run`](Self::execute_run).
     pub async fn execute(&self, backup_id: Uuid) -> Result<Backup> {
+        let run = self.execute_run(backup_id).await?;
+        match run.failure {
+            Some(message) => Err(AppError::Internal(message)),
+            None => Ok(run.backup),
+        }
+    }
+
+    /// Execute a backup and report how the run ended.
+    ///
+    /// Returns `Ok` for any run that actually executed, including one that
+    /// FAILED — the failure is carried in [`BackupRun::failure`] and is already
+    /// persisted on the backup row as `status = failed` plus `error_message`
+    /// (#3327). `Err` is reserved for the cases where there is no run outcome
+    /// to report: another backup is already in progress, the backup does not
+    /// exist, or the status bookkeeping itself could not be written.
+    pub async fn execute_run(&self, backup_id: Uuid) -> Result<BackupRun> {
         // Check if another backup is running
         {
             let mut active = self.active_backup.lock().await;
@@ -602,12 +651,33 @@ impl BackupService {
             Ok(backup) => {
                 self.update_status(backup_id, BackupStatus::Completed, None)
                     .await?;
-                Ok(backup)
+                // Re-read for the same reason the failed arm does: `do_backup`
+                // loaded the row while it was still `in_progress`, so returning
+                // it unchanged would answer a caller that has just been told to
+                // trust `status` with a status that is no longer true. Falls
+                // back to the pre-read row if the re-read fails — the run did
+                // complete, and that is not worth failing the call over.
+                let backup = self.get_by_id(backup_id).await.unwrap_or(backup);
+                Ok(BackupRun {
+                    backup,
+                    failure: None,
+                })
             }
             Err(e) => {
-                self.update_status(backup_id, BackupStatus::Failed, Some(&e.to_string()))
+                let message = e.to_string();
+                self.update_status(backup_id, BackupStatus::Failed, Some(&message))
                     .await?;
-                Err(e)
+                // Re-read so the caller receives the row exactly as persisted
+                // (`status = failed`, `error_message` set). If even that read
+                // fails there is no recorded outcome to report, so the original
+                // error propagates rather than being invented.
+                match self.get_by_id(backup_id).await {
+                    Ok(backup) => Ok(BackupRun {
+                        backup,
+                        failure: Some(message),
+                    }),
+                    Err(_) => Err(e),
+                }
             }
         }
     }

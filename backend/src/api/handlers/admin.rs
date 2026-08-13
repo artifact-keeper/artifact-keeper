@@ -453,6 +453,13 @@ pub async fn create_backup(
 }
 
 /// Execute a pending backup
+///
+/// Answers with the backup resource as persisted after the run. A run that
+/// FAILED is reported as `status = "failed"` with `error_message` naming the
+/// cause — it is not a transport-level error, because the request was
+/// understood and carried out and the outcome belongs to the backup (#3327).
+/// Clients must read `status`, not just the HTTP code. `500` is reserved for
+/// the cases where no run outcome exists to report at all.
 #[utoipa::path(
     post,
     path = "/backups/{id}/execute",
@@ -462,9 +469,10 @@ pub async fn create_backup(
         ("id" = Uuid, Path, description = "Backup ID")
     ),
     responses(
-        (status = 200, description = "Backup executed", body = BackupResponse),
+        (status = 200, description = "Backup run finished; `status` is `completed` or `failed` and `error_message` carries the cause of a failure", body = BackupResponse),
         (status = 404, description = "Backup not found"),
-        (status = 500, description = "Internal server error")
+        (status = 409, description = "Another backup is already in progress"),
+        (status = 500, description = "The run could not be started or its outcome could not be recorded")
     ),
     security(("bearer_auth" = []))
 )]
@@ -485,7 +493,20 @@ pub async fn execute_backup(
     let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
     let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
 
-    let backup = service.execute(id).await?;
+    // `execute_run`, not `execute`: a run that ends FAILED has already recorded
+    // its own terminal state and the message naming what went wrong, and that
+    // is what the caller is answered with. Collapsing it into an `Err` here
+    // produced a bare `500 {"code":"INTERNAL_ERROR"}` whose body threw away the
+    // very message the failure exists to deliver (#3327).
+    let run = service.execute_run(id).await?;
+    if let Some(ref message) = run.failure {
+        tracing::warn!(
+            backup_id = %id,
+            "backup run finished in state failed: {}",
+            message
+        );
+    }
+    let backup = run.backup;
 
     Ok(Json(BackupResponse {
         id: backup.id,
@@ -2581,5 +2602,127 @@ mod tests {
         assert_eq!(uid, None);
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3327: a backup run that ends FAILED is reported as the backup resource
+    // (HTTP 200, `status = "failed"`, `error_message` naming the cause), not as
+    // a transport-level 500.
+    //
+    // The regression this pins: `execute_backup` used to call
+    // `BackupService::execute`, whose `Err` for a failed run propagated through
+    // `Result<Json<_>>` into `500 {"code":"INTERNAL_ERROR","message":"Internal
+    // server error"}`. The message #3170 composes — the one naming every
+    // artifact object whose bytes could not be read, which is the entire point
+    // of failing the job — was written to `backups.error_message` and to the
+    // server log, and then discarded at the HTTP boundary. An operator
+    // triggering a backup got a bare 500 and no way to learn why.
+    //
+    // The assertion is deliberately on BOTH halves: the status code must not be
+    // 5xx, AND the body must carry the failed status plus the causal message.
+    // Asserting only on the code would pass for a handler that reports success.
+    // -----------------------------------------------------------------------
+
+    /// Insert an artifact row whose bytes are absent from the repository's
+    /// resolved storage root, so the backup enumerates a key it cannot read.
+    #[cfg(test)]
+    async fn insert_unreadable_artifact(pool: &sqlx::PgPool, repo_id: Uuid) -> String {
+        let key = format!("bk-3327/{}", Uuid::new_v4());
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (repository_id, path, name, size_bytes, checksum_sha256,
+                 content_type, storage_key)
+            VALUES ($1, $2, 'unreadable', 10, $3, 'application/octet-stream', $4)
+            "#,
+        )
+        .bind(repo_id)
+        .bind(format!("path/{}", key))
+        .bind("0".repeat(64))
+        .bind(&key)
+        .execute(pool)
+        .await
+        .expect("insert artifact row with no bytes behind it");
+        key
+    }
+
+    #[tokio::test]
+    async fn execute_reports_a_failed_run_as_the_backup_resource_not_a_500() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let missing_key = insert_unreadable_artifact(&f.pool, f.repo_id).await;
+
+        // Scope the backup to the fixture repository so the assertion cannot be
+        // satisfied (or broken) by unrelated rows in a shared test database.
+        let storage = Arc::new(
+            StorageService::from_config(&f.state.config)
+                .await
+                .expect("storage from test config"),
+        );
+        let service = BackupService::new(f.pool.clone(), storage);
+        let backup = service
+            .create(ServiceCreateBackup {
+                backup_type: BackupType::Full,
+                repository_ids: Some(vec![f.repo_id]),
+                exclude_repository_ids: None,
+                since: None,
+                created_by: None,
+                name: None,
+            })
+            .await
+            .expect("create backup job");
+
+        // `execute_backup` extracts the non-Option `Extension<AuthExtension>`,
+        // exactly as the production auth middleware inserts it.
+        let app = tdh::router_with_auth_ext(
+            super::router(),
+            f.state.clone(),
+            tdh::make_auth(f.user_id, &f.username),
+        );
+        let (status, body) = tdh::send(
+            app,
+            tdh::post(
+                format!("/backups/{}/execute", backup.id),
+                "application/json",
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+
+        assert!(
+            !status.is_server_error(),
+            "a recorded run outcome must not surface as a transport error; got {status} body={}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "the trigger answers with the backup resource"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("execute must answer with a BackupResponse");
+        assert_eq!(
+            json["status"], "failed",
+            "the run failed, so the resource must say so rather than report success: {json}"
+        );
+        let message = json["error_message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&missing_key),
+            "the response must carry the message naming the unreadable object; got {message:?}"
+        );
+
+        // The persisted row agrees with what the caller was told.
+        let row = service.get_by_id(backup.id).await.expect("reload backup");
+        assert_eq!(row.status, BackupStatus::Failed);
+
+        let _ = sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(backup.id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
     }
 }
