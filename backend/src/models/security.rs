@@ -66,6 +66,13 @@ impl Severity {
     }
 
     /// Parse from string (case-insensitive).
+    ///
+    /// Strict: returns `None` for anything it does not recognise. This is the
+    /// right parser for an *operator-configured* value (a policy threshold),
+    /// where the caller must decide for itself what an unparseable
+    /// configuration means. It is NOT the right parser for a severity token
+    /// coming off a scanner — use [`Severity::from_scanner_token`] for that,
+    /// so the "unrecognised" decision is made in exactly one place (#3243).
     pub fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "critical" => Some(Severity::Critical),
@@ -74,6 +81,84 @@ impl Severity {
             "low" => Some(Severity::Low),
             "info" | "informational" | "none" => Some(Severity::Info),
             _ => None,
+        }
+    }
+
+    /// The bucket an **unrecognised** scanner severity token lands in.
+    ///
+    /// `Info` — the lowest bucket, which is exactly where every adapter's own
+    /// private fallback sent an unrecognised token before #3294. Naming it
+    /// changes nothing on its own; it exists so the decision has one place to
+    /// live instead of three, and so the one edit that changes it is a
+    /// one-symbol edit.
+    ///
+    /// **This value is known to be wrong and is deliberately left alone here.**
+    /// A vulnerability whose severity a scanner could not classify is an
+    /// *ungraded* vulnerability, not a harmless one; filing it at the floor
+    /// means every severity-reading gate grades it as the least dangerous
+    /// thing it has ever seen, which fails OPEN on precisely the findings
+    /// nobody has triaged yet. Fixing it moves four gates and can drop a
+    /// repository's security grade by several bands on the next scan — far too
+    /// much behaviour change for a patch release — so it is staged separately
+    /// as #3306 (milestone 1.8.0), which repoints this constant to
+    /// `Severity::Medium` and carries the operator-facing upgrade note.
+    ///
+    /// `Info` is also the only value that needs no schema change today:
+    /// `Severity`'s five variants are pinned by DB CHECK constraints on
+    /// `scan_findings.severity` and `scan_configs.severity_threshold`
+    /// (`migrations/022_security_scanning.sql`), by the per-severity count
+    /// columns on `scan_results`, and by the `SeverityThreshold` unions in the
+    /// web and CLI clients — see #3306 for why a distinct `Unknown` variant
+    /// was rejected.
+    ///
+    /// **This constant governs the three scanner ADAPTERS only, and is not the
+    /// only unrecognised-severity fallback in the crate.** The OSV/GitHub
+    /// advisory ingestion path in `scanner_service::scan_dependencies` has its
+    /// own, independent, and *different* one:
+    /// `from_str_loose(&advisory_match.severity).unwrap_or(Severity::Medium)`.
+    /// It is deliberately not routed through here — advisory feeds are a
+    /// different producer with a different vocabulary, and converging them is
+    /// a behaviour change for that path, not a consolidation. Anyone repointing
+    /// this constant under #3306 must therefore decide explicitly whether the
+    /// advisory fallback converges with it or stays independent; repointing
+    /// this symbol alone does NOT make the crate's handling of an unrecognised
+    /// severity uniform.
+    pub const UNRECOGNIZED_SCANNER_SEVERITY: Severity = Severity::Info;
+
+    /// Bucket a severity token **as emitted by a vulnerability scanner**.
+    ///
+    /// This is the single classification point for every scanner adapter
+    /// (Trivy, Grype, OpenSCAP, and everything that funnels through
+    /// `convert_trivy_findings`). Before #3294 each adapter carried its own
+    /// `unwrap_or(Severity::Info)` / `_ => Severity::Info` fallback, and the
+    /// three drifted apart: the OpenSCAP one had no `critical` arm at all, so
+    /// a wrapper emitting `critical` had its most severe result downgraded to
+    /// `info`, and nothing anywhere recognised Grype's `Negligible` — it
+    /// reached the lowest bucket by falling off the end of a match, so nothing
+    /// recorded that it was a decision rather than a parse miss.
+    ///
+    /// Vocabulary handled here on top of [`Severity::from_str_loose`]:
+    ///   * `negligible` — Grype's Debian/Ubuntu OVAL feeds (and Harbor) emit
+    ///     this for CVEs the distro has triaged as not worth fixing. It is a
+    ///     RECOGNISED token that maps to the lowest bucket **on purpose**, not
+    ///     a parse miss. Matches Harbor, which documents `negligible` as never
+    ///     blocking a pull.
+    ///   * anything else, including Trivy's `UNKNOWN` and XCCDF's `unknown`
+    ///     (the OpenSCAP default when a rule declares no severity) — bucketed
+    ///     at [`Severity::UNRECOGNIZED_SCANNER_SEVERITY`], which is `Info`
+    ///     today and is the fail-open #3306 closes.
+    ///
+    /// The token is lowercased but **not trimmed**, matching
+    /// `from_str_loose` and therefore every adapter's pre-#3294 behaviour: a
+    /// whitespace-padded token classifies as unrecognised exactly as it did
+    /// before. Trimming would be a second behaviour change and belongs with
+    /// #3306, not here.
+    ///
+    /// Total, not `Option`: an ingestion path has no sensible "no answer".
+    pub fn from_scanner_token(token: &str) -> Self {
+        match token.to_lowercase().as_str() {
+            "negligible" => Severity::Info,
+            other => Severity::from_str_loose(other).unwrap_or(Self::UNRECOGNIZED_SCANNER_SEVERITY),
         }
     }
 
@@ -407,6 +492,124 @@ mod tests {
         assert_eq!(Severity::from_str_loose("unknown"), None);
         assert_eq!(Severity::from_str_loose(""), None);
         assert_eq!(Severity::from_str_loose("very-high"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3294: scanner-token classification.
+    //
+    // These assert the *classifier*. The test that gates the behaviour change
+    // is the adapter-level one (`openscap_scanner`), because the missing
+    // `critical` arm lived in that adapter's own private match, not in this
+    // function. Expected values are written out literally rather than derived
+    // from `from_str_loose` + the constant, so the assertions cannot agree
+    // with the implementation by construction.
+    //
+    // Scope note: #3294 consolidates three per-adapter fallbacks onto this one
+    // classifier WITHOUT moving where an unrecognised token lands. That move
+    // is #3306 (1.8.0). The `..._still_classify_at_the_floor` test below pins
+    // the un-moved behaviour so #3306 has to delete it on purpose.
+    // -----------------------------------------------------------------------
+
+    /// Positive control: every token the strict parser already recognised must
+    /// classify to exactly the same bucket it does today, in both cases.
+    #[test]
+    fn test_from_scanner_token_preserves_every_recognized_token() {
+        for (token, expected) in [
+            ("critical", Severity::Critical),
+            ("CRITICAL", Severity::Critical),
+            ("Critical", Severity::Critical),
+            ("high", Severity::High),
+            ("HIGH", Severity::High),
+            ("medium", Severity::Medium),
+            ("MEDIUM", Severity::Medium),
+            ("moderate", Severity::Medium),
+            ("low", Severity::Low),
+            ("LOW", Severity::Low),
+            ("info", Severity::Info),
+            ("informational", Severity::Info),
+            ("none", Severity::Info),
+        ] {
+            assert_eq!(
+                Severity::from_scanner_token(token),
+                expected,
+                "recognized token {token:?} must classify unchanged"
+            );
+        }
+    }
+
+    /// `Negligible` is a token the classifier KNOWS, not one it fails to
+    /// parse. Behaviourally it lands where it always did (Info) — that is why
+    /// recognising it is safe to ship in a patch. The change is that it gets
+    /// there deliberately, so it stays at the floor when #3306 moves the
+    /// unrecognised bucket off it.
+    ///
+    /// No revert can distinguish this arm today: with
+    /// `UNRECOGNIZED_SCANNER_SEVERITY == Severity::Info`, deleting
+    /// `"negligible" => Severity::Info` leaves the observable result
+    /// unchanged. That is the point — the arm is behaviour-preserving by
+    /// construction. It becomes load-bearing, and independently revert-proved,
+    /// in #3306.
+    #[test]
+    fn test_negligible_is_recognized_and_maps_to_the_lowest_bucket() {
+        for token in ["negligible", "Negligible", "NEGLIGIBLE"] {
+            assert_eq!(
+                Severity::from_scanner_token(token),
+                Severity::Info,
+                "{token:?} is Grype's/Harbor's explicit 'not worth fixing' \
+                 grade and belongs in the lowest bucket"
+            );
+        }
+    }
+
+    /// Neutrality pin for the 1.7.2 patch: consolidating the three adapter
+    /// fallbacks onto one classifier must NOT move where an unrecognised token
+    /// lands. It still lands at the floor, exactly as each adapter's private
+    /// `unwrap_or(Severity::Info)` / `_ => Severity::Info` put it.
+    ///
+    /// This is a fail-open and it is known to be one — see
+    /// `UNRECOGNIZED_SCANNER_SEVERITY` and #3306, which repoints the constant
+    /// to `Medium` in 1.8.0. **#3306 must delete this test deliberately**; it
+    /// exists so that closing the fail-open cannot happen by accident inside a
+    /// patch release.
+    #[test]
+    fn test_unrecognized_tokens_still_classify_at_the_floor() {
+        for token in [
+            "unknown",
+            "UNKNOWN",
+            "Unknown",
+            "",
+            "   ",
+            " high ",
+            "very-high",
+            "sev:9",
+        ] {
+            assert_eq!(
+                Severity::from_scanner_token(token),
+                Severity::Info,
+                "unrecognised token {token:?} must classify exactly as it did \
+                 before #3294 — moving it is #3306, not this patch"
+            );
+        }
+
+        // Positive controls in the SAME test. Without these the assertions
+        // above are satisfied in full by `from_scanner_token` rewritten as
+        // `|_| Severity::Info`, which is the exact failure mode this test is
+        // supposed to detect on the day #3306 lands a half-finished change.
+        // Every graded token must still reach its own bucket.
+        for (token, expected) in [
+            ("critical", Severity::Critical),
+            ("high", Severity::High),
+            ("medium", Severity::Medium),
+            ("low", Severity::Low),
+        ] {
+            assert_eq!(
+                Severity::from_scanner_token(token),
+                expected,
+                "graded token {token:?} must still classify as {expected:?} — \
+                 the floor assertions above are only meaningful if the \
+                 classifier still discriminates"
+            );
+        }
     }
 
     #[test]

@@ -153,17 +153,27 @@ pub struct HarborVulnerability {
 
 /// Normalize a Harbor severity token to the trivy severity vocabulary the
 /// shared converter understands. Harbor adds `Negligible` (mapped to `Low`)
-/// and `Unknown` (mapped to `Unknown`, which `Severity::from_str_loose` does
-/// not recognise and therefore falls back to `Info` in the converter). All
-/// other tokens (Critical/High/Medium/Low/None) pass through unchanged. Pure
-/// fn so it is covered without a network.
+/// and `Unknown` (mapped to `Unknown`, which the converter's classifier does
+/// not recognise and therefore files at `Info`). All other tokens
+/// (Critical/High/Medium/Low/None) pass through unchanged. Pure fn so it is
+/// covered without a network.
 fn normalize_harbor_severity(sev: &str) -> String {
     match sev.to_ascii_lowercase().as_str() {
+        // Deliberately mapped UP to `Low` rather than passed through to
+        // `Severity::from_scanner_token`, which buckets `negligible` at
+        // `Info`. Left alone by #3294, which was scoped not to change what
+        // blocks: `Low` violates a `max_severity = 'low'` policy and `Info`
+        // violates nothing, so reconciling the two would RELAX a gate. That
+        // leaves two `Negligible` mappings in the tree — Grype's at `Info`,
+        // Harbor's at `Low` — to be reconciled with #3243 stage 2, which
+        // decides the disposition of the `Info` bucket for blocking.
         "negligible" => "Low".to_string(),
         // Empty severity is normalized to `Unknown` (-> Info in the converter).
-        // `Unknown` itself is intentionally passed through: `from_str_loose`
-        // returns None for it and the converter defaults to Info, matching the
-        // spec's "Unknown -> Info" requirement without duplicating the mapping.
+        // `Unknown` itself is intentionally passed through: the classifier does
+        // not recognise it and files it at `Info`, matching the spec's
+        // "Unknown -> Info" requirement without duplicating the mapping. That
+        // an ungraded finding lands at the floor at all is the fail-open
+        // tracked in #3306.
         "" => "Unknown".to_string(),
         _ => sev.to_string(),
     }

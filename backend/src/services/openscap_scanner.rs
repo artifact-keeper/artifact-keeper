@@ -239,12 +239,23 @@ impl OpenScapScanner {
             .iter()
             .filter(|f| matches!(f.result.as_str(), "fail" | "error" | "unknown"))
             .map(|f| {
-                let severity = match f.severity.to_lowercase().as_str() {
-                    "high" => Severity::High,
-                    "medium" | "moderate" => Severity::Medium,
-                    "low" => Severity::Low,
-                    _ => Severity::Info,
-                };
+                // #3294: shared classifier, replacing a private match that
+                // recognised only `high | medium | moderate | low` and sent
+                // everything else to `Severity::Info`. It had no `critical`
+                // arm, so content emitting `critical` had its MOST severe
+                // result filed as the least severe one — the fail-open this
+                // patch closes. XCCDF 1.2 (NISTIR 7275r4 §6.4.4.2) defines the
+                // Rule `severity` attribute as `unknown | info | low | medium
+                // | high`, so `critical` is non-standard and reaches this only
+                // from content or a wrapper that emits it; the volume is
+                // therefore near zero, which is what makes the change safe in
+                // a patch.
+                //
+                // Every other token classifies exactly as it did before,
+                // `unknown` included — XCCDF's default rule severity still
+                // lands at `Info`. That is a separate, high-volume fail-open
+                // and it is staged as #3306 (1.8.0).
+                let severity = Severity::from_scanner_token(&f.severity);
 
                 let source_url = f.references.first().cloned();
 
@@ -437,6 +448,123 @@ mod tests {
         );
         assert_eq!(findings[0].source_url, Some("CCE-27286-2".to_string()));
         assert_eq!(findings[1].severity, Severity::Medium);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3294: severity classification through OpenSCAP's REAL parse path.
+    //
+    // Pre-fix this adapter had its own private match arm list
+    // (`high | medium | moderate | low`, everything else `_ =>
+    // Severity::Info`) with NO `critical` arm, so content emitting `critical`
+    // had its most severe result filed as the least severe one. That is the
+    // one behaviour change in this patch, and
+    // `test_convert_findings_openscap_critical_is_not_downgraded` is the test
+    // that gates it: restoring the private match turns that test — and only
+    // that test — red.
+    //
+    // XCCDF 1.2 (NISTIR 7275r4, §6.4.4.2) defines the Rule `severity`
+    // attribute as `unknown | info | low | medium | high`, so `critical` is
+    // NOT in the spec's vocabulary and only non-standard content produces it —
+    // which is exactly why closing it is safe in a patch. The spec's DEFAULT
+    // value, `unknown`, is the high-volume case and is deliberately left
+    // classifying at `Info` here; that is #3306 (1.8.0).
+    // -----------------------------------------------------------------------
+
+    fn openscap_response_with_severities(sevs: &[&str]) -> OpenScapResponse {
+        OpenScapResponse {
+            findings: sevs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| OpenScapFinding {
+                    rule_id: format!("xccdf_org.ssgproject.content_rule_{i}"),
+                    // `fail` so nothing is dropped by the result filter and
+                    // the indices below line up with `sevs`.
+                    result: "fail".into(),
+                    severity: (*s).to_string(),
+                    title: format!("rule {i}"),
+                    description: None,
+                    references: vec![],
+                })
+                .collect(),
+            profile: Some("standard".into()),
+            error: None,
+        }
+    }
+
+    /// Positive control: the XCCDF grades this adapter already understood must
+    /// convert exactly as they do today.
+    #[test]
+    fn test_convert_findings_preserves_graded_xccdf_severities() {
+        let response = openscap_response_with_severities(&["high", "medium", "moderate", "low"]);
+        let findings = OpenScapScanner::convert_findings(&response);
+        assert_eq!(findings.len(), 4);
+        assert_eq!(findings[0].severity, Severity::High);
+        assert_eq!(findings[1].severity, Severity::Medium);
+        assert_eq!(findings[2].severity, Severity::Medium);
+        assert_eq!(findings[3].severity, Severity::Low);
+    }
+
+    /// Neutrality pin: XCCDF's default rule severity, `unknown`, classifies
+    /// exactly where the adapter's private match put it — the lowest bucket.
+    /// That is a fail-open and it is deliberately left in place by this patch
+    /// because it is the high-volume case (Artifact Keeper's own wrapper,
+    /// `scripts/openscap-wrapper.py:211,231`, defaults a rule's severity to
+    /// the literal `unknown`, so most rules on a typical profile arrive
+    /// ungraded). **#3306 must delete this test on purpose.**
+    #[test]
+    fn test_convert_findings_xccdf_unknown_is_unchanged_pending_3306() {
+        let response = openscap_response_with_severities(&["unknown", "info", "high"]);
+        let findings = OpenScapScanner::convert_findings(&response);
+        assert_eq!(findings.len(), 3);
+
+        assert_eq!(
+            findings[0].severity,
+            Severity::Info,
+            "XCCDF `unknown` must classify as it did before #3294 — moving it \
+             is #3306, not this patch"
+        );
+        // An EXPLICIT `info` grade lands in the same bucket, which is the
+        // whole problem #3306 exists to fix: the two are indistinguishable.
+        assert_eq!(findings[1].severity, Severity::Info);
+
+        // Positive control in the same fixture: a graded rule is untouched, so
+        // the equalities above cannot be satisfied by a converter that stopped
+        // grading anything.
+        assert_eq!(findings[2].severity, Severity::High);
+    }
+
+    /// **The one behaviour change in this patch.** The private match this
+    /// replaced had arms for `high | medium | moderate | low` only, so a
+    /// `critical` result fell through its `_ => Severity::Info` catch-all and
+    /// the adapter's MOST severe finding was filed as its least severe one.
+    ///
+    /// `critical` is not in XCCDF 1.2's `unknown | info | low | medium | high`
+    /// vocabulary, so it reaches this adapter only from non-standard content —
+    /// near-zero volume, unambiguously a fail-open when it does fire, which is
+    /// why this half ships in a patch while #3306 does not.
+    #[test]
+    fn test_convert_findings_openscap_critical_is_not_downgraded() {
+        let response = openscap_response_with_severities(&["critical", "high", "info"]);
+        let findings = OpenScapScanner::convert_findings(&response);
+        assert_eq!(findings.len(), 3);
+
+        assert_eq!(
+            findings[0].severity,
+            Severity::Critical,
+            "an OpenSCAP `critical` result must not be downgraded"
+        );
+        assert_ne!(
+            findings[0].severity,
+            Severity::Info,
+            "the pre-#3294 private match had no `critical` arm, so this landed \
+             in the lowest bucket"
+        );
+
+        // Positive controls in the same fixture, so the assertions above
+        // cannot be satisfied by a change that raises every finding: a graded
+        // `high` is unchanged, and an explicit `info` stays at the floor.
+        assert_eq!(findings[1].severity, Severity::High);
+        assert_eq!(findings[2].severity, Severity::Info);
     }
 
     /// When the OpenSCAP sidecar is unreachable, the scanner must return Err
