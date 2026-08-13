@@ -24,9 +24,13 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
 
    It asserts main is actually releasable — `.trivyignore` covers every
    active `release/*` branch's suppressions (the drift that stalled
-   v1.7.0-rc.1 at Security Scan, #3039), the version set is consistent, and
-   main's last Docker Publish cleanly published its manifest. A `NOT READY`
-   (exit 1) means fix main first; tagging over it costs a full re-cut cycle.
+   v1.7.0-rc.1 at Security Scan, #3039), the version set is consistent,
+   main's last Docker Publish cleanly published its manifest, and no
+   component pinned by a checked-in `VERSION` file would try to republish an
+   exact tag that already exists with different content (the collision that
+   killed the v1.7.2 tag). A `NOT READY` (exit 1) means fix main first;
+   tagging over it costs a full re-cut cycle. An exit 2 is `INFRA` — a check
+   that could not be measured, which is neither a pass nor a failure.
 
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
@@ -59,12 +63,30 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    as `backend_tag`, `version-set-integrity` also verifies the published
    image set and the CHANGELOG entry before you commit to the tag.
 
-5. **Tag the release.**
+5. **Cut a release candidate first, then tag the release.** Tag
+   `vX.Y.Z-rc.N` and let the full chain complete before tagging `vX.Y.Z`.
 
    ```bash
    git checkout main && git pull
+   git tag vX.Y.Z-rc.1 && git push origin vX.Y.Z-rc.1
+   # chain completes green, then:
    git tag vX.Y.Z && git push origin vX.Y.Z
    ```
+
+   v1.7.0 was cut this way and took four candidates — rc.1, rc.2 and rc.3
+   all failed. v1.7.1 and v1.7.2 went straight to a real tag; v1.7.1 got
+   away with it and v1.7.2 did not, failing Docker Publish on an unbumped
+   `docker/scanner-adapter/VERSION` and leaving a dead tag that had to be
+   deleted by hand.
+
+   This is safe because the repository ruleset applies tag immutability to
+   `refs/tags/v*` but **excludes** `v*-rc*`, `v*-beta*` and `v*-alpha*`:
+   candidates are deletable and re-cuttable, releases are not.
+
+   A candidate is not a full substitute, though. Some publish logic keys on
+   a clean `refs/tags/v*` ref and is skipped for prereleases — the
+   scanner-adapter exact-version check is one, which is why that specific
+   trap is caught by the preflight in step 1 rather than by the candidate.
 
    The tag triggers `release.yml` (binaries, gates, GitHub Release) and
    `docker-publish.yml` (backend, web, openscap images on ghcr.io and
@@ -96,6 +118,10 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
   Thank You) follow the CLAUDE.md policy.
 - Prerelease tags (`-rc.N`, `-beta.N`) are exempt from the CHANGELOG
   entry requirement; final releases are not.
+- Cut a release candidate and let the chain finish before tagging the real
+  release. Tag immutability covers `refs/tags/v*` and excludes `v*-rc*` /
+  `v*-beta*` / `v*-alpha*`, so a failed candidate is re-cuttable while a
+  failed release leaves a dead tag that must be deleted by hand (v1.7.2).
 
 
 ## Release-notes style

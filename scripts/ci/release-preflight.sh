@@ -51,6 +51,41 @@
 #        * could not measure (the gh query failed)     -> INFRA, exit 2
 #        * measured red                                -> blocking, exit 1
 #
+#   4. VERSION-PINNED IMAGE COLLISION (hard, when it can be measured): for each
+#      component whose image tag comes from a checked-in VERSION file, whether
+#      that exact tag is ALREADY published from different sources. Exact
+#      version tags are never republished (#2457 / the v1.5.8 integrity
+#      failure), so a changed component with an unbumped VERSION cannot
+#      publish -- and the failure skips every remaining manifest, so
+#      resolve-candidate-digest has nothing to pin and the whole release chain
+#      stops.
+#
+#      The motivating incident: v1.7.2 was tagged on a commit where #3315
+#      re-pinned the trivy base image inside docker/Dockerfile.scanner-adapter
+#      but left docker/scanner-adapter/VERSION at 1.2.2. The tag's Docker
+#      Publish failed with "1.2.2 already exists ... but scanner-adapter
+#      sources changed", the chain stopped, and because the tag was immutable
+#      it had to be deleted by hand.
+#
+#      Why nothing caught it earlier is the whole point of putting the check
+#      HERE. The publish job derives `stable_requested` from the ref, and only
+#      a clean `refs/tags/v*` (no hyphen) sets it. On main the job publishes
+#      dev/sha tags and returns before the collision check; on a `-rc.N` tag it
+#      does the same. So Docker Publish passed on main for the SAME commit, and
+#      an RC would have passed too. The defect was reachable by exactly one
+#      kind of run -- the real tag -- which is the most expensive place to
+#      discover it and the one place it cannot be amended.
+#
+#      Same three-way outcome as check 3, for the same reason: a registry we
+#      cannot read is not a registry that said yes.
+#        * tag absent                                  -> ok, it will be created
+#        * published, sources identical                -> ok (a rebuild may
+#          still move the floating tags; the exact tag stays put)
+#        * published, sources differ                   -> blocking, exit 1
+#        * published, no provenance annotation         -> blocking, exit 1
+#          (measured: the publish job hard-fails on this too)
+#        * registry unreadable / commit unfetchable    -> INFRA, exit 2
+#
 # Exit-code contract (mirrors scripts/ci/check-migration-ledger.sh):
 #   0  ready       -- no blocking problem found.
 #   1  NOT READY   -- a real, blocking problem (drift, version mismatch, or a
@@ -70,6 +105,13 @@
 #                    should read differently in the transcript. Using this is a
 #                    judgement call a human makes and owns; it is never a
 #                    default, and it is not a way to make a red main green.
+#   PREFLIGHT_SKIP_VERSION_PIN=1    do not run check 4 at all.
+#   PREFLIGHT_TAG_STATE_CMD         path to the tag-presence probe
+#                    (default .github/scripts/registry-tag-state.sh).
+#   PREFLIGHT_TAG_REVISION_CMD      path to the tag-revision probe
+#                    (default .github/scripts/registry-tag-revision.sh).
+#                    Both exist so the self-test can replay canned registry
+#                    answers without a network or a docker daemon.
 #
 set -euo pipefail
 
@@ -204,6 +246,105 @@ else
     note "  -> fix it on main and let Docker Publish go green before tagging (#3039, #3307)."
     note "  -> PREFLIGHT_ALLOW_RED_PUBLISH=1 overrides this deliberately; do not use it to retry a red away."
   fi
+fi
+echo
+
+# --- check 4: version-pinned image collision --------------------------------
+#
+# One row per component whose published image tag is named by a checked-in
+# VERSION file, as `<version file>|<image name suffix>|<source paths>`. The
+# source paths MUST mirror the paths the publish job diffs, or this check and
+# the gate it predicts disagree.
+#
+# scanner-adapter is currently the ONLY such component: `docker/scanner-adapter/
+# VERSION` is the only VERSION file in the repo. backend, web and openscap are
+# tagged with the AK release semver taken from the git tag itself, so their
+# exact tags cannot collide the same way -- a re-cut of an existing version is
+# caught earlier, by assert-release-absent.sh / assert-stable-tag-free.sh. This
+# is a list rather than a hardcoded component so that adding the second one is
+# a one-line change instead of a rewrite.
+echo "4) version-pinned image tags (VERSION file vs published image)"
+VERSION_PINNED_COMPONENTS=(
+  "docker/scanner-adapter/VERSION|-scanner-adapter|docker/scanner-adapter docker/Dockerfile.scanner-adapter"
+)
+TAG_STATE_CMD="${PREFLIGHT_TAG_STATE_CMD:-.github/scripts/registry-tag-state.sh}"
+TAG_REVISION_CMD="${PREFLIGHT_TAG_REVISION_CMD:-.github/scripts/registry-tag-revision.sh}"
+
+if [[ "${PREFLIGHT_SKIP_VERSION_PIN:-0}" == "1" ]]; then
+  note "NOT MEASURED (PREFLIGHT_SKIP_VERSION_PIN=1) -- this check did not run,"
+  note "which is not the same as it passing."
+elif [[ ! -x "$TAG_STATE_CMD" || ! -x "$TAG_REVISION_CMD" ]]; then
+  echo "INFRA: registry probe scripts not found/executable ($TAG_STATE_CMD, $TAG_REVISION_CMD)" >&2
+  exit 2
+else
+  for component in "${VERSION_PINNED_COMPONENTS[@]}"; do
+    IFS='|' read -r vfile suffix srcpaths <<< "$component"
+    read -r -a srcarr <<< "$srcpaths"
+    if [[ ! -f "$vfile" ]]; then
+      warn "no $vfile -- skipping this component"
+      continue
+    fi
+    pinned="$(tr -d '[:space:]' < "$vfile")"
+    image="${REPO}${suffix}"
+    if [[ -z "$pinned" ]]; then
+      bad "$vfile is empty -- the publish job cannot derive a tag from it"
+      continue
+    fi
+
+    state="$("$TAG_STATE_CMD" ghcr.io "$image" "$pinned" 2>/dev/null || true)"
+    note "$image:$pinned -> $state"
+    case "$state" in
+      absent)
+        ok "$vfile pins $pinned, which is unpublished -- the cut will create it"
+        continue
+        ;;
+      present) ;;
+      *)
+        # Includes `indeterminate` and an empty/absent probe answer. We could
+        # not read the registry, so we must not render a verdict either way.
+        echo "INFRA: could not determine whether $image:$pinned is published (got '${state:-<no answer>}')" >&2
+        exit 2
+        ;;
+    esac
+
+    # Published. Whether that is fine depends entirely on whether this commit
+    # would rebuild it from different sources.
+    rev="$("$TAG_REVISION_CMD" ghcr.io "$image" "$pinned" 2>/dev/null || true)"
+    if [[ "$rev" == "none" ]]; then
+      bad "$image:$pinned is published but carries no source-revision annotation"
+      note "  -> the publish job fails closed on this (\"provenance missing\") and"
+      note "     demands a $vfile bump; it will do the same on the tag."
+      continue
+    fi
+    if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "INFRA: could not read the source revision of $image:$pinned (got '${rev:-<no answer>}')" >&2
+      exit 2
+    fi
+
+    # A shallow checkout will not have the published commit; fetch just it.
+    if ! git cat-file -e "${rev}^{commit}" 2>/dev/null; then
+      git fetch --no-tags --depth=1 origin "$rev" >/dev/null 2>&1 || true
+    fi
+    if ! git cat-file -e "${rev}^{commit}" 2>/dev/null; then
+      echo "INFRA: $image:$pinned names commit $rev, which could not be fetched" >&2
+      exit 2
+    fi
+
+    if git diff --quiet "$rev" HEAD -- "${srcarr[@]}"; then
+      ok "$vfile pins $pinned and its sources are unchanged since $(git rev-parse --short "$rev")"
+    else
+      bad "$image:$pinned is already published from $(git rev-parse --short "$rev"), but its sources CHANGED here."
+      note "  -> exact version tags are never republished, so the tag's Docker"
+      note "     Publish will fail, skip every remaining manifest, and stall the"
+      note "     whole release chain at resolve-candidate-digest."
+      note "  -> bump $vfile before tagging. Changed paths:"
+      while IFS= read -r f; do [[ -n "$f" ]] && note "       $f"; done < <(
+        git diff --name-only "$rev" HEAD -- "${srcarr[@]}"
+      )
+      note "  -> neither a main build nor an -rc.N tag can catch this: the publish"
+      note "     job only checks the exact tag on a clean refs/tags/v* ref."
+    fi
+  done
 fi
 echo
 

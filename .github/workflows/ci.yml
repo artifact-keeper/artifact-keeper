@@ -568,7 +568,14 @@ jobs:
       # invisible whenever main is green: with a green Docker Publish the buggy
       # and fixed scripts are byte-identical in behaviour. Stubs `gh`, so no
       # network and no dependence on main's current health. ~1s.
-      - name: Check release-preflight blocks on a measured red
+      #
+      # Also covers check 4 (#3339), which asks whether a component's pinned
+      # VERSION tag is already published from different sources. Same species
+      # again: the v1.7.2 tag died on that collision while Docker Publish on
+      # main passed for the SAME commit, because the exact-tag check only runs
+      # on a clean refs/tags/v* ref. Registry answers are stubbed too, so this
+      # stays offline.
+      - name: Check release-preflight gates block on what they measure
         run: bash scripts/ci/test-release-preflight.sh
 
   coverage:
