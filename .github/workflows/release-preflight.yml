@@ -10,7 +10,8 @@ name: Release Preflight
 # from release/1.6.x to main).
 #
 # This publishes NOTHING. It only reads: the repo tree, the .trivyignore of
-# active release/* branches, and the latest main Docker Publish run status.
+# active release/* branches, the latest main Docker Publish run status, and
+# the manifests of already-published component images (check 4, #3339).
 # A red run means "do not tag yet"; a green run means main is safe to cut.
 
 on:
@@ -23,6 +24,12 @@ on:
 permissions:
   contents: read
   actions: read
+  # Check 4 reads published component manifests from ghcr.io. These packages
+  # are public, so an anonymous pull token would usually do -- but "usually"
+  # is not a property to depend on: if one is ever made private the probe
+  # would report `indeterminate` and the preflight would exit 2 (INFRA)
+  # rather than silently degrade. Read scope keeps that from happening.
+  packages: read
 
 jobs:
   preflight:
@@ -47,4 +54,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PREFLIGHT_REPO: ${{ github.repository }}
+          # Used by check 4's registry probes. The checkout is depth-1, so the
+          # commit a published tag was built from is not local; the check
+          # fetches just that commit when it needs it, and reports INFRA if it
+          # cannot get it rather than guessing.
+          GHCR_TOKEN: ${{ github.token }}
         run: bash scripts/ci/release-preflight.sh
