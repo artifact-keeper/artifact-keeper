@@ -2061,8 +2061,35 @@ async fn serve_remote_metadata(
     project: &NormalizedProjectName,
     filename: &str,
 ) -> Result<Response, Response> {
-    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let metadata_filename = format!("{}.metadata", filename);
+    let cache_path = build_pypi_proxy_cache_path(project, &metadata_filename);
+
+    // The probe must stay ahead of target resolution (#3300): resolving reads
+    // the upstream simple index through `proxy_fetch_uncached`, so a probe
+    // behind it pays an upstream round-trip even on a hit. Keyed on the
+    // sidecar's own cache path — the key the fetch below writes.
+    //
+    // A probe error counts as a miss, so a cache fault degrades to a refetch
+    // rather than failing the request.
+    if let Ok(Some((content, _content_type, content_encoding))) = proxy
+        .cached_metadata_if_servable(
+            &proxy_helpers::build_remote_repo_with_format(
+                repo_id,
+                repo_key,
+                upstream_url,
+                RepositoryFormat::Pypi,
+            ),
+            &cache_path,
+        )
+        .await
+    {
+        return Ok(pep658_metadata_response(
+            content,
+            content_encoding.as_deref(),
+        ));
+    }
+
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let target = resolve_pypi_remote_fetch_target(
         proxy,
         repo_id,
@@ -2081,35 +2108,24 @@ async fn serve_remote_metadata(
         RepositoryFormat::Pypi,
     );
 
+    // Fetching through the cache is what lets the probe above ever hit: the
+    // `fetch_upstream_direct_*` family bypasses the cache in both directions.
+    // This stores the body and its upstream `Content-Encoding` under
+    // `target.cache_path` (`simple/{project}/{dist}.metadata`), which is
+    // distinct from the distribution's own key.
     match proxy
-        .fetch_upstream_direct_with_link(&remote_repo, &target.fetch_path)
+        .fetch_artifact_with_cache_path_capped(
+            &remote_repo,
+            &target.fetch_path,
+            &target.cache_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
         .await
     {
-        Ok(upstream) => {
-            // The content-type is fixed, never relayed from upstream: a PEP 658
-            // metadata resource is always the plain-text METADATA file, so a
-            // hostile or misconfigured upstream labelling it `text/html` must
-            // not get that type echoed back under this origin. Matches the
-            // wheel-extraction arm below.
-            //
-            // The content *coding* is the opposite case (#3193). These bytes are
-            // forwarded VERBATIM, and the shared HTTP client no longer lets
-            // reqwest decode upstream bodies, so a `.metadata` from a gzipping
-            // CDN or an object-store upstream arrives here still coded. Pinning
-            // the type while dropping the coding is the worst of both: pip gets
-            // compressed bytes labelled `text/plain; charset=utf-8` with no
-            // coding declared, and PEP 658 metadata parsing fails. Declare what
-            // the bytes actually are. `None` upstream means the header stays
-            // ABSENT — manufacturing a coding would mislabel every ordinary
-            // uncoded serve, which is the common case.
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/plain; charset=utf-8");
-            if let Some(enc) = upstream.content_encoding.as_deref() {
-                builder = builder.header(CONTENT_ENCODING, enc);
-            }
-            Ok(builder.body(Body::from(upstream.content)).unwrap())
-        }
+        Ok((content, _content_type, content_encoding)) => Ok(pep658_metadata_response(
+            content,
+            content_encoding.as_deref(),
+        )),
         Err(AppError::NotFound(_)) => {
             let wheel_target = resolve_pypi_remote_fetch_target(
                 proxy,
@@ -2176,14 +2192,35 @@ async fn serve_remote_metadata(
             .ok_or_else(|| {
                 AppError::NotFound("Metadata not available".to_string()).into_response()
             })?;
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from(metadata))
-                .unwrap())
+            // Extracted here, so the bytes are plain: no coding to declare.
+            Ok(pep658_metadata_response(Bytes::from(metadata), None))
         }
         Err(error) => Err(error.into_response()),
     }
+}
+
+/// Build the response for a PEP 658 `.metadata` resource.
+///
+/// The content-type is pinned rather than relayed: a PEP 658 resource is always
+/// the plain-text METADATA file, so an upstream labelling it `text/html` must
+/// not get that type echoed back under this origin.
+///
+/// The coding is the opposite case (#3193). The shared HTTP client hands over
+/// undecoded upstream bodies, so bytes forwarded verbatim may still be coded
+/// and must say so, or pip parses a compressed body as METADATA. `None` leaves
+/// the header absent — the common, uncoded case.
+///
+/// Shared by every arm that produces a sidecar (cache hit, upstream fetch,
+/// wheel extraction) so one resource carries identical headers whichever
+/// served it.
+fn pep658_metadata_response(content: Bytes, content_encoding: Option<&str>) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8");
+    if let Some(enc) = content_encoding {
+        builder = builder.header(CONTENT_ENCODING, enc);
+    }
+    builder.body(Body::from(content)).unwrap()
 }
 
 fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
@@ -12127,6 +12164,96 @@ mod tests {
             content_type, "text/plain; charset=utf-8",
             "the served content-type must be pinned to text/plain, not relayed \
              from the upstream (which answered text/html here)"
+        );
+    }
+
+    /// A repeated `.whl.metadata` request is served from the proxy cache
+    /// (#3300), reaching upstream zero times.
+    ///
+    /// Asserted on the upstream request COUNT, not the body: the sidecar's
+    /// bytes are correct whether or not the cache is consulted, so only the
+    /// count separates a cache hit from a silent refetch of the simple index
+    /// and the sidecar.
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_is_served_from_cache_on_repeat() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(metadata))
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let uri = format!("/{}/simple/{project}/{wheel}.metadata", fx.repo_key);
+
+        let (cold_status, cold_body, cold_headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        let after_cold = upstream.received_requests().await.unwrap_or_default().len();
+
+        let (warm_status, warm_body, warm_headers) =
+            tdh::send_with_headers(tdh::router_anon(super::router(), state), tdh::get(uri)).await;
+        let after_warm = upstream.received_requests().await.unwrap_or_default().len();
+
+        fx.teardown().await;
+
+        assert_eq!(
+            cold_status,
+            StatusCode::OK,
+            "cold .metadata request must be served; body: {}",
+            String::from_utf8_lossy(&cold_body)
+        );
+        assert_eq!(&cold_body[..], metadata);
+        assert_eq!(
+            after_cold, 2,
+            "a cold sidecar costs one simple-index read plus one sidecar fetch"
+        );
+
+        assert_eq!(
+            warm_status,
+            StatusCode::OK,
+            "warm .metadata request must be served; body: {}",
+            String::from_utf8_lossy(&warm_body)
+        );
+        assert_eq!(
+            after_warm, after_cold,
+            "a repeated .metadata request must hit the proxy cache and reach \
+             upstream zero times — neither the sidecar nor the simple index"
+        );
+
+        // What the cache replays must be indistinguishable from what filled it.
+        assert_eq!(
+            warm_body, cold_body,
+            "cached sidecar bytes must be identical"
+        );
+        assert_eq!(
+            warm_headers.get(CONTENT_TYPE),
+            cold_headers.get(CONTENT_TYPE),
+            "cached sidecar must carry the same Content-Type"
+        );
+        assert_eq!(
+            warm_headers.get(CONTENT_ENCODING),
+            cold_headers.get(CONTENT_ENCODING),
+            "cached sidecar must carry the same Content-Encoding"
         );
     }
 
