@@ -9747,16 +9747,31 @@ async fn tags_list_remote(
     Ok(split_remote_tags_page(tags, n, upstream_has_more))
 }
 
-/// Aggregate tags from the virtual repo members the CALLER may read.
+/// Aggregate tags from the virtual repo members the CALLER may see.
 ///
-/// `auth` is the CALLER. Members are narrowed through
-/// [`proxy_helpers::authorize_virtual_members`] — the same filter
-/// `resolve_virtual_manifest` and `resolve_virtual_blob` apply (#3268 review
-/// F2) — so a member's tags are listable through the virtual exactly when a
-/// direct tags/list of that member would succeed. A denied member contributes
-/// nothing, which reads as "no tags there" and leaks neither tag names nor
-/// member existence. Tag pages are computed per request and never enter the
-/// shared negative cache, so there is no principal-independence concern here.
+/// `auth` is the CALLER. Members are narrowed through the same member
+/// visibility filter `resolve_virtual_manifest` and `resolve_virtual_blob`
+/// apply (#3268 review F2): a member contributes its tags when it is public
+/// or the caller holds *any* grant on it (a role assignment or any
+/// fine-grained rule, regardless of the actions it carries), and it passes
+/// the token-scope ceiling. That is deliberately the shared predicate, not a
+/// new one — note it is coarser than the direct read gate, which requires the
+/// `read` action: a principal holding only a write-scoped rule on a private
+/// member is refused a direct tags/list of it but does see its tags here.
+/// Anonymous and ungranted callers see public members only. A denied member
+/// contributes nothing, which reads as "no tags there" and leaks neither tag
+/// names nor member existence. Tag pages are computed per request and never
+/// enter the shared negative cache, so there is no principal-independence
+/// concern here.
+///
+/// The fallible [`proxy_helpers::try_authorize_virtual_members`] is used
+/// rather than the flattening form: this walker AGGREGATES the filtered set
+/// into the response, and downstream an empty first page on a Virtual repo
+/// (which owns no `oci_tags` rows of its own) is answered `404 NAME_UNKNOWN`
+/// — so flattening a failed visibility query into the empty set would turn a
+/// transient DB error into "this image does not exist". Surfacing `Err`
+/// keeps that case the same retryable server error `fetch_virtual_members`
+/// produces.
 ///
 /// Forward the merged cursor to every member because any tag at or before the
 /// merged cursor cannot appear on the next merged page.
@@ -9768,7 +9783,8 @@ async fn tags_list_virtual(
     last: Option<&str>,
 ) -> Result<Vec<String>, Response> {
     let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-    let members = proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
+    let members =
+        proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
     let member_limit = n_limit.saturating_add(1);
     let member_cursor = last;
     let image = repo.image.clone();
@@ -30636,8 +30652,8 @@ mod oci_read_authz_tests {
         assert!(
             granted_tags.iter().any(|t| t == TAG) && granted_tags.iter().any(|t| t == PUBLIC_TAG),
             "the private member's granted principal must still see BOTH \
-             members' tags through the virtual — a member is listable exactly \
-             when a direct read of it would succeed; got {granted_tags:?}"
+             members' tags through the virtual — the filter narrows to the \
+             caller's visible members, it does not deny everyone; got {granted_tags:?}"
         );
     }
 }

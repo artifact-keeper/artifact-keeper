@@ -3122,10 +3122,34 @@ pub async fn authorize_virtual_members(
     virtual_repo_id: Uuid,
     members: Vec<Repository>,
 ) -> Vec<Repository> {
+    // Flattening Err into the empty set is correct for the WALKING callers
+    // (manifest/blob resolution): they probe members one by one and a missing
+    // member reads as "artifact not found here", so the deny direction is
+    // safe. Callers that AGGREGATE the filtered set into a response (OCI
+    // tags/list, #3320) must use [`try_authorize_virtual_members`] instead:
+    // for them an empty set is indistinguishable from "nothing exists" and a
+    // transient DB error would surface as 404 NAME_UNKNOWN.
+    try_authorize_virtual_members(db, auth, virtual_repo_id, members)
+        .await
+        .unwrap_or_default()
+}
+
+/// Fallible form of [`authorize_virtual_members`] — same filter, but a failed
+/// visibility query is surfaced as `Err` (the [`map_db_err`] response shape,
+/// matching [`fetch_virtual_members`]) instead of being flattened into the
+/// empty set. Both directions fail closed; `Err` additionally lets the caller
+/// answer with a retryable server error rather than a definitive "not found"
+/// when the answer is unknowable (#3320).
+pub async fn try_authorize_virtual_members(
+    db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    virtual_repo_id: Uuid,
+    members: Vec<Repository>,
+) -> Result<Vec<Repository>, Response> {
     use crate::api::handlers::repositories::{member_grant_visibility, member_passes_token_scope};
 
     if members.is_empty() {
-        return members;
+        return Ok(members);
     }
     let member_ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
     let granted: std::collections::HashSet<Uuid> =
@@ -3141,16 +3165,16 @@ pub async fn authorize_virtual_members(
                     error = %e,
                     "virtual member authorization query failed; denying all members"
                 );
-                return Vec::new();
+                return Err(map_db_err(e));
             }
         };
-    members
+    Ok(members
         .into_iter()
         .filter(|m| {
             granted.contains(&m.id)
                 && member_passes_token_scope(auth, virtual_repo_id, m.id, m.is_public)
         })
-        .collect()
+        .collect())
 }
 
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
@@ -13091,6 +13115,68 @@ mod tests {
         for d in [public_dir, norules_dir, ruled_dir] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// #3320 follow-up: a failed visibility query must be surfaceable as an
+    /// ERROR, not only as the empty set. The flattening form keeps failing
+    /// closed to empty — safe for the walking callers, where a missing member
+    /// reads as "artifact not found here" — but an AGGREGATING caller (OCI
+    /// tags/list) answers `404 NAME_UNKNOWN` to an empty first page on a
+    /// Virtual repo, so for it the empty set turns a transient DB error into
+    /// "this image does not exist". The fallible form returns `Err` with a
+    /// retryable server-error response instead.
+    #[tokio::test]
+    async fn try_authorize_virtual_members_surfaces_query_failure_as_err() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (virtual_id, _vkey, vdir) = db_helpers::create_repo(&pool, "virtual", "docker").await;
+        let (member_id, _mkey, mdir) = db_helpers::create_repo(&pool, "local", "docker").await;
+        db_helpers::link_member(&pool, virtual_id, member_id, 1).await;
+        let members = fetch_virtual_members(&pool, virtual_id)
+            .await
+            .expect("fetch members");
+        assert_eq!(members.len(), 1, "fixture must yield one member");
+
+        // Clean the rows while the pool is still usable; the loaded `members`
+        // vec is all the two calls under test need.
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        db_helpers::cleanup(&pool, member_id, user_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for d in [vdir, mdir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+
+        // Sever the pool: every subsequent query fails, which is the
+        // transient-database-failure shape the two forms must diverge on.
+        pool.close().await;
+
+        let err = try_authorize_virtual_members(&pool, None, virtual_id, members.clone()).await;
+        match err {
+            Err(resp) => assert!(
+                resp.status().is_server_error(),
+                "the surfaced failure must be a retryable server error, got {}",
+                resp.status()
+            ),
+            Ok(v) => panic!(
+                "a failed visibility query must surface as Err from the \
+                 fallible form, not as a member set of {} entries",
+                v.len()
+            ),
+        }
+
+        let flattened = authorize_virtual_members(&pool, None, virtual_id, members).await;
+        assert!(
+            flattened.is_empty(),
+            "the flattening form must keep failing CLOSED to the empty set"
+        );
     }
 
     #[test]
