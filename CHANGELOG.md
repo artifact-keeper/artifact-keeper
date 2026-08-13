@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade note — migration 193 blocks OCI writes while it runs, and the backend is not listening yet
+
+`backend/migrations/193_oci_blobs_storage_key_index.sql` builds a plain `CREATE INDEX` on `oci_blobs`. Plan a write window before deploying, and on Kubernetes raise your startup/liveness thresholds first.
+
+**The mechanism.** Migrations run at `main.rs:223`; the HTTP listener does not bind until `main.rs:1183`. For the whole index build the backend is therefore **not listening at all** — health probes get connection-refused, not a `503`, because there is no server to answer them. `CREATE INDEX CONCURRENTLY` is deliberately not used: `sqlx::migrate!` runs each migration file inside a transaction and Postgres rejects `CONCURRENTLY` there, the same constraint migrations 166 and 194 are under. A plain `CREATE INDEX` takes a `SHARE` lock, which conflicts with `ROW EXCLUSIVE`, so for the duration of the build **writes to `oci_blobs` block and reads do not**: blob commits on the push path wait, as do blob GC's row deletes, while plain `SELECT`s take `ACCESS SHARE` and are unaffected. `docker pull` keeps working while `docker push` hangs, and that asymmetry is the diagnostic signature — if pushes are hanging during a deploy while pulls are fine, this is what you are looking at. It is *not* `ACCESS EXCLUSIVE`: nothing here rewrites the table, so plan the window against blocked writers, not blocked readers.
+
+**The failure mode is a crash loop, not a slow start.** The migration runner raises its timeouts session-locally — `statement_timeout = '30min'` (`main.rs:217`) and `lock_timeout = '5min'` (`main.rs:220`). The lock timeout is the one that bites: if a long-running transaction holds a conflicting lock on `oci_blobs` for more than five minutes, the migration errors, `run_server` returns `Err`, and the process exits. Kubernetes restarts it, it takes the lock timeout again, and the deployment never comes up. Drain or kill long transactions touching `oci_blobs` before deploying.
+
+**Kubernetes is the real risk.** A `livenessProbe` with a short `failureThreshold` kills the pod mid-`CREATE INDEX`. The transaction rolls back, the partially built index is discarded, and the replacement pod starts the build again from zero — on a large registry that never converges; it just spends a write stall per attempt, forever. Raise `startupProbe.failureThreshold` to cover the build (or the liveness thresholds, if you have no startup probe) **before** you deploy this release, not after the first pod is killed.
+
+**No build-time estimate is given here, because none has been measured.** `oci_blobs` holds one row per stored blob and is much smaller than `artifacts`, so the build is expected to be short — but "expected" is not a number, and the only honest input is your own row count. Size it first, on the running 1.7.1 instance:
+
+```sql
+SELECT count(*) FROM oci_blobs;
+```
+
+**Avoiding the stall entirely.** Build the index out of band against the live table, before deploying:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_oci_blobs_storage_key ON oci_blobs (storage_key);
+```
+
+The migration's `CREATE INDEX IF NOT EXISTS` then finds it and is a no-op. This is the only supported way to avoid the stall — the migration cannot simply be skipped for one file, because sqlx tracks applied migrations by version and checksum and a missing entry blocks the ledger. Do build it, one way or the other: without the index the OCI cleanup sweep's per-candidate liveness re-check falls back to a sequential scan (measured on 300k blobs at 87 ms per hold versus 0.19 ms with it, ~163x over a full 1,000-row batch), and the cost scales linearly with registry size, so on a large registry a batch approaches the 15-minute claim TTL, leases lapse mid-sweep, and storage reclamation stops making progress. Skipping it trades a bounded write stall for an unbounded GC stall (#3085).
+
+### Upgrade note — rolling back to 1.7.1 requires `SKIP_MIGRATIONS=true`
+
+The 1.7.2 schema is forward-compatible with a 1.7.1 binary, but a 1.7.1 binary will **refuse to start** against a 1.7.2 database unless you set `SKIP_MIGRATIONS=true`. You set the flag that sounds dangerous in order to roll back safely; that inversion is exactly what nobody works out mid-incident, so it is written down here rather than left to be discovered.
+
+**The data is fine.** 1.7.2 adds three migrations and all three are additive. 193 creates an index. 194 adds `oci_upload_cleanup_keys.pending_delete_at` (`TIMESTAMPTZ`, nullable, no default) plus a partial index over it. 195 adds six columns to `curation_packages`: `attestation_state TEXT NOT NULL DEFAULT 'unverified'` and five nullable ones. Nothing is dropped, renamed or retyped, and every added column either carries a safe default or accepts `NULL`, so a 1.7.1 binary that never mentions them still writes correct rows. There is no data migration to undo and no restore-from-backup step.
+
+**What blocks the rollback is the migration ledger, not the data.** `main.rs:223` runs `sqlx::migrate!("./migrations")`, whose `Migrator` carries `ignore_missing = false`. On startup sqlx validates the applied set recorded in `_sqlx_migrations` against the versions embedded in the binary and returns `MigrateError::VersionMissing` for any applied version the binary does not know about. v1.7.1 embeds migrations up to 192; a 1.7.2 database has 193, 194 and 195 applied. The 1.7.1 binary therefore fails validation and exits before it binds — the same symptom as the crash loop above, from an entirely different cause, which is why the two notes sit together.
+
+**Am I affected?** Only if you roll back. The supported path is to set `SKIP_MIGRATIONS=true` on the 1.7.1 deployment: it takes the `if skip_migrations` branch at `main.rs:203-205`, logs `SKIP_MIGRATIONS=true, skipping automatic database migrations`, and never constructs the `Migrator` at all, so nothing validates the ledger. The one-shot legacy repair routines that run ahead of the gate (`main.rs:191-196`) still run and still no-op on a healthy database. Rolling forward again is simply removing the flag — 193 through 195 are already applied, so the runner has nothing to do. Do **not** delete rows from `_sqlx_migrations` as an alternative: sqlx will then try to re-run those files against a schema that already contains their objects.
+
 ### Upgrade note — authenticated callers now need a grant to pull private OCI/Docker repositories
 
 OCI `/v2` reads are authorized. Previously the only check on the pull path was whether the caller was *anonymous*, so **any authenticated principal could pull any private image** by name or digest, and `GET /v2/<name>/tags/list` handed a private repository's tag names to the same audience. Writes were never affected.
@@ -14,6 +48,53 @@ OCI `/v2` reads are authorized. Previously the only check on the pull path was w
 **The mechanism.** `/v2` is nested in the router ahead of `format_routes`, and `repo_visibility_middleware` — the layer that authorizes every other format's reads — is attached to `format_routes` only, so the entire OCI read surface sat outside it. Inside the handlers the guard was `if is_anon && !repo.is_public`: `authenticate_oci` establishes *who* the caller is and never asked whether they may read this repository. The neighbouring gates did not close it either — `enforce_token_repo_scope` is unrestricted for a JWT session, `require_scope` is satisfied unconditionally by a principal carrying `scopes: None`, and `can_access_repo` is a token-scope ceiling (`AccessScope::Admin => true`), never a visibility check. All five read verbs — `GET`/`HEAD` blob, `GET`/`HEAD` manifest and `GET tags/list` — now run `require_oci_repo_read_access`, which asks `PermissionService::check_repository_action`, the same choke point the OCI write gate already used. That is deliberately not a new predicate: a role carrying `admin` (the `repository-owner` row repository creation seeds) always wins, an applicable fine-grained rule stays authoritative for the principals it names, and every other principal keeps its role-based capabilities. A denial is `403 DENIED` when fine-grained rules govern the repository and `404 NAME_UNKNOWN` when none do, with a body byte-identical to the one a genuinely missing repository returns, so the two answers cannot be used to probe which private repositories exist (#3261).
 
 **Am I affected?** Yes, if any principal pulls from a private OCI/Docker repository while holding no role assignment, no fine-grained `read`/`admin` rule and no repository ownership — a CI service account carrying only an API token and no grant is the usual case. Give those principals a grant before upgrading. Anonymous pulls, public repositories, admin pulls, repository owners and every already-granted principal are unaffected, and the `401` + `WWW-Authenticate: Bearer` challenge that drives the `docker login` handshake is untouched. Vulnerability scanning of private images also keeps working: `_ak_scanner` is seeded with no grants by design, so the single-repository token `generate_scan_token` mints is accepted as the authorization it is, after `enforce_scan_pull_scope` has already confirmed the token names this repository.
+
+**Finding those principals before you upgrade.** "Give them a grant" is only actionable if you can list them. This is the inverse of `PermissionService::check_repository_action(user, repo, 'read', false)` — the same admin-role arm, the same rules-are-authoritative-when-present `CASE`, the same group and project arms — evaluated over everyone who has actually pulled from a private OCI-backed repository, so it returns principals that will start being denied rather than every ungranted account in the instance:
+
+```sql
+SELECT u.username, r.key AS repository, max(ds.downloaded_at) AS last_pull
+FROM download_statistics ds
+JOIN artifacts a    ON a.id = ds.artifact_id
+JOIN repositories r ON r.id = a.repository_id
+JOIN users u        ON u.id = ds.user_id
+CROSS JOIN LATERAL (
+  SELECT
+    EXISTS (SELECT 1 FROM role_assignments ra JOIN roles ro ON ro.id = ra.role_id
+             WHERE ra.user_id = u.id
+               AND (ra.repository_id = r.id OR ra.repository_id IS NULL)
+               AND 'admin' = ANY(ro.permissions))                       AS role_admin,
+    EXISTS (SELECT 1 FROM permissions p
+             WHERE ((p.principal_type IN ('user','service_account') AND p.principal_id = u.id)
+                 OR (p.principal_type = 'group' AND p.principal_id IN
+                      (SELECT group_id FROM user_group_members WHERE user_id = u.id)))
+               AND ((p.target_type = 'repository' AND p.target_id = r.id)
+                 OR (p.target_type = 'project'    AND p.target_id = r.project_id))) AS has_rule,
+    EXISTS (SELECT 1 FROM permissions p
+             WHERE ((p.principal_type IN ('user','service_account') AND p.principal_id = u.id)
+                 OR (p.principal_type = 'group' AND p.principal_id IN
+                      (SELECT group_id FROM user_group_members WHERE user_id = u.id)))
+               AND ((p.target_type = 'repository' AND p.target_id = r.id)
+                 OR (p.target_type = 'project'    AND p.target_id = r.project_id))
+               AND ('read' = ANY(p.actions) OR 'admin' = ANY(p.actions)))           AS rule_grants,
+    EXISTS (SELECT 1 FROM role_assignments ra JOIN roles ro ON ro.id = ra.role_id
+             WHERE ra.user_id = u.id
+               AND (ra.repository_id = r.id OR ra.repository_id IS NULL)
+               AND ('read' = ANY(ro.permissions) OR 'admin' = ANY(ro.permissions))) AS role_grants
+) g
+WHERE r.format::text IN ('docker','podman','buildx','oras','wasm_oci','helm_oci')
+  AND r.is_public = false
+  AND u.is_admin = false
+  AND ds.downloaded_at > NOW() - INTERVAL '90 days'
+  AND NOT (g.role_admin OR CASE WHEN g.has_rule THEN g.rule_grants ELSE g.role_grants END)
+GROUP BY 1, 2
+ORDER BY 3 DESC;
+```
+
+Read it as a floor, not a census: `download_statistics` records a row for a manifest `GET` and not for a `HEAD`, `user_id` is `NULL` for anonymous pulls, and a service account that has not pulled inside the window will not appear. Widen the interval, or drop the `downloaded_at` predicate entirely, if your CI fleet pulls seasonally.
+
+**If you miss one, the symptom will not look like an authorization failure.** The `403 DENIED` arm only fires when the repository carries rows in the `permissions` table. Grants usually come from `role_assignments` instead, so the common denial is the other arm: `404 NAME_UNKNOWN`, with a body byte-identical to the one a genuinely missing repository returns. `docker login` still succeeds, because the token handshake is untouched; `GET /v2/<name>/tags/list` 404s the same way; and there is **no server-side log line on a denial** — only the lookup-failure paths log. The on-call engineer's first hypothesis will therefore be "GC deleted our images", and Docker lifecycle retention *also* changed in this release (#2998, #3026, under Fixed), so that hypothesis will look plausible for longer than it should. If images vanish for one principal and not another after this upgrade, check grants before you check retention.
+
+**Known limitation (#3269).** `GET /v2/_catalog` still returns every repository key present in `oci_tags` to any authenticated caller, with no per-repository filtering — name enumeration, not content. It is left as-is because the Docker Registry HTTP API V2 makes catalog contents implementation-specific and most registries behave the same way, but it means this release closes private-image *reads* without closing private-repository-name *discovery*. Treat the repository namespace as visible to every authenticated principal until #3269 lands.
 
 ### Upgrade note — two OCI `/v2` error paths now return the spec error envelope
 
@@ -30,6 +111,37 @@ A client that parses the **body** of an OCI scope denial or a curation block see
 **The mechanism.** The write endpoints were admin-gated, the reads and the delete were not. The two read handlers extracted no `AuthExtension` at all, so any authenticated principal — including a read-scoped service-account token — could page the whole ACL table and learn which principals hold `admin` on which repositories. `DELETE` checked only `require_scope("delete")`, and `AuthExtension::has_scope` returns `true` unconditionally when `scopes` is `None`, which is what every interactive JWT session carries — so any logged-in non-admin could delete arbitrary permission rows. All three now use the same `require_auth` + scope + `require_admin()` shape the create and update handlers already had, before any database work (#3229).
 
 **Am I affected?** Only if a non-admin principal calls those three endpoints. The shipped consumers are all admin surfaces — the web UI reads the list only from its admin route group, and the CLI `permission` command is an admin management command — so no shipped workflow breaks. Admin-only was chosen over a filtered "grants naming me" view because the endpoint has no per-caller filtering model today; a self-service view should be a deliberately designed endpoint rather than a widening of this one.
+
+### Upgrade note — seven smaller operational changes worth two minutes before you deploy
+
+Each of these is documented in full under Security, Changed or Fixed. Collected here is only the part an operator has to act on, ordered by how likely it is to page someone who cannot immediately tell what happened.
+
+- **Storage alerts will fire on upgrade day, and it is not an incident** (#3134, #3249). `total_storage_bytes` now sums the `repository_usage_ledger` instead of aggregating `artifacts`, so on a Docker-heavy registry the reported total steps up by the entire OCI blob volume — layers were previously invisible because only manifests land in `artifacts` — and proxy-cached bytes fold in as well. The daily `storage_metrics` snapshot changes basis on the same day, so growth charts show a one-day vertical step. **Any alert on `total_storage_bytes` or on storage growth rate will fire, and it will look like a real incident.** It is display-only: quota admission reads the per-repository `repository_usage_ledger` row and is unchanged, so **no repository becomes over-quota as a result of this**. Record the pre-upgrade values, silence or re-baseline storage-growth alerts for 48 hours, and annotate the series at the cut. Historical `storage_metrics` rows are deliberately not backfilled — the source tables hold no history, so a backfill could only fabricate one.
+- **Curation freshness silently drops 12x** (#2219). `curation_sync_interval_secs` was previously read into the row and never used, so every enabled staging repository re-synced on every 5-minute scheduler tick. It is now honoured (`scheduler_service.rs:1518-1533`, 60-second floor), and the column default is **3600** (`migrations/071_curation.sql:54`). Unless you explicitly set the field, curation freshness goes from roughly 5 minutes to 1 hour. The failure signature is "a package we blocked upstream an hour ago is still installable" — there is no metric, no log line and no alert for it. Check what your repositories are actually configured for, and lower the interval where an hour is too slow:
+  ```sql
+  SELECT id, curation_sync_interval_secs, curation_last_synced_at
+  FROM repositories WHERE curation_enabled;
+  ```
+- **PyPI project names that were never valid become permanently unreachable** (#3186, #3198). Read routes now reject a `:project` segment that fails the PEP 508 name pattern with `404` before any lookup, and uploads reject the same with `400`. Malformed names were previously coerced rather than validated, and some of them were *stored* — an artifact whose project name is empty or otherwise outside the pattern still consumes quota but is now reachable at no URL, with no migration to repair it. This is the correct fix and it is a silent data-visibility loss, so inventory before you upgrade rather than after. The predicate is the enforced regex itself (`formats::pypi_name::PEP508_NAME_RE`), written in the spec's `^`/`$` spelling:
+  ```sql
+  SELECT r.key AS repository, a.name AS project, count(*) AS artifacts
+  FROM artifacts a
+  JOIN repositories r ON r.id = a.repository_id
+  WHERE r.format::text IN ('pypi','poetry','conda')
+    AND a.is_deleted = false
+    AND a.name !~ '^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$'
+  GROUP BY 1, 2 ORDER BY 3 DESC;
+  ```
+  Zero rows means nothing becomes unreachable. Rows returned are what to re-publish under a valid name (or delete) before upgrading.
+- **The scan-gate widening only bites deployments that configured a policy** (#3220, #3143, #3142). `PolicyService::evaluate_artifact` short-circuits to allowed when no enabled policy matches (`policy_service.rs:152-173`), and nothing seeds a default row, so one query sizes the entire exposure:
+  ```sql
+  SELECT id, name, repository_id, is_enabled, block_unscanned, block_on_fail, max_severity
+  FROM scan_policies;
+  ```
+  Zero rows means zero risk from all three changes. If rows come back, two amplifiers are worth knowing: a row with `repository_id IS NULL` is **global** and applies to every repository, and since migration 121 a policy created without an explicit `block_unscanned` gets `true`.
+- **`helm push oci://` into a classic Helm repository now returns `400`, and charts pushed that way disappear from the index** (#3150). Legacy OCI manifest rows are excluded from `index.yaml` generation (`helm.rs:119-134`, `is_oci_manifest_artifact`), so the operator-visible event is "our charts vanished from `helm repo update` and our publish job started failing". The index those rows produced was never valid, and reads are deliberately left open so the bytes can be pulled back out, but the disappearance is abrupt. Re-publish affected charts to a `helm_oci` repository, or push them as classic charts.
+- **The OCI push path can now answer `503`, on a path that never did before** (#3187). When a push races the cleanup sweep reclaiming the same storage key, the monolithic blob `POST` (`oci_v2.rs:5497`) and the chunked completion (`oci_v2.rs:6962`) return `503` with code `BLOB_UPLOAD_INVALID`, the message `blob storage was being reclaimed concurrently; retry the upload`, and `Retry-After: 1`. The window is narrow — it needs a digest whose orphaned blob object is at least 24 hours old, unreferenced, and actively being reclaimed — but `BLOB_UPLOAD_INVALID` reads as terminal to some clients, so a CI pipeline with no push retry will see intermittent, unexplained failures. Add a retry around `docker push` if you do not have one.
+- **The S3 bulk request timeout default moves from 30s to 1800s** (#3180). The knobs themselves are listed under Added; the default change is the operational item. A wedged S3 endpoint previously failed a bulk request in 30 seconds; it can now hold the connection for up to 30 minutes, which turns a fast fail into connection-pool and task pileup during a partial object-store brownout. Control-plane calls (head, exists, list, delete, multipart create/abort) keep the short 30-second cliff, so this applies only to payload movement — object reads and writes, multipart parts, and server-side `CopyObject`. If you sized your pool around a 30-second worst case, set `S3_BULK_TIMEOUT_SECS` deliberately rather than inheriting the new default.
 
 ### Security
 
