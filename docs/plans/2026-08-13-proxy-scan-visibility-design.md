@@ -1,267 +1,409 @@
-# Proxy Scan Visibility and SBOM — Design
+# Proxy Scan Visibility and SBOM — Design (v2)
 
 **Date**: 2026-08-13
-**Status**: Approved for implementation
+**Status**: Revised after four-lens audit; two prerequisite bugs must land first
 **Target milestone**: 1.8.0
 **Branch**: `feat/proxy-scan-visibility`
+**Supersedes**: v1 of this document (commit `177e179f`)
+
+## Revision note
+
+v1 was audited by four independent reviewers (security, architecture,
+fact-check, adversarial). Of six load-bearing claims, only one survived
+unqualified. This revision incorporates their findings. Material corrections
+from v1 are listed in "Corrections to v1" at the end.
+
+Cite **symbols, not line numbers**. v1's line references had drifted in four
+places; this document names functions and files only.
 
 ## Problem
 
 Artifact Keeper scans proxy-cached artifacts and blocks vulnerable ones at
-download time. That capability shipped in #2954 (PyPI) and #3003 (npm,
-Docker/OCI). None of it is visible.
+download time (#2954 PyPI, #3003 npm and Docker/OCI). None of it is visible.
 
-A user who enables `scan_on_proxy` gets enforcement with no instrumentation:
+- No API exposes `proxy_scan_results`; the only reads are gate logic.
+- The artifact Security tab renders a green shield reading **"No vulnerabilities
+  detected for this artifact"** for proxy artifacts, including ones the gate
+  just returned 403 for (`security-tab-content.tsx`, `total === 0` branch). This
+  is more dangerous than the "cannot be scanned" string and is the primary bug
+  to fix.
+- Repository security scores ignore proxy repositories entirely.
+- `Scan All` is enabled on all proxy repositories regardless of whether they
+  have scannable rows.
+- The user-facing string claims security scanning is unavailable for
+  proxy-cached artifacts, false since #2954 (#3344).
 
-- No API exposes `proxy_scan_results`. The only reads are internal gate logic.
-- The artifact detail view renders **"This artifact cannot be scanned."** for an
-  artifact the gate may have just blocked.
-- Repository security scores ignore proxy repositories entirely; a proxy repo
-  that has blocked hundreds of pulls still grades A.
-- The admin dashboard's "Policy Blocks" tile is hardcoded to `0`.
-- `Scan All` is enabled on proxy repositories and silently reports success
-  having scanned zero artifacts.
-- The user-facing error string claims security scanning is unavailable for
-  proxy-cached artifacts, which has been false since #2954 (tracked: #3344).
+## Prerequisites — must land before this work
 
-Separately, every inline proxy scan already generates a complete CycloneDX SBOM
-and deletes it milliseconds later (see "Prior art" below).
+Two defects were discovered during the audit. Both corrupt the numbers this
+design would surface, so both block it.
 
-## Evidence
+### P1 — Proxy `findings_count` is inflated by pin duplication
 
-Reproduced end-to-end on a local stack (backend 1.7.1, web 1.7.0) on
-2026-08-13.
-
-Proxy repository with `scan_enabled=true`, `scan_on_proxy=true`,
-`proxy_scan_action=fail_closed`, pulling `requests-2.32.5-py3-none-any.whl`
-from pypi.org:
+**Empirically confirmed** on a local stack, backend 1.7.1, Trivy not
+registered (so this is not multi-scanner overlap):
 
 ```
-GET /pypi/ak-demo-proxy/simple/requests/requests-2.32.5-py3-none-any.whl
-  → HTTP 403 {"error":"scan_blocked","reason":"blocked by inline vulnerability scan policy"}
-
-SELECT ... FROM proxy_scan_results;
-  digest 2462f946… | grype | vulnerable | medium | 2 findings | grype-0.116.0
+same digest 2462f946… , same scanner grype-0.116.0
+  proxy verdict  : findings_count = 2, medium_count = 2
+  hosted scan    : findings_count = 1
+  distinct CVEs  : 1  (CVE-2026-25645, medium, requests)
 ```
 
-The verdict exists. Nothing surfaces it.
+`ScanWorkspace::prepare_pinned` extracts the archive into a subdirectory and
+writes the synthetic component pin into the workspace root. Syft therefore
+catalogs the same component twice — once from the artifact's real
+`dist-info/METADATA`, once from the pin — and grype matches the same CVE
+against both. `aggregate_proxy_verdict` counts `findings.len()` with no dedup
+by `cve_id`.
 
-A byte-identical copy of the same wheel uploaded to a hosted repository
-(`sha256` matches exactly) produces a full CycloneDX SBOM, a completed grype
-scan, and a CVE history entry. The content is not the obstacle; the absence of
-an `artifacts` row is.
+Consequence: every pinned file-format proxy verdict overstates its finding
+count, roughly 2x. Surfacing this number in the UI would ship the miscount.
+Fix requires dedup by `(cve_id, affected_component, affected_version)` before
+aggregation.
 
-## Prior art and constraints
+### P2 — `scanner_version` records the first applicable scanner, not the CVE-authoritative one
 
-**Why proxy content has no `artifacts` row.** #1278 — an `artifacts` row whose
-`storage_key` points at the global backend, read back through the per-repo
-backend, produced a doubled path (`/data/storage/<repo>/proxy-cache/<repo>/…`)
-and HTTP 500 on filesystem backends. #1280 fixed it by deleting the insert. The
-root cause was never repaired: `storage_for_artifact` does not exist anywhere in
-the codebase, and `registry.rs:51-53` plus `filesystem.rs:99-118` are unchanged.
-Re-enabling the insert today would produce cluster-lock-taking 507s on most
-formats, and on PyPI a silent duplicate write that serves stale content
-indefinitely.
+`run_inline_proxy_scanners_target` captures the version of whichever scanner
+runs first. Registration order places TrivyFsScanner before GrypeScanner, and
+Trivy is applicable to `.whl`/`.tgz`. The freshness gate
+(`verdict_is_fresh`) compares the stored string against
+`cve_scanner_version()`, which resolves the **CVE-authoritative** scanner
+(only grype is). In any Trivy-enabled deployment the two never match, so
+`verdict_is_fresh` returns false permanently, the verdict cache is silently
+defeated, and every proxy pull re-scans inline.
 
-This design therefore does **not** write `artifacts` rows for proxy content.
-That remains a valid long-term direction (OCI already does it safely for
-proxied manifests via #1505, using the per-repo key convention) and is filed
-separately.
+This design proposes displaying `scanner_version` to users. It must be the
+right engine's before it is shown.
 
-**The SBOM is already generated.** `run_grype_dir_with_catalog`
-(`grype_scanner.rs:1096`) invokes grype with two presenters in one subprocess:
-
-```rust
-.args(["-o", "json",
-       "-o", &format!("cyclonedx-json={}", bom_path.to_string_lossy())])
-```
-
-The in-repo comment states the intent: *"emits the FULL catalog (every component
-syft found, matched or not), so we ask for both in the SAME invocation: no
-second scan, no extra extraction, one subprocess."*
-
-`parse_cyclonedx_catalog` (`grype_scanner.rs:289-306`) then reduces that BOM to
-`{name, version}` pairs, uses it for one boolean identity check, and the file is
-deleted at `grype_scanner.rs:1144`. PURL, licenses, and component type are
-discarded at parse time.
+Both are separate bug issues, not part of this feature.
 
 ## Scope
 
-Two independent issues, split by risk rather than by feature. Issue 1 ships
-without waiting on Issue 2.
+Three slices, split by risk and by data store. Each ships independently.
 
-### Issue 1 — Surface proxy scan results (read-only)
+### Issue 1 — Surface proxy scan verdicts for PyPI and npm (read-only)
 
-No migration. No writes. No changes to the gate's block/serve decision.
+**Format coverage is explicitly PyPI and npm only.** Docker/OCI is a different
+data store and a different response shape; see Issue 1b. v1 claimed all three
+formats and could not have delivered OCI.
 
-**Data source.** `proxy_cache_artifacts.checksum_sha256` joined to
-`proxy_scan_results.checksum_sha256`. Verified query plan uses two existing
-indexes (`idx_proxy_cache_repo`, `idx_proxy_scan_checksum`); no new index is
-required.
+**Data source.** `proxy_cache_artifacts ⋈ proxy_scan_results` on
+`checksum_sha256`, filtered `scan_type = 'grype'`. The `scan_type` filter is
+mandatory: `uq_proxy_scan` is `(checksum_sha256, scan_type)`, so a join without
+it will duplicate listing rows the day a second scan type is written.
 
-**Three-state contract.** Absence of a verdict row is the common case and MUST
-NOT render as "clean":
+**Query shape.** Use `LEFT JOIN LATERAL (… LIMIT 1)` on the paginated listing,
+or a second batched `WHERE checksum_sha256 = ANY($1)` over the already-sliced
+page. A plain `LEFT JOIN` combined with the listing's `path ILIKE '%…%'` filter
+risks the planner flipping to a hash join and materialising the entire global
+`proxy_scan_results` table. Both alternatives avoid N+1 and are plan-stable.
 
-| State | Condition | Renders as |
+**Index.** The repo-level summary aggregates over all of a repository's cache
+rows against a global verdict table on every Security-tab render. It requires
+`CREATE INDEX idx_proxy_cache_repo_checksum ON proxy_cache_artifacts
+(repository_id, checksum_sha256)` — migration **196** (next free slot,
+collision-checked against all active `release/*` branches).
+
+v1 claimed "no migration required" on the strength of an EXPLAIN run against a
+single-row table. That EXPLAIN covered the listing query, not the summary
+query, and proved nothing at scale. The claim is withdrawn.
+
+**State contract.** Five states. `verdict='error'` is **not** among them — it
+is unreachable dead code with zero production writers.
+
+| State | DB predicate | Renders as |
 |---|---|---|
-| Not scanned | no row, or `checksum_sha256 IS NULL` | "Not scanned" + why (scanning disabled / format unsupported) |
-| Clean | `verdict='clean'` | "Clean" + scanned timestamp |
-| Vulnerable | `verdict='vulnerable'` | severity counts + max severity + blocked state |
-| Error | `verdict='error'` | "Scan failed" — explicitly not clean |
+| `clean` | row, `verdict='clean'`, fresh | "Clean" + relative age |
+| `vulnerable` | row, `verdict='vulnerable'` | severity counts + max severity |
+| `stale` | row exists, `verdict_is_reusable` false | prior verdict, explicitly marked no longer authoritative |
+| `pending` | no row, recent serve with `X-AK-Scan: pending` | "Scan in progress" |
+| `not_scanned` | no row | "Not scanned" **plus a reason** |
 
-**API.** New additive field on proxy artifact responses. `analyzable` is
-deliberately left unchanged.
+`not_scanned` MUST carry a reason discriminant. The reasons are materially
+different and at least two of them mean *content was served without ever being
+scanned*:
+
+- `scanning_disabled` — `scan_on_proxy` off for this repository.
+- `format_unsupported` — format has no proxy gate wiring.
+- `exceeds_size_cap` — object over `PROXY_SCAN_MAX_BYTES` (200 MiB). Under
+  fail-open the handler streams it and never calls `proxy_scan_and_record`,
+  not even asynchronously. No rescan job exists. This is permanent.
+- `identity_unestablished` — the gate deliberately declines to scan rather than
+  record an unfounded clean verdict. Also permanent.
+- `inconclusive` — the scan ran and failed (engine error, budget timeout, empty
+  catalog). Writes no row today. Under `fail_closed` the user received a 423.
+
+Rendering `inconclusive` or `exceeds_size_cap` as "scanning disabled" would be
+the same false reassurance this work exists to remove.
+
+**Freshness.** Compute a `stale: bool` from the existing pure
+`verdict_is_reusable` predicate. Do not require the user to infer staleness by
+reading a timestamp. A `clean` verdict older than the freshness threshold must
+not render with the same visual confidence as a same-day scan.
+
+**Cross-tenant caveat.** Verdicts are global by content digest. A repository
+with `scan_on_proxy` **off** can inherit a verdict recorded by another
+repository or tenant for byte-identical content. The UI must not imply "this
+repository scanned this," and the API must not expose
+`proxy_scan_results.repository_id`. Add a source-scanning test asserting the
+query never selects that column; `security.rs` already has this test idiom.
+
+**API.** `analyzable` is unchanged. A new always-serialized field is added —
+never `skip_serializing_if`, because clients must distinguish "old server" from
+"never scanned":
 
 ```jsonc
 {
-  "analyzable": false,          // unchanged: SBOM/on-demand scan still unavailable
-  "proxy_scan": {               // null when never scanned
-    "verdict": "vulnerable",
+  "analyzable": false,
+  "capabilities": { "sbom": false, "on_demand_scan": false, "verdict": true },
+  "scan_verdict": {                    // null when no row
+    "source": "proxy",
+    "state": "vulnerable",
+    "stale": false,
     "max_severity": "medium",
-    "findings_count": 2,
-    "critical_count": 0,
-    "high_count": 0,
-    "medium_count": 2,
-    "low_count": 0,
+    "findings_count": 1,
+    "critical_count": 0, "high_count": 0, "medium_count": 1, "low_count": 0,
     "scanner_version": "grype-0.116.0",
     "scanned_at": "2026-08-13T20:11:49Z"
-  }
+  },
+  "not_scanned_reason": null           // set when scan_verdict is null
 }
 ```
 
-Rationale for not flipping `analyzable`: it gates the SBOM button. Flipping it
-before Issue 2 lands would enable that button and return 404 — reintroducing the
-exact defect this work exists to fix.
+Named `scan_verdict` with a `source` discriminant rather than `proxy_scan`:
+the latter bakes a workaround into the public API and would be wrong forever if
+unification lands.
 
-Endpoints:
+`capabilities` replaces the impulse to flip `analyzable`. `analyzable` means
+"this id resolves to an `artifacts` row" — it is also `false` for historical
+`artifact_versions` rows, which have nothing to do with proxying — and it gates
+three affordances, not one: the SBOM generate button, the Security tab empty
+state, and the scans section empty state. Issue 1 ships `capabilities` with
+only `verdict` true; Issue 2 flips `sbom`; unification would make them all true
+and retire the object.
 
-- Repository artifact listing gains `proxy_scan` inline via `LEFT JOIN` (no N+1).
-- `GET /api/v1/repositories/:key/security/proxy-verdicts` — repo-level summary
-  and paged list.
+**Endpoint.** `GET /api/v1/repositories/:key/security/proxy-scans` — vocabulary
+matches the existing `scans`/`findings`/`scores`/`policies` siblings. It must be
+scoped through `proxy_cache_artifacts` for the calling repository and must not
+accept a caller-supplied digest, which would make it a cross-tenant lookup
+oracle.
+
+**Authorization — explicit, because the two candidate patterns differ.**
+`list_repo_scans` and `get_repo_security` require authentication
+unconditionally, *including for public repositories*. `list_artifacts` does
+not — `require_visible` returns `Ok(())` immediately when `repo.is_public`.
+Attaching verdict data to the artifact listing without a decision here would
+make vulnerability data anonymously readable on public proxy repositories.
+
+**Decision: vulnerability data follows the `security.rs` pattern.**
+`scan_verdict` is omitted (null) for unauthenticated callers on public
+repositories; the new endpoint requires authentication. Integration test
+required.
 
 **Web.**
 
-- Artifact Security tab renders the verdict panel for proxy artifacts, replacing
-  "This artifact cannot be scanned."
-- SBOM tab copy narrowed to SBOM specifically, not "SBOM and scanning".
-- Repository Security tab shows a proxy summary (scanned / clean / vulnerable /
-  not scanned counts).
-- `Scan All` disabled on proxy repositories, with an explanatory tooltip. Today
-  it returns `{"artifacts_queued": 0}` with HTTP 200 — a false success.
-- Admin dashboard: stop reporting a hardcoded `0` for Policy Blocks; report
-  proxy and hosted separately rather than blending them.
+- Replace the green "No vulnerabilities detected" shield for proxy artifacts
+  with the verdict panel. This is the primary fix.
+- Narrow the SBOM tab copy to SBOM specifically. Note
+  `ARTIFACT_NOT_ANALYZABLE_MSG` is shared by SBOM, scan trigger, and signing —
+  changing it touches all three (#3344).
+- Repository Security tab: proxy summary by state.
+- `Scan All`: gate on **whether the repository has scannable rows**, not on
+  `repo_type == Remote`. OCI remote repositories accumulate real `artifacts`
+  rows for proxied manifests (#1505) and `Scan All` genuinely works there today;
+  a repo-type check would remove working functionality.
+- The verdict panel MUST state that per-CVE detail is unavailable for
+  proxy-cached content and name the available workaround. This is a hard
+  requirement, not polish — without it Issue 1 tells users they are blocked and
+  offers no path forward.
 
-Client uses `apiFetch` rather than the generated SDK, since
-`@artifact-keeper/sdk` regenerates only on `release: published`. Migration to
-the SDK is a follow-up.
+**Policy Blocks tile: removed from scope.** v1 filed it under Web; the hardcoded
+`0` is in the backend (`build_dashboard_summary`). More importantly there is no
+data source for a block *count* — `proxy_scan_results` stores verdicts, not
+events — and both candidate sources (audit trail, metrics) are out of scope.
+Replacing a hardcoded `0` with a differently-wrong number under a security label
+is worse than leaving it.
 
-### Issue 2 — Persist the component catalog and generate SBOMs for proxy content
+### Issue 1b — Extend verdict visibility to Docker/OCI
 
-One migration. Touches the gate's write path (not its decision path).
+Separate slice, different data store. OCI content is in `oci_blobs` /
+`manifest_blob_refs`, not `proxy_cache_artifacts`. The Docker view requests
+`group_by=docker_tag`, which returns `DockerTag[]` and never reaches
+`ArtifactResponse`, so the Issue 1 field addition does not surface there. The
+join key also differs: `proxy_scan_results.checksum_sha256` stores bare hex,
+while manifest digests carry a `sha256:` prefix requiring normalisation, as the
+existing OCI verdict joins already do.
 
-**Changes.**
+Also in scope here: the virtual-repository path, where verdicts resolve through
+members.
 
-1. `parse_cyclonedx_catalog` (`grype_scanner.rs:289`) retains `purl`,
-   `licenses`, and component `type` in addition to name and version.
-2. The CycloneDX BOM is serialized before `remove_file`
-   (`grype_scanner.rs:1144`).
-3. `ProxyScanVerdict` (`scanner_service.rs:2491`) carries the catalog;
-   `run_inline_proxy_scanners_target` (`scanner_service.rs:2623`) stops dropping
-   it.
-4. New digest-keyed table `proxy_sbom_components`, written by
-   `proxy_scan_and_record` (`proxy_helpers.rs:6229`) inside the existing
-   transaction, using bulk `UNNEST` insert.
-5. SBOM served for proxy artifacts from the persisted catalog, reusing
-   `generate_cyclonedx_inner` / `generate_spdx_inner`, which take a
-   `Vec<DependencyInfo>` and are already database-independent.
-6. `analyzable` becomes `true` for proxy artifacts once a catalog exists —
-   deferred to this issue, not Issue 1.
+### Issue 2 — SBOMs for proxy-cached content
 
-**Why this is cheap.** No new subprocess, no new grype flag, no syft install
-(grype embeds syft). The expensive cataloging pass already runs on every scan.
+**Reuse the existing SBOM tables. Do not create `proxy_sbom_components`.**
 
-**Digest-keyed SBOMs never go stale.** The component inventory of fixed bytes
-cannot change. Unlike vulnerability verdicts, which rot as the CVE database
-updates, an SBOM keyed on content digest is write-once and reusable forever,
-across repositories and across cache evictions.
+`sbom_components` already has exactly the required columns: `name, version,
+purl, cpe, component_type, licenses TEXT[], sha256, supplier, external_refs`.
+The only obstacle is `sbom_documents.artifact_id UUID NOT NULL REFERENCES
+artifacts(id)`.
 
-**Component truncation.** OCI images routinely produce thousands of components.
-Persist at most `PROXY_SBOM_MAX_COMPONENTS = 5000` per digest, ordered by
-component name for determinism. On overflow, record `truncated = true` on the
-parent row and surface it in both the API response and the SBOM's generator
-metadata, so a truncated SBOM is never presented as complete. Bulk insert via
-`UNNEST`, never row-at-a-time.
+**Migration (197):** make `artifact_id` nullable, add `content_digest TEXT`, a
+CHECK that exactly one of the two is set, and a partial unique index on
+`(content_digest, format)`.
 
-**Provenance caveat.** For file-format scans, `ScanWorkspace::prepare_pinned`
-(`scanner_service.rs:963`) injects a synthetic `METADATA` or
-`package-lock.json` so grype has something to grade. That pin appears in the
-CycloneDX catalog. It reflects the request coordinate and is defensible as the
-SBOM's top-level component, but it is a component Artifact Keeper injected
-rather than one discovered from the bytes. This must be recorded in the SBOM's
-generator metadata and MUST NOT be presented as attestation-grade provenance
-without an explicit decision.
+This is smaller than a new table plus a new insert path plus a new serve path.
+It reuses the `#903` content-hash cache and the licenses GIN index, makes every
+existing SBOM consumer (license policy, Dependency-Track export) work for proxy
+content for free, and is the **first step of unification** rather than a fourth
+parallel structure to unwind later.
+
+**Catalog retention.**
+
+1. Do **not** extend `CatalogedComponent`. That type feeds the #3003 fail-closed
+   identity check and its derived `PartialEq`; changing it is a security-path
+   change, not a refactor. Add a separate detail type, or carry the BOM bytes
+   through unparsed.
+2. Retain `purl`, `licenses`, and component `type`. Note `type` is currently the
+   filter predicate (`type == "library"`), so retaining it is a change to that
+   filter's behaviour — `type: "file"` entries are excluded today by design.
+3. **Bound the parse.** Enforce `PROXY_SBOM_MAX_COMPONENTS = 10_000` *during*
+   collection — stop consuming once the limit is reached and mark the document
+   as refused — and cap individual field lengths at
+   `PROXY_SBOM_MAX_FIELD_LEN = 1024` for `name`, `purl`, and `license`.
+   These strings originate in files inside untrusted upstream artifacts. v1
+   specified collect-then-sort-then-truncate, which fully materialises an
+   attacker-influenced vector and runs an O(n log n) sort that the scan's
+   `tokio::timeout` cannot preempt.
+4. **Sanitize before persisting.** A raw BOM carries syft
+   `evidence.occurrences.location` values exposing internal workspace paths.
+5. **Deduplicate.** Per P1, the pin causes duplicate components. Dedup by
+   `(name, version, purl)` before persisting.
+
+**Write path.** `record_verdict` is a single statement whose failure is
+swallowed with `warn!` — there is no transaction today. Choose explicitly:
+either introduce one, or accept a verdict without its catalog and define the
+recovery. **The catalog write must sit outside `PROXY_SCAN_INLINE_BUDGET`** — a
+slow insert inside the budget can push the scan future into timeout and thereby
+change the block/serve decision.
+
+**Completeness.** Reuse the existing `inventory_completeness` mechanism
+(`artifact-keeper:scan-completeness`, #1153) rather than a bespoke `truncated`
+flag. Policy on overflow is **document-level refusal**, not truncation: an SBOM
+missing components while looking complete is worse than no SBOM for its actual
+uses (license compliance, VEX matching).
+
+**Render path.** `generate_cyclonedx_inner` and `generate_spdx_inner` take
+`&[DependencyInfo]` and are `&self` methods on `SbomService`, so reuse requires
+a service instance. `DependencyInfo.license` is **singular** and
+`component_type` is hardcoded `"library"`. Persisting `licenses[]` and `type`
+without widening `DependencyInfo` would store data the renderer discards.
+
+**Capabilities.** Flip `capabilities.sbom` only. `on_demand_scan` stays false:
+`trigger_scan` resolves ids against `artifacts` and would 404 on a synthetic id.
+
+**Provenance — stronger than v1 stated.** The pin is not merely an extra
+top-level component:
+
+- It **duplicates** a component the artifact genuinely contains (P1).
+- For npm the pin merges into `package-lock.json`, which lists *declared
+  transitive dependencies*. An npm tarball does not vendor `node_modules`, so
+  the resulting BOM asserts components the artifact does not contain.
+- `proxy_scan_results` has no format column, so byte-identical content pulled
+  through a PyPI proxy and a Generic proxy shares a digest; the Generic repo
+  would serve an SBOM built from the PyPI repo's request coordinate.
+
+These SBOMs describe *what the scanner cataloged*, not *what the artifact
+contains*. They MUST be labelled accordingly and MUST NOT be presented as
+attestation-grade without an explicit product decision.
 
 ## Out of scope
 
-- Per-CVE finding detail for proxy content. `proxy_scan_results` stores counts
-  only; individual CVEs are computed and discarded. Requires its own table and
-  a resolution to the cross-tenant acknowledgment question (see Risks).
-- Audit trail for proxy blocks (no audit write exists on the gate path today).
-- Prometheus metrics for proxy scan decisions.
-- `severity_threshold` ignored by the proxy gate (#3243) — blocked on #3306.
-- Verdict staleness: `scanner_version` records the grype CLI version only, so
-  CVE-database updates never invalidate a verdict (#3287).
-- Writing `artifacts` rows for proxy content (separate issue).
-- Extending proxy scan coverage beyond PyPI, npm, and Docker/OCI.
+- Per-CVE finding detail for proxy content. Note this is **not** blocked on
+  unresolved design — the findings exist at `aggregate_proxy_verdict` and cost
+  one digest-keyed table. It is deferred on value, not feasibility, and should
+  be compared against SBOM on user value before either is built.
+- Audit trail for proxy blocks; Prometheus metrics for proxy scan decisions.
+- `severity_threshold` ignored by the proxy gate (#3243), blocked on #3306.
+- Verdict staleness root cause (#3287). This design renders staleness; it does
+  not fix it.
+- Writing `artifacts` rows for proxy content (see below).
+
+## Why unification is deferred
+
+v1 argued this on storage-key doubling. That is the weaker half. The stronger
+argument: four subsystems now treat "proxy content has no `artifacts` row" as a
+correctness invariant, not a workaround — the trigger-maintained usage ledger
+charges `hosted_bytes` on `storage_key NOT LIKE 'proxy-cache/%'` (migrations
+171/182), quarantine (#2940), `artifacts_search_vector` (176), and the
+digest-keyed verdict model itself, which shares verdicts cross-repo and
+survives cache eviction. An `artifacts`-row model would lose that last
+property.
+
+Unification is a data-model migration with a ledger backfill, not a
+storage-routing fix. It is also true that #1278's root cause is unrepaired
+(`storage_for_artifact` does not exist), and OCI demonstrates the pattern can be
+done safely with the per-repo key convention (#1505).
 
 ## Risks
 
-**Cross-tenant data sharing.** `proxy_scan_results` and any digest-keyed
-component table are global across repositories and tenants. Per-finding
-acknowledgment or waivers therefore cannot be stored on these tables — one
-tenant waiving a CVE would waive it for everyone. Issue 2 deliberately omits
-acknowledgment columns. A scoped waiver model is a separate design.
-
-**Provenance leakage.** `proxy_scan_results.repository_id` records which
-repository first scanned a digest. It MUST NOT be exposed on a repo-scoped read.
-
-**Stale verdicts rendered authoritatively.** Because of #3287, a verdict can be
-up to 30 days old while looking current. Any verdict UI must display
-`scanned_at` and `scanner_version` prominently.
-
-**Eviction.** Verdicts and SBOM components survive proxy cache eviction by
-design (they are digest-keyed). The repo-level listing joins from the cache
-side, so an evicted-but-scanned digest disappears from the repository view while
-its verdict is retained for reuse. This is intended and should be documented.
+- **Fail-closed caches the bytes it refuses to serve.** The cache write happens
+  inside the fetch, before the gate decides. A 403'd vulnerable artifact is
+  resident in local storage and counted in the catalog. This is why the join
+  works at all; it is also an undocumented posture, and the listing will now
+  advertise "vulnerable, blocked" for bytes on disk.
+- **Legacy cold caches.** A repository with zero catalog rows falls back to
+  storage enumeration and would render `scan_verdict: null` for everything.
+- **Placeholder rows.** `record_proxy_download` upserts a row with
+  `checksum_sha256 NULL` before the content commits; that row transiently joins
+  to nothing.
+- Cross-tenant verdict inheritance and `scanned_at` timing as an inferential
+  side channel (low value for public upstream content).
 
 ## Testing
 
-**Unit.** Three-state mapping (not scanned / clean / vulnerable / error),
-including `checksum_sha256 IS NULL` and `verdict='error'`. Catalog parsing with
-PURL and license fields. Truncation behavior.
+**Unit.** State mapping across all five states plus every `not_scanned` reason,
+including `checksum_sha256 IS NULL`. Staleness computation. Catalog parse with
+`purl`/`licenses`/`type`, bounded collection, field-length caps, dedup.
 
-**Integration.** Verdict persisted by the gate is readable through the new API.
-Repo summary counts correct across mixed states. Provenance field not exposed on
-repo-scoped reads.
+**Integration.** Verdict written by the gate is readable through the new API.
+Summary counts correct across mixed states. `repository_id` never selected.
+`scan_verdict` omitted for anonymous callers on public repos. Serde test
+asserting the field is always serialized.
 
-**End-to-end** (reproducible on the local stack):
+**Performance.** Plan-stability test for the listing join and the summary
+aggregate at representative scale. v1 had none; this is how the index gap was
+missed.
 
-1. Create a proxy repository; enable `scan_enabled`, `scan_on_proxy`,
-   `proxy_scan_action=fail_closed`.
-2. Pull a CVE-bearing package; assert HTTP 403 `scan_blocked`.
-3. Assert a `proxy_scan_results` row exists with the expected verdict.
-4. Assert the artifact listing returns a populated `proxy_scan` object.
-5. Assert the repo summary reports the artifact as vulnerable.
-6. Assert the UI renders the verdict rather than "cannot be scanned".
-7. Issue 2 only: assert an SBOM is generated for the proxy artifact and its
-   component list is non-empty and includes non-vulnerable components.
+**End-to-end** (reproducible locally): enable `scan_on_proxy` + `fail_closed`,
+pull a CVE-bearing package, assert 403, assert the verdict row, assert the API
+surfaces it, assert the UI renders it instead of the green shield.
 
-**Regression.** `analyzable` remains `false` for proxy artifacts throughout
-Issue 1. The gate's block/serve decision is unchanged — existing proxy scan
-tests must pass untouched.
+**Regression.** `analyzable` unchanged throughout. The gate's block/serve
+decision unchanged — existing proxy scan tests pass untouched. #3003 identity
+check untouched.
+
+## Corrections to v1
+
+| v1 claim | Correction |
+|---|---|
+| Covers PyPI, npm, Docker/OCI | Issue 1 covers PyPI and npm only; OCI is a different store, shape and join key |
+| No migration required | Summary endpoint needs an index (196) |
+| "Verified query plan" | EXPLAIN was one row and covered a different query; claim withdrawn |
+| Four states incl. `error` | `error` is unreachable; five states plus a reason discriminant |
+| Fix Policy Blocks tile (Web) | Backend hardcode, and no data source exists; removed from scope |
+| Fix "cannot be scanned" copy | The dangerous string is the green "No vulnerabilities detected" shield |
+| Disable `Scan All` on proxy repos | Would break OCI proxies where it works; gate on scannable rows |
+| Flip `analyzable` in Issue 2 | `analyzable` also gates on-demand scan, which would 404; use `capabilities` |
+| New `proxy_sbom_components` table | Relax `sbom_documents.artifact_id`; reuse `sbom_components` |
+| Write "inside the existing transaction" | No transaction exists; must be chosen explicitly |
+| Generators take `Vec<DependencyInfo>` | `&[DependencyInfo]`, `&self` methods, singular license, hardcoded type |
+| Field named `proxy_scan` | `scan_verdict` + `source` discriminant |
+| Cap at persist, sorted, truncate | Bound during parse; refuse at document level |
+| Pin is a defensible top-level component | Also duplicates real components and inflates npm transitives |
+| Evidence: "2 findings" | One CVE double-counted (P1) |
 
 ## Coverage and duplication gates
 
-Per CLAUDE.md: changed lines require >= 70% coverage and <= 3% duplication.
-Read-path mapping logic should be extracted into pure functions so it is
-coverable without database fixtures.
+Per CLAUDE.md: >= 70% coverage on changed lines, <= 3% duplication. Extract
+state-mapping and staleness logic into pure functions so they are coverable
+without database fixtures.
