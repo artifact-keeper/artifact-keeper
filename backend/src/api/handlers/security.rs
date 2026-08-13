@@ -758,7 +758,7 @@ async fn trigger_scan(
                 .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
         if exists.is_none() {
             return Err(AppError::NotFound(
-                crate::api::handlers::sbom::ARTIFACT_NOT_ANALYZABLE_MSG.into(),
+                crate::api::handlers::sbom::ON_DEMAND_SCAN_NOT_AVAILABLE_MSG.into(),
             ));
         }
 

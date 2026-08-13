@@ -20,14 +20,22 @@ use crate::models::sbom::{
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::sbom_service::{DependencyInfo, LicenseCheckResult, SbomService};
 
-/// Not-found message for artifact-scoped analysis endpoints (SBOM generate,
-/// CVE history). A bare "Artifact not found" was confusing for proxy-cached
-/// (Remote) objects: those are listed with a synthetic, SHA-256-derived id and
-/// have no row in the `artifacts` table (#1280/#1278), so SBOM/scan lookups by
-/// `artifacts.id` can never resolve them even though the object is visible in
-/// the listing. This message distinguishes that expected case from a genuine
-/// missing id and tells the caller what actually works. (#2227)
-pub(crate) const ARTIFACT_NOT_ANALYZABLE_MSG: &str = "Artifact not found or not eligible for analysis: SBOM generation and security scanning are available only for artifacts hosted in this registry, not proxy-cached remote artifacts.";
+/// Not-found messages for artifact-scoped endpoints. Proxy-cached (Remote)
+/// objects are listed with a synthetic, SHA-256-derived id and have no row in
+/// the `artifacts` table (#1278/#1280), so lookups by `artifacts.id` cannot
+/// resolve them even though the object is visible in the listing. (#2227)
+///
+/// One message per capability (#3344). The previous single constant claimed
+/// "SBOM generation and security scanning" were both hosted-only; the scanning
+/// half has been false since #2954, where proxy-cached artifacts began being
+/// scanned and blocked at download time under the repository's scan-on-proxy
+/// policy. Messages that describe a capability with a proxy equivalent must
+/// point the caller at it.
+pub(crate) const SBOM_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for SBOM generation: SBOM generation is available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts are still scanned for vulnerabilities at download time when scan-on-proxy is enabled for the repository.";
+
+pub(crate) const ON_DEMAND_SCAN_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for on-demand scanning: on-demand scans are available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached remote artifacts are scanned automatically at download time when scan-on-proxy is enabled for the repository.";
+
+pub(crate) const SIGNING_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for signing: signing is available only for artifacts hosted in this registry, not proxy-cached remote artifacts.";
 
 /// Emit an audit log entry for an SBOM action against an artifact. Failures
 /// are logged but never propagated: the mutation/read is already complete and
@@ -370,7 +378,7 @@ async fn generate_sbom(
             .fetch_optional(&state.db)
             .await
             .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
-            .ok_or_else(|| AppError::NotFound(ARTIFACT_NOT_ANALYZABLE_MSG.into()))?;
+            .ok_or_else(|| AppError::NotFound(SBOM_NOT_AVAILABLE_MSG.into()))?;
 
     // If force_regenerate, delete existing SBOM first
     if body.force_regenerate {
@@ -1738,7 +1746,7 @@ async fn ensure_artifact_repo_access(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    require_repo_visibility(db, auth, repo, ARTIFACT_NOT_ANALYZABLE_MSG).await
+    require_repo_visibility(db, auth, repo, SBOM_NOT_AVAILABLE_MSG).await
 }
 
 /// Like [`ensure_artifact_repo_access`] but resolves through `sbom_documents`
@@ -2487,23 +2495,46 @@ mod tests {
     }
 
     #[test]
-    fn test_artifact_analysis_missing_uses_honest_not_analyzable_message() {
-        // #2227: the artifact-scoped analysis endpoints (SBOM generate, CVE
-        // history) no longer return a bare "Artifact not found". When the id
-        // has no `artifacts` row -- e.g. the synthetic id a Remote repo lists
-        // for a proxy-cached object -- the caller must learn that analysis is
-        // only available for hosted artifacts. Pin the exact wording that
-        // `ensure_artifact_repo_access` (and `generate_sbom`) surface.
+    fn test_capability_messages_do_not_claim_scanning_is_unavailable() {
+        // #3344: the single shared message claimed "SBOM generation and
+        // security scanning are available only for artifacts hosted in this
+        // registry". The scanning half has been false since #2954: proxy-cached
+        // artifacts are scanned at download time when scan-on-proxy is enabled.
+        // Each endpoint now states only its own limitation.
+        for msg in [
+            SBOM_NOT_AVAILABLE_MSG,
+            ON_DEMAND_SCAN_NOT_AVAILABLE_MSG,
+            SIGNING_NOT_AVAILABLE_MSG,
+        ] {
+            assert!(
+                !msg.contains("SBOM generation and security scanning"),
+                "message still makes the blanket claim: {msg}"
+            );
+            assert_ne!(msg, "Artifact not found");
+            assert!(
+                msg.contains("proxy-cached remote artifacts") || msg.contains("proxy-cached"),
+                "message should still name the proxy-cached case: {msg}"
+            );
+        }
+
+        // The two messages for capabilities that DO have a proxy equivalent
+        // must point the caller at it rather than dead-ending.
+        assert!(SBOM_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+        assert!(ON_DEMAND_SCAN_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+
+        // Signing has no proxy equivalent, so it must not imply one.
+        assert!(!SIGNING_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+    }
+
+    #[test]
+    fn test_sbom_visibility_denial_uses_the_sbom_message() {
+        // `ensure_artifact_repo_access` guards the SBOM and CVE-history
+        // endpoints, so its denial must be the SBOM-specific message.
         let auth = make_auth(None, false);
-        let err = require_repo_access(&auth, None, ARTIFACT_NOT_ANALYZABLE_MSG).unwrap_err();
+        let err = require_repo_access(&auth, None, SBOM_NOT_AVAILABLE_MSG).unwrap_err();
         match err {
-            AppError::NotFound(msg) => {
-                assert_eq!(msg, ARTIFACT_NOT_ANALYZABLE_MSG);
-                assert!(msg.contains("hosted in this registry"));
-                assert!(msg.contains("proxy-cached remote artifacts"));
-                assert_ne!(msg, "Artifact not found");
-            }
-            other => panic!("expected NotFound with the honest message, got {:?}", other),
+            AppError::NotFound(msg) => assert_eq!(msg, SBOM_NOT_AVAILABLE_MSG),
+            other => panic!("expected NotFound with the SBOM message, got {:?}", other),
         }
     }
 
