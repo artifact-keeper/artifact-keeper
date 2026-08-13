@@ -2225,13 +2225,20 @@ async fn get_package_metadata(
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let encoded_name = encode_package_name_for_upstream(package_name);
+                // Fetch/cache split (#3297): the `%2F`-encoded name is what
+                // upstream registries require in the URL, but the local proxy
+                // cache key (persisted into the `proxy_cache_artifacts`
+                // catalog and shown in the web UI) must use the canonical
+                // decoded `@scope/name`.
                 let (content, content_type, _budget_permit) =
-                    proxy_helpers::proxy_fetch_capped_budgeted(
+                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
                         proxy,
                         repo.id,
                         repo_key,
                         upstream_url,
                         &encoded_name,
+                        package_name,
+                        None,
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await?;
@@ -2315,12 +2322,16 @@ async fn get_package_metadata(
             };
 
             let encoded_name = encode_package_name_for_upstream(package_name);
-            let result = proxy_helpers::proxy_fetch_capped_budgeted(
+            // Fetch/cache split (#3297): encoded name upstream, decoded
+            // `@scope/name` as the member's local cache key.
+            let result = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
                 proxy,
                 member.id,
                 &member.key,
                 upstream_url,
                 &encoded_name,
+                package_name,
+                None,
                 proxy_helpers::LARGE_METADATA_MAX_BYTES,
             )
             .await;
@@ -2495,15 +2506,20 @@ async fn fetch_remote_packument(
         .as_ref()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
     let encoded_name = encode_package_name_for_upstream(package_name);
-    let (content, _ct, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
-        proxy,
-        repo.id,
-        repo_key,
-        upstream_url,
-        &encoded_name,
-        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-    )
-    .await?;
+    // Fetch/cache split (#3297): encoded name upstream, decoded `@scope/name`
+    // as the local cache key.
+    let (content, _ct, _budget_permit) =
+        proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+            proxy,
+            repo.id,
+            repo_key,
+            upstream_url,
+            &encoded_name,
+            package_name,
+            None,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await?;
     let mut json: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
         AppError::Internal(format!("Invalid JSON from upstream: {}", e)).into_response()
     })?;
@@ -2586,12 +2602,16 @@ async fn fetch_virtual_packument(
         };
 
         let encoded_name = encode_package_name_for_upstream(package_name);
-        let result = proxy_helpers::proxy_fetch_capped_budgeted(
+        // Fetch/cache split (#3297): encoded name upstream, decoded
+        // `@scope/name` as the member's local cache key.
+        let result = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
             proxy,
             member.id,
             &member.key,
             upstream_url,
             &encoded_name,
+            package_name,
+            None,
             proxy_helpers::LARGE_METADATA_MAX_BYTES,
         )
         .await;
@@ -2736,15 +2756,23 @@ async fn npm_publish_time_for_version(
         // Capped like every other buffered packument read (#2181): this runs
         // on the tarball download path, where an unbounded upstream metadata
         // body must not be able to balloon memory.
-        if let Ok((content, _, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
-            proxy,
-            repo.id,
-            &repo.key,
-            upstream_url,
-            &encoded_name,
-            proxy_helpers::LARGE_METADATA_MAX_BYTES,
-        )
-        .await
+        //
+        // Fetch/cache split (#3297): same decoded cache key as the metadata
+        // handlers, so the packument this age-gate probe caches is the SAME
+        // entry `get_package_metadata` reads and refreshes — leaving this
+        // site on the encoded key would double-cache every scoped packument.
+        if let Ok((content, _, _budget_permit)) =
+            proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+                proxy,
+                repo.id,
+                &repo.key,
+                upstream_url,
+                &encoded_name,
+                package_name,
+                None,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            )
+            .await
         {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
                 let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
@@ -7544,6 +7572,192 @@ mod tests {
         assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
 
         cleanup().await;
+    }
+
+    /// #3297: a Remote npm proxy must request a scoped packument from
+    /// upstream with the scope separator percent-encoded (`@scope%2Fpkg` —
+    /// private registries require that form) while keying the LOCAL proxy
+    /// cache — and therefore the `proxy_cache_artifacts` catalog row that the
+    /// web UI's Artifacts tab lists — under the canonical decoded
+    /// `@scope/pkg`. Before the fix the handlers passed the encoded upstream
+    /// form as the single `path` of `proxy_fetch_capped_budgeted`, which
+    /// reuses it as the cache key, so the catalog listed `@scope%2Fpkg`
+    /// verbatim.
+    ///
+    /// Positive controls in the same fixture:
+    /// * the upstream mock matches ONLY the encoded literal path, so the
+    ///   fetch/cache split cannot have decoded the UPSTREAM request;
+    /// * an unscoped package still resolves and catalogs under its plain
+    ///   name (separator-free names cannot diverge, per the #3179 lesson,
+    ///   so they must be unaffected);
+    /// * a second scoped request is answered from the cache written under
+    ///   the decoded key — wiremock's `expect(1)` fails the test if the
+    ///   re-read misses its own write and refetches upstream.
+    ///
+    /// Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_remote_scoped_packument_cached_under_decoded_name() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let scoped_packument = serde_json::json!({
+            "name": "@e2escope/scopedpkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "@e2escope/scopedpkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!(
+                            "{}/@e2escope/scopedpkg/-/scopedpkg-1.0.0.tgz",
+                            mock_server.uri()
+                        )
+                    }
+                }
+            }
+        });
+        // Metadata requests must reach upstream with the literal `%2F`
+        // (unlike tarballs, B7): match ONLY the encoded path, so a decoded
+        // upstream request 404s and fails the test. `expect(1)` proves the
+        // second request below was a cache hit under the decoded key.
+        Mock::given(method("GET"))
+            .and(path("/@e2escope%2Fscopedpkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&scoped_packument),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let plain_packument = serde_json::json!({
+            "name": "plainpkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "plainpkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!(
+                            "{}/plainpkg/-/plainpkg-1.0.0.tgz",
+                            mock_server.uri()
+                        )
+                    }
+                }
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/plainpkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&plain_packument),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        // The router percent-decodes `%2F` on the way in, so the handler
+        // receives the canonical decoded name.
+        let scoped_first = super::get_package_metadata(
+            &state,
+            &fx.repo_key,
+            "@e2escope/scopedpkg",
+            "http://localhost",
+            false,
+        )
+        .await;
+        let scoped_second = super::get_package_metadata(
+            &state,
+            &fx.repo_key,
+            "@e2escope/scopedpkg",
+            "http://localhost",
+            false,
+        )
+        .await;
+        let plain = super::get_package_metadata(
+            &state,
+            &fx.repo_key,
+            "plainpkg",
+            "http://localhost",
+            false,
+        )
+        .await;
+
+        // What the Artifacts tab lists: the catalog rows' `path`.
+        let catalog_paths: Vec<String> = sqlx::query_scalar(
+            "SELECT path FROM proxy_cache_artifacts WHERE repository_id = $1 ORDER BY path",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read proxy_cache_artifacts catalog");
+
+        // Tear down before asserting so a failure never leaks DB/storage state.
+        fx.teardown().await;
+
+        let scoped_resp = scoped_first.unwrap_or_else(|r| {
+            panic!("scoped packument fetch must succeed; got HTTP {}", r.status())
+        });
+        assert_eq!(scoped_resp.status(), StatusCode::OK);
+        let scoped_body = axum::body::to_bytes(scoped_resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read scoped packument body");
+        let scoped_json: serde_json::Value =
+            serde_json::from_slice(&scoped_body).expect("parse scoped packument");
+        assert_eq!(scoped_json["name"], "@e2escope/scopedpkg");
+
+        let second_resp = scoped_second.unwrap_or_else(|r| {
+            panic!(
+                "second scoped fetch must be served from cache; got HTTP {}",
+                r.status()
+            )
+        });
+        assert_eq!(second_resp.status(), StatusCode::OK);
+
+        let plain_resp = plain.unwrap_or_else(|r| {
+            panic!("unscoped packument fetch must succeed; got HTTP {}", r.status())
+        });
+        assert_eq!(plain_resp.status(), StatusCode::OK);
+
+        // The catalog must list the canonical decoded names — no `%2F`.
+        assert!(
+            catalog_paths.iter().any(|p| p == "@e2escope/scopedpkg"),
+            "scoped packument must be catalogued under its decoded name; rows: {catalog_paths:?}"
+        );
+        assert!(
+            catalog_paths.iter().any(|p| p == "plainpkg"),
+            "unscoped packument must still be catalogued under its plain name; rows: {catalog_paths:?}"
+        );
+        assert!(
+            !catalog_paths
+                .iter()
+                .any(|p| p.contains("%2F") || p.contains("%2f")),
+            "no catalog row may keep the percent-encoded scope separator (#3297); rows: {catalog_paths:?}"
+        );
+
+        // Drop the mock server last: `expect(1)` on each mock verifies the
+        // second scoped request never produced a second upstream round-trip.
+        drop(mock_server);
     }
 
     // #2192 / #1608 Phase 4c: an npm tarball larger than the old buffered cap
