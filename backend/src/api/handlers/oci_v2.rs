@@ -373,8 +373,24 @@ async fn authenticate_oci_with_scopes(
             // the scopes so the caller can enforce GHSA-vvc3-h39c-mrq5.
             if let Ok(validation) = auth_service.validate_api_token(&token).await {
                 let scopes = validation.scopes.clone();
+                // Thread the API token's declared repository allow-list onto
+                // the minted OCI claims so `enforce_token_repo_scope` confines
+                // this token to its repositories (#3316), mirroring the
+                // `/v2/token` exchange path above. Without this the ceiling is
+                // discarded (`allowed_repo_ids: None` = unrestricted) on the
+                // direct-credential path — a scoped token could read/write any
+                // repository its owner can reach. `AccessScope::Admin` (an
+                // unscoped token) maps to `None` = unrestricted, and
+                // `Restricted(vec![])` maps to `Some(vec![])` = deny-all, so
+                // the fail-closed case is preserved.
+                let allowed_repo_ids: Option<Vec<Uuid>> =
+                    validation.allowed_repo_ids.clone().into();
                 let claims = auth_service
-                    .generate_tokens(&validation.user)
+                    .generate_tokens_with_scope(
+                        &validation.user,
+                        Some(scopes.clone()),
+                        allowed_repo_ids,
+                    )
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
@@ -401,8 +417,22 @@ async fn authenticate_oci_with_scopes(
             // /v2/token behavior): the token itself identifies the user.
             if let Ok(validation) = auth_service.validate_api_token(&password).await {
                 let scopes = validation.scopes.clone();
+                // Thread the API token's declared repository allow-list onto
+                // the minted OCI claims so `enforce_token_repo_scope` confines
+                // this token to its repositories (#3316), mirroring the
+                // `/v2/token` exchange path. Without this the ceiling is
+                // discarded on the Basic-password direct-credential path (the
+                // slot service accounts / CI / `-u user:token` use most).
+                // `AccessScope::Admin` maps to `None` = unrestricted;
+                // `Restricted(vec![])` maps to `Some(vec![])` = deny-all.
+                let allowed_repo_ids: Option<Vec<Uuid>> =
+                    validation.allowed_repo_ids.clone().into();
                 let claims = auth_service
-                    .generate_tokens(&validation.user)
+                    .generate_tokens_with_scope(
+                        &validation.user,
+                        Some(scopes.clone()),
+                        allowed_repo_ids,
+                    )
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
@@ -435,13 +465,24 @@ async fn authenticate_oci_with_scopes(
                 // JWT-as-password that was itself exchanged from a scoped API
                 // token must keep its `Some(ceiling)` here, not reset to full.
                 let scopes = claims.scopes.clone();
+                // Preserve the presented JWT's REPOSITORY ceiling too (#3316):
+                // a JWT minted from a scoped API token (via `/v2/token`) carries
+                // `allowed_repo_ids: Some([..])`. Re-minting via `generate_tokens`
+                // would reset it to `None` (unrestricted), letting that JWT reach
+                // repositories outside its scope when presented as the Docker
+                // password — the same discarded-context defect as the raw-token
+                // slots above, and a bypass of their fix. The Bearer-JWT arm
+                // returns the original claims directly and already keeps this;
+                // this arm re-mints, so thread the ceiling explicitly. An
+                // interactive/keyless JWT carries `None` and stays unrestricted.
+                let allowed_repo_ids = claims.allowed_repo_ids.clone();
                 if let Ok(user) = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
                     .bind(claims.sub)
                     .fetch_one(db)
                     .await
                 {
                     return auth_service
-                        .generate_tokens(&user)
+                        .generate_tokens_with_scope(&user, scopes.clone(), allowed_repo_ids)
                         .map_err(|_| ())
                         .and_then(|tokens| {
                             auth_service
@@ -30776,5 +30817,268 @@ mod oci_error_envelope_db_tests {
             String::from_utf8_lossy(&allowed_raw)
         );
         assert_oci_envelope(&allowed_json, &allowed_raw, "MANIFEST_UNKNOWN");
+    }
+}
+
+/// Regression tests for #3316: the OCI `/v2/` **direct-credential** paths
+/// (raw API token in the Bearer slot and the Basic-auth password slot, plus a
+/// JWT-as-password) must thread the presenting credential's repository-scope
+/// ceiling onto the minted `Claims`, so `enforce_token_repo_scope` (the first
+/// act of both the read and write gates) confines the token to its declared
+/// repositories.
+///
+/// Before the fix, `authenticate_oci_with_scopes` re-minted via
+/// `generate_tokens(&user)` — which sets `Claims.allowed_repo_ids = None`
+/// (unrestricted) — so a token scoped to repository A could read AND write any
+/// repository B the owning identity could otherwise reach. Only the `/v2/token`
+/// exchange path threaded the ceiling.
+///
+/// These are DB-backed: they no-op when no database is configured and PANIC
+/// under `AK_TESTS_REQUIRE_DB=1` if the pool is missing (revert-proof: a
+/// sub-second "pass" means the body never ran).
+#[cfg(test)]
+mod direct_credential_repo_scope_regression_3316 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use base64::Engine;
+    use std::sync::Arc;
+
+    fn scoped_scopes() -> Vec<String> {
+        vec!["read:artifacts".to_string(), "write:artifacts".to_string()]
+    }
+
+    /// Mint an API token for `user_id` and pin it to the explicit repo allow-list
+    /// via the `api_token_repositories` join table (the same store
+    /// `validate_api_token` reads when no `repo_selector` is set).
+    async fn mint_repo_scoped_token(
+        auth_service: &AuthService,
+        pool: &PgPool,
+        user_id: Uuid,
+        repos: &[Uuid],
+    ) -> String {
+        let (token, token_id) = auth_service
+            .generate_api_token(user_id, "scope-3316", scoped_scopes(), None)
+            .await
+            .expect("mint API token");
+        for repo in repos {
+            sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+                .bind(token_id)
+                .bind(repo)
+                .execute(pool)
+                .await
+                .expect("pin token to repo");
+        }
+        token
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    fn basic_headers(user: &str, secret: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"));
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Basic {enc}").parse().unwrap(),
+        );
+        h
+    }
+
+    /// Bearer slot: a raw API token scoped to A yields claims that permit A and
+    /// DENY B, and preserve the action-scope allowlist.
+    #[tokio::test]
+    async fn bearer_slot_confines_scoped_token_to_its_repos() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let (repo_a, _ka, _pa) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _kb, _pb) = tdh::create_repo(&pool, "local", "docker").await;
+        let storage = std::env::temp_dir().join(format!("oci-3316-be-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let token = mint_repo_scoped_token(&auth, &pool, user_id, &[repo_a]).await;
+
+        let (claims, grant) =
+            authenticate_oci_with_scopes(&state.db, &state.config, &bearer_headers(&token))
+                .await
+                .expect("authenticate scoped bearer token");
+
+        // The load-bearing assertion: the ceiling reached the claims (was
+        // `None` = unrestricted before the fix).
+        assert_eq!(
+            claims.allowed_repo_ids,
+            Some(vec![repo_a]),
+            "Bearer slot must thread the token's repo ceiling onto the claims"
+        );
+        // enforce_token_repo_scope is the first act of BOTH the read gate
+        // (require_oci_repo_read_access) and the write gate
+        // (require_oci_repo_write_access), so this proves both handlers deny B.
+        assert!(
+            enforce_token_repo_scope(&claims, repo_a).is_ok(),
+            "A allowed"
+        );
+        let err = enforce_token_repo_scope(&claims, repo_b)
+            .expect_err("cross-repo B must be denied for read AND write");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        // The action-scope allowlist is preserved too (parity with /v2/token).
+        assert_eq!(grant, Some(scoped_scopes()));
+        assert_eq!(claims.scopes, Some(scoped_scopes()));
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    /// Basic password slot (service accounts / CI / `-u user:token`): identical
+    /// containment. The Basic username is ignored, so an arbitrary username with
+    /// the scoped token must still be confined.
+    #[tokio::test]
+    async fn basic_password_slot_confines_scoped_token_to_its_repos() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let (repo_a, _ka, _pa) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _kb, _pb) = tdh::create_repo(&pool, "local", "docker").await;
+        let storage = std::env::temp_dir().join(format!("oci-3316-basic-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let token = mint_repo_scoped_token(&auth, &pool, user_id, &[repo_a]).await;
+
+        // Username is deliberately NOT the token owner — it is ignored.
+        let (claims, grant) = authenticate_oci_with_scopes(
+            &state.db,
+            &state.config,
+            &basic_headers("nobody", &token),
+        )
+        .await
+        .expect("authenticate scoped token in Basic password slot");
+
+        assert_eq!(
+            claims.allowed_repo_ids,
+            Some(vec![repo_a]),
+            "Basic password slot must thread the token's repo ceiling onto the claims"
+        );
+        assert!(
+            enforce_token_repo_scope(&claims, repo_a).is_ok(),
+            "A allowed"
+        );
+        let err = enforce_token_repo_scope(&claims, repo_b)
+            .expect_err("cross-repo B must be denied for read AND write");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert_eq!(grant, Some(scoped_scopes()));
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    /// Deny-all: a selector that matches nothing resolves to
+    /// `AccessScope::Restricted(vec![])`, which must convert to `Some(vec![])`
+    /// (grant nothing), NOT `None` (grant everything). The inversion would make
+    /// the fix a worse bug than the one it closes.
+    #[tokio::test]
+    async fn deny_all_repo_selector_denies_every_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let (repo_a, _ka, _pa) = tdh::create_repo(&pool, "local", "docker").await;
+        let storage = std::env::temp_dir().join(format!("oci-3316-deny-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+
+        let (token, token_id) = auth
+            .generate_api_token(user_id, "deny-all-3316", scoped_scopes(), None)
+            .await
+            .expect("mint API token");
+        // Non-empty selector that resolves to no repositories -> deny-all.
+        let selector = serde_json::json!({ "match_repos": [Uuid::new_v4().to_string()] });
+        sqlx::query("UPDATE api_tokens SET repo_selector = $1 WHERE id = $2")
+            .bind(&selector)
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect("set deny-all repo_selector");
+
+        let (claims, _grant) =
+            authenticate_oci_with_scopes(&state.db, &state.config, &bearer_headers(&token))
+                .await
+                .expect("authenticate deny-all token");
+
+        assert_eq!(
+            claims.allowed_repo_ids,
+            Some(vec![]),
+            "deny-all must be Some(empty), never None (unrestricted)"
+        );
+        let err = enforce_token_repo_scope(&claims, repo_a)
+            .expect_err("deny-all token must be denied even on a real repo");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        let err2 = enforce_token_repo_scope(&claims, Uuid::new_v4())
+            .expect_err("deny-all token must be denied on any repo");
+        assert_eq!(err2.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    /// Sibling defect (same function): a JWT exchanged from a scoped API token
+    /// carries `allowed_repo_ids: Some([A])`. When that JWT is presented as the
+    /// Docker Basic *password*, the re-mint must preserve the ceiling — otherwise
+    /// it is a laundering bypass of the raw-token fix above. (The Bearer-JWT arm
+    /// returns the original claims and already keeps it; this arm re-mints.)
+    #[tokio::test]
+    async fn jwt_as_password_preserves_repo_ceiling() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let (repo_a, _ka, _pa) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _kb, _pb) = tdh::create_repo(&pool, "local", "docker").await;
+        let storage = std::env::temp_dir().join(format!("oci-3316-jwtpw-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let token = mint_repo_scoped_token(&auth, &pool, user_id, &[repo_a]).await;
+
+        // Exchange the scoped API token into a JWT that carries the ceiling,
+        // exactly as the /v2/token exchange path does.
+        let validation = auth
+            .validate_api_token(&token)
+            .await
+            .expect("validate scoped api token");
+        let repo_ids: Option<Vec<Uuid>> = validation.allowed_repo_ids.clone().into();
+        assert_eq!(repo_ids, Some(vec![repo_a]));
+        let jwt = auth
+            .generate_tokens_with_scope(&validation.user, Some(validation.scopes.clone()), repo_ids)
+            .expect("mint scoped JWT")
+            .access_token;
+
+        // Present the JWT as the Basic password with a non-token-owner username.
+        let (claims, _grant) =
+            authenticate_oci_with_scopes(&state.db, &state.config, &basic_headers("nobody", &jwt))
+                .await
+                .expect("authenticate JWT-as-password");
+
+        assert_eq!(
+            claims.allowed_repo_ids,
+            Some(vec![repo_a]),
+            "JWT-as-password must preserve the exchanged ceiling, not reset to None"
+        );
+        assert!(
+            enforce_token_repo_scope(&claims, repo_a).is_ok(),
+            "A allowed"
+        );
+        let err = enforce_token_repo_scope(&claims, repo_b)
+            .expect_err("cross-repo B must be denied via JWT-as-password too");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&storage);
     }
 }
