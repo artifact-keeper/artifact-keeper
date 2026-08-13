@@ -383,14 +383,21 @@ async fn authenticate_oci_with_scopes(
                 // unscoped token) maps to `None` = unrestricted, and
                 // `Restricted(vec![])` maps to `Some(vec![])` = deny-all, so
                 // the fail-closed case is preserved.
+                //
+                // Only the REPOSITORY ceiling is threaded, not the action-scope
+                // allowlist: the action ceiling is enforced through the returned
+                // tuple element (`oci_scopes_grant`), and setting `Claims.scopes`
+                // to `Some(..)` here would additionally demote a global admin's
+                // `is_admin` via `From<Claims> for AuthExtension`'s
+                // `.with_scope_gated_admin()` (auth.rs), silently locking an
+                // unrestricted admin token out of virtual-member resolution
+                // (404). That admin-demotion is a separate policy question from
+                // #3316 (it hits tokens with no repo scope) and is deferred to
+                // 1.8.0 rather than shipped as a side effect here.
                 let allowed_repo_ids: Option<Vec<Uuid>> =
                     validation.allowed_repo_ids.clone().into();
                 let claims = auth_service
-                    .generate_tokens_with_scope(
-                        &validation.user,
-                        Some(scopes.clone()),
-                        allowed_repo_ids,
-                    )
+                    .generate_tokens_with_repo_scope(&validation.user, allowed_repo_ids)
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
@@ -425,14 +432,15 @@ async fn authenticate_oci_with_scopes(
                 // slot service accounts / CI / `-u user:token` use most).
                 // `AccessScope::Admin` maps to `None` = unrestricted;
                 // `Restricted(vec![])` maps to `Some(vec![])` = deny-all.
+                //
+                // Repository ceiling only — see the Bearer branch above for why
+                // `Claims.scopes` is deliberately left `None` (avoiding the
+                // scope-gated-admin demotion) and the action ceiling rides the
+                // returned tuple element instead.
                 let allowed_repo_ids: Option<Vec<Uuid>> =
                     validation.allowed_repo_ids.clone().into();
                 let claims = auth_service
-                    .generate_tokens_with_scope(
-                        &validation.user,
-                        Some(scopes.clone()),
-                        allowed_repo_ids,
-                    )
+                    .generate_tokens_with_repo_scope(&validation.user, allowed_repo_ids)
                     .map_err(|_| ())
                     .and_then(|tokens| {
                         auth_service
@@ -475,6 +483,16 @@ async fn authenticate_oci_with_scopes(
                 // returns the original claims directly and already keeps this;
                 // this arm re-mints, so thread the ceiling explicitly. An
                 // interactive/keyless JWT carries `None` and stays unrestricted.
+                //
+                // Repository ceiling only, like the raw-token branches: the
+                // action ceiling still rides `scopes` in the returned tuple, and
+                // `Claims.scopes` is left `None` to avoid the scope-gated-admin
+                // demotion described above. The presented JWT's `scan_pull_repo`
+                // pin (if any) is NOT carried onto the re-minted claims — as with
+                // the pre-existing `generate_tokens` here — but scan tokens reach
+                // OCI through the Bearer slot, not as a Docker password, and a
+                // dropped scan pin fails closed (the scanner bypass in the read
+                // gate simply does not engage), so this is inert.
                 let allowed_repo_ids = claims.allowed_repo_ids.clone();
                 if let Ok(user) = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
                     .bind(claims.sub)
@@ -482,7 +500,7 @@ async fn authenticate_oci_with_scopes(
                     .await
                 {
                     return auth_service
-                        .generate_tokens_with_scope(&user, scopes.clone(), allowed_repo_ids)
+                        .generate_tokens_with_repo_scope(&user, allowed_repo_ids)
                         .map_err(|_| ())
                         .and_then(|tokens| {
                             auth_service
@@ -30929,9 +30947,59 @@ mod direct_credential_repo_scope_regression_3316 {
         let err = enforce_token_repo_scope(&claims, repo_b)
             .expect_err("cross-repo B must be denied for read AND write");
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
-        // The action-scope allowlist is preserved too (parity with /v2/token).
+        // The action-scope allowlist rides the returned tuple element
+        // (`oci_scopes_grant`), NOT `Claims.scopes`. It must be surfaced there so
+        // the write/delete handlers enforce GHSA-vvc3-h39c-mrq5...
         assert_eq!(grant, Some(scoped_scopes()));
-        assert_eq!(claims.scopes, Some(scoped_scopes()));
+        // ...but `Claims.scopes` is deliberately left `None`: setting it would
+        // demote a global admin's `is_admin` through `with_scope_gated_admin`
+        // (a separate 1.8.0 policy question), so this fix must not touch it.
+        assert_eq!(
+            claims.scopes, None,
+            "Claims.scopes must stay None to avoid the scope-gated-admin demotion"
+        );
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    /// An UNSCOPED API token (`AccessScope::Admin`) must map to
+    /// `Claims.allowed_repo_ids: None` = unrestricted, through the real mint
+    /// path — not to `Some(vec![])`. This pins the non-regression side of the
+    /// fix: if someone later "hardens" the `Admin -> Option` conversion to
+    /// `Some(vec![])` (plausible after reading the deny-by-default `Default` on
+    /// `AccessScope`), every unscoped token would be locked out of every
+    /// repository, and none of the restricted-token tests above would catch it.
+    #[tokio::test]
+    async fn unscoped_token_stays_unrestricted() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let (repo_a, _ka, _pa) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _kb, _pb) = tdh::create_repo(&pool, "local", "docker").await;
+        let storage = std::env::temp_dir().join(format!("oci-3316-unscoped-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        // No `api_token_repositories` rows and no `repo_selector` => unrestricted
+        // => `AccessScope::Admin`.
+        let (token, _id) = auth
+            .generate_api_token(user_id, "unscoped-3316", scoped_scopes(), None)
+            .await
+            .expect("mint unscoped API token");
+
+        let (claims, _grant) =
+            authenticate_oci_with_scopes(&state.db, &state.config, &bearer_headers(&token))
+                .await
+                .expect("authenticate unscoped token");
+
+        assert_eq!(
+            claims.allowed_repo_ids, None,
+            "an unscoped token must stay unrestricted (None), never Some(vec![])"
+        );
+        assert!(enforce_token_repo_scope(&claims, repo_a).is_ok());
+        assert!(enforce_token_repo_scope(&claims, repo_b).is_ok());
+        assert!(enforce_token_repo_scope(&claims, Uuid::new_v4()).is_ok());
 
         let _ = std::fs::remove_dir_all(&storage);
     }
