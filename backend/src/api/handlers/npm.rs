@@ -7716,7 +7716,10 @@ mod tests {
         fx.teardown().await;
 
         let scoped_resp = scoped_first.unwrap_or_else(|r| {
-            panic!("scoped packument fetch must succeed; got HTTP {}", r.status())
+            panic!(
+                "scoped packument fetch must succeed; got HTTP {}",
+                r.status()
+            )
         });
         assert_eq!(scoped_resp.status(), StatusCode::OK);
         let scoped_body = axum::body::to_bytes(scoped_resp.into_body(), 1024 * 1024)
@@ -7735,7 +7738,10 @@ mod tests {
         assert_eq!(second_resp.status(), StatusCode::OK);
 
         let plain_resp = plain.unwrap_or_else(|r| {
-            panic!("unscoped packument fetch must succeed; got HTTP {}", r.status())
+            panic!(
+                "unscoped packument fetch must succeed; got HTTP {}",
+                r.status()
+            )
         });
         assert_eq!(plain_resp.status(), StatusCode::OK);
 
