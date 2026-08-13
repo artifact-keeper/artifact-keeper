@@ -489,9 +489,17 @@ async fn fetch_chart_via_index(
 /// For Virtual repos the members are tried in priority order: hosted members
 /// (local storage) are checked before remote members so that promoted/cached
 /// artifacts are served without an upstream round-trip.
+///
+/// `auth` is the CALLER (#3324). The route middleware authorizes only the URL
+/// repository — for a public Virtual parent an anonymous caller passes — so
+/// the member walk must be narrowed to the members this caller may read
+/// directly, the same `authorize_virtual_members` filter the OCI virtual
+/// walkers and `resolve_virtual_download` apply. Without it a public virtual
+/// parent laundered a PRIVATE member's chart bytes to anonymous callers.
 async fn download_chart_via_index(
     state: &SharedState,
     repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
     name: &str,
     version: &str,
     filename: &str,
@@ -528,6 +536,13 @@ async fn download_chart_via_index(
 
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Narrow to the members the CALLER may read. The fallible form is
+        // used so a failed visibility query surfaces as a retryable server
+        // error rather than being flattened into the empty set, which the
+        // caller would answer with a definitive "Chart not found" (#3321).
+        // A denied member is simply skipped, indistinguishable from a miss.
+        let members =
+            proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 // Hosted / staging member: check local storage.
@@ -598,6 +613,7 @@ async fn download_chart_via_index(
 
 async fn download_chart(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, filename)): Path<(String, String)>,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
@@ -631,8 +647,15 @@ async fn download_chart(
                     .map(|(n, v)| (n.to_string(), v.to_string()));
 
                 if let Some((name, version)) = name_version {
-                    if let Some(resp) =
-                        download_chart_via_index(&state, &repo, &name, &version, &filename).await?
+                    if let Some(resp) = download_chart_via_index(
+                        &state,
+                        &repo,
+                        auth.as_ref(),
+                        &name,
+                        &version,
+                        &filename,
+                    )
+                    .await?
                     {
                         return Ok(resp);
                     }
@@ -1702,6 +1725,17 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
             f.user_id,
         )
         .await;
+
+        // The member walk is caller-authorized since #3324 and this fixture
+        // probes anonymously, so publish the member: the subject here is the
+        // scan policy, which must hold for exactly the members a caller may
+        // read (the anonymous-vs-private direction is pinned by
+        // `virtual_member_authz_tests`).
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("publish fixture member");
 
         // A virtual Helm repo whose only member is the fixture's hosted repo.
         let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&f.pool, "virtual", "helm").await;
@@ -2829,7 +2863,8 @@ entries:
             curation_default_action: "allow".to_string(),
         };
 
-        let result = download_chart_via_index(&state, &repo, "tc", "2.0.0", "tc-2.0.0.tgz").await;
+        let result =
+            download_chart_via_index(&state, &repo, None, "tc", "2.0.0", "tc-2.0.0.tgz").await;
 
         let _ = std::fs::remove_dir_all(&tmp);
 
@@ -2867,7 +2902,8 @@ entries:
             curation_default_action: "allow".to_string(),
         };
 
-        let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+        let result =
+            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz").await;
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(matches!(result, Ok(None)));
@@ -2897,7 +2933,8 @@ entries:
             curation_default_action: "allow".to_string(),
         };
 
-        let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+        let result =
+            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz").await;
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(matches!(result, Ok(None)));
@@ -2925,5 +2962,155 @@ mod db_cov_tests {
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
         fx.teardown().await;
+    }
+}
+
+/// #3324 regression: a public Virtual helm repository must not launder a
+/// PRIVATE member's chart bytes to an anonymous caller.
+///
+/// `GET /helm/{virtual}/charts/{filename}` reaches `download_chart_via_index`,
+/// which walked `fetch_virtual_members` unfiltered and resolved hosted members
+/// through `local_fetch_by_path_suffix(member.id)` — and `download_chart` binds
+/// no auth extractor at all, so the walk structurally could not filter. The
+/// member set is now narrowed through
+/// `proxy_helpers::try_authorize_virtual_members` (the same filter the OCI
+/// virtual walkers use), keyed on the CALLER.
+#[cfg(test)]
+mod virtual_member_authz_tests {
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Seed a hosted member's chart: an `artifacts` row plus the `.tgz` bytes
+    /// in the member's own storage root, where
+    /// `local_fetch_by_path_suffix(member.id, member.storage_location())`
+    /// resolves them.
+    async fn seed_member_chart(
+        pool: &sqlx::PgPool,
+        member_id: uuid::Uuid,
+        member_dir: &std::path::Path,
+        name: &str,
+        version: &str,
+        content: &[u8],
+        uploaded_by: uuid::Uuid,
+    ) -> String {
+        let filename = format!("{name}-{version}.tgz");
+        let storage_key = format!("charts/{filename}");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, 'application/gzip', $2, $7)",
+        )
+        .bind(member_id)
+        .bind(&storage_key)
+        .bind(name)
+        .bind(version)
+        .bind(content.len() as i64)
+        .bind(format!("seed-{name}"))
+        .bind(uploaded_by)
+        .execute(pool)
+        .await
+        .expect("seed member chart artifact row");
+        let dir = member_dir.join("charts");
+        std::fs::create_dir_all(&dir).expect("member charts dir");
+        std::fs::write(dir.join(&filename), content).expect("seed member chart bytes");
+        filename
+    }
+
+    #[tokio::test]
+    async fn virtual_chart_download_does_not_leak_a_private_members_bytes_to_anon() {
+        const PRIVATE_BYTES: &[u8] = b"helm PRIVATE member chart bytes";
+        const PUBLIC_BYTES: &[u8] = b"helm public member chart bytes";
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "helm").await else {
+            return;
+        };
+        let (private_id, _private_key, private_dir) =
+            tdh::create_repo(&fx.pool, "local", "helm").await;
+        let (public_id, _public_key, public_dir) =
+            tdh::create_repo(&fx.pool, "local", "helm").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(public_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish public member");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, private_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, public_id, 2).await;
+        let private_file = seed_member_chart(
+            &fx.pool,
+            private_id,
+            &private_dir,
+            "privchart",
+            "1.0.0",
+            PRIVATE_BYTES,
+            fx.user_id,
+        )
+        .await;
+        let public_file = seed_member_chart(
+            &fx.pool,
+            public_id,
+            &public_dir,
+            "pubchart",
+            "1.0.0",
+            PUBLIC_BYTES,
+            fx.user_id,
+        )
+        .await;
+        // The fixture user holds a grant on the PRIVATE member (positive
+        // control) — Fixture::setup already granted it the virtual parent.
+        tdh::grant_repo_access(&fx.pool, private_id, fx.user_id).await;
+
+        // `download_chart_via_index` early-returns None without a proxy
+        // service, so build a state that carries one: without it every branch
+        // 404s and the anonymous assertion below would be green on `main`.
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+
+        let uri_private = format!("/{}/charts/{}", fx.repo_key, private_file);
+        let uri_public = format!("/{}/charts/{}", fx.repo_key, public_file);
+
+        let (anon_private_status, anon_private_body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(uri_private.clone()),
+        )
+        .await;
+        let (anon_public_status, anon_public_body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(uri_public),
+        )
+        .await;
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (granted_status, granted_body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(uri_private),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
+        fx.teardown().await;
+
+        assert_ne!(
+            anon_private_status,
+            StatusCode::OK,
+            "an ANONYMOUS caller must not download a PRIVATE member's chart \
+             through a public Virtual parent; got body {:?}",
+            String::from_utf8_lossy(&anon_private_body)
+        );
+        assert_eq!(
+            (anon_public_status, anon_public_body),
+            (StatusCode::OK, Bytes::from_static(PUBLIC_BYTES)),
+            "a PUBLIC member's chart must still be served anonymously through \
+             the same virtual — the walk is filtered, not broken"
+        );
+        assert_eq!(
+            (granted_status, granted_body),
+            (StatusCode::OK, Bytes::from_static(PRIVATE_BYTES)),
+            "the private member's granted principal must still download its \
+             chart through the virtual"
+        );
     }
 }

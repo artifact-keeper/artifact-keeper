@@ -114,6 +114,32 @@ async fn effective_local_repo_ids(
     Ok((local_ids, members))
 }
 
+/// Caller-authorized form of [`effective_local_repo_ids`] for BYTE-serving
+/// paths (#3324). The route middleware authorizes only the URL repository —
+/// for a public Virtual parent an anonymous caller passes — so a member must
+/// additionally be one this caller may read directly, the same
+/// `authorize_virtual_members` filter the V3 virtual download applies through
+/// `resolve_virtual_download`. The fallible form is used so a failed
+/// visibility query surfaces as a retryable server error instead of being
+/// flattened into an empty id set, which the download would answer with a
+/// definitive "Package version not found" (#3321).
+async fn effective_local_repo_ids_for_caller(
+    db: &PgPool,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+) -> Result<Vec<uuid::Uuid>, Response> {
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok(vec![repo.id]);
+    }
+    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+    let members = proxy_helpers::try_authorize_virtual_members(db, auth, repo.id, members).await?;
+    Ok(members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect())
+}
+
 /// Detect a NuGet pre-release version. Per the SemVer rules NuGet follows, a
 /// pre-release version carries a `-` separated suffix after the version core
 /// (e.g. `2.0.0-beta.1`). Stable versions have no such suffix.
@@ -1812,6 +1838,7 @@ fn xml_escape(s: &str) -> String {
 /// GET /nuget/{repo_key}/v2/*odata — OData query, `$metadata`, or download.
 async fn v2_odata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, odata)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     base_url: RequestBaseUrl,
@@ -1835,7 +1862,7 @@ async fn v2_odata(
         let mut it = rest.splitn(2, '/');
         let id = it.next().unwrap_or_default().to_string();
         let version = it.next().unwrap_or_default().to_string();
-        return v2_download(&state, &repo, &repo_key, &id, &version, &ctx).await;
+        return v2_download(&state, auth.as_ref(), &repo, &repo_key, &id, &version, &ctx).await;
     }
 
     // Otherwise an OData query: FindPackagesById(), Packages(...), Search(), ...
@@ -1979,8 +2006,15 @@ async fn load_hosted_v2_entries(
 /// GET /nuget/{repo_key}/v2/package/{id}/{version} — download the .nupkg.
 /// Remote repos stream from their upstream V2 feed; hosted repos serve from
 /// storage.
+///
+/// `auth` is the CALLER (#3324): on a Virtual repo the member walk is
+/// narrowed to the members the caller may read, matching the V3
+/// `flatcontainer_download` sibling. Without it the legacy V2 / Chocolatey
+/// route streamed a PRIVATE member's `.nupkg` to an anonymous caller through
+/// a public virtual parent.
 async fn v2_download(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     repo_key: &str,
     id: &str,
@@ -2014,9 +2048,11 @@ async fn v2_download(
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
-    // Hosted / local: look the artifact up and stream from storage.
+    // Hosted / local: look the artifact up and stream from storage. The id
+    // set is caller-authorized: a virtual member this caller may not read is
+    // dropped, so its bytes read as "not found" here (#3324).
     let id_lower = id.to_lowercase();
-    let (repo_ids, _members) = effective_local_repo_ids(&state.db, repo).await?;
+    let repo_ids = effective_local_repo_ids_for_caller(&state.db, repo, auth).await?;
     let artifact = sqlx::query!(
         r#"
         SELECT id, storage_key, size_bytes
@@ -5072,6 +5108,7 @@ mod read_db_tests {
 
         let resp = super::v2_odata(
             axum::extract::State(state.clone()),
+            axum::extract::Extension(None),
             axum::extract::Path((fx.repo_key.clone(), "FindPackagesById()".to_string())),
             axum::extract::RawQuery(Some("id='git'".to_string())),
             crate::api::extractors::RequestBaseUrl("https://ak.example".to_string()),
@@ -5138,6 +5175,7 @@ mod read_db_tests {
 
         let resp = super::v2_odata(
             axum::extract::State(state.clone()),
+            axum::extract::Extension(None),
             axum::extract::Path((fx.repo_key.clone(), "package/git/2.0".to_string())),
             axum::extract::RawQuery(None),
             crate::api::extractors::RequestBaseUrl("https://ak.example".to_string()),
@@ -5352,6 +5390,141 @@ mod read_db_tests {
             flat_status,
             StatusCode::OK,
             "the advertised PackageBaseAddress version list ({flat_path}) must resolve, not 404"
+        );
+    }
+}
+
+/// #3324 regression: a public Virtual NuGet repository must not launder a
+/// PRIVATE member's `.nupkg` bytes to an anonymous caller over the legacy
+/// V2 / Chocolatey protocol.
+///
+/// `GET /nuget/{virtual}/v2/package/{id}/{version}` reaches `v2_download`,
+/// which resolved the artifact against `effective_local_repo_ids` — every
+/// non-remote member, unfiltered — and `v2_odata` bound no auth extractor, so
+/// the walk structurally could not filter. The V3 sibling
+/// (`flatcontainer_download`) already filters through the caller-authorized
+/// `resolve_virtual_download`; V2 now uses the same
+/// `proxy_helpers::try_authorize_virtual_members` predicate via
+/// `effective_local_repo_ids_for_caller`.
+#[cfg(test)]
+mod virtual_member_authz_tests {
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Seed a member's package row. `v2_download` streams the bytes through
+    /// the URL repo's storage location (the virtual parent's root), so the
+    /// blob is written under `parent_dir` at the member row's `storage_key`.
+    async fn seed_member_nupkg(
+        pool: &sqlx::PgPool,
+        member_id: uuid::Uuid,
+        parent_dir: &std::path::Path,
+        name: &str,
+        version: &str,
+        content: &[u8],
+        uploaded_by: uuid::Uuid,
+    ) {
+        let storage_key = format!("{name}/{version}/{name}.{version}.nupkg");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream', $2, $7)",
+        )
+        .bind(member_id)
+        .bind(&storage_key)
+        .bind(name)
+        .bind(version)
+        .bind(content.len() as i64)
+        .bind(format!("seed-{name}"))
+        .bind(uploaded_by)
+        .execute(pool)
+        .await
+        .expect("seed member nupkg artifact row");
+        let path = parent_dir.join(&storage_key);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("member nupkg dir");
+        std::fs::write(path, content).expect("seed member nupkg bytes");
+    }
+
+    #[tokio::test]
+    async fn v2_package_download_does_not_leak_a_private_members_nupkg_to_anon() {
+        const PRIVATE_BYTES: &[u8] = b"nuget PRIVATE member nupkg bytes";
+        const PUBLIC_BYTES: &[u8] = b"nuget public member nupkg bytes";
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let (private_id, _private_key, private_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        let (public_id, _public_key, public_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(public_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish public member");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, private_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, public_id, 2).await;
+        seed_member_nupkg(
+            &fx.pool,
+            private_id,
+            &fx.storage_dir,
+            "privpkg",
+            "1.0.0",
+            PRIVATE_BYTES,
+            fx.user_id,
+        )
+        .await;
+        seed_member_nupkg(
+            &fx.pool,
+            public_id,
+            &fx.storage_dir,
+            "pubpkg",
+            "1.0.0",
+            PUBLIC_BYTES,
+            fx.user_id,
+        )
+        .await;
+        // The fixture user holds a grant on the PRIVATE member (positive
+        // control) — Fixture::setup already granted it the virtual parent.
+        tdh::grant_repo_access(&fx.pool, private_id, fx.user_id).await;
+
+        let uri_private = format!("/{}/v2/package/privpkg/1.0.0", fx.repo_key);
+        let uri_public = format!("/{}/v2/package/pubpkg/1.0.0", fx.repo_key);
+
+        let (anon_private_status, anon_private_body) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(uri_private.clone()),
+        )
+        .await;
+        let (anon_public_status, anon_public_body) =
+            tdh::send(fx.router_anon(super::router()), tdh::get(uri_public)).await;
+        let (granted_status, granted_body) =
+            tdh::send(fx.router_with_auth(super::router()), tdh::get(uri_private)).await;
+
+        tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
+        fx.teardown().await;
+
+        assert_ne!(
+            anon_private_status,
+            StatusCode::OK,
+            "an ANONYMOUS caller must not download a PRIVATE member's .nupkg \
+             through a public Virtual parent over the V2 route; got body {:?}",
+            String::from_utf8_lossy(&anon_private_body)
+        );
+        assert_eq!(
+            (anon_public_status, anon_public_body),
+            (StatusCode::OK, Bytes::from_static(PUBLIC_BYTES)),
+            "a PUBLIC member's .nupkg must still be served anonymously through \
+             the same virtual — the walk is filtered, not broken"
+        );
+        assert_eq!(
+            (granted_status, granted_body),
+            (StatusCode::OK, Bytes::from_static(PRIVATE_BYTES)),
+            "the private member's granted principal must still download its \
+             .nupkg through the virtual"
         );
     }
 }

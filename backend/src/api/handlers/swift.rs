@@ -345,7 +345,7 @@ async fn version_path_handler(
     if version_path.ends_with("/Package.swift") || version_path.contains("/Package.swift") {
         // Fetch manifest: /:scope/:name/:version/Package.swift
         let version = version_path.trim_end_matches("/Package.swift");
-        return fetch_manifest(state, &repo_key, &scope, &name, version).await;
+        return fetch_manifest(state, auth.as_ref(), &repo_key, &scope, &name, version).await;
     }
 
     // Release metadata: /:scope/:name/:version
@@ -686,14 +686,27 @@ async fn query_manifest(
 /// and returns the first that owns the release (issue #1554); for any other
 /// repo type it returns the repo itself. The returned tuple carries the
 /// owning repo's id, its storage location, and the cached manifest (if any).
+///
+/// `auth` is the CALLER (#3324). The route middleware authorizes only the URL
+/// repository — for a public Virtual parent an anonymous caller passes — so
+/// the member walk is narrowed to the members this caller may read directly,
+/// exactly as the already-authorized `download_archive` sibling does through
+/// `resolve_virtual_download`. Without it a public virtual parent served a
+/// PRIVATE member's manifest source to anonymous callers. The fallible filter
+/// form is used so a failed visibility query surfaces as a retryable server
+/// error rather than collapsing into the definitive "Release not found"
+/// below (#3321); a denied member is skipped, indistinguishable from a miss.
 async fn resolve_manifest_owner(
     db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     repo: &RepoInfo,
     package_id: &str,
     version: &str,
 ) -> Result<(uuid::Uuid, crate::storage::StorageLocation, Option<String>), Response> {
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+        let members =
+            proxy_helpers::try_authorize_virtual_members(db, auth, repo.id, members).await?;
         for member in &members {
             if member.repo_type != RepositoryType::Local
                 && member.repo_type != RepositoryType::Staging
@@ -718,6 +731,7 @@ async fn resolve_manifest_owner(
 
 async fn fetch_manifest(
     state: SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     repo_key: &str,
     scope: &str,
     name: &str,
@@ -727,9 +741,10 @@ async fn fetch_manifest(
     let package_id = format!("{}.{}", scope, name);
 
     // Resolve the owning repo (handles virtual fan-out), preferring the cached
-    // manifest from artifact_metadata.
+    // manifest from artifact_metadata. The member walk is caller-authorized
+    // (#3324).
     let (owner_id, owner_location, cached_manifest) =
-        resolve_manifest_owner(&state.db, &repo, &package_id, version).await?;
+        resolve_manifest_owner(&state.db, auth, &repo, &package_id, version).await?;
 
     // When the cache is missing (legacy uploads predating issue #1100, or
     // publishes that bypassed the header path), parse the source archive on
@@ -1609,5 +1624,146 @@ mod db_cov_tests {
         drop(mock_server);
         tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
+    }
+}
+
+/// #3324 regression: a public Virtual Swift repository must not launder a
+/// PRIVATE member's `Package.swift` manifest source to an anonymous caller.
+///
+/// `GET /swift/{virtual}/{scope}/{name}/{version}/Package.swift` reaches
+/// `fetch_manifest` → `resolve_manifest_owner`, which walked
+/// `fetch_virtual_members` unfiltered — `version_path_handler` even binds
+/// `Extension(auth)` and never threaded it through. The already-authorized
+/// `download_archive` sibling filters through the caller-authorized
+/// `resolve_virtual_download`; the manifest walk now applies the same
+/// `proxy_helpers::try_authorize_virtual_members` predicate.
+#[cfg(test)]
+mod virtual_member_authz_tests {
+    use axum::http::StatusCode;
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Seed a member's Swift release with a CACHED manifest in
+    /// `artifact_metadata`, the path `resolve_manifest_owner` prefers — no
+    /// storage bytes are needed to serve it.
+    async fn seed_member_release(
+        pool: &sqlx::PgPool,
+        member_id: uuid::Uuid,
+        package_id: &str,
+        version: &str,
+        manifest: &str,
+        uploaded_by: uuid::Uuid,
+    ) {
+        let artifact_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 id, repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, 1, $6, 'application/zip', $3, $7)",
+        )
+        .bind(artifact_id)
+        .bind(member_id)
+        .bind(format!("{package_id}/{version}.zip"))
+        .bind(package_id)
+        .bind(version)
+        .bind(format!("seed-{package_id}"))
+        .bind(uploaded_by)
+        .execute(pool)
+        .await
+        .expect("seed member release artifact row");
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'swift', $2)",
+        )
+        .bind(artifact_id)
+        .bind(serde_json::json!({ "manifest": manifest }))
+        .execute(pool)
+        .await
+        .expect("seed member cached manifest");
+    }
+
+    #[tokio::test]
+    async fn virtual_manifest_does_not_leak_a_private_members_source_to_anon() {
+        const PRIVATE_MANIFEST: &str = "// swift-tools-version:5.9 PRIVATE manifest source";
+        const PUBLIC_MANIFEST: &str = "// swift-tools-version:5.9 public manifest source";
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "swift").await else {
+            return;
+        };
+        let (private_id, _private_key, private_dir) =
+            tdh::create_repo(&fx.pool, "local", "swift").await;
+        let (public_id, _public_key, public_dir) =
+            tdh::create_repo(&fx.pool, "local", "swift").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(public_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish public member");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, private_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, public_id, 2).await;
+        seed_member_release(
+            &fx.pool,
+            private_id,
+            "privscope.privpkg",
+            "1.0.0",
+            PRIVATE_MANIFEST,
+            fx.user_id,
+        )
+        .await;
+        seed_member_release(
+            &fx.pool,
+            public_id,
+            "pubscope.pubpkg",
+            "1.0.0",
+            PUBLIC_MANIFEST,
+            fx.user_id,
+        )
+        .await;
+        // The fixture user holds a grant on the PRIVATE member (positive
+        // control) — Fixture::setup already granted it the virtual parent.
+        tdh::grant_repo_access(&fx.pool, private_id, fx.user_id).await;
+
+        let uri_private = format!("/{}/privscope/privpkg/1.0.0/Package.swift", fx.repo_key);
+        let uri_public = format!("/{}/pubscope/pubpkg/1.0.0/Package.swift", fx.repo_key);
+
+        let (anon_private_status, anon_private_body) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(uri_private.clone()),
+        )
+        .await;
+        let (anon_public_status, anon_public_body) =
+            tdh::send(fx.router_anon(super::router()), tdh::get(uri_public)).await;
+        let (granted_status, granted_body) =
+            tdh::send(fx.router_with_auth(super::router()), tdh::get(uri_private)).await;
+
+        tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
+        fx.teardown().await;
+
+        assert_ne!(
+            anon_private_status,
+            StatusCode::OK,
+            "an ANONYMOUS caller must not read a PRIVATE member's manifest \
+             source through a public Virtual parent; got body {:?}",
+            String::from_utf8_lossy(&anon_private_body)
+        );
+        assert_eq!(
+            (
+                anon_public_status,
+                String::from_utf8_lossy(&anon_public_body).to_string()
+            ),
+            (StatusCode::OK, PUBLIC_MANIFEST.to_string()),
+            "a PUBLIC member's manifest must still be served anonymously \
+             through the same virtual — the walk is filtered, not broken"
+        );
+        assert_eq!(
+            (
+                granted_status,
+                String::from_utf8_lossy(&granted_body).to_string()
+            ),
+            (StatusCode::OK, PRIVATE_MANIFEST.to_string()),
+            "the private member's granted principal must still read its \
+             manifest through the virtual"
+        );
     }
 }

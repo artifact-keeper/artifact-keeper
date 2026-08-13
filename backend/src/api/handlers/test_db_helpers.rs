@@ -1092,6 +1092,40 @@ pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
         .await;
 }
 
+/// Link `member_id` into virtual repository `virtual_id`'s member set at
+/// `priority`. Shared by the virtual-member authorization tests (#3324) so
+/// each format module does not hand-roll the same INSERT.
+pub async fn link_virtual_member(pool: &PgPool, virtual_id: Uuid, member_id: Uuid, priority: i32) {
+    sqlx::query(
+        "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(virtual_id)
+    .bind(member_id)
+    .bind(priority)
+    .execute(pool)
+    .await
+    .expect("link virtual member");
+}
+
+/// Drop a member repository created by [`create_repo`] for a virtual-repo
+/// test, along with everything the test seeded under it (membership rows,
+/// grants, artifacts + their metadata) and its storage directory. Shared by
+/// the virtual-member authorization tests (#3324).
+pub async fn cleanup_member_repo(pool: &PgPool, member_id: Uuid, dir: &std::path::Path) {
+    for sql in [
+        "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+        "DELETE FROM role_assignments WHERE repository_id = $1",
+        "DELETE FROM artifact_metadata WHERE artifact_id IN \
+         (SELECT id FROM artifacts WHERE repository_id = $1)",
+        "DELETE FROM artifacts WHERE repository_id = $1",
+        "DELETE FROM repositories WHERE id = $1",
+    ] {
+        let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Count `audit_log` rows for a given resource id + action string.
 ///
 /// Shared by the auth-event audit trail tests (#386 / #1617 Phase 1) across
