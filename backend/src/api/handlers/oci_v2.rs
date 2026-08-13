@@ -9225,10 +9225,20 @@ async fn handle_tags_list(
         return build_tags_response(&repo.image, vec![]);
     }
 
-    let (page, has_more) = match resolve_tags_page(state, &repo, n, last.as_deref()).await {
-        Ok(page) => page,
-        Err(e) => return e,
-    };
+    // The CALLER, for the virtual-member walk. For a Virtual repo the read
+    // gate above authorizes the PARENT only (and for an anonymous caller on a
+    // public parent it never runs at all), so the member set must be narrowed
+    // to what this caller may read directly — the same
+    // `authorize_virtual_members` filter `resolve_virtual_manifest` /
+    // `resolve_virtual_blob` apply (#3268 review F2). Without it, a public
+    // virtual parent laundered its private members' tag names to anonymous
+    // callers.
+    let auth = virtual_caller_auth(claims.as_ref());
+    let (page, has_more) =
+        match resolve_tags_page(state, &repo, auth.as_ref(), n, last.as_deref()).await {
+            Ok(page) => page,
+            Err(e) => return e,
+        };
 
     // OCI spec: return 404 NAME_UNKNOWN when the repository name is not
     // known to the registry. For local repos, if the first page is empty
@@ -9254,6 +9264,7 @@ async fn handle_tags_list(
 async fn resolve_tags_page(
     state: &SharedState,
     repo: &OciRepoInfo,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     n: usize,
     last: Option<&str>,
 ) -> Result<(Vec<String>, bool), Response> {
@@ -9262,7 +9273,7 @@ async fn resolve_tags_page(
     }
 
     if repo.repo_type == RepositoryType::Virtual {
-        return resolve_virtual_tags_page(state, repo, n, last).await;
+        return resolve_virtual_tags_page(state, repo, auth, n, last).await;
     }
 
     resolve_local_tags_page(state, repo, n, last).await
@@ -9305,10 +9316,11 @@ async fn resolve_remote_tags_page(
 async fn resolve_virtual_tags_page(
     state: &SharedState,
     repo: &OciRepoInfo,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     n: usize,
     last: Option<&str>,
 ) -> Result<(Vec<String>, bool), Response> {
-    let tags = tags_list_virtual(state, repo, n, last).await?;
+    let tags = tags_list_virtual(state, repo, auth, n, last).await?;
     Ok(apply_cursor_pagination(tags, last, n))
 }
 
@@ -9735,17 +9747,28 @@ async fn tags_list_remote(
     Ok(split_remote_tags_page(tags, n, upstream_has_more))
 }
 
-/// Aggregate tags from all virtual repo members.
+/// Aggregate tags from the virtual repo members the CALLER may read.
+///
+/// `auth` is the CALLER. Members are narrowed through
+/// [`proxy_helpers::authorize_virtual_members`] — the same filter
+/// `resolve_virtual_manifest` and `resolve_virtual_blob` apply (#3268 review
+/// F2) — so a member's tags are listable through the virtual exactly when a
+/// direct tags/list of that member would succeed. A denied member contributes
+/// nothing, which reads as "no tags there" and leaks neither tag names nor
+/// member existence. Tag pages are computed per request and never enter the
+/// shared negative cache, so there is no principal-independence concern here.
 ///
 /// Forward the merged cursor to every member because any tag at or before the
 /// merged cursor cannot appear on the next merged page.
 async fn tags_list_virtual(
     state: &SharedState,
     repo: &OciRepoInfo,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     n_limit: usize,
     last: Option<&str>,
 ) -> Result<Vec<String>, Response> {
     let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+    let members = proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
     let member_limit = n_limit.saturating_add(1);
     let member_cursor = last;
     let image = repo.image.clone();
@@ -30464,6 +30487,157 @@ mod oci_read_authz_tests {
         assert!(
             String::from_utf8_lossy(&granted_private_body).contains(MANIFEST_MARKER),
             "the granted principal's 200 must carry the private manifest bytes"
+        );
+    }
+
+    /// The #3268 review F2 class on the THIRD virtual walker. `tags_list_virtual`
+    /// merged every member's tags with no authorization filter, and
+    /// `handle_tags_list`'s read gate is wrapped in `if let Some(claims)` — for
+    /// an anonymous caller on a PUBLIC repo it never runs at all. Combined:
+    /// `GET /v2/{public-virtual}/{image}/tags/list` with no credential
+    /// enumerated a PRIVATE member's tag names, while a direct anonymous
+    /// tags/list of that member was correctly challenged.
+    ///
+    /// Positive controls in the same fixture: the PUBLIC member's tags still
+    /// appear anonymously through the virtual (the walk is filtered, not
+    /// broken), and the private member's granted principal still sees both
+    /// members' tags (the filter is not simply denying everyone).
+    #[tokio::test]
+    async fn public_virtual_does_not_leak_a_private_members_tags() {
+        const PUBLIC_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0penc0ffee","size":2},"layers":[]}"#;
+        const PUBLIC_LAYER_BODY: &[u8] = b"ak public member layer bytes (tags)";
+        /// Deliberately NOT a substring of the private fixture tag (`v1`) or
+        /// vice versa; membership is asserted on the PARSED tag array anyway.
+        const PUBLIC_TAG: &str = "zpublic";
+
+        fn tag_names(body: &Bytes) -> Vec<String> {
+            let json: serde_json::Value = serde_json::from_slice(body).expect("tags/list json");
+            json["tags"]
+                .as_array()
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+
+        // A PUBLIC hosted member with its own tag on the same image, and a
+        // PUBLIC virtual parent aggregating it with the PRIVATE fixture repo.
+        let (public_id, _public_key, public_dir) =
+            tdh::create_repo(&f.pool, "local", "docker").await;
+        let (virt_id, virt_key, virt_dir) = tdh::create_repo(&f.pool, "virtual", "docker").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![public_id, virt_id])
+            .execute(&f.pool)
+            .await
+            .expect("publish member + virtual");
+        let public_storage = f
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: public_dir.to_string_lossy().into_owned(),
+            })
+            .expect("public member storage");
+        seed_image(
+            &f.pool,
+            &public_storage,
+            public_id,
+            PUBLIC_TAG,
+            PUBLIC_MANIFEST_BODY,
+            PUBLIC_LAYER_BODY,
+        )
+        .await;
+        for (member, priority) in [(f.repo_id, 1i32), (public_id, 2i32)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&f.pool)
+            .await
+            .expect("link virtual member");
+        }
+
+        let tags_via_virtual = format!("/{}/{}/tags/list", virt_key, IMAGE);
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let member_bearer = f.bearer(f.member_id).await;
+
+        let (anon_status, anon_body) = f.call("GET", tags_via_virtual.clone(), &anon).await;
+        let (outsider_status, outsider_body) = f
+            .call("GET", tags_via_virtual.clone(), &outsider_bearer)
+            .await;
+        // Positive control: the private member's granted principal.
+        let (granted_status, granted_body) = f.call("GET", tags_via_virtual, &member_bearer).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&f.pool)
+            .await;
+        for table in ["oci_tags", "oci_blobs"] {
+            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
+                .bind(public_id)
+                .execute(&f.pool)
+                .await;
+        }
+        for repo in [public_id, virt_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&f.pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&public_dir);
+        let _ = std::fs::remove_dir_all(&virt_dir);
+        f.teardown().await;
+
+        let anon_tags = tag_names(&anon_body);
+        assert!(
+            !anon_tags.iter().any(|t| t == TAG),
+            "an ANONYMOUS caller must not enumerate a private member's tags \
+             through a public Virtual parent; got tags {anon_tags:?}"
+        );
+        assert_eq!(
+            anon_status,
+            StatusCode::OK,
+            "anonymous tags/list on the public virtual must still succeed"
+        );
+        assert!(
+            anon_tags.iter().any(|t| t == PUBLIC_TAG),
+            "the PUBLIC member's tags must still appear anonymously through \
+             the same virtual — the walk is filtered, not broken; got {anon_tags:?}"
+        );
+
+        let outsider_tags = tag_names(&outsider_body);
+        assert!(
+            !outsider_tags.iter().any(|t| t == TAG),
+            "an authenticated caller with no grant on the private member must \
+             not see its tags either; got {outsider_tags:?}"
+        );
+        assert_eq!(
+            outsider_status,
+            StatusCode::OK,
+            "the ungranted caller still lists the public member's tags"
+        );
+        assert!(
+            outsider_tags.iter().any(|t| t == PUBLIC_TAG),
+            "and they must still see the public member's tags; got {outsider_tags:?}"
+        );
+
+        let granted_tags = tag_names(&granted_body);
+        assert_eq!(granted_status, StatusCode::OK, "granted member lists 200");
+        assert!(
+            granted_tags.iter().any(|t| t == TAG) && granted_tags.iter().any(|t| t == PUBLIC_TAG),
+            "the private member's granted principal must still see BOTH \
+             members' tags through the virtual — a member is listable exactly \
+             when a direct read of it would succeed; got {granted_tags:?}"
         );
     }
 }
