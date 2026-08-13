@@ -30715,6 +30715,155 @@ mod oci_read_authz_tests {
              caller's visible members, it does not deny everyone; got {granted_tags:?}"
         );
     }
+
+    /// #3325, driven end-to-end through the real `tags/list` route: a grant
+    /// that does not carry `read` must not enumerate a private member's tags
+    /// through a virtual parent.
+    ///
+    /// This test exists to pin the PLACEMENT of the read-action gate, not only
+    /// its behaviour. `authorize_virtual_members` is a thin wrapper over
+    /// `try_authorize_virtual_members`, and `tags_list_virtual` calls the
+    /// FALLIBLE form directly (#3320). A gate added to the wrapper instead of
+    /// the shared body would compile, would keep every test written against
+    /// the walking (manifest/blob) callers green, and would silently exempt
+    /// this path — reintroducing the leak on exactly the route the member
+    /// filter above was added to protect. That is a defect that survives
+    /// compilation, review and CI, so it is asserted mechanically here rather
+    /// than left to inspection: this test fails if the gate sits in the
+    /// wrapper and passes only if it sits in the body.
+    ///
+    /// Controls in both directions, so a fix that merely denied more would
+    /// fail rather than pass: the `{read}` principal still enumerates the
+    /// private member's tag, and both principals still see the PUBLIC member's
+    /// tag through the same virtual.
+    #[tokio::test]
+    async fn write_only_grant_does_not_enumerate_a_private_members_tags() {
+        const PUBLIC_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0penc0ffee","size":2},"layers":[]}"#;
+        const PUBLIC_LAYER_BODY: &[u8] = b"ak public member layer bytes (3325)";
+        const PUBLIC_TAG: &str = "zpublic";
+
+        fn tag_names(body: &Bytes) -> Vec<String> {
+            let json: serde_json::Value = serde_json::from_slice(body).expect("tags/list json");
+            json["tags"]
+                .as_array()
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+
+        // A PUBLIC hosted member plus a PUBLIC virtual parent aggregating it
+        // with the PRIVATE fixture repo — the shape that makes the leak
+        // reachable at all.
+        let (public_id, _public_key, public_dir) =
+            tdh::create_repo(&f.pool, "local", "docker").await;
+        let (virt_id, virt_key, virt_dir) = tdh::create_repo(&f.pool, "virtual", "docker").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![public_id, virt_id])
+            .execute(&f.pool)
+            .await
+            .expect("publish member + virtual");
+        let public_storage = f
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: public_dir.to_string_lossy().into_owned(),
+            })
+            .expect("public member storage");
+        seed_image(
+            &f.pool,
+            &public_storage,
+            public_id,
+            PUBLIC_TAG,
+            PUBLIC_MANIFEST_BODY,
+            PUBLIC_LAYER_BODY,
+        )
+        .await;
+        for (member, priority) in [(f.repo_id, 1i32), (public_id, 2i32)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&f.pool)
+            .await
+            .expect("link virtual member");
+        }
+
+        // Two principals differing ONLY in the action their rule carries.
+        let write_only = f.add_user(false).await;
+        let read_only = f.add_user(false).await;
+        tdh::grant_repo_actions(&f.pool, f.repo_id, write_only, &["write"]).await;
+        tdh::grant_repo_actions(&f.pool, f.repo_id, read_only, &["read"]).await;
+        let write_only_bearer = f.bearer(write_only).await;
+        let read_only_bearer = f.bearer(read_only).await;
+
+        let tags_via_virtual = format!("/{}/{}/tags/list", virt_key, IMAGE);
+        let (write_status, write_body) = f
+            .call("GET", tags_via_virtual.clone(), &write_only_bearer)
+            .await;
+        let (read_status, read_body) = f.call("GET", tags_via_virtual, &read_only_bearer).await;
+
+        // -- Cleanup before asserting, so a failure does not leak fixture rows.
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&f.pool)
+            .await;
+        for table in ["oci_tags", "oci_blobs"] {
+            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
+                .bind(public_id)
+                .execute(&f.pool)
+                .await;
+        }
+        for repo in [public_id, virt_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&f.pool)
+                .await;
+        }
+        for d in [public_dir, virt_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+
+        // -- THE PLACEMENT ASSERTION.
+        let write_tags = tag_names(&write_body);
+        assert_eq!(
+            write_status,
+            StatusCode::OK,
+            "the write-only caller still reaches the public virtual"
+        );
+        assert!(
+            !write_tags.iter().any(|t| t == TAG),
+            "a {{write}}-only grant must NOT enumerate the PRIVATE member's tags \
+             through a virtual: a direct read of that member is refused by \
+             check_repository_action, and tags/list goes through \
+             try_authorize_virtual_members, so this failing means the read-action \
+             gate is in the authorize_virtual_members WRAPPER rather than in the \
+             shared body; got {write_tags:?}"
+        );
+        assert!(
+            write_tags.iter().any(|t| t == PUBLIC_TAG),
+            "the PUBLIC member's tags must still be listed for the same caller — \
+             the walk is filtered, not broken; got {write_tags:?}"
+        );
+
+        // -- CONTROL: read is what distinguishes them, nothing else.
+        let read_tags = tag_names(&read_body);
+        assert_eq!(read_status, StatusCode::OK, "read-granted caller lists 200");
+        assert!(
+            read_tags.iter().any(|t| t == TAG) && read_tags.iter().any(|t| t == PUBLIC_TAG),
+            "a {{read}} grant on the same member, through the same virtual, must \
+             still enumerate BOTH members' tags; got {read_tags:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

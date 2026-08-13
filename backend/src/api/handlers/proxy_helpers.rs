@@ -3100,13 +3100,54 @@ pub async fn fetch_virtual_members(
 /// a public Virtual parent, an ANONYMOUS caller — able to read a private
 /// member's bytes.
 ///
-/// Note the entitlement half is now identical to a direct read of the member
-/// ([`build_grant_predicate`] honours BOTH the `role_assignments` store and the
-/// fine-grained `permissions` store, including group grants), so a member is
-/// readable through the virtual exactly when its own `GET` would succeed.
+/// The grant half above is a TENANT gate, not an action decision. It honours
+/// BOTH grant stores ([`build_grant_predicate`] reads `role_assignments` and
+/// the fine-grained `permissions` table, including the group and project arms),
+/// but it asks only whether the principal holds SOME grant: the `permissions`
+/// arm tests `actions <> '{}'`, and the `role_assignments` arm does not join
+/// `roles` at all. So a principal whose only entitlement on a private member is
+/// `{write}` — or a role assignment to a role carrying no `read` — passed it.
+///
+/// That is the same shape `require_repo_write_access` has, and the same remedy
+/// applies: layer the canonical ACTION choke-point on top of the tenant gate,
+/// exactly as the REST upload and delete handlers do for `write`/`delete`
+/// (`repositories.rs`, "Action gate (#2603 G1): the tenant gate above admits
+/// any grantee"). Reads now ask
+/// [`PermissionService::check_repository_action`] with the `read` action — the
+/// SAME function, with the same arguments, that the direct `/v2` read gate
+/// (`oci_v2::require_oci_repo_read_access`) and the native-format
+/// `repo_visibility_middleware` call. A member is therefore readable through a
+/// virtual exactly when a direct read of that member would succeed, by
+/// construction rather than by assertion: the two cannot drift because they are
+/// one function.
+///
+/// The gate lives in [`try_authorize_virtual_members`], NOT in this wrapper, so
+/// the aggregating callers that use the fallible form directly — OCI
+/// `tags_list_virtual` (#3320) — inherit it too. Putting it here instead would
+/// compile, keep every existing test green, and silently exempt tags/list.
+/// `try_authorize_virtual_members_applies_the_read_action_gate` asserts the
+/// placement mechanically rather than leaving it to review.
+///
+/// A hand-rolled `'read' = ANY(actions)` term in the shared SQL fragment was
+/// deliberately NOT the fix. It would be a fourth predicate — it cannot express
+/// "an applicable rule is authoritative for the principals it names, everyone
+/// else keeps their role capabilities, and a role carrying `admin` always
+/// wins", and it would leave the action-blind `role_assignments` arm untouched.
+/// It would also narrow repository LISTING, which shares the fragment and for
+/// which "any grant means you may see this repository exists" is the intended
+/// contract. The fragment is unchanged; only this content-resolution path gains
+/// the action term.
+///
+/// A **public** member short-circuits before the action check, preserving the
+/// anonymous read baseline a public repository already confers — the same
+/// `public_read_satisfies_acl` ordering the direct `/v2` gate uses, so an
+/// authenticated caller never ends up below an anonymous one.
 ///
 /// Fails CLOSED: a database error yields the empty set rather than the
-/// unfiltered one.
+/// unfiltered one, and a per-member action lookup that errors drops that
+/// member.
+///
+/// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
 ///
 /// Callers should treat a denied member as if it did not contain the artifact
 /// (continue to the next member / return not-found) so member existence is not
@@ -3168,12 +3209,79 @@ pub async fn try_authorize_virtual_members(
                 return Err(map_db_err(e));
             }
         };
-    Ok(members
+    let tenant_admitted: Vec<Repository> = members
         .into_iter()
         .filter(|m| {
             granted.contains(&m.id)
                 && member_passes_token_scope(auth, virtual_repo_id, m.id, m.is_public)
         })
+        .collect();
+
+    // Action gate (#3325). The filter above admits any grantee, including a
+    // write-only one; without this a `{write}` grant on a private member bought
+    // that member's bytes through a virtual parent while a direct read of the
+    // same member correctly refused.
+    //
+    // This belongs HERE and not in the `authorize_virtual_members` wrapper:
+    // `tags_list_virtual` calls this function directly, so a gate in the
+    // wrapper would leave the aggregating path ungated while still compiling
+    // and still passing every test written against the walking path.
+    let Some(principal) = auth else {
+        // Anonymous: the grant half already reduced to `is_public`, so every
+        // surviving member is public and the read baseline applies.
+        return Ok(tenant_admitted);
+    };
+    if principal.is_admin {
+        // A global admin satisfies the action for every repository; skip the
+        // per-member round trips rather than asking a question with one answer.
+        return Ok(tenant_admitted);
+    }
+
+    // The checks are independent single-row reads, so they are issued together
+    // rather than in sequence: this sits on the Docker pull path, where the
+    // walk already fans out over members (`tags_list_virtual` uses the same
+    // `join_all` shape), and a serial loop would add one round trip per member
+    // to every manifest and blob request. `join_all` preserves input order, and
+    // members are resolved in priority order, so the ordering contract holds.
+    // Only members that cleared the tenant gate are checked, and public members
+    // are not checked at all, so the fan-out is bounded by the members this
+    // principal already holds a grant on.
+    let permission_service =
+        crate::services::permission_service::PermissionService::new(db.clone());
+    let decisions = futures::future::join_all(tenant_admitted.iter().map(|member| {
+        let permission_service = &permission_service;
+        async move {
+            // A public member keeps the anonymous read baseline (#2329): rules
+            // must not leave an authenticated caller below a logged-out one.
+            if member.is_public {
+                return true;
+            }
+            match permission_service
+                .check_repository_action(principal.user_id, member.id, "read", false)
+                .await
+            {
+                Ok(allowed) => allowed,
+                // Fail closed for this member: a flaky lookup must not widen
+                // the member set. Dropping one member (rather than all) keeps a
+                // transient error from emptying a walk the caller is entitled
+                // to.
+                Err(e) => {
+                    tracing::warn!(
+                        virtual_repo_id = %virtual_repo_id,
+                        member_repo_id = %member.id,
+                        error = %e,
+                        "virtual member read-action check failed; denying this member"
+                    );
+                    false
+                }
+            }
+        }
+    }))
+    .await;
+    Ok(tenant_admitted
+        .into_iter()
+        .zip(decisions)
+        .filter_map(|(member, ok)| ok.then_some(member))
         .collect())
 }
 
@@ -13177,6 +13285,292 @@ mod tests {
             flattened.is_empty(),
             "the flattening form must keep failing CLOSED to the empty set"
         );
+    }
+
+    /// A grant that does not carry `read` must not buy a private member's bytes
+    /// through a virtual parent.
+    ///
+    /// The member filter's grant half is a TENANT gate: its `permissions` arm
+    /// tests only `actions <> '{}'` and its `role_assignments` arm never joins
+    /// `roles`. So a `{write}` grant — or a role assignment to a role carrying
+    /// no `read` — admitted the member, while a DIRECT read of that same member
+    /// (`check_repository_action(.., "read", ..)`, which the `/v2` gate and the
+    /// native-format middleware both call) correctly refused. Aggregation
+    /// through a virtual must not be a way around the action a direct read
+    /// requires.
+    ///
+    /// Every assertion below is paired with its opposite, so a fix that simply
+    /// denied more would fail this test rather than pass it:
+    ///   * `{write}`-only  => DENIED   (the bug)
+    ///   * `{read}`        => ALLOWED  (must not over-restrict)
+    ///   * `{write,read}`  => ALLOWED  (read alongside other actions still counts)
+    ///   * `{admin}`       => ALLOWED  (admin implies the action)
+    ///   * public member   => ALLOWED even with a write-only rule (#2329 baseline)
+    ///   * global admin    => ALLOWED  (bypass preserved)
+    #[tokio::test]
+    async fn test_virtual_member_read_requires_read_action() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let virtual_id = Uuid::new_v4();
+
+        // One repository per grant shape: `permissions` has a UNIQUE constraint
+        // on (principal_type, principal_id, target_type, target_id), so the same
+        // user cannot hold two rules on one repository.
+        let (write_only_id, _k1, d1) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (read_id, _k2, d2) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (write_read_id, _k3, d3) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (admin_rule_id, _k4, d4) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (public_write_id, _k5, d5) = db_helpers::create_repo(&pool, "local", "maven").await;
+        // `create_repo` leaves `is_public` at its DEFAULT false, so the four
+        // above are private without an UPDATE. This one is the public control.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(public_write_id)
+            .execute(&pool)
+            .await
+            .expect("publish member");
+
+        let (user_id, _u) = tdh::create_user(&pool).await;
+
+        tdh::grant_repo_actions(&pool, write_only_id, user_id, &["write"]).await;
+        tdh::grant_repo_actions(&pool, read_id, user_id, &["read"]).await;
+        tdh::grant_repo_actions(&pool, write_read_id, user_id, &["write", "read"]).await;
+        tdh::grant_repo_actions(&pool, admin_rule_id, user_id, &["admin"]).await;
+        tdh::grant_repo_actions(&pool, public_write_id, user_id, &["write"]).await;
+
+        let load = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                crate::services::repository_service::RepositoryService::new(pool)
+                    .get_by_id(id)
+                    .await
+                    .expect("load member row")
+            }
+        };
+        let write_only = load(write_only_id).await;
+        let read_ok = load(read_id).await;
+        let write_read = load(write_read_id).await;
+        let admin_rule = load(admin_rule_id).await;
+        let public_write = load(public_write_id).await;
+
+        let auth = nonadmin_auth(user_id);
+
+        // -- THE REGRESSION. Write-only grant on a PRIVATE member: denied.
+        assert!(
+            !caller_can_read_member(&pool, Some(&auth), virtual_id, &write_only).await,
+            "a {{write}}-only grant must NOT confer read of a private member through a \
+             virtual: the direct read gate (check_repository_action with \"read\") \
+             refuses this exact principal, and aggregation must not be a way around it"
+        );
+
+        // -- CONTROLS in the allow direction. A fix that denied everything fails here.
+        assert!(
+            caller_can_read_member(&pool, Some(&auth), virtual_id, &read_ok).await,
+            "a {{read}} grant must still confer read through a virtual"
+        );
+        assert!(
+            caller_can_read_member(&pool, Some(&auth), virtual_id, &write_read).await,
+            "read alongside write must still confer read"
+        );
+        assert!(
+            caller_can_read_member(&pool, Some(&auth), virtual_id, &admin_rule).await,
+            "an {{admin}} rule implies the read action"
+        );
+        assert!(
+            caller_can_read_member(&pool, Some(&auth), virtual_id, &public_write).await,
+            "a PUBLIC member keeps the anonymous read baseline (#2329); a write-only \
+             rule must not drop an authenticated caller below a logged-out one"
+        );
+
+        // -- The set form used by every format handler agrees with the single form.
+        let members = vec![
+            write_only.clone(),
+            read_ok.clone(),
+            write_read.clone(),
+            admin_rule.clone(),
+            public_write.clone(),
+        ];
+        let allowed = authorize_virtual_members(&pool, Some(&auth), virtual_id, members.clone())
+            .await
+            .iter()
+            .map(|m| m.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            allowed,
+            std::collections::HashSet::from([
+                read_id,
+                write_read_id,
+                admin_rule_id,
+                public_write_id
+            ]),
+            "the set form must drop exactly the write-only PRIVATE member and keep the rest"
+        );
+
+        // -- The global-admin bypass is preserved.
+        let admin = crate::api::middleware::auth::AuthExtension {
+            is_admin: true,
+            ..nonadmin_auth(Uuid::new_v4())
+        };
+        let allowed_admin = authorize_virtual_members(&pool, Some(&admin), virtual_id, members)
+            .await
+            .len();
+        assert_eq!(
+            allowed_admin, 5,
+            "a global admin must still see every member, including the write-only one"
+        );
+
+        // -- Cleanup (tdh::cleanup also clears permissions/role_assignments).
+        for id in [
+            write_only_id,
+            read_id,
+            write_read_id,
+            admin_rule_id,
+            public_write_id,
+        ] {
+            tdh::cleanup(&pool, id, user_id).await;
+        }
+        for d in [d1, d2, d3, d4, d5] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// The `role_assignments` arm is action-blind too: it never joins `roles`,
+    /// so ANY assignment admitted the member. A role that carries no `read`
+    /// must not confer read through a virtual, while the stock `developer`
+    /// role (which does carry `read`) must keep working.
+    #[tokio::test]
+    async fn test_virtual_member_read_requires_read_action_via_role_assignment() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let virtual_id = Uuid::new_v4();
+
+        let (writer_role_id, _k1, d1) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (dev_role_id, _k2, d2) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (user_id, _u) = tdh::create_user(&pool).await;
+
+        // A bespoke role carrying `write` but NOT `read`.
+        let role_name = format!("ph-test-writer-{}", Uuid::new_v4());
+        let role_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO roles (name, description, permissions) \
+             VALUES ($1, 'write-only test role', ARRAY['write']::TEXT[]) RETURNING id",
+        )
+        .bind(&role_name)
+        .fetch_one(&pool)
+        .await
+        .expect("create write-only role");
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(role_id)
+        .bind(writer_role_id)
+        .execute(&pool)
+        .await
+        .expect("assign write-only role");
+
+        // Control: the stock `developer` role, which carries `read`.
+        tdh::grant_repo_access(&pool, dev_role_id, user_id).await;
+
+        let load = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                crate::services::repository_service::RepositoryService::new(pool)
+                    .get_by_id(id)
+                    .await
+                    .expect("load member row")
+            }
+        };
+        let writer_member = load(writer_role_id).await;
+        let dev_member = load(dev_role_id).await;
+        let auth = nonadmin_auth(user_id);
+
+        assert!(
+            !caller_can_read_member(&pool, Some(&auth), virtual_id, &writer_member).await,
+            "a role assignment whose role carries no `read` must NOT confer read of a \
+             private member through a virtual"
+        );
+        assert!(
+            caller_can_read_member(&pool, Some(&auth), virtual_id, &dev_member).await,
+            "the stock `developer` role carries `read` and must keep working"
+        );
+
+        // -- Cleanup.
+        for id in [writer_role_id, dev_role_id] {
+            tdh::cleanup(&pool, id, user_id).await;
+        }
+        let _ = sqlx::query("DELETE FROM roles WHERE id = $1")
+            .bind(role_id)
+            .execute(&pool)
+            .await;
+        for d in [d1, d2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Placement guard: the read-action gate must live in
+    /// [`try_authorize_virtual_members`], the SHARED body, not in the
+    /// [`authorize_virtual_members`] wrapper.
+    ///
+    /// `authorize_virtual_members` is `try_authorize_virtual_members(..).
+    /// unwrap_or_default()`, and the aggregating callers (OCI `tags_list_virtual`,
+    /// #3320) call the fallible form DIRECTLY. A gate placed in the wrapper
+    /// would compile and would keep every test written against the walking
+    /// callers green while leaving tags/list ungated. Asserting against the
+    /// fallible form makes that placement mechanical: this test can only pass
+    /// if the gate is in the body.
+    ///
+    /// `oci_v2::tests::write_only_grant_does_not_enumerate_a_private_members_tags`
+    /// asserts the same property end-to-end through the real route.
+    #[tokio::test]
+    async fn try_authorize_virtual_members_applies_the_read_action_gate() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let virtual_id = Uuid::new_v4();
+        let (write_only_id, _k1, d1) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (read_id, _k2, d2) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, write_only_id, user_id, &["write"]).await;
+        tdh::grant_repo_actions(&pool, read_id, user_id, &["read"]).await;
+
+        let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
+        let write_only = svc.get_by_id(write_only_id).await.expect("load write-only");
+        let read_ok = svc.get_by_id(read_id).await.expect("load read");
+        let auth = nonadmin_auth(user_id);
+
+        let allowed: std::collections::HashSet<Uuid> = try_authorize_virtual_members(
+            &pool,
+            Some(&auth),
+            virtual_id,
+            vec![write_only, read_ok],
+        )
+        .await
+        .expect("visibility query must succeed")
+        .iter()
+        .map(|m| m.id)
+        .collect();
+
+        assert!(
+            !allowed.contains(&write_only_id),
+            "the FALLIBLE form must apply the read-action gate too; if this passes \
+             the member through, the gate is in the authorize_virtual_members \
+             wrapper and OCI tags/list is ungated"
+        );
+        assert!(
+            allowed.contains(&read_id),
+            "the read-granted member must survive the fallible form (no over-restriction)"
+        );
+
+        for id in [write_only_id, read_id] {
+            tdh::cleanup(&pool, id, user_id).await;
+        }
+        for d in [d1, d2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]
