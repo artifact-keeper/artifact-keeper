@@ -557,6 +557,20 @@ jobs:
       - name: Check Trivy gate severity filter
         run: ./scripts/ci/check-trivy-gate-severity.sh
 
+      # Same species as the check above, one layer out (#3308). That one asks
+      # "does the publish gate apply the filter it declares?"; this one asks
+      # "does the PRE-TAG gate block on what it just measured?" It did not:
+      # release-preflight.sh printed "a tag cut will likely stall" and
+      # "READY: ... Safe to cut the tag." in the same run, because the
+      # measured-red branch called `warn` (non-incrementing) instead of `bad`.
+      #
+      # It needs a test rather than a live run because the interesting case is
+      # invisible whenever main is green: with a green Docker Publish the buggy
+      # and fixed scripts are byte-identical in behaviour. Stubs `gh`, so no
+      # network and no dependence on main's current health. ~1s.
+      - name: Check release-preflight blocks on a measured red
+        run: bash scripts/ci/test-release-preflight.sh
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
