@@ -22,10 +22,12 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    # or, from the Actions UI: run the "Release Preflight" workflow
    ```
 
-   It asserts main is actually releasable — `.trivyignore` covers every
-   active `release/*` branch's suppressions (the drift that stalled
-   v1.7.0-rc.1 at Security Scan, #3039), the version set is consistent,
-   main's last Docker Publish cleanly published its manifest, and no
+   It asserts main is actually releasable — `.trivyignore` accounts for
+   every active `release/*` branch's suppressions, live or via a
+   `# RETIRED:` tombstone (the drift that stalled v1.7.0-rc.1 at Security
+   Scan, #3039; the tombstone mechanism is #3309), the version set is
+   consistent, Docker Publish for the exact commit being tagged (not
+   merely the latest run, #3338) cleanly published its manifest, and no
    component pinned by a checked-in `VERSION` file would try to republish an
    exact tag that already exists with different content (the collision that
    killed the v1.7.2 tag). A `NOT READY` (exit 1) means fix main first;
