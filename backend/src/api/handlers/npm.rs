@@ -5949,7 +5949,9 @@ mod tests {
                 uploaded_by: fx.user_id,
             },
         )
-        .await;
+        .await
+        .map_err(|r| r.status())
+        .expect("seed fork artifact");
 
         // Priority-2 remote member: the upstream release.
         let upstream = MockServer::start().await;
