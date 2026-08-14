@@ -34,7 +34,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::maven::{generate_metadata_xml, MavenCoordinates, MavenHandler};
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 
 // TODO: Remaining format handlers (beyond maven, npm, pypi, cargo) still use
 // plain-text error responses and should be migrated to AppError (#553).
@@ -870,6 +870,75 @@ fn content_type_for_path(path: &str) -> &'static str {
     } else {
         "application/octet-stream"
     }
+}
+
+// ---------------------------------------------------------------------------
+// .sha1 sidecar verification for proxied package assets (GHSA-qxv7-p3mq-88fv)
+// ---------------------------------------------------------------------------
+
+/// Parse a Maven `.sha1` sidecar body into the digest the proxy-cache commit
+/// gate compares against. Sidecars are either the bare hex digest or the
+/// two-field `<hex>  <filename>` (`md5sum`-style) form; only the first
+/// whitespace-separated token is considered, and only when it is bare
+/// lowercase SHA-1 hex — a value in any other shape is not treated as
+/// authoritative, the same provenance rule
+/// `proxy_helpers::normalize_expected_sha256` applies.
+fn parse_maven_sha1_sidecar(
+    body: &[u8],
+) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+    use crate::services::proxy_service::CacheCommitDigest;
+
+    let text = std::str::from_utf8(body).ok()?;
+    let token = text.split_whitespace().next()?;
+    if token.len() == 40
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Some(CacheCommitDigest::Sha1Hex(token.to_string()));
+    }
+    None
+}
+
+/// Resolve the upstream `.sha1` sidecar for a proxied Maven package asset so
+/// the streamed download can gate its proxy-cache commit on it —
+/// serve-but-don't-cache on a mismatch, mirroring Cargo's #2929 `cksum` gate
+/// (GHSA-qxv7-p3mq-88fv). Maven clients fetch `.sha1` files as independent
+/// downloads and verify them locally; before this, nothing cross-checked the
+/// sidecar server-side, so a `.jar`/`.pom` whose bytes disagreed with its
+/// sidecar was committed to the cache and served warm from then on.
+///
+/// Only RELEASE-versioned package assets are gated. Checksum/signature
+/// sidecars and `maven-metadata.xml` are excluded by the catalog's own skip
+/// rules (`maven_proxy_package_name`), and `-SNAPSHOT` assets are mutable —
+/// a racing re-deploy would pin a stale sidecar and refuse to cache a
+/// legitimate body. The sidecar fetch rides the proxy cache (a Maven/Gradle
+/// client requests the sidecar anyway, so it is usually warm or
+/// negative-cached), and any failure — absent, unparseable, upstream error —
+/// returns `None`: the download proceeds unverified, exactly as before.
+async fn resolve_maven_sha1_sidecar(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+    crate::services::proxy_service::maven_proxy_package_name(path)?;
+    let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
+    if coords.version.ends_with("-SNAPSHOT") {
+        return None;
+    }
+    let (content, _ct, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &format!("{}.sha1", path),
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    .ok()?;
+    parse_maven_sha1_sidecar(&content)
 }
 
 // ---------------------------------------------------------------------------
@@ -1796,6 +1865,42 @@ async fn serve_artifact(
                     // #895: stream large bodies; pass content_type_for_path
                     // so .pom -> text/xml, .jar -> application/java-archive
                     // when upstream omits Content-Type (closes review N2).
+                    //
+                    // GHSA-qxv7-p3mq-88fv: when the upstream's `.sha1`
+                    // sidecar for this package asset resolves, gate the
+                    // proxy-cache commit on it — a body whose SHA-1 disagrees
+                    // with the sidecar is streamed to the client (which
+                    // verifies it) but never cached. No sidecar -> the
+                    // unverified fetch, exactly as before.
+                    if let Some(expected) =
+                        resolve_maven_sha1_sidecar(proxy, repo.id, repo_key, upstream_url, path)
+                            .await
+                    {
+                        let gated_repo = proxy_helpers::build_remote_repo_with_format(
+                            repo.id,
+                            repo_key,
+                            upstream_url,
+                            RepositoryFormat::Maven,
+                        );
+                        let result = proxy
+                            .fetch_artifact_streaming_with_cache_path_gated_digest(
+                                &gated_repo,
+                                path,
+                                path,
+                                Some(expected),
+                            )
+                            .await
+                            .map_err(IntoResponse::into_response)?;
+                        return proxy_helpers::build_streaming_response_with_disposition(
+                            result,
+                            content_type_for_path(path),
+                            None,
+                        )
+                        .map_err(|e| {
+                            AppError::Internal(format!("failed to build response: {}", e))
+                                .into_response()
+                        });
+                    }
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -2809,6 +2914,70 @@ mod tests {
     fn test_parse_metadata_path_version_level_snapshot() {
         let result = parse_metadata_path("com/test/artifacthub/0.0.1-SNAPSHOT/maven-metadata.xml");
         assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // .sha1 sidecar parsing (GHSA-qxv7-p3mq-88fv)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_maven_sha1_sidecar_bare_and_two_field() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        let sha = "a".repeat(40);
+        // Bare digest (Central's shape).
+        assert_eq!(
+            parse_maven_sha1_sidecar(sha.as_bytes()),
+            Some(CacheCommitDigest::Sha1Hex(sha.clone()))
+        );
+        // Two-field `md5sum`-style: `<hex>  <filename>` — only the digest
+        // token is authoritative.
+        let two_field = format!("{sha}  my-lib-1.0.0.jar\n");
+        assert_eq!(
+            parse_maven_sha1_sidecar(two_field.as_bytes()),
+            Some(CacheCommitDigest::Sha1Hex(sha))
+        );
+    }
+
+    #[test]
+    fn test_parse_maven_sha1_sidecar_rejects_non_canonical() {
+        // Uppercase hex is not the canonical form the gate compares.
+        assert_eq!(parse_maven_sha1_sidecar("A".repeat(40).as_bytes()), None);
+        // Wrong length (SHA-256 pasted into a .sha1, truncation).
+        assert_eq!(parse_maven_sha1_sidecar("a".repeat(64).as_bytes()), None);
+        assert_eq!(parse_maven_sha1_sidecar(b"abc123"), None);
+        // Empty / non-UTF-8 bodies have no enforceable digest.
+        assert_eq!(parse_maven_sha1_sidecar(b""), None);
+        assert_eq!(parse_maven_sha1_sidecar(&[0xff, 0xfe, 0x00]), None);
+    }
+
+    #[test]
+    fn test_parse_maven_sha1_sidecar_snapshot_and_sidecar_paths_are_not_gated() {
+        // The path-level eligibility rules behind resolve_maven_sha1_sidecar:
+        // checksum sidecars and maven-metadata are skipped by the catalog's
+        // own package-name rule, and -SNAPSHOT versions are mutable, so
+        // gating them could pin a stale sidecar against a re-deployed body.
+        assert!(
+            crate::services::proxy_service::maven_proxy_package_name(
+                "com/example/my-lib/1.0.0/my-lib-1.0.0.jar.sha1"
+            )
+            .is_none(),
+            "a .sha1 request itself must never be sidecar-gated"
+        );
+        assert!(
+            crate::services::proxy_service::maven_proxy_package_name(
+                "com/example/my-lib/maven-metadata.xml"
+            )
+            .is_none(),
+            "maven-metadata.xml must never be sidecar-gated"
+        );
+        assert!(
+            crate::services::proxy_service::maven_proxy_package_name(
+                "com/example/my-lib/1.0.0/my-lib-1.0.0.jar"
+            )
+            .is_some(),
+            "a release jar IS eligible for sidecar gating"
+        );
     }
 
     #[test]

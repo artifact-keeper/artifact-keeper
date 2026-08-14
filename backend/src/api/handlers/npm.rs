@@ -900,6 +900,159 @@ fn build_tarball_upstream_path(package_name: &str, filename: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Tarball integrity gating (GHSA-qxv7-p3mq-88fv)
+// ---------------------------------------------------------------------------
+
+/// Parse an npm `dist.integrity` SRI string into the strongest supported
+/// [`CacheCommitDigest`]. SRI permits several space-separated
+/// `algo-base64` tokens; SHA-512 wins over SHA-256 over SHA-1. SHA-384 has
+/// no tee-hasher support and is skipped (a weaker sibling token is used when
+/// present). Base64 payloads are decoded to the lowercase hex the gate
+/// compares; malformed tokens are ignored — an unusable integrity field
+/// degrades to the pre-existing unverified fetch, never to an error.
+fn parse_npm_sri(integrity: &str) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+    use crate::services::proxy_service::CacheCommitDigest;
+    use base64::Engine as _;
+
+    let mut best: Option<(u8, CacheCommitDigest)> = None;
+    for token in integrity.split_whitespace() {
+        let Some((algo, payload)) = token.split_once('-') else {
+            continue;
+        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .ok();
+        let candidate = match (algo, decoded) {
+            ("sha512", Some(bytes)) if bytes.len() == 64 => {
+                Some((3u8, CacheCommitDigest::Sha512Hex(hex::encode(bytes))))
+            }
+            ("sha256", Some(bytes)) if bytes.len() == 32 => {
+                Some((2u8, CacheCommitDigest::Sha256Hex(hex::encode(bytes))))
+            }
+            ("sha1", Some(bytes)) if bytes.len() == 20 => {
+                Some((1u8, CacheCommitDigest::Sha1Hex(hex::encode(bytes))))
+            }
+            _ => None,
+        };
+        if let Some((rank, digest)) = candidate {
+            // MSRV 1.75: `Option::is_none_or` is 1.82 — keep `map_or`.
+            if best.as_ref().map_or(true, |(r, _)| rank > *r) {
+                best = Some((rank, digest));
+            }
+        }
+    }
+    best.map(|(_, digest)| digest)
+}
+
+/// Validate a legacy npm `dist.shasum` as bare lowercase SHA-1 hex — the
+/// canonical form the commit gate compares. Same rationale as
+/// `proxy_helpers::normalize_expected_sha256`: a value not already in the
+/// comparison's canonical form did not come from this codebase's hashing
+/// path, so it is not treated as authoritative.
+fn normalize_npm_shasum(raw: &str) -> Option<String> {
+    let candidate = raw.trim();
+    if candidate.len() == 40
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Some(candidate.to_string());
+    }
+    None
+}
+
+/// Match a packument's `versions.*.dist` entries to a tarball request by the
+/// tarball URL's FILENAME — never by parsing a version out of the requested
+/// filename (hyphenated names and prerelease tags make that ambiguous; the
+/// curation gate refuses to for the same reason, #2930). `dist.integrity`
+/// (SRI) is preferred over the legacy `dist.shasum` (SHA-1 hex).
+fn npm_integrity_for_filename(
+    packument: &serde_json::Value,
+    filename: &str,
+) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+    use crate::services::proxy_service::CacheCommitDigest;
+
+    let versions = packument.get("versions")?.as_object()?;
+    for version in versions.values() {
+        let Some(dist) = version.get("dist") else {
+            continue;
+        };
+        let tarball = dist.get("tarball").and_then(|t| t.as_str()).unwrap_or("");
+        let tarball_name = tarball
+            .split(['#', '?'])
+            .next()
+            .unwrap_or(tarball)
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        if tarball_name.is_empty() || tarball_name != filename {
+            continue;
+        }
+        if let Some(digest) = dist
+            .get("integrity")
+            .and_then(|i| i.as_str())
+            .and_then(parse_npm_sri)
+        {
+            return Some(digest);
+        }
+        if let Some(digest) = dist
+            .get("shasum")
+            .and_then(|s| s.as_str())
+            .and_then(normalize_npm_shasum)
+        {
+            return Some(CacheCommitDigest::Sha1Hex(digest));
+        }
+    }
+    None
+}
+
+/// Resolve the registry-published integrity for the tarball `filename` of
+/// `package_name` from the packument, so the streamed tarball fetch can gate
+/// its proxy-cache commit on it — serve-but-don't-cache on a mismatch, the
+/// same posture as Cargo's #2929 `cksum` gate (GHSA-qxv7-p3mq-88fv). Before
+/// this, the tarball fetch hardcoded `expected_checksum: None`, so the
+/// `dist.integrity` the server itself served in the packument was decorative:
+/// a tarball whose bytes disagreed with it was committed to the cache and
+/// served warm from then on.
+///
+/// The packument is re-read through the same cache-keyed metadata helper the
+/// metadata handler uses, so an npm client — which always fetches the
+/// packument immediately before the tarball — finds it warm. The cached copy
+/// is the RAW upstream document (tarball-URL rewriting happens after the
+/// cache read), so the digests are the upstream's own values. Best-effort by
+/// construction: any failure (fetch/parse error, version entry missing, no
+/// usable digest) returns `None` and the download proceeds unverified,
+/// exactly as before.
+async fn resolve_npm_tarball_integrity(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    package_name: &str,
+    filename: &str,
+) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+    // Fetch/cache split (#3297): `%2F`-encoded name upstream, decoded
+    // `@scope/name` as the local cache key — identical to the metadata
+    // handler, so this rides the same cache entry.
+    let encoded_name = encode_package_name_for_upstream(package_name);
+    let (content, _ct, _budget_permit) =
+        proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            &encoded_name,
+            package_name,
+            None,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
+        .ok()?;
+    let packument: serde_json::Value = serde_json::from_slice(&content).ok()?;
+    npm_integrity_for_filename(&packument, filename)
+}
+
+// ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
 
@@ -3142,16 +3295,40 @@ async fn serve_tarball(
             // even though other download paths already stream. Stream it (teed
             // into the proxy cache under `fetch_path`) so a large tarball
             // succeeds with 200 and subsequent pulls are served warm.
-            let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+            //
+            // GHSA-qxv7-p3mq-88fv: gate the proxy-cache commit on the
+            // packument's `dist.integrity` (SRI) / `dist.shasum` for this
+            // exact tarball filename. Resolved AFTER the age gate so a
+            // last-known-good substitution is gated on its OWN integrity.
+            // npm's digests are SHA-512/SHA-1, which the storage layer never
+            // observes, so the fetch goes through the digest-flexible gated
+            // variant rather than the SHA-256-only proxy_helpers wrapper; a
+            // mismatch is served to the client (npm verifies the SRI itself)
+            // but never cached.
+            let expected_integrity = resolve_npm_tarball_integrity(
                 proxy,
                 repo.id,
                 repo_key,
                 upstream_url,
-                &fetch_path,
-                &fetch_path,
-                RepositoryFormat::Npm,
+                package_name,
+                &response_filename,
             )
-            .await?;
+            .await;
+            let gated_repo = proxy_helpers::build_remote_repo_with_format(
+                repo.id,
+                repo_key,
+                upstream_url,
+                RepositoryFormat::Npm,
+            );
+            let result = proxy
+                .fetch_artifact_streaming_with_cache_path_gated_digest(
+                    &gated_repo,
+                    &fetch_path,
+                    &fetch_path,
+                    expected_integrity,
+                )
+                .await
+                .map_err(IntoResponse::into_response)?;
 
             // The upstream registry may return application/octet-stream for
             // npm tarballs, which also gets persisted by the proxy cache.
@@ -5454,6 +5631,111 @@ mod tests {
         let ok = parse_npm_policy_list(repo_id, NPM_ALLOWED_SCOPES_KEY, "[\"@Types\"]")
             .expect("well-formed JSON must parse");
         assert_eq!(ok, vec!["@types"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-qxv7-p3mq-88fv: tarball integrity gating (unit level)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_npm_sri_prefers_sha512_and_decodes_to_hex() {
+        use crate::services::proxy_service::CacheCommitDigest;
+        use base64::Engine as _;
+
+        let sha512_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"tarball"));
+        let sha1_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sha1::Sha1::digest(b"tarball"));
+        // Weakest-first ordering must not matter: sha512 wins.
+        let sri = format!("sha1-{sha1_b64} sha512-{sha512_b64}");
+        let digest = parse_npm_sri(&sri).expect("a sha512 token must parse");
+        assert_eq!(
+            digest,
+            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"tarball")))
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_sri_skips_malformed_and_unsupported_tokens() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        // Garbage and unsupported sha384 alone -> None (unverified fetch).
+        assert_eq!(parse_npm_sri("not-an-sri-token"), None);
+        assert_eq!(
+            parse_npm_sri(
+                "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB="
+            ),
+            None
+        );
+        // A sha256 SRI decodes to the hex the storage-observed gate compares.
+        let sha256_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            sha2::Sha256::digest(b"tarball"),
+        );
+        assert_eq!(
+            parse_npm_sri(&format!("sha256-{sha256_b64}")),
+            Some(CacheCommitDigest::Sha256Hex(hex::encode(
+                sha2::Sha256::digest(b"tarball")
+            )))
+        );
+    }
+
+    #[test]
+    fn test_npm_integrity_for_filename_matches_by_tarball_basename() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        let shasum = hex::encode(sha1::Sha1::digest(b"tarball-bytes"));
+        let packument = serde_json::json!({
+            "name": "my-pkg",
+            "versions": {
+                // Hyphenated name: a version parse of the filename would
+                // mis-split "my-pkg-1.0.0.tgz"; basename matching must not.
+                "1.0.0": {"dist": {"tarball": "https://reg.example/my-pkg/-/my-pkg-1.0.0.tgz",
+                                   "shasum": &shasum}},
+                "2.0.0": {"dist": {"tarball": "https://reg.example/my-pkg/-/my-pkg-2.0.0.tgz",
+                                   "shasum": "0000000000000000000000000000000000000000"}},
+            }
+        });
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "my-pkg-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum.clone()))
+        );
+        // A filename no version serves resolves to no gate.
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "my-pkg-9.9.9.tgz"),
+            None
+        );
+        // Scoped tarball URL shapes match by basename too.
+        let scoped = serde_json::json!({
+            "versions": {"1.0.0": {"dist": {
+                "tarball": "https://reg.example/@scope/pkg/-/pkg-1.0.0.tgz",
+                "shasum": &shasum}}}}
+        );
+        assert_eq!(
+            npm_integrity_for_filename(&scoped, "pkg-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum))
+        );
+    }
+
+    #[test]
+    fn test_npm_integrity_for_filename_prefers_sri_over_shasum() {
+        use crate::services::proxy_service::CacheCommitDigest;
+        use base64::Engine as _;
+
+        let sha512_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"real"));
+        let packument = serde_json::json!({
+            "versions": {"1.0.0": {"dist": {
+                "tarball": "https://reg.example/p/-/p-1.0.0.tgz",
+                "integrity": format!("sha512-{sha512_b64}"),
+                "shasum": "0000000000000000000000000000000000000000"}}}}
+        );
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha512Hex(hex::encode(
+                sha2::Sha512::digest(b"real")
+            )))
+        );
     }
 
     /// DB-backed (#2327 secondary): a virtual repo with two Remote members —
@@ -7862,6 +8144,123 @@ mod tests {
         }
 
         // `.expect(1)` on the mock is verified on server drop.
+        drop(mock_server);
+        cleanup().await;
+    }
+
+    /// GHSA-qxv7-p3mq-88fv: a remote npm tarball whose bytes disagree with
+    /// the packument's `dist.integrity` must be SERVED (the client verifies
+    /// the SRI itself) but NEVER CACHED — a second pull refetches upstream
+    /// instead of serving the poisoned bytes warm. The matching-integrity
+    /// companion pull must cache normally. DB-backed; skips when no
+    /// `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn test_remote_tarball_integrity_mismatch_served_but_not_cached() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let tarball_bytes = b"pkged-up-tarball-bytes".to_vec();
+        // The packument pins an integrity that does NOT match the served
+        // bytes (here: the SRI of a different body entirely).
+        let mismatched_sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"other bytes"))
+        );
+        Mock::given(method("GET"))
+            .and(path("/intpkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "intpkg",
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": {"dist": {
+                    "tarball": format!("{}/intpkg/-/intpkg-1.0.0.tgz", mock_server.uri()),
+                    "integrity": mismatched_sri,
+                }}},
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/intpkg/-/intpkg-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(tarball_bytes.clone()),
+            )
+            // The integrity gate must refuse every cache commit, so BOTH
+            // pulls reach upstream.
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        for i in 0..2 {
+            let result = super::download_tarball(
+                axum::extract::State(state.clone()),
+                axum::Extension(tdh::admin_auth_ext()),
+                axum::extract::Path((
+                    fx.repo_key.clone(),
+                    "intpkg".to_string(),
+                    "intpkg-1.0.0.tgz".to_string(),
+                )),
+                Default::default(),
+            )
+            .await;
+
+            let response = match result {
+                Ok(r) => r,
+                Err(r) => {
+                    let status = r.status();
+                    cleanup().await;
+                    panic!(
+                        "pull {i}: mismatched-integrity tarball must still be served, got {status}"
+                    );
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read streamed body");
+            assert_eq!(
+                body_bytes.as_ref(),
+                tarball_bytes.as_slice(),
+                "pull {i}: the client receives the upstream bytes (it verifies the SRI itself)"
+            );
+            // Let the background tee writer settle (and, pre-fix, wrongly
+            // commit the mismatched bytes) before the next pull probes the
+            // cache. NOT `wait_for_cache_commit`: the whole point is that no
+            // commit may happen, and that helper panics in exactly that case.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+
+        // `.expect(2)` on the tarball mock is verified on server drop: had
+        // either pull committed the mismatched bytes, the second pull would
+        // have been served from cache and upstream would have seen ONE hit.
         drop(mock_server);
         cleanup().await;
     }

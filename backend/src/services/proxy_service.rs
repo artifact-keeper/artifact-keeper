@@ -213,6 +213,72 @@ impl StreamingFetchResult {
     }
 }
 
+/// A content digest a streaming proxy-cache commit can be gated on.
+///
+/// #2274 introduced the gate for bare SHA-256 hex, which the storage layer
+/// observes for free. GHSA-qxv7-p3mq-88fv extends it to the digest
+/// algorithms ecosystems actually publish for their immutable artifacts:
+/// npm records tarball integrity as an SRI `sha512-<base64>`
+/// (`dist.integrity`) or legacy SHA-1 hex (`dist.shasum`) in the packument,
+/// and Maven publishes SHA-1 `.sha1` sidecars. The storage layer never
+/// computes those, so for the non-SHA-256 variants the tee hashes the bytes
+/// it hands to the cache writer itself and the writer compares before
+/// committing. All variants carry the expected digest as lowercase hex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheCommitDigest {
+    /// Bare lowercase SHA-256 hex, compared against the storage layer's
+    /// observed checksum — the original #2274 gate (OCI blob digests,
+    /// Cargo sparse-index `cksum` #2929, PyPI `#sha256=` fragments).
+    Sha256Hex(String),
+    /// Lowercase SHA-512 hex (npm `dist.integrity` SRI, decoded from its
+    /// base64 payload by the caller).
+    Sha512Hex(String),
+    /// Lowercase SHA-1 hex (npm `dist.shasum`, Maven `.sha1` sidecars).
+    Sha1Hex(String),
+}
+
+impl CacheCommitDigest {
+    /// The expected digest as lowercase hex, regardless of algorithm.
+    fn as_hex(&self) -> &str {
+        match self {
+            Self::Sha256Hex(h) | Self::Sha512Hex(h) | Self::Sha1Hex(h) => h,
+        }
+    }
+}
+
+/// Running hasher for the non-SHA-256 commit gates (GHSA-qxv7-p3mq-88fv):
+/// the tee feeds it every byte it hands to the cache writer and finalizes
+/// it at upstream EOF. SHA-256 expectations never get one — the storage
+/// layer's observed checksum covers those.
+enum TeeDigestHasher {
+    Sha1(sha1::Sha1),
+    Sha512(sha2::Sha512),
+}
+
+impl TeeDigestHasher {
+    fn for_expected(expected: &CacheCommitDigest) -> Option<Self> {
+        match expected {
+            CacheCommitDigest::Sha1Hex(_) => Some(Self::Sha1(sha1::Sha1::default())),
+            CacheCommitDigest::Sha512Hex(_) => Some(Self::Sha512(sha2::Sha512::default())),
+            CacheCommitDigest::Sha256Hex(_) => None,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha1(h) => sha1::Digest::update(h, bytes),
+            Self::Sha512(h) => sha2::Digest::update(h, bytes),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        match self {
+            Self::Sha1(h) => hex::encode(sha1::Digest::finalize(h)),
+            Self::Sha512(h) => hex::encode(sha2::Digest::finalize(h)),
+        }
+    }
+}
+
 /// Metadata fields known up-front when teeing an upstream stream into
 /// the proxy cache. The size + sha-256 fields of [`CacheMetadata`] are
 /// observed during the stream itself and filled in by the writer task
@@ -230,16 +296,16 @@ struct CacheMetadataTemplate {
     /// which does not currently surface the header into the tee template.
     last_modified: Option<String>,
     ttl_secs: i64,
-    /// Optional content-addressable checksum the cache commit is gated on
-    /// (#2274). Bare lowercase SHA-256 hex (no `sha256:` prefix). When
-    /// `Some`, [`CachePersister::tee_stream`] persists the cached object
-    /// ONLY if the streamed body's SHA-256 equals this value; a mismatch is
-    /// treated like a rejected write (object deleted, no metadata sidecar)
-    /// so a digest-addressed fetch that returns wrong bytes cannot poison
-    /// the proxy cache. `None` preserves the pre-existing behaviour for every
-    /// other streaming caller (deb/pypi/plain-Remote), which gate only on the
-    /// upstream Content-Length.
-    expected_checksum: Option<String>,
+    /// Optional content digest the cache commit is gated on (#2274, widened
+    /// past SHA-256 by GHSA-qxv7-p3mq-88fv). When `Some`,
+    /// [`CachePersister::tee_stream`] persists the cached object ONLY if the
+    /// streamed body matches it; a mismatch is treated like a rejected write
+    /// (object deleted, no metadata sidecar) so a digest-addressed fetch
+    /// that returns wrong bytes cannot poison the proxy cache. `None`
+    /// preserves the pre-existing behaviour for every other streaming
+    /// caller (deb/pypi/plain-Remote), which gate only on the upstream
+    /// Content-Length.
+    expected_checksum: Option<CacheCommitDigest>,
     /// Owning repository id for the persisted proxy-cache catalog row
     /// (#2218/#2270). Threaded so the streaming Commit arm can upsert
     /// `proxy_cache_artifacts` with the TRUE `bytes_written`/checksum.
@@ -1633,6 +1699,21 @@ impl CachePersister {
         // cached SHA-256).
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(TEE_CHANNEL_DEPTH);
 
+        // GHSA-qxv7-p3mq-88fv: for a non-SHA-256 expected digest the storage
+        // layer never observes the hash (put_stream reports SHA-256 only), so
+        // the tee hashes every byte it hands to the cache writer and
+        // publishes the finalized hex digest through this slot at upstream
+        // EOF — BEFORE `tx` is dropped, so when `put_stream` returns the
+        // writer either reads the completed digest or finds `None` (client
+        // disconnect mid-stream, or a cache write abandoned under the #2928
+        // ceiling), which fails the gate closed and skips the cache commit.
+        let tee_hasher = template
+            .expected_checksum
+            .as_ref()
+            .and_then(TeeDigestHasher::for_expected);
+        let tee_digest_slot = Arc::new(std::sync::Mutex::new(None::<String>));
+        let tee_digest_slot_writer = Arc::clone(&tee_digest_slot);
+
         // Spawn the storage writer. It consumes the channel as a stream
         // and calls put_stream against a private staging key, never
         // `cache_key` directly (see the `copy` call below). On completion,
@@ -1658,19 +1739,39 @@ impl CachePersister {
                 Ok(result) => match classify_stream_write(result.bytes_written, expected_len) {
                     StreamWriteOutcome::Commit => {
                         // #2274 digest-gated commit: when the caller pinned an
-                        // expected content-addressable checksum (the OCI
+                        // expected content-addressable digest (the OCI
                         // virtual-repo blob fallback passes the requested blob
-                        // digest), refuse to persist a body whose streamed
-                        // SHA-256 does not match it. The bytes were already
-                        // forwarded to the client — which independently verifies
-                        // the digest — but the proxy cache must never be poisoned
-                        // with mismatched content addressed by that digest. Treat
-                        // a mismatch exactly like the truncated/empty reject path:
-                        // discard the staging object and skip the sidecar so
-                        // the next request refetches (self-heal); `cache_key`
-                        // was never touched.
-                        if let Some(expected) = template.expected_checksum.as_deref() {
-                            if result.checksum_sha256 != expected {
+                        // digest; npm/PyPI/Maven pass the registry-published
+                        // tarball/file digest, GHSA-qxv7-p3mq-88fv), refuse to
+                        // persist a body whose digest does not match it. The
+                        // bytes were already forwarded to the client — which
+                        // independently verifies the digest — but the proxy
+                        // cache must never be poisoned with mismatched content
+                        // addressed by that digest. Treat a mismatch exactly
+                        // like the truncated/empty reject path: discard the
+                        // staging object and skip the sidecar so the next
+                        // request refetches (self-heal); `cache_key` was never
+                        // touched.
+                        //
+                        // The observed digest comes from the storage layer for
+                        // SHA-256 and from the tee-side hasher (finalized into
+                        // `tee_digest_slot_writer` at upstream EOF) for
+                        // SHA-1/SHA-512. A missing tee digest — the client
+                        // disconnected mid-stream, or the cache write was
+                        // abandoned — cannot match, so the gate fails closed.
+                        if let Some(expected) = template.expected_checksum.as_ref() {
+                            let observed_hex = match expected {
+                                CacheCommitDigest::Sha256Hex(_) => {
+                                    Some(result.checksum_sha256.clone())
+                                }
+                                CacheCommitDigest::Sha512Hex(_) | CacheCommitDigest::Sha1Hex(_) => {
+                                    tee_digest_slot_writer
+                                        .lock()
+                                        .ok()
+                                        .and_then(|slot| slot.clone())
+                                }
+                            };
+                            if observed_hex.as_deref() != Some(expected.as_hex()) {
                                 tracing::warn!(
                                     cache_key = %cache_key_for_writer,
                                     "streamed body checksum does not match the requested digest; \
@@ -1844,6 +1945,10 @@ impl CachePersister {
         // sees the error and aborts cleanly) and surface to the client.
         let tee_stream = async_stream::try_stream! {
             let mut upstream = upstream;
+            // GHSA-qxv7-p3mq-88fv: hash the bytes actually handed to the
+            // cache writer (never bytes withheld past the #2928 ceiling) so
+            // the writer can gate a non-SHA-256 commit on the result.
+            let mut tee_hasher = tee_hasher;
             // #2928: cumulative bytes handed to the cache writer, and the
             // latch that says we have stopped doing so. Counted on the tee
             // side rather than after `put_stream` returns, because the whole
@@ -1890,6 +1995,9 @@ impl CachePersister {
                             // its receiver), drop the caching half silently
                             // and keep yielding to the client.
                             if !cache_abandoned {
+                                if let Some(hasher) = tee_hasher.as_mut() {
+                                    hasher.update(&slice);
+                                }
                                 let _ = tx.send(Ok(slice.clone())).await;
                             }
                             yield slice;
@@ -1913,6 +2021,17 @@ impl CachePersister {
                         let _ = tx.send(storage_msg).await;
                         Err(e)?;
                     }
+                }
+            }
+            // upstream EOF: publish the tee-computed digest (when a
+            // non-SHA-256 commit gate is in play) BEFORE dropping tx, so the
+            // writer's `put_stream` can only complete after the digest it is
+            // about to compare is visible. A stream abandoned under the
+            // #2928 ceiling publishes nothing — its writer is already on the
+            // error arm, and an empty slot fails the gate closed regardless.
+            if let (Some(hasher), false) = (tee_hasher, cache_abandoned) {
+                if let Ok(mut slot) = tee_digest_slot.lock() {
+                    *slot = Some(hasher.finalize_hex());
                 }
             }
             // upstream EOF: drop tx so the writer sees end-of-stream
@@ -2294,8 +2413,39 @@ impl UpstreamClient {
                 // realm to an internal address.
                 crate::api::validation::validate_outbound_url(realm, "OCI token realm")?;
 
+                // GHSA-78h6-3wp8-2542: the realm is UPSTREAM-CONTROLLED, and
+                // SSRF validation alone does not stop a public-but-hostile
+                // realm — it only keeps the token request off internal
+                // addresses. Forwarding the configured upstream's Basic
+                // credentials to whatever host the realm names would hand
+                // them to an attacker who controls (or has compromised) the
+                // registry's 401 responses. Pin the credential forwarding to
+                // the configured upstream's ORIGIN (scheme + host + port,
+                // the same notion nuget's `same_upstream_origin` enforces for
+                // discovered feed resources, #2925/#3130): when the realm is
+                // a different origin, attempt the token exchange WITHOUT
+                // credentials rather than failing outright — anonymous token
+                // endpoints (Docker Hub's auth.docker.io among them) answer
+                // such requests, and a realm that genuinely requires the
+                // upstream's credentials simply rejects the exchange, which
+                // fails closed. There is deliberately no cross-host
+                // allowance: this codebase pins credentials to the
+                // operator-configured origin everywhere else.
+                let realm_auth = if Self::realm_matches_upstream_origin(realm, url) {
+                    upstream_auth.clone()
+                } else {
+                    tracing::warn!(
+                        target: "security",
+                        realm = %redact_url_for_diagnostics(realm),
+                        "OCI bearer realm is a different origin than the configured upstream; \
+                         requesting the token WITHOUT the upstream's Basic credentials \
+                         (GHSA-78h6-3wp8-2542)"
+                    );
+                    None
+                };
+
                 let token = self
-                    .obtain_bearer_token(realm, &service, &scope, upstream_auth)
+                    .obtain_bearer_token(realm, &service, &scope, &realm_auth)
                     .await?;
 
                 // Retry with the bearer token only. The original upstream
@@ -2530,6 +2680,32 @@ impl UpstreamClient {
         }
 
         params
+    }
+
+    /// Whether an upstream-supplied OCI bearer `realm` shares an ORIGIN
+    /// (scheme + host + port, host compared case-insensitively, default ports
+    /// normalized) with the upstream request URL that produced the 401 —
+    /// i.e. with the operator-configured upstream the request URL was built
+    /// from. Credentials configured for the upstream are forwarded to the
+    /// token endpoint only when this holds (GHSA-78h6-3wp8-2542); a
+    /// cross-origin realm gets an anonymous token request instead. Strict
+    /// origin match, no suffix allowance: a private registry whose token
+    /// endpoint legitimately lives on another host keeps working only for
+    /// anonymous-scope tokens, which is the fail-closed trade-off this
+    /// advisory calls for. Unparseable URLs never match.
+    fn realm_matches_upstream_origin(realm: &str, upstream_url: &str) -> bool {
+        match (
+            reqwest::Url::parse(realm),
+            reqwest::Url::parse(upstream_url),
+        ) {
+            (Ok(realm), Ok(upstream)) => {
+                realm.scheme() == upstream.scheme()
+                    && realm.host_str().map(str::to_ascii_lowercase)
+                        == upstream.host_str().map(str::to_ascii_lowercase)
+                    && realm.port_or_known_default() == upstream.port_or_known_default()
+            }
+            _ => false,
+        }
     }
 
     /// Check if upstream ETag has changed (returns true if changed/newer).
@@ -3344,6 +3520,30 @@ impl ProxyService {
         cache_path: &str,
         expected_checksum: Option<String>,
     ) -> Result<StreamingFetchResult> {
+        self.fetch_artifact_streaming_with_cache_path_gated_digest(
+            repo,
+            fetch_path,
+            cache_path,
+            expected_checksum.map(CacheCommitDigest::Sha256Hex),
+        )
+        .await
+    }
+
+    /// Algorithm-flexible sibling of
+    /// [`Self::fetch_artifact_streaming_with_cache_path_gated`]
+    /// (GHSA-qxv7-p3mq-88fv): the npm packument pins tarballs by SRI
+    /// SHA-512 / legacy SHA-1 and Maven by SHA-1 sidecars — digests the
+    /// storage layer never observes — so this variant takes a
+    /// [`CacheCommitDigest`] and has the tee hash the forwarded bytes for
+    /// the non-SHA-256 algorithms. Serve-but-don't-cache posture on a
+    /// mismatch is identical.
+    pub async fn fetch_artifact_streaming_with_cache_path_gated_digest(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        expected_checksum: Option<CacheCommitDigest>,
+    ) -> Result<StreamingFetchResult> {
         // #1631 layer 2 (#1694): single-flight the cold-cache streaming path so
         // N concurrent requests for the same uncached object open upstream ONCE.
         // The streaming coordinator's followers subscribe to the leader's
@@ -3408,7 +3608,7 @@ impl ProxyService {
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
-        expected_checksum: Option<String>,
+        expected_checksum: Option<CacheCommitDigest>,
     ) -> Result<Option<StreamingFetchResult>> {
         let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
@@ -3652,7 +3852,7 @@ impl ProxyService {
         cache_path: &str,
         cache_key: String,
         metadata_key: String,
-        expected_checksum: Option<String>,
+        expected_checksum: Option<CacheCommitDigest>,
     ) -> Result<StreamHandle> {
         // Package Age Policy (#1770): the streaming path has no buffered
         // upstream `Last-Modified` to base a release-date hold on (#1771), so
@@ -3893,7 +4093,7 @@ impl ProxyService {
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
-        expected_checksum: Option<String>,
+        expected_checksum: Option<CacheCommitDigest>,
     ) -> Result<StreamingFetchResult> {
         let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
@@ -10525,8 +10725,9 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let mut mismatched_template = template();
-        mismatched_template.expected_checksum =
-            Some("0000000000000000000000000000000000000000000000000000000000000".to_string());
+        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha256Hex(
+            "0000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
         let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
@@ -10558,6 +10759,128 @@ mod tests {
              cache-key: got {:?}",
             deletes[0]
         );
+    }
+
+    /// GHSA-qxv7-p3mq-88fv: the gate must also fire for a non-SHA-256 expected
+    /// digest (npm `dist.integrity` is SRI SHA-512; `dist.shasum` and Maven
+    /// `.sha1` sidecars are SHA-1) — the storage layer only observes SHA-256,
+    /// so these are compared against the tee-side hasher's result. A mismatch
+    /// degrades exactly like the #2274 reject: served to the client, never
+    /// cached.
+    #[tokio::test]
+    async fn test_tee_sha512_gate_mismatch_is_not_cached() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut mismatched_template = template();
+        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
+            sha2::Sha512::digest(b"some other body"),
+        )));
+
+        let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            mismatched_template,
+            Some(11),
+            None,
+        );
+        // The client still receives the full body (serve-but-don't-cache).
+        let mut received: Vec<u8> = Vec::new();
+        while let Some(chunk) = client.next().await {
+            received.extend_from_slice(&chunk.expect("client chunk"));
+        }
+        assert_eq!(received, b"first-chunk");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a SHA-512-gated mismatch must not write a metadata sidecar"
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a SHA-512-gated mismatch must never publish onto the live key"
+        );
+    }
+
+    /// GHSA-qxv7-p3mq-88fv: SHA-1 gate variant (npm `dist.shasum` / Maven
+    /// `.sha1` sidecar) — same mismatch posture.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_mismatch_is_not_cached() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut mismatched_template = template();
+        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"some other body"),
+        )));
+
+        let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            mismatched_template,
+            Some(11),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a SHA-1-gated mismatch must not write a metadata sidecar"
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a SHA-1-gated mismatch must never publish onto the live key"
+        );
+    }
+
+    /// GHSA-qxv7-p3mq-88fv: a body whose tee-computed SHA-512 MATCHES the
+    /// expected digest commits normally — the gate must admit good bytes, or
+    /// every npm tarball would be a permanent cache miss.
+    #[tokio::test]
+    async fn test_tee_sha512_gate_match_commits() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
+            sha2::Sha512::digest(b"first-chunk"),
+        )));
+
+        let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(11),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(
+            writes.len(),
+            1,
+            "a matching SHA-512 gate must commit the metadata sidecar"
+        );
+        assert_eq!(writes[0].0, "meta-key");
+        let copies = backend.copies.lock().await;
+        assert_eq!(
+            copies.len(),
+            1,
+            "a matching SHA-512 gate must publish onto the live key"
+        );
+        assert_eq!(copies[0].1, "cache-key");
     }
 
     /// An error mid-upstream-stream must surface to the client AND
@@ -13880,6 +14203,134 @@ mod tests {
         assert_eq!(
             *ttl, MAX_TOKEN_TTL_SECS,
             "an oversized expires_in must be capped at MAX_TOKEN_TTL_SECS",
+        );
+    }
+
+    // -- GHSA-78h6-3wp8-2542: realm-origin credential pinning -----------------
+    //
+    // The full `exchange_bearer_then` path cannot run against wiremock: its
+    // realm SSRF check hard-blocks loopback (see the note above
+    // `test_buffered_fetch_rejects_ssrf_bearer_realm`). The fix is therefore
+    // pinned at its two seams: the origin matcher that decides whether the
+    // configured upstream's credentials may follow the realm, and
+    // `obtain_bearer_token`'s credential attachment, which the exchange now
+    // drives with `None` for a cross-origin realm.
+
+    #[test]
+    fn test_realm_matches_upstream_origin_accepts_same_origin() {
+        assert!(UpstreamClient::realm_matches_upstream_origin(
+            "https://registry.example.com/token",
+            "https://registry.example.com/v2/lib/img/manifests/latest"
+        ));
+        // Default ports normalize: an explicit :443 on one side is the same
+        // origin.
+        assert!(UpstreamClient::realm_matches_upstream_origin(
+            "https://registry.example.com/token",
+            "https://registry.example.com:443/v2/x"
+        ));
+        // Host comparison is case-insensitive.
+        assert!(UpstreamClient::realm_matches_upstream_origin(
+            "https://REGISTRY.example.com/token",
+            "https://registry.example.com/v2/x"
+        ));
+    }
+
+    #[test]
+    fn test_realm_matches_upstream_origin_rejects_cross_origin() {
+        // The attack shape: a compromised/hostile registry answering 401 with
+        // `realm="https://attacker.example/token"` must not receive the
+        // configured upstream's Basic credentials.
+        assert!(!UpstreamClient::realm_matches_upstream_origin(
+            "https://attacker.example/token",
+            "https://registry.example.com/v2/x"
+        ));
+        // Docker Hub's own split (realm on auth.docker.io, pulls from
+        // registry-1.docker.io) is cross-origin, so the token request goes
+        // out WITHOUT the configured credentials: anonymous token endpoints
+        // answer it, and a realm that genuinely requires the credentials
+        // fails closed. Deliberate — the codebase pins credentials to the
+        // operator-configured origin everywhere else (#2925/#3130).
+        assert!(!UpstreamClient::realm_matches_upstream_origin(
+            "https://auth.docker.io/token",
+            "https://registry-1.docker.io/v2/library/alpine/manifests/latest"
+        ));
+        // A scheme downgrade to the same host is not the same origin.
+        assert!(!UpstreamClient::realm_matches_upstream_origin(
+            "http://registry.example.com/token",
+            "https://registry.example.com/v2/x"
+        ));
+        // A different port is not the same origin.
+        assert!(!UpstreamClient::realm_matches_upstream_origin(
+            "https://registry.example.com:4443/token",
+            "https://registry.example.com/v2/x"
+        ));
+        // Unparseable URLs never match (fail closed).
+        assert!(!UpstreamClient::realm_matches_upstream_origin(
+            "not a url",
+            "https://registry.example.com/v2/x"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_attaches_basic_credentials_only_when_given() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for token_path in ["/token", "/token-anon"] {
+            Mock::given(method("GET"))
+                .and(path(token_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "token": "t",
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+
+        // Same-origin realm: the exchange passes the configured auth through,
+        // and the token endpoint receives the Basic credentials.
+        let auth = Some(crate::services::upstream_auth::UpstreamAuthType::Basic {
+            username: "svc".to_string(),
+            password: "s3cret".to_string(),
+        });
+        let realm = format!("{}/token", server.uri());
+        client
+            .obtain_bearer_token(&realm, "", "", &auth)
+            .await
+            .expect("credentialed token exchange must succeed");
+
+        // Cross-origin realm (GHSA-78h6-3wp8-2542): the exchange passes
+        // `None`, and the token request must carry NO Authorization header.
+        let anon_realm = format!("{}/token-anon", server.uri());
+        client
+            .obtain_bearer_token(&anon_realm, "", "", &None)
+            .await
+            .expect("anonymous token exchange must succeed");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 2);
+        let by_path = |p: &str| requests.iter().find(|r| r.url.path() == p).unwrap();
+        // Compute the expected header at runtime rather than hardcoding a
+        // base64 `user:pass` literal — secret scanners (rightly) flag those.
+        use base64::Engine as _;
+        let expected_auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("svc:s3cret")
+        );
+        assert_eq!(
+            by_path("/token").headers.get("authorization").unwrap(),
+            &expected_auth,
+            "a same-origin realm must receive the configured Basic credentials"
+        );
+        assert!(
+            by_path("/token-anon")
+                .headers
+                .get("authorization")
+                .is_none(),
+            "a cross-origin realm must NOT receive the configured credentials"
         );
     }
 

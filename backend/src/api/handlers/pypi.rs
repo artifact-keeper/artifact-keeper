@@ -3255,6 +3255,13 @@ struct PypiRemoteFetchTarget {
     /// Stable proxy-cache key (`simple/{project}/{filename}`), independent
     /// of the actual upstream URL layout.
     cache_path: String,
+    /// SHA-256 the upstream simple index pinned for this file in its
+    /// `#sha256=` fragment (GHSA-qxv7-p3mq-88fv). `Some` gates the
+    /// streaming proxy-cache commit: a body whose digest disagrees with the
+    /// index is streamed to the client (which verifies it independently)
+    /// but never persisted. `None` — no usable fragment, e.g. a PEP 658
+    /// `.metadata` resolution — fetches unverified, as before.
+    expected_sha256: Option<String>,
 }
 
 /// Resolve the real download URL for a file hosted by a remote PyPI
@@ -3355,10 +3362,19 @@ async fn resolve_pypi_remote_fetch_target(
         None => fallback(),
     };
 
+    // GHSA-qxv7-p3mq-88fv: the same index page that vouched for the download
+    // URL also pins the file's SHA-256 in the anchor fragment — the digest
+    // pip verifies the download against. Lift it so the streamed fetch gates
+    // the proxy-cache commit on it; before this, the fragment was forwarded
+    // to clients but never checked server-side, so a body that disagreed
+    // with the index was cached and served warm from then on.
+    let expected_sha256 = find_upstream_sha256_for_file(&index_html, filename);
+
     Ok(PypiRemoteFetchTarget {
         fetch_base,
         fetch_path,
         cache_path,
+        expected_sha256,
     })
 }
 
@@ -3436,13 +3452,17 @@ async fn fetch_from_pypi_remote_streaming(
     )
     .await?;
 
-    proxy_helpers::proxy_fetch_streaming_with_cache_key(
+    // GHSA-qxv7-p3mq-88fv: gate the proxy-cache commit on the index-pinned
+    // SHA-256 when the upstream simple page carried one — serve-but-don't-cache
+    // on a mismatch, the same posture as Cargo's #2929 `cksum` gate.
+    proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
         proxy,
         repo_id,
         repo_key,
         &target.fetch_base,
         &target.fetch_path,
         &target.cache_path,
+        target.expected_sha256,
         format,
     )
     .await
@@ -4257,21 +4277,30 @@ static HREF_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r##"(?is)<a\s+[^>]*?\bhref\s*=\s*(?:"([^"#]*)|'([^'#]*)|([^\s>#]+))"##).unwrap()
 });
 
-// URL lands in group 2 (double-quoted), 3 (single-quoted), or 4 (unquoted);
-// group 1 = attributes before `href`, group 5 = attributes after.
-static REWRITE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?is)<a\s+([^>]*?)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))([^>]*)>"#)
-        .unwrap()
-});
+/// Anchor START-tag matcher for the simple-index REBUILD paths
+/// (`rewrite_upstream_urls`, GHSA-4cw7-mgqj-hgmg, and the #2967 R3
+/// ownership rebuild `filter_remote_case_a_html`). Matches `<a ...>` with NO
+/// required `</a>`, so an unclosed/malformed upstream anchor is still parsed
+/// rather than passing through unexamined.
+static SIMPLE_ANCHOR_START_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<a\b[^>]*>").unwrap());
 
-/// Matches an upstream `<base ...>` element. A `<base href>` re-anchors every
-/// relative/root-relative link on the page; because `rewrite_upstream_urls`
-/// emits ROOT-RELATIVE download URLs (`/pypi/<repo>/...`), a surviving `<base>`
-/// would make the client resolve them against the upstream origin instead of
-/// Artifact Keeper — a proxy bypass that also discloses the upstream host and
-/// breaks air-gapped installs. We strip it. Same class as the #2801
-/// Content-Type sniff fix, for the `<base>` vector.
-static BASE_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<base\b[^>]*>").unwrap());
+/// Quote-agnostic, case-insensitive `href` extractor applied to a single
+/// anchor start-tag. The value lands in group 1 (double-quoted), 2
+/// (single-quoted), or 3 (unquoted).
+static SIMPLE_HREF_ATTR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?i)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap());
+
+/// `data-*` attribute extractor applied to a single anchor start-tag, for
+/// the simple-index rebuild: group 1 is the attribute name (emitted
+/// lowercased), groups 2/3/4 its double-quoted / single-quoted / unquoted
+/// value. A bare attribute (PEP 714 permits `data-core-metadata` with no
+/// value) captures the name only. This is how `data-requires-python`,
+/// `data-dist-info-metadata` / `data-core-metadata`, `data-gpg-sig`, etc.
+/// survive the rebuild without any other upstream markup surviving with
+/// them (GHSA-4cw7-mgqj-hgmg).
+static SIMPLE_DATA_ATTR_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)\b(data-[a-z0-9-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?"#).unwrap()
+});
 
 /// Split a URL into its base (scheme + host) and path components.
 ///
@@ -4344,6 +4373,43 @@ fn find_upstream_url_for_file(
     None
 }
 
+/// Extract the `#sha256=` fragment the upstream simple index advertises for
+/// `filename`, normalized to the bare lowercase hex the proxy-cache commit
+/// gate compares against (GHSA-qxv7-p3mq-88fv). This is the same digest the
+/// rewritten index hands to pip as a URL fragment — the client verifies it,
+/// and the download path now gates the cache commit on it too. Returns
+/// `None` when no anchor names the file or its fragment is absent or not a
+/// canonical SHA-256 — the caller then fetches unverified, exactly as it did
+/// before the gate existed.
+fn find_upstream_sha256_for_file(index_html: &str, filename: &str) -> Option<String> {
+    for tag in SIMPLE_ANCHOR_START_RE.find_iter(index_html) {
+        let Some(href_caps) = SIMPLE_HREF_ATTR_RE.captures(tag.as_str()) else {
+            continue;
+        };
+        let href_raw = href_caps
+            .get(1)
+            .or_else(|| href_caps.get(2))
+            .or_else(|| href_caps.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        let href = decode_html_entities_minimal(href_raw);
+        let Some((url_part, fragment)) = href.split_once('#') else {
+            continue;
+        };
+        let url_no_query = url_part.split('?').next().unwrap_or(url_part);
+        if url_no_query.rsplit('/').next().unwrap_or("") != filename {
+            continue;
+        }
+        let Some(digest) = fragment.strip_prefix("sha256=") else {
+            continue;
+        };
+        if let Some(normalized) = proxy_helpers::normalize_expected_sha256(digest) {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
 /// Resolve a PEP 658 metadata filename from the corresponding wheel URL.
 /// PyPI advertises the metadata hash on the wheel anchor but usually does not
 /// include a separate `.whl.metadata` anchor in the Simple API page.
@@ -4363,24 +4429,6 @@ fn find_upstream_metadata_url(
     Some(url.into())
 }
 
-/// Rewrite download URLs in upstream PyPI simple index HTML to route through
-/// Artifact Keeper's proxy endpoint.
-///
-/// Upstream sources return links that would bypass the cache:
-///   - External PyPI: `<a href="https://files.pythonhosted.org/packages/...">`
-///   - Local AK repos: `<a href="/pypi/upstream-key/simple/pkg/file#hash">`
-///
-/// This function rewrites both forms to paths under the current (remote) repo:
-/// `/pypi/{repo_key}/simple/{project}/{filename}#sha256=...` so downloads go
-/// through Artifact Keeper and get cached.
-///
-/// Absolute URLs (`http://`, `https://`) and root-relative paths starting with
-/// `/pypi/` are rewritten. Plain relative URLs and anchors are left unchanged.
-///
-/// PEP 658 metadata attributes (`data-dist-info-metadata` and
-/// `data-core-metadata`) are preserved on rewritten links. The download path
-/// resolves `.metadata` filenames through the same upstream Simple API page,
-/// so removing these attributes would prevent installers from using PEP 658.
 /// Classification of a proxied PyPI simple-index body sniffed from its
 /// content, used when the upstream `Content-Type` is neither PEP 691 JSON nor
 /// PEP 503 HTML. See #2801: corporate outbound proxies / quirky mirrors
@@ -4438,58 +4486,118 @@ fn bad_upstream_simple_index() -> Response {
         .into_response()
 }
 
+/// Rewrite download URLs in upstream PyPI simple index HTML to route through
+/// Artifact Keeper's proxy endpoint — by REBUILDING a fresh minimal PEP 503
+/// page from the parsed anchors, never by editing the upstream markup in
+/// place (GHSA-4cw7-mgqj-hgmg). Mirrors the #2967 R3 ownership rebuild
+/// (`filter_remote_case_a_html`).
+///
+/// SECURITY. The previous in-place rewriter passed every upstream byte
+/// through except `<base>` tags and the href values it recognized. A proxied
+/// index is served from THIS registry's origin, so any surviving upstream
+/// markup — a `<script>`, an `onerror=` handler, a `<form>` — is stored XSS
+/// against anyone (admins included) browsing the index; and a filename or
+/// `#fragment` containing the upstream's own href quote character broke out
+/// of the rewritten attribute into arbitrary attacker-controlled markup. The
+/// rebuild emits only what it can vouch for:
+///
+///   * one `<a>` per upstream anchor whose href yields a non-empty filename,
+///     the href rebuilt as `/pypi/{repo_key}/simple/{project}/{filename}
+///     {#fragment}` — the same local download path the in-place rewriter
+///     produced, so absolute, root-relative and plain-relative upstream hrefs
+///     (pypi.org, Nexus, Artifactory, devpi, another AK repo) all keep
+///     routing through the proxy, and no upstream host/path/query survives;
+///   * the anchor's `data-*` attributes (`data-requires-python`, the PEP
+///     658/714 `data-dist-info-metadata` / `data-core-metadata`, …), each
+///     entity-decoded then re-escaped into a fresh double-quoted value, so a
+///     single-quoted upstream value cannot break out of its attribute;
+///   * the filename, HTML-escaped, as the link text (PEP 503).
+///
+/// Everything else — `<base>`, `<script>`, event handlers, non-`data-*`
+/// attributes, wrapper markup — is dropped with the rest of the upstream
+/// page. The emitted skeleton keeps the `<head>`/`<body>` markers (and the
+/// `pypi:repository-version` meta) that `merge_local_into_remote_simple_html`
+/// splices local entries and operator `tracks` into.
 fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     let normalized = PypiHandler::normalize_name(project);
 
-    // Neutralize any upstream `<base href>` first: our rewritten download links
-    // are root-relative, so a surviving `<base>` re-anchors them onto the
-    // upstream origin (proxy bypass + host disclosure). Strip to a FIXPOINT:
-    // removing one `<base>` can splice surrounding bytes into a NEW one
-    // (`<ba<base x>se href=...>`), so loop until nothing more matches.
-    let mut html = html.to_string();
-    loop {
-        let stripped = BASE_TAG_RE.replace_all(&html, "").into_owned();
-        if stripped == html {
-            break;
+    let mut anchors = String::new();
+    for tag in SIMPLE_ANCHOR_START_RE.find_iter(html) {
+        let tag = tag.as_str();
+        let Some(href_caps) = SIMPLE_HREF_ATTR_RE.captures(tag) else {
+            continue;
+        };
+        let href_raw = href_caps
+            .get(1)
+            .or_else(|| href_caps.get(2))
+            .or_else(|| href_caps.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        // Minimal entity-decode BEFORE deriving the file identity from the
+        // href — the same treatment the #2967 rebuild gives it; everything
+        // re-emitted below is escaped again.
+        let href = decode_html_entities_minimal(href_raw);
+        // Keep the upstream fragment (#sha256=...) so pip can verify the
+        // bytes AK proxies; strip it — and any query — before taking the
+        // basename.
+        let fragment = match href.find('#') {
+            Some(pos) => &href[pos..],
+            None => "",
+        };
+        let url_part = href.split('#').next().unwrap_or(&href);
+        let url_no_query = url_part.split('?').next().unwrap_or(url_part);
+        let filename = url_no_query.rsplit('/').next().unwrap_or("").trim();
+        // Not a file link (navigation, `../`, a bare host): there is no
+        // download entry to rebuild, and nothing else about the anchor may
+        // survive either. A "filename" containing HTML metacharacters or
+        // whitespace is no filename at all — it is an attribute-breakout
+        // payload riding the href (GHSA-4cw7-mgqj-hgmg), and the anchor is
+        // dropped rather than escaped-and-emitted (the same posture
+        // `is_safe_upload_filename` takes at the ingest choke-point, #3107).
+        if filename.is_empty()
+            || filename
+                .chars()
+                .any(|c| matches!(c, '<' | '>' | '"' | '\'') || c.is_whitespace() || c.is_control())
+        {
+            continue;
         }
-        html = stripped;
+
+        // Preserve ONLY the anchor's `data-*` attributes, each re-emitted
+        // escaped into a double-quoted value (or bare, as PEP 714 permits).
+        let mut data_attrs = String::new();
+        for attr in SIMPLE_DATA_ATTR_RE.captures_iter(tag) {
+            let name = attr[1].to_ascii_lowercase();
+            let value = attr
+                .get(2)
+                .or_else(|| attr.get(3))
+                .or_else(|| attr.get(4))
+                .map(|m| m.as_str());
+            match value {
+                Some(v) => data_attrs.push_str(&format!(
+                    " {}=\"{}\"",
+                    name,
+                    html_escape(&decode_html_entities_minimal(v))
+                )),
+                None => data_attrs.push_str(&format!(" {}", name)),
+            }
+        }
+
+        anchors.push_str(&format!(
+            "<a href=\"/pypi/{}/simple/{}/{}{}\"{}>{}</a><br/>\n",
+            repo_key,
+            normalized,
+            html_escape(filename),
+            html_escape(fragment),
+            data_attrs,
+            html_escape(filename),
+        ));
     }
 
-    REWRITE_RE
-        .replace_all(&html, |caps: &regex::Captures| {
-            let before_href = &caps[1];
-            // The href value is in whichever quote-alternation group matched
-            // (double / single / unquoted); `after` is the trailing group.
-            let full_url = caps
-                .get(2)
-                .or_else(|| caps.get(3))
-                .or_else(|| caps.get(4))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-            let after_href = caps.get(5).map(|m| m.as_str()).unwrap_or("");
-
-            // Split off the fragment (#sha256=...) if present
-            let (url_path, fragment) = match full_url.find('#') {
-                Some(pos) => (&full_url[..pos], &full_url[pos..]),
-                None => (full_url, ""),
-            };
-
-            // Extract the filename from the URL path
-            let filename = url_path.rsplit('/').next().unwrap_or(url_path);
-
-            if filename.is_empty() {
-                // Not a file URL, leave unchanged
-                return caps[0].to_string();
-            }
-
-            let rewritten = format!(
-                "/pypi/{}/simple/{}/{}{}",
-                repo_key, normalized, filename, fragment
-            );
-
-            format!("<a {}href=\"{}\"{}>", before_href, rewritten, after_href)
-        })
-        .into_owned()
+    // Fresh minimal PEP 503 document containing ONLY Artifact-Keeper-pathed
+    // anchors — the same skeleton `filter_remote_case_a_html` emits.
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta name=\"pypi:repository-version\" content=\"1.0\"/>\n</head>\n<body>\n{anchors}</body>\n</html>\n"
+    )
 }
 
 /// PEP 691 JSON simple-index media type.
@@ -4880,14 +4988,10 @@ fn filter_remote_case_a_html(
     repo_key: &str,
     normalized: &str,
 ) -> String {
-    static ANCHOR_START: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<a\b[^>]*>").unwrap());
-    static HREF_ATTR: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r#"(?i)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap());
-
     let mut survivors = String::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for tag in ANCHOR_START.find_iter(html) {
-        let Some(href_caps) = HREF_ATTR.captures(tag.as_str()) else {
+    for tag in SIMPLE_ANCHOR_START_RE.find_iter(html) {
+        let Some(href_caps) = SIMPLE_HREF_ATTR_RE.captures(tag.as_str()) else {
             continue;
         };
         let href_raw = href_caps
@@ -6311,13 +6415,27 @@ mod tests {
     // rewrite_upstream_urls
     // -----------------------------------------------------------------------
 
+    /// Expected shape of a REGENERATED simple-index page (GHSA-4cw7-mgqj-hgmg):
+    /// `rewrite_upstream_urls` no longer edits the upstream page in place — it
+    /// emits a fresh minimal PEP 503 document containing ONLY the rebuilt
+    /// anchors. The skeleton carries the `</head>` / `</body>` markers
+    /// `merge_local_into_remote_simple_html` splices into.
+    fn rebuilt_simple_page(anchors: &str) -> String {
+        format!(
+            "<!DOCTYPE html>\n<html>\n<head>\n<meta name=\"pypi:repository-version\" content=\"1.0\"/>\n</head>\n<body>\n{anchors}</body>\n</html>\n"
+        )
+    }
+
     #[test]
     fn test_rewrite_absolute_url_with_hash() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/ab/cd/numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
         assert_eq!(
             result,
-            r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#
+            rebuilt_simple_page(
+                r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a><br/>
+"#
+            )
         );
     }
 
@@ -6327,7 +6445,10 @@ mod tests {
         let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
         assert_eq!(
             result,
-            r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz">numpy-1.3.0.tar.gz</a>"#
+            rebuilt_simple_page(
+                r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz">numpy-1.3.0.tar.gz</a><br/>
+"#
+            )
         );
     }
 
@@ -6372,7 +6493,10 @@ mod tests {
         let result = rewrite_upstream_urls(html, "repo", "pkg");
         assert_eq!(
             result,
-            r#"<a href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a>"#
+            rebuilt_simple_page(
+                r#"<a href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a><br/>
+"#
+            )
         );
     }
 
@@ -6387,15 +6511,22 @@ mod tests {
 
     #[test]
     fn test_rewrite_no_links() {
+        // GHSA-4cw7-mgqj-hgmg: a page with no file anchors regenerates as an
+        // EMPTY listing — the upstream `<h1>` (and any other markup) no longer
+        // passes through.
         let html = "<html><body><h1>No links here</h1></body></html>";
         let result = rewrite_upstream_urls(html, "repo", "pkg");
-        assert_eq!(result, html);
+        assert_eq!(result, rebuilt_simple_page(""));
+        assert!(
+            !result.contains("<h1>"),
+            "upstream markup survived: {result}"
+        );
     }
 
     #[test]
     fn test_rewrite_empty_string() {
         let result = rewrite_upstream_urls("", "repo", "pkg");
-        assert_eq!(result, "");
+        assert_eq!(result, rebuilt_simple_page(""));
     }
 
     #[test]
@@ -6423,8 +6554,11 @@ mod tests {
         // data-requires-python should be preserved
         assert!(result.contains("data-requires-python"));
 
-        // Non-link content should be preserved
-        assert!(result.contains("<h1>Links for numpy</h1>"));
+        // GHSA-4cw7-mgqj-hgmg: non-link upstream content does NOT survive —
+        // the page is regenerated from parsed anchors, so the upstream's
+        // `<h1>`/`<title>` are gone. The repository-version meta that remains
+        // is OUR OWN skeleton's, not the upstream's.
+        assert!(!result.contains("<h1>Links for numpy</h1>"));
         assert!(result.contains("pypi:repository-version"));
     }
 
@@ -6466,7 +6600,10 @@ mod tests {
         let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
         assert_eq!(
             result,
-            r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#
+            rebuilt_simple_page(
+                r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a><br/>
+"#
+            )
         );
     }
 
@@ -6476,7 +6613,10 @@ mod tests {
         let result = rewrite_upstream_urls(html, "remote-repo", "pkg");
         assert_eq!(
             result,
-            r#"<a href="/pypi/remote-repo/simple/pkg/pkg-2.0.whl">pkg-2.0.whl</a>"#
+            rebuilt_simple_page(
+                r#"<a href="/pypi/remote-repo/simple/pkg/pkg-2.0.whl">pkg-2.0.whl</a><br/>
+"#
+            )
         );
     }
 
@@ -6541,9 +6681,10 @@ mod tests {
             r#"href="/pypi/remote-pypi/simple/mypackage/mypackage-1.0.0-py3-none-any.whl#sha256=bbb222""#
         ));
 
-        // data-requires-python and other structure should be preserved
+        // data-requires-python is preserved; the upstream page structure is
+        // NOT (GHSA-4cw7-mgqj-hgmg — the page is regenerated).
         assert!(result.contains("data-requires-python"));
-        assert!(result.contains("<h1>Links for mypackage</h1>"));
+        assert!(!result.contains("<h1>Links for mypackage</h1>"));
     }
 
     #[test]
@@ -6593,8 +6734,9 @@ mod tests {
         assert!(result.contains(r#"data-dist-info-metadata="sha256=5620""#));
         assert!(result.contains(r#"data-core-metadata="sha256=5620""#));
 
-        // Structure should be preserved
-        assert!(result.contains("<h1>Links for six</h1>"));
+        // Upstream page structure does NOT survive the regeneration
+        // (GHSA-4cw7-mgqj-hgmg).
+        assert!(!result.contains("<h1>Links for six</h1>"));
     }
 
     // -----------------------------------------------------------------------
@@ -7123,6 +7265,112 @@ mod tests {
         assert!(out.contains("/pypi/repo/simple/pkg/pkg-3.0.whl"), "{out}");
     }
 
+    // -----------------------------------------------------------------------
+    // GHSA-4cw7-mgqj-hgmg: proxied simple-index stored XSS
+    //
+    // The proxied page is served from THIS registry's origin, so any upstream
+    // markup that survives the render runs with the registry's privileges.
+    // The rewriter now REGENERATES the page from parsed anchors instead of
+    // editing the upstream markup in place. These tests pin that contract.
+    // -----------------------------------------------------------------------
+
+    // The advisory's breakout: a single-quoted upstream href carries a double
+    // quote, so the old in-place rewriter's `href="..."` re-emission let the
+    // value escape its attribute into attacker markup. The "filename" of such
+    // an href is no plausible filename, so the anchor is dropped wholesale.
+    #[test]
+    fn test_rewrite_regeneration_blocks_single_quote_href_breakout() {
+        let html = concat!(
+            "<a href='pkg-1.0.whl\"><img src=x onerror=alert(1)>'>pkg-1.0.whl</a>\n",
+            "<script>alert(2)</script>",
+        );
+        let out = rewrite_upstream_urls(html, "repo", "pkg");
+        assert_eq!(
+            out,
+            rebuilt_simple_page(""),
+            "a breakout-payload href must yield NO anchor: {out}"
+        );
+        assert!(
+            !out.contains("<img"),
+            "event-handler markup survived: {out}"
+        );
+        assert!(!out.contains("onerror"), "event handler survived: {out}");
+        assert!(!out.contains("<script"), "script tag survived: {out}");
+        assert!(
+            !out.contains("alert("),
+            "attacker payload survived in any form: {out}"
+        );
+    }
+
+    // An event handler riding a legitimate anchor's attribute list: only
+    // `data-*` attributes are carried into the rebuilt page, so the handler
+    // is dropped with the rest of the upstream markup.
+    #[test]
+    fn test_rewrite_regeneration_drops_anchor_event_handlers() {
+        let html = r#"<a href="https://files.example.com/pkg-1.0.whl#sha256=aa" onmouseover="alert(1)" data-requires-python="&gt;=3.8">pkg-1.0.whl</a>"#;
+        let out = rewrite_upstream_urls(html, "repo", "pkg");
+        assert!(
+            !out.contains("onmouseover"),
+            "event handler survived: {out}"
+        );
+        assert!(
+            !out.contains("files.example.com"),
+            "offsite host survived: {out}"
+        );
+        assert!(
+            out.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=aa""#),
+            "rebuilt href missing: {out}"
+        );
+        // data-* attributes DO survive (escaped).
+        assert!(
+            out.contains(r#"data-requires-python="&gt;=3.8""#),
+            "data-requires-python lost: {out}"
+        );
+    }
+
+    // A single-quoted `data-requires-python` value containing a double quote
+    // must not break out of the double-quoted attribute it is re-emitted
+    // into: the raw quote is escaped, so the `" onmouseover="` breakout
+    // sequence never appears.
+    #[test]
+    fn test_rewrite_regeneration_escapes_data_attr_breakout() {
+        let html = "<a href='pkg-1.0.whl' data-requires-python='&gt;=3.8\" onmouseover=\"alert(1)'>pkg-1.0.whl</a>";
+        let out = rewrite_upstream_urls(html, "repo", "pkg");
+        assert!(
+            !out.contains("\" onmouseover"),
+            "attribute breakout survived: {out}"
+        );
+        assert!(
+            !out.contains("onmouseover=\""),
+            "live event-handler attribute survived: {out}"
+        );
+        assert!(
+            out.contains("data-requires-python=\"&gt;=3.8&quot;"),
+            "the (escaped) value must be re-emitted quoted: {out}"
+        );
+    }
+
+    // The regenerated page must keep the skeleton markers downstream code
+    // splices into: `</head>` / `</body>` for the virtual-repo local merge,
+    // and the PEP 503 doctype.
+    #[test]
+    fn test_rewrite_regeneration_keeps_pep503_skeleton_markers() {
+        let out = rewrite_upstream_urls("", "repo", "pkg");
+        assert!(out.starts_with("<!DOCTYPE html>"), "{out}");
+        assert!(
+            out.contains("</head>"),
+            "merge splice marker missing: {out}"
+        );
+        assert!(
+            out.contains("</body>"),
+            "merge splice marker missing: {out}"
+        );
+        assert!(
+            out.contains("pypi:repository-version"),
+            "repository-version meta missing: {out}"
+        );
+    }
+
     #[test]
     fn test_case_a_filter_remote_body_dispatch_sniffs_and_fails_closed() {
         let owned = linux_owner_profile();
@@ -7506,6 +7754,55 @@ mod tests {
         let index_url = "https://nexus.example.com/repository/pypi/simple/other/";
         let result = find_upstream_url_for_file(html, "nonexistent-1.0.tar.gz", Some(index_url));
         assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_upstream_sha256_for_file (GHSA-qxv7-p3mq-88fv)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_upstream_sha256_extracts_fragment_for_filename() {
+        let sha = "a".repeat(64);
+        let html = format!(
+            r#"<a href="https://files.example.com/packages/ab/six-1.0.tar.gz#sha256={sha}">six-1.0.tar.gz</a>"#
+        );
+        assert_eq!(
+            find_upstream_sha256_for_file(&html, "six-1.0.tar.gz"),
+            Some(sha)
+        );
+        // A different file on the same page is not matched.
+        assert_eq!(find_upstream_sha256_for_file(&html, "six-2.0.tar.gz"), None);
+    }
+
+    #[test]
+    fn test_find_upstream_sha256_rejects_non_canonical_or_absent() {
+        // No fragment -> None (the download proceeds unverified, as before).
+        let html = r#"<a href="https://files.example.com/six-1.0.tar.gz">six-1.0.tar.gz</a>"#;
+        assert_eq!(find_upstream_sha256_for_file(html, "six-1.0.tar.gz"), None);
+        // Uppercase digests are not the canonical form the gate compares.
+        let upper = "A".repeat(64);
+        let html = format!(
+            r#"<a href="https://files.example.com/six-1.0.tar.gz#sha256={upper}">six-1.0.tar.gz</a>"#
+        );
+        assert_eq!(find_upstream_sha256_for_file(&html, "six-1.0.tar.gz"), None);
+        // Truncated digests are not SHA-256.
+        let html = r#"<a href="https://files.example.com/six-1.0.tar.gz#sha256=abc123">six-1.0.tar.gz</a>"#;
+        assert_eq!(find_upstream_sha256_for_file(html, "six-1.0.tar.gz"), None);
+        // An md5 fragment is not a SHA-256 pin.
+        let html =
+            r#"<a href="https://files.example.com/six-1.0.tar.gz#md5=deadbeef">six-1.0.tar.gz</a>"#;
+        assert_eq!(find_upstream_sha256_for_file(html, "six-1.0.tar.gz"), None);
+    }
+
+    #[test]
+    fn test_find_upstream_sha256_handles_relative_and_single_quoted_hrefs() {
+        let sha = "b".repeat(64);
+        let html =
+            format!("<a href='../../packages/six-1.0.tar.gz#sha256={sha}'>six-1.0.tar.gz</a>");
+        assert_eq!(
+            find_upstream_sha256_for_file(&html, "six-1.0.tar.gz"),
+            Some(sha)
+        );
     }
 
     #[test]
@@ -11038,7 +11335,8 @@ mod tests {
     /// The simple index page has no matching href, so `resolve_pypi_remote_fetch_target`
     /// falls through to the stable `simple/{project}/{filename}` fallback path.
     /// This avoids the SSRF check (which hard-blocks loopback) while still
-    /// exercising `fetch_from_pypi_remote_streaming` and `proxy_fetch_streaming_with_cache_key`.
+    /// exercising `fetch_from_pypi_remote_streaming` and
+    /// `proxy_fetch_streaming_with_cache_key_verified`.
     ///
     /// Skipped when `DATABASE_URL` is unset (CI always sets it).
     #[tokio::test]
@@ -14394,7 +14692,9 @@ mod tests {
     // Simple index must be neutralized, or it re-anchors our root-relative
     // rewritten download URLs onto the upstream origin — a proxy bypass that
     // discloses the upstream host and breaks air-gapped installs. RED before
-    // the BASE_TAG_RE strip, GREEN after. Sibling of the #2801 sniff fix.
+    // the BASE_TAG_RE strip, GREEN after; the GHSA-4cw7-mgqj-hgmg regeneration
+    // made the strip moot (no upstream markup survives at all). Sibling of the
+    // #2801 sniff fix.
     #[test]
     fn test_rewrite_upstream_urls_neutralizes_base_href() {
         let upstream = concat!(

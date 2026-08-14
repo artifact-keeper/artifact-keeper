@@ -1426,6 +1426,18 @@ pub(crate) fn extract_repo_key(path: &str) -> &str {
         segments.next(); // "t"
         segments.next(); // "<TOKEN>"
     }
+    // WASM plugin proxy routes are nested as
+    //   /ext/<format_key>/<repo_key>/...
+    // so the repository key is the THIRD path segment, not the second
+    // (GHSA-9rqp-mgmw-5879). Returning the second segment (the plugin format
+    // key) made the visibility middleware resolve a nonexistent repo and fall
+    // into its no-repo branch: anonymous callers were 401'd, but ANY
+    // authenticated caller passed through with no visibility/permission check
+    // on the actual target repo — including private repos. Skip the
+    // format-key segment so the real repository key is evaluated.
+    if format == "ext" {
+        segments.next(); // "<format_key>"
+    }
     segments.next().unwrap_or("")
 }
 
@@ -1601,7 +1613,10 @@ fn is_non_mutating_format_post(path: &str) -> bool {
 /// Build a 401 response with `WWW-Authenticate` challenges for both Basic
 /// and Bearer schemes.  Package manager clients use the challenge to decide
 /// how to retry with credentials.
-fn unauthorized_response() -> Response {
+///
+/// `pub(crate)` so the WASM proxy handler (`/ext/*`) can emit the identical
+/// anonymous-denial response as this middleware (GHSA-9rqp-mgmw-5879).
+pub(crate) fn unauthorized_response() -> Response {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header("WWW-Authenticate", "Basic realm=\"artifact-keeper\"")
@@ -3282,6 +3297,31 @@ mod tests {
         // A conda channel that merely happens to be named "t" (no token
         // segment shape) still resolves to that key when addressed plainly.
         assert_eq!(extract_repo_key("/conda/t"), "");
+    }
+
+    #[test]
+    fn test_extract_repo_key_ext_wasm_proxy() {
+        // GHSA-9rqp-mgmw-5879: /ext routes are nested
+        // `/ext/<format_key>/<repo_key>/...`, so the repository key is the
+        // THIRD segment. Before the fix the generic rule returned the second
+        // segment (the plugin format key), no repo matched, and the
+        // visibility middleware's no-repo branch let ANY authenticated caller
+        // through to any repo — including private ones.
+        assert_eq!(
+            extract_repo_key("/ext/pypi-custom/my-repo/simple/"),
+            "my-repo"
+        );
+        assert_eq!(
+            extract_repo_key("/ext/rpm-custom/centos-repo/repodata/repomd.xml"),
+            "centos-repo"
+        );
+        // Exact-mount forms (no sub-path) resolve the same way.
+        assert_eq!(extract_repo_key("/ext/pypi-custom/my-repo"), "my-repo");
+        assert_eq!(extract_repo_key("/ext/pypi-custom/my-repo/"), "my-repo");
+        // Missing repo segment: empty key, middleware passes through and the
+        // router/handler 404s — unchanged from other formats.
+        assert_eq!(extract_repo_key("/ext/pypi-custom"), "");
+        assert_eq!(extract_repo_key("/ext"), "");
     }
 
     #[test]
@@ -6010,6 +6050,168 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "a role assignment must restore native-path access to the private repo"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Regression for GHSA-9rqp-mgmw-5879: the /ext WASM proxy routes are
+    /// nested `/ext/<format_key>/<repo_key>/...`, but `extract_repo_key`
+    /// returned the SECOND segment (the plugin format key) as the repo key.
+    /// No repo matched, so `repo_visibility_middleware` fell into its no-repo
+    /// branch and let ANY authenticated caller through with no visibility or
+    /// permission check on the real target repo — a full private-repo read
+    /// bypass (the handler then hands the plugin the repo's entire artifact
+    /// metadata list). After the fix the middleware resolves the third
+    /// segment and applies the standard gate: anonymous -> 401, an
+    /// authenticated non-admin WITHOUT a grant -> existence-hiding 404 (same
+    /// as the REST `require_visible` model), a granted member -> pass.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset; runs for real in the
+    /// CI coverage job (which seeds Postgres before `cargo llvm-cov --lib`).
+    #[tokio::test]
+    async fn test_ext_wasm_proxy_route_enforces_repo_visibility() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::user::{AuthProvider, User};
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (user_id, username) = tdh::create_user(&pool).await; // non-admin
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "pypi").await; // is_public defaults false
+
+        // Mint a real access JWT for this non-admin user. AuthService is built
+        // on the real pool so the replica-safe invalidation check succeeds.
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            make_test_config_for_middleware(),
+        ));
+        let now = chrono::Utc::now();
+        let user = User {
+            id: user_id,
+            username: username.clone(),
+            email: format!("{}@test.local", username),
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin: false,
+            is_service_account: false,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: now,
+            last_login_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let bearer = format!(
+            "Bearer {}",
+            auth_service.generate_tokens(&user).unwrap().access_token
+        );
+
+        // Fresh state per request: a pre-populated cache so the middleware
+        // skips the DB repo lookup, with the private repo's real id so the
+        // role_assignments query resolves against it.
+        async fn mk_state(
+            pool: &sqlx::PgPool,
+            auth: Arc<AuthService>,
+            repo_key: &str,
+            repo_id: Uuid,
+            storage_path: String,
+        ) -> RepoVisibilityState {
+            let cache: RepoCache =
+                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+            let entry = CachedRepo {
+                id: repo_id,
+                format: "pypi".to_string(),
+                repo_type: "local".to_string(),
+                upstream_url: None,
+                storage_path,
+                storage_backend: "filesystem".to_string(),
+                is_public: false,
+                index_upstream_url: None,
+            };
+            cache
+                .write()
+                .await
+                .insert(repo_key.to_string(), (entry, std::time::Instant::now()));
+            RepoVisibilityState {
+                auth_service: auth,
+                db: pool.clone(),
+                repo_cache: cache,
+                permission_service: Arc::new(PermissionService::new(pool.clone())),
+            }
+        }
+
+        // The /ext WASM proxy shape: plugin format key first, repo key second.
+        let ext_uri = format!("/ext/pypi-custom/{}/simple/", repo_key);
+        let storage = storage_dir.to_string_lossy().into_owned();
+
+        // 1) Anonymous caller -> 401 (the middleware's standard private-repo
+        //    denial, with the credential challenge).
+        let state = mk_state(
+            &pool,
+            auth_service.clone(),
+            &repo_key,
+            repo_id,
+            storage.clone(),
+        )
+        .await;
+        let resp = run_through_visibility(state, empty_get(&ext_uri)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "anonymous /ext read of a private repo must be 401"
+        );
+
+        // 2) Authenticated non-admin WITHOUT a role assignment -> 404. This is
+        //    the core GHSA-9rqp-mgmw-5879 regression assertion: before the fix
+        //    the middleware resolved the format key ("pypi-custom") as the
+        //    repo, matched nothing, and let this request THROUGH (200).
+        let authed_req = || {
+            axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(&ext_uri)
+                .header("Authorization", &bearer)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let state = mk_state(
+            &pool,
+            auth_service.clone(),
+            &repo_key,
+            repo_id,
+            storage.clone(),
+        )
+        .await;
+        let resp = run_through_visibility(state, authed_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "authenticated non-admin without a grant must NOT read a private \
+             repo through /ext (existence-hiding 404, same as REST)"
+        );
+
+        // 3) Grant a role assignment -> access restored (200 = reached the
+        //    handler), matching the native-format and REST paths.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = mk_state(&pool, auth_service, &repo_key, repo_id, storage).await;
+        let resp = run_through_visibility(state, authed_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a role assignment must restore /ext access to the private repo"
         );
 
         tdh::cleanup(&pool, repo_id, user_id).await;
