@@ -3269,11 +3269,8 @@ async fn serve_tarball(
                 .await
                 .unwrap_or(false)
             {
-                let action =
-                    crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-                        .proxy_scan_action(repo.id)
-                        .await
-                        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+                let (action, severity_gate) =
+                    proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                 return serve_scanned_npm_tarball(
                     state,
                     proxy,
@@ -3284,6 +3281,7 @@ async fn serve_tarball(
                     &fetch_path,
                     &response_filename,
                     action,
+                    severity_gate,
                     ctx,
                 )
                 .await;
@@ -3485,7 +3483,7 @@ async fn serve_tarball(
                 let Some(ref member_upstream) = member.upstream_url else {
                     continue;
                 };
-                let (enabled, action) =
+                let (enabled, action, severity_gate) =
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
                         .await;
                 if !enabled {
@@ -3501,6 +3499,7 @@ async fn serve_tarball(
                     &upstream_path,
                     filename,
                     action,
+                    severity_gate,
                     ctx,
                 )
                 .await
@@ -3798,6 +3797,7 @@ async fn serve_scanned_npm_tarball(
     fetch_path: &str,
     filename: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     // Buffered capped fetch (cache-first) under the SAME cache key as the
@@ -3928,6 +3928,7 @@ async fn serve_scanned_npm_tarball(
         synthetic,
         &bytes,
         action,
+        severity_gate,
         identity,
         proxy_helpers::ProxyScanMode::File,
     )
