@@ -73,18 +73,43 @@
 
 # ---------------------------------------------------------------------------
 # grype v0.117.0 binary — Go stdlib @ go1.26.3
-# Fixed in Go 1.26.4/1.26.5 (1.25.11/1.25.12). grype v0.117.0 (latest) is
-# still built with go1.26.3 — the v0.116.0 -> v0.117.0 bump for #3307 did not
-# move the toolchain. Drops off when grype ships a release built on Go >=
-# 1.26.5. Re-measured against ghcr.io/anchore/grype:v0.117.0 on 2026-08-13:
-# all five still present, CVE-2026-27145 / -39822 / -42504 at HIGH+fixed (i.e.
-# these three are the ones actually holding the gate open), -42505 / -42507 at
-# MEDIUM.
+# Fixed in Go 1.26.4/1.26.5/1.26.6 (1.25.11/1.25.12/1.25.13). grype v0.117.0
+# (latest, published 2026-08-10) is still built with go1.26.3 — the v0.116.0 ->
+# v0.117.0 bump for #3307 did not move the toolchain. Drops off when grype ships
+# a release built on Go >= 1.26.6. Re-measured against
+# ghcr.io/anchore/grype:v0.117.0 on 2026-08-14 (trivy 0.69.3, --ignore-unfixed):
+# CVE-2026-27145 / -39821 / -39822 / -42504 at HIGH+fixed (i.e. these four are
+# the ones actually holding the gate open), -42505 / -42507 at MEDIUM.
+#
+# CVE-2026-39821 (x/net/idna, privilege escalation via incorrect Punycode label
+# processing) is NEW as of the 2026-08-14 DB and is what failed the 1.7.4
+# publish. It needs Go 1.26.6, one line past the 1.26.5 this block previously
+# anticipated. Anchore has shipped no rebuilt release, so there is no tool
+# version to bump to — checked against the grype releases feed on 2026-08-14.
+#
+# Scope: unlike the trivy entries below, a positive runtime argument applies
+# here. The backend images set GRYPE_DB_AUTO_UPDATE=false and
+# GRYPE_CHECK_FOR_APP_UPDATE=false against a DB pre-seeded at build time
+# (Dockerfile.backend stage 5b, #1001), and the backend invokes grype against
+# on-disk artifacts and SBOMs. grype therefore issues no outbound HTTP at
+# runtime, so the net/http hostname path these stdlib CVEs sit in is not
+# driven. This is scope, not a fix: the vulnerable code is still linked in.
+#
+# Tracked for a real fix in #3352 (build grype from source with a patched
+# toolchain, as #3123 already does for trivy).
 CVE-2026-27145
+CVE-2026-39821
 CVE-2026-39822
 CVE-2026-42504
 CVE-2026-42505
 CVE-2026-42507
+
+# NOTE — CVE-2026-46600 also appears in this grype binary's Go stdlib (HIGH,
+# fixed in Go 1.26.6), not only in the vendored trivy CLI it is filed under in
+# the RETIRED section below. It is not duplicated here because the ID is
+# already suppressed file-wide; recorded so that deleting the retired trivy
+# block does not silently un-suppress a live grype finding. Same runtime scope
+# as the block above.
 
 # ---------------------------------------------------------------------------
 # grype v0.117.0 binary — github.com/docker/docker @ v28.5.2+incompatible
