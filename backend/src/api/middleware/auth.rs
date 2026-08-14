@@ -1315,8 +1315,12 @@ pub async fn optional_auth_middleware(
     // must produce 401. We allow a ticket to rescue the request because a
     // browser may include a stale Authorization cookie alongside a fresh
     // download ticket — the ticket is what authorizes the read.
+    //
+    // Header-aware: a browser fetch carrying a stale token must not trigger
+    // the native Basic popup over the web UI's own login flow (#2936/#3082);
+    // package clients keep the full challenge set.
     if credential_invalid && auth_ext.is_none() {
-        return unauthorized_response();
+        return unauthorized_response_for(request.headers());
     }
 
     request.extensions_mut().insert(auth_ext);
@@ -1676,6 +1680,35 @@ fn is_non_mutating_format_post(path: &str) -> bool {
     }
 }
 
+/// True when the request plausibly originates from an interactive web browser
+/// rather than a package-manager client (#2936 / #3082).
+///
+/// Browsers pop up a native credential dialog whenever a 401 carries a
+/// `WWW-Authenticate: Basic` challenge — including for `fetch()`/XHR calls
+/// made by the web UI — hijacking the login screen with a Basic auth box.
+/// Package clients (pip, npm, docker, cargo, maven, …) rely on those
+/// challenges to decide how to retry with credentials, so the challenge is
+/// only suppressed when the request is identifiably browser-originated:
+///
+/// * any Fetch Metadata header (`Sec-Fetch-Mode` / `Sec-Fetch-Site`) — these
+///   are forbidden request headers that every modern browser attaches to
+///   every request (navigations *and* `fetch()`/XHR) in secure contexts, and
+///   that no package-manager client sends;
+/// * an `Accept` header explicitly listing `text/html` — the classic HTML
+///   navigation signal, covering older browsers and plain-HTTP deployments
+///   where Fetch Metadata is not sent.
+///
+/// Pure and header-only so the negotiation is unit-testable.
+pub(crate) fn is_browser_request(headers: &HeaderMap) -> bool {
+    if headers.contains_key("sec-fetch-mode") || headers.contains_key("sec-fetch-site") {
+        return true;
+    }
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("text/html"))
+}
+
 /// Build a 401 response with `WWW-Authenticate` challenges for both Basic
 /// and Bearer schemes.  Package manager clients use the challenge to decide
 /// how to retry with credentials.
@@ -1683,17 +1716,39 @@ fn is_non_mutating_format_post(path: &str) -> bool {
 /// `pub(crate)` so the WASM proxy handler (`/ext/*`) can emit the identical
 /// anonymous-denial response as this middleware (GHSA-9rqp-mgmw-5879).
 pub(crate) fn unauthorized_response() -> Response {
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header("WWW-Authenticate", "Basic realm=\"artifact-keeper\"")
-        .header(
-            "WWW-Authenticate",
-            "Bearer realm=\"artifact-keeper\", charset=\"UTF-8\"",
-        )
+    challenge_unauthorized_response(true)
+}
+
+/// Header-aware variant of [`unauthorized_response`]: browser-originated
+/// requests (see [`is_browser_request`]) get a 401 *without* the `Basic`
+/// challenge so the browser shows the web UI's login screen instead of a
+/// native Basic auth popup (#2936 / #3082). Every other caller — package
+/// managers included — receives the identical challenges as before.
+pub(crate) fn unauthorized_response_for(headers: &HeaderMap) -> Response {
+    challenge_unauthorized_response(!is_browser_request(headers))
+}
+
+/// Shared 401 builder. `challenge_basic = false` omits the `Basic` (and the
+/// cargo-only `Cargo`) challenge for browser requests, keeping the `Bearer`
+/// challenge so the response stays RFC 7235-compliant without triggering the
+/// native browser credential dialog (only `Basic` does that).
+fn challenge_unauthorized_response(challenge_basic: bool) -> Response {
+    let mut builder = Response::builder().status(StatusCode::UNAUTHORIZED);
+    if challenge_basic {
+        builder = builder.header("WWW-Authenticate", "Basic realm=\"artifact-keeper\"");
+    }
+    builder = builder.header(
+        "WWW-Authenticate",
+        "Bearer realm=\"artifact-keeper\", charset=\"UTF-8\"",
+    );
+    if challenge_basic {
         // Signals cargo 1.67+ to use the Cargo token protocol (sends the token
         // as the raw Authorization header value) rather than aborting on the
-        // Basic/Bearer challenges it does not understand.
-        .header("WWW-Authenticate", "Cargo")
+        // Basic/Bearer challenges it does not understand. Browsers never speak
+        // the cargo protocol, so this challenge is browser-suppressed too.
+        builder = builder.header("WWW-Authenticate", "Cargo");
+    }
+    builder
         .header(axum::http::header::CONTENT_TYPE, "text/plain")
         .body(axum::body::Body::from("Authentication required"))
         .unwrap()
@@ -3690,6 +3745,116 @@ mod tests {
             www_auth_values.iter().any(|v| v.starts_with("Cargo")),
             "expected a Cargo WWW-Authenticate challenge"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_browser_request / unauthorized_response_for (#2936 / #3082)
+    // -----------------------------------------------------------------------
+
+    fn challenges_of(resp: &Response) -> Vec<String> {
+        resp.headers()
+            .get_all("WWW-Authenticate")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn test_is_browser_request_sec_fetch_mode() {
+        // Modern browsers attach Fetch Metadata to every request, including
+        // the web UI's fetch()/XHR calls (Sec-Fetch-Mode: cors).
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+        headers.insert("accept", "*/*".parse().unwrap());
+        assert!(is_browser_request(&headers));
+    }
+
+    #[test]
+    fn test_is_browser_request_sec_fetch_site_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(is_browser_request(&headers));
+    }
+
+    #[test]
+    fn test_is_browser_request_html_navigation_accept() {
+        // Plain-HTTP deployments where Fetch Metadata is absent: an HTML
+        // navigation still declares text/html in Accept.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                .parse()
+                .unwrap(),
+        );
+        assert!(is_browser_request(&headers));
+    }
+
+    #[test]
+    fn test_is_browser_request_rejects_package_clients() {
+        // pip / npm / cargo / docker style requests: no Fetch Metadata, no
+        // text/html Accept. These MUST keep their native auth challenges.
+        assert!(!is_browser_request(&HeaderMap::new()));
+
+        let mut pip = HeaderMap::new();
+        pip.insert("accept", "*/*".parse().unwrap());
+        pip.insert("user-agent", "pip/24.0".parse().unwrap());
+        assert!(!is_browser_request(&pip));
+
+        let mut docker = HeaderMap::new();
+        docker.insert(
+            "accept",
+            "application/vnd.oci.image.index.v1+json".parse().unwrap(),
+        );
+        assert!(!is_browser_request(&docker));
+
+        let mut npm = HeaderMap::new();
+        npm.insert("accept", "application/json".parse().unwrap());
+        assert!(!is_browser_request(&npm));
+    }
+
+    #[test]
+    fn test_unauthorized_response_for_browser_omits_basic_and_cargo() {
+        // A browser request must not receive the Basic challenge (it would
+        // pop the native credential dialog over the login screen), nor the
+        // cargo-only challenge; the Bearer challenge keeps the response
+        // RFC 7235-compliant without triggering a popup.
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        headers.insert("accept", "text/html".parse().unwrap());
+        let resp = unauthorized_response_for(&headers);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let challenges = challenges_of(&resp);
+        assert!(
+            !challenges.iter().any(|v| v.starts_with("Basic")),
+            "browser 401 must not carry a Basic challenge, got: {challenges:?}"
+        );
+        assert!(
+            !challenges.iter().any(|v| v.starts_with("Cargo")),
+            "browser 401 must not carry a Cargo challenge, got: {challenges:?}"
+        );
+        assert!(
+            challenges.iter().any(|v| v.starts_with("Bearer")),
+            "browser 401 must keep the Bearer challenge, got: {challenges:?}"
+        );
+    }
+
+    #[test]
+    fn test_unauthorized_response_for_package_client_keeps_all_challenges() {
+        // Non-browser callers get the byte-identical challenge set as the
+        // headerless unauthorized_response().
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "*/*".parse().unwrap());
+        let resp = unauthorized_response_for(&headers);
+        assert_eq!(
+            challenges_of(&resp),
+            challenges_of(&unauthorized_response())
+        );
+        let challenges = challenges_of(&resp);
+        assert!(challenges.iter().any(|v| v.starts_with("Basic")));
+        assert!(challenges.iter().any(|v| v.starts_with("Bearer")));
+        assert!(challenges.iter().any(|v| v.starts_with("Cargo")));
     }
 
     #[test]

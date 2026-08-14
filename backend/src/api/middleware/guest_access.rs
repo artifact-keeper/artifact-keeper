@@ -51,7 +51,8 @@ use axum::{
 use serde_json::json;
 
 use crate::api::middleware::auth::{
-    extract_visibility_token, service_unavailable_response, try_resolve_auth_outcome, AuthOutcome,
+    extract_visibility_token, is_browser_request, service_unavailable_response,
+    try_resolve_auth_outcome, AuthOutcome,
 };
 use crate::services::auth_service::AuthService;
 
@@ -101,7 +102,16 @@ fn is_allowlisted(path: &str) -> bool {
 /// Includes `WWW-Authenticate` headers (Basic, Bearer, Cargo) so
 /// RFC 7235-compliant clients (Maven, pip, npm, etc.) can determine
 /// the auth scheme and retry with credentials.
-fn unauthorized_response() -> Response {
+///
+/// When the request is browser-originated (`for_browser`, see
+/// [`is_browser_request`]), the `Basic` and `Cargo` challenges are omitted so
+/// the browser does not raise its native Basic credential popup over the web
+/// UI's own login screen (#2936 / #3082). The `Bearer` challenge is kept for
+/// RFC 7235 compliance — it never triggers a popup — and the web UI reacts to
+/// the 401 body by routing to its login / OIDC flow. Package-manager clients
+/// (pip, npm, docker, cargo, maven, …) are never classified as browsers and
+/// keep the full challenge set.
+fn unauthorized_response(for_browser: bool) -> Response {
     let mut response = (
         StatusCode::UNAUTHORIZED,
         Json(json!({
@@ -111,17 +121,21 @@ fn unauthorized_response() -> Response {
     )
         .into_response();
 
-    response.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Basic realm=\"artifact-keeper\""),
-    );
+    if !for_browser {
+        response.headers_mut().append(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"artifact-keeper\""),
+        );
+    }
     response.headers_mut().append(
         header::WWW_AUTHENTICATE,
         HeaderValue::from_static("Bearer realm=\"artifact-keeper\", charset=\"UTF-8\""),
     );
-    response
-        .headers_mut()
-        .append(header::WWW_AUTHENTICATE, HeaderValue::from_static("Cargo"));
+    if !for_browser {
+        response
+            .headers_mut()
+            .append(header::WWW_AUTHENTICATE, HeaderValue::from_static("Cargo"));
+    }
 
     response
 }
@@ -133,7 +147,10 @@ fn unauthorized_response() -> Response {
 /// retryable **503**, NOT a 401. Collapsing it into the "unauthenticated" 401
 /// would make valid credentials fail under transient auth-cap saturation. Kept
 /// as a pure function so the mapping is unit-testable without a live auth backend.
-fn guard_short_circuit(outcome: &AuthOutcome) -> Option<Response> {
+///
+/// `for_browser` selects the popup-free challenge variant of the 401 for
+/// browser-originated requests (#2936 / #3082); it never changes the status.
+fn guard_short_circuit(outcome: &AuthOutcome, for_browser: bool) -> Option<Response> {
     match outcome {
         // A principal resolved — let the request through; inner middlewares
         // re-resolve and populate request extensions for handlers.
@@ -141,7 +158,9 @@ fn guard_short_circuit(outcome: &AuthOutcome) -> Option<Response> {
         // Transient bcrypt-capacity shed: retryable 503, never a 401.
         AuthOutcome::Overloaded => Some(service_unavailable_response()),
         // No/invalid credential presented: guest access is disabled → 401.
-        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => Some(unauthorized_response()),
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => {
+            Some(unauthorized_response(for_browser))
+        }
     }
 }
 
@@ -182,7 +201,12 @@ pub async fn guest_access_guard(
     // `allow_basic_api_token=false` and still refuse an API token as the Basic
     // password on the management API.
     let outcome = try_resolve_auth_outcome(&state.auth_service, extracted, true).await;
-    match guard_short_circuit(&outcome) {
+    // Browser-originated requests get the popup-free 401 variant so the web
+    // UI can show its login / OIDC screen instead of the native Basic dialog
+    // (#2936 / #3082). Classified from request headers only (Fetch Metadata /
+    // `Accept: text/html`), so package clients are unaffected.
+    let for_browser = is_browser_request(request.headers());
+    match guard_short_circuit(&outcome, for_browser) {
         Some(response) => response,
         None => next.run(request).await,
     }
@@ -262,8 +286,8 @@ mod tests {
         // retryable 503 through the guard. Collapsing it into the
         // GUEST_ACCESS_DISABLED 401 is what broke preemptive-auth clients
         // (twine, uv/pip token-in-url, CI X-API-Key) under concurrent load.
-        let resp =
-            guard_short_circuit(&AuthOutcome::Overloaded).expect("Overloaded must short-circuit");
+        let resp = guard_short_circuit(&AuthOutcome::Overloaded, false)
+            .expect("Overloaded must short-circuit");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             resp.headers().contains_key(axum::http::header::RETRY_AFTER),
@@ -273,14 +297,14 @@ mod tests {
 
     #[test]
     fn short_circuit_no_credential_is_401() {
-        let resp = guard_short_circuit(&AuthOutcome::NoCredential)
+        let resp = guard_short_circuit(&AuthOutcome::NoCredential, false)
             .expect("NoCredential must short-circuit");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn short_circuit_invalid_credential_is_401() {
-        let resp = guard_short_circuit(&AuthOutcome::InvalidCredential)
+        let resp = guard_short_circuit(&AuthOutcome::InvalidCredential, false)
             .expect("InvalidCredential must short-circuit");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -289,7 +313,7 @@ mod tests {
 
     #[test]
     fn unauthorized_response_status_and_body() {
-        let resp = unauthorized_response();
+        let resp = unauthorized_response(false);
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let ct = resp
             .headers()
@@ -301,7 +325,7 @@ mod tests {
 
     #[test]
     fn unauthorized_response_includes_www_authenticate_basic() {
-        let resp = unauthorized_response();
+        let resp = unauthorized_response(false);
         let challenges: Vec<&str> = resp
             .headers()
             .get_all(header::WWW_AUTHENTICATE)
@@ -317,7 +341,7 @@ mod tests {
 
     #[test]
     fn unauthorized_response_includes_www_authenticate_bearer() {
-        let resp = unauthorized_response();
+        let resp = unauthorized_response(false);
         let challenges: Vec<&str> = resp
             .headers()
             .get_all(header::WWW_AUTHENTICATE)
@@ -333,7 +357,7 @@ mod tests {
 
     #[test]
     fn unauthorized_response_includes_www_authenticate_cargo() {
-        let resp = unauthorized_response();
+        let resp = unauthorized_response(false);
         let challenges: Vec<&str> = resp
             .headers()
             .get_all(header::WWW_AUTHENTICATE)
@@ -344,6 +368,67 @@ mod tests {
             challenges.contains(&"Cargo"),
             "expected Cargo challenge, got: {:?}",
             challenges
+        );
+    }
+
+    // -- browser variant of the 401 (#2936 / #3082) --
+
+    #[test]
+    fn unauthorized_response_browser_omits_basic_and_cargo_keeps_bearer() {
+        // A browser must not receive the Basic challenge (it raises the
+        // native credential popup over the web UI's login screen), nor the
+        // cargo-only challenge; Bearer stays for RFC 7235 compliance.
+        let resp = unauthorized_response(true);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let challenges: Vec<&str> = resp
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(
+            !challenges.iter().any(|v| v.starts_with("Basic")),
+            "browser 401 must not carry a Basic challenge, got: {:?}",
+            challenges
+        );
+        assert!(
+            !challenges.contains(&"Cargo"),
+            "browser 401 must not carry a Cargo challenge, got: {:?}",
+            challenges
+        );
+        assert!(
+            challenges.contains(&"Bearer realm=\"artifact-keeper\", charset=\"UTF-8\""),
+            "browser 401 must keep the Bearer challenge, got: {:?}",
+            challenges
+        );
+    }
+
+    #[test]
+    fn unauthorized_response_browser_keeps_json_body_marker() {
+        // The web UI keys off the GUEST_ACCESS_DISABLED error to route to its
+        // login/OIDC flow; the browser variant must keep the same JSON shape.
+        let resp = unauthorized_response(true);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        assert!(ct.starts_with("application/json"));
+    }
+
+    #[test]
+    fn short_circuit_browser_flag_selects_popup_free_401() {
+        let resp = guard_short_circuit(&AuthOutcome::NoCredential, true)
+            .expect("NoCredential must short-circuit");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !resp
+                .headers()
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .any(|v| v.starts_with("Basic")),
+            "browser short-circuit must not carry a Basic challenge"
         );
     }
 
@@ -428,6 +513,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guard_blocks_browser_without_basic_challenge_when_disabled() {
+        // Browser fetch()/navigation (identified by Fetch Metadata) must get
+        // a 401 WITHOUT a Basic challenge so no native popup appears and the
+        // web UI can route to its login/OIDC screen (#2936 / #3082).
+        let app = make_app(make_state(false));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/repositories")
+                    .header("sec-fetch-mode", "cors")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !resp
+                .headers()
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .any(|v| v.starts_with("Basic")),
+            "browser request must not receive a Basic challenge"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_blocks_package_client_with_basic_challenge_when_disabled() {
+        // Package-manager clients (no Fetch Metadata, no text/html Accept)
+        // must keep the native Basic/Bearer/Cargo challenges so they can
+        // retry with credentials.
+        let app = make_app(make_state(false));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/repositories")
+                    .header("accept", "*/*")
+                    .header("user-agent", "pip/24.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let challenges: Vec<String> = resp
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(String::from)
+            .collect();
+        assert!(
+            challenges.iter().any(|v| v.starts_with("Basic")),
+            "package client must keep the Basic challenge, got: {:?}",
+            challenges
+        );
+        assert!(
+            challenges.iter().any(|v| v == "Cargo"),
+            "package client must keep the Cargo challenge, got: {:?}",
+            challenges
+        );
     }
 
     #[tokio::test]

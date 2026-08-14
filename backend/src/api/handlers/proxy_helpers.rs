@@ -1147,9 +1147,14 @@ pub async fn proxy_fetch_or_redirect(
 
     // Slow path: cache miss / expired / presigned disabled. The fetch
     // populates the proxy cache so a subsequent presigned redirect on the
-    // *next* request can take the fast path above.
-    let (content, content_type) =
-        proxy_fetch(proxy_service, repo_id, repo_key, upstream_url, path).await?;
+    // *next* request can take the fast path above. The buffered body is
+    // served VERBATIM below, so the upstream `Content-Encoding` is carried
+    // along and re-declared (RFC 9110 §8.4, #3273) — nothing on this path
+    // decodes, and an adopter of this helper must not inherit the #3149
+    // mislabeling silently.
+    let (content, content_type, content_encoding) =
+        proxy_fetch_with_cache_key(proxy_service, repo_id, repo_key, upstream_url, path, path)
+            .await?;
 
     // If presigned is configured, prefer redirecting to the just-populated
     // cache entry over streaming the buffered content back to the client.
@@ -1171,13 +1176,14 @@ pub async fn proxy_fetch_or_redirect(
         }
     }
 
-    let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", ct)
-        .header("content-length", content.len().to_string())
-        .body(axum::body::Body::from(content))
-        .unwrap())
+    // Verbatim buffered serve: re-declare the upstream coding when present
+    // (#3273), with `Content-Length` describing the coded bytes actually sent.
+    Ok(forward_verbatim_metadata(
+        content,
+        content_type,
+        "application/octet-stream",
+        content_encoding,
+    ))
 }
 
 /// Try to short-circuit a proxy-cache hit into a presigned redirect, without
@@ -2702,23 +2708,24 @@ where
 /// Suitable for metadata endpoints where only one upstream response is
 /// needed (go .info/.mod metadata, hex package, rubygems gem info).
 ///
-/// `transform` receives `(body, content_encoding, member_key)`, where
-/// `content_encoding` is the upstream `Content-Encoding` of that body
-/// (#3260). The body is the member upstream's bytes AS TRANSFERRED — nothing
-/// on this path decodes (`http_client::base_client_builder` disables every
-/// codec and advertises `Accept-Encoding: identity`) — so a transform that
-/// forwards the bytes verbatim must re-declare the coding (RFC 9110 §8.4),
-/// e.g. via [`forward_verbatim_metadata`]. A transform that parses or
-/// rewrites the body must decode it first and drop the coding, because the
-/// bytes it emits are no longer the bytes the coding describes. Before #3260
-/// this helper dropped the coding unconditionally, which mislabeled every
-/// coded upstream response its (all verbatim-forwarding) callers served.
-///
-/// The member's `Content-TYPE` is still dropped (both passes bind it `_ct`),
-/// so the verbatim-forwarding callers each hardcode a literal and can
-/// disagree with the Remote arm of the same endpoint. Pre-existing and NOT
-/// addressed by #3260 — tracked in #3281, which widens this seam once more
-/// rather than twice.
+/// `transform` receives `(body, content_type, content_encoding, member_key)`,
+/// where `content_type` and `content_encoding` are the upstream
+/// `Content-Type` / `Content-Encoding` of that body (#3260 / #3281). The body
+/// is the member upstream's bytes AS TRANSFERRED — nothing on this path
+/// decodes (`http_client::base_client_builder` disables every codec and
+/// advertises `Accept-Encoding: identity`) — so a transform that forwards the
+/// bytes verbatim must re-declare the coding (RFC 9110 §8.4) and should serve
+/// the member's own `Content-Type` (§8.3), keeping its format literal only as
+/// the fallback for a member that declared none — e.g. via
+/// [`forward_verbatim_metadata`], which implements exactly that. A transform
+/// that parses or rewrites the body must decode it first and drop the coding,
+/// because the bytes it emits are no longer the bytes the coding describes.
+/// Before #3260 this helper dropped the coding unconditionally, which
+/// mislabeled every coded upstream response its (all verbatim-forwarding)
+/// callers served; before #3281 it dropped the `Content-Type` too, so a
+/// Virtual verbatim forward could disagree with the Remote arm of the same
+/// endpoint (a `mix` client got hex's signed protobuf labelled
+/// `application/json`).
 pub async fn resolve_virtual_metadata<F, Fut>(
     db: &PgPool,
     proxy_service: Option<&ProxyService>,
@@ -2727,7 +2734,7 @@ pub async fn resolve_virtual_metadata<F, Fut>(
     transform: F,
 ) -> Result<Response, Response>
 where
-    F: Fn(Bytes, Option<String>, String) -> Fut,
+    F: Fn(Bytes, Option<String>, Option<String>, String) -> Fut,
     Fut: std::future::Future<Output = Result<Response, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
@@ -2756,8 +2763,8 @@ where
             // (warm path never fans out) while a held entry is skipped rather
             // than served raw. A fresh hit is transformed into the response.
             match proxy.cached_metadata_if_servable(member, path).await {
-                Ok(Some((bytes, _ct, enc))) => {
-                    match transform(bytes, enc, member.key.clone()).await {
+                Ok(Some((bytes, ct, enc))) => {
+                    match transform(bytes, ct, enc, member.key.clone()).await {
                         Ok(response) => (
                             MemberCacheClass::DefiniteHit,
                             Some(MemberResolveOutcome::Hit(response)),
@@ -2801,7 +2808,8 @@ where
             };
             // The cache-keyed fetch is `proxy_fetch` with `fetch_path ==
             // cache_path`, widened to also report the upstream
-            // `Content-Encoding` (#3260) so the transform can re-declare it.
+            // `Content-Encoding` (#3260) and `Content-Type` (#3281) so the
+            // transform can re-declare them.
             match proxy_fetch_with_cache_key(
                 proxy,
                 member.id,
@@ -2812,7 +2820,7 @@ where
             )
             .await
             {
-                Ok((bytes, _ct, enc)) => match transform(bytes, enc, member.key.clone()).await {
+                Ok((bytes, ct, enc)) => match transform(bytes, ct, enc, member.key.clone()).await {
                     Ok(response) => MemberResolveOutcome::Hit(response),
                     Err(_) => {
                         tracing::warn!(
@@ -2995,14 +3003,22 @@ pub fn stricter_scan_policy(
 /// The effective proxy-scan policy for a Virtual repo resolving an artifact
 /// from a member (#3023): the stricter-of-two over the virtual's own config and
 /// the member's (see [`stricter_scan_policy`]). Callers gate on the returned
-/// `enabled` and thread the returned `action` into the per-format scan gate so
-/// the virtual path enforces the same digest-keyed verdict as a direct pull.
+/// `enabled` and thread the returned `action` and severity gate into the
+/// per-format scan gate so the virtual path enforces the same digest-keyed
+/// verdict as a direct pull. The severity gate combines stricter-of-two the
+/// same way (#3243 stage 3): `BlockOnAny` on either side dominates, so a
+/// virtual that has not opted into threshold gating cannot become the lax
+/// route around a member's block-on-any posture, and vice versa.
 pub async fn effective_virtual_scan_policy(
     db: &PgPool,
     virtual_id: Uuid,
     member_id: Uuid,
-) -> (bool, crate::services::proxy_scan_service::ProxyScanAction) {
-    use crate::services::proxy_scan_service::ProxyScanAction;
+) -> (
+    bool,
+    crate::services::proxy_scan_service::ProxyScanAction,
+    crate::services::proxy_scan_service::ProxySeverityGate,
+) {
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
     let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
     let virtual_enabled = svc.is_proxy_scan_enabled(virtual_id).await.unwrap_or(false);
     let member_enabled = svc.is_proxy_scan_enabled(member_id).await.unwrap_or(false);
@@ -3014,12 +3030,51 @@ pub async fn effective_virtual_scan_policy(
         .proxy_scan_action(member_id)
         .await
         .unwrap_or(ProxyScanAction::FailOpen);
-    stricter_scan_policy(
+    // Fail closed on a config read fault: an unreadable gate is block-on-any.
+    let virtual_gate = svc
+        .proxy_severity_gate(virtual_id)
+        .await
+        .unwrap_or(ProxySeverityGate::BlockOnAny);
+    let member_gate = svc
+        .proxy_severity_gate(member_id)
+        .await
+        .unwrap_or(ProxySeverityGate::BlockOnAny);
+    let (enabled, action) = stricter_scan_policy(
         virtual_enabled,
         virtual_action,
         member_enabled,
         member_action,
+    );
+    (
+        enabled,
+        action,
+        ProxySeverityGate::stricter(virtual_gate, member_gate),
     )
+}
+
+/// The proxy-scan `(action, severity_gate)` pair for a DIRECT (non-virtual)
+/// repo pull, with the shared fail-safe defaults: an unreadable action is
+/// fail-open (availability-first, matching the column default) while an
+/// unreadable severity gate is block-on-any (the fail-closed direction —
+/// a config fault must not weaken the blocking decision, #3243).
+pub async fn direct_scan_policy(
+    db: &PgPool,
+    repo_id: Uuid,
+) -> (
+    crate::services::proxy_scan_service::ProxyScanAction,
+    crate::services::proxy_scan_service::ProxySeverityGate,
+) {
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
+    let action = svc
+        .proxy_scan_action(repo_id)
+        .await
+        .unwrap_or(ProxyScanAction::FailOpen);
+    let gate = svc
+        .proxy_severity_gate(repo_id)
+        .await
+        .unwrap_or(ProxySeverityGate::BlockOnAny);
+    (action, gate)
 }
 
 /// Fetch virtual repository member repos sorted by priority.
@@ -6290,6 +6345,34 @@ pub(crate) enum ProxyScanServeOutcome {
 ///
 /// `synthetic` is the format-specific scan identity for these bytes; it is
 /// also what the async fail-open scan runs over.
+/// Does a stored BLOCKING (`vulnerable`) verdict row still block under the
+/// repo's severity gate (#3243 stage 3 / #3246)?
+///
+/// Pure so the fail-closed edges are unit-testable without a DB:
+/// * a verdict whose stored `max_severity` is KNOWN and strictly below an
+///   opted-in threshold is released (the manifest serves);
+/// * an absent or unparseable stored `max_severity` (legacy rows) blocks even
+///   under a configured threshold — never fail-open on an ungraded verdict;
+/// * a missing row blocks (the caller only asks on `BlockCached`, where a row
+///   is present; `None` is the defensive arm and takes the strict answer);
+/// * `ProxySeverityGate::BlockOnAny` (every repo that has not opted in via
+///   `block_on_policy_violation`) blocks unconditionally — the historical
+///   posture, byte-for-byte.
+pub(crate) fn stored_verdict_blocks_under_gate(
+    row: Option<&crate::services::proxy_scan_service::ProxyScanRow>,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+) -> bool {
+    let row_max_severity = row.and_then(|r| {
+        r.max_severity
+            .as_deref()
+            .and_then(crate::models::security::Severity::from_str_loose)
+    });
+    match row {
+        None => true,
+        Some(_) => severity_gate.blocks(row_max_severity),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn gate_proxy_scan_serve(
     state: &crate::api::SharedState,
@@ -6299,6 +6382,7 @@ pub(crate) async fn gate_proxy_scan_serve(
     synthetic: crate::models::artifact::Artifact,
     bytes: &Bytes,
     action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     identity: ProxyScanIdentity,
     mode: ProxyScanMode,
 ) -> ProxyScanServeOutcome {
@@ -6327,6 +6411,17 @@ pub(crate) async fn gate_proxy_scan_serve(
         Utc::now(),
     ) {
         ServeDecision::BlockCached => {
+            // #3243 stage 3 / #3246: a repo that explicitly opted in via
+            // `block_on_policy_violation` applies its `severity_threshold` to
+            // the stored verdict — see [`stored_verdict_blocks_under_gate`].
+            if !stored_verdict_blocks_under_gate(row.as_ref(), severity_gate) {
+                tracing::info!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    "serving proxy pull: cached vulnerable verdict is below this \
+                     repo's configured severity threshold (#3243)"
+                );
+                return ProxyScanServeOutcome::Serve { pending: false };
+            }
             tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: cached vulnerable verdict");
             ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
         }
@@ -6353,7 +6448,9 @@ pub(crate) async fn gate_proxy_scan_serve(
             match proxy_scan_and_record(state, repo_id, digest, &synthetic, bytes, expected, &mode)
                 .await
             {
-                Some(verdict) if verdict.is_vulnerable() => {
+                Some(verdict)
+                    if verdict.is_vulnerable() && severity_gate.blocks(verdict.max_severity) =>
+                {
                     tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
                     ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
                 }
@@ -6420,6 +6517,59 @@ pub(crate) async fn gate_proxy_scan_serve(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // ── #3243 stage 3 / #3246: severity gate over a stored verdict ──
+
+    /// Pure decision for the `BlockCached` arm of [`gate_proxy_scan_serve`]:
+    /// a below-threshold verdict is released ONLY when the repo opted in AND
+    /// the stored severity is known; every ambiguous shape blocks.
+    #[test]
+    fn stored_verdict_severity_gate_direction() {
+        use crate::models::security::Severity;
+        use crate::services::proxy_scan_service::{ProxyScanRow, ProxySeverityGate};
+        let mk = |max_severity: Option<&str>| ProxyScanRow {
+            checksum_sha256: "deadbeef".to_string(),
+            scan_type: "grype".to_string(),
+            verdict: "vulnerable".to_string(),
+            findings_count: 3,
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 3,
+            max_severity: max_severity.map(|s| s.to_string()),
+            scanner_version: Some("grype-1.0.0".to_string()),
+            scanned_at: Utc::now(),
+        };
+        let high = ProxySeverityGate::Threshold(Severity::High);
+
+        // Not opted in: block-on-any, byte-for-byte the historical posture.
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&mk(Some("low"))),
+            ProxySeverityGate::BlockOnAny
+        ));
+        // Opted in at high: a known low verdict is released...
+        assert!(!stored_verdict_blocks_under_gate(
+            Some(&mk(Some("low"))),
+            high
+        ));
+        // ...an at/above-threshold verdict still blocks...
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&mk(Some("critical"))),
+            high
+        ));
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&mk(Some("high"))),
+            high
+        ));
+        // ...and the fail-closed edges block: absent max_severity (legacy
+        // row), unparseable token, and the defensive no-row arm.
+        assert!(stored_verdict_blocks_under_gate(Some(&mk(None)), high));
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&mk(Some("bogus"))),
+            high
+        ));
+        assert!(stored_verdict_blocks_under_gate(None, high));
+    }
 
     // ── Curation block rendering (#2930 body, #3110 structured verdict) ──
     //
@@ -14414,5 +14564,83 @@ mod tests {
             .execute(&pool)
             .await;
         db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3273: the `proxy_fetch_or_redirect` slow path (cache miss with
+    /// presigned downloads disabled) serves the buffered upstream body
+    /// VERBATIM, so an upstream `Content-Encoding` must be re-declared
+    /// (RFC 9110 §8.4) with `Content-Length` describing the coded bytes
+    /// (§8.6). Latent today — no in-tree handler calls this helper — but any
+    /// future adopter inherits the response shape asserted here instead of
+    /// silently reintroducing the #3149 mislabeling.
+    // Test reads full (small) fixture response bodies; the streaming policy
+    // (#1608) targets production code paths.
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test]
+    async fn test_proxy_fetch_or_redirect_slow_path_redeclares_content_encoding_3273_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let up = tdh::coded_and_plain_upstreams(
+            "deflate",
+            "application/octet-stream",
+            b"redirect-slow-path-3273 ",
+        )
+        .await;
+        // Presigned downloads stay at their default (disabled), which is what
+        // routes the request onto the buffered slow path under test.
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.coded_mock.uri()).await;
+        let proxy = state.proxy_service.clone().expect("proxy service wired");
+        assert!(
+            !state.config.presigned_downloads_enabled,
+            "fixture must exercise the buffered slow path"
+        );
+
+        // Unique coordinate: the helper reads through the process-global
+        // metadata LRU (#2758).
+        let path = format!("blobs/coded-{}.bin", Uuid::new_v4());
+        let resp = super::proxy_fetch_or_redirect(
+            &proxy,
+            &state,
+            fx.repo_id,
+            &fx.repo_key,
+            &up.coded_mock.uri(),
+            &path,
+            &Default::default(),
+        )
+        .await
+        .expect("slow path must serve the buffered upstream body");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (parts, body) = resp.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("read buffered body");
+        up.assert_coded_forward(&parts.headers, &body, "proxy_fetch_or_redirect slow path");
+
+        // Control: an uncoded upstream must not grow a spurious coding.
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.plain_mock.uri()).await;
+        let proxy = state.proxy_service.clone().expect("proxy service wired");
+        let path = format!("blobs/plain-{}.bin", Uuid::new_v4());
+        let resp = super::proxy_fetch_or_redirect(
+            &proxy,
+            &state,
+            fx.repo_id,
+            &fx.repo_key,
+            &up.plain_mock.uri(),
+            &path,
+            &Default::default(),
+        )
+        .await
+        .expect("slow path must serve the buffered upstream body");
+        let (parts, body) = resp.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("read buffered body");
+        up.assert_plain_forward(&parts.headers, &body, "control slow path");
+
+        fx.teardown().await;
     }
 }
