@@ -11001,6 +11001,69 @@ mod tests {
         }
     }
 
+    /// `dedupe_packages` was reimplemented from a per-package linear scan to
+    /// an index when the CVE scanner started reporting its full component
+    /// catalogue (the quadratic form ran inline on the proxy download path).
+    /// The observable contract must be identical: `(name, version)` identity,
+    /// FIRST occurrence keeps its position, later duplicates only fill fields
+    /// the first left empty — they never overwrite.
+    #[test]
+    fn test_dedupe_packages_merges_partial_records_without_reordering() {
+        let p = |name: &str,
+                 version: Option<&str>,
+                 purl: Option<&str>,
+                 license: Option<&str>,
+                 source: Option<&str>| RawPackage {
+            name: name.to_string(),
+            version: version.map(str::to_string),
+            purl: purl.map(str::to_string),
+            license: license.map(str::to_string),
+            source_target: source.map(str::to_string),
+        };
+
+        let deduped = dedupe_packages(vec![
+            p("zlib", Some("1.3"), None, Some("Zlib"), None),
+            p("acme", Some("1.0"), Some("pkg:pypi/acme@1.0"), None, None),
+            // Duplicate of `zlib`: fills purl and source_target, and must NOT
+            // overwrite the license the first record already carried.
+            p(
+                "zlib",
+                Some("1.3"),
+                Some("pkg:apk/zlib@1.3"),
+                Some("OVERWRITE-ME"),
+                Some("apk"),
+            ),
+            // Same name, different version: a distinct component.
+            p("zlib", Some("1.4"), None, None, None),
+            // Same name, NO version: distinct again (None is its own key).
+            p("zlib", None, None, None, None),
+        ]);
+
+        let identity: Vec<(&str, Option<&str>)> = deduped
+            .iter()
+            .map(|x| (x.name.as_str(), x.version.as_deref()))
+            .collect();
+        assert_eq!(
+            identity,
+            vec![
+                ("zlib", Some("1.3")),
+                ("acme", Some("1.0")),
+                ("zlib", Some("1.4")),
+                ("zlib", None),
+            ],
+            "first occurrence keeps its position; only exact (name, version) \
+             duplicates collapse"
+        );
+        assert_eq!(deduped[0].purl.as_deref(), Some("pkg:apk/zlib@1.3"));
+        assert_eq!(deduped[0].source_target.as_deref(), Some("apk"));
+        assert_eq!(
+            deduped[0].license.as_deref(),
+            Some("Zlib"),
+            "a later duplicate fills gaps, it never overwrites"
+        );
+        assert!(dedupe_packages(Vec::new()).is_empty());
+    }
+
     #[test]
     fn test_dedupe_findings_merges_the_pinned_wheel_duplicate() {
         // The reproducer from the bug report: `requests 2.32.5`, one real
