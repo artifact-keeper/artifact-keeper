@@ -622,13 +622,61 @@ fn first_xff_token_in(headers: &axum::http::HeaderMap) -> Option<&str> {
 /// diving further left into attacker-controlled text; empty tokens carry no
 /// information and are skipped. `None` is also returned when every token is
 /// trusted (no client IP recoverable from the header).
+///
+/// ⚠️ Walks **every** `X-Forwarded-For` field line, last line first, not just
+/// the first one (#3372). RFC 9110 §5.2 makes repeated field lines equivalent
+/// to the comma-joined value *in order*, and proxies differ in which they
+/// emit: Caddy merges into one line, but HAProxy (`option forwardfor`), Go
+/// `net/http` reverse proxies and some Envoy configurations `Add` a second
+/// line. Reading only `headers.get()` there returns the ATTACKER's line —
+/// theirs arrives first — and the walk never sees the trusted proxy's own
+/// append, leaving GHSA-8jm4-4x6c-6787 unmitigated for those topologies.
+///
+/// Tokens are stripped of an optional `:port` suffix and `[..]` brackets
+/// before parsing: Azure Application Gateway appends `1.2.3.4:5678` and some
+/// proxies append `[2001:db8::1]`, and treating either as unparseable aborted
+/// the walk and silently collapsed every client onto the shared peer bucket.
+/// Strip the decorations real proxies add to an `X-Forwarded-For` token so it
+/// parses as a bare `IpAddr`: surrounding whitespace, `[..]` brackets around an
+/// IPv6 literal, and a trailing `:port`.
+///
+/// A bare IPv6 address contains multiple colons and must NOT be truncated at
+/// one, so a `:port` is only stripped when the remainder still looks like an
+/// address (bracketed form, or a single colon as in `1.2.3.4:5678`).
+fn normalize_xff_token(token: &str) -> &str {
+    let t = token.trim();
+    if let Some(rest) = t.strip_prefix('[') {
+        // `[2001:db8::1]` or `[2001:db8::1]:443`
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+        return t;
+    }
+    if t.matches(':').count() == 1 {
+        // `1.2.3.4:5678` — an IPv4 address with a port. A bare IPv6 always
+        // has two or more colons, so this cannot truncate one.
+        if let Some((host, _port)) = t.rsplit_once(':') {
+            return host;
+        }
+    }
+    t
+}
+
 fn rightmost_untrusted_xff_token(
     headers: &axum::http::HeaderMap,
     trusted_proxies: &[CidrRange],
 ) -> Option<IpAddr> {
-    let xff = headers.get("x-forwarded-for")?.to_str().ok()?;
-    for token in xff.split(',').rev() {
-        let token = token.trim();
+    // Last field line first, then tokens right-to-left within each line.
+    let lines: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    for token in lines.iter().rev().flat_map(|line| line.split(',').rev()) {
+        let token = normalize_xff_token(token);
         if token.is_empty() {
             continue;
         }
@@ -741,6 +789,122 @@ pub(crate) fn resolve_client_ip_addr(
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
+
+    // ---- GHSA-8jm4 follow-up: multi-line XFF + token normalization (#3372) ----
+
+    fn xff_lines(lines: &[&str]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for l in lines {
+            h.append(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_str(l).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// REVERT-PROOF for the core defect. A proxy that `Add`s its own field
+    /// line (HAProxy `option forwardfor`, Go `net/http`, some Envoy configs)
+    /// puts the ATTACKER's line first. Reading only `headers.get()` returns
+    /// `9.9.9.9` and the walk never sees the trusted proxy's own append, so
+    /// the attacker controls the rate-limit key — the advisory, unmitigated.
+    #[test]
+    fn xff_walks_every_field_line_not_just_the_first() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        // line 1 = attacker-supplied; line 2 = the trusted proxy's observation
+        let headers = xff_lines(&["9.9.9.9", "203.0.113.9, 172.30.0.5"]);
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &trusted),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap()),
+            "must select the client observed by the trusted proxy, not the attacker's first line"
+        );
+    }
+
+    /// The attacker cannot win by making their line the LAST one either: the
+    /// walk starts at the right, and their token is not inside a trusted CIDR,
+    /// so it is only selected if no trusted hop appended after it. Here the
+    /// real proxy's line is last, so its observation wins.
+    #[test]
+    fn xff_attacker_line_does_not_win_when_proxy_appends_after() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        let headers = xff_lines(&["1.2.3.4, 9.9.9.9", "203.0.113.9, 172.30.0.5"]);
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &trusted),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    /// Single merged line (Caddy, the shipped compose stack) is unchanged.
+    #[test]
+    fn xff_single_merged_line_still_selects_rightmost_untrusted() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        let headers = xff_lines(&["9.9.9.9, 203.0.113.9, 172.30.0.5"]);
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &trusted),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    /// Azure Application Gateway appends `ip:port`. Pre-fix that token failed
+    /// to parse, aborted the walk, and silently collapsed every client onto
+    /// the shared TCP-peer bucket.
+    #[test]
+    fn xff_strips_port_suffix_from_ipv4_token() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        let headers = xff_lines(&["203.0.113.9:5678, 172.30.0.5"]);
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &trusted),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    /// Bracketed IPv6, with and without a port.
+    #[test]
+    fn xff_strips_brackets_from_ipv6_token() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        for tok in ["[2001:db8::1]", "[2001:db8::1]:443"] {
+            let headers = xff_lines(&[&format!("{tok}, 172.30.0.5")]);
+            assert_eq!(
+                rightmost_untrusted_xff_token(&headers, &trusted),
+                Some("2001:db8::1".parse::<IpAddr>().unwrap()),
+                "failed for {tok}"
+            );
+        }
+    }
+
+    /// A BARE IPv6 address has multiple colons and must never be truncated at
+    /// one — the port-strip must not corrupt it.
+    #[test]
+    fn xff_bare_ipv6_is_not_truncated_by_port_strip() {
+        assert_eq!(normalize_xff_token("2001:db8::1"), "2001:db8::1");
+        assert_eq!(normalize_xff_token(" 2001:db8::1 "), "2001:db8::1");
+        // single-colon IPv6 is not representable, so this is unambiguously host:port
+        assert_eq!(normalize_xff_token("1.2.3.4:5678"), "1.2.3.4");
+        assert_eq!(normalize_xff_token("1.2.3.4"), "1.2.3.4");
+    }
+
+    /// Every token trusted → no client IP recoverable → caller uses the peer.
+    #[test]
+    fn xff_all_trusted_yields_none() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        let headers = xff_lines(&["172.30.0.9", "172.30.0.5"]);
+        assert_eq!(rightmost_untrusted_xff_token(&headers, &trusted), None);
+    }
+
+    /// Empty trusted list must fail CLOSED (fall back to the TCP peer), never
+    /// open onto attacker-controlled header text.
+    #[test]
+    fn xff_empty_trusted_list_selects_rightmost_and_caller_falls_back() {
+        let headers = xff_lines(&["9.9.9.9, 203.0.113.9"]);
+        // With nothing trusted, the rightmost token is returned; the CALLER
+        // (resolve_client_ip_addr) only consults this when the peer is itself
+        // trusted, which an empty list makes impossible.
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &[]),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap())
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

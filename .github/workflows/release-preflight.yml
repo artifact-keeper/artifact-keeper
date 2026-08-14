@@ -10,7 +10,8 @@ name: Release Preflight
 # from release/1.6.x to main).
 #
 # This publishes NOTHING. It only reads: the repo tree, the .trivyignore of
-# active release/* branches, the latest main Docker Publish run status, and
+# active release/* branches, the status of the Docker Publish run for the
+# exact commit being checked (selected by head_sha, not recency -- #3338), and
 # the manifests of already-published component images (check 4, #3339).
 # A red run means "do not tag yet"; a green run means main is safe to cut.
 

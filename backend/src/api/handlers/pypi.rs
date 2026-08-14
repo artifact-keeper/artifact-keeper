@@ -1937,6 +1937,10 @@ async fn serve_virtual_metadata(
         // PEP 658 metadata is not hash-tied to the distribution, so pip would
         // resolve against one package's dependencies and install another's,
         // with nothing anywhere to detect it.
+
+        // Set when this member owns the name but its bytes are temporarily
+        // unavailable; confines the fallback to this member (#3372).
+        let mut owns_unavailable_bytes = false;
         match serve_metadata(
             state,
             &state.db,
@@ -1948,6 +1952,20 @@ async fn serve_virtual_metadata(
         {
             Ok(response) => return Ok(response),
             Err(response) if response.status() == StatusCode::NOT_FOUND => {}
+            // 507: this member HAS an `artifacts` row for the file, but
+            // storage could not produce the bytes even after the coordinated
+            // re-read. That is NOT "this member does not have it" -- the
+            // member owns the name, so falling through to a lower-priority
+            // member would serve THAT member's upstream METADATA for a
+            // distribution this one owns. We still try this member's OWN
+            // upstream (same provenance the wheel would resolve to), but the
+            // flag below stops resolution at this member either way (#3372).
+            Err(response) if response.status() == StatusCode::INSUFFICIENT_STORAGE => {
+                owns_unavailable_bytes = true;
+                if first_member_error.is_none() {
+                    first_member_error = Some(response);
+                }
+            }
             // A non-404 here is a storage or DB fault, or a 503 from the
             // decode-permit fast-fail -- not "this member does not have it".
             // Swallowing it would fall through to a lower-priority REMOTE
@@ -2010,6 +2028,21 @@ async fn serve_virtual_metadata(
             }
         } else {
             // Local storage was already tried for this member above.
+            //
+            // A Local/Staging member that owns the name but could not produce
+            // its bytes must not fall through either. `pypi_virtual_isolates_name`
+            // does suppress lower-priority Remotes for a Local-owned name, so
+            // this is belt-and-braces — but the substitution guard should not
+            // depend on a second mechanism agreeing with it (#3372).
+            if owns_unavailable_bytes {
+                return Err(first_member_error.take().unwrap_or_else(|| {
+                    (
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        "artifact metadata unavailable; retry later",
+                    )
+                        .into_response()
+                }));
+            }
             continue;
         };
 
@@ -2028,10 +2061,24 @@ async fn serve_virtual_metadata(
         // 404.
         match result {
             Ok(response) => return Ok(response),
-            Err(response) if response.status() == StatusCode::NOT_FOUND => continue,
             Err(response) => {
-                if first_member_error.is_none() {
+                if response.status() != StatusCode::NOT_FOUND && first_member_error.is_none() {
                     first_member_error = Some(response);
+                }
+                // This member owns the name (it holds an `artifacts` row for
+                // the file) and neither its storage nor its own upstream could
+                // serve it. Stop here rather than letting a lower-priority
+                // member answer for a name it does not own -- that is the
+                // metadata/wheel mismatch the local-first ordering exists to
+                // prevent (#3372).
+                if owns_unavailable_bytes {
+                    return Err(first_member_error.take().unwrap_or_else(|| {
+                        (
+                            StatusCode::INSUFFICIENT_STORAGE,
+                            "artifact metadata unavailable; retry later",
+                        )
+                            .into_response()
+                    }));
                 }
                 continue;
             }
@@ -3828,27 +3875,40 @@ async fn serve_metadata(
 
     // Try to extract METADATA from the package file
     let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(|e| match e {
-            // A NotFound here means the artifacts row promised bytes that
-            // storage cannot produce — durably, not transiently. For the
-            // caller that is "this repository does not have it", the same
-            // stance #3147 takes on the download path for a missing cached
-            // object. Mapping it through the blanket storage-error 500 made
-            // the virtual member loop's non-404 propagation (a deliberate
-            // #3179 dependency-confusion guard against TRANSIENT faults)
-            // pin every retry to a permanent 500 and suppress the same
-            // member's own upstream fallback (#3366). There are no local
-            // bytes for a fallback to mismatch against, so 404 is the one
-            // honest answer.
-            AppError::NotFound(_) => {
-                AppError::NotFound(format!("Metadata source not available: {}", filename))
-                    .into_response()
-            }
-            other => map_storage_err(other),
-        })?;
+    let content = match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => bytes,
+        // A storage NotFound on a row we just read is the "row present,
+        // object absent" state — and in this codebase that state is TRANSIENT
+        // until proven otherwise. `coordinated_retry_get` is the download
+        // path's handling of exactly it (#1609/#3147): take the cluster-wide
+        // hydration lease, re-read, and only if the object is *still* absent
+        // answer 507 "retry later".
+        //
+        // Do NOT map this to 404. #3366 did, and 404 is the virtual member
+        // loop's "this member does not have it" signal — the one status that
+        // lets resolution fall through to a LOWER-PRIORITY member. A Remote
+        // member carrying `artifacts` rows (direct upload, replication,
+        // promotion — see the local-first comment in `serve_virtual_metadata`)
+        // owns the name, but `pypi_virtual_isolates_name` counts only
+        // Local/Staging members, so nothing suppresses the lower-priority
+        // Remote. The result was pip resolving `Requires-Dist` from a public
+        // package while the wheel path — which DOES coordinate and retry —
+        // served the private bytes, with nothing anywhere to detect it.
+        //
+        // 507 keeps metadata and the wheel failing together, which is the
+        // invariant that matters. The caller's loop treats it as "owns the
+        // name, bytes unavailable" and confines the fallback to this member.
+        Err(AppError::NotFound(_)) => {
+            crate::api::handlers::proxy_helpers::coordinated_retry_get(
+                db,
+                artifact.id,
+                &artifact.storage_key,
+                storage.as_ref(),
+            )
+            .await?
+        }
+        Err(other) => return Err(map_storage_err(other)),
+    };
 
     // #2561: permit-scoped decode on the serve path, fast-fail 503 on
     // saturation. Only taken for the branches that actually decode an archive.

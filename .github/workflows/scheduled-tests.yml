@@ -94,7 +94,15 @@ jobs:
           cargo outdated --workspace || true
 
   security-scan:
-    name: 🔒 Security Scan
+    # Deliberately named as a non-gating REPORT (#3310): every step below ends
+    # in `|| true`, the job is in no gate predicate, and its only real output
+    # is the uploaded artifact — it succeeds whether the audit is clean, finds
+    # a critical advisory, or fails to install the tool. The enforcing cargo
+    # audit lives in ci.yml (`security-audit`, via require_success). This job
+    # must NOT share a display name with docker-publish.yml's "Security Scan",
+    # which is a hard gate — two jobs named "Security Scan" where one cannot
+    # fail made "Security Scan is green/red" a coin flip over meaning.
+    name: Security audit report (non-gating)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

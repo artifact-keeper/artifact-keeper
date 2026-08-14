@@ -458,26 +458,20 @@ jobs:
       # The nightly run on 2026-05-09 (#1128) crashed at startup with
       # `duplicate key value violates unique constraint "_sqlx_migrations_pkey"
       # Key (version)=(73)` because a forward-port attempted to reuse a slot
-      # already taken on main. A cheap filename-prefix dedup catches the
-      # entire class of failures without needing a Postgres to apply them.
+      # already taken on main; #3313 recorded the same shape as a near-miss
+      # (193 renumbered to 195 during review).
+      #
+      # MERGE-RESULT PROPERTY THIS DEPENDS ON (#3313): a duplicate version is
+      # invisible on either PR branch alone — each branch has exactly one file
+      # at the colliding number. The `pull_request` checkout above is the PR's
+      # MERGE COMMIT, which is what makes this step able to see the collision
+      # at all. Do not change this job to check out `pull_request.head`.
+      #
+      # The check itself (numeric-normalised dedup + sequence-gap warning)
+      # lives in a script so it is self-testable; its self-test runs in
+      # shell-tests.
       - name: Lint migration slots are unique
-        run: |
-          set -euo pipefail
-          # Glob-based to keep shellcheck (SC2010/SC2012) happy and handle
-          # filenames with spaces, though migrations follow `NNN_*.sql`.
-          slots=$(for f in backend/migrations/*.sql; do
-            basename "$f" | awk -F_ '{print $1}'
-          done)
-          dupes=$(echo "$slots" | sort | uniq -d)
-          if [ -n "$dupes" ]; then
-            echo "::error::duplicate migration version slot(s): $dupes"
-            pattern=$(echo "$dupes" | paste -sd'|' -)
-            for f in backend/migrations/*.sql; do
-              name=$(basename "$f")
-              echo "$name" | grep -E "^(${pattern})_" || true
-            done
-            exit 1
-          fi
+        run: ./scripts/ci/check-duplicate-migrations.sh
 
       - name: Wait for Postgres
         run: |
@@ -577,6 +571,14 @@ jobs:
       # stays offline.
       - name: Check release-preflight gates block on what they measure
         run: bash scripts/ci/test-release-preflight.sh
+
+      # Duplicate sqlx migration versions merge CLEAN and abort the backend at
+      # startup (#3313, #1128). The live gate runs in test-backend-unit against
+      # the merge result; this exercises the script's failure modes (numeric
+      # normalisation, gaps, unparseable prefixes) so the gate itself cannot
+      # silently rot. ~1s, no dependencies.
+      - name: Check duplicate-migration gate catches what it must
+        run: bash scripts/ci/test-check-duplicate-migrations.sh
 
   coverage:
     name: 📊 Code Coverage
