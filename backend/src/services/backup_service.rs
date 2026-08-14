@@ -235,6 +235,24 @@ fn validate_export_table(table: &str) -> Result<()> {
     Ok(())
 }
 
+/// Tables restored by [`BackupService::restore`], in dependency order.
+///
+/// This MUST stay in sync with [`ALLOWED_EXPORT_TABLES`]: restore rejects any
+/// table outside the allowlist (GHSA-95fx-g94v-8jqg, enforced in
+/// `restore_table`), so an allowlisted table missing here would silently never
+/// be restored. `test_restore_table_order_covers_allowlist` pins the
+/// invariant.
+const RESTORE_TABLE_ORDER: &[&str] = &[
+    "users",
+    "roles",
+    "user_roles",
+    "repositories",
+    "permission_grants",
+    "artifacts",
+    "download_statistics",
+    "api_tokens",
+];
+
 /// Build a tar.gz archive from pre-fetched table data and artifact data.
 ///
 /// Uses `tar::Builder::append_data` instead of `header.set_path` + `tar.append`
@@ -1031,21 +1049,14 @@ impl BackupService {
             }
         }
 
-        // Restore database tables in dependency order
+        // Restore database tables in dependency order. There is deliberately
+        // no catch-all pass for other `database/*.json` entries:
+        // RESTORE_TABLE_ORDER already covers every table in
+        // ALLOWED_EXPORT_TABLES, and `restore_table` rejects anything outside
+        // the allowlist (GHSA-95fx-g94v-8jqg), so unknown entries are ignored
+        // rather than inserted into attacker-chosen tables.
         if options.restore_database {
-            let table_order = [
-                "users",
-                "roles",
-                "user_roles",
-                "repositories",
-                "permission_grants",
-                "artifacts",
-                "download_statistics",
-                "api_tokens",
-            ];
-
-            // Restore ordered tables first
-            for table_name in &table_order {
+            for table_name in RESTORE_TABLE_ORDER {
                 if let Some(content) = entries.iter().find(|(p, _)| {
                     p.starts_with("database/")
                         && p.file_stem().and_then(|s| s.to_str()) == Some(table_name)
@@ -1059,29 +1070,6 @@ impl BackupService {
                             .errors
                             .push(format!("Failed to restore {}: {}", table_name, e)),
                     }
-                }
-            }
-
-            // Restore any remaining database entries not in the ordered list
-            for (path, content) in &entries {
-                if !path.starts_with("database/") {
-                    continue;
-                }
-                let table_name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown");
-                if table_order.contains(&table_name) {
-                    continue; // already restored above
-                }
-                match self.restore_table(table_name, content).await {
-                    Ok(rows) => {
-                        tracing::info!("Restored {} rows into table '{}'", rows, table_name);
-                        result.tables_restored.push(table_name.to_string());
-                    }
-                    Err(e) => result
-                        .errors
-                        .push(format!("Failed to restore {}: {}", table_name, e)),
                 }
             }
         }
@@ -1164,6 +1152,18 @@ impl BackupService {
     async fn restore_table(&self, table: &str, content: &[u8]) -> Result<usize> {
         let rows: Vec<serde_json::Value> = serde_json::from_slice(content)?;
         let mut restored = 0usize;
+
+        // GHSA-95fx-g94v-8jqg: enforce the export allowlist on the restore
+        // path too. The table name is interpolated into the INSERT below, so
+        // without this check a crafted backup archive could insert
+        // attacker-controlled rows into any alphanumeric-named table
+        // (`signing_keys`, `role_assignments`, ...).
+        if !ALLOWED_EXPORT_TABLES.contains(&table) {
+            return Err(AppError::Validation(format!(
+                "Invalid restore table: {}",
+                table
+            )));
+        }
 
         // Validate table name to prevent SQL injection (only allow alphanumeric + underscore)
         if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
@@ -2102,6 +2102,157 @@ mod tests {
             !ALLOWED_EXPORT_TABLES.contains(&"repository_permissions"),
             "ALLOWED_EXPORT_TABLES must not reference 'repository_permissions' (non-existent table)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-95fx-g94v-8jqg: restore must never ingest non-allowlisted tables.
+    //
+    // The restore path used to have a catch-all second pass that fed EVERY
+    // `database/*.json` entry in an archive to `restore_table`, which only
+    // character-validated the derived table name before interpolating it into
+    // `INSERT INTO {table} ... jsonb_populate_record(NULL::{table}, ...)`. A
+    // crafted archive could therefore insert attacker-controlled rows into any
+    // alphanumeric-named table (`signing_keys`, `audit_log`, ...). The export
+    // allowlist is now enforced on restore as well, and the catch-all pass is
+    // gone.
+    // -----------------------------------------------------------------------
+
+    /// The restore order must cover the whole allowlist; an allowlisted table
+    /// missing from it would silently never be restored now that the catch-all
+    /// second pass is gone.
+    #[test]
+    fn test_restore_table_order_covers_allowlist() {
+        for table in ALLOWED_EXPORT_TABLES {
+            assert!(
+                RESTORE_TABLE_ORDER.contains(table),
+                "allowlisted table '{}' is missing from RESTORE_TABLE_ORDER and would never be restored",
+                table
+            );
+        }
+        assert_eq!(
+            RESTORE_TABLE_ORDER.len(),
+            ALLOWED_EXPORT_TABLES.len(),
+            "RESTORE_TABLE_ORDER must not contain non-allowlisted tables"
+        );
+    }
+
+    /// `restore_table` rejects tables outside the export allowlist before any
+    /// database access, so a lazy pool (which never connects) is enough.
+    #[tokio::test]
+    async fn test_restore_table_rejects_non_allowlisted_tables() {
+        let pool = PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy should not contact the database");
+        let service = service_for(pool);
+
+        // Real tables that are NOT in the export allowlist.
+        for table in ["audit_log", "signing_keys", "role_assignments"] {
+            let err = service
+                .restore_table(table, br#"[{"id": 1}]"#)
+                .await
+                .expect_err("non-allowlisted table must be rejected");
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "expected Validation error for '{}', got {:?}",
+                table,
+                err
+            );
+        }
+
+        // Sanity: an allowlisted table still passes validation (an empty row
+        // set issues no queries, so the lazy pool is never touched).
+        assert_eq!(
+            service
+                .restore_table("users", b"[]")
+                .await
+                .expect("allowlisted table passes validation"),
+            0
+        );
+    }
+
+    /// End-to-end GHSA-95fx-g94v-8jqg regression: a crafted archive carrying a
+    /// `database/audit_log.json` entry (`audit_log` is a real table, but not
+    /// in the export allowlist) must be skipped entirely — never attempted,
+    /// never reported restored, no rows inserted. Skips cleanly when
+    /// `DATABASE_URL` is unset, like the other DB-backed tests.
+    #[tokio::test]
+    async fn test_restore_skips_non_allowlisted_table_entries() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_service::FilesystemBackend;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let dir = std::env::temp_dir().join(format!("bk-ghsa95fx-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp storage dir");
+        let backend = Arc::new(FilesystemBackend::new(dir.clone()));
+        let storage = Arc::new(StorageService::new(backend));
+        let service = BackupService::new(pool.clone(), storage);
+
+        // Crafted archive: one legitimate allowlisted table, one rogue table
+        // with attacker-controlled rows.
+        let users: &[u8] = b"[]";
+        let rogue: &[u8] = br#"[{"action": "privilege-escalation"}]"#;
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "version": "1.0",
+            "backup_id": Uuid::new_v4(),
+            "backup_type": "full",
+            "created_at": Utc::now(),
+            "database_tables": ["users", "audit_log"],
+            "artifact_count": 0,
+            "total_size_bytes": 0,
+            "checksum": ""
+        }))
+        .expect("manifest serializes");
+        let archive = build_backup_tar(&[("users", users), ("audit_log", rogue)], &[], &manifest)
+            .expect("build crafted archive");
+
+        let storage_path = format!("backups/ghsa95fx/{}.tar.gz", Uuid::new_v4());
+        service
+            .archive_storage
+            .put(&storage_path, Bytes::from(archive))
+            .await
+            .expect("write archive to storage");
+
+        let backup_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO backups (backup_type, status, storage_path, completed_at) \
+             VALUES ('full', 'completed', $1, now()) RETURNING id",
+        )
+        .bind(&storage_path)
+        .fetch_one(&pool)
+        .await
+        .expect("insert completed backup row");
+
+        let result = service
+            .restore(
+                backup_id,
+                RestoreOptions {
+                    restore_database: true,
+                    restore_artifacts: false,
+                    target_repository_id: None,
+                },
+            )
+            .await
+            .expect("restore runs");
+
+        assert!(
+            result.tables_restored.iter().any(|t| t == "users"),
+            "the allowlisted table is restored normally"
+        );
+        assert!(
+            !result.tables_restored.iter().any(|t| t == "audit_log"),
+            "GHSA-95fx-g94v-8jqg: non-allowlisted table must never be restored"
+        );
+        assert!(
+            !result.errors.iter().any(|e| e.contains("audit_log")),
+            "the rogue entry is skipped, not attempted; got {:?}",
+            result.errors
+        );
+
+        let _ = sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(backup_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------

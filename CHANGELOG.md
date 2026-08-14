@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Backup restore rejects tables outside the export allowlist** (GHSA-95fx-g94v-8jqg) - a crafted backup archive could insert attacker-controlled rows into arbitrary database tables (e.g. `user_roles`, `permission_grants`) because the restore path never consulted `ALLOWED_EXPORT_TABLES`; restore now only ingests the known table set and rejects anything else.
+- **Percent-encoded repository keys can no longer bypass repository visibility** (GHSA-fv45-mwhh-q23r) - `repo_visibility_middleware` evaluated the raw (still-encoded) path segment while handlers resolve the decoded key, so an authenticated caller with no grant could read a private repo via e.g. `/maven/privat%65/...`; the middleware now percent-decodes before lookup and fails closed with an existence-hiding 404 when no repository matches.
+- **Rate limiting no longer trusts the leftmost X-Forwarded-For entry** (GHSA-8jm4-4x6c-6787) - behind an appending trusted proxy, a client-supplied XFF prefix previously controlled the resolved client IP (bucket rotation, exemption spoofing); the resolver now walks right-to-left and selects the first non-trusted, parseable hop. No behavior change for the default compose deployment (Caddy as the single trusted proxy); multi-hop deployments must list every trusted hop in `RATE_LIMIT_TRUSTED_PROXY_CIDRS`.
+
+### Fixed
+
+- **Corrected swapped GHSA labels** in `backend/tests/security_regression_tests.rs` - the Maven LIKE-escape and IPv6/cloud-metadata SSRF regression tests were annotated with each other's advisory IDs; coverage was always correct, only the comments were wrong.
+
 ## [1.7.3] - 2026-08-13
 
 ### Note — there is no 1.7.2 release

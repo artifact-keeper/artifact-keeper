@@ -9,6 +9,7 @@
 //! - `X-API-Key: <api_token>` - API tokens via custom header
 //! - `X-NuGet-ApiKey: <api_token>` - API tokens on the NuGet push route only
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1406,11 +1407,67 @@ pub struct RepoVisibilityState {
     pub permission_service: Arc<PermissionService>,
 }
 
+/// Decode one hex digit of a percent escape; `None` for non-hex input.
+fn percent_hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode a single path segment with the same semantics axum's
+/// `PercentDecodedStr` applies to `Path<...>` route params: `%XX` escapes
+/// become their byte, everything else (including `+`, which is NOT a space in
+/// a path) stays literal, and the decoded bytes must be valid UTF-8.
+///
+/// Returns `None` when the encoding is malformed (truncated or non-hex
+/// escape) or the decoded bytes are not UTF-8 — the same conditions under
+/// which axum rejects the route-param extraction, so the caller must treat
+/// the segment as unresolvable rather than guessing at a key. The borrowed
+/// fast path avoids any allocation for the overwhelmingly common case of a
+/// segment with no `%` at all.
+fn percent_decode_path_segment(segment: &str) -> Option<Cow<'_, str>> {
+    if !segment.as_bytes().contains(&b'%') {
+        return Some(Cow::Borrowed(segment));
+    }
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hi = percent_hex_val(*bytes.get(i + 1)?)?;
+                let lo = percent_hex_val(*bytes.get(i + 2)?)?;
+                decoded.push((hi << 4) | lo);
+                i += 3;
+            }
+            b => {
+                decoded.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok().map(Cow::Owned)
+}
+
 /// Extract the repository key from a format handler request path.
 ///
 /// Format routes are nested as `/{format}/{repo_key}/...`, so the repo key
 /// is the second path segment (e.g. `/pypi/my-repo/simple/` -> `"my-repo"`).
-pub(crate) fn extract_repo_key(path: &str) -> &str {
+///
+/// The segment is percent-DECODED before it is returned (GHSA-fv45-mwhh-q23r):
+/// axum's `Path<String>` extraction percent-decodes route params, so the
+/// handler resolves the decoded key (`/maven/privat%65/...` -> `"private"`).
+/// Evaluating the RAW segment here instead made the DB lookup miss every
+/// percent-encoded spelling of a real key and dropped the request into the
+/// no-repo branch, which let any authenticated caller through with no
+/// visibility/scope/ACL check — an authenticated cross-tenant read of any
+/// private repo. Decoding with the same per-segment semantics
+/// ([`percent_decode_path_segment`]) guarantees the middleware and the
+/// handler always evaluate the SAME key.
+pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
     // Format prefix (pypi, npm, maven, ...).
@@ -1438,7 +1495,16 @@ pub(crate) fn extract_repo_key(path: &str) -> &str {
     if format == "ext" {
         segments.next(); // "<format_key>"
     }
-    segments.next().unwrap_or("")
+    let raw = segments.next().unwrap_or("");
+    match percent_decode_path_segment(raw) {
+        Some(decoded) => decoded,
+        // Malformed percent-encoding or non-UTF-8 bytes: keep the raw
+        // segment. A repository key can never contain '%' (the charset is
+        // alphanumeric plus `-`, `_`, `.`), so the lookup misses and the
+        // request fails closed in the no-repo branch — which is also what
+        // axum's own extraction rejection produces downstream.
+        None => Cow::Borrowed(raw),
+    }
 }
 
 /// Extract the credential from a conda token-channel URL path.
@@ -1742,7 +1808,10 @@ pub async fn repo_visibility_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Extract the first path segment as a potential repo key.
+    // Extract the repository key segment. The path here is the RAW request
+    // URI; `extract_repo_key` percent-decodes the segment so `repo_key` is
+    // the same decoded value the handler's `Path<String>` extraction will
+    // resolve (GHSA-fv45-mwhh-q23r).
     let path = request.uri().path().to_string();
     let repo_key = extract_repo_key(&path);
 
@@ -1756,7 +1825,7 @@ pub async fn repo_visibility_middleware(
     // without issuing their own DB lookup.
     let cached = {
         let cache = vis_state.repo_cache.read().await;
-        cache.get(repo_key).and_then(|(entry, at)| {
+        cache.get(&*repo_key).and_then(|(entry, at)| {
             if at.elapsed().as_secs() < REPO_CACHE_TTL_SECS {
                 Some(entry.clone())
             } else {
@@ -1781,7 +1850,7 @@ pub async fn repo_visibility_middleware(
                   AND key = 'index_upstream_url') AS index_upstream_url \
                  FROM repositories WHERE key = $1",
             )
-            .bind(repo_key)
+            .bind(&*repo_key)
             .fetch_optional(&vis_state.db)
             .await
             .ok()
@@ -1811,16 +1880,21 @@ pub async fn repo_visibility_middleware(
         }
     };
 
-    // If no repo found for this key, still inject Option<AuthExtension> so
-    // handlers that declare `Extension<Option<AuthExtension>>` don't fail
-    // Axum extraction with HTTP 500 (MissingExtension). The handler itself
-    // is responsible for returning the 404 once it tries to resolve the repo.
+    // No repository row matched this (decoded) key. Every format route is
+    // `/{format}/{repo_key}/...`, so a non-empty key always NAMES a repo;
+    // the only key-less paths (format roots such as `/` or `/pypi`) already
+    // returned early above. This branch therefore decides how a request that
+    // can never resolve a repo is answered, per credential state:
     //
-    // Off-boarding (#1371): an explicitly-presented credential that failed
-    // validation must produce 401 even before we know whether the repo
-    // exists. Leaking the existence of a repo via 404-vs-401 is a separate
-    // info-disclosure question (#-TBD); for now we mirror
-    // `optional_auth_middleware` and prioritise honouring the deactivation.
+    // - transient auth-capacity shed -> retryable 503;
+    // - an explicitly-presented credential that failed validation -> 401
+    //   (off-boarding, #1371: honour the deactivation even before we know
+    //   whether the repo exists);
+    // - no credential at all -> the same 401 + `WWW-Authenticate` challenge
+    //   an existing *private* repo produces (#1808, the anonymous
+    //   repo-existence oracle);
+    // - a VALID credential -> the existence-hiding 404 below
+    //   (GHSA-fv45-mwhh-q23r).
     let Some(repo) = repo else {
         let extracted = extract_visibility_token(&request);
         // Format/registry endpoint: preserve pip-netrc / Artifactory-style
@@ -1854,11 +1928,17 @@ pub async fn repo_visibility_middleware(
         if no_credential {
             return unauthorized_response();
         }
-        // Note: `credential_invalid` was captured before the match consumed
-        // `outcome`; this mirrors the pattern further down for the repo-hit
-        // branch.
-        request.extensions_mut().insert(auth_ext);
-        return next.run(request).await;
+        // GHSA-fv45-mwhh-q23r: a VALID credential whose (decoded) repo key
+        // matches no row must NOT fall through to the handler. Before this
+        // fix the request continued with no visibility/scope/ACL check at
+        // all; combined with the raw-segment lookup, `/{format}/privat%65/...`
+        // matched nothing here while the handler resolved the decoded
+        // `private` — an authenticated cross-tenant read of any private repo.
+        // Answer with the same existence-hiding 404 an authenticated
+        // non-member gets for an EXISTING private repo (`not_found_response`,
+        // mirroring REST `require_visible`), so "no such repo" and "repo you
+        // may not see" stay indistinguishable for authenticated callers too.
+        return not_found_response();
     };
 
     let is_public = repo.is_public;
@@ -3322,6 +3402,52 @@ mod tests {
         // router/handler 404s — unchanged from other formats.
         assert_eq!(extract_repo_key("/ext/pypi-custom"), "");
         assert_eq!(extract_repo_key("/ext"), "");
+    }
+
+    #[test]
+    fn test_extract_repo_key_percent_decoded() {
+        // GHSA-fv45-mwhh-q23r: axum's `Path<String>` extraction percent-decodes
+        // route params, so the middleware must evaluate the SAME decoded key.
+        // Before the fix the RAW segment (`privat%65`) was returned: the DB
+        // lookup missed, the no-repo branch let any authenticated caller
+        // through, and the handler resolved the decoded `private` — a
+        // cross-tenant read of a private repo.
+        assert_eq!(extract_repo_key("/maven/privat%65/com/acme/lib"), "private");
+        // Other key-charset characters round-trip too (`-`, `.`, `_`), and the
+        // encoding is case-insensitive hex.
+        assert_eq!(extract_repo_key("/pypi/my%2Drepo/simple/"), "my-repo");
+        assert_eq!(extract_repo_key("/npm/my%2erepo/pkg"), "my.repo");
+        assert_eq!(extract_repo_key("/npm/my%5Frepo/pkg"), "my_repo");
+        // `+` is NOT a space in a path segment (PercentDecodedStr semantics).
+        assert_eq!(extract_repo_key("/npm/my+repo/pkg"), "my+repo");
+        // Double-encoding decodes exactly once, like the handler.
+        assert_eq!(extract_repo_key("/npm/a%2520b/pkg"), "a%20b");
+        // The conda token-channel and /ext skips happen BEFORE decoding, so
+        // encoded keys under those mounts canonicalize the same way.
+        assert_eq!(
+            extract_repo_key("/conda/t/abc123token/privat%65/noarch/repodata.json"),
+            "private"
+        );
+        assert_eq!(
+            extract_repo_key("/ext/pypi-custom/privat%65/simple/"),
+            "private"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_key_invalid_percent_encoding_fails_safe() {
+        // GHSA-fv45-mwhh-q23r: malformed escapes or non-UTF-8 decode output
+        // must fail SAFE — the raw segment is returned, which can never match
+        // a repository key (keys are alphanumeric plus `-`, `_`, `.`), so the
+        // request fails closed in the middleware's no-repo branch instead of
+        // being guessed into some other key.
+        assert_eq!(extract_repo_key("/maven/privat%6/com/acme"), "privat%6");
+        assert_eq!(extract_repo_key("/maven/privat%zz/com/acme"), "privat%zz");
+        assert_eq!(extract_repo_key("/maven/privat%6x/com/acme"), "privat%6x");
+        // Trailing bare '%' at the end of the path.
+        assert_eq!(extract_repo_key("/maven/privat%"), "privat%");
+        // `%ff` decodes to a byte that is not valid UTF-8 on its own.
+        assert_eq!(extract_repo_key("/maven/privat%ff/com/acme"), "privat%ff");
     }
 
     #[test]
@@ -5906,6 +6032,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_repo_visibility_percent_encoded_key_resolves_same_repo() {
+        // GHSA-fv45-mwhh-q23r: `/pypi/privat%65/simple/` must be evaluated
+        // against the repo the HANDLER will resolve ("private"), not the raw
+        // segment. The repo below is PUBLIC and cached under the decoded key;
+        // with canonical decoding the anonymous read passes (200). Before the
+        // fix the raw key `privat%65` missed the lookup and the request fell
+        // into the no-repo branch (401 for an anonymous caller) — the visible
+        // symptom that the middleware and handler disagreed about the key.
+        let key = "private";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let resp = run_through_visibility(state, empty_get("/pypi/privat%65/simple/")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_percent_encoded_private_repo_anonymous_401() {
+        // GHSA-fv45-mwhh-q23r: same canonicalization, PRIVATE repo — the
+        // encoded spelling must hit the standard private-repo gate (401
+        // challenge for an anonymous caller), byte-for-byte the same answer
+        // as the unencoded spelling.
+        let key = "private";
+        let cached = make_cached_repo(/* is_public */ false);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let resp = run_through_visibility(state, empty_get("/pypi/privat%65/simple/")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn test_repo_visibility_private_write_with_ticket_query_returns_401() {
         // Even if a ticket somehow validated, ticket-authenticated writes are
         // refused. With the lazy pool the ticket trivially fails to resolve
@@ -6212,6 +6367,154 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "a role assignment must restore /ext access to the private repo"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Regression for GHSA-fv45-mwhh-q23r (instance 1): percent-encoded
+    /// repo-key authz bypass.
+    ///
+    /// `repo_visibility_middleware` reads the RAW request URI, but axum
+    /// percent-decodes `Path<String>` route params. Before the fix,
+    /// `GET /maven/privat%65/...` was looked up under the raw segment
+    /// `privat%65`, matched no `repositories` row, and — for any VALID
+    /// credential — fell through the no-repo branch with no
+    /// visibility/scope/ACL check, after which the handler resolved the
+    /// DECODED key `private`: an authenticated cross-tenant read of any
+    /// private repo.
+    ///
+    /// After the fix the extracted segment is percent-decoded with the same
+    /// per-segment semantics as axum, so the middleware evaluates the SAME
+    /// key the handler resolves, and a valid credential whose (decoded) key
+    /// matches no row gets the existence-hiding 404 instead of a fall-through.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset; runs for real in the
+    /// CI coverage job (which seeds Postgres before `cargo llvm-cov --lib`).
+    #[tokio::test]
+    async fn test_percent_encoded_repo_key_cannot_bypass_repo_visibility() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::user::{AuthProvider, User};
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (user_id, username) = tdh::create_user(&pool).await; // non-admin
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "maven").await; // is_public defaults false
+
+        // Mint a real access JWT for this non-admin user. AuthService is built
+        // on the real pool so the replica-safe invalidation check succeeds.
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            make_test_config_for_middleware(),
+        ));
+        let now = chrono::Utc::now();
+        let user = User {
+            id: user_id,
+            username: username.clone(),
+            email: format!("{}@test.local", username),
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin: false,
+            is_service_account: false,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: now,
+            last_login_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let bearer = format!(
+            "Bearer {}",
+            auth_service.generate_tokens(&user).unwrap().access_token
+        );
+
+        // Fresh state per request with an EMPTY repo cache, so the middleware
+        // really queries the DB with the (decoded) key instead of short-
+        // circuiting on a pre-populated entry.
+        let mk_state = || RepoVisibilityState {
+            auth_service: auth_service.clone(),
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+
+        // Percent-encode the first character of the real repo key (repo keys
+        // are alphanumeric plus `-`, `_`, `.`), e.g. `private` -> `%70rivate`.
+        // The handler's `Path<String>` extraction decodes this back to the
+        // real key; the middleware must do the same.
+        let first = repo_key.chars().next().expect("repo key is non-empty");
+        let encoded_key = format!("%{:02x}{}", first as u32, &repo_key[first.len_utf8()..]);
+        let authed_get = |key: &str| {
+            axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(format!("/maven/{}/com/example/artifact/1.0/", key))
+                .header("Authorization", &bearer)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        // 1) THE EXPLOIT: authenticated non-admin WITHOUT a grant, ENCODED
+        //    key. Before the fix this matched no row and FELL THROUGH the
+        //    no-repo branch to the handler (200 "handler-reached" in this
+        //    harness = the cross-tenant read). After the fix the decoded key
+        //    resolves the private repo and the standard gate answers the
+        //    existence-hiding 404 — the SAME response as for a nonexistent
+        //    repo (see 4).
+        let resp = run_through_visibility(mk_state(), authed_get(&encoded_key)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "percent-encoded key for a private repo must NOT bypass visibility \
+             for an authenticated non-granted caller (GHSA-fv45-mwhh-q23r)"
+        );
+
+        // 2) Parity control: the PLAIN key with the same credential gets the
+        //    same 404 — canonicalization changed WHICH key is evaluated, not
+        //    the access decision.
+        let resp = run_through_visibility(mk_state(), authed_get(&repo_key)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "encoded and plain spellings must produce the same access decision"
+        );
+
+        // 3) Grant a role assignment -> the ENCODED key now passes (200 =
+        //    reached the handler), proving the decoded key drives the same
+        //    grant evaluation as the plain key rather than failing closed for
+        //    legitimate access.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let resp = run_through_visibility(mk_state(), authed_get(&encoded_key)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a role assignment must restore access via the percent-encoded key"
+        );
+
+        // 4) Fail-closed no-repo branch: a valid credential with a
+        //    structurally-valid key that matches NO row gets the
+        //    existence-hiding 404, NOT a fall-through to the handler (which
+        //    was 200 "handler-reached" here before the fix). This is the
+        //    authenticated counterpart of the #1808 anonymous oracle closure.
+        let resp = run_through_visibility(mk_state(), authed_get("zzz-no-such-repo-9")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "authenticated caller + nonexistent repo key must get the same 404 \
+             as an inaccessible private repo (GHSA-fv45-mwhh-q23r)"
         );
 
         tdh::cleanup(&pool, repo_id, user_id).await;
