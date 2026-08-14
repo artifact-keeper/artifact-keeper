@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`auth.admin_break_glass_enabled` in `GET /api/v1/system/config`** (#2571). The public system-config endpoint now advertises whether the verified-admin break-glass local login is available, mirroring `local_login_gate` for an admin caller: `true` unless an SSO provider is enabled *and* the operator opted into strict SSO-only via `SSO_DISABLE_ADMIN_BREAK_GLASS` (#2018). This is the backend flag the login UI needs to render a discoverable "Sign in with admin" button next to the SSO buttons instead of hiding break-glass behind the undocumented `?fallback=local` parameter. Display-only: the login endpoint keeps enforcing the same policy server-side, so the flag never widens access. The existing `local_login_enabled` flag is unchanged and still only advertises the full local form on explicit `ALLOW_LOCAL_ADMIN_LOGIN=true` opt-in.
+
+### Fixed
+
+- **No more native Basic-auth popup over the login screen when guest access is disabled** (#2936, #3082). With `AK_GUEST_ACCESS_ENABLED=false`, the guest-access guard answered every unauthenticated request — including the web UI's own `fetch()` calls — with `401` + `WWW-Authenticate: Basic`, and browsers respond to that challenge by raising their native credential dialog before the user ever sees the login/OIDC page. The guard (and the optional-auth middleware's invalid-credential 401) now classify browser-originated requests via a pure header check — any Fetch Metadata header (`Sec-Fetch-Mode`/`Sec-Fetch-Site`, forbidden headers that every modern browser sends and no package client does) or an `Accept` listing `text/html` — and omit the `Basic` (and cargo-only `Cargo`) challenge for them, keeping the `Bearer` challenge for RFC 7235 compliance. Browsers therefore land on the web UI's login/OIDC flow directly. Package-manager clients (pip, npm, docker, cargo, maven, conan, …) are never classified as browsers and keep the byte-identical challenge set they had before, so credential retry semantics are unchanged.
+- **An OIDC provider seeded from `OIDC_*` env vars no longer outlives its configuration** (#2819, migration 197). `bootstrap_oidc_from_env` created/reconciled a provider row on boot, but removing `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET` and restarting left that row enabled: the login page kept advertising a flow that could no longer complete while `local_login_enabled` stayed `false` because an enabled provider row still existed — locking operators out of the UI. Env-seeded rows are now marked (`oidc_configs.env_seeded`), and a boot without the env vars disables — never deletes — any still-enabled marked row, restoring local login; re-adding the env vars re-enables it through the normal reconcile path. Admin ownership is respected in both directions: rows created via the admin API are never touched (the column defaults to `false`), and editing or re-enabling a previously env-seeded provider through the admin API clears the marker so later boots leave it alone.
+
 ## [1.7.5] - 2026-08-14
 
 ### Security
