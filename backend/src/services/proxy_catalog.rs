@@ -85,13 +85,49 @@ pub async fn upsert(
     Ok(())
 }
 
+/// True when a stored catalog row is the transient placeholder
+/// [`record_proxy_download`] inserts on the request path (`size_bytes = 0`,
+/// `checksum_sha256 IS NULL`) rather than an authoritative row written by the
+/// tee's [`upsert`].
+///
+/// Pure mirror of the `ON CONFLICT` guard in [`backfill_from_sidecar`], kept in
+/// Rust so the placeholder definition has one testable statement and cannot
+/// drift from the SQL that applies it.
+///
+/// Both conditions are required. A genuinely cached zero-byte object still
+/// carries its checksum, so it is never mistaken for a placeholder — and even
+/// if it were, the sidecar would repair it to the same `size_bytes = 0`.
+pub fn is_placeholder_catalog_row(size_bytes: i64, checksum_sha256: Option<&str>) -> bool {
+    size_bytes == 0 && checksum_sha256.is_none()
+}
+
 /// Lazy backfill for a pre-existing, un-cataloged cached object discovered on a
 /// cache HIT.
 ///
-/// `ON CONFLICT DO NOTHING` on the body fields (so a concurrent authoritative
-/// write is never clobbered by a backfill guess) while still bumping
-/// `last_accessed_at`, which doubles as the PF-002 lifecycle seam. Fire-and-
-/// forget from the serve path — never blocks the response.
+/// Inserts the row when absent. When a row already exists the conflict arm
+/// **repairs it if it is still a placeholder** (#3305) and otherwise leaves the
+/// authoritative body fields untouched, always bumping `last_accessed_at`
+/// (which doubles as the PF-002 lifecycle seam). Fire-and-forget from the serve
+/// path — never blocks the response, and safely skippable (the bounded limiter
+/// added in #3289 drops these under saturation; the next hit retries).
+///
+/// # Why the conflict arm has to repair (#3305)
+///
+/// `record_proxy_download` is awaited *inline on the request* and ensures a
+/// catalog row for `(repository_id, path)` so the first serve counts (#2537),
+/// inserting a placeholder with `size_bytes = 0` and a NULL checksum. The
+/// backfill runs detached and therefore normally *loses* that race. While the
+/// conflict arm only touched `last_accessed_at`, the losing backfill returned
+/// without ever writing the real size / checksum / content type, and nothing
+/// else repaired the row — so the #2218 / #2270 self-healing this function
+/// exists for was inert for exactly the pre-catalog entries it targets, and
+/// storage accounting read zeros for them.
+///
+/// Since the placeholder insert is on the request path, the backfill is by
+/// definition almost always an UPDATE; the conflict arm is the path that
+/// matters. Repair is scoped by [`is_placeholder_catalog_row`] so a genuinely
+/// populated row is never overwritten by a stale sidecar guess — the original
+/// no-clobber contract still holds for every authoritative row.
 #[allow(clippy::too_many_arguments)]
 pub async fn backfill_from_sidecar(
     db: &PgPool,
@@ -110,6 +146,30 @@ pub async fn backfill_from_sidecar(
              checksum_sha256, content_type, cached_at, last_accessed_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
         ON CONFLICT (repository_id, path) DO UPDATE SET
+            storage_key = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.storage_key ELSE proxy_cache_artifacts.storage_key END,
+            metadata_key = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.metadata_key ELSE proxy_cache_artifacts.metadata_key END,
+            size_bytes = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.size_bytes ELSE proxy_cache_artifacts.size_bytes END,
+            content_type = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.content_type ELSE proxy_cache_artifacts.content_type END,
+            -- Assigned LAST: the guard reads the stored checksum, and an
+            -- UPDATE SET list evaluates every right-hand side against the OLD
+            -- row, so ordering is presentational only. Kept last regardless so
+            -- the guard column is visibly the one being replaced.
+            checksum_sha256 = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.checksum_sha256 ELSE proxy_cache_artifacts.checksum_sha256 END,
             last_accessed_at = now()
         "#,
         repository_id,
@@ -531,6 +591,144 @@ mod tests {
         assert_eq!(rows.len(), 1, "still one row");
         assert_eq!(rows[0].size_bytes, 500, "backfill never overwrites size");
         assert_eq!(rows[0].checksum_sha256.as_deref(), Some("sha"));
+        cleanup_repo(&pool, repo).await;
+    }
+
+    // --- #3305: the backfill must repair the placeholder row it races -------
+
+    #[test]
+    fn placeholder_predicate_needs_zero_size_and_null_checksum() {
+        assert!(
+            is_placeholder_catalog_row(0, None),
+            "the row record_proxy_download inserts is the placeholder"
+        );
+        assert!(
+            !is_placeholder_catalog_row(4096, None),
+            "a sized row is authoritative even without a checksum"
+        );
+        assert!(
+            !is_placeholder_catalog_row(0, Some("abc")),
+            "a genuinely cached zero-byte object carries its checksum"
+        );
+        assert!(!is_placeholder_catalog_row(4096, Some("abc")));
+    }
+
+    /// #3305 regression test. `record_proxy_download` is awaited inline on the
+    /// request and inserts a `size_bytes = 0` placeholder; the lazy backfill
+    /// runs detached and normally loses that race. Before the fix its conflict
+    /// arm only bumped `last_accessed_at`, so the placeholder was permanent and
+    /// the #2218/#2270 self-healing was inert.
+    ///
+    /// The foreground insert is made to win DETERMINISTICALLY here (it is
+    /// simply called first), and the assertions are on the REPAIRED VALUES —
+    /// asserting a row merely exists, or that the backfill "ran", would pass
+    /// with the bug in place.
+    #[tokio::test]
+    async fn test_backfill_repairs_the_placeholder_row_it_races() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/racy/racy-2.0.whl";
+        let key = format!("proxy-cache/{}/{path}/__content__", repo.simple());
+        let meta = format!("proxy-cache/{}/{path}/__cache_meta__.json", repo.simple());
+
+        // 1. The request path wins the race and leaves a placeholder.
+        record_proxy_download(&pool, repo, path, &key, &meta, None, None, None)
+            .await
+            .expect("record serve");
+        let rows = list_paged(&pool, repo, None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            is_placeholder_catalog_row(rows[0].size_bytes, rows[0].checksum_sha256.as_deref()),
+            "precondition: the foreground insert left a placeholder"
+        );
+
+        // 2. The detached backfill arrives second and must REPAIR it.
+        backfill_from_sidecar(
+            &pool,
+            repo,
+            path,
+            &key,
+            &meta,
+            8192,
+            Some("realchecksum"),
+            Some("application/octet-stream"),
+        )
+        .await
+        .expect("backfill");
+
+        let rows = list_paged(&pool, repo, None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1, "still exactly one row");
+        assert_eq!(
+            rows[0].size_bytes, 8192,
+            "the placeholder's size must be repaired from the sidecar (#3305)"
+        );
+        assert_eq!(
+            rows[0].checksum_sha256.as_deref(),
+            Some("realchecksum"),
+            "the placeholder's checksum must be repaired from the sidecar (#3305)"
+        );
+        assert_eq!(
+            rows[0].content_type.as_deref(),
+            Some("application/octet-stream"),
+            "the placeholder's content type must be repaired from the sidecar (#3305)"
+        );
+        assert_eq!(
+            sum_by_repo(&pool, repo).await.unwrap(),
+            8192,
+            "storage accounting must stop reading zeros for repaired entries"
+        );
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// The repair is scoped to placeholders: a genuinely cached zero-byte
+    /// object (size 0 WITH a checksum) is authoritative and a later sidecar
+    /// guess must not overwrite it.
+    #[tokio::test]
+    async fn test_backfill_does_not_repair_an_authoritative_zero_byte_row() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/empty/empty-1.0.whl";
+        let key = format!("proxy-cache/{}/{path}/__content__", repo.simple());
+
+        upsert(
+            &pool,
+            repo,
+            path,
+            &key,
+            "m",
+            0,
+            Some("e3b0c442"),
+            None,
+            None,
+        )
+        .await
+        .expect("authoritative zero-byte upsert");
+
+        backfill_from_sidecar(
+            &pool,
+            repo,
+            path,
+            "other-key",
+            "m2",
+            77,
+            Some("wrong"),
+            None,
+        )
+        .await
+        .expect("backfill");
+
+        let rows = list_paged(&pool, repo, None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].size_bytes, 0, "authoritative size preserved");
+        assert_eq!(rows[0].checksum_sha256.as_deref(), Some("e3b0c442"));
+        assert_eq!(
+            rows[0].storage_key, key,
+            "authoritative storage key preserved"
+        );
         cleanup_repo(&pool, repo).await;
     }
 

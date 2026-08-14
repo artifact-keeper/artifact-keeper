@@ -713,13 +713,18 @@ impl AuthConfigService {
             existing.client_secret_encrypted
         };
 
+        // `env_seeded = FALSE` (#2819): an update through this path means a
+        // caller other than the env bootstrap has taken ownership of the row,
+        // so a later boot without OIDC_* env vars must not auto-disable it.
+        // The env bootstrap itself re-asserts the marker via
+        // `mark_oidc_env_seeded` right after calling this.
         let row = sqlx::query_as::<_, OidcConfigRow>(
             r#"
             UPDATE oidc_configs
             SET name = $1, issuer_url = $2, client_id = $3, client_secret_encrypted = $4,
                 scopes = $5, attribute_mapping = $6, is_enabled = $7, auto_create_users = $8,
                 pkce_enabled = $9, map_groups_to_groups = $10, allow_legacy_rsa_keys = $11,
-                updated_at = NOW()
+                env_seeded = FALSE, updated_at = NOW()
             WHERE id = $12
             RETURNING id, name, issuer_url, client_id, client_secret_encrypted,
                       scopes, attribute_mapping, is_enabled, auto_create_users,
@@ -764,9 +769,12 @@ impl AuthConfigService {
         id: Uuid,
         toggle: ToggleRequest,
     ) -> Result<OidcConfigResponse> {
+        // `env_seeded = FALSE` (#2819): an explicit admin toggle takes
+        // ownership of the row, so a boot without OIDC_* env vars will not
+        // re-disable a provider an administrator deliberately re-enabled.
         let row = sqlx::query_as::<_, OidcConfigRow>(
             r#"
-            UPDATE oidc_configs SET is_enabled = $1, updated_at = NOW()
+            UPDATE oidc_configs SET is_enabled = $1, env_seeded = FALSE, updated_at = NOW()
             WHERE id = $2
             RETURNING id, name, issuer_url, client_id, client_secret_encrypted,
                       scopes, attribute_mapping, is_enabled, auto_create_users,
@@ -782,6 +790,52 @@ impl AuthConfigService {
         .ok_or_else(|| AppError::NotFound(format!("OIDC config {id} not found")))?;
 
         Ok(Self::oidc_row_to_response(row))
+    }
+
+    /// Mark an OIDC provider row as owned by the OIDC_* env bootstrap
+    /// (#2819). Called by `bootstrap_oidc_from_env` right after it creates or
+    /// reconciles the env-named provider, so a later boot *without* the env
+    /// vars knows the row may be auto-disabled via
+    /// [`Self::disable_env_seeded_oidc`]. Admin-API updates and toggles clear
+    /// the marker (they take ownership).
+    pub async fn mark_oidc_env_seeded(pool: &PgPool, id: Uuid) -> Result<()> {
+        sqlx::query("UPDATE oidc_configs SET env_seeded = TRUE WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to mark OIDC config env-seeded: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Disable every still-enabled OIDC provider that was seeded from OIDC_*
+    /// env vars (#2819). Called on boot when the env vars are absent, so an
+    /// env-configured provider does not outlive its configuration: the login
+    /// page stops advertising a flow that can no longer complete, and
+    /// `local_login_enabled` recovers once no enabled provider remains.
+    ///
+    /// Rows are disabled — never deleted — so linked identities and audit
+    /// history survive, and re-adding the env vars re-enables the provider on
+    /// the next boot via the normal reconcile path. Admin-created providers
+    /// (`env_seeded = FALSE`, the column default) are never touched.
+    ///
+    /// Returns the names of the providers that were disabled.
+    pub async fn disable_env_seeded_oidc(pool: &PgPool) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            UPDATE oidc_configs
+            SET is_enabled = FALSE, updated_at = NOW()
+            WHERE env_seeded = TRUE AND is_enabled = TRUE
+            RETURNING name
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Failed to disable env-seeded OIDC configs: {e}"))
+        })?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 
     fn oidc_row_to_response(row: OidcConfigRow) -> OidcConfigResponse {
@@ -3205,6 +3259,153 @@ mod tests {
             // New columns survive the toggle.
             assert!(toggled.pkce_enabled);
             assert!(!toggled.map_groups_to_groups);
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        // -------------------------------------------------------------------
+        // Env-seeded provider lifecycle (#2819): a provider bootstrapped from
+        // OIDC_* env vars must be auto-disabled once the env vars are gone,
+        // while admin-owned providers are never touched.
+        // -------------------------------------------------------------------
+
+        async fn env_seeded_of(pool: &PgPool, id: Uuid) -> bool {
+            sqlx::query_scalar("SELECT env_seeded FROM oidc_configs WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read env_seeded")
+        }
+
+        async fn is_enabled_of(pool: &PgPool, id: Uuid) -> bool {
+            sqlx::query_scalar("SELECT is_enabled FROM oidc_configs WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read is_enabled")
+        }
+
+        #[tokio::test]
+        async fn test_disable_env_seeded_oidc_disables_only_marked_rows() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            // disable_env_seeded_oidc is a whole-table sweep; serialize
+            // against other suites that seed env-marked providers.
+            let _guard = db_helpers::sso_provider_serial_lock().await;
+
+            let seeded = AuthConfigService::create_oidc(&pool, make_create_req("env-seeded"))
+                .await
+                .expect("create env-seeded provider");
+            AuthConfigService::mark_oidc_env_seeded(&pool, seeded.id)
+                .await
+                .expect("mark env_seeded");
+            let admin_owned = AuthConfigService::create_oidc(&pool, make_create_req("admin-owned"))
+                .await
+                .expect("create admin-owned provider");
+
+            let disabled_names = AuthConfigService::disable_env_seeded_oidc(&pool)
+                .await
+                .expect("disable_env_seeded_oidc");
+
+            assert!(
+                disabled_names.contains(&seeded.name),
+                "env-seeded provider must be reported as disabled, got {disabled_names:?}"
+            );
+            assert!(
+                !disabled_names.contains(&admin_owned.name),
+                "admin-owned provider must not be touched, got {disabled_names:?}"
+            );
+            assert!(
+                !is_enabled_of(&pool, seeded.id).await,
+                "env-seeded provider must be disabled once the env vars are gone"
+            );
+            assert!(
+                is_enabled_of(&pool, admin_owned.id).await,
+                "admin-owned provider must stay enabled"
+            );
+
+            // A second sweep is a no-op: the row is already disabled.
+            let second = AuthConfigService::disable_env_seeded_oidc(&pool)
+                .await
+                .expect("second sweep");
+            assert!(
+                !second.contains(&seeded.name),
+                "already-disabled provider must not be re-reported"
+            );
+
+            cleanup_oidc(&pool, seeded.id).await;
+            cleanup_oidc(&pool, admin_owned.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_oidc_takes_ownership_from_env() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let created = AuthConfigService::create_oidc(&pool, make_create_req("env-owned-upd"))
+                .await
+                .expect("create_oidc");
+            AuthConfigService::mark_oidc_env_seeded(&pool, created.id)
+                .await
+                .expect("mark env_seeded");
+            assert!(env_seeded_of(&pool, created.id).await);
+
+            // An admin-API update clears the marker: the row is now
+            // admin-owned and must survive env-var removal.
+            let update = UpdateOidcConfigRequest {
+                issuer_url: Some("https://issuer2.test.local".to_string()),
+                name: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                attribute_mapping: None,
+                attribute_mapping_replace: None,
+                is_enabled: None,
+                auto_create_users: None,
+                pkce_enabled: None,
+                map_groups_to_groups: None,
+                allow_legacy_rsa_keys: None,
+            };
+            AuthConfigService::update_oidc(&pool, created.id, update)
+                .await
+                .expect("update_oidc");
+            assert!(
+                !env_seeded_of(&pool, created.id).await,
+                "an admin update must clear env_seeded"
+            );
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_toggle_oidc_takes_ownership_from_env() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let created = AuthConfigService::create_oidc(&pool, make_create_req("env-owned-tgl"))
+                .await
+                .expect("create_oidc");
+            AuthConfigService::mark_oidc_env_seeded(&pool, created.id)
+                .await
+                .expect("mark env_seeded");
+
+            // An explicit admin toggle (e.g. re-enabling after the sweep
+            // disabled it) takes ownership so later boots leave it alone.
+            AuthConfigService::toggle_oidc(&pool, created.id, ToggleRequest { enabled: true })
+                .await
+                .expect("toggle_oidc");
+            assert!(
+                !env_seeded_of(&pool, created.id).await,
+                "an admin toggle must clear env_seeded"
+            );
             cleanup_oidc(&pool, created.id).await;
         }
 
