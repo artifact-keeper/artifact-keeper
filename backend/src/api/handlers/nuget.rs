@@ -29,6 +29,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::curation_service::version_compare;
+use crate::storage::StorageLocation;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -123,20 +124,26 @@ async fn effective_local_repo_ids(
 /// visibility query surfaces as a retryable server error instead of being
 /// flattened into an empty id set, which the download would answer with a
 /// definitive "Package version not found" (#3321).
-async fn effective_local_repo_ids_for_caller(
+///
+/// Each id is paired with that repository's own [`StorageLocation`] (#3329):
+/// a virtual member's `storage_key` is rooted at the MEMBER's backend + path,
+/// not the parent's, so byte serving must open storage from the location of
+/// whichever repository the winning artifact row belongs to — exactly as the
+/// V3 flat-container path does through `local_lookup_artifact`.
+async fn effective_local_repo_locations_for_caller(
     db: &PgPool,
     repo: &RepoInfo,
     auth: Option<&AuthExtension>,
-) -> Result<Vec<uuid::Uuid>, Response> {
+) -> Result<Vec<(uuid::Uuid, StorageLocation)>, Response> {
     if repo.repo_type != RepositoryType::Virtual {
-        return Ok(vec![repo.id]);
+        return Ok(vec![(repo.id, repo.storage_location())]);
     }
     let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
     let members = proxy_helpers::try_authorize_virtual_members(db, auth, repo.id, members).await?;
     Ok(members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
-        .map(|m| m.id)
+        .map(|m| (m.id, m.storage_location()))
         .collect())
 }
 
@@ -2052,10 +2059,11 @@ async fn v2_download(
     // set is caller-authorized: a virtual member this caller may not read is
     // dropped, so its bytes read as "not found" here (#3324).
     let id_lower = id.to_lowercase();
-    let repo_ids = effective_local_repo_ids_for_caller(&state.db, repo, auth).await?;
+    let locations = effective_local_repo_locations_for_caller(&state.db, repo, auth).await?;
+    let repo_ids: Vec<uuid::Uuid> = locations.iter().map(|(id, _)| *id).collect();
     let artifact = sqlx::query!(
         r#"
-        SELECT id, storage_key, size_bytes
+        SELECT id, repository_id, storage_key, size_bytes
         FROM artifacts
         WHERE repository_id = ANY($1::uuid[])
           AND is_deleted = false
@@ -2072,8 +2080,25 @@ async fn v2_download(
     .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package version not found").into_response())?;
 
+    // Serve the bytes from the WINNING row's own repository location (#3329):
+    // a virtual member's `storage_key` is rooted at the member's backend +
+    // path, so resolving it against the parent's location points at a
+    // non-existent object (a guaranteed 500 on the filesystem backend). The
+    // `find` cannot legitimately miss — the query is constrained to exactly
+    // these ids — so the fallback is a defensive server error, not a route.
+    let location = locations
+        .iter()
+        .find(|(repo_id, _)| *repo_id == artifact.repository_id)
+        .map(|(_, loc)| loc.clone())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage location unresolved for artifact repository",
+            )
+                .into_response()
+        })?;
     let storage = state
-        .storage_for_repo(&repo.storage_location())
+        .storage_for_repo(&location)
         .map_err(|e| e.into_response())?;
     crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
         .await
@@ -5405,7 +5430,7 @@ mod read_db_tests {
 /// (`flatcontainer_download`) already filters through the caller-authorized
 /// `resolve_virtual_download`; V2 now uses the same
 /// `proxy_helpers::try_authorize_virtual_members` predicate via
-/// `effective_local_repo_ids_for_caller`.
+/// `effective_local_repo_locations_for_caller`.
 #[cfg(test)]
 mod virtual_member_authz_tests {
     use axum::http::StatusCode;
@@ -5413,13 +5438,14 @@ mod virtual_member_authz_tests {
 
     use crate::api::handlers::test_db_helpers as tdh;
 
-    /// Seed a member's package row. `v2_download` streams the bytes through
-    /// the URL repo's storage location (the virtual parent's root), so the
-    /// blob is written under `parent_dir` at the member row's `storage_key`.
+    /// Seed a member's package row. `v2_download` streams the bytes from the
+    /// WINNING row's own repository storage location (#3329), so the blob is
+    /// written under the MEMBER's `member_dir` at the row's `storage_key` —
+    /// exactly where a push to that member would have placed it.
     async fn seed_member_nupkg(
         pool: &sqlx::PgPool,
         member_id: uuid::Uuid,
-        parent_dir: &std::path::Path,
+        member_dir: &std::path::Path,
         name: &str,
         version: &str,
         content: &[u8],
@@ -5442,9 +5468,92 @@ mod virtual_member_authz_tests {
         .execute(pool)
         .await
         .expect("seed member nupkg artifact row");
-        let path = parent_dir.join(&storage_key);
+        let path = member_dir.join(&storage_key);
         std::fs::create_dir_all(path.parent().unwrap()).expect("member nupkg dir");
         std::fs::write(path, content).expect("seed member nupkg bytes");
+    }
+
+    /// #3329 regression (RED→GREEN): a virtual-member `.nupkg` lives under the
+    /// MEMBER's storage location, and `v2_download` used to open storage at the
+    /// PARENT's location instead — on the filesystem backend every
+    /// virtual-member V2 download answered 500 "Storage error". The winning
+    /// artifact row's `repository_id` must map back to that member's own
+    /// location. Two members on distinct filesystem paths, package only in the
+    /// second, prove the row→location mapping rather than "first member".
+    #[tokio::test]
+    async fn virtual_repo_v2_download_streams_member_bytes() {
+        const MEMBER_BYTES: &[u8] = b"nuget member-rooted nupkg bytes #3329";
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let (member_a_id, _member_a_key, member_a_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        let (member_b_id, _member_b_key, member_b_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, member_a_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, member_b_id, 2).await;
+        tdh::grant_repo_access(&fx.pool, member_a_id, fx.user_id).await;
+        tdh::grant_repo_access(&fx.pool, member_b_id, fx.user_id).await;
+        // The package exists ONLY in member B, on B's own storage path.
+        seed_member_nupkg(
+            &fx.pool,
+            member_b_id,
+            &member_b_dir,
+            "memberpkg",
+            "2.1.0",
+            MEMBER_BYTES,
+            fx.user_id,
+        )
+        .await;
+
+        let uri = format!("/{}/v2/package/memberpkg/2.1.0", fx.repo_key);
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), tdh::get(uri)).await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_a_id, &member_a_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, member_b_id, &member_b_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, Bytes::from_static(MEMBER_BYTES)),
+            "a virtual-member V2 download must stream the member's bytes from \
+             the member's own storage location (was 500 \"Storage error\" when \
+             resolved against the parent's location)"
+        );
+    }
+
+    /// Non-virtual regression guard for #3329: a hosted repository's V2
+    /// download must keep resolving storage exactly as before — the
+    /// (id, location) set degenerates to the URL repository itself.
+    #[tokio::test]
+    async fn hosted_v2_download_still_streams() {
+        const HOSTED_BYTES: &[u8] = b"nuget hosted nupkg bytes";
+
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        seed_member_nupkg(
+            &fx.pool,
+            fx.repo_id,
+            &fx.storage_dir,
+            "hostedpkg",
+            "1.2.3",
+            HOSTED_BYTES,
+            fx.user_id,
+        )
+        .await;
+
+        let uri = format!("/{}/v2/package/hostedpkg/1.2.3", fx.repo_key);
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), tdh::get(uri)).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, Bytes::from_static(HOSTED_BYTES)),
+            "a hosted (non-virtual) V2 download must remain byte-identical"
+        );
     }
 
     #[tokio::test]
@@ -5469,7 +5578,7 @@ mod virtual_member_authz_tests {
         seed_member_nupkg(
             &fx.pool,
             private_id,
-            &fx.storage_dir,
+            &private_dir,
             "privpkg",
             "1.0.0",
             PRIVATE_BYTES,
@@ -5479,7 +5588,7 @@ mod virtual_member_authz_tests {
         seed_member_nupkg(
             &fx.pool,
             public_id,
-            &fx.storage_dir,
+            &public_dir,
             "pubpkg",
             "1.0.0",
             PUBLIC_BYTES,
@@ -5507,11 +5616,12 @@ mod virtual_member_authz_tests {
         tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
         fx.teardown().await;
 
-        assert_ne!(
+        assert_eq!(
             anon_private_status,
-            StatusCode::OK,
+            StatusCode::NOT_FOUND,
             "an ANONYMOUS caller must not download a PRIVATE member's .nupkg \
-             through a public Virtual parent over the V2 route; got body {:?}",
+             through a public Virtual parent over the V2 route — the filtered \
+             member reads as not-found (never 500, never bytes); got body {:?}",
             String::from_utf8_lossy(&anon_private_body)
         );
         assert_eq!(
