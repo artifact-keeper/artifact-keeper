@@ -2499,6 +2499,21 @@ pub struct ProxyScanVerdict {
     /// Scanner binary/DB version string (e.g. `grype-0.83.0`), for CVE-DB
     /// freshness gating of a reused verdict.
     pub scanner_version: Option<String>,
+    /// The full package inventory the CVE-authoritative scanner cataloged for
+    /// these bytes, retained so proxy-cached content can have an SBOM
+    /// generated from it without re-fetching or re-scanning.
+    ///
+    /// Distinct from the `cataloged` side channel used by the #3003 identity
+    /// gate, which carries only `{name, version}`. This carries `purl` and
+    /// `license` too, which is what an SBOM document actually needs.
+    ///
+    /// Empty for scanners that report no inventory. Never load-bearing for the
+    /// verdict itself: an empty inventory must not change whether content is
+    /// blocked, only whether an SBOM can be produced for it.
+    pub packages: Vec<RawPackage>,
+    /// Whether the scanner saw a target it could not parse (#1153). Threaded
+    /// into generated SBOMs so a partial inventory does not render as complete.
+    pub scan_completeness: Option<String>,
 }
 
 impl ProxyScanVerdict {
@@ -2608,6 +2623,47 @@ struct FindingDedupKey {
 /// group retains at least one finding, and the proxy verdict token is
 /// `findings_count > 0` — dedup only ever reduces a strictly-positive count,
 /// never zeroes it.
+/// Collapse duplicate inventory entries before they are persisted for SBOM
+/// generation.
+///
+/// Same mechanism as the finding duplication [`dedupe_findings`] addresses: a
+/// PyPI wheel is scanned with its own `METADATA` plus the synthetic pin
+/// `prepare_pinned` writes into the workspace root, so the scanner catalogs the
+/// distribution twice. An SBOM listing the same component twice is visibly
+/// wrong to any consumer.
+///
+/// Keyed on `(name, version)` exactly — NOT normalized the way finding dedup
+/// normalizes, because a purl is ecosystem-qualified already and two entries
+/// that differ only in normalization are genuinely different rows worth
+/// keeping. The richer record wins: an entry carrying a `purl`/`license` is
+/// preferred over a bare one for the same coordinate, so merging never discards
+/// metadata the SBOM would otherwise carry.
+fn dedupe_packages(packages: Vec<RawPackage>) -> Vec<RawPackage> {
+    let mut out: Vec<RawPackage> = Vec::with_capacity(packages.len());
+    for pkg in packages {
+        let existing = out
+            .iter_mut()
+            .find(|p| p.name == pkg.name && p.version == pkg.version);
+        match existing {
+            Some(prev) => {
+                // Fill gaps rather than replace wholesale, so a pair of
+                // partial records merges into the most complete one.
+                if prev.purl.is_none() {
+                    prev.purl = pkg.purl;
+                }
+                if prev.license.is_none() {
+                    prev.license = pkg.license;
+                }
+                if prev.source_target.is_none() {
+                    prev.source_target = pkg.source_target;
+                }
+            }
+            None => out.push(pkg),
+        }
+    }
+    out
+}
+
 fn dedupe_findings(
     findings: Vec<RawFinding>,
     ecosystem: Option<ComponentEcosystem>,
@@ -2698,6 +2754,12 @@ pub fn aggregate_proxy_verdict(
         low_count: count(Severity::Low),
         max_severity,
         scanner_version,
+        // Populated by `run_inline_proxy_scanners_target` after aggregation.
+        // Kept out of this signature deliberately: the verdict contract
+        // (counts and severity) is what every existing caller and test
+        // depends on, and the inventory must never influence it.
+        packages: Vec::new(),
+        scan_completeness: None,
     }
 }
 
@@ -2739,6 +2801,9 @@ async fn run_inline_proxy_scanners_target(
     let synthetic = target.artifact;
     let mut findings: Vec<RawFinding> = Vec::new();
     let mut scanner_version: Option<String> = None;
+    // Full package inventory, retained for proxy SBOM generation.
+    let mut packages: Vec<RawPackage> = Vec::new();
+    let mut scan_completeness: Option<String> = None;
     // "did SOME applicable scanner run Ok" — necessary but NOT sufficient.
     let mut any_ran = false;
     // "was a CVE-authoritative scanner applicable" vs "did one complete Ok".
@@ -2773,6 +2838,17 @@ async fn run_inline_proxy_scanners_target(
                 // for CVE-DB freshness (Grype reports one).
                 if scanner_version.is_none() {
                     scanner_version = scanner.version().await;
+                }
+                // Retain the full inventory for SBOM generation. Only the
+                // CVE-authoritative scanner's inventory is kept: supplementary
+                // scanners can report overlapping package sets, and merging
+                // them would produce an SBOM that claims components no single
+                // engine actually cataloged.
+                if is_cve_authoritative {
+                    packages.extend(output.packages);
+                    if output.scan_completeness != ScanCompleteness::Complete {
+                        scan_completeness = Some(output.scan_completeness.as_str().to_string());
+                    }
                 }
                 findings.extend(output.findings);
             }
@@ -2899,7 +2975,12 @@ async fn run_inline_proxy_scanners_target(
     let ecosystem = target.expected_component.map(|c| c.ecosystem);
     let findings = dedupe_findings(findings, ecosystem);
 
-    Ok(aggregate_proxy_verdict(&findings, scanner_version))
+    let mut verdict = aggregate_proxy_verdict(&findings, scanner_version);
+    // Attach the retained inventory. Deliberately after aggregation so the
+    // counts/severity contract is computed from findings alone.
+    verdict.packages = dedupe_packages(packages);
+    verdict.scan_completeness = scan_completeness;
+    Ok(verdict)
 }
 
 /// Live version string of the CVE-authoritative scanner (Grype), e.g.
