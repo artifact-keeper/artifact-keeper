@@ -172,8 +172,10 @@ async fn run_trivy_scan(
     args.extend_from_slice(&[
         "--format",
         "json",
+        // #3296: the shared allowlist includes UNKNOWN so ungraded CVEs
+        // reach the report instead of being dropped at the CLI.
         "--severity",
-        "CRITICAL,HIGH,MEDIUM,LOW",
+        crate::services::scanner_service::TRIVY_FS_SEVERITY_LIST,
         "--quiet",
         "--timeout",
         "10m",

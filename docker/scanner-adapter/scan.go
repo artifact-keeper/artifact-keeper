@@ -310,10 +310,12 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 }
 
 // fsSeverity is the severity filter for filesystem scans. It mirrors the
-// backend's legacy `trivy filesystem` CLI invocation (trivy_fs_scanner.rs /
-// incus_scanner.rs) so routing through the adapter (#2363) does not change
-// which findings are reported.
-const fsSeverity = "CRITICAL,HIGH,MEDIUM,LOW"
+// backend's `trivy filesystem` CLI invocation (TRIVY_FS_SEVERITY_LIST in
+// scanner_service.rs) so routing through the adapter (#2363) does not change
+// which findings are reported. UNKNOWN is included deliberately (#3296): an
+// ungraded CVE dropped at the CLI never reaches a report, a gate, or a score,
+// and no operator-side policy can recover it.
+const fsSeverity = "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
 
 // buildFsArgs returns the trivy CLI arguments for a filesystem scan over dir.
 // `--list-all-pkgs` is load-bearing: the backend's SBOM package inventory

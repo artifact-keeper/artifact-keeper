@@ -2995,14 +2995,22 @@ pub fn stricter_scan_policy(
 /// The effective proxy-scan policy for a Virtual repo resolving an artifact
 /// from a member (#3023): the stricter-of-two over the virtual's own config and
 /// the member's (see [`stricter_scan_policy`]). Callers gate on the returned
-/// `enabled` and thread the returned `action` into the per-format scan gate so
-/// the virtual path enforces the same digest-keyed verdict as a direct pull.
+/// `enabled` and thread the returned `action` and severity gate into the
+/// per-format scan gate so the virtual path enforces the same digest-keyed
+/// verdict as a direct pull. The severity gate combines stricter-of-two the
+/// same way (#3243 stage 3): `BlockOnAny` on either side dominates, so a
+/// virtual that has not opted into threshold gating cannot become the lax
+/// route around a member's block-on-any posture, and vice versa.
 pub async fn effective_virtual_scan_policy(
     db: &PgPool,
     virtual_id: Uuid,
     member_id: Uuid,
-) -> (bool, crate::services::proxy_scan_service::ProxyScanAction) {
-    use crate::services::proxy_scan_service::ProxyScanAction;
+) -> (
+    bool,
+    crate::services::proxy_scan_service::ProxyScanAction,
+    crate::services::proxy_scan_service::ProxySeverityGate,
+) {
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
     let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
     let virtual_enabled = svc.is_proxy_scan_enabled(virtual_id).await.unwrap_or(false);
     let member_enabled = svc.is_proxy_scan_enabled(member_id).await.unwrap_or(false);
@@ -3014,12 +3022,51 @@ pub async fn effective_virtual_scan_policy(
         .proxy_scan_action(member_id)
         .await
         .unwrap_or(ProxyScanAction::FailOpen);
-    stricter_scan_policy(
+    // Fail closed on a config read fault: an unreadable gate is block-on-any.
+    let virtual_gate = svc
+        .proxy_severity_gate(virtual_id)
+        .await
+        .unwrap_or(ProxySeverityGate::BlockOnAny);
+    let member_gate = svc
+        .proxy_severity_gate(member_id)
+        .await
+        .unwrap_or(ProxySeverityGate::BlockOnAny);
+    let (enabled, action) = stricter_scan_policy(
         virtual_enabled,
         virtual_action,
         member_enabled,
         member_action,
+    );
+    (
+        enabled,
+        action,
+        ProxySeverityGate::stricter(virtual_gate, member_gate),
     )
+}
+
+/// The proxy-scan `(action, severity_gate)` pair for a DIRECT (non-virtual)
+/// repo pull, with the shared fail-safe defaults: an unreadable action is
+/// fail-open (availability-first, matching the column default) while an
+/// unreadable severity gate is block-on-any (the fail-closed direction —
+/// a config fault must not weaken the blocking decision, #3243).
+pub async fn direct_scan_policy(
+    db: &PgPool,
+    repo_id: Uuid,
+) -> (
+    crate::services::proxy_scan_service::ProxyScanAction,
+    crate::services::proxy_scan_service::ProxySeverityGate,
+) {
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
+    let action = svc
+        .proxy_scan_action(repo_id)
+        .await
+        .unwrap_or(ProxyScanAction::FailOpen);
+    let gate = svc
+        .proxy_severity_gate(repo_id)
+        .await
+        .unwrap_or(ProxySeverityGate::BlockOnAny);
+    (action, gate)
 }
 
 /// Fetch virtual repository member repos sorted by priority.
@@ -6290,6 +6337,34 @@ pub(crate) enum ProxyScanServeOutcome {
 ///
 /// `synthetic` is the format-specific scan identity for these bytes; it is
 /// also what the async fail-open scan runs over.
+/// Does a stored BLOCKING (`vulnerable`) verdict row still block under the
+/// repo's severity gate (#3243 stage 3 / #3246)?
+///
+/// Pure so the fail-closed edges are unit-testable without a DB:
+/// * a verdict whose stored `max_severity` is KNOWN and strictly below an
+///   opted-in threshold is released (the manifest serves);
+/// * an absent or unparseable stored `max_severity` (legacy rows) blocks even
+///   under a configured threshold — never fail-open on an ungraded verdict;
+/// * a missing row blocks (the caller only asks on `BlockCached`, where a row
+///   is present; `None` is the defensive arm and takes the strict answer);
+/// * `ProxySeverityGate::BlockOnAny` (every repo that has not opted in via
+///   `block_on_policy_violation`) blocks unconditionally — the historical
+///   posture, byte-for-byte.
+pub(crate) fn stored_verdict_blocks_under_gate(
+    row: Option<&crate::services::proxy_scan_service::ProxyScanRow>,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+) -> bool {
+    let row_max_severity = row.and_then(|r| {
+        r.max_severity
+            .as_deref()
+            .and_then(crate::models::security::Severity::from_str_loose)
+    });
+    match row {
+        None => true,
+        Some(_) => severity_gate.blocks(row_max_severity),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn gate_proxy_scan_serve(
     state: &crate::api::SharedState,
@@ -6299,6 +6374,7 @@ pub(crate) async fn gate_proxy_scan_serve(
     synthetic: crate::models::artifact::Artifact,
     bytes: &Bytes,
     action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     identity: ProxyScanIdentity,
     mode: ProxyScanMode,
 ) -> ProxyScanServeOutcome {
@@ -6327,6 +6403,17 @@ pub(crate) async fn gate_proxy_scan_serve(
         Utc::now(),
     ) {
         ServeDecision::BlockCached => {
+            // #3243 stage 3 / #3246: a repo that explicitly opted in via
+            // `block_on_policy_violation` applies its `severity_threshold` to
+            // the stored verdict — see [`stored_verdict_blocks_under_gate`].
+            if !stored_verdict_blocks_under_gate(row.as_ref(), severity_gate) {
+                tracing::info!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    "serving proxy pull: cached vulnerable verdict is below this \
+                     repo's configured severity threshold (#3243)"
+                );
+                return ProxyScanServeOutcome::Serve { pending: false };
+            }
             tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: cached vulnerable verdict");
             ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
         }
@@ -6353,7 +6440,9 @@ pub(crate) async fn gate_proxy_scan_serve(
             match proxy_scan_and_record(state, repo_id, digest, &synthetic, bytes, expected, &mode)
                 .await
             {
-                Some(verdict) if verdict.is_vulnerable() => {
+                Some(verdict)
+                    if verdict.is_vulnerable() && severity_gate.blocks(verdict.max_severity) =>
+                {
                     tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
                     ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
                 }
@@ -6420,6 +6509,59 @@ pub(crate) async fn gate_proxy_scan_serve(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // ── #3243 stage 3 / #3246: severity gate over a stored verdict ──
+
+    /// Pure decision for the `BlockCached` arm of [`gate_proxy_scan_serve`]:
+    /// a below-threshold verdict is released ONLY when the repo opted in AND
+    /// the stored severity is known; every ambiguous shape blocks.
+    #[test]
+    fn stored_verdict_severity_gate_direction() {
+        use crate::models::security::Severity;
+        use crate::services::proxy_scan_service::{ProxyScanRow, ProxySeverityGate};
+        let mk = |max_severity: Option<&str>| ProxyScanRow {
+            checksum_sha256: "deadbeef".to_string(),
+            scan_type: "grype".to_string(),
+            verdict: "vulnerable".to_string(),
+            findings_count: 3,
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 3,
+            max_severity: max_severity.map(|s| s.to_string()),
+            scanner_version: Some("grype-1.0.0".to_string()),
+            scanned_at: Utc::now(),
+        };
+        let high = ProxySeverityGate::Threshold(Severity::High);
+
+        // Not opted in: block-on-any, byte-for-byte the historical posture.
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&mk(Some("low"))),
+            ProxySeverityGate::BlockOnAny
+        ));
+        // Opted in at high: a known low verdict is released...
+        assert!(!stored_verdict_blocks_under_gate(
+            Some(&mk(Some("low"))),
+            high
+        ));
+        // ...an at/above-threshold verdict still blocks...
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&mk(Some("critical"))),
+            high
+        ));
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&mk(Some("high"))),
+            high
+        ));
+        // ...and the fail-closed edges block: absent max_severity (legacy
+        // row), unparseable token, and the defensive no-row arm.
+        assert!(stored_verdict_blocks_under_gate(Some(&mk(None)), high));
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&mk(Some("bogus"))),
+            high
+        ));
+        assert!(stored_verdict_blocks_under_gate(None, high));
+    }
 
     // ── Curation block rendering (#2930 body, #3110 structured verdict) ──
     //

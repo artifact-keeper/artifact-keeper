@@ -113,6 +113,15 @@ pub enum AuditAction {
     // conflict-free with in-flight taxonomy work.
     CurationVersionCreated,
     CurationVersionPublished,
+
+    // Proxy scan verdict invalidation (#3244). Recorded when an instance
+    // admin deletes the stored `proxy_scan_results` row(s) for a content
+    // digest via `DELETE /admin/proxy-scan-verdicts/{digest}`, forcing
+    // re-assessment on the next pull. The verdict store is global across
+    // repos/tenants, so the trail must capture who discarded which blocking
+    // state. Appended at the END of the enum to keep the additive change
+    // conflict-free with in-flight taxonomy work.
+    ProxyScanVerdictDeleted,
 }
 
 impl AuditAction {
@@ -169,6 +178,7 @@ impl AuditAction {
             AuditAction::CurationSyncTriggered => "CURATION_SYNC_TRIGGERED",
             AuditAction::CurationVersionCreated => "CURATION_VERSION_CREATED",
             AuditAction::CurationVersionPublished => "CURATION_VERSION_PUBLISHED",
+            AuditAction::ProxyScanVerdictDeleted => "PROXY_SCAN_VERDICT_DELETED",
         }
     }
 }
