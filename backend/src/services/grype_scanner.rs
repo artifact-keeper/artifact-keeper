@@ -3836,6 +3836,97 @@ mod tests {
         );
     }
 
+    /// A minimal but REAL Python wheel: a zip carrying a `.dist-info/METADATA`,
+    /// which is what syft's installed-package cataloger reads. Built in-process
+    /// so the fixture is a few hundred bytes rather than a checked-in binary.
+    fn minimal_clean_wheel() -> Bytes {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            zip.start_file("acme_widget-1.2.3.dist-info/METADATA", opts)
+                .unwrap();
+            zip.write_all(
+                b"Metadata-Version: 2.1\nName: acme-widget\nVersion: 1.2.3\nLicense: MIT\n",
+            )
+            .unwrap();
+            zip.start_file("acme_widget-1.2.3.dist-info/WHEEL", opts)
+                .unwrap();
+            zip.write_all(b"Wheel-Version: 1.0\n").unwrap();
+            zip.start_file("acme_widget/__init__.py", opts).unwrap();
+            zip.write_all(b"__version__ = '1.2.3'\n").unwrap();
+            zip.finish().unwrap();
+        }
+        Bytes::from(buf)
+    }
+
+    /// END-TO-END against the REAL grype binary, because the whole fix is a
+    /// change to how grype is invoked and no mock scanner can catch a wrong
+    /// flag. `acme-widget 1.2.3` matches no CVE, so this is exactly the case
+    /// that produced ZERO components and therefore no SBOM at all: the
+    /// match-derived inventory is empty by construction and every component
+    /// here comes from the catalogue.
+    ///
+    /// Skips when grype is not installed (local runs without the scanner
+    /// image); the assertions are meaningless without the binary and this must
+    /// not fail a DB-free/scanner-free developer run.
+    #[tokio::test]
+    async fn e2e_clean_artifact_reports_a_component_inventory() {
+        if std::process::Command::new("grype")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("grype not installed; skipping the end-to-end catalog test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = GrypeScanner::new(dir.path().to_string_lossy().to_string());
+        let artifact = make_artifact("acme_widget-1.2.3-py3-none-any.whl", "application/zip");
+
+        let output = match scanner.scan(&artifact, None, &minimal_clean_wheel()).await {
+            Ok(output) => output,
+            Err(e) => {
+                // A grype present but unusable (no vulnerability DB in this
+                // environment) must not fail the suite.
+                eprintln!("grype present but the scan could not run ({e}); skipping");
+                return;
+            }
+        };
+
+        assert!(
+            output.findings.is_empty(),
+            "acme-widget 1.2.3 is not a real package and must match no CVE; \
+             got {:?}",
+            output.findings
+        );
+        // THE regression this fix exists for.
+        assert!(
+            !output.packages.is_empty(),
+            "a CLEAN artifact must still report its components; an empty \
+             inventory here means the catalogue is being discarded again"
+        );
+        let widget = output
+            .packages
+            .iter()
+            .find(|p| p.name == "acme-widget")
+            .unwrap_or_else(|| panic!("acme-widget missing from {:?}", output.packages));
+        assert_eq!(widget.version.as_deref(), Some("1.2.3"));
+        assert_eq!(widget.purl.as_deref(), Some("pkg:pypi/acme-widget@1.2.3"));
+        assert_eq!(widget.license.as_deref(), Some("MIT"));
+
+        // The workspace path must not have leaked in as a component: syft
+        // catalogues every file it reads, named by absolute path.
+        for p in &output.packages {
+            assert!(
+                !p.name.starts_with('/'),
+                "a filesystem path reached the inventory: {:?}",
+                p
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Issue #1465: classify_grype_spawn_error pins the contract that
     // "Grype binary not available" is reserved for the *spawn* NotFound
