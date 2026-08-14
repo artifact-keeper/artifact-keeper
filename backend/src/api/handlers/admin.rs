@@ -560,6 +560,7 @@ pub struct RestoreResponse {
 )]
 pub async fn restore_backup(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>> {
@@ -580,6 +581,7 @@ pub async fn restore_backup(
         restore_database: payload.restore_database.unwrap_or(true),
         restore_artifacts: payload.restore_artifacts.unwrap_or(true),
         target_repository_id: payload.target_repository_id,
+        actor: Some(auth.user_id),
     };
 
     let result = service.restore(id, options).await?;

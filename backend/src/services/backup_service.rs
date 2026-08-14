@@ -8,14 +8,18 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::io::Read;
 use std::sync::Arc;
 use tar::{Archive, Builder};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
+use crate::services::metrics_service;
 use crate::services::storage_service::StorageService;
 
 /// Backup status
@@ -471,6 +475,117 @@ fn parse_since_filter(metadata: Option<&serde_json::Value>) -> Option<DateTime<U
         .and_then(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).ok())
 }
 
+/// Reject backup requests whose declared type the archive would not honor
+/// (#3011): an `Incremental` backup without a `since` anchor would produce a
+/// byte-identical full archive while reporting itself incremental. Until the
+/// incremental epic (#2788) gives it a stored anchor of its own, the anchor
+/// must be explicit.
+fn validate_backup_request(backup_type: BackupType, since: Option<DateTime<Utc>>) -> Result<()> {
+    if backup_type == BackupType::Incremental && since.is_none() {
+        return Err(AppError::Validation(
+            "An incremental backup requires 'since': without a cutoff it would capture a full \
+             archive while reporting itself incremental. Pass 'since' or request a full backup."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether archives of this backup type carry artifact BYTES (#3011).
+///
+/// A `Metadata` backup captures the database dump (including artifact rows)
+/// and the manifest, but no artifact content — that is the distinction the
+/// API advertises, so `do_backup` must actually honor it.
+fn backup_includes_artifact_bytes(backup_type: BackupType) -> bool {
+    match backup_type {
+        BackupType::Full | BackupType::Incremental => true,
+        BackupType::Metadata => false,
+    }
+}
+
+/// Compute the manifest's integrity pair — total payload bytes and a SHA-256
+/// over every payload entry (name and content, in archive order) — from the
+/// same `(name, bytes)` pairs the tar is built from (#3011).
+///
+/// The digest covers entry names and lengths as well as content so a renamed
+/// or reordered entry cannot collide with a clean archive.
+fn payload_summary<'a>(entries: impl Iterator<Item = (&'a str, &'a [u8])>) -> (i64, String) {
+    let mut hasher = Sha256::new();
+    let mut total_size_bytes: i64 = 0;
+    for (name, bytes) in entries {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+        total_size_bytes += bytes.len() as i64;
+    }
+    (total_size_bytes, format!("{:x}", hasher.finalize()))
+}
+
+/// Map extracted archive entries back to the `(name, bytes)` payload pairs
+/// [`payload_summary`] hashed at backup time: `database/<t>.json` contributes
+/// its table name, `artifacts/<key>` its storage key; `manifest.json` (and
+/// anything unrecognized) is not payload. Entry order is tar order, which is
+/// the order the backup hashed them in.
+fn archive_payload_entries(entries: &[(std::path::PathBuf, Vec<u8>)]) -> Vec<(String, &[u8])> {
+    entries
+        .iter()
+        .filter_map(|(path, content)| {
+            if path.starts_with("database/") {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|table| (table.to_string(), content.as_slice()))
+            } else if path.starts_with("artifacts/") {
+                path.strip_prefix("artifacts/")
+                    .ok()
+                    .map(|key| (key.to_string_lossy().to_string(), content.as_slice()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Verify extracted archive entries against the manifest's recorded checksum.
+///
+/// An empty recorded checksum (every archive written before #3011) skips
+/// verification — those archives carry no integrity value to check. A
+/// mismatch returns the message the restore refuses with.
+fn verify_archive_checksum(
+    manifest: &BackupManifest,
+    entries: &[(std::path::PathBuf, Vec<u8>)],
+) -> std::result::Result<(), String> {
+    if manifest.checksum.is_empty() {
+        return Ok(());
+    }
+    let payload = archive_payload_entries(entries);
+    let (_, actual) = payload_summary(payload.iter().map(|(n, b)| (n.as_str(), *b)));
+    if actual != manifest.checksum {
+        return Err(format!(
+            "archive integrity check failed: manifest records payload checksum {} but the \
+             archive's contents hash to {}; refusing to restore from a corrupted archive",
+            manifest.checksum, actual
+        ));
+    }
+    Ok(())
+}
+
+/// Fail the in-flight backup if its durable claim was lost (#3084).
+///
+/// Checked between chunks of work — table exports, artifact reads, the final
+/// archive write — so a worker whose `backup_schedule_runs` claim another
+/// replica reclaimed (renewal failure under a DB partition, expired TTL)
+/// aborts instead of writing a second archive for the same occurrence.
+fn ensure_backup_not_cancelled(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(AppError::Internal(
+            "backup aborted: its run claim was lost, so another replica may own this occurrence"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl BackupService {
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
         // Default: backup archives live in the same bucket as artifacts, so
@@ -507,6 +622,7 @@ impl BackupService {
 
     /// Create a new backup job
     pub async fn create(&self, req: CreateBackupRequest) -> Result<Backup> {
+        validate_backup_request(req.backup_type, req.since)?;
         let prefix = std::env::var("BACKUP_S3_PREFIX").ok();
         let file_id = Uuid::new_v4();
         let filename = resolve_backup_filename(req.name.as_deref(), file_id)?;
@@ -626,7 +742,20 @@ impl BackupService {
     /// to report the run's outcome rather than react to it use
     /// [`execute_run`](Self::execute_run).
     pub async fn execute(&self, backup_id: Uuid) -> Result<Backup> {
-        let run = self.execute_run(backup_id).await?;
+        self.execute_cancellable(backup_id, CancellationToken::new())
+            .await
+    }
+
+    /// [`execute`](Self::execute) with an external cancellation boundary: the
+    /// scheduler passes the token wired to its run-claim renewal loop so a
+    /// lost claim aborts the in-flight archive between chunks (#3084). A
+    /// fresh, never-cancelled token makes this identical to `execute`.
+    pub async fn execute_cancellable(
+        &self,
+        backup_id: Uuid,
+        cancel: CancellationToken,
+    ) -> Result<Backup> {
+        let run = self.execute_run_cancellable(backup_id, cancel).await?;
         match run.failure {
             Some(message) => Err(AppError::Internal(message)),
             None => Ok(run.backup),
@@ -642,6 +771,22 @@ impl BackupService {
     /// to report: another backup is already in progress, the backup does not
     /// exist, or the status bookkeeping itself could not be written.
     pub async fn execute_run(&self, backup_id: Uuid) -> Result<BackupRun> {
+        self.execute_run_cancellable(backup_id, CancellationToken::new())
+            .await
+    }
+
+    /// [`execute_run`](Self::execute_run) with an external cancellation
+    /// boundary — see [`execute_cancellable`](Self::execute_cancellable).
+    pub async fn execute_run_cancellable(
+        &self,
+        backup_id: Uuid,
+        cancel: CancellationToken,
+    ) -> Result<BackupRun> {
+        // Read the row up front so audit events and metrics can name the
+        // backup's type and creator even when the run itself fails (#3011).
+        let pending = self.get_by_id(backup_id).await?;
+        let backup_type_str = format!("{:?}", pending.backup_type).to_lowercase();
+
         // Check if another backup is running
         {
             let mut active = self.active_backup.lock().await;
@@ -657,7 +802,21 @@ impl BackupService {
         self.update_status(backup_id, BackupStatus::InProgress, None)
             .await?;
 
-        let result = self.do_backup(backup_id).await;
+        self.log_audit(
+            AuditEntry::new(AuditAction::BackupStarted, ResourceType::Backup)
+                .resource(backup_id)
+                .details(serde_json::json!({ "backup_type": backup_type_str })),
+            pending.created_by,
+        )
+        .await;
+
+        let started = std::time::Instant::now();
+        let result = self.do_backup(backup_id, &cancel).await;
+        metrics_service::record_backup(
+            &backup_type_str,
+            result.is_ok(),
+            started.elapsed().as_secs_f64(),
+        );
 
         // Clear active backup
         {
@@ -669,6 +828,17 @@ impl BackupService {
             Ok(backup) => {
                 self.update_status(backup_id, BackupStatus::Completed, None)
                     .await?;
+                self.log_audit(
+                    AuditEntry::new(AuditAction::BackupCompleted, ResourceType::Backup)
+                        .resource(backup_id)
+                        .details(serde_json::json!({
+                            "backup_type": backup_type_str,
+                            "size_bytes": backup.size_bytes,
+                            "artifact_count": backup.artifact_count,
+                        })),
+                    pending.created_by,
+                )
+                .await;
                 // Re-read for the same reason the failed arm does: `do_backup`
                 // loaded the row while it was still `in_progress`, so returning
                 // it unchanged would answer a caller that has just been told to
@@ -685,6 +855,16 @@ impl BackupService {
                 let message = e.to_string();
                 self.update_status(backup_id, BackupStatus::Failed, Some(&message))
                     .await?;
+                self.log_audit(
+                    AuditEntry::new(AuditAction::BackupFailed, ResourceType::Backup)
+                        .resource(backup_id)
+                        .details(serde_json::json!({
+                            "backup_type": backup_type_str,
+                            "error": message,
+                        })),
+                    pending.created_by,
+                )
+                .await;
                 // Re-read so the caller receives the row exactly as persisted
                 // (`status = failed`, `error_message` set). If even that read
                 // fails there is no recorded outcome to report, so the original
@@ -700,7 +880,23 @@ impl BackupService {
         }
     }
 
-    async fn do_backup(&self, backup_id: Uuid) -> Result<Backup> {
+    /// Best-effort audit write for backup/restore lifecycle events (#3011).
+    ///
+    /// Backup and restore are among the highest-privilege operations in the
+    /// product, so every run leaves `BACKUP_*` / `RESTORE_*` entries in the
+    /// audit trail. Audit failure never fails the operation itself — the run's
+    /// own durable bookkeeping (the `backups` row) is the source of truth.
+    async fn log_audit(&self, entry: AuditEntry, actor: Option<Uuid>) {
+        let entry = match actor {
+            Some(user_id) => entry.user(user_id),
+            None => entry,
+        };
+        if let Err(e) = AuditService::new(self.db.clone()).log(entry).await {
+            tracing::warn!(error = %e, "failed to write backup audit event");
+        }
+    }
+
+    async fn do_backup(&self, backup_id: Uuid, cancel: &CancellationToken) -> Result<Backup> {
         let backup = self.get_by_id(backup_id).await?;
 
         // Export database tables as JSON
@@ -729,6 +925,7 @@ impl BackupService {
 
         let mut table_data: Vec<(String, Vec<u8>)> = Vec::new();
         for table in &table_names {
+            ensure_backup_not_cancelled(cancel)?;
             // The `artifacts` table is the only per-repository table exported,
             // so when a repository filter is in effect an excluded repository's
             // artifact rows are kept out of the dump too (not just its bytes).
@@ -742,16 +939,23 @@ impl BackupService {
             table_data.push((table.to_string(), json_bytes));
         }
 
-        // Fetch artifact storage keys and content
-        let storage_keys = self
-            .artifact_storage_keys(repository_filter.as_deref(), since_filter)
-            .await?;
+        // Fetch artifact storage keys and content. A metadata backup carries
+        // no artifact bytes — that is the advertised distinction between the
+        // types, so it must be honored rather than silently producing a full
+        // archive (#3011).
+        let storage_keys = if backup_includes_artifact_bytes(backup.backup_type) {
+            self.artifact_storage_keys(repository_filter.as_deref(), since_filter)
+                .await?
+        } else {
+            Vec::new()
+        };
         // Read each artifact's bytes, tracking failures rather than discarding
         // them (#3170). A read that fails means the archive will not contain
         // that artifact's content; that must never be invisible.
         let mut artifact_data: Vec<(String, Vec<u8>)> = Vec::new();
         let mut unreadable: Vec<(String, String)> = Vec::new();
         for key in storage_keys {
+            ensure_backup_not_cancelled(cancel)?;
             match self.storage.get(&key).await {
                 Ok(content) => artifact_data.push((key, content.to_vec())),
                 Err(e) => {
@@ -766,22 +970,6 @@ impl BackupService {
             }
         }
 
-        // Build manifest. Both counts are recorded so an archive can be audited
-        // after the fact without re-running the backup (#3170).
-        let manifest = BackupManifest {
-            version: "1.0".to_string(),
-            backup_id,
-            backup_type: backup.backup_type,
-            created_at: Utc::now(),
-            database_tables: table_names.iter().map(|s| s.to_string()).collect(),
-            artifact_count: artifact_data.len() as i64,
-            artifacts_unreadable: unreadable.len() as i64,
-            total_size_bytes: 0,     // Will be actual size in final backup
-            checksum: String::new(), // Will be computed after archive is complete
-        };
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-
-        // Build tar.gz archive using append_data (supports paths > 100 chars)
         let tables_ref: Vec<(&str, &[u8])> = table_data
             .iter()
             .map(|(name, data)| (name.as_str(), data.as_slice()))
@@ -790,7 +978,36 @@ impl BackupService {
             .iter()
             .map(|(key, data)| (key.as_str(), data.as_slice()))
             .collect();
+
+        // Build manifest. Both counts are recorded so an archive can be audited
+        // after the fact without re-running the backup (#3170), and the payload
+        // size/checksum give the archive an integrity value the restore path
+        // verifies (#3011).
+        let (total_size_bytes, checksum) = payload_summary(
+            tables_ref
+                .iter()
+                .copied()
+                .chain(artifacts_ref.iter().copied()),
+        );
+        let manifest = BackupManifest {
+            version: "1.0".to_string(),
+            backup_id,
+            backup_type: backup.backup_type,
+            created_at: Utc::now(),
+            database_tables: table_names.iter().map(|s| s.to_string()).collect(),
+            artifact_count: artifact_data.len() as i64,
+            artifacts_unreadable: unreadable.len() as i64,
+            total_size_bytes,
+            checksum,
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+
+        // Build tar.gz archive using append_data (supports paths > 100 chars)
         let tar_buffer = build_backup_tar(&tables_ref, &artifacts_ref, &manifest_bytes)?;
+
+        // A claim lost while chunks were being gathered must abort BEFORE the
+        // externally visible side effect — the archive write — not after (#3084).
+        ensure_backup_not_cancelled(cancel)?;
 
         // Store backup
         let storage_path = backup
@@ -1014,6 +1231,48 @@ impl BackupService {
             ));
         }
 
+        // Restore is among the highest-privilege operations in the product;
+        // every attempt and its outcome must reach the audit trail (#3011).
+        self.log_audit(
+            AuditEntry::new(AuditAction::RestoreStarted, ResourceType::Backup)
+                .resource(backup_id)
+                .details(serde_json::json!({
+                    "restore_database": options.restore_database,
+                    "restore_artifacts": options.restore_artifacts,
+                })),
+            options.actor,
+        )
+        .await;
+
+        let result = self.do_restore(&backup, &options).await;
+        match &result {
+            Ok(r) => {
+                self.log_audit(
+                    AuditEntry::new(AuditAction::RestoreCompleted, ResourceType::Backup)
+                        .resource(backup_id)
+                        .details(serde_json::json!({
+                            "tables_restored": r.tables_restored.len(),
+                            "artifacts_restored": r.artifacts_restored,
+                            "errors": r.errors.len(),
+                        })),
+                    options.actor,
+                )
+                .await;
+            }
+            Err(e) => {
+                self.log_audit(
+                    AuditEntry::new(AuditAction::RestoreFailed, ResourceType::Backup)
+                        .resource(backup_id)
+                        .details(serde_json::json!({ "error": e.to_string() })),
+                    options.actor,
+                )
+                .await;
+            }
+        }
+        result
+    }
+
+    async fn do_restore(&self, backup: &Backup, options: &RestoreOptions) -> Result<RestoreResult> {
         // Download backup archive
         let storage_path = backup
             .storage_path
@@ -1039,6 +1298,11 @@ impl BackupService {
         // capture time, and if a partial archive was deliberately opted in to,
         // the restore still refuses to call it clean.
         if let Some(manifest) = Self::read_manifest(&entries) {
+            // Archives written since #3011 carry a payload checksum; verify it
+            // before restoring anything so a corrupted archive is refused
+            // outright rather than partially applied. Older archives record an
+            // empty checksum and skip this check.
+            verify_archive_checksum(&manifest, &entries).map_err(AppError::Validation)?;
             if manifest.artifacts_unreadable > 0 {
                 result.errors.push(format!(
                     "archive is incomplete: its manifest records {} artifact object(s) that were \
@@ -1320,6 +1584,9 @@ pub struct RestoreOptions {
     pub restore_database: bool,
     pub restore_artifacts: bool,
     pub target_repository_id: Option<Uuid>,
+    /// The user who requested the restore, recorded on the `RESTORE_*` audit
+    /// events (#3011). `None` for system-initiated restores.
+    pub actor: Option<Uuid>,
 }
 
 /// Result of restore operation
@@ -2621,6 +2888,7 @@ mod tests {
                     restore_database: false,
                     restore_artifacts: true,
                     target_repository_id: None,
+                    actor: None,
                 },
             )
             .await;
@@ -2694,6 +2962,7 @@ mod tests {
                     restore_database: false,
                     restore_artifacts: true,
                     target_repository_id: None,
+                    actor: None,
                 },
             )
             .await
@@ -2749,5 +3018,173 @@ mod tests {
             serde_json::from_value(legacy).expect("legacy manifest deserializes");
         assert_eq!(manifest.artifacts_unreadable, 0);
         assert_eq!(manifest.artifact_count, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3011 — BackupType is honored, not just stored
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn incremental_backup_without_since_is_rejected() {
+        let err = validate_backup_request(BackupType::Incremental, None)
+            .expect_err("an incremental backup without a cutoff must be refused");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "must be a validation error, got {err:?}"
+        );
+        assert!(err.to_string().contains("since"));
+    }
+
+    #[test]
+    fn full_metadata_and_anchored_incremental_requests_are_accepted() {
+        assert!(validate_backup_request(BackupType::Full, None).is_ok());
+        assert!(validate_backup_request(BackupType::Metadata, None).is_ok());
+        assert!(validate_backup_request(BackupType::Incremental, Some(Utc::now())).is_ok());
+        // A full backup MAY carry a cutoff (#2789); that is not incremental's
+        // missing-anchor problem.
+        assert!(validate_backup_request(BackupType::Full, Some(Utc::now())).is_ok());
+    }
+
+    #[test]
+    fn only_metadata_backups_skip_artifact_bytes() {
+        assert!(backup_includes_artifact_bytes(BackupType::Full));
+        assert!(backup_includes_artifact_bytes(BackupType::Incremental));
+        assert!(!backup_includes_artifact_bytes(BackupType::Metadata));
+    }
+
+    // -----------------------------------------------------------------------
+    // #3011 — the manifest carries a real checksum and total size,
+    //          and restore verifies it
+    // -----------------------------------------------------------------------
+
+    type Payload = Vec<(&'static str, &'static [u8])>;
+
+    fn sample_payload() -> (Payload, Payload) {
+        let tables: Vec<(&str, &[u8])> = vec![
+            ("users", br#"[{"id":1}]"# as &[u8]),
+            ("artifacts", br#"[]"# as &[u8]),
+        ];
+        let artifacts: Vec<(&str, &[u8])> = vec![(
+            "repo-a/some/deep/path/artifact.bin",
+            b"artifact-bytes" as &[u8],
+        )];
+        (tables, artifacts)
+    }
+
+    fn manifest_for(
+        tables_len: usize,
+        artifacts_len: usize,
+        summary: (i64, String),
+    ) -> BackupManifest {
+        BackupManifest {
+            version: "1.0".to_string(),
+            backup_id: Uuid::nil(),
+            backup_type: BackupType::Full,
+            created_at: Utc::now(),
+            database_tables: (0..tables_len).map(|i| format!("t{i}")).collect(),
+            artifact_count: artifacts_len as i64,
+            artifacts_unreadable: 0,
+            total_size_bytes: summary.0,
+            checksum: summary.1,
+        }
+    }
+
+    #[test]
+    fn payload_summary_is_deterministic_and_orders_and_names_matter() {
+        let (tables, artifacts) = sample_payload();
+        let all = || tables.iter().copied().chain(artifacts.iter().copied());
+        let (total, checksum) = payload_summary(all());
+        assert_eq!(
+            total,
+            (br#"[{"id":1}]"#.len() + br#"[]"#.len() + b"artifact-bytes".len()) as i64,
+            "total must be the sum of payload entry sizes"
+        );
+        assert!(!checksum.is_empty());
+        assert_eq!(payload_summary(all()), (total, checksum.clone()));
+
+        // Reordering or renaming an entry must not collide with the original.
+        let (_, reordered) =
+            payload_summary(artifacts.iter().copied().chain(tables.iter().copied()));
+        assert_ne!(reordered, checksum);
+        let renamed: Vec<(&str, &[u8])> = vec![("users2", br#"[{"id":1}]"# as &[u8])];
+        let (_, a) = payload_summary(renamed.iter().copied());
+        let one: Vec<(&str, &[u8])> = vec![("users", br#"[{"id":1}]"# as &[u8])];
+        let (_, b) = payload_summary(one.iter().copied());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn archive_checksum_roundtrips_through_the_tar() {
+        let (tables, artifacts) = sample_payload();
+        let summary = payload_summary(tables.iter().copied().chain(artifacts.iter().copied()));
+        let manifest = manifest_for(tables.len(), artifacts.len(), summary);
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+
+        let tar = build_backup_tar(&tables, &artifacts, &manifest_bytes).unwrap();
+        let entries = BackupService::extract_entries(&tar).unwrap();
+        let parsed = BackupService::read_manifest(&entries).expect("manifest present");
+        assert!(
+            !parsed.checksum.is_empty() && parsed.total_size_bytes > 0,
+            "a written manifest must carry a real checksum and size (#3011)"
+        );
+        assert!(
+            verify_archive_checksum(&parsed, &entries).is_ok(),
+            "an untampered archive must verify against its manifest"
+        );
+    }
+
+    #[test]
+    fn archive_checksum_catches_tampered_content() {
+        let (tables, artifacts) = sample_payload();
+        let summary = payload_summary(tables.iter().copied().chain(artifacts.iter().copied()));
+        let manifest = manifest_for(tables.len(), artifacts.len(), summary);
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+
+        let tampered_tables: Vec<(&str, &[u8])> = vec![
+            ("users", br#"[{"id":2}]"# as &[u8]), // flipped content, same size
+            ("artifacts", br#"[]"# as &[u8]),
+        ];
+        let tar = build_backup_tar(&tampered_tables, &artifacts, &manifest_bytes).unwrap();
+        let entries = BackupService::extract_entries(&tar).unwrap();
+        let parsed = BackupService::read_manifest(&entries).unwrap();
+        let err = verify_archive_checksum(&parsed, &entries)
+            .expect_err("tampered payload must fail verification");
+        assert!(err.contains("integrity"), "got: {err}");
+    }
+
+    #[test]
+    fn legacy_archives_with_empty_checksum_skip_verification() {
+        let (tables, artifacts) = sample_payload();
+        let manifest = manifest_for(tables.len(), artifacts.len(), (0, String::new()));
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let tar = build_backup_tar(&tables, &artifacts, &manifest_bytes).unwrap();
+        let entries = BackupService::extract_entries(&tar).unwrap();
+        let parsed = BackupService::read_manifest(&entries).unwrap();
+        assert!(
+            verify_archive_checksum(&parsed, &entries).is_ok(),
+            "archives written before #3011 carry no checksum and must still restore"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3084 — a lost run claim aborts the in-flight backup between chunks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backup_proceeds_while_its_claim_is_held() {
+        let cancel = CancellationToken::new();
+        assert!(ensure_backup_not_cancelled(&cancel).is_ok());
+    }
+
+    #[test]
+    fn backup_aborts_once_its_claim_is_lost() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = ensure_backup_not_cancelled(&cancel)
+            .expect_err("a lost claim must abort the in-flight backup");
+        assert!(
+            err.to_string().contains("claim"),
+            "the abort must name the lost claim; got {err}"
+        );
     }
 }

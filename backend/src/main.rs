@@ -1423,6 +1423,12 @@ async fn initialize_wasm_plugins(
 }
 
 /// Initialize or retrieve the persistent peer identity for this instance.
+///
+/// The `is_local` row in `peer_instances` is reconciled from
+/// `PEER_INSTANCE_NAME` / `PEER_PUBLIC_ENDPOINT` on EVERY boot, exactly like
+/// `peer_instance_identity` — not only seeded at first boot — so env changes
+/// after the initial deployment reach the Peers UI instead of it showing the
+/// stale first-boot name/endpoint forever (#2832).
 async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::Uuid> {
     // Check if identity already exists
     let existing: Option<uuid::Uuid> =
@@ -1431,50 +1437,47 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
             .await
             .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
-    if let Some(id) = existing {
-        // Update name/endpoint in case config changed
-        sqlx::query(
-            "UPDATE peer_instance_identity SET name = $1, endpoint_url = $2, updated_at = NOW()",
+    let peer_instances =
+        artifact_keeper_backend::services::peer_instance_service::PeerInstanceService::new(
+            db.clone(),
+        );
+
+    let id = match existing {
+        Some(id) => {
+            // Update name/endpoint in case config changed
+            sqlx::query(
+                "UPDATE peer_instance_identity SET name = $1, endpoint_url = $2, updated_at = NOW()",
+            )
+            .bind(&config.peer_instance_name)
+            .bind(&config.peer_public_endpoint)
+            .execute(db)
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            id
+        }
+        None => {
+            // Generate new identity
+            let id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO peer_instance_identity (peer_instance_id, name, endpoint_url) VALUES ($1, $2, $3)",
+            )
+            .bind(id)
+            .bind(&config.peer_instance_name)
+            .bind(&config.peer_public_endpoint)
+            .execute(db)
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            id
+        }
+    };
+
+    peer_instances
+        .reconcile_local_instance(
+            &config.peer_instance_name,
+            &config.peer_public_endpoint,
+            &config.peer_api_key,
         )
-        .bind(&config.peer_instance_name)
-        .bind(&config.peer_public_endpoint)
-        .execute(db)
-        .await
-        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-        return Ok(id);
-    }
-
-    // Generate new identity
-    let id = uuid::Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO peer_instance_identity (peer_instance_id, name, endpoint_url) VALUES ($1, $2, $3)",
-    )
-    .bind(id)
-    .bind(&config.peer_instance_name)
-    .bind(&config.peer_public_endpoint)
-    .execute(db)
-    .await
-    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-
-    // Also register this instance in the peer_instances table as is_local=true
-    sqlx::query(
-        r#"
-        INSERT INTO peer_instances (name, endpoint_url, status, api_key, is_local)
-        VALUES ($1, $2, 'online', $3, true)
-        ON CONFLICT (name) DO UPDATE SET
-            endpoint_url = EXCLUDED.endpoint_url,
-            api_key = EXCLUDED.api_key,
-            status = 'online',
-            is_local = true,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(&config.peer_instance_name)
-    .bind(&config.peer_public_endpoint)
-    .bind(&config.peer_api_key)
-    .execute(db)
-    .await
-    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+        .await?;
 
     Ok(id)
 }
