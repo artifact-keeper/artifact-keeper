@@ -1,0 +1,54 @@
+-- Migration: index maven_flat_object_owner.storage_key for the Maven
+-- flat-object orphan-sweep candidate scan.
+--
+-- `select_orphan_maven_flat_objects` (storage_gc_service.rs) filters this
+-- table on `storage_key LIKE 'maven/%' AND created_at < NOW() - INTERVAL
+-- '1 hour'`, then orders by `storage_key` and takes `LIMIT 1000`. The table's
+-- primary key is `(storage_backend, storage_key)` (migration 168); the query
+-- never constrains `storage_backend`, so the PK's leading column cannot be
+-- used and Postgres falls back to a sequential scan of the whole table,
+-- evaluating the (expensive, several correlated NOT EXISTS subqueries)
+-- predicate against every row, then sorting the survivors before applying
+-- the limit.
+--
+-- A plain `created_at` index would not help much: the migration-163 backfill
+-- inserts an attribution row for every flat Maven key, including ones still
+-- referenced by a live artifact, and rows are never deleted except by this
+-- same GC sweep -- so in steady state the large majority of rows already
+-- satisfy the age filter, and the age predicate has little selectivity.
+--
+-- Indexing `storage_key` instead lets Postgres do an index scan in the same
+-- order as `ORDER BY storage_key`, evaluate the NOT EXISTS predicate lazily
+-- row by row, and stop as soon as 1000 qualifying rows are found, instead of
+-- reading and sorting the entire table on every hourly tick.
+--
+-- LOCK BEHAVIOUR. As with migration 193 (and 166 before it), CREATE INDEX
+-- CONCURRENTLY is intentionally not used here: sqlx::migrate runs each
+-- migration file inside a transaction, and CONCURRENTLY is rejected inside a
+-- transaction block.
+--
+-- A plain CREATE INDEX takes a SHARE lock on `maven_flat_object_owner` for
+-- the duration of the build. SHARE conflicts with ROW EXCLUSIVE, so for as
+-- long as the build runs:
+--
+--   * writes to maven_flat_object_owner BLOCK -- new attribution rows from
+--     Maven flat-key writes, and this same GC's own row deletes;
+--   * reads do NOT block -- plain SELECT takes ACCESS SHARE, compatible with
+--     SHARE, so uploads/downloads that only read other tables are unaffected.
+--
+-- This table holds one attribution row per row-less Maven flat key (far
+-- smaller than `artifacts` or `oci_blobs`), so the build should be short --
+-- but the write stall is real on a large Maven registry.
+--
+-- Operators who cannot accept even a brief write stall should build the
+-- index out of band, BEFORE deploying this migration, against a live table:
+--
+--   CREATE INDEX CONCURRENTLY idx_maven_flat_object_owner_storage_key
+--       ON maven_flat_object_owner (storage_key);
+--
+-- The IF NOT EXISTS below then makes this migration a no-op. This is the
+-- only supported way to avoid the stall -- the migration itself cannot
+-- simply be skipped, since sqlx tracks applied migrations by checksum and a
+-- missing entry blocks the ledger.
+CREATE INDEX IF NOT EXISTS idx_maven_flat_object_owner_storage_key
+    ON maven_flat_object_owner (storage_key);
