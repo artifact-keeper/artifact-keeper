@@ -445,7 +445,18 @@ pub fn spawn_all(
                     .await
                     {
                         Ok(true) => {
+                            // #3285: name the offending digests. Without this,
+                            // diagnosing a stuck gate meant reconstructing the
+                            // gate query by hand against the database.
+                            let blockers =
+                                crate::services::manifest_blob_refs_backfill::list_live_manifests_missing_refs(
+                                    &gate_db,
+                                    crate::services::manifest_blob_refs_backfill::GATE_BLOCKER_SAMPLE_LIMIT,
+                                )
+                                .await
+                                .unwrap_or_default();
                             tracing::warn!(
+                                blocking_manifests = %crate::services::manifest_blob_refs_backfill::describe_gate_blockers(&blockers),
                                 "Blob GC: manifest_blob_refs is incomplete for one or more live \
                                  image manifests (startup backfill unfinished or partially \
                                  failed); forcing dry-run this tick and retrying next tick"
