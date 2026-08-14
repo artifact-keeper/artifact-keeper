@@ -9,8 +9,10 @@
 //! are referenced from `oci_tags`) with no corresponding rows in
 //! `manifest_blob_refs`.
 //!
-//! This module walks the image manifests safely backfillable from `oci_tags`
-//! (directly tagged manifests whose content-type is NOT an image index) that
+//! This module walks the image manifests safely backfillable from this
+//! repository's own corpus — directly tagged manifests whose content-type is
+//! NOT an image index, plus the children of tagged indexes whose manifest body
+//! this repository actually holds (#3285) — that
 //! have zero `manifest_blob_refs` rows, loads each manifest body from storage,
 //! parses the JSON, and inserts the
 //! (manifest, blob, repo, kind) edges. The backfill is idempotent
@@ -18,16 +20,15 @@
 //! a malformed manifest is logged at WARN and skipped; it does not stop
 //! the backfill or fail startup.
 //!
-//! A bare `oci_manifest_refs.child_digest` is intentionally not a backfill
+//! A *bare* `oci_manifest_refs.child_digest` is intentionally not a backfill
 //! source: an index body can reference a digest whose manifest body was never
 //! uploaded to this repository. On shared cloud backends, loading that digest
 //! from `oci-manifests/<digest>` would import another repository's manifest
 //! metadata and later authorize digest fallback through the wrong repository.
-//! Child manifests that were actually pushed to this repository are still
-//! covered through their `oci_tags` rows. The blob-GC readiness gate still
-//! treats live child edges as missing refs, so destructive blob GC stays off
-//! rather than collecting legacy child blobs that could not be backfilled
-//! safely.
+//! A child whose manifest body *was* committed into this repository — proven by
+//! a live `artifacts` row at `oci-manifests/<child_digest>` under that
+//! repository id — carries no such risk and IS backfilled (#3285); see
+//! [`LIVE_IMAGE_MANIFEST_SET_SQL`].
 //!
 //! Called once from `main.rs` after migrations run. On the next restart
 //! the same query returns zero rows and the backfill is effectively a
@@ -211,20 +212,151 @@ fn insert_rows_error(e: impl std::fmt::Display) -> String {
     format!("insert manifest_blob_refs rows: {}", e)
 }
 
-/// Select the distinct (manifest_digest, repository_id) tuples for tagged image
+/// The set of *live* image manifests, shared verbatim by the backfill
+/// candidate query and the blob-GC readiness gate (#3285).
+///
+/// **The two must be the same set.** The gate is "does any live image manifest
+/// still lack `manifest_blob_refs` rows"; the backfill is "populate refs for
+/// every live image manifest". If the gate's set is any wider than the
+/// backfill's, the members of the difference can never gain refs and the gate
+/// is closed forever — `BLOB_GC_ENABLED=true` silently becomes a no-op while
+/// object storage grows without bound. That is exactly what #3285 reported: the
+/// gate counted children of tagged indexes that the candidate query never
+/// selected, so 365 manifests held blob GC off permanently with no operator
+/// remedy. Deriving both from this one fragment makes the failure mode
+/// unrepresentable.
+///
+/// Two arms, both filtered to manifests that can actually own blobs:
+///
+/// 1. **Directly tagged manifests.** `oci_tags` rows whose content-type is not
+///    an image index and which are not *structurally* an index. The structural
+///    guard (#1409 C1) catches an index pushed with a wrong/absent
+///    Content-Type: it has no blobs of its own, so it could never gain
+///    `manifest_blob_refs` rows and would pin the gate forever.
+///
+/// 2. **Children of tagged indexes whose manifest body is local.** A bare
+///    `oci_manifest_refs` edge only proves that some parent index *references*
+///    the digest — on a shared cloud namespace, blindly reading
+///    `oci-manifests/<digest>` could import another repository's manifest. The
+///    `artifacts` join is the locality proof: a live row in THIS repository at
+///    exactly that storage key means this repository committed that manifest
+///    body (both the push path and the proxy path write it), so reading it back
+///    is safe. The same structural + content-type guards are applied so a
+///    nested index cannot slip in.
+///
+/// Consequently a child that is merely *referenced* — the normal steady state
+/// for a proxy cache, which only fetches the architecture actually pulled —
+/// is in neither set. It cannot be backfilled (there is no local body to
+/// parse) and it no longer gates: with no manifest body there are no local
+/// blobs attributable to it that a sweep could wrongly reclaim.
+const LIVE_IMAGE_MANIFEST_SET_SQL: &str = r#"
+    SELECT ot.manifest_digest AS manifest_digest,
+           ot.repository_id AS repository_id
+    FROM oci_tags ot
+    WHERE ot.manifest_content_type NOT IN (
+            'application/vnd.oci.image.index.v1+json',
+            'application/vnd.docker.distribution.manifest.list.v2+json'
+        )
+      AND NOT EXISTS (
+            SELECT 1 FROM oci_manifest_refs omr_parent
+            WHERE omr_parent.repository_id = ot.repository_id
+              AND omr_parent.parent_digest = ot.manifest_digest
+        )
+    UNION
+    SELECT omr.child_digest AS manifest_digest,
+           omr.repository_id AS repository_id
+    FROM oci_manifest_refs omr
+    JOIN oci_tags ot_parent
+      ON ot_parent.repository_id = omr.repository_id
+     AND ot_parent.manifest_digest = omr.parent_digest
+    JOIN artifacts a
+      ON a.repository_id = omr.repository_id
+     AND a.storage_key = 'oci-manifests/' || omr.child_digest
+     AND a.is_deleted = false
+    WHERE a.content_type NOT IN (
+            'application/vnd.oci.image.index.v1+json',
+            'application/vnd.docker.distribution.manifest.list.v2+json'
+        )
+      AND NOT EXISTS (
+            SELECT 1 FROM oci_manifest_refs omr_child
+            WHERE omr_child.repository_id = omr.repository_id
+              AND omr_child.parent_digest = omr.child_digest
+        )
+"#;
+
+// Pin the `oci-manifests/` literal embedded above to the Rust constant the
+// candidate's `storage_key()` builds from, so the locality join can never
+// address a different key space than the read it authorizes.
+const _: () = assert!(crate::storage::keys::prefix_matches("oci-manifests/"));
+
+/// The *un-backfilled live manifest* relation: [`LIVE_IMAGE_MANIFEST_SET_SQL`]
+/// restricted to members with zero `manifest_blob_refs` rows, exposed under
+/// `alias` with columns `manifest_digest` / `repository_id`.
+///
+/// Every consumer — the backfill candidate query, the readiness gate, and the
+/// operator diagnostic — builds its FROM clause from this one function. That is
+/// what makes "the gate can only be closed by something the backfill selects"
+/// a structural property rather than a convention (#3285).
+fn unbackfilled_live_manifests(alias: &str) -> String {
+    format!(
+        r#"(
+            SELECT u.manifest_digest AS manifest_digest,
+                   u.repository_id AS repository_id
+            FROM ({live}) AS u
+            WHERE NOT EXISTS (
+                    SELECT 1 FROM manifest_blob_refs mbr
+                    WHERE mbr.manifest_digest = u.manifest_digest
+                      AND mbr.repository_id = u.repository_id
+                )
+        ) AS {alias}"#,
+        live = LIVE_IMAGE_MANIFEST_SET_SQL,
+    )
+}
+
+/// SQL for [`select_unbackfilled_manifests`]. Pure builder so the query text is
+/// assertable without a database.
+fn candidate_query_sql() -> String {
+    format!(
+        r#"
+        SELECT DISTINCT ON (c.manifest_digest, c.repository_id)
+            c.manifest_digest AS manifest_digest,
+            c.repository_id AS repository_id,
+            r.storage_backend AS storage_backend,
+            r.storage_path AS storage_path
+        FROM {rel}
+        JOIN repositories r ON r.id = c.repository_id
+        "#,
+        rel = unbackfilled_live_manifests("c"),
+    )
+}
+
+/// SQL for [`any_live_manifest_missing_refs`]. Pure builder, see
+/// [`candidate_query_sql`].
+fn gate_query_sql() -> String {
+    format!(
+        "SELECT EXISTS (SELECT 1 FROM {rel})",
+        rel = unbackfilled_live_manifests("live"),
+    )
+}
+
+/// SQL for [`list_live_manifests_missing_refs`]. Pure builder, see
+/// [`candidate_query_sql`].
+fn blocker_query_sql() -> String {
+    format!(
+        r#"
+        SELECT live.manifest_digest AS manifest_digest,
+               live.repository_id AS repository_id
+        FROM {rel}
+        LIMIT $1
+        "#,
+        rel = unbackfilled_live_manifests("live"),
+    )
+}
+
+/// Select the distinct (manifest_digest, repository_id) tuples for live image
 /// manifests that have zero rows in `manifest_blob_refs` and are safe to
-/// backfill from storage.
-///
-/// `oci_tags` rows whose content-type is NOT an image index AND which are not
-/// structurally an index (no children in `oci_manifest_refs`) are directly
-/// tagged image manifests. The structural guard (#1409 C1) keeps an index
-/// pushed with a wrong/absent Content-Type out of the image-candidate set,
-/// since it has no blobs of its own and would otherwise pin the readiness gate
-/// forever.
-///
-/// `oci_manifest_refs.child_digest` rows are deliberately not selected on
-/// their own. The edge proves a parent index references that digest, not that
-/// the child manifest body was pushed into the same repository.
+/// backfill from storage — i.e. [`LIVE_IMAGE_MANIFEST_SET_SQL`] restricted by
+/// [`missing_refs_predicate`].
 ///
 /// We pull `storage_backend` / `storage_path` from the repositories table
 /// along the way so the per-candidate work can resolve the correct backend
@@ -233,45 +365,7 @@ fn insert_rows_error(e: impl std::fmt::Display) -> String {
 /// all rows for the same (digest, repo) point at the same manifest body, that
 /// is fine.
 async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<BackfillCandidate>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT DISTINCT ON (c.manifest_digest, c.repository_id)
-            c.manifest_digest AS manifest_digest,
-            c.repository_id AS repository_id,
-            r.storage_backend AS storage_backend,
-            r.storage_path AS storage_path
-        FROM (
-            SELECT ot.manifest_digest AS manifest_digest,
-                   ot.repository_id AS repository_id
-            FROM oci_tags ot
-            WHERE ot.manifest_content_type NOT IN (
-                    'application/vnd.oci.image.index.v1+json',
-                    'application/vnd.docker.distribution.manifest.list.v2+json'
-                )
-              -- Structural index guard (#1409 C1): exclude any tagged digest
-              -- that is itself an index (has children in oci_manifest_refs),
-              -- even when its stored content-type does not match the two
-              -- index media types above (pushed with a wrong/absent
-              -- Content-Type). An index carries no blobs of its own, so it
-              -- can never gain manifest_blob_refs rows; left in the candidate
-              -- set it would pin the readiness gate true forever and disable
-              -- blob GC permanently.
-              AND NOT EXISTS (
-                    SELECT 1 FROM oci_manifest_refs omr_parent
-                    WHERE omr_parent.repository_id = ot.repository_id
-                      AND omr_parent.parent_digest = ot.manifest_digest
-                )
-        ) AS c
-        JOIN repositories r ON r.id = c.repository_id
-        WHERE NOT EXISTS (
-                SELECT 1 FROM manifest_blob_refs mbr
-                WHERE mbr.manifest_digest = c.manifest_digest
-                  AND mbr.repository_id = c.repository_id
-          )
-        "#,
-    )
-    .fetch_all(db)
-    .await?;
+    let rows = sqlx::query(&candidate_query_sql()).fetch_all(db).await?;
 
     let candidates = rows
         .into_iter()
@@ -289,10 +383,10 @@ async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<Backfill
 
 /// Blob-GC readiness gate (#1408; design from #1409 review, finding 3).
 ///
-/// Returns `true` while any *live* image manifest (a tagged non-index
-/// manifest, or a per-architecture child of a tagged index) still has
-/// zero rows in `manifest_blob_refs` — i.e. a successful backfill has not
-/// yet established the full live blob set.
+/// Returns `true` while any *live* image manifest — a tagged non-index
+/// manifest, or a per-architecture child of a tagged index whose body this
+/// repository actually holds — still has zero rows in `manifest_blob_refs`,
+/// i.e. a successful backfill has not yet established the full live blob set.
 ///
 /// Blob GC MUST NOT delete while this holds: a blob that looks
 /// unreferenced may simply belong to a manifest whose refs have not been
@@ -303,47 +397,58 @@ async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<Backfill
 /// through the push handler) it returns `false` and GC resumes on the
 /// next scheduler tick.
 ///
-/// This is deliberately broader than [`select_unbackfilled_manifests`]:
-/// backfill cannot safely import bare `oci_manifest_refs.child_digest` bodies
-/// from shared storage, but blob GC must still treat those live children as
-/// incomplete and force dry-run until refs are established by a re-push or the
-/// parent index is untagged.
+/// This is evaluated over exactly [`LIVE_IMAGE_MANIFEST_SET_SQL`], the same
+/// set [`select_unbackfilled_manifests`] enumerates, so every manifest that
+/// can close this gate is also one the backfill can open it with (#3285).
 pub async fn any_live_manifest_missing_refs(db: &PgPool) -> sqlx::Result<bool> {
-    sqlx::query_scalar::<_, bool>(
-        r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM (
-                SELECT ot.manifest_digest AS manifest_digest,
-                       ot.repository_id AS repository_id
-                FROM oci_tags ot
-                WHERE ot.manifest_content_type NOT IN (
-                        'application/vnd.oci.image.index.v1+json',
-                        'application/vnd.docker.distribution.manifest.list.v2+json'
-                    )
-                  AND NOT EXISTS (
-                        SELECT 1 FROM oci_manifest_refs omr_parent
-                        WHERE omr_parent.repository_id = ot.repository_id
-                          AND omr_parent.parent_digest = ot.manifest_digest
-                    )
-                UNION
-                SELECT omr.child_digest AS manifest_digest,
-                       omr.repository_id AS repository_id
-                FROM oci_manifest_refs omr
-                JOIN oci_tags ot_parent
-                  ON ot_parent.repository_id = omr.repository_id
-                 AND ot_parent.manifest_digest = omr.parent_digest
-            ) AS live
-            WHERE NOT EXISTS (
-                SELECT 1 FROM manifest_blob_refs mbr
-                WHERE mbr.manifest_digest = live.manifest_digest
-                  AND mbr.repository_id = live.repository_id
+    sqlx::query_scalar::<_, bool>(&gate_query_sql())
+        .fetch_one(db)
+        .await
+}
+
+/// Bounded operator diagnostic for a closed readiness gate (#3285): the
+/// `(manifest_digest, repository_id)` pairs currently holding blob GC off.
+///
+/// Reported by the reporter's own request — before this, diagnosing a stuck
+/// gate meant reconstructing both queries by hand against the database. Capped
+/// at `limit` rows so a large stuck corpus cannot produce an unbounded log
+/// line or an unbounded result set.
+pub async fn list_live_manifests_missing_refs(
+    db: &PgPool,
+    limit: i64,
+) -> sqlx::Result<Vec<(String, Uuid)>> {
+    let rows = sqlx::query(&blocker_query_sql())
+        .bind(limit)
+        .fetch_all(db)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.try_get("manifest_digest").unwrap_or_default(),
+                r.try_get("repository_id").unwrap_or_default(),
             )
-        )
-        "#,
-    )
-    .fetch_one(db)
-    .await
+        })
+        .collect())
+}
+
+/// How many gate-blocking manifests [`describe_gate_blockers`] names in one log
+/// line. Enough to spot the pattern (one bad repo, one bad index) without
+/// flooding the log every scheduler tick.
+pub const GATE_BLOCKER_SAMPLE_LIMIT: i64 = 20;
+
+/// Render a gate-blocker sample as a single log-friendly string. Pure, so the
+/// operator-facing wording is unit-testable without a database.
+pub fn describe_gate_blockers(blockers: &[(String, Uuid)]) -> String {
+    if blockers.is_empty() {
+        return "none (the gate query found no blocking manifest)".to_string();
+    }
+    blockers
+        .iter()
+        .map(|(digest, repo)| format!("{digest}@{repo}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Hard cap on the manifest body size we are willing to load and parse
@@ -667,9 +772,13 @@ mod tests {
         let candidates = select_unbackfilled_manifests(&fixture.pool)
             .await
             .expect("candidate query runs");
-        let gate_missing = any_live_manifest_missing_refs(&fixture.pool)
+        // The gate is instance-wide, so a bare boolean says nothing about THIS
+        // fixture while other tests share the database. Scope both sides to the
+        // fixture's repository and compare them directly — that comparison is
+        // the #3285 invariant (gate set == candidate set).
+        let blockers = list_live_manifests_missing_refs(&fixture.pool, 1_000_000)
             .await
-            .expect("gate query runs");
+            .expect("gate blocker listing runs");
 
         assert!(
             !candidates
@@ -684,26 +793,46 @@ mod tests {
                 .any(|c| c.manifest_digest == child_digest && c.repository_id == fixture.repo_id),
             "a bare child edge must not authorize backfilling that child from shared storage"
         );
+        // #3285: and therefore it must not gate either. A proxy cache that only
+        // fetched linux/amd64 legitimately references an arm64 child it will
+        // never hold; while that child gated, BLOB_GC_ENABLED=true was a
+        // permanent no-op on every proxy-backed registry.
         assert!(
-            gate_missing,
-            "a live child edge without manifest_blob_refs must still keep destructive blob GC gated"
+            !blockers
+                .iter()
+                .any(|(d, r)| *d == child_digest && *r == fixture.repo_id),
+            "a child with no local manifest body cannot be backfilled, so it must not hold the \
+             readiness gate closed (#3285)"
         );
 
+        // Now give the child a live artifacts row at its manifest storage key —
+        // the locality proof that this repository committed the body. It must
+        // become a candidate WITHOUT needing a tag of its own (index children
+        // never carry one), and it must gate until its refs are recorded.
         sqlx::query(
             r#"
-            INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
-            VALUES ($1, 'c1/index', $2, $2, 'application/vnd.oci.image.manifest.v1+json')
+            INSERT INTO artifacts
+                (repository_id, path, name, version, size_bytes, checksum_sha256,
+                 content_type, storage_key)
+            VALUES ($1, $2, $3, $4, 1, $5, 'application/vnd.oci.image.manifest.v1+json', $6)
             "#,
         )
         .bind(fixture.repo_id)
+        .bind(format!("v2/c1/index/manifests/{child_digest}"))
+        .bind(format!("c1/index:{child_digest}"))
         .bind(&child_digest)
+        .bind(child_digest.trim_start_matches("sha256:"))
+        .bind(format!("oci-manifests/{child_digest}"))
         .execute(&fixture.pool)
         .await
-        .expect("insert child tag");
+        .expect("insert child manifest artifact row");
 
         let candidates = select_unbackfilled_manifests(&fixture.pool)
             .await
-            .expect("candidate query runs after child tag");
+            .expect("candidate query runs after the child body is local");
+        let blockers = list_live_manifests_missing_refs(&fixture.pool, 1_000_000)
+            .await
+            .expect("gate blocker listing runs after the child body is local");
 
         fixture.teardown().await;
 
@@ -711,8 +840,130 @@ mod tests {
             candidates
                 .iter()
                 .any(|c| c.manifest_digest == child_digest && c.repository_id == fixture.repo_id),
-            "a child manifest that was actually pushed/tagged in this repo must still be \
-             enumerated as an unbackfilled candidate"
+            "an index child whose manifest body is committed in this repository must be \
+             enumerated as an unbackfilled candidate (#3285); before the fix only tagged \
+             manifests were, so index children could never gain refs"
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|(d, r)| *d == child_digest && *r == fixture.repo_id),
+            "and it must gate until its refs are recorded"
         );
     }
+
+    /// #3285 core invariant, asserted structurally so it holds regardless of
+    /// database contents: the readiness gate and the backfill candidate set are
+    /// derived from the SAME live-manifest fragment under the SAME missing-refs
+    /// predicate. Any divergence reintroduces a gate that a successful backfill
+    /// can never open.
+    #[test]
+    fn gate_and_candidate_queries_share_one_live_set_definition() {
+        // Byte-identical relation text, differing only in the outer alias:
+        // neither query can range over a manifest the other cannot see.
+        let relation = unbackfilled_live_manifests("c");
+        assert_eq!(
+            relation.replace(") AS c", ") AS live"),
+            unbackfilled_live_manifests("live"),
+            "the un-backfilled live relation must depend only on its alias"
+        );
+        for (name, sql) in [
+            ("candidate", candidate_query_sql()),
+            ("gate", gate_query_sql()),
+            ("blocker", blocker_query_sql()),
+        ] {
+            let alias_free = sql.replace(") AS live", ") AS c");
+            assert!(
+                alias_free.contains(&relation),
+                "the {name} query must be built from the shared un-backfilled live relation \
+                 (#3285); a wider gate than candidate set can never be opened by a backfill"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_query_carries_the_backend_columns_the_read_needs() {
+        let sql = candidate_query_sql();
+        assert!(sql.contains("r.storage_backend"));
+        assert!(sql.contains("r.storage_path"));
+        assert!(sql.contains("JOIN repositories r ON r.id = c.repository_id"));
+        assert!(
+            sql.contains("DISTINCT ON (c.manifest_digest, c.repository_id)"),
+            "a digest tagged under several names in one repo must be visited once"
+        );
+    }
+
+    #[test]
+    fn blocker_query_is_bounded() {
+        assert!(
+            blocker_query_sql().contains("LIMIT $1"),
+            "the operator diagnostic must never return an unbounded result set"
+        );
+    }
+
+    #[test]
+    fn live_set_backfills_index_children_only_with_a_local_body() {
+        // The locality proof: the child arm joins `artifacts` on this
+        // repository's own row at the child's manifest storage key. Without it
+        // a bare `oci_manifest_refs` edge would authorize reading another
+        // repository's manifest off a shared cloud namespace.
+        assert!(
+            LIVE_IMAGE_MANIFEST_SET_SQL.contains("omr.child_digest"),
+            "index children must be reachable by the live set (#3285)"
+        );
+        assert!(
+            LIVE_IMAGE_MANIFEST_SET_SQL
+                .contains("a.storage_key = 'oci-manifests/' || omr.child_digest"),
+            "the child arm must require a live artifacts row in the SAME repository at the \
+             child's manifest storage key"
+        );
+        assert!(
+            LIVE_IMAGE_MANIFEST_SET_SQL.contains("a.repository_id = omr.repository_id"),
+            "the locality join must be repository-scoped"
+        );
+        assert!(
+            LIVE_IMAGE_MANIFEST_SET_SQL.contains("a.is_deleted = false"),
+            "a soft-deleted manifest row is not a local body"
+        );
+        // Nested indexes own no blobs; letting one in would pin the gate.
+        assert!(
+            LIVE_IMAGE_MANIFEST_SET_SQL.contains("omr_child.parent_digest = omr.child_digest"),
+            "the structural index guard must apply to the child arm too"
+        );
+    }
+
+    #[test]
+    fn unbackfilled_relation_excludes_manifests_that_already_have_refs() {
+        let rel = unbackfilled_live_manifests("live");
+        assert!(rel.contains("NOT EXISTS"));
+        assert!(rel.contains("FROM manifest_blob_refs mbr"));
+        assert!(rel.contains("mbr.manifest_digest = u.manifest_digest"));
+        assert!(rel.contains("mbr.repository_id = u.repository_id"));
+        assert!(
+            rel.trim_end().ends_with(") AS live"),
+            "the relation must expose the caller's alias"
+        );
+    }
+
+    // -- operator diagnostic (#3285) ----------------------------------------
+
+    #[test]
+    fn describe_gate_blockers_names_digest_and_repository() {
+        let repo = Uuid::nil();
+        let out = describe_gate_blockers(&[
+            ("sha256:aaa".to_string(), repo),
+            ("sha256:bbb".to_string(), repo),
+        ]);
+        assert_eq!(out, format!("sha256:aaa@{repo}, sha256:bbb@{repo}"));
+    }
+
+    #[test]
+    fn describe_gate_blockers_empty_is_explicit() {
+        assert!(describe_gate_blockers(&[]).contains("none"));
+    }
+
+    // The sample is logged once per scheduler tick; keep it small enough to
+    // read and large enough to show a pattern.
+    const _SAMPLE_SANE: () =
+        assert!(GATE_BLOCKER_SAMPLE_LIMIT >= 5 && GATE_BLOCKER_SAMPLE_LIMIT <= 100);
 }

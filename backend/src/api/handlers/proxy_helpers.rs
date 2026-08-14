@@ -5909,6 +5909,84 @@ pub async fn evaluate_curation_lookup(
 /// logged and swallowed. `upsert_package`'s `ON CONFLICT DO UPDATE` makes
 /// repeated proxy hits idempotent. Only proxy repos (`remote`/`virtual`) have an
 /// upstream worth ingesting from.
+/// Whether a proxy download response is one that may enqueue an on-demand
+/// curation row (#3233).
+///
+/// The seam runs **after** the format handler's serve call returns, and this is
+/// the predicate that makes "after" mean something: only a response the
+/// repository access check inside that call actually let through, for an
+/// artifact that actually resolved, may write a catalog row. Enqueuing on
+/// anything else lets an unauthenticated caller write `curation_packages` rows
+/// for packages that do not exist, into a staging repo belonging to another
+/// tenant.
+///
+/// `3xx` counts because #1555 answers a fresh proxy-cache hit on a remote member
+/// with a `307` to a presigned URL (`presigned_downloads_enabled`); gating on
+/// success alone would switch ingestion off for every operator running
+/// object-storage downloads. Both shapes mean the same two things: the access
+/// check passed and the artifact resolved.
+pub fn response_admits_ondemand_ingest(status: StatusCode) -> bool {
+    status.is_success() || status.is_redirection()
+}
+
+/// Upper bound on the pending on-demand rows one staging repository may
+/// accumulate from proxy traffic (#3233).
+///
+/// Proxy-driven ingestion has no natural upper bound: every served download of a
+/// curated remote can mint a row. That costs more than table size —
+/// `evaluate_ondemand_curation` processes `MAX_PENDING_PER_TICK = 500` rows per
+/// tick with serial per-row network I/O and `ORDER BY first_seen_at ASC`, so a
+/// large backlog both delays the packages an operator actually cares about
+/// (head-of-line) and stalls the rest of the sync cycle behind it. At the cap,
+/// new rows are dropped and existing ones keep being refreshed; draining the
+/// review queue re-opens ingestion on its own.
+pub const MAX_PENDING_ONDEMAND_ROWS: i64 = 5_000;
+
+/// Whether one on-demand row may be written, given the staging repo's current
+/// pending backlog (#3233).
+///
+/// A row that already exists is always admitted: the write is an upsert that
+/// refreshes metadata rather than growing the catalog, and refusing it would
+/// freeze a row's metadata at whatever the first request saw. Only genuinely new
+/// rows are capped.
+pub fn on_demand_row_admitted(row_exists: bool, pending_rows: i64, cap: i64) -> bool {
+    row_exists || pending_rows < cap
+}
+
+/// Count this staging repo's pending rows (bounded by `cap + 1`, so the scan
+/// cost does not grow with the backlog) and report whether the row being
+/// ingested already exists — the two inputs [`on_demand_row_admitted`] needs.
+async fn ondemand_admission_inputs(
+    db: &PgPool,
+    staging_repo_id: Uuid,
+    entry: &crate::services::curation_sync::CurationPackageEntry,
+    cap: i64,
+) -> Result<(bool, i64), sqlx::Error> {
+    sqlx::query_as(
+        r#"SELECT
+             EXISTS(
+               SELECT 1 FROM curation_packages
+               WHERE staging_repo_id = $1 AND format = $2 AND package_name = $3
+                 AND version = $4 AND COALESCE(release, '') = COALESCE($5::text, '')
+                 AND COALESCE(architecture, '') = COALESCE($6::text, '')
+             ),
+             (SELECT count(*) FROM (
+                SELECT 1 FROM curation_packages
+                WHERE staging_repo_id = $1 AND status = 'pending'
+                LIMIT $7::bigint
+             ) capped)"#,
+    )
+    .bind(staging_repo_id)
+    .bind(&entry.format)
+    .bind(&entry.package_name)
+    .bind(&entry.version)
+    .bind(entry.release.as_deref())
+    .bind(entry.architecture.as_deref())
+    .bind(cap.saturating_add(1))
+    .fetch_one(db)
+    .await
+}
+
 pub async fn enqueue_curation_on_demand(
     db: &PgPool,
     proxy_repo_id: Uuid,
@@ -5945,6 +6023,32 @@ pub async fn enqueue_curation_on_demand(
     }
     let svc = crate::services::curation_service::CurationService::new(db.clone());
     for staging_id in staging {
+        // #3233 cap: never let proxy traffic grow one staging repo's pending
+        // backlog without bound. A failed admission query skips the write rather
+        // than assuming room — the seam is best-effort in both directions, and a
+        // missed row is re-ingested by the next download or the next sync.
+        match ondemand_admission_inputs(db, staging_id, &entry, MAX_PENDING_ONDEMAND_ROWS).await {
+            Ok((row_exists, pending_rows)) => {
+                if !on_demand_row_admitted(row_exists, pending_rows, MAX_PENDING_ONDEMAND_ROWS) {
+                    tracing::warn!(
+                        staging_repo_id = %staging_id,
+                        package = %entry.package_name,
+                        cap = MAX_PENDING_ONDEMAND_ROWS,
+                        "on-demand curation ingest: staging repo is at its pending-row cap; dropping the row"
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    staging_repo_id = %staging_id,
+                    package = %entry.package_name,
+                    error = %e,
+                    "on-demand curation ingest: pending-row cap check failed; skipping"
+                );
+                continue;
+            }
+        }
         if let Err(e) = svc
             .upsert_package(
                 staging_id,
@@ -14642,5 +14746,74 @@ mod tests {
         up.assert_plain_forward(&parts.headers, &body, "control slow path");
 
         fx.teardown().await;
+    }
+
+    // ── #3233: the on-demand curation ingestion seam ─────────────────────────
+    //
+    // The PyPI seam was moved from before the upstream fetch to after the serve
+    // call returns, because in its original position it ran ahead of the
+    // repository access check and ahead of any upstream contact: an
+    // unauthenticated caller could write `curation_packages` rows for packages
+    // that do not exist, into a staging repo belonging to another tenant,
+    // uncapped. The relocation shipped without a test; these cover the two
+    // properties it turns on.
+
+    #[test]
+    fn only_a_served_response_admits_ondemand_ingest() {
+        // Positive control first: without it, "no ingest on 404" is satisfied by
+        // a predicate that is false for everything.
+        for served in [
+            StatusCode::OK,
+            StatusCode::PARTIAL_CONTENT,
+            StatusCode::MOVED_PERMANENTLY,
+            // #1555 presigned-download redirect — the shape that would silently
+            // switch ingestion off for object-storage deployments if this seam
+            // gated on 2xx alone.
+            StatusCode::TEMPORARY_REDIRECT,
+        ] {
+            assert!(
+                response_admits_ondemand_ingest(served),
+                "{served} is a served response and must admit ingestion"
+            );
+        }
+
+        for refused in [
+            // The access check inside the serve call refused the caller.
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            // The distribution does not exist upstream: the name and version on
+            // the request path were never corroborated by anything.
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+            // Curation / age gate blocks, and upstream failures.
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(
+                !response_admits_ondemand_ingest(refused),
+                "{refused} must never write a curation row"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_row_cap_bounds_new_rows_only() {
+        let cap = MAX_PENDING_ONDEMAND_ROWS;
+
+        // Under the cap, a new row is admitted (the positive control).
+        assert!(on_demand_row_admitted(false, 0, cap));
+        assert!(on_demand_row_admitted(false, cap - 1, cap));
+
+        // At and past the cap, new rows are dropped.
+        assert!(!on_demand_row_admitted(false, cap, cap));
+        assert!(!on_demand_row_admitted(false, cap + 1, cap));
+
+        // A row that already exists is always admitted: the write is an upsert
+        // that refreshes metadata rather than growing the catalog, so capping it
+        // would freeze the row at whatever the first request saw without
+        // bounding anything.
+        assert!(on_demand_row_admitted(true, cap, cap));
+        assert!(on_demand_row_admitted(true, cap * 10, cap));
     }
 }

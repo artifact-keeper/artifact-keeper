@@ -445,7 +445,18 @@ pub fn spawn_all(
                     .await
                     {
                         Ok(true) => {
+                            // #3285: name the offending digests. Without this,
+                            // diagnosing a stuck gate meant reconstructing the
+                            // gate query by hand against the database.
+                            let blockers =
+                                crate::services::manifest_blob_refs_backfill::list_live_manifests_missing_refs(
+                                    &gate_db,
+                                    crate::services::manifest_blob_refs_backfill::GATE_BLOCKER_SAMPLE_LIMIT,
+                                )
+                                .await
+                                .unwrap_or_default();
                             tracing::warn!(
+                                blocking_manifests = %crate::services::manifest_blob_refs_backfill::describe_gate_blockers(&blockers),
                                 "Blob GC: manifest_blob_refs is incomplete for one or more live \
                                  image manifests (startup backfill unfinished or partially \
                                  failed); forcing dry-run this tick and retrying next tick"
@@ -1989,35 +2000,49 @@ async fn evaluate_ondemand_curation(
 
         match format {
             "pypi" => {
-                let verdict = match &trust {
-                    Some(t) => {
-                        verify_pypi_curation_row(
-                            client,
-                            upstream_auth,
-                            upstream_url,
-                            &pkg,
-                            &allowlist,
-                            t,
-                        )
-                        .await
+                // #3230: the persisted record is the source of truth when it is
+                // still usable. Re-verifying means re-downloading the whole
+                // distribution from the upstream, and a verification is a
+                // statement about an immutable digest — so a fresh record short-
+                // circuits the network work AND, more importantly, survives the
+                // tick that computed it. `reusable_verdict` fails safe: any
+                // doubt returns None and we verify again.
+                let cached = attestation_verify::reusable_verdict(
+                    &attestation_verify::AttestationRecord::of(&pkg),
+                    &allowlist,
+                    chrono::Utc::now(),
+                );
+                let verdict = match cached {
+                    Some(v) => v,
+                    None => {
+                        let verdict = match &trust {
+                            Some(t) => {
+                                verify_pypi_curation_row(
+                                    client,
+                                    upstream_auth,
+                                    upstream_url,
+                                    &pkg,
+                                    &allowlist,
+                                    t,
+                                )
+                                .await
+                            }
+                            None => attestation_verify::AttestationVerdict::unverified(),
+                        };
+                        let _ = curation
+                            .record_attestation(
+                                pkg.id,
+                                verdict.state.as_str(),
+                                verdict.identity.as_deref(),
+                                verdict.issuer.as_deref(),
+                                verdict.owner.as_deref(),
+                                verdict.error.as_deref(),
+                            )
+                            .await;
+                        verdict
                     }
-                    None => attestation_verify::AttestationVerdict::unverified(),
                 };
-                let _ = curation
-                    .record_attestation(
-                        pkg.id,
-                        verdict.state.as_str(),
-                        verdict.identity.as_deref(),
-                        verdict.issuer.as_deref(),
-                        verdict.owner.as_deref(),
-                        verdict.error.as_deref(),
-                    )
-                    .await;
-                if let Some(marker) = attestation_verify::verified_marker(&verdict) {
-                    if let Some(obj) = eval_metadata.as_object_mut() {
-                        obj.insert(publisher_source::VERIFICATION_MARKER.to_string(), marker);
-                    }
-                }
+                attestation_verify::apply_verified_marker(&mut eval_metadata, Some(&verdict));
             }
             "npm" => {
                 // npm is ingested but unsupported (sha512-only subject binding);

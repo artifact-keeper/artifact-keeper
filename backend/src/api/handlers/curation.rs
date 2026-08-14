@@ -255,6 +255,17 @@ pub struct CurationPackageResponse {
     #[schema(value_type = Object)]
     pub metadata: serde_json::Value,
     pub first_seen_at: String,
+    /// Attestation verification record (#2955, surfaced by #3230):
+    /// `unverified` | `verified` | `failed`, with the certificate-bound identity
+    /// on success and the specific failing check otherwise. Without these an
+    /// operator cannot answer "which packages verified, and against which
+    /// certificate identity" without querying the database directly.
+    pub attestation_state: String,
+    pub attestation_identity: Option<String>,
+    pub attestation_issuer: Option<String>,
+    pub attestation_owner: Option<String>,
+    pub attestation_verified_at: Option<String>,
+    pub attestation_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -1094,6 +1105,12 @@ fn pkg_to_response(pkg: crate::models::curation::CurationPackage) -> CurationPac
         rule_id: pkg.rule_id,
         metadata: pkg.metadata,
         first_seen_at: pkg.first_seen_at.to_rfc3339(),
+        attestation_state: pkg.attestation_state,
+        attestation_identity: pkg.attestation_identity,
+        attestation_issuer: pkg.attestation_issuer,
+        attestation_owner: pkg.attestation_owner,
+        attestation_verified_at: pkg.attestation_verified_at.map(|t| t.to_rfc3339()),
+        attestation_error: pkg.attestation_error,
     }
 }
 

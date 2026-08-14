@@ -4641,6 +4641,20 @@ pub struct ArtifactResponse {
     pub content_type: String,
     pub download_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Id of the user that uploaded this artifact (#3271), mirroring
+    /// [`ArtifactVersionResponse::uploaded_by`] (#2397). Always serialized —
+    /// `null` for anonymous/unknown uploads and for proxy-cached objects,
+    /// which have no `artifacts` row — so the UI can rely on the key being
+    /// present.
+    pub uploaded_by: Option<Uuid>,
+    /// Display name for [`Self::uploaded_by`], resolved server-side so the UI
+    /// does not have to follow a bare UUID with an admin-only user lookup
+    /// (#3271). `null` whenever `uploaded_by` is `null`, and also when the
+    /// referenced user row no longer exists (a deleted account leaves the id
+    /// on the artifact). Populated by the listing and per-artifact metadata
+    /// endpoints; other responses that build an `ArtifactResponse` leave it
+    /// unresolved.
+    pub uploaded_by_username: Option<String>,
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
     /// Whether this artifact can have an SBOM generated or a security scan
@@ -5058,7 +5072,7 @@ pub async fn list_artifacts(
     // `normalize_lookup_path` (#1443); this keeps the listing consistent.
     let rewrite_npm_tarball_paths = is_npm_family_format(&repo.format);
 
-    let mut items = Vec::new();
+    let mut items: Vec<ArtifactResponse> = Vec::new();
     for artifact in artifacts {
         let artifact_id = artifact.id;
         let download_count = *download_counts.get(&artifact_id).unwrap_or(&0);
@@ -5077,6 +5091,11 @@ pub async fn list_artifacts(
             ));
         }
     }
+
+    // #3271: turn the uploader ids already carried on the rows into display
+    // names in one batched lookup, so the UI can render "uploaded by <name>"
+    // without an admin-only per-artifact user fetch.
+    resolve_uploader_usernames(&state.db, &mut items).await;
 
     Ok(Json(ArtifactListResponse {
         items,
@@ -5166,7 +5185,14 @@ async fn list_remote_cached_artifacts(
 
     let items = entries
         .iter()
-        .map(|entry| build_cached_artifact_response(entry, key))
+        .map(|entry| {
+            let mut item = build_cached_artifact_response(entry, key);
+            // #3265: same Maven coordinate recovery as the catalog-backed path
+            // above, so a pre-catalog cache is not left with filename-shaped
+            // names and no version.
+            apply_maven_cached_identity(&mut item, &repo.format);
+            item
+        })
         .collect();
 
     Ok(Json(ArtifactListResponse {
@@ -5263,9 +5289,23 @@ async fn list_remote_cached_from_catalog(
     };
     let total = grouped_listing_total(exact_total, offset, rows.len(), has_more);
 
+    // #3265: proxy-served downloads ARE recorded (in the
+    // `proxy_download_statistics` sibling of `download_statistics`), they were
+    // just never surfaced — every cached row reported `download_count: 0`. One
+    // batched lookup per page keeps that O(1) queries, like the hosted
+    // listing's `get_download_stats_batch`.
+    let page_paths: Vec<String> = rows.iter().map(|r| r.path.clone()).collect();
+    let download_counts =
+        proxy_catalog::download_counts_by_paths(&state.db, repo.id, &page_paths).await?;
+
     let items = rows
         .iter()
-        .map(|row| build_catalog_artifact_response(row, key))
+        .map(|row| {
+            let mut item = build_catalog_artifact_response(row, key);
+            item.download_count = download_counts.get(&row.path).copied().unwrap_or(0);
+            apply_maven_cached_identity(&mut item, &repo.format);
+            item
+        })
         .collect();
 
     Ok(Json(ArtifactListResponse {
@@ -5281,6 +5321,58 @@ async fn list_remote_cached_from_catalog(
         next_cursor,
         has_more: Some(has_more),
     }))
+}
+
+/// Overwrite a proxy-cached listing row's `name` / `version` with the Maven
+/// coordinates encoded in its path (#3265).
+///
+/// A remote listing row is reconstructed from the cache catalog, which stores
+/// only a path — so `name` defaulted to the bare filename
+/// (`guava-33.6.0-jre.jar`) and `version` to `None`. The UI reads those two
+/// fields as the artifactId and version, so a proxied Maven artifact showed a
+/// filename where hosted ones show `guava`, no version at all, and an install
+/// snippet built from the wrong coordinates. Deriving them from the path makes
+/// a proxied row carry the same `(name, version)` a hosted upload of the same
+/// GAV does.
+///
+/// No-op for non-Maven-family repositories and for paths that are not GAV
+/// shaped, so every other format keeps its filename/no-version defaults.
+fn apply_maven_cached_identity(item: &mut ArtifactResponse, format: &RepositoryFormat) {
+    if let Some((artifact_id, version)) = maven_cached_identity(format, &item.path) {
+        item.name = artifact_id;
+        item.version = Some(version);
+    }
+}
+
+/// Derive `(artifactId, version)` for a proxy-cached path under a Maven-family
+/// repository (#3265), or `None` when the path carries no usable coordinates.
+///
+/// Rejected (so the caller keeps the filename/no-version defaults):
+/// * a non-Maven-family repository format,
+/// * `maven-metadata.xml` and its checksum sidecars — these sit one directory
+///   ABOVE the version directory, so
+///   [`MavenHandler::parse_coordinates`](crate::formats::maven::MavenHandler::parse_coordinates)
+///   accepts them while reading the artifactId segment as the version,
+/// * anything else that does not parse as `groupId/artifactId/version/file`.
+///
+/// Checksum/signature sidecars of a real asset
+/// (`.../33.6.0-jre/guava-33.6.0-jre.jar.sha1`) DO resolve: they live in the
+/// version directory and carry the same coordinates as the asset itself,
+/// exactly as a hosted repository lists them.
+fn maven_cached_identity(format: &RepositoryFormat, path: &str) -> Option<(String, String)> {
+    if !matches!(
+        format,
+        RepositoryFormat::Maven | RepositoryFormat::Gradle | RepositoryFormat::Sbt
+    ) {
+        return None;
+    }
+    let path = path.trim_start_matches('/');
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    if filename == "maven-metadata.xml" || filename.starts_with("maven-metadata.xml.") {
+        return None;
+    }
+    let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
+    Some((coords.artifact_id, coords.version))
 }
 
 /// Map a `proxy_cache_artifacts` catalog row to the listing's
@@ -5309,6 +5401,10 @@ fn build_catalog_artifact_response(
             .unwrap_or_else(|| "application/octet-stream".to_string()),
         download_count: 0,
         created_at: row.cached_at,
+        // Proxy-cached objects have no `artifacts` row, so no uploader
+        // is recorded for them (#3271).
+        uploaded_by: None,
+        uploaded_by_username: None,
         metadata: None,
         // Same rationale as the sidecar-recovered path: synthetic id, no
         // `artifacts` row, so SBOM/scan cannot resolve the object.
@@ -5419,6 +5515,9 @@ fn build_cached_artifact_response(
         content_type: entry.content_type.clone(),
         download_count: 0,
         created_at: entry.cached_at,
+        // No `artifacts` row behind a proxy-cache entry (#3271).
+        uploaded_by: None,
+        uploaded_by_username: None,
         metadata: None,
         // Proxy-cached objects have no `artifacts` row (#1280/#1278) and a
         // synthetic id, so SBOM/scan cannot resolve them: not analyzable.
@@ -5621,6 +5720,12 @@ fn build_artifact_response(
         content_type: artifact.content_type.clone(),
         download_count,
         created_at: artifact.created_at,
+        // #3271: the uploader is already on the `artifacts` row the
+        // listing selected, so surfacing the id costs no extra query.
+        // The display name is resolved in one batched lookup by the
+        // caller (`apply_uploader_usernames`).
+        uploaded_by: artifact.uploaded_by,
+        uploaded_by_username: None,
         metadata: None,
         // Hosted artifact backed by a real `artifacts` row: SBOM/scan resolve.
         analyzable: true,
@@ -5640,6 +5745,68 @@ fn build_artifact_response(
         quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
         quarantine_until: artifact.quarantine_until,
     }
+}
+
+/// The distinct uploader ids referenced by a page of artifact rows (#3271),
+/// in first-seen order. Pure, so the de-duplication that keeps the username
+/// lookup to one small `= ANY` query is unit-testable without a database.
+fn uploader_ids(items: &[ArtifactResponse]) -> Vec<Uuid> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| item.uploaded_by)
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
+/// Stamp resolved uploader display names onto a page of artifact rows
+/// (#3271). Rows with no `uploaded_by`, and rows whose uploader has since
+/// been deleted (id present, no `users` row), keep `uploaded_by_username:
+/// None` — the raw id still ships, so the UI can degrade to showing it. Pure.
+fn apply_uploader_usernames(
+    items: &mut [ArtifactResponse],
+    usernames: &std::collections::HashMap<Uuid, String>,
+) {
+    for item in items.iter_mut() {
+        item.uploaded_by_username = item.uploaded_by.and_then(|id| usernames.get(&id)).cloned();
+    }
+}
+
+/// Look up display names for a batch of uploader ids (#3271).
+///
+/// One `= ANY` query per listing page (never per row), and best-effort: a
+/// failure logs and yields an empty map rather than failing the listing,
+/// since the uploader name is presentational and the raw id is already on the
+/// response.
+async fn fetch_uploader_usernames(
+    db: &sqlx::PgPool,
+    ids: &[Uuid],
+) -> std::collections::HashMap<Uuid, String> {
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let rows: std::result::Result<Vec<(Uuid, String)>, _> =
+        sqlx::query_as("SELECT id, username FROM users WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(db)
+            .await;
+    match rows {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(e) => {
+            tracing::debug!(error = %e, "uploader username lookup failed; omitting names");
+            std::collections::HashMap::new()
+        }
+    }
+}
+
+/// Resolve and stamp uploader display names for one page of artifact rows
+/// (#3271): the [`uploader_ids`] / [`fetch_uploader_usernames`] /
+/// [`apply_uploader_usernames`] trio in one call, so every listing surface
+/// wires it up the same way.
+async fn resolve_uploader_usernames(db: &sqlx::PgPool, items: &mut [ArtifactResponse]) {
+    let ids = uploader_ids(items);
+    let usernames = fetch_uploader_usernames(db, &ids).await;
+    apply_uploader_usernames(items, &usernames);
 }
 
 /// Build `ArtifactResponse` rows for each Maven secondary file recorded
@@ -5683,6 +5850,10 @@ fn expand_maven_secondary_files(
             content_type: content_type_for_maven_extension(ext).to_string(),
             download_count: 0,
             created_at: artifact.created_at,
+            // Companion files share the primary's row, so they share its
+            // uploader too (#3271).
+            uploaded_by: artifact.uploaded_by,
+            uploaded_by_username: None,
             metadata: None,
             // Secondary Maven files are recorded under a real primary
             // artifact row (its id), so they are analyzable like the primary.
@@ -5850,6 +6021,15 @@ async fn list_artifacts_grouped_by_maven_component(
         } else {
             None
         };
+        // #3270: the component rows come from the package catalog, which has
+        // no per-file detail, so `artifact_files` used to ship empty for every
+        // remote component and the web UI's grouped view rendered zero files
+        // (no POM row, no jar row). The individual cached objects ARE
+        // enumerated in `proxy_cache_artifacts`, so fill the list in from
+        // there for just this page's components — the proxy-side equivalent of
+        // what `build_maven_components_for_keys` does from the `artifacts`
+        // table for hosted repos.
+        populate_remote_component_files(&state.db, repo.id, &mut components).await?;
         let exact_total = if count_exact {
             Some(count_maven_catalog_components(&state.db, repo.id, search_query).await?)
         } else {
@@ -6143,6 +6323,96 @@ async fn build_maven_components_for_keys(
     Ok(order_components_by_keys(grouped, keys))
 }
 
+/// Upper bound on cached files pulled back to fill one page of remote Maven
+/// components' `artifact_files` (#3270). A Maven GAV directory normally holds
+/// well under a dozen objects (jar, pom, sources, javadoc, and their checksum
+/// sidecars); 64 per component leaves generous headroom while keeping the
+/// query bounded no matter how large the proxy cache grows.
+const REMOTE_COMPONENT_FILES_PER_COMPONENT: i64 = 64;
+
+/// Fill in `artifact_files` for one page of remote (proxy) Maven components
+/// from the proxy cache catalog (#3270, #3265).
+///
+/// Remote components are reconstructed from `packages` rows, which carry no
+/// file detail — so the grouped listing reported `artifact_files: []` and the
+/// web UI, which renders one row per file (with a special-cased POM row),
+/// showed an empty component. The cached objects themselves are cataloged in
+/// `proxy_cache_artifacts`, so one bounded `LIKE ANY` over this page's GAV
+/// directory prefixes recovers them. Components whose GAV has nothing cached
+/// (a catalog row written for a `.pom`-only lookup, say) keep an empty list
+/// rather than failing the listing.
+async fn populate_remote_component_files(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    components: &mut [MavenComponentResponse],
+) -> Result<()> {
+    let prefixes = maven_component_prefixes(components);
+    if prefixes.is_empty() {
+        return Ok(());
+    }
+    let limit = REMOTE_COMPONENT_FILES_PER_COMPONENT * prefixes.len() as i64;
+    let paths =
+        crate::services::proxy_catalog::paths_under_prefixes(db, repository_id, &prefixes, limit)
+            .await?;
+    attach_cached_files_to_components(components, &paths);
+    Ok(())
+}
+
+/// The GAV directory prefix of each Maven component, positionally aligned with
+/// `components` (`None` where the coordinates yield no prefix) so a caller can
+/// index straight back into the component list.
+fn maven_component_prefixes_aligned(components: &[MavenComponentResponse]) -> Vec<Option<String>> {
+    components
+        .iter()
+        .map(|c| {
+            maven_component_path_prefix(&format!("{}:{}", c.group_id, c.artifact_id), &c.version)
+        })
+        .collect()
+}
+
+/// The GAV directory prefixes for a page of Maven components, in component
+/// order and skipping any component whose coordinates do not yield one.
+/// Split out of [`populate_remote_component_files`] so the prefix derivation
+/// is unit-testable without a database.
+fn maven_component_prefixes(components: &[MavenComponentResponse]) -> Vec<String> {
+    maven_component_prefixes_aligned(components)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Attach each cached object path to the component whose GAV directory it
+/// lives directly under, as a sorted, de-duplicated filename list (#3270).
+///
+/// The prefix is re-checked here rather than trusted from SQL: the catalog
+/// query matches with `LIKE`, under which a `_` in a Maven artifactId is a
+/// single-character wildcard, so an over-broad match must not be attributed to
+/// the wrong component. Paths nested deeper than the GAV directory are
+/// dropped, matching the hosted listing's one-row-per-file view. Pure (no I/O)
+/// so the attribution contract is unit-testable.
+fn attach_cached_files_to_components(components: &mut [MavenComponentResponse], paths: &[String]) {
+    let prefixes = maven_component_prefixes_aligned(components);
+
+    for path in paths {
+        let trimmed = path.trim_start_matches('/');
+        for (idx, prefix) in prefixes.iter().enumerate() {
+            let Some(prefix) = prefix else { continue };
+            let Some(filename) = trimmed.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            if !filename.is_empty() && !filename.contains('/') {
+                components[idx].artifact_files.push(filename.to_string());
+            }
+            break;
+        }
+    }
+
+    for component in components.iter_mut() {
+        component.artifact_files.sort();
+        component.artifact_files.dedup();
+    }
+}
+
 /// Reorder/assemble grouped Maven components to match a keyset page's ordered
 /// `(groupId:artifactId, version)` keys (#2723). A component whose GAV is not
 /// in `keys` (pulled in by an over-broad path-prefix match) is dropped, and a
@@ -6322,6 +6592,9 @@ async fn maven_components_from_catalog(
             size_bytes: row.get("size_bytes"),
             download_count: row.get("download_count"),
             created_at: row.get("created_at"),
+            // The package catalog has no per-file detail; the caller fills
+            // this in from the proxy cache catalog for just the page it keeps
+            // (`populate_remote_component_files`, #3270).
             artifact_files: Vec::new(),
         });
     }
@@ -7021,6 +7294,14 @@ pub async fn get_artifact_metadata(
         // `cache_metadata_lookup_path` maps the stored path back to the URL
         // shape for npm-family tarballs so the cache key matches what the
         // proxy wrote.
+        // #3271: resolve the uploader's display name for the artifact detail
+        // view. Best-effort and batched through the same helper the listing
+        // uses (a one-element batch here).
+        let uploader_username = match artifact.uploaded_by {
+            Some(id) => fetch_uploader_usernames(&state.db, &[id]).await.remove(&id),
+            None => None,
+        };
+
         let cache_lookup_path = cache_metadata_lookup_path(&artifact.path, &repo.format);
         let cache_meta = if repo.repo_type == RepositoryType::Remote {
             if let Some(proxy) = state.proxy_service.as_ref() {
@@ -7047,6 +7328,8 @@ pub async fn get_artifact_metadata(
             content_type: artifact.content_type,
             download_count: downloads,
             created_at: artifact.created_at,
+            uploaded_by: artifact.uploaded_by,
+            uploaded_by_username: uploader_username,
             metadata: metadata.map(|m| m.metadata),
             // This handler resolves a real `artifacts` row by id, so it is
             // always a hosted artifact (analyzable), even inside a Remote repo.
@@ -7179,6 +7462,10 @@ fn artifact_version_to_response(
         content_type: stored.content_type,
         download_count: 0,
         created_at: stored.created_at,
+        // #3271: `artifact_versions` records the uploader per revision
+        // (#2397); surface it on the revision response too.
+        uploaded_by: stored.uploaded_by,
+        uploaded_by_username: None,
         metadata: None,
         analyzable: false,
         cache_cached_at: None,
@@ -7548,6 +7835,9 @@ async fn persist_generic_staged_upload(
             content_type: artifact.content_type,
             download_count: downloads,
             created_at: artifact.created_at,
+            // The upload was just performed by the authenticated caller.
+            uploaded_by: artifact.uploaded_by,
+            uploaded_by_username: None,
             metadata: metadata_json,
             // Freshly-uploaded hosted artifact with a real DB id: analyzable.
             analyzable: true,
@@ -10520,6 +10810,265 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Remote/proxy Maven component files (#3270) and coordinates (#3265)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remote_component_files_include_the_pom_and_are_sorted() {
+        // #3270: the grouped view for a proxy repo shipped `artifact_files:
+        // []`, so the web UI (which renders one row per file, with a
+        // special-cased POM row) showed a component with nothing in it.
+        let mut components = vec![maven_component("com.google.guava", "guava", "33.6.0-jre")];
+        let cached = vec![
+            "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar".to_string(),
+            "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.pom".to_string(),
+            "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar.sha1".to_string(),
+        ];
+        attach_cached_files_to_components(&mut components, &cached);
+        assert_eq!(
+            components[0].artifact_files,
+            vec![
+                "guava-33.6.0-jre.jar".to_string(),
+                "guava-33.6.0-jre.jar.sha1".to_string(),
+                "guava-33.6.0-jre.pom".to_string(),
+            ],
+            "the POM must be listed for a proxy-cached component (#3270)"
+        );
+    }
+
+    #[test]
+    fn remote_component_files_are_attributed_to_the_owning_component() {
+        // A sibling version and a different artifactId must not bleed into
+        // each other, and a path from an unrelated GAV is dropped entirely.
+        let mut components = vec![
+            maven_component("com.example", "mylib", "1.0.0"),
+            maven_component("com.example", "mylib", "2.0.0"),
+        ];
+        let cached = vec![
+            "com/example/mylib/1.0.0/mylib-1.0.0.jar".to_string(),
+            "com/example/mylib/2.0.0/mylib-2.0.0.jar".to_string(),
+            "com/example/other/1.0.0/other-1.0.0.jar".to_string(),
+        ];
+        attach_cached_files_to_components(&mut components, &cached);
+        assert_eq!(components[0].artifact_files, vec!["mylib-1.0.0.jar"]);
+        assert_eq!(components[1].artifact_files, vec!["mylib-2.0.0.jar"]);
+    }
+
+    #[test]
+    fn remote_component_files_drop_nested_paths_and_duplicates() {
+        // Anything below the GAV directory is not a file of the component,
+        // and a repeated catalog path must not double the list.
+        let mut components = vec![maven_component("com.example", "mylib", "1.0.0")];
+        let cached = vec![
+            "com/example/mylib/1.0.0/mylib-1.0.0.jar".to_string(),
+            "com/example/mylib/1.0.0/mylib-1.0.0.jar".to_string(),
+            "com/example/mylib/1.0.0/nested/extra.jar".to_string(),
+            "com/example/mylib/1.0.0/".to_string(),
+        ];
+        attach_cached_files_to_components(&mut components, &cached);
+        assert_eq!(components[0].artifact_files, vec!["mylib-1.0.0.jar"]);
+    }
+
+    #[test]
+    fn remote_component_files_reject_like_wildcard_overmatch() {
+        // `_` is legal in a Maven artifactId and is a single-character
+        // wildcard in the catalog's `LIKE ANY` query, so an over-fetched row
+        // must be dropped by the Rust-side prefix re-check rather than
+        // attributed to the wrong component.
+        let mut components = vec![maven_component("com.example", "my_lib", "1.0.0")];
+        let cached = vec![
+            "com/example/my_lib/1.0.0/my_lib-1.0.0.jar".to_string(),
+            "com/example/myXlib/1.0.0/myXlib-1.0.0.jar".to_string(),
+        ];
+        attach_cached_files_to_components(&mut components, &cached);
+        assert_eq!(components[0].artifact_files, vec!["my_lib-1.0.0.jar"]);
+    }
+
+    #[test]
+    fn maven_component_prefixes_cover_every_component_in_order() {
+        let components = vec![
+            maven_component("com.example", "mylib", "1.0.0"),
+            maven_component("org.junit.jupiter", "junit-jupiter-api", "5.11.0"),
+        ];
+        assert_eq!(
+            maven_component_prefixes(&components),
+            vec![
+                "com/example/mylib/1.0.0/".to_string(),
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/".to_string(),
+            ]
+        );
+        assert!(maven_component_prefixes(&[]).is_empty());
+    }
+
+    #[test]
+    fn maven_cached_identity_recovers_gav_from_the_cache_path() {
+        // #3265: a proxied jar listed as `name = "guava-33.6.0-jre.jar"` with
+        // no version drove the wrong artifactId, a blank version, and a broken
+        // "copy install command" snippet in the UI.
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Maven,
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar"
+            ),
+            Some(("guava".to_string(), "33.6.0-jre".to_string()))
+        );
+        // A checksum sidecar of a real asset lives in the version directory
+        // and carries the same coordinates, exactly as a hosted repo lists it.
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Gradle,
+                "/com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar.sha1"
+            ),
+            Some(("guava".to_string(), "33.6.0-jre".to_string()))
+        );
+    }
+
+    #[test]
+    fn maven_cached_identity_rejects_metadata_and_other_formats() {
+        // `maven-metadata.xml` sits ABOVE the version directory, so the
+        // coordinate parser would read the artifactId segment as the version.
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Maven,
+                "com/google/guava/guava/maven-metadata.xml"
+            ),
+            None
+        );
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Maven,
+                "com/google/guava/guava/maven-metadata.xml.sha1"
+            ),
+            None
+        );
+        // Not GAV shaped.
+        assert_eq!(
+            maven_cached_identity(&RepositoryFormat::Maven, "index.html"),
+            None
+        );
+        // A non-Maven-family proxy keeps its filename/no-version defaults.
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Pypi,
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_maven_cached_identity_rewrites_only_maven_rows() {
+        let mut item = sample_artifact_response(
+            "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar",
+            "guava-33.6.0-jre.jar",
+        );
+        apply_maven_cached_identity(&mut item, &RepositoryFormat::Maven);
+        assert_eq!(item.name, "guava");
+        assert_eq!(item.version.as_deref(), Some("33.6.0-jre"));
+
+        // A path with no coordinates keeps the filename/no-version defaults.
+        let mut untouched = sample_artifact_response("index.html", "index.html");
+        apply_maven_cached_identity(&mut untouched, &RepositoryFormat::Maven);
+        assert_eq!(untouched.name, "index.html");
+        assert_eq!(untouched.version, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Uploader surfacing on artifact responses (#3271)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn uploader_ids_are_deduplicated_in_first_seen_order() {
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let mut items = vec![
+            sample_artifact_response("a.jar", "a"),
+            sample_artifact_response("b.jar", "b"),
+            sample_artifact_response("c.jar", "c"),
+            sample_artifact_response("d.jar", "d"),
+        ];
+        items[0].uploaded_by = Some(alice);
+        items[1].uploaded_by = Some(bob);
+        items[2].uploaded_by = Some(alice);
+        items[3].uploaded_by = None;
+        assert_eq!(uploader_ids(&items), vec![alice, bob]);
+        assert!(uploader_ids(&[]).is_empty());
+    }
+
+    #[test]
+    fn apply_uploader_usernames_resolves_known_ids_only() {
+        let alice = Uuid::new_v4();
+        let deleted = Uuid::new_v4();
+        let mut items = vec![
+            sample_artifact_response("a.jar", "a"),
+            sample_artifact_response("b.jar", "b"),
+            sample_artifact_response("c.jar", "c"),
+        ];
+        items[0].uploaded_by = Some(alice);
+        items[1].uploaded_by = Some(deleted);
+        items[2].uploaded_by = None;
+
+        let mut usernames = std::collections::HashMap::new();
+        usernames.insert(alice, "alice".to_string());
+        apply_uploader_usernames(&mut items, &usernames);
+
+        assert_eq!(items[0].uploaded_by_username.as_deref(), Some("alice"));
+        // Id retained, name unresolved: the account was deleted.
+        assert_eq!(items[1].uploaded_by, Some(deleted));
+        assert_eq!(items[1].uploaded_by_username, None);
+        assert_eq!(items[2].uploaded_by_username, None);
+    }
+
+    #[test]
+    fn artifact_response_always_serializes_the_uploader_keys() {
+        // #3271: the UI relies on the keys being present (null when unknown)
+        // rather than having to treat an absent key as "no uploader".
+        let alice = Uuid::new_v4();
+        let mut item = sample_artifact_response("a.jar", "a");
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"uploaded_by\":null"), "got {json}");
+        assert!(json.contains("\"uploaded_by_username\":null"), "got {json}");
+
+        item.uploaded_by = Some(alice);
+        item.uploaded_by_username = Some("alice".to_string());
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(
+            json.contains(&format!("\"uploaded_by\":\"{alice}\"")),
+            "got {json}"
+        );
+        assert!(
+            json.contains("\"uploaded_by_username\":\"alice\""),
+            "got {json}"
+        );
+    }
+
+    /// Minimal `ArtifactResponse` for the pure-helper tests above.
+    fn sample_artifact_response(path: &str, name: &str) -> ArtifactResponse {
+        ArtifactResponse {
+            id: Uuid::new_v4(),
+            repository_key: "maven-central".to_string(),
+            path: path.to_string(),
+            name: name.to_string(),
+            version: None,
+            size_bytes: 1,
+            checksum_sha256: String::new(),
+            content_type: "application/octet-stream".to_string(),
+            download_count: 0,
+            created_at: chrono::Utc::now(),
+            uploaded_by: None,
+            uploaded_by_username: None,
+            metadata: None,
+            analyzable: false,
+            cache_cached_at: None,
+            cache_expires_at: None,
+            revision: None,
+            version_label: None,
+            quarantine_status: NOT_QUARANTINED.to_string(),
+            quarantine_until: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Hosted/virtual Maven grouped keyset paging (#2723)
     // -----------------------------------------------------------------------
 
@@ -12699,6 +13248,8 @@ mod tests {
             content_type: "application/java-archive".to_string(),
             download_count: 42,
             created_at: chrono::Utc::now(),
+            uploaded_by: None,
+            uploaded_by_username: None,
             metadata: None,
             analyzable: true,
             cache_cached_at: None,
@@ -12789,6 +13340,8 @@ mod tests {
             content_type: "application/octet-stream".to_string(),
             download_count: 0,
             created_at: cached,
+            uploaded_by: None,
+            uploaded_by_username: None,
             metadata: None,
             analyzable: false,
             cache_cached_at: Some(cached),
