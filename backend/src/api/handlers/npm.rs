@@ -1923,6 +1923,23 @@ fn build_npm_metadata_response(
     stored_dist_tags: &serde_json::Map<String, serde_json::Value>,
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
+    Ok(respond_with_packument(
+        build_npm_metadata_value(artifacts, package_name, base_url, repo_key, stored_dist_tags),
+        want_abbreviated,
+    ))
+}
+
+/// Build the FULL packument JSON value from a set of stored artifacts — the
+/// value form of [`build_npm_metadata_response`], split out so the virtual
+/// member merge (#2844) can combine per-member contributions before a single
+/// response is emitted.
+fn build_npm_metadata_value(
+    artifacts: &[NpmMetadataArtifact],
+    package_name: &str,
+    base_url: &str,
+    repo_key: &str,
+    stored_dist_tags: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
     let mut versions = serde_json::Map::new();
     let mut version_list: Vec<String> = Vec::new();
 
@@ -1968,13 +1985,48 @@ fn build_npm_metadata_response(
         }
     }
 
-    let response = serde_json::json!({
+    serde_json::json!({
         "name": package_name,
         "versions": versions,
         "dist-tags": serde_json::Value::Object(dist_tags),
-    });
+    })
+}
 
-    Ok(respond_with_packument(response, want_abbreviated))
+/// Merge a lower-priority virtual member's packument into the accumulator
+/// (#2844).
+///
+/// Members are visited in priority order, so for the object-valued fields
+/// that federate across members — `versions`, `dist-tags` and `time` — a key
+/// the accumulator already holds wins, while keys only the later member
+/// knows about are added. Every other top-level field keeps the
+/// highest-priority member's value. This is what lets a project resolve the
+/// upstream `19.2.25` from a proxy member even when a hosted member holds
+/// only a fork build like `19.2.25-myorg.1` at higher priority.
+fn merge_packument_into(acc: &mut serde_json::Value, next: serde_json::Value) {
+    let (Some(acc_obj), serde_json::Value::Object(next_obj)) = (acc.as_object_mut(), next) else {
+        return;
+    };
+    for (field, next_value) in next_obj {
+        match field.as_str() {
+            "versions" | "dist-tags" | "time" => {
+                let serde_json::Value::Object(next_map) = next_value else {
+                    continue;
+                };
+                let slot = acc_obj
+                    .entry(field)
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                let Some(acc_map) = slot.as_object_mut() else {
+                    continue;
+                };
+                for (key, value) in next_map {
+                    acc_map.entry(key).or_insert(value);
+                }
+            }
+            _ => {
+                acc_obj.entry(field).or_insert(next_value);
+            }
+        }
+    }
 }
 
 /// Choose the `latest` dist-tag for a set of versions when none is recorded.
@@ -2412,118 +2464,16 @@ async fn get_package_metadata(
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
-    // For virtual repos, iterate through members in priority order.
-    // Local/Staging members are checked first (query DB for artifacts),
-    // then Remote members are proxied from upstream. First match wins.
+    // For virtual repos, merge every member's contribution in priority order
+    // (#2844). The old first-match-wins walk meant a hosted member holding
+    // only a fork build (e.g. `19.2.25-myorg.1`) masked the proxy member
+    // entirely, so `npm install pkg@19.2.25` failed even though the proxy
+    // member carried that version. Each Remote member's contribution is
+    // still filtered with that member's own age-gate params before merging.
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-
-        if members.is_empty() {
-            return Err(
-                AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
-            );
-        }
-
-        // Batch-load per-member npm scope policies once per request (#2327).
-        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
-            .await
-            .map_err(IntoResponse::into_response)?;
-
-        for member in &members {
-            // For Local/Staging members, query artifacts from the DB.
-            if member.repo_type == RepositoryType::Local
-                || member.repo_type == RepositoryType::Staging
-            {
-                let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
-                if !meta.is_empty() {
-                    let dist_tags = fetch_npm_dist_tags(&state.db, member.id, package_name).await;
-                    return build_npm_metadata_response(
-                        &meta,
-                        package_name,
-                        base_url,
-                        repo_key,
-                        &dist_tags,
-                        want_abbreviated,
-                    );
-                }
-                continue;
-            }
-
-            // For Remote members, proxy metadata from upstream.
-            if member.repo_type != RepositoryType::Remote {
-                continue;
-            }
-            // Honour the member's npm scope policy before proxying (#2327).
-            if !npm_member_eligible(
-                &member.repo_type,
-                scope_policies.get(&member.id),
-                package_name,
-            ) {
-                debug!(
-                    member_key = %member.key,
-                    package = %package_name,
-                    "npm virtual member skipped by scope policy"
-                );
-                continue;
-            }
-            let Some(ref upstream_url) = member.upstream_url else {
-                continue;
-            };
-            let Some(ref proxy) = state.proxy_service else {
-                continue;
-            };
-
-            let encoded_name = encode_package_name_for_upstream(package_name);
-            // Fetch/cache split (#3297): encoded name upstream, decoded
-            // `@scope/name` as the member's local cache key.
-            let result = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-                proxy,
-                member.id,
-                &member.key,
-                upstream_url,
-                &encoded_name,
-                package_name,
-                None,
-                proxy_helpers::LARGE_METADATA_MAX_BYTES,
-            )
-            .await;
-
-            match result {
-                Ok((content, content_type, _budget_permit)) => {
-                    // DB-resolve the member's gate policy: the Repository
-                    // model deliberately carries no `age_gate_mode`, and
-                    // policy inputs are read from the source of truth (#2264).
-                    let params = crate::services::age_gate_service::resolve_repo_params(
-                        &state.db, member.id,
-                    )
-                    .await
-                    .map_err(|e| e.into_response())?;
-                    return rewrite_and_respond_with_age_gate_params(
-                        state,
-                        &params,
-                        package_name,
-                        content,
-                        content_type,
-                        base_url,
-                        repo_key,
-                        want_abbreviated,
-                    )
-                    .await;
-                }
-                Err(_e) => {
-                    debug!(
-                        member_key = %member.key,
-                        "npm metadata proxy fetch missed for virtual member"
-                    );
-                }
-            }
-        }
-
-        return Err(
-            AppError::NotFound("Package not found in any member repository".to_string())
-                .into_response(),
-        );
+        let merged =
+            collect_virtual_packument(state, &repo, repo_key, package_name, base_url, true).await?;
+        return Ok(respond_with_packument(merged, want_abbreviated));
     }
 
     // For local/staged repos, build metadata from stored artifacts
@@ -2680,13 +2630,78 @@ async fn fetch_remote_packument(
     Ok(json)
 }
 
-/// Fetch the full packument JSON by iterating virtual repo members.
+/// Fetch the full packument JSON by merging virtual repo members (#2844).
 async fn fetch_virtual_packument(
     state: &SharedState,
     repo: &proxy_helpers::RepoInfo,
     repo_key: &str,
     package_name: &str,
     base_url: &str,
+) -> Result<serde_json::Value, Response> {
+    // This path never applied per-member age-gate filtering (the gate is
+    // enforced on the packument endpoint and again at download time), so the
+    // merge preserves that convention.
+    collect_virtual_packument(state, repo, repo_key, package_name, base_url, false).await
+}
+
+/// Parse a remote member's packument body into a JSON value: optionally apply
+/// that member's age-gate filter, then rewrite tarball URLs to the virtual
+/// repo key. Returns `Ok(None)` for an unparseable body — the member is
+/// treated as a miss rather than failing the whole merge.
+async fn remote_member_packument_value(
+    state: &SharedState,
+    member_id: uuid::Uuid,
+    package_name: &str,
+    content: &Bytes,
+    base_url: &str,
+    repo_key: &str,
+    apply_age_gate: bool,
+) -> Result<Option<serde_json::Value>, Response> {
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(content) else {
+        return Ok(None);
+    };
+    if apply_age_gate {
+        if let Some(svc) = state.age_gate_service.as_ref() {
+            // DB-resolve the member's gate policy: the Repository model
+            // deliberately carries no `age_gate_mode`, and policy inputs are
+            // read from the source of truth (#2264).
+            let params =
+                crate::services::age_gate_service::resolve_repo_params(&state.db, member_id)
+                    .await
+                    .map_err(|e| e.into_response())?;
+            if AgeGateService::is_applicable(&params) {
+                svc.filter_npm_packument(&params, package_name, &mut json)
+                    .await
+                    .map_err(|e| e.into_response())?;
+            }
+        }
+    }
+    rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+    Ok(Some(json))
+}
+
+/// Collect every virtual member's contribution for `package_name` and merge
+/// them in priority order (#2844).
+///
+/// The previous behaviour was first-match-wins: as soon as ANY member knew
+/// the package, its packument was returned alone. A hosted member holding
+/// only a fork build (e.g. `19.2.25-myorg.1`) therefore masked the upstream
+/// proxy member entirely, and `npm install pkg@19.2.25` failed with "no
+/// matching version" even though the proxy member had it. Merging keeps the
+/// higher-priority member authoritative per version / dist-tag while still
+/// federating versions that only lower-priority members carry.
+///
+/// Always returns the FULL packument (abbreviation is the caller's concern).
+/// `apply_age_gate` filters each Remote member's contribution with that
+/// member's own age-gate params, matching the packument endpoint's existing
+/// convention; the version-metadata path passes `false` as before.
+async fn collect_virtual_packument(
+    state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+    apply_age_gate: bool,
 ) -> Result<serde_json::Value, Response> {
     let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
     if members.is_empty() {
@@ -2701,97 +2716,115 @@ async fn fetch_virtual_packument(
         .await
         .map_err(IntoResponse::into_response)?;
 
+    let mut merged: Option<serde_json::Value> = None;
     for member in &members {
-        if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
-        {
-            let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
-            if !meta.is_empty() {
-                // Always build the full packument here so the version can be extracted.
-                let resp = build_npm_metadata_response(
-                    &meta,
-                    package_name,
-                    base_url,
-                    repo_key,
-                    &serde_json::Map::new(),
-                    false,
-                )?;
-                #[allow(clippy::disallowed_methods)]
-                // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
-                let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
-                    .await
-                    .map_err(|e| {
-                        AppError::Internal(format!("Failed to read packument body: {}", e))
-                            .into_response()
-                    })?;
-                return serde_json::from_slice(&body_bytes).map_err(|e| {
-                    AppError::Internal(format!("Failed to parse packument JSON: {}", e))
-                        .into_response()
-                });
-            }
-            continue;
-        }
-
-        if member.repo_type != RepositoryType::Remote {
-            continue;
-        }
-        // Honour the member's npm scope policy before proxying (#2327).
-        if !npm_member_eligible(
-            &member.repo_type,
+        let contribution = virtual_member_packument_contribution(
+            state,
+            member,
             scope_policies.get(&member.id),
             package_name,
-        ) {
-            debug!(
-                member_key = %member.key,
-                package = %package_name,
-                "npm virtual member skipped by scope policy"
-            );
-            continue;
-        }
-        let Some(ref upstream_url) = member.upstream_url else {
-            continue;
-        };
-        let Some(ref proxy) = state.proxy_service else {
-            continue;
-        };
-
-        let encoded_name = encode_package_name_for_upstream(package_name);
-        // Fetch/cache split (#3297): encoded name upstream, decoded
-        // `@scope/name` as the member's local cache key.
-        let result = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-            proxy,
-            member.id,
-            &member.key,
-            upstream_url,
-            &encoded_name,
-            package_name,
-            None,
-            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            base_url,
+            repo_key,
+            apply_age_gate,
         )
-        .await;
-
-        match result {
-            Ok((content, _ct, _budget_permit)) => {
-                let mut json: serde_json::Value =
-                    serde_json::from_slice(&content).map_err(|e| {
-                        AppError::Internal(format!("Invalid JSON from upstream: {}", e))
-                            .into_response()
-                    })?;
-                rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
-                return Ok(json);
-            }
-            Err(_e) => {
-                debug!(
-                    member_key = %member.key,
-                    "npm metadata proxy fetch missed for virtual member"
-                );
+        .await?;
+        if let Some(value) = contribution {
+            match merged.as_mut() {
+                Some(acc) => merge_packument_into(acc, value),
+                None => merged = Some(value),
             }
         }
     }
 
-    Err(
+    merged.ok_or_else(|| {
         AppError::NotFound("Package not found in any member repository".to_string())
-            .into_response(),
+            .into_response()
+    })
+}
+
+/// A single member's packument contribution for the virtual merge, or `None`
+/// when the member does not know the package (or is skipped by policy /
+/// upstream failure — a member miss never fails the whole merge).
+async fn virtual_member_packument_contribution(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    scope_policy: Option<&NpmScopePolicy>,
+    package_name: &str,
+    base_url: &str,
+    repo_key: &str,
+    apply_age_gate: bool,
+) -> Result<Option<serde_json::Value>, Response> {
+    // Local/Staging members contribute from stored artifacts.
+    if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging {
+        let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
+        if meta.is_empty() {
+            return Ok(None);
+        }
+        let dist_tags = fetch_npm_dist_tags(&state.db, member.id, package_name).await;
+        return Ok(Some(build_npm_metadata_value(
+            &meta,
+            package_name,
+            base_url,
+            repo_key,
+            &dist_tags,
+        )));
+    }
+
+    if member.repo_type != RepositoryType::Remote {
+        return Ok(None);
+    }
+    // Honour the member's npm scope policy before proxying (#2327).
+    if !npm_member_eligible(&member.repo_type, scope_policy, package_name) {
+        debug!(
+            member_key = %member.key,
+            package = %package_name,
+            "npm virtual member skipped by scope policy"
+        );
+        return Ok(None);
+    }
+    let Some(ref upstream_url) = member.upstream_url else {
+        return Ok(None);
+    };
+    let Some(ref proxy) = state.proxy_service else {
+        return Ok(None);
+    };
+
+    let encoded_name = encode_package_name_for_upstream(package_name);
+    // Fetch/cache split (#3297): encoded name upstream, decoded
+    // `@scope/name` as the member's local cache key.
+    let result = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+        proxy,
+        member.id,
+        &member.key,
+        upstream_url,
+        &encoded_name,
+        package_name,
+        None,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
     )
+    .await;
+
+    match result {
+        Ok((content, _ct, _budget_permit)) => {
+            remote_member_packument_value(
+                state,
+                member.id,
+                package_name,
+                &content,
+                base_url,
+                repo_key,
+                apply_age_gate,
+            )
+            .await
+        }
+        Err(_e) => {
+            debug!(
+                member_key = %member.key,
+                "npm metadata proxy fetch missed for virtual member"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Content type for npm tarballs (.tgz). npm packages are always gzip-compressed
@@ -5878,6 +5911,126 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #2844: a hosted member holding only a fork build must not mask the
+    /// upstream release carried by a lower-priority proxy member. The merged
+    /// packument must contain BOTH versions so `npm install pkg@<upstream>`
+    /// resolves through the virtual repo.
+    #[tokio::test]
+    async fn test_virtual_packument_merges_fork_member_with_proxy_member_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "fork-mask-pkg";
+        let fork_version = "1.2.3-myorg.1";
+
+        // Priority-1 hosted member: holds ONLY the fork build.
+        let (local_id, _lkey, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let fork_path = format!("{package}/{fork_version}/{package}-{fork_version}.tgz");
+        proxy_helpers::insert_artifact(
+            &fx.pool,
+            proxy_helpers::NewArtifact {
+                repository_id: local_id,
+                path: &fork_path,
+                name: package,
+                version: fork_version,
+                size_bytes: 3,
+                checksum_sha256: "fork-checksum",
+                content_type: "application/gzip",
+                storage_key: &format!("npm/{fork_path}"),
+                uploaded_by: fx.user_id,
+            },
+        )
+        .await;
+
+        // Priority-2 remote member: the upstream release.
+        let upstream = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": package,
+            "dist-tags": {"latest": "1.2.3"},
+            "versions": {
+                "1.2.3": {"name": package, "version": "1.2.3",
+                          "dist": {"tarball": format!(
+                              "{}/{}/-/{}-1.2.3.tgz", upstream.uri(), package, package)}},
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+            .mount(&upstream)
+            .await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        for (member_id, priority) in [(local_id, 1), (remote_id, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result =
+            super::get_package_metadata(&state, &fx.repo_key, package, "http://localhost", false)
+                .await;
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        for member_id in [local_id, remote_id] {
+            for sql in [
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sql).bind(member_id).execute(&fx.pool).await;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        fx.teardown().await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => panic!("virtual packument must resolve: HTTP {}", r.status()),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read packument body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse packument");
+        assert!(
+            json["versions"].get(fork_version).is_some(),
+            "the hosted member's fork build must be present"
+        );
+        assert!(
+            json["versions"].get("1.2.3").is_some(),
+            "the upstream release must federate from the proxy member instead \
+             of being masked by the fork-only member (#2844)"
+        );
+        // The proxied version's tarball is rewritten to the virtual repo key.
+        let tarball = json["versions"]["1.2.3"]["dist"]["tarball"]
+            .as_str()
+            .expect("tarball url");
+        assert!(
+            tarball.contains(&format!("/npm/{}/", fx.repo_key)),
+            "proxied tarball must be rewritten to the virtual repo: {tarball}"
+        );
+    }
+
     // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
@@ -8578,6 +8731,77 @@ mod tests {
     #[test]
     fn test_derive_latest_empty_is_none() {
         assert_eq!(derive_latest_version(&[]), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual packument merge (#2844)
+    // -----------------------------------------------------------------------
+
+    /// The issue #2844 shape in miniature: a higher-priority member holds a
+    /// fork build, a lower-priority member holds the upstream release. The
+    /// merge must union `versions` so both resolve.
+    #[test]
+    fn test_merge_packument_unions_versions_across_members() {
+        let mut acc = serde_json::json!({
+            "name": "@angular/core",
+            "versions": {"19.2.25-myorg.1": {"version": "19.2.25-myorg.1"}},
+            "dist-tags": {"latest": "19.2.25-myorg.1"},
+        });
+        merge_packument_into(
+            &mut acc,
+            serde_json::json!({
+                "name": "@angular/core",
+                "versions": {"19.2.25": {"version": "19.2.25"}},
+                "dist-tags": {"latest": "19.2.25", "next": "20.0.0-rc.1"},
+                "time": {"19.2.25": "2026-01-01T00:00:00Z"},
+            }),
+        );
+        assert!(acc["versions"].get("19.2.25-myorg.1").is_some());
+        assert!(
+            acc["versions"].get("19.2.25").is_some(),
+            "the lower-priority member's version must federate into the merge"
+        );
+        // Priority order: the higher-priority member keeps its `latest`,
+        // while tags only the later member knows about are added.
+        assert_eq!(acc["dist-tags"]["latest"], "19.2.25-myorg.1");
+        assert_eq!(acc["dist-tags"]["next"], "20.0.0-rc.1");
+        assert_eq!(acc["time"]["19.2.25"], "2026-01-01T00:00:00Z");
+    }
+
+    /// Per-version conflicts resolve to the higher-priority member, and
+    /// non-object / missing fields never panic.
+    #[test]
+    fn test_merge_packument_priority_wins_and_tolerates_shapes() {
+        let mut acc = serde_json::json!({
+            "name": "pkg",
+            "versions": {"1.0.0": {"dist": {"tarball": "https://a/pkg-1.0.0.tgz"}}},
+        });
+        merge_packument_into(
+            &mut acc,
+            serde_json::json!({
+                "name": "pkg",
+                "versions": {"1.0.0": {"dist": {"tarball": "https://b/pkg-1.0.0.tgz"}},
+                             "2.0.0": {"dist": {"tarball": "https://b/pkg-2.0.0.tgz"}}},
+                "dist-tags": {"latest": "2.0.0"},
+                "description": "from the later member",
+            }),
+        );
+        assert_eq!(
+            acc["versions"]["1.0.0"]["dist"]["tarball"], "https://a/pkg-1.0.0.tgz",
+            "a version both members hold must keep the higher-priority body"
+        );
+        assert_eq!(acc["versions"]["2.0.0"]["dist"]["tarball"], "https://b/pkg-2.0.0.tgz");
+        // `dist-tags` was absent from the accumulator: created from the later
+        // member; other top-level fields fill in when missing.
+        assert_eq!(acc["dist-tags"]["latest"], "2.0.0");
+        assert_eq!(acc["description"], "from the later member");
+
+        // Non-object inputs are a no-op, not a panic.
+        let mut scalar = serde_json::json!("not an object");
+        merge_packument_into(&mut scalar, serde_json::json!({"versions": {}}));
+        assert_eq!(scalar, serde_json::json!("not an object"));
+        merge_packument_into(&mut acc, serde_json::json!(42));
+        assert!(acc["versions"].get("2.0.0").is_some());
     }
 
     /// #1543 end-to-end: a custom dist-tag is served in the packument and
