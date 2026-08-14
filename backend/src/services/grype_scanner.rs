@@ -1245,11 +1245,10 @@ impl GrypeScanner {
                 RawFinding {
                     // #3294: one shared classifier for every adapter, replacing
                     // this call site's own `from_str_loose(..)
-                    // .unwrap_or(Severity::Info)`. Behaviour here is unchanged
-                    // token for token: Grype's `Negligible` still maps to Info
-                    // (now because it is RECOGNISED rather than by falling off
-                    // the end of a match), and an ungraded `Unknown` still maps
-                    // to Info — that fail-open is #3306, not this patch.
+                    // .unwrap_or(Severity::Info)`. Grype's `Negligible` maps to
+                    // Info because it is RECOGNISED (an explicit distro triage
+                    // grade), while an ungraded `Unknown` fails closed at High
+                    // as of #3306.
                     severity: Severity::from_scanner_token(&m.vulnerability.severity),
                     title: format!("{} in {}", primary_id, m.artifact.name),
                     description: m.vulnerability.description.clone(),
@@ -3240,12 +3239,9 @@ mod tests {
     // fixing, which is why every Debian-derived base image carries a long tail
     // of them.
     //
-    // This adapter's classification is UNCHANGED by #3294 — it is a pure
-    // consolidation here, and these tests are the evidence for that: every one
-    // of them passes against the pre-#3294 expression
-    // `Severity::from_str_loose(..).unwrap_or(Severity::Info)` as well.
-    // Distinguishing `Unknown` from `Negligible` is #3306 (1.8.0), which will
-    // turn the `Unknown` row below red on purpose.
+    // #3294 was a pure consolidation here; #3306 then distinguished an
+    // ungraded `Unknown` (fails closed at High) from an explicitly-triaged
+    // `Negligible` (stays at the Info floor on purpose).
     // -----------------------------------------------------------------------
 
     /// Build a one-match report carrying `severity` verbatim, so the assertion
@@ -3280,12 +3276,12 @@ mod tests {
             ("High", Severity::High),
             ("Medium", Severity::Medium),
             ("Low", Severity::Low),
-            // Grype's explicit "distro says don't bother" grade. Unchanged
-            // bucket, but now reached because the token is RECOGNIZED.
+            // Grype's explicit "distro says don't bother" grade. RECOGNIZED,
+            // and stays at the floor on purpose — not a parse miss.
             ("Negligible", Severity::Info),
-            // Ungraded. Unchanged in this patch, and known to be wrong: an
-            // ungraded match is not a harmless one. Moving it is #3306.
-            ("Unknown", Severity::Info),
+            // Ungraded. An ungraded match is not a harmless one, so as of
+            // #3306 it fails closed at High.
+            ("Unknown", Severity::High),
         ] {
             let findings =
                 GrypeScanner::convert_findings(&grype_report_with_severity("CVE-2026-1", token));
@@ -3297,29 +3293,32 @@ mod tests {
         }
     }
 
-    /// Neutrality pin: a severity Grype has never emitted (feed change, forked
-    /// build, empty field) classifies exactly where it did before #3294 —
-    /// the lowest bucket. That is a fail-open and is deliberately left in
-    /// place by the patch; **#3306 must delete this test on purpose** when it
-    /// repoints `Severity::UNRECOGNIZED_SCANNER_SEVERITY`.
+    /// #3306: a severity Grype has never emitted (feed change, forked build,
+    /// empty field) is UNGRADED and fails closed at `High`, instead of landing
+    /// at the `Info` floor where no severity-aware gate could see it. This is
+    /// the deliberate rewrite of the stage-1a pinning test
+    /// (`..._is_unchanged_pending_3306`) that guarded the pre-fix behaviour.
     #[test]
-    fn test_convert_findings_grype_unrecognized_severity_is_unchanged_pending_3306() {
+    fn test_convert_findings_grype_unrecognized_severity_fails_closed_3306() {
         for token in ["", "Severe", "P1", "Unknown"] {
             let findings =
                 GrypeScanner::convert_findings(&grype_report_with_severity("CVE-2026-7", token));
             assert_eq!(
                 findings[0].severity,
-                Severity::Info,
-                "unrecognized grype token {token:?} must classify as it did \
-                 before #3294"
+                Severity::High,
+                "unrecognized grype token {token:?} must fail closed at High \
+                 (#3306)"
             );
         }
 
-        // Positive control in the same fixture, so the equalities above cannot
-        // be satisfied by a converter that stopped grading anything at all.
+        // Positive controls in the same fixture, so the equalities above
+        // cannot be satisfied by a converter that grades everything High:
+        // a graded token above AND below High must both survive.
         let graded =
             GrypeScanner::convert_findings(&grype_report_with_severity("CVE-2026-6", "Critical"));
         assert_eq!(graded[0].severity, Severity::Critical);
+        let low = GrypeScanner::convert_findings(&grype_report_with_severity("CVE-2026-8", "Low"));
+        assert_eq!(low[0].severity, Severity::Low);
     }
 
     /// Scan failures (workspace creation, missing grype binary) must

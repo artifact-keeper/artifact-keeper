@@ -1489,8 +1489,8 @@ mod tests {
         assert_eq!(findings[1].severity, Severity::High);
         assert_eq!(findings[2].severity, Severity::Medium);
         assert_eq!(findings[3].severity, Severity::Low);
-        // Unknown severity falls back to Info
-        assert_eq!(findings[4].severity, Severity::Info);
+        // Ungraded severity fails closed at High (#3306)
+        assert_eq!(findings[4].severity, Severity::High);
     }
 
     #[test]

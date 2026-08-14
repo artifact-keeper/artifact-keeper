@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Unrecognised scanner severity tokens now classify as `high` instead of `info`, so ungraded findings fail closed at severity gates (#3306). This applies to every scanner adapter (Trivy/Grype/Harbor image reports, filesystem scans, OpenSCAP), covering tokens such as Trivy's `UNKNOWN`, XCCDF's `unknown`, and any vendor-specific grade the classifier does not recognise. Explicitly graded tokens are unchanged, `negligible` (a recognised distro triage grade) stays at `info`, and the OSV/GHSA advisory-ingestion fallback remains independently at `medium`. Note this is deliberately stronger than the `medium` originally proposed on #3306: a `max_severity='high'` policy blocks only `critical` and `high`, so a `medium`-bucketed ungraded finding would still have been served under the default posture.
+
+### Upgrade note — security grades drop and severity gates tighten in volume on the next rescan
+
+Ungraded findings previously landed at `info`, which is in no `max_severity` block set, carries zero penalty weight, and is invisible to promotion severity counts — so they affected nothing. After this change each ungraded finding is filed at `high`: it now counts against `scan_policies.max_severity` thresholds of `high`, `medium`, and `low`, contributes `high`-level weight to repository security scores, and is counted by promotion rules that read high-severity counts.
+
+Expect this to move **in volume** on the first rescan, not at the margin. In particular, OpenSCAP: XCCDF's default rule severity is `unknown`, and the bundled wrapper emits the literal `unknown` for any rule that declares no severity — on a typical SCAP profile that is **most reported rules**. Repositories with OpenSCAP findings should expect their security grade to drop by one or more bands and, if a `max_severity` policy of `high` or stricter is enabled, downloads/promotions of affected artifacts to start being blocked. Trivy image scans with `UNKNOWN`-severity CVEs move the same way at smaller volume. To triage, acknowledge individual findings (acknowledged findings are excluded from the gate) or grade the rules in your SCAP content; do not widen the policy threshold past `high` unless you intend to stop blocking known-high findings too.
+
 ## [1.7.4] - 2026-08-14
 
 A security-only release. It carries exactly one functional commit on top of 1.7.3 — four repository advisories fixed together (#3347) — plus the version bump. There are **no feature changes and no schema migrations**, so for anyone already on 1.7.3 this is a low-risk upgrade that can be taken quickly. Three of the four advisories need action beyond upgrading — credential rotation for GHSA-78h6, a proxy-cache judgement call for GHSA-qxv7, and token rotation for GHSA-9rqp — and the GHSA-78h6 fix carries one deliberate behaviour change on Docker Hub pull-through; all of it is written up below.

@@ -154,9 +154,9 @@ pub struct HarborVulnerability {
 /// Normalize a Harbor severity token to the trivy severity vocabulary the
 /// shared converter understands. Harbor adds `Negligible` (mapped to `Low`)
 /// and `Unknown` (mapped to `Unknown`, which the converter's classifier does
-/// not recognise and therefore files at `Info`). All other tokens
-/// (Critical/High/Medium/Low/None) pass through unchanged. Pure fn so it is
-/// covered without a network.
+/// not recognise and therefore files at the fail-closed unrecognised bucket,
+/// `High` as of #3306). All other tokens (Critical/High/Medium/Low/None) pass
+/// through unchanged. Pure fn so it is covered without a network.
 fn normalize_harbor_severity(sev: &str) -> String {
     match sev.to_ascii_lowercase().as_str() {
         // Deliberately mapped UP to `Low` rather than passed through to
@@ -168,12 +168,10 @@ fn normalize_harbor_severity(sev: &str) -> String {
         // Harbor's at `Low` — to be reconciled with #3243 stage 2, which
         // decides the disposition of the `Info` bucket for blocking.
         "negligible" => "Low".to_string(),
-        // Empty severity is normalized to `Unknown` (-> Info in the converter).
-        // `Unknown` itself is intentionally passed through: the classifier does
-        // not recognise it and files it at `Info`, matching the spec's
-        // "Unknown -> Info" requirement without duplicating the mapping. That
-        // an ungraded finding lands at the floor at all is the fail-open
-        // tracked in #3306.
+        // Empty severity is normalized to `Unknown`. `Unknown` itself is
+        // intentionally passed through: the classifier does not recognise it
+        // and files it at `UNRECOGNIZED_SCANNER_SEVERITY` (`High` as of
+        // #3306), so an ungraded finding fails closed at severity gates.
         "" => "Unknown".to_string(),
         _ => sev.to_string(),
     }
@@ -1188,8 +1186,8 @@ mod tests {
         assert_eq!(findings[0].fixed_version, Some("2.12.6-r0".to_string()));
         // Negligible -> Low
         assert_eq!(findings[1].severity, Severity::Low);
-        // Unknown -> Info (from_str_loose returns None -> default Info)
-        assert_eq!(findings[2].severity, Severity::Info);
+        // Unknown is ungraded -> fails closed at High (#3306)
+        assert_eq!(findings[2].severity, Severity::High);
         // No title -> synthesized "<id> in <pkg>"
         assert!(findings[2].title.contains("CVE-2026-0003"));
     }
