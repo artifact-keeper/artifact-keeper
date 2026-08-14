@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Cargo endpoints answer under the documented `/api/cargo` prefix** (#3000). The generated/documented cargo client config points the sparse registry index at `sparse+{base}/api/cargo/{repo}/`, but the backend only mounted the cargo router at `/cargo`, so cargo's very first fetch — `/api/cargo/{repo}/config.json` — 404'd and every publish against a freshly created repo failed with `config.json not found`. The full cargo router is now additionally mounted at `/api/cargo` (same visibility middleware, same upload limit), so `config.json`, the sparse index files, downloads and publishes resolve under both prefixes.
+
+- **npm Virtual repositories merge every member's packument instead of first-match-wins** (#2844). The virtual metadata walk returned as soon as ANY member knew the package, so a hosted member holding only a fork build (e.g. `19.2.25-myorg.1`) masked the proxy member entirely and `npm install pkg@19.2.25` failed with "no matching version" even though the proxy member carried that release — deleting the fork artifact "fixed" it. Member contributions are now merged in priority order: `versions`, `dist-tags` and `time` federate across members with the higher-priority member winning per key, other packument fields keep the highest-priority member's values, per-member scope policies and age-gate filtering apply to each contribution exactly as before, and an unreachable member is still just a miss. The version-metadata path (`GET /{pkg}/{version}`) resolves through the same merge, so a version that only a lower-priority member carries now resolves there too.
+
+- **Helm charts push with a plain `helm cm-push chart.tgz <repo-url>`** (#2941). The ChartMuseum `cm-push` plugin constructs its push URL as `{host}/api{repo_path}/charts`, so for a repository URL of `{host}/helm/{repo}` it POSTs to `/api/helm/{repo}/charts` — not the native `/helm/{repo}/api/charts` — and the push 404'd unless the non-obvious `--context-path` flag was supplied. The upload and delete handlers are now also mounted under the plugin's default shape (`POST /api/helm/{repo}/charts`, `DELETE /api/helm/{repo}/charts/{name}/{version}`).
+
+- **The NuGet flat-container repair re-materializes the row's own storage object** (#2921). The #2919 streaming repair warms the shared proxy cache under `v3/flatcontainer/...`, which is a different key namespace from the row's `artifacts.storage_key`, and since #1278 proxy-cached content is not recorded in `artifacts` — so nothing ever healed the row, and every subsystem that reads `storage_key` directly (vulnerability scanning, quality gates, peer replication, promotion, signing, backup/export, the NuGet V2 OData download) kept seeing a missing blob permanently. When the repair finds a committed proxy-cache body, it now copies it back to the row's storage key — no second upstream pull — and serves from storage like the primary path; a cold cache still streams from upstream and heals on the next request. Entries that are negative-cached, age-gate-held, or content-coded are never copied; the digest-verified buffered repair (#2929) already wrote back and is unchanged.
+
+- **Remote NuGet/Chocolatey metadata caching survives large OData queries** (#3291). A Chocolatey `choco search` sends OData queries whose sanitized cache segment exceeded the 255-byte filesystem component limit, so every sidecar write failed with `File name too long (os error 36)`, the entry was treated as a permanent cache miss, and each search/list re-queried upstream. Segments over 200 bytes are now truncated and suffixed with a SHA-256 prefix of the raw query — deterministic, collision-safe, and inside every filesystem's component limit — while shorter segments keep their exact historical keys so existing cache entries stay hits.
+
+- **Artifactory source connections ping deployments fronted by the JFrog Platform router** (#2847). The migration connection test probed only the classic `{base}/api/system/ping`, which JFrog Cloud and self-hosted platform installs answer with `404 page not found`; those instances expose the Access service's ping at `{platform_root}/access/api/v1/system/ping` instead. The ping now falls back through the Access-service shapes (with a trailing `/artifactory` context stripped for the platform-root candidate) and reports reachable on the first success, so dry-run imports no longer fail at the connection test.
+
 ## [1.7.5] - 2026-08-14
 
 ### Security
@@ -675,8 +691,6 @@ Security hotfix: closes a systemic cross-repository authorization gap where arti
 
 - **Admin quality-checks list-all endpoint** (#2419): `GET /api/v1/admin/quality-checks` (admin-only, paginated, filterable by `repository_id`/`artifact_id`/`status`) backs the admin quality-checks view. The artifact-scoped `GET /api/v1/quality/checks` contract (400 without `artifact_id`) is unchanged.
 
-
-
 ## [1.5.2] - 2026-07-12
 
 Security hotfix: closes a token-exchange privilege-escalation where a scope-restricted API token could be exchanged (via docker-login `/v2/token` or Conan `users/authenticate`) into an unrestricted JWT — a read-only token could gain write/delete. Also completes the GHSA-vvc3 write-scope enforcement on the eight remaining format publish handlers.
@@ -1152,7 +1166,6 @@ Community contributors who shipped fixes in this release candidate:
 ### Dependencies
 
 (No new dependency bumps in this RC beyond what landed in rc.2.)
-
 
 Second release candidate for v1.2.0. Folds in ~40 PRs merged since rc.1, covering smoke-E2E CI breakage, the v1.1.9 -> v1.2.0 migration repair path, scanner archive extraction, format-handler bugs across Maven, PyPI, OCI, NuGet, Debian, Hex, Incus/LXC, CocoaPods, and several auth scope-enforcement fixes uncovered during the release-gate audit.
 
