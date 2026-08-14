@@ -276,6 +276,49 @@ pub async fn browse_count(
     Ok(count)
 }
 
+/// Every cached object path living under any of `path_prefixes`, ordered by
+/// `path` and bounded by `limit` (#3270).
+///
+/// Mirrors the hosted-side `ArtifactService::list_by_path_prefixes` (same
+/// `LIKE ANY` shape, same "caller supplies directory prefixes" contract) so
+/// the remote Maven grouped listing can fill in each component's file list
+/// from the proxy cache catalog the way the hosted one fills it from the
+/// `artifacts` table. The caller passes O(page) prefixes and re-checks the
+/// prefix in Rust, so an artifactId containing a `LIKE` wildcard (`_` is
+/// legal in Maven coordinates) can only over-fetch, never mis-attribute.
+pub async fn paths_under_prefixes(
+    db: &PgPool,
+    repository_id: Uuid,
+    path_prefixes: &[String],
+    limit: i64,
+) -> Result<Vec<String>> {
+    if path_prefixes.is_empty() || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let patterns: Vec<String> = path_prefixes.iter().map(|p| format!("{}%", p)).collect();
+
+    // Runtime-checked (not `query!`): keeps the offline `.sqlx` cache
+    // untouched, matching `list_by_path_prefixes`'s untyped `LIKE ANY` query.
+    let paths: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT path
+        FROM proxy_cache_artifacts
+        WHERE repository_id = $1
+          AND path LIKE ANY($2)
+        ORDER BY path
+        LIMIT $3
+        "#,
+    )
+    .bind(repository_id)
+    .bind(&patterns[..])
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(paths)
+}
+
 /// Keyset-paged catalog listing for one repository, ordered by `path`
 /// (#2270 visibility / PF-002 seam). `after` is the last path from the previous
 /// page (exclusive); pass `None` for the first page.
@@ -381,6 +424,40 @@ pub async fn record_proxy_download(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(res.rows_affected())
+}
+
+/// Recorded proxy-download counts for the given cached `paths`, keyed by path
+/// (#3265). Paths with no recorded serve are absent from the map; the caller
+/// substitutes zero.
+///
+/// Batched (`= ANY`) so a listing page costs one query rather than one per
+/// row, mirroring `ArtifactService::get_download_stats_batch` on the hosted
+/// side. Runtime-checked so the offline `.sqlx` cache is untouched.
+pub async fn download_counts_by_paths(
+    db: &PgPool,
+    repository_id: Uuid,
+    paths: &[String],
+) -> Result<std::collections::HashMap<String, i64>> {
+    if paths.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT a.path, COUNT(d.id)::BIGINT
+        FROM proxy_cache_artifacts a
+        LEFT JOIN proxy_download_statistics d ON d.proxy_cache_id = a.id
+        WHERE a.repository_id = $1
+          AND a.path = ANY($2)
+        GROUP BY a.path
+        "#,
+    )
+    .bind(repository_id)
+    .bind(paths)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(rows.into_iter().collect())
 }
 
 /// Count of proxy downloads recorded for one repository's cached objects.
@@ -845,6 +922,116 @@ mod tests {
             usage, 350,
             "hosted(100) + catalog(250); legacy proxy-cache/% artifact(500) excluded"
         );
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Catalog a set of cached object paths for one repository, deriving a
+    /// plausible content storage key for each. Shared by the #3270 / #3265
+    /// tests below so the fixture setup is written once.
+    async fn cache_paths(pool: &PgPool, repo: Uuid, paths: &[&str]) {
+        for path in paths {
+            upsert(
+                pool,
+                repo,
+                path,
+                &format!("proxy-cache/{}/{path}/__content__", repo.simple()),
+                "m",
+                10,
+                Some("c"),
+                None,
+                None,
+            )
+            .await
+            .expect("catalog cached path");
+        }
+    }
+
+    /// #3270: the remote Maven grouped listing fills each component's file
+    /// list from this query, so it must return every object under the GAV
+    /// directory and nothing from a sibling GAV.
+    #[tokio::test]
+    async fn test_paths_under_prefixes_scopes_to_the_given_directories() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        cache_paths(
+            &pool,
+            repo,
+            &[
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar",
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.pom",
+                "com/google/guava/guava/32.0.0-jre/guava-32.0.0-jre.jar",
+                "org/other/thing/1.0/thing-1.0.jar",
+            ],
+        )
+        .await;
+
+        let found = paths_under_prefixes(
+            &pool,
+            repo,
+            &["com/google/guava/guava/33.6.0-jre/".to_string()],
+            100,
+        )
+        .await
+        .expect("prefix query");
+        assert_eq!(
+            found,
+            vec![
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar".to_string(),
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.pom".to_string(),
+            ],
+            "only the requested GAV directory, ordered by path"
+        );
+
+        // No prefixes / a non-positive limit short-circuit without a query.
+        assert!(paths_under_prefixes(&pool, repo, &[], 100)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(paths_under_prefixes(
+            &pool,
+            repo,
+            &["com/google/guava/guava/33.6.0-jre/".to_string()],
+            0
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// #3265: proxy serves were recorded but never surfaced, so every cached
+    /// row in the remote listing reported `download_count: 0`.
+    #[tokio::test]
+    async fn test_download_counts_by_paths_reports_recorded_serves() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let served = "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar";
+        let untouched = "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.pom";
+        cache_paths(&pool, repo, &[served, untouched]).await;
+        for _ in 0..3 {
+            record_proxy_download(&pool, repo, served, "k", "m", None, None, None)
+                .await
+                .unwrap();
+        }
+
+        let counts =
+            download_counts_by_paths(&pool, repo, &[served.to_string(), untouched.to_string()])
+                .await
+                .expect("count query");
+        assert_eq!(counts.get(served).copied(), Some(3));
+        assert_eq!(
+            counts.get(untouched).copied(),
+            Some(0),
+            "a cached-but-never-served object reports zero, not absent"
+        );
+        assert!(download_counts_by_paths(&pool, repo, &[])
+            .await
+            .unwrap()
+            .is_empty());
         cleanup_repo(&pool, repo).await;
     }
 }

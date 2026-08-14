@@ -103,6 +103,12 @@ struct ArtifactByIdRow {
     created_at: chrono::DateTime<chrono::Utc>,
     quarantine_status: Option<String>,
     quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Uploader id from the `artifacts` row, plus the display name resolved
+    /// by the same query's `LEFT JOIN users` (#3271) — so the detail view
+    /// gets the uploader without a second, admin-only user lookup. The join
+    /// is a LEFT one: a deleted uploader leaves the id with a `NULL` name.
+    uploaded_by: Option<Uuid>,
+    uploaded_by_username: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -143,9 +149,11 @@ pub async fn get_artifact(
     let artifact: ArtifactByIdRow = sqlx::query_as(
         "SELECT a.id, r.key AS repository_key, a.path, a.name, a.version, \
                 a.size_bytes, a.checksum_sha256, a.content_type, a.created_at, \
-                a.quarantine_status, a.quarantine_until \
+                a.quarantine_status, a.quarantine_until, \
+                a.uploaded_by, u.username AS uploaded_by_username \
          FROM artifacts a \
          JOIN repositories r ON r.id = a.repository_id \
+         LEFT JOIN users u ON u.id = a.uploaded_by \
          WHERE a.id = $1 AND a.is_deleted = false",
     )
     .bind(id)
@@ -181,6 +189,8 @@ pub async fn get_artifact(
         content_type: artifact.content_type,
         download_count,
         created_at: artifact.created_at,
+        uploaded_by: artifact.uploaded_by,
+        uploaded_by_username: artifact.uploaded_by_username,
         metadata,
         // This handler resolves a real `artifacts` row by id, so it is
         // always a hosted artifact (analyzable), matching the by-path
@@ -355,6 +365,8 @@ mod tests {
             content_type: "application/java-archive".to_string(),
             download_count: 42,
             created_at: now,
+            uploaded_by: None,
+            uploaded_by_username: None,
             metadata: Some(serde_json::json!({"groupId": "com.example"})),
             analyzable: true,
             cache_cached_at: None,
@@ -394,6 +406,8 @@ mod tests {
             content_type: "application/octet-stream".to_string(),
             download_count: 0,
             created_at: Utc::now(),
+            uploaded_by: None,
+            uploaded_by_username: None,
             metadata: None,
             analyzable: true,
             cache_cached_at: None,
@@ -437,6 +451,8 @@ mod tests {
             content_type: "application/octet-stream".to_string(),
             download_count: 0,
             created_at: Utc::now(),
+            uploaded_by: None,
+            uploaded_by_username: None,
             metadata: None,
             analyzable: false,
             cache_cached_at: None,
@@ -556,6 +572,8 @@ mod tests {
             content_type: "t".to_string(),
             download_count: 0,
             created_at: Utc::now(),
+            uploaded_by: None,
+            uploaded_by_username: None,
             metadata: None,
             analyzable: true,
             cache_cached_at: None,
