@@ -294,10 +294,16 @@ fn classify_maven(lower: &str) -> Mutability {
     if leaf.starts_with("maven-metadata.xml") {
         return Mutability::mutable_default();
     }
-    // A SNAPSHOT path that is NOT a concrete timestamped artifact is mutable
-    // (the directory listing / metadata is republished). Concrete timestamped
-    // SNAPSHOT artifacts (e.g. `app-1.0-20240101.120000-3.jar`) are immutable.
-    if lower.contains("-snapshot/") && !has_artifact_extension(leaf) {
+    // Files inside a `-SNAPSHOT/` version directory. A NON-UNIQUE SNAPSHOT
+    // artifact keeps the literal `-SNAPSHOT` token in its filename
+    // (e.g. `app-1.0-SNAPSHOT.jar`) and Maven redeploys it in place — mutable,
+    // as are its checksum/signature sidecars and the directory
+    // metadata/listing. A UNIQUE (timestamped) SNAPSHOT artifact
+    // (`app-1.0-20240101.120000-3.jar`) has a one-shot filename — the token is
+    // replaced by the timestamp — and stays immutable, like a released
+    // coordinate.
+    if lower.contains("-snapshot/") && (leaf.contains("-snapshot") || !has_artifact_extension(leaf))
+    {
         return Mutability::mutable_default();
     }
     if has_artifact_extension(leaf) {
@@ -525,6 +531,11 @@ mod tests {
         ));
         assert!(is_explicitly_mutable_index(&Pypi, "simple/requests/"));
         assert!(is_explicitly_mutable_index(&Npm, "left-pad"));
+        // A NON-UNIQUE SNAPSHOT artifact is redeployed in place -> true.
+        assert!(is_explicitly_mutable_index(
+            &Maven,
+            "com/x/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar"
+        ));
         // Versioned / content-addressed artifacts -> false (protected).
         assert!(!is_explicitly_mutable_index(
             &Maven,
@@ -583,6 +594,29 @@ mod tests {
                 Maven,
                 "com/example/app/1.0-SNAPSHOT/app-1.0-20240101.120000-3.jar",
                 true,
+            ),
+            // Non-unique SNAPSHOT artifacts keep the literal `-SNAPSHOT` token
+            // in the filename and are redeployed in place -> mutable, along
+            // with their checksum sidecars and secondary artifacts.
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar",
+                false,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.pom",
+                false,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT-sources.jar",
+                false,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar.sha1",
+                false,
             ),
             (Gradle, "org/foo/bar/2.1/bar-2.1.jar", true),
             (Sbt, "org/foo/bar/maven-metadata.xml", false),

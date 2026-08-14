@@ -729,6 +729,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_cleanup_allows_nonunique_snapshot_redeploy_different_bytes() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "maven").await;
+        // Non-unique SNAPSHOT artifact: redeployed in place per Maven semantics.
+        let path = "com/x/app/1.0.0-SNAPSHOT/app-1.0.0-SNAPSHOT.jar";
+        insert_tombstone(
+            &pool,
+            repo,
+            path,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await;
+
+        // Redeploy with DIFFERENT bytes -> allowed (SNAPSHOTs are mutable).
+        let res = cleanup_soft_deleted_artifact_checked(
+            &pool,
+            &RepositoryFormat::Maven,
+            repo,
+            path,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "non-unique SNAPSHOT redeploy over a tombstone must be allowed, got {res:?}",
+        );
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "SNAPSHOT tombstone purged so redeploy can land"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    #[tokio::test]
     async fn checked_cleanup_no_tombstone_proceeds() {
         let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
             return;
