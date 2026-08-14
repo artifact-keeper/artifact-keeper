@@ -1891,7 +1891,7 @@ async fn serve_artifact(
                             )
                             .await
                             .map_err(IntoResponse::into_response)?;
-                        return proxy_helpers::build_streaming_response_with_disposition(
+                        let response = proxy_helpers::build_streaming_response_with_disposition(
                             result,
                             content_type_for_path(path),
                             None,
@@ -1899,9 +1899,19 @@ async fn serve_artifact(
                         .map_err(|e| {
                             AppError::Internal(format!("failed to build response: {}", e))
                                 .into_response()
-                        });
+                        })?;
+                        // #3265: count the proxy serve. Every other proxying
+                        // format (pypi, npm, and the shared
+                        // `try_remote_or_virtual_download` path) records here;
+                        // Maven has its own remote branch and was the one
+                        // format that never did, so a jar pulled through a
+                        // maven-central proxy always reported 0 downloads.
+                        // HEAD-guarded + best-effort inside.
+                        proxy_helpers::record_proxy_download(state, repo.id, repo_key, path, ctx)
+                            .await;
+                        return Ok(response);
                     }
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         repo_key,
@@ -1909,7 +1919,10 @@ async fn serve_artifact(
                         path,
                         content_type_for_path(path),
                     )
-                    .await;
+                    .await?;
+                    // #3265: same counting as the sidecar-gated branch above.
+                    proxy_helpers::record_proxy_download(state, repo.id, repo_key, path, ctx).await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -4861,6 +4874,34 @@ mod tests {
     /// requires a live upstream.  The routing assertions give us a lightweight
     /// regression signal without a network dependency.
     const MAVEN_HANDLER_SRC: &str = include_str!("maven.rs");
+
+    /// #3265 regression: the Maven remote (proxy) download branch is the one
+    /// proxying format that never recorded the serve, so a jar pulled through
+    /// a maven-central proxy always reported `download_count: 0` in the UI.
+    /// Every other format calls `record_proxy_download` (directly, as pypi and
+    /// npm do, or via the shared `try_remote_or_virtual_download`); Maven has
+    /// its own branch and must call it on BOTH exits — the sha1-sidecar-gated
+    /// fetch and the plain streaming fetch.
+    ///
+    /// Asserted structurally rather than over HTTP because the branch requires
+    /// a live upstream; the recorder itself is covered by
+    /// `proxy_catalog::record_proxy_download`'s own tests.
+    #[test]
+    fn remote_download_records_proxy_download_on_both_exits() {
+        // Split so this assertion's own source text is not counted as a call
+        // site (the needle only exists joined at compile time).
+        let needle = concat!(
+            "record_proxy_download",
+            "(state, repo.id, repo_key, path, ctx)"
+        );
+        let calls = MAVEN_HANDLER_SRC.matches(needle).count();
+        assert_eq!(
+            calls, 2,
+            "expected the Maven remote download branch to record a proxy download on both \
+             the sha1-gated and the plain streaming exit — without it the UI reports \
+             0 downloads for every proxied Maven artifact (#3265)"
+        );
+    }
 
     #[test]
     fn root_probe_routes_are_registered() {

@@ -1496,7 +1496,25 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
 
     let req = match build_oidc_bootstrap_request() {
         Some(r) => r,
-        None => return Ok(()),
+        None => {
+            // #2819: the OIDC_* env vars are absent (removed or never set).
+            // Any provider a previous boot seeded from the environment must
+            // not outlive its configuration: disable (never delete) rows the
+            // bootstrap owns, so the login page stops advertising a flow
+            // that can no longer complete and local login recovers once no
+            // enabled provider remains. Admin-created providers — and
+            // env-seeded rows an admin later edited or toggled (which clears
+            // the `env_seeded` marker) — are untouched.
+            for name in AuthConfigService::disable_env_seeded_oidc(db).await? {
+                tracing::warn!(
+                    "Disabled OIDC provider '{}': it was seeded from OIDC_* environment \
+                     variables that are no longer set. Re-set the env vars to re-enable it, \
+                     or re-enable it via the admin API to take manual ownership.",
+                    name
+                );
+            }
+            return Ok(());
+        }
     };
 
     // Reconcile the env-managed provider (matched by name) on every boot so
@@ -1509,6 +1527,9 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
     match plan_provider_reconcile(&req.name, &pairs) {
         ReconcileAction::Create => {
             let config = AuthConfigService::create_oidc(db, req).await?;
+            // Record env ownership so removing the env vars later disables
+            // this row rather than leaving it advertised forever (#2819).
+            AuthConfigService::mark_oidc_env_seeded(db, config.id).await?;
             tracing::info!(
                 "Bootstrapped OIDC provider '{}' (id={}) from environment variables",
                 config.name,
@@ -1518,6 +1539,9 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
         ReconcileAction::Update(id) => {
             let name = req.name.clone();
             let cfg = AuthConfigService::update_oidc(db, id, req.into()).await?;
+            // `update_oidc` clears the env-ownership marker (admin updates
+            // take ownership); the bootstrap is the env, so re-assert it.
+            AuthConfigService::mark_oidc_env_seeded(db, cfg.id).await?;
             tracing::info!(
                 "Reconciled env-managed OIDC provider '{}' (id={}) from environment variables",
                 name,

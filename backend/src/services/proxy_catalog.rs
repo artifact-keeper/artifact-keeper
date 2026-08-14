@@ -85,13 +85,49 @@ pub async fn upsert(
     Ok(())
 }
 
+/// True when a stored catalog row is the transient placeholder
+/// [`record_proxy_download`] inserts on the request path (`size_bytes = 0`,
+/// `checksum_sha256 IS NULL`) rather than an authoritative row written by the
+/// tee's [`upsert`].
+///
+/// Pure mirror of the `ON CONFLICT` guard in [`backfill_from_sidecar`], kept in
+/// Rust so the placeholder definition has one testable statement and cannot
+/// drift from the SQL that applies it.
+///
+/// Both conditions are required. A genuinely cached zero-byte object still
+/// carries its checksum, so it is never mistaken for a placeholder — and even
+/// if it were, the sidecar would repair it to the same `size_bytes = 0`.
+pub fn is_placeholder_catalog_row(size_bytes: i64, checksum_sha256: Option<&str>) -> bool {
+    size_bytes == 0 && checksum_sha256.is_none()
+}
+
 /// Lazy backfill for a pre-existing, un-cataloged cached object discovered on a
 /// cache HIT.
 ///
-/// `ON CONFLICT DO NOTHING` on the body fields (so a concurrent authoritative
-/// write is never clobbered by a backfill guess) while still bumping
-/// `last_accessed_at`, which doubles as the PF-002 lifecycle seam. Fire-and-
-/// forget from the serve path — never blocks the response.
+/// Inserts the row when absent. When a row already exists the conflict arm
+/// **repairs it if it is still a placeholder** (#3305) and otherwise leaves the
+/// authoritative body fields untouched, always bumping `last_accessed_at`
+/// (which doubles as the PF-002 lifecycle seam). Fire-and-forget from the serve
+/// path — never blocks the response, and safely skippable (the bounded limiter
+/// added in #3289 drops these under saturation; the next hit retries).
+///
+/// # Why the conflict arm has to repair (#3305)
+///
+/// `record_proxy_download` is awaited *inline on the request* and ensures a
+/// catalog row for `(repository_id, path)` so the first serve counts (#2537),
+/// inserting a placeholder with `size_bytes = 0` and a NULL checksum. The
+/// backfill runs detached and therefore normally *loses* that race. While the
+/// conflict arm only touched `last_accessed_at`, the losing backfill returned
+/// without ever writing the real size / checksum / content type, and nothing
+/// else repaired the row — so the #2218 / #2270 self-healing this function
+/// exists for was inert for exactly the pre-catalog entries it targets, and
+/// storage accounting read zeros for them.
+///
+/// Since the placeholder insert is on the request path, the backfill is by
+/// definition almost always an UPDATE; the conflict arm is the path that
+/// matters. Repair is scoped by [`is_placeholder_catalog_row`] so a genuinely
+/// populated row is never overwritten by a stale sidecar guess — the original
+/// no-clobber contract still holds for every authoritative row.
 #[allow(clippy::too_many_arguments)]
 pub async fn backfill_from_sidecar(
     db: &PgPool,
@@ -110,6 +146,30 @@ pub async fn backfill_from_sidecar(
              checksum_sha256, content_type, cached_at, last_accessed_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
         ON CONFLICT (repository_id, path) DO UPDATE SET
+            storage_key = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.storage_key ELSE proxy_cache_artifacts.storage_key END,
+            metadata_key = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.metadata_key ELSE proxy_cache_artifacts.metadata_key END,
+            size_bytes = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.size_bytes ELSE proxy_cache_artifacts.size_bytes END,
+            content_type = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.content_type ELSE proxy_cache_artifacts.content_type END,
+            -- Assigned LAST: the guard reads the stored checksum, and an
+            -- UPDATE SET list evaluates every right-hand side against the OLD
+            -- row, so ordering is presentational only. Kept last regardless so
+            -- the guard column is visibly the one being replaced.
+            checksum_sha256 = CASE
+                WHEN proxy_cache_artifacts.size_bytes = 0
+                 AND proxy_cache_artifacts.checksum_sha256 IS NULL
+                THEN EXCLUDED.checksum_sha256 ELSE proxy_cache_artifacts.checksum_sha256 END,
             last_accessed_at = now()
         "#,
         repository_id,
@@ -276,6 +336,49 @@ pub async fn browse_count(
     Ok(count)
 }
 
+/// Every cached object path living under any of `path_prefixes`, ordered by
+/// `path` and bounded by `limit` (#3270).
+///
+/// Mirrors the hosted-side `ArtifactService::list_by_path_prefixes` (same
+/// `LIKE ANY` shape, same "caller supplies directory prefixes" contract) so
+/// the remote Maven grouped listing can fill in each component's file list
+/// from the proxy cache catalog the way the hosted one fills it from the
+/// `artifacts` table. The caller passes O(page) prefixes and re-checks the
+/// prefix in Rust, so an artifactId containing a `LIKE` wildcard (`_` is
+/// legal in Maven coordinates) can only over-fetch, never mis-attribute.
+pub async fn paths_under_prefixes(
+    db: &PgPool,
+    repository_id: Uuid,
+    path_prefixes: &[String],
+    limit: i64,
+) -> Result<Vec<String>> {
+    if path_prefixes.is_empty() || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let patterns: Vec<String> = path_prefixes.iter().map(|p| format!("{}%", p)).collect();
+
+    // Runtime-checked (not `query!`): keeps the offline `.sqlx` cache
+    // untouched, matching `list_by_path_prefixes`'s untyped `LIKE ANY` query.
+    let paths: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT path
+        FROM proxy_cache_artifacts
+        WHERE repository_id = $1
+          AND path LIKE ANY($2)
+        ORDER BY path
+        LIMIT $3
+        "#,
+    )
+    .bind(repository_id)
+    .bind(&patterns[..])
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(paths)
+}
+
 /// Keyset-paged catalog listing for one repository, ordered by `path`
 /// (#2270 visibility / PF-002 seam). `after` is the last path from the previous
 /// page (exclusive); pass `None` for the first page.
@@ -381,6 +484,40 @@ pub async fn record_proxy_download(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(res.rows_affected())
+}
+
+/// Recorded proxy-download counts for the given cached `paths`, keyed by path
+/// (#3265). Paths with no recorded serve are absent from the map; the caller
+/// substitutes zero.
+///
+/// Batched (`= ANY`) so a listing page costs one query rather than one per
+/// row, mirroring `ArtifactService::get_download_stats_batch` on the hosted
+/// side. Runtime-checked so the offline `.sqlx` cache is untouched.
+pub async fn download_counts_by_paths(
+    db: &PgPool,
+    repository_id: Uuid,
+    paths: &[String],
+) -> Result<std::collections::HashMap<String, i64>> {
+    if paths.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT a.path, COUNT(d.id)::BIGINT
+        FROM proxy_cache_artifacts a
+        LEFT JOIN proxy_download_statistics d ON d.proxy_cache_id = a.id
+        WHERE a.repository_id = $1
+          AND a.path = ANY($2)
+        GROUP BY a.path
+        "#,
+    )
+    .bind(repository_id)
+    .bind(paths)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(rows.into_iter().collect())
 }
 
 /// Count of proxy downloads recorded for one repository's cached objects.
@@ -531,6 +668,144 @@ mod tests {
         assert_eq!(rows.len(), 1, "still one row");
         assert_eq!(rows[0].size_bytes, 500, "backfill never overwrites size");
         assert_eq!(rows[0].checksum_sha256.as_deref(), Some("sha"));
+        cleanup_repo(&pool, repo).await;
+    }
+
+    // --- #3305: the backfill must repair the placeholder row it races -------
+
+    #[test]
+    fn placeholder_predicate_needs_zero_size_and_null_checksum() {
+        assert!(
+            is_placeholder_catalog_row(0, None),
+            "the row record_proxy_download inserts is the placeholder"
+        );
+        assert!(
+            !is_placeholder_catalog_row(4096, None),
+            "a sized row is authoritative even without a checksum"
+        );
+        assert!(
+            !is_placeholder_catalog_row(0, Some("abc")),
+            "a genuinely cached zero-byte object carries its checksum"
+        );
+        assert!(!is_placeholder_catalog_row(4096, Some("abc")));
+    }
+
+    /// #3305 regression test. `record_proxy_download` is awaited inline on the
+    /// request and inserts a `size_bytes = 0` placeholder; the lazy backfill
+    /// runs detached and normally loses that race. Before the fix its conflict
+    /// arm only bumped `last_accessed_at`, so the placeholder was permanent and
+    /// the #2218/#2270 self-healing was inert.
+    ///
+    /// The foreground insert is made to win DETERMINISTICALLY here (it is
+    /// simply called first), and the assertions are on the REPAIRED VALUES —
+    /// asserting a row merely exists, or that the backfill "ran", would pass
+    /// with the bug in place.
+    #[tokio::test]
+    async fn test_backfill_repairs_the_placeholder_row_it_races() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/racy/racy-2.0.whl";
+        let key = format!("proxy-cache/{}/{path}/__content__", repo.simple());
+        let meta = format!("proxy-cache/{}/{path}/__cache_meta__.json", repo.simple());
+
+        // 1. The request path wins the race and leaves a placeholder.
+        record_proxy_download(&pool, repo, path, &key, &meta, None, None, None)
+            .await
+            .expect("record serve");
+        let rows = list_paged(&pool, repo, None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            is_placeholder_catalog_row(rows[0].size_bytes, rows[0].checksum_sha256.as_deref()),
+            "precondition: the foreground insert left a placeholder"
+        );
+
+        // 2. The detached backfill arrives second and must REPAIR it.
+        backfill_from_sidecar(
+            &pool,
+            repo,
+            path,
+            &key,
+            &meta,
+            8192,
+            Some("realchecksum"),
+            Some("application/octet-stream"),
+        )
+        .await
+        .expect("backfill");
+
+        let rows = list_paged(&pool, repo, None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1, "still exactly one row");
+        assert_eq!(
+            rows[0].size_bytes, 8192,
+            "the placeholder's size must be repaired from the sidecar (#3305)"
+        );
+        assert_eq!(
+            rows[0].checksum_sha256.as_deref(),
+            Some("realchecksum"),
+            "the placeholder's checksum must be repaired from the sidecar (#3305)"
+        );
+        assert_eq!(
+            rows[0].content_type.as_deref(),
+            Some("application/octet-stream"),
+            "the placeholder's content type must be repaired from the sidecar (#3305)"
+        );
+        assert_eq!(
+            sum_by_repo(&pool, repo).await.unwrap(),
+            8192,
+            "storage accounting must stop reading zeros for repaired entries"
+        );
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// The repair is scoped to placeholders: a genuinely cached zero-byte
+    /// object (size 0 WITH a checksum) is authoritative and a later sidecar
+    /// guess must not overwrite it.
+    #[tokio::test]
+    async fn test_backfill_does_not_repair_an_authoritative_zero_byte_row() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let path = "simple/empty/empty-1.0.whl";
+        let key = format!("proxy-cache/{}/{path}/__content__", repo.simple());
+
+        upsert(
+            &pool,
+            repo,
+            path,
+            &key,
+            "m",
+            0,
+            Some("e3b0c442"),
+            None,
+            None,
+        )
+        .await
+        .expect("authoritative zero-byte upsert");
+
+        backfill_from_sidecar(
+            &pool,
+            repo,
+            path,
+            "other-key",
+            "m2",
+            77,
+            Some("wrong"),
+            None,
+        )
+        .await
+        .expect("backfill");
+
+        let rows = list_paged(&pool, repo, None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].size_bytes, 0, "authoritative size preserved");
+        assert_eq!(rows[0].checksum_sha256.as_deref(), Some("e3b0c442"));
+        assert_eq!(
+            rows[0].storage_key, key,
+            "authoritative storage key preserved"
+        );
         cleanup_repo(&pool, repo).await;
     }
 
@@ -845,6 +1120,116 @@ mod tests {
             usage, 350,
             "hosted(100) + catalog(250); legacy proxy-cache/% artifact(500) excluded"
         );
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Catalog a set of cached object paths for one repository, deriving a
+    /// plausible content storage key for each. Shared by the #3270 / #3265
+    /// tests below so the fixture setup is written once.
+    async fn cache_paths(pool: &PgPool, repo: Uuid, paths: &[&str]) {
+        for path in paths {
+            upsert(
+                pool,
+                repo,
+                path,
+                &format!("proxy-cache/{}/{path}/__content__", repo.simple()),
+                "m",
+                10,
+                Some("c"),
+                None,
+                None,
+            )
+            .await
+            .expect("catalog cached path");
+        }
+    }
+
+    /// #3270: the remote Maven grouped listing fills each component's file
+    /// list from this query, so it must return every object under the GAV
+    /// directory and nothing from a sibling GAV.
+    #[tokio::test]
+    async fn test_paths_under_prefixes_scopes_to_the_given_directories() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        cache_paths(
+            &pool,
+            repo,
+            &[
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar",
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.pom",
+                "com/google/guava/guava/32.0.0-jre/guava-32.0.0-jre.jar",
+                "org/other/thing/1.0/thing-1.0.jar",
+            ],
+        )
+        .await;
+
+        let found = paths_under_prefixes(
+            &pool,
+            repo,
+            &["com/google/guava/guava/33.6.0-jre/".to_string()],
+            100,
+        )
+        .await
+        .expect("prefix query");
+        assert_eq!(
+            found,
+            vec![
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar".to_string(),
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.pom".to_string(),
+            ],
+            "only the requested GAV directory, ordered by path"
+        );
+
+        // No prefixes / a non-positive limit short-circuit without a query.
+        assert!(paths_under_prefixes(&pool, repo, &[], 100)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(paths_under_prefixes(
+            &pool,
+            repo,
+            &["com/google/guava/guava/33.6.0-jre/".to_string()],
+            0
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// #3265: proxy serves were recorded but never surfaced, so every cached
+    /// row in the remote listing reported `download_count: 0`.
+    #[tokio::test]
+    async fn test_download_counts_by_paths_reports_recorded_serves() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let served = "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar";
+        let untouched = "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.pom";
+        cache_paths(&pool, repo, &[served, untouched]).await;
+        for _ in 0..3 {
+            record_proxy_download(&pool, repo, served, "k", "m", None, None, None)
+                .await
+                .unwrap();
+        }
+
+        let counts =
+            download_counts_by_paths(&pool, repo, &[served.to_string(), untouched.to_string()])
+                .await
+                .expect("count query");
+        assert_eq!(counts.get(served).copied(), Some(3));
+        assert_eq!(
+            counts.get(untouched).copied(),
+            Some(0),
+            "a cached-but-never-served object reports zero, not absent"
+        );
+        assert!(download_counts_by_paths(&pool, repo, &[])
+            .await
+            .unwrap()
+            .is_empty());
         cleanup_repo(&pool, repo).await;
     }
 }

@@ -818,7 +818,7 @@ async fn simple_project(
                         &repo_key,
                         &effective_upstream,
                         &upstream_path,
-                        &format!("{}index.v1+json", upstream_path),
+                        &format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
                         Some(PEP691_JSON_CONTENT_TYPE),
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
@@ -1107,7 +1107,7 @@ async fn simple_project(
                         &member.key,
                         &effective_upstream,
                         &upstream_path,
-                        &format!("{}index.v1+json", upstream_path),
+                        &format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
                         Some(PEP691_JSON_CONTENT_TYPE),
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
@@ -1803,12 +1803,11 @@ async fn download_or_metadata(
     // way: it enqueues only after a version document resolves out of a real
     // packument.
     //
-    // 3xx counts because #1555 answers a fresh proxy-cache hit on a remote member
-    // with a 307 to a presigned URL (`presigned_downloads_enabled`); gating on
-    // `is_success()` alone would silently switch ingestion off for every operator
-    // running object-storage downloads. Both shapes mean the same thing here: the
-    // access check inside `serve_file` passed and the artifact resolved.
-    let served = response.status().is_success() || response.status().is_redirection();
+    // The predicate itself lives in `proxy_helpers` so the relocation is covered
+    // by a test (#3233): `response_admits_ondemand_ingest` documents why 3xx
+    // counts (#1555 presigned redirects) and pins that 401/403/404 do not.
+    let served =
+        crate::api::handlers::proxy_helpers::response_admits_ondemand_ingest(response.status());
     if served && repo.repo_type == RepositoryType::Remote && !filename.ends_with(".metadata") {
         if let Some(version) = requested_version.clone() {
             // `normalized.as_str()` (#3186): the catalog row must key on the same
@@ -4717,6 +4716,34 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 /// PEP 691 JSON simple-index media type.
 const PEP691_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 
+/// Cache-path suffix under which the PEP 691 JSON representation of a Simple
+/// project index is stored, appended to the HTML representation's cache path
+/// (see `simple_project`'s `{upstream_path}index.v1+json` cache key).
+const PEP691_JSON_CACHE_SUFFIX: &str = "index.v1+json";
+
+/// The sibling content-negotiated cache path of a PyPI Simple project index
+/// (#3290), or `None` when `path` is not a Simple-index cache path.
+///
+/// A Remote PyPI project index is cached once per negotiated representation:
+/// the PEP 503 HTML under the index path itself (`.../<project>/`) and the
+/// PEP 691 JSON under `.../<project>/index.v1+json`. The two entries expire
+/// independently, so evicting one representation without the other leaves
+/// them describing different upstream snapshots — `uv` (which prefers JSON)
+/// then reports versions missing that the HTML index already lists. Callers
+/// that explicitly invalidate either representation use this to evict the
+/// sibling in the same operation.
+pub(crate) fn pep691_sibling_cache_path(path: &str) -> Option<String> {
+    if let Some(base) = path.strip_suffix(PEP691_JSON_CACHE_SUFFIX) {
+        // JSON variant -> its HTML sibling, which is always a directory-shaped
+        // index path. A non-directory base means `path` merely *ends* in the
+        // suffix (e.g. an artifact literally named `index.v1+json`).
+        return base.ends_with('/').then(|| base.to_string());
+    }
+    // Directory-shaped index path (HTML variant) -> its JSON sibling.
+    path.ends_with('/')
+        .then(|| format!("{path}{PEP691_JSON_CACHE_SUFFIX}"))
+}
+
 /// Rewrite the `files[].url` of a parsed PEP 691 JSON simple index to route
 /// downloads through Artifact Keeper's proxy, mirroring `rewrite_upstream_urls`
 /// for the HTML form. PEP 658/714 metadata signals (`core-metadata`,
@@ -5197,6 +5224,40 @@ mod tests {
     use super::*;
     use crate::api::handlers::proxy_helpers::scan_blocked_response;
     use sha2::{Digest, Sha256};
+
+    /// #3290: the sibling mapping between the two content-negotiated cache
+    /// paths of a Simple project index, in both directions — and `None` for
+    /// paths that are not Simple-index cache paths (a package file, or an
+    /// artifact whose name merely ends in the JSON suffix).
+    #[test]
+    fn test_pep691_sibling_cache_path_maps_both_directions_3290() {
+        assert_eq!(
+            pep691_sibling_cache_path("simple/requests/").as_deref(),
+            Some("simple/requests/index.v1+json"),
+            "HTML index path must map to its PEP 691 sibling"
+        );
+        assert_eq!(
+            pep691_sibling_cache_path("simple/requests/index.v1+json").as_deref(),
+            Some("simple/requests/"),
+            "PEP 691 path must map back to its HTML sibling"
+        );
+        // Flat (no `simple/` prefix) upstream layouts keep the same shape.
+        assert_eq!(
+            pep691_sibling_cache_path("requests/").as_deref(),
+            Some("requests/index.v1+json")
+        );
+        // Not Simple-index cache paths: no sibling.
+        assert_eq!(
+            pep691_sibling_cache_path("simple/requests/requests-2.0.0-py3-none-any.whl"),
+            None,
+            "a package file has no negotiated sibling"
+        );
+        assert_eq!(
+            pep691_sibling_cache_path("simple/proj/weird-index.v1+json"),
+            None,
+            "a non-directory base merely ends in the JSON suffix"
+        );
+    }
 
     /// Build a [`NormalizedProjectName`] for a test fixture (#3186).
     ///

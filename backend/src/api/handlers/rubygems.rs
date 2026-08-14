@@ -125,17 +125,19 @@ async fn gem_info(
 
     // Virtual repo: try remote members in priority order. The member's body
     // is forwarded VERBATIM, so its `Content-Encoding` is re-declared when
-    // present (RFC 9110 §8.4, #3260).
+    // present (RFC 9110 §8.4, #3260) and its own `Content-Type` is served
+    // (#3281), with the JSON literal only as the fallback for a member that
+    // declared none.
     if repo.repo_type == RepositoryType::Virtual {
         return proxy_helpers::resolve_virtual_metadata(
             &state.db,
             state.proxy_service.as_deref(),
             repo.id,
             &format!("api/v1/gems/{}.json", gem_name),
-            |bytes, content_encoding, _member_key| async move {
+            |bytes, content_type, content_encoding, _member_key| async move {
                 Ok(proxy_helpers::forward_verbatim_metadata(
                     bytes,
-                    None,
+                    content_type,
                     "application/json",
                     content_encoding,
                 ))
@@ -802,16 +804,18 @@ async fn quick_spec(
         }
         // Otherwise proxy the upstream quick spec verbatim (already Marshal),
         // re-declaring the member's `Content-Encoding` when present
-        // (RFC 9110 §8.4, #3260).
+        // (RFC 9110 §8.4, #3260) and serving the member's own `Content-Type`
+        // (#3281), with the octet-stream literal only as the fallback for a
+        // member that declared none.
         return proxy_helpers::resolve_virtual_metadata(
             &state.db,
             state.proxy_service.as_deref(),
             repo.id,
             &format!("quick/Marshal.4.8/{}", spec_file),
-            |bytes, content_encoding, _member_key| async move {
+            |bytes, content_type, content_encoding, _member_key| async move {
                 Ok(proxy_helpers::forward_verbatim_metadata(
                     bytes,
-                    None,
+                    content_type,
                     "application/octet-stream",
                     content_encoding,
                 ))
@@ -1670,6 +1674,34 @@ mod db_cov_tests {
                 .execute(&fx.pool)
                 .await;
         }
+        fx.teardown().await;
+    }
+
+    /// #3281: the Virtual arms of `gem_info` and `quick_spec` forward the
+    /// member's body verbatim and must serve the member's own `Content-Type`,
+    /// keeping today's literals (`application/json` / octet-stream) only for
+    /// a member that declares none.
+    #[tokio::test]
+    async fn test_rubygems_virtual_forwards_member_content_type_3281_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let rig = tdh::setup_ct_3281_rig(&fx, "rubygems", b"gem-info-3281").await;
+        rig.assert_member_ct_forwarded(
+            super::router(),
+            |key| format!("/{key}/api/v1/gems/pkg3281.json"),
+            "application/json",
+            "rubygems virtual gem_info",
+        )
+        .await;
+        rig.assert_member_ct_forwarded(
+            super::router(),
+            |key| format!("/{key}/quick/Marshal.4.8/pkg3281-1.0.0.gemspec.rz"),
+            "application/octet-stream",
+            "rubygems virtual quick_spec",
+        )
+        .await;
+        rig.cleanup(&fx.pool).await;
         fx.teardown().await;
     }
 }

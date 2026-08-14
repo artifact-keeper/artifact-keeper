@@ -2496,6 +2496,7 @@ mod tests {
                     restore_database: true,
                     restore_artifacts: false,
                     target_repository_id: None,
+                    actor: None,
                 },
             )
             .await

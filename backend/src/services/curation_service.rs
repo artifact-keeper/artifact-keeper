@@ -972,8 +972,37 @@ impl CurationService {
         let popularity_source =
             crate::services::curation::popularity_source::HttpPopularitySource::new().cached();
 
+        // #3230: re-evaluation must not lose a verification the scheduler
+        // already computed and persisted. Without this the marker is per-tick
+        // only, so a bulk re-evaluate silently returns every attestation-
+        // approved package to `review`. `reusable_verdict` re-checks the
+        // recorded issuer against the CURRENT allowlist and the record's age, so
+        // a narrowed allowlist takes effect here rather than being grandfathered.
+        let allowlist: Vec<String> =
+            crate::services::curation::attestation_verify::DEFAULT_ISSUER_ALLOWLIST
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let now = chrono::Utc::now();
+
         for pkg in &pending {
-            let context = Self::context_metadata(&pkg.metadata, pkg.architecture.as_deref());
+            let mut metadata = pkg.metadata.clone();
+            let reused = crate::services::curation::attestation_verify::reusable_verdict(
+                &crate::services::curation::attestation_verify::AttestationRecord::of(pkg),
+                &allowlist,
+                now,
+            );
+            if crate::services::curation::attestation_verify::apply_verified_marker(
+                &mut metadata,
+                reused.as_ref(),
+            ) {
+                tracing::warn!(
+                    package = %pkg.package_name,
+                    version = %pkg.version,
+                    "curation re-evaluate: dropped a pre-existing attestation-verification marker from stored metadata"
+                );
+            }
+            let context = Self::context_metadata(&metadata, pkg.architecture.as_deref());
             let (decision, rule_id) = Self::evaluate_typed_rules(
                 &rules,
                 Self::default_decision(default_action),
@@ -2367,6 +2396,241 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+    }
+
+    /// Wire one staging repo to curate `remote` with a given default action —
+    /// the two-line setup every on-demand curation DB test needs.
+    async fn wire_curation(
+        pool: &sqlx::PgPool,
+        staging_id: Uuid,
+        remote_id: Uuid,
+        default_action: &str,
+    ) {
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, curation_source_repo_id = $2, curation_default_action = $3 WHERE id = $1",
+        )
+        .bind(staging_id)
+        .bind(remote_id)
+        .bind(default_action)
+        .execute(pool)
+        .await
+        .expect("wire staging->remote curation");
+    }
+
+    /// A pypi catalog entry shaped like the one the proxy seam builds from a
+    /// served distribution download.
+    fn ondemand_pypi_entry(
+        name: &str,
+        version: &str,
+        metadata: serde_json::Value,
+    ) -> crate::services::curation_sync::CurationPackageEntry {
+        crate::services::curation_sync::CurationPackageEntry {
+            format: "pypi".to_string(),
+            package_name: name.to_string(),
+            version: version.to_string(),
+            release: None,
+            architecture: None,
+            checksum_sha256: None,
+            upstream_path: format!("{name}-{version}-py3-none-any.whl"),
+            metadata,
+            primary_metadata: None,
+        }
+    }
+
+    /// #3230: a verification must survive the tick that computed it.
+    ///
+    /// Before this, the attestation columns were write-only — nothing carried
+    /// them onto `CurationPackage`, so the marker existed only in the scheduler
+    /// tick's memory. A bulk re-evaluate therefore re-ran the publisher-trust
+    /// rule with no marker, hit the fail-safe Flag, and silently returned an
+    /// `approved` package to `review`. This drives the real re-evaluation path
+    /// against a persisted `verified` record and asserts it stays approved.
+    #[tokio::test]
+    async fn test_persisted_attestation_survives_re_evaluation_db() {
+        use crate::api::handlers::proxy_helpers::enqueue_curation_on_demand;
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _guard = tdh::curation_global_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, _uname) = tdh::create_user(&pool).await;
+        let svc = CurationService::new(pool.clone());
+        let (remote_id, _rk, _rp) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (staging_id, _sk, _sp) = tdh::create_repo(&pool, "staging", "pypi").await;
+        wire_curation(&pool, staging_id, remote_id, "review").await;
+
+        let config = serde_json::json!({
+            "trusted_publishers": ["sigstore"],
+            "match": "attestation",
+            "action": "allow"
+        });
+        let rule = svc
+            .create_rule(
+                None,
+                "*",
+                "*",
+                "*",
+                "allow",
+                1,
+                "#3230 regression",
+                "publisher_trust",
+                &config,
+                user,
+            )
+            .await
+            .expect("create rule");
+
+        let entry = ondemand_pypi_entry(
+            "sigstore",
+            "4.5.0",
+            serde_json::json!({
+                "name": "sigstore", "version": "4.5.0",
+                "_ak_dist": {"filename": "sigstore-4.5.0-py3-none-any.whl"},
+                "provenance": {"attestation_bundles": [
+                    {"publisher": {"repository": "sigstore/sigstore-python"}}
+                ]}
+            }),
+        );
+        enqueue_curation_on_demand(&pool, remote_id, "remote", entry).await;
+
+        let pkg = svc
+            .list_pending_packages_by_format(staging_id, "pypi", 100)
+            .await
+            .expect("list pending")
+            .into_iter()
+            .find(|p| p.package_name == "sigstore")
+            .expect("ingested pypi row is pending");
+
+        // NEGATIVE CONTROL: with no verification on record, re-evaluation must
+        // land on the fail-safe review path. Without this, the positive
+        // assertion below could be satisfied by a rule that approves anything.
+        svc.re_evaluate_pending(staging_id, "review")
+            .await
+            .expect("re-evaluate (unverified)");
+        let row = svc.get_package(pkg.id).await.expect("get pkg");
+        assert_eq!(
+            row.status, "review",
+            "an unverified attested package must Flag"
+        );
+        assert_eq!(row.attestation_state, "unverified");
+
+        // The scheduler verifies and persists. Reset to pending as an operator
+        // (or a re-sync) would, so re-evaluation actually reconsiders the row.
+        svc.record_attestation(
+            pkg.id,
+            "verified",
+            Some("https://github.com/sigstore/sigstore-python/.github/workflows/release.yml@refs/tags/v4.5.0"),
+            Some("https://token.actions.githubusercontent.com"),
+            Some("sigstore"),
+            None,
+        )
+        .await
+        .expect("record attestation");
+        sqlx::query("UPDATE curation_packages SET status = 'pending' WHERE id = $1")
+            .bind(pkg.id)
+            .execute(&pool)
+            .await
+            .expect("reset to pending");
+
+        svc.re_evaluate_pending(staging_id, "review")
+            .await
+            .expect("re-evaluate (verified)");
+        let row = svc.get_package(pkg.id).await.expect("get pkg");
+        assert_eq!(
+            row.status, "approved",
+            "the persisted verification must survive re-evaluation (#3230), got reason: {:?}",
+            row.evaluation_reason
+        );
+        // The record is readable off the row now, which is also the admin read
+        // surface the issue asks for.
+        assert_eq!(row.attestation_state, "verified");
+        assert_eq!(row.attestation_owner.as_deref(), Some("sigstore"));
+        assert!(row.attestation_verified_at.is_some());
+
+        svc.delete_rule(rule.id).await.ok();
+        sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
+            .bind(staging_id)
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup(&pool, staging_id, user).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// #3233 positive control: a served download enqueues exactly ONE pending
+    /// row per curating staging repo, and a repeat download does not add a
+    /// second. Without this, an "assert no row" test is satisfied by the seam
+    /// never running at all.
+    #[tokio::test]
+    async fn test_ondemand_enqueue_writes_one_row_per_staging_repo_db() {
+        use crate::api::handlers::proxy_helpers::enqueue_curation_on_demand;
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _guard = tdh::curation_global_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, _uname) = tdh::create_user(&pool).await;
+        let (remote_id, _rk, _rp) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (staging_a, _ak, _ap) = tdh::create_repo(&pool, "staging", "pypi").await;
+        let (staging_b, _bk, _bp) = tdh::create_repo(&pool, "staging", "pypi").await;
+        for staging in [staging_a, staging_b] {
+            wire_curation(&pool, staging, remote_id, "review").await;
+        }
+
+        let entry = || {
+            ondemand_pypi_entry(
+                "seam-pkg",
+                "1.0.0",
+                serde_json::json!({"name": "seam-pkg", "version": "1.0.0"}),
+            )
+        };
+
+        // Two served downloads of the same distribution.
+        enqueue_curation_on_demand(&pool, remote_id, "remote", entry()).await;
+        enqueue_curation_on_demand(&pool, remote_id, "remote", entry()).await;
+
+        for staging in [staging_a, staging_b] {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM curation_packages WHERE staging_repo_id = $1 AND package_name = 'seam-pkg' AND status = 'pending'",
+            )
+            .bind(staging)
+            .fetch_one(&pool)
+            .await
+            .expect("count rows");
+            assert_eq!(n, 1, "exactly one pending row per curating staging repo");
+        }
+
+        // A proxy type that is not a pull-through never ingests, and neither
+        // does a proxy no staging repo curates.
+        enqueue_curation_on_demand(&pool, remote_id, "local", entry()).await;
+        let (other_remote, _ok, _op) = tdh::create_repo(&pool, "remote", "pypi").await;
+        enqueue_curation_on_demand(&pool, other_remote, "remote", entry()).await;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM curation_packages WHERE package_name = 'seam-pkg'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
+        assert_eq!(total, 2, "no extra rows from the non-ingesting calls");
+
+        sqlx::query("DELETE FROM curation_packages WHERE package_name = 'seam-pkg'")
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup(&pool, staging_a, user).await;
+        for id in [staging_b, remote_id, other_remote] {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
     }
 
     /// A registry document must not be able to assert its own attestation

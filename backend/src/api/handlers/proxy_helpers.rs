@@ -1147,9 +1147,14 @@ pub async fn proxy_fetch_or_redirect(
 
     // Slow path: cache miss / expired / presigned disabled. The fetch
     // populates the proxy cache so a subsequent presigned redirect on the
-    // *next* request can take the fast path above.
-    let (content, content_type) =
-        proxy_fetch(proxy_service, repo_id, repo_key, upstream_url, path).await?;
+    // *next* request can take the fast path above. The buffered body is
+    // served VERBATIM below, so the upstream `Content-Encoding` is carried
+    // along and re-declared (RFC 9110 §8.4, #3273) — nothing on this path
+    // decodes, and an adopter of this helper must not inherit the #3149
+    // mislabeling silently.
+    let (content, content_type, content_encoding) =
+        proxy_fetch_with_cache_key(proxy_service, repo_id, repo_key, upstream_url, path, path)
+            .await?;
 
     // If presigned is configured, prefer redirecting to the just-populated
     // cache entry over streaming the buffered content back to the client.
@@ -1171,13 +1176,14 @@ pub async fn proxy_fetch_or_redirect(
         }
     }
 
-    let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", ct)
-        .header("content-length", content.len().to_string())
-        .body(axum::body::Body::from(content))
-        .unwrap())
+    // Verbatim buffered serve: re-declare the upstream coding when present
+    // (#3273), with `Content-Length` describing the coded bytes actually sent.
+    Ok(forward_verbatim_metadata(
+        content,
+        content_type,
+        "application/octet-stream",
+        content_encoding,
+    ))
 }
 
 /// Try to short-circuit a proxy-cache hit into a presigned redirect, without
@@ -2702,23 +2708,24 @@ where
 /// Suitable for metadata endpoints where only one upstream response is
 /// needed (go .info/.mod metadata, hex package, rubygems gem info).
 ///
-/// `transform` receives `(body, content_encoding, member_key)`, where
-/// `content_encoding` is the upstream `Content-Encoding` of that body
-/// (#3260). The body is the member upstream's bytes AS TRANSFERRED — nothing
-/// on this path decodes (`http_client::base_client_builder` disables every
-/// codec and advertises `Accept-Encoding: identity`) — so a transform that
-/// forwards the bytes verbatim must re-declare the coding (RFC 9110 §8.4),
-/// e.g. via [`forward_verbatim_metadata`]. A transform that parses or
-/// rewrites the body must decode it first and drop the coding, because the
-/// bytes it emits are no longer the bytes the coding describes. Before #3260
-/// this helper dropped the coding unconditionally, which mislabeled every
-/// coded upstream response its (all verbatim-forwarding) callers served.
-///
-/// The member's `Content-TYPE` is still dropped (both passes bind it `_ct`),
-/// so the verbatim-forwarding callers each hardcode a literal and can
-/// disagree with the Remote arm of the same endpoint. Pre-existing and NOT
-/// addressed by #3260 — tracked in #3281, which widens this seam once more
-/// rather than twice.
+/// `transform` receives `(body, content_type, content_encoding, member_key)`,
+/// where `content_type` and `content_encoding` are the upstream
+/// `Content-Type` / `Content-Encoding` of that body (#3260 / #3281). The body
+/// is the member upstream's bytes AS TRANSFERRED — nothing on this path
+/// decodes (`http_client::base_client_builder` disables every codec and
+/// advertises `Accept-Encoding: identity`) — so a transform that forwards the
+/// bytes verbatim must re-declare the coding (RFC 9110 §8.4) and should serve
+/// the member's own `Content-Type` (§8.3), keeping its format literal only as
+/// the fallback for a member that declared none — e.g. via
+/// [`forward_verbatim_metadata`], which implements exactly that. A transform
+/// that parses or rewrites the body must decode it first and drop the coding,
+/// because the bytes it emits are no longer the bytes the coding describes.
+/// Before #3260 this helper dropped the coding unconditionally, which
+/// mislabeled every coded upstream response its (all verbatim-forwarding)
+/// callers served; before #3281 it dropped the `Content-Type` too, so a
+/// Virtual verbatim forward could disagree with the Remote arm of the same
+/// endpoint (a `mix` client got hex's signed protobuf labelled
+/// `application/json`).
 pub async fn resolve_virtual_metadata<F, Fut>(
     db: &PgPool,
     proxy_service: Option<&ProxyService>,
@@ -2727,7 +2734,7 @@ pub async fn resolve_virtual_metadata<F, Fut>(
     transform: F,
 ) -> Result<Response, Response>
 where
-    F: Fn(Bytes, Option<String>, String) -> Fut,
+    F: Fn(Bytes, Option<String>, Option<String>, String) -> Fut,
     Fut: std::future::Future<Output = Result<Response, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
@@ -2756,8 +2763,8 @@ where
             // (warm path never fans out) while a held entry is skipped rather
             // than served raw. A fresh hit is transformed into the response.
             match proxy.cached_metadata_if_servable(member, path).await {
-                Ok(Some((bytes, _ct, enc))) => {
-                    match transform(bytes, enc, member.key.clone()).await {
+                Ok(Some((bytes, ct, enc))) => {
+                    match transform(bytes, ct, enc, member.key.clone()).await {
                         Ok(response) => (
                             MemberCacheClass::DefiniteHit,
                             Some(MemberResolveOutcome::Hit(response)),
@@ -2801,7 +2808,8 @@ where
             };
             // The cache-keyed fetch is `proxy_fetch` with `fetch_path ==
             // cache_path`, widened to also report the upstream
-            // `Content-Encoding` (#3260) so the transform can re-declare it.
+            // `Content-Encoding` (#3260) and `Content-Type` (#3281) so the
+            // transform can re-declare them.
             match proxy_fetch_with_cache_key(
                 proxy,
                 member.id,
@@ -2812,7 +2820,7 @@ where
             )
             .await
             {
-                Ok((bytes, _ct, enc)) => match transform(bytes, enc, member.key.clone()).await {
+                Ok((bytes, ct, enc)) => match transform(bytes, ct, enc, member.key.clone()).await {
                     Ok(response) => MemberResolveOutcome::Hit(response),
                     Err(_) => {
                         tracing::warn!(
@@ -5901,6 +5909,84 @@ pub async fn evaluate_curation_lookup(
 /// logged and swallowed. `upsert_package`'s `ON CONFLICT DO UPDATE` makes
 /// repeated proxy hits idempotent. Only proxy repos (`remote`/`virtual`) have an
 /// upstream worth ingesting from.
+/// Whether a proxy download response is one that may enqueue an on-demand
+/// curation row (#3233).
+///
+/// The seam runs **after** the format handler's serve call returns, and this is
+/// the predicate that makes "after" mean something: only a response the
+/// repository access check inside that call actually let through, for an
+/// artifact that actually resolved, may write a catalog row. Enqueuing on
+/// anything else lets an unauthenticated caller write `curation_packages` rows
+/// for packages that do not exist, into a staging repo belonging to another
+/// tenant.
+///
+/// `3xx` counts because #1555 answers a fresh proxy-cache hit on a remote member
+/// with a `307` to a presigned URL (`presigned_downloads_enabled`); gating on
+/// success alone would switch ingestion off for every operator running
+/// object-storage downloads. Both shapes mean the same two things: the access
+/// check passed and the artifact resolved.
+pub fn response_admits_ondemand_ingest(status: StatusCode) -> bool {
+    status.is_success() || status.is_redirection()
+}
+
+/// Upper bound on the pending on-demand rows one staging repository may
+/// accumulate from proxy traffic (#3233).
+///
+/// Proxy-driven ingestion has no natural upper bound: every served download of a
+/// curated remote can mint a row. That costs more than table size —
+/// `evaluate_ondemand_curation` processes `MAX_PENDING_PER_TICK = 500` rows per
+/// tick with serial per-row network I/O and `ORDER BY first_seen_at ASC`, so a
+/// large backlog both delays the packages an operator actually cares about
+/// (head-of-line) and stalls the rest of the sync cycle behind it. At the cap,
+/// new rows are dropped and existing ones keep being refreshed; draining the
+/// review queue re-opens ingestion on its own.
+pub const MAX_PENDING_ONDEMAND_ROWS: i64 = 5_000;
+
+/// Whether one on-demand row may be written, given the staging repo's current
+/// pending backlog (#3233).
+///
+/// A row that already exists is always admitted: the write is an upsert that
+/// refreshes metadata rather than growing the catalog, and refusing it would
+/// freeze a row's metadata at whatever the first request saw. Only genuinely new
+/// rows are capped.
+pub fn on_demand_row_admitted(row_exists: bool, pending_rows: i64, cap: i64) -> bool {
+    row_exists || pending_rows < cap
+}
+
+/// Count this staging repo's pending rows (bounded by `cap + 1`, so the scan
+/// cost does not grow with the backlog) and report whether the row being
+/// ingested already exists — the two inputs [`on_demand_row_admitted`] needs.
+async fn ondemand_admission_inputs(
+    db: &PgPool,
+    staging_repo_id: Uuid,
+    entry: &crate::services::curation_sync::CurationPackageEntry,
+    cap: i64,
+) -> Result<(bool, i64), sqlx::Error> {
+    sqlx::query_as(
+        r#"SELECT
+             EXISTS(
+               SELECT 1 FROM curation_packages
+               WHERE staging_repo_id = $1 AND format = $2 AND package_name = $3
+                 AND version = $4 AND COALESCE(release, '') = COALESCE($5::text, '')
+                 AND COALESCE(architecture, '') = COALESCE($6::text, '')
+             ),
+             (SELECT count(*) FROM (
+                SELECT 1 FROM curation_packages
+                WHERE staging_repo_id = $1 AND status = 'pending'
+                LIMIT $7::bigint
+             ) capped)"#,
+    )
+    .bind(staging_repo_id)
+    .bind(&entry.format)
+    .bind(&entry.package_name)
+    .bind(&entry.version)
+    .bind(entry.release.as_deref())
+    .bind(entry.architecture.as_deref())
+    .bind(cap.saturating_add(1))
+    .fetch_one(db)
+    .await
+}
+
 pub async fn enqueue_curation_on_demand(
     db: &PgPool,
     proxy_repo_id: Uuid,
@@ -5937,6 +6023,32 @@ pub async fn enqueue_curation_on_demand(
     }
     let svc = crate::services::curation_service::CurationService::new(db.clone());
     for staging_id in staging {
+        // #3233 cap: never let proxy traffic grow one staging repo's pending
+        // backlog without bound. A failed admission query skips the write rather
+        // than assuming room — the seam is best-effort in both directions, and a
+        // missed row is re-ingested by the next download or the next sync.
+        match ondemand_admission_inputs(db, staging_id, &entry, MAX_PENDING_ONDEMAND_ROWS).await {
+            Ok((row_exists, pending_rows)) => {
+                if !on_demand_row_admitted(row_exists, pending_rows, MAX_PENDING_ONDEMAND_ROWS) {
+                    tracing::warn!(
+                        staging_repo_id = %staging_id,
+                        package = %entry.package_name,
+                        cap = MAX_PENDING_ONDEMAND_ROWS,
+                        "on-demand curation ingest: staging repo is at its pending-row cap; dropping the row"
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    staging_repo_id = %staging_id,
+                    package = %entry.package_name,
+                    error = %e,
+                    "on-demand curation ingest: pending-row cap check failed; skipping"
+                );
+                continue;
+            }
+        }
         if let Err(e) = svc
             .upsert_package(
                 staging_id,
@@ -14556,5 +14668,152 @@ mod tests {
             .execute(&pool)
             .await;
         db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3273: the `proxy_fetch_or_redirect` slow path (cache miss with
+    /// presigned downloads disabled) serves the buffered upstream body
+    /// VERBATIM, so an upstream `Content-Encoding` must be re-declared
+    /// (RFC 9110 §8.4) with `Content-Length` describing the coded bytes
+    /// (§8.6). Latent today — no in-tree handler calls this helper — but any
+    /// future adopter inherits the response shape asserted here instead of
+    /// silently reintroducing the #3149 mislabeling.
+    // Test reads full (small) fixture response bodies; the streaming policy
+    // (#1608) targets production code paths.
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test]
+    async fn test_proxy_fetch_or_redirect_slow_path_redeclares_content_encoding_3273_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let up = tdh::coded_and_plain_upstreams(
+            "deflate",
+            "application/octet-stream",
+            b"redirect-slow-path-3273 ",
+        )
+        .await;
+        // Presigned downloads stay at their default (disabled), which is what
+        // routes the request onto the buffered slow path under test.
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.coded_mock.uri()).await;
+        let proxy = state.proxy_service.clone().expect("proxy service wired");
+        assert!(
+            !state.config.presigned_downloads_enabled,
+            "fixture must exercise the buffered slow path"
+        );
+
+        // Unique coordinate: the helper reads through the process-global
+        // metadata LRU (#2758).
+        let path = format!("blobs/coded-{}.bin", Uuid::new_v4());
+        let resp = super::proxy_fetch_or_redirect(
+            &proxy,
+            &state,
+            fx.repo_id,
+            &fx.repo_key,
+            &up.coded_mock.uri(),
+            &path,
+            &Default::default(),
+        )
+        .await
+        .expect("slow path must serve the buffered upstream body");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (parts, body) = resp.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("read buffered body");
+        up.assert_coded_forward(&parts.headers, &body, "proxy_fetch_or_redirect slow path");
+
+        // Control: an uncoded upstream must not grow a spurious coding.
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.plain_mock.uri()).await;
+        let proxy = state.proxy_service.clone().expect("proxy service wired");
+        let path = format!("blobs/plain-{}.bin", Uuid::new_v4());
+        let resp = super::proxy_fetch_or_redirect(
+            &proxy,
+            &state,
+            fx.repo_id,
+            &fx.repo_key,
+            &up.plain_mock.uri(),
+            &path,
+            &Default::default(),
+        )
+        .await
+        .expect("slow path must serve the buffered upstream body");
+        let (parts, body) = resp.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("read buffered body");
+        up.assert_plain_forward(&parts.headers, &body, "control slow path");
+
+        fx.teardown().await;
+    }
+
+    // ── #3233: the on-demand curation ingestion seam ─────────────────────────
+    //
+    // The PyPI seam was moved from before the upstream fetch to after the serve
+    // call returns, because in its original position it ran ahead of the
+    // repository access check and ahead of any upstream contact: an
+    // unauthenticated caller could write `curation_packages` rows for packages
+    // that do not exist, into a staging repo belonging to another tenant,
+    // uncapped. The relocation shipped without a test; these cover the two
+    // properties it turns on.
+
+    #[test]
+    fn only_a_served_response_admits_ondemand_ingest() {
+        // Positive control first: without it, "no ingest on 404" is satisfied by
+        // a predicate that is false for everything.
+        for served in [
+            StatusCode::OK,
+            StatusCode::PARTIAL_CONTENT,
+            StatusCode::MOVED_PERMANENTLY,
+            // #1555 presigned-download redirect — the shape that would silently
+            // switch ingestion off for object-storage deployments if this seam
+            // gated on 2xx alone.
+            StatusCode::TEMPORARY_REDIRECT,
+        ] {
+            assert!(
+                response_admits_ondemand_ingest(served),
+                "{served} is a served response and must admit ingestion"
+            );
+        }
+
+        for refused in [
+            // The access check inside the serve call refused the caller.
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            // The distribution does not exist upstream: the name and version on
+            // the request path were never corroborated by anything.
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+            // Curation / age gate blocks, and upstream failures.
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(
+                !response_admits_ondemand_ingest(refused),
+                "{refused} must never write a curation row"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_row_cap_bounds_new_rows_only() {
+        let cap = MAX_PENDING_ONDEMAND_ROWS;
+
+        // Under the cap, a new row is admitted (the positive control).
+        assert!(on_demand_row_admitted(false, 0, cap));
+        assert!(on_demand_row_admitted(false, cap - 1, cap));
+
+        // At and past the cap, new rows are dropped.
+        assert!(!on_demand_row_admitted(false, cap, cap));
+        assert!(!on_demand_row_admitted(false, cap + 1, cap));
+
+        // A row that already exists is always admitted: the write is an upsert
+        // that refreshes metadata rather than growing the catalog, so capping it
+        // would freeze the row at whatever the first request saw without
+        // bounding anything.
+        assert!(on_demand_row_admitted(true, cap, cap));
+        assert!(on_demand_row_admitted(true, cap * 10, cap));
     }
 }

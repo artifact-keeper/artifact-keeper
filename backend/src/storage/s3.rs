@@ -1654,12 +1654,43 @@ impl super::StorageBackend for S3Backend {
         let path: ObjectPath = full_key.into();
         let key_owned = key.to_string();
 
-        let result = self.bulk_store.get(&path).await.map_err(|e| match e {
-            object_store::Error::NotFound { .. } => {
-                AppError::NotFound(format!("Storage key not found: {}", key_owned))
+        let result = match self.bulk_store.get(&path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => {
+                // #2927: mirror `get()` / `get_range()` (and the GCS/Azure
+                // `get_stream()` impls) and consult the Artifactory-migration
+                // fallback before reporting NotFound. Without this, an object
+                // that lives only at the legacy key layout is found by the
+                // buffered `get()` and missed by the streaming `get_stream()`,
+                // so every buffered->streaming handler conversion silently
+                // changed migration-mode lookup semantics on S3 only.
+                //
+                // The fallback body is buffered (`try_fallback_get` returns
+                // `Bytes`), exactly as GCS and Azure do; wrapping it in a
+                // single-item stream keeps the caller's interface uniform. A
+                // fully streaming fallback is a larger change and should not
+                // block parity.
+                //
+                // `try_fallback_get` is gated on `path_format.has_fallback()`,
+                // so this is a no-op outside Artifactory-migration mode.
+                if let Some(bytes) = self
+                    .try_fallback_get(key, "primary not found (stream)")
+                    .await?
+                {
+                    return Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })));
+                }
+                return Err(AppError::NotFound(format!(
+                    "Storage key not found: {}",
+                    key_owned
+                )));
             }
-            _ => AppError::Storage(format!("Failed to get object '{}': {}", key_owned, e)),
-        })?;
+            Err(e) => {
+                return Err(AppError::Storage(format!(
+                    "Failed to get object '{}': {}",
+                    key_owned, e
+                )));
+            }
+        };
 
         let stream = result
             .into_stream()
@@ -2262,6 +2293,83 @@ impl S3Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #2927: Artifactory-migration fallback parity across backends ---
+
+    /// Text of the method that starts at the first occurrence of `signature`,
+    /// ending where the next method (or the enclosing `impl`) begins.
+    ///
+    /// Deliberately delimiter-based rather than brace-matched: braces appear
+    /// inside `format!` templates and comments, so counting them is fragile in
+    /// a way that could silently widen the slice and make the assertion below
+    /// pass for the wrong reason. Returns `None` when the signature is absent.
+    fn method_text<'a>(src: &'a str, signature: &str) -> Option<&'a str> {
+        let start = src.find(signature)?;
+        let rest = &src[start + signature.len()..];
+        // Every method in these `impl` blocks is indented four spaces, and the
+        // block itself closes at column 0.
+        let end = ["\n    async fn ", "\n    fn ", "\n    pub ", "\n}"]
+            .iter()
+            .filter_map(|d| rest.find(d))
+            .min()
+            .unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    #[test]
+    fn method_text_stops_at_the_next_method() {
+        let src = "impl X {\n    async fn a(&self) {\n        body_a();\n    }\n\n    fn b(&self) {\n        body_b();\n    }\n}\n";
+        let a = method_text(src, "async fn a(&self)").expect("a is present");
+        assert!(a.contains("body_a()"));
+        assert!(!a.contains("body_b()"), "must not run into the next method");
+    }
+
+    #[test]
+    fn method_text_missing_signature_is_none() {
+        assert!(method_text("impl X {\n    fn a(&self) {}\n}", "fn zzz()").is_none());
+    }
+
+    /// #2927 regression guard. S3, GCS and Azure all implement the
+    /// Artifactory-migration path fallback — a no-op when
+    /// `path_format.has_fallback()` is false — and all three must run it from
+    /// `get_stream`, not only from the buffered `get`. S3 used to be the
+    /// outlier, so an object present only at the legacy key layout was found by
+    /// `storage.get()` and reported `NotFound` by `storage.get_stream()`; every
+    /// buffered->streaming handler conversion (#1608) silently inherited that
+    /// gap. The filesystem backend has no `path_format` and no fallback of any
+    /// kind, so it is not part of this comparison.
+    ///
+    /// Either spelling counts: S3 and GCS route through the buffered
+    /// `try_fallback_get` helper, while Azure re-issues a streaming GET against
+    /// `try_artifactory_fallback` directly. The invariant is that the legacy
+    /// key is consulted at all.
+    ///
+    /// A live assertion would need a real bucket in migration mode, so this
+    /// pins the invariant structurally instead — the same source-scanning
+    /// pattern used elsewhere in the tree for cross-file invariants that no
+    /// unit test can reach.
+    #[test]
+    fn every_fallback_capable_backend_runs_the_migration_fallback_in_get_stream() {
+        const GET_STREAM_SIG: &str = "async fn get_stream(&self, key: &str)";
+        for (backend, src) in [
+            ("s3", include_str!("s3.rs")),
+            ("gcs", include_str!("gcs.rs")),
+            ("azure", include_str!("azure.rs")),
+        ] {
+            assert!(
+                src.contains("try_artifactory_fallback"),
+                "{backend} is expected to implement the Artifactory-migration fallback"
+            );
+            let body = method_text(src, GET_STREAM_SIG)
+                .unwrap_or_else(|| panic!("{backend} must define `{GET_STREAM_SIG}`"));
+            assert!(
+                body.contains("try_fallback_get") || body.contains("try_artifactory_fallback"),
+                "{backend}::get_stream must consult the Artifactory-migration fallback before \
+                 reporting NotFound (#2927); otherwise a legacy-layout object resolves through \
+                 the buffered `get` but 404s through the streaming read"
+            );
+        }
+    }
 
     // --- free function tests: make_full_key ---
 
