@@ -1332,7 +1332,8 @@ impl GrypeScanner {
         // second `-o` MUST carry `=<path>`: two stdout presenters conflict and
         // grype refuses the run.
         //
-        // CAUTION, verified against grype 0.113.0: if the BOM path is not
+        // CAUTION, verified against grype 0.113.0 and the 0.117.0 that ships
+        // in the backend image: if the BOM path is not
         // writable grype exits 1 with EMPTY stdout — the whole scan fails,
         // findings included. The directory must therefore be known to exist
         // before the BOM is requested at all, which is why this is an `Option`
@@ -4235,9 +4236,9 @@ mod tests {
         );
     }
 
-    /// Verified against grype 0.113.0: pointing `cyclonedx-json=` at an
-    /// unwritable path makes grype exit 1 with EMPTY stdout — the findings are
-    /// lost with the BOM. The BOM is therefore only ever requested at a path
+    /// Verified against grype 0.113.0 and the 0.117.0 that ships in the
+    /// backend image: pointing `cyclonedx-json=` at an unwritable path makes
+    /// grype exit 1 with EMPTY stdout — the findings are lost with the BOM. The BOM is therefore only ever requested at a path
     /// whose directory we just created, and the request is skippable.
     #[test]
     fn test_grype_bom_path_is_optional_so_an_unwritable_dir_cannot_fail_the_scan() {
