@@ -107,6 +107,147 @@ pub(crate) fn sbom_read_details(
     })
 }
 
+/// Returned when a cached path resolves but no package inventory was ever
+/// recorded for its digest.
+///
+/// This is the common case on any deployment that predates the inventory
+/// write path: only content pulled AFTER it shipped has an inventory. It must
+/// stay distinguishable from "an SBOM with zero components", which would read
+/// as "this artifact has no dependencies" -- a claim the data cannot support,
+/// and the same class of false-clean bug as the green all-clear shield.
+pub(crate) const PROXY_SBOM_NOT_RECORDED_MSG: &str =
+    "No SBOM recorded for this proxy-cached artifact. An inventory is captured \
+     when the artifact is scanned at download time, so this artifact will have \
+     one the next time it is pulled through a repository with scan-on-proxy \
+     enabled.";
+
+/// Returned when the cache path itself does not resolve for this repository.
+pub(crate) const PROXY_SBOM_PATH_NOT_FOUND_MSG: &str =
+    "No proxy-cached artifact at that path in this repository.";
+
+/// Query for [`get_proxy_sbom`].
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ProxySbomQuery {
+    /// Cache path within the calling repository.
+    ///
+    /// Path-keyed, never digest-keyed: verdicts and inventories are stored by
+    /// content digest and are therefore global, so accepting a digest would
+    /// turn this into a cross-tenant lookup oracle. A path is inherently
+    /// scoped to the repository that cached it.
+    pub path: String,
+    /// `cyclonedx` (default) or `spdx`.
+    pub format: Option<String>,
+}
+
+/// Generate an SBOM for a proxy-cached artifact, on demand.
+///
+/// Proxy-cached content has no `artifacts` row (#1278/#1280), so it cannot be
+/// served by the artifact-keyed SBOM handlers and nothing is persisted in
+/// `sbom_documents`. The document is regenerated per request from the package
+/// inventory the inline proxy scan recorded, which is why this endpoint has no
+/// SBOM id, no listing, and no delete.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repositories/{key}/security/proxy-sbom",
+    params(ProxySbomQuery, ("key" = String, Path, description = "Repository key")),
+    responses(
+        (status = 200, description = "SBOM document for the cached artifact"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Path unknown, or no inventory recorded"),
+    ),
+    tag = "sbom"
+)]
+async fn get_proxy_sbom(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<ProxySbomQuery>,
+) -> Result<Json<serde_json::Value>> {
+    // Authentication FIRST, unconditionally. `require_visible` returns Ok early
+    // for a public repository, so checking visibility first would make this
+    // anonymously readable on exactly the repositories with the widest
+    // audience.
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    let repo_service = crate::services::repository_service::RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    crate::api::handlers::repositories::require_visible(&repo, &Some(auth), &repo_service).await?;
+
+    let format = parse_proxy_sbom_format(query.format.as_deref())?;
+
+    // Resolve the path to a digest, scoped to THIS repository. Rows whose
+    // checksum is still NULL are placeholders written before the content
+    // committed; they resolve to no inventory, not to an empty one.
+    let digest: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT checksum_sha256
+        FROM proxy_cache_artifacts
+        WHERE repository_id = $1 AND path = $2 AND checksum_sha256 IS NOT NULL
+        "#,
+    )
+    .bind(repo.id)
+    .bind(&query.path)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let digest = digest.ok_or_else(|| AppError::NotFound(PROXY_SBOM_PATH_NOT_FOUND_MSG.to_string()))?;
+
+    let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    let packages = pss
+        .fetch_packages(
+            &digest,
+            crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+        )
+        .await?;
+
+    // An empty inventory is NOT an empty SBOM. Returning a zero-component
+    // document here would assert that the artifact has no components, which is
+    // exactly the false-clean failure this feature exists to remove.
+    if packages.is_empty() {
+        return Err(AppError::NotFound(PROXY_SBOM_NOT_RECORDED_MSG.to_string()));
+    }
+
+    let dependencies: Vec<DependencyInfo> = packages
+        .into_iter()
+        .map(|p| DependencyInfo {
+            name: p.name,
+            version: p.version,
+            purl: p.purl,
+            license: p.license,
+            sha256: None,
+        })
+        .collect();
+
+    let document = SbomService::new(state.db.clone())
+        .generate_ephemeral(format, &dependencies, None)?;
+
+    Ok(Json(document))
+}
+
+/// Parse the requested SBOM format, rejecting anything unrecognized.
+///
+/// Deliberately not a silent fallback: a typo'd `format=cyclonedex` that
+/// quietly returned SPDX would be indistinguishable from the caller's intent.
+fn parse_proxy_sbom_format(raw: Option<&str>) -> Result<SbomFormat> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(SbomFormat::CycloneDX),
+        Some(s) if s.eq_ignore_ascii_case("cyclonedx") => Ok(SbomFormat::CycloneDX),
+        Some(s) if s.eq_ignore_ascii_case("spdx") => Ok(SbomFormat::SPDX),
+        Some(other) => Err(AppError::Validation(format!(
+            "Unsupported SBOM format '{other}'. Supported formats: cyclonedx, spdx."
+        ))),
+    }
+}
+
+/// Repository-scoped proxy SBOM route, merged into the `/repositories` nest.
+///
+/// Registered here rather than in `security.rs` so the proxy SBOM read path
+/// lives beside the other SBOM handlers it shares generation logic with.
+pub fn proxy_repo_router() -> Router<SharedState> {
+    Router::new().route("/:key/security/proxy-sbom", get(get_proxy_sbom))
+}
+
 /// Create SBOM routes.
 pub fn router() -> Router<SharedState> {
     Router::new()
