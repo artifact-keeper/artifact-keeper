@@ -4939,6 +4939,42 @@ impl ProxyService {
         self.load_cache_metadata(metadata_key).await.ok().flatten()
     }
 
+    /// Open the committed proxy-cache body for `(repo_key, cache_path)` as a
+    /// raw storage stream, with the sidecar's recorded size (#2921).
+    ///
+    /// Used by the NuGet flat-container repair to re-materialize an artifact
+    /// row's own storage object from an already-warm proxy-cache entry without
+    /// a second upstream pull. The cache commit writes the body before the
+    /// `__cache_meta__.json` sidecar, so a present sidecar implies a complete
+    /// body. Returns `Ok(None)` — caller falls back to its normal repair path,
+    /// which surfaces these states with the proper client-facing semantics —
+    /// when the entry is absent or uncommitted, is a negative (404) cache,
+    /// carries an active Package Age Policy hold, or holds a content-coded
+    /// body (raw storage objects are stored uncoded; copying coded bytes would
+    /// corrupt what `storage_key` is defined to hold).
+    pub async fn open_committed_cache_body(
+        &self,
+        repo_key: &str,
+        cache_path: &str,
+    ) -> Result<Option<(BoxStream<'static, Result<Bytes>>, i64)>> {
+        let keys = CacheKeys::derive(repo_key, cache_path)?;
+        let Some(meta) = self.load_cache_metadata(&keys.metadata).await? else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        if meta.negative_cached_until.is_some_and(|t| t > now)
+            || meta.quarantine_until.is_some_and(|t| t > now)
+            || meta.content_encoding.is_some()
+        {
+            return Ok(None);
+        }
+        match self.storage.get_stream(&keys.content).await {
+            Ok(stream) => Ok(Some((stream, meta.size_bytes))),
+            Err(AppError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// List the PyPI project names that already have a cached `simple/<name>/`
     /// index in this repository's proxy cache.
     ///

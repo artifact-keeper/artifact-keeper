@@ -649,8 +649,77 @@ async fn flatcontainer_fetch_target(
     )?;
     Ok((
         format!("{}/{}", pkg_base, sub_path),
-        format!("v3/flatcontainer/{}", sub_path),
+        flatcontainer_cache_path(sub_path),
     ))
+}
+
+/// Proxy-cache path for a flat-container object — the key both the primary
+/// Remote arm and the repair arms cache under. Factored out so the #2921
+/// cache-to-storage copy cannot drift from the key the fetches write.
+fn flatcontainer_cache_path(sub_path: &str) -> String {
+    format!("v3/flatcontainer/{}", sub_path)
+}
+
+/// Best-effort re-materialization of a Remote row's missing storage object
+/// from the already-committed proxy-cache body (#2921).
+///
+/// The #2919 streaming repair warms the SHARED proxy cache under
+/// `v3/flatcontainer/...` — a different key namespace from the row's own
+/// `artifacts.storage_key` — and since #1278 proxy-cached content is
+/// deliberately not recorded in `artifacts`, nothing else ever healed the
+/// row. Every subsystem that reads `storage_key` directly (vulnerability
+/// scanning, quality gates, peer replication, promotion, signing,
+/// backup/export, the NuGet V2 OData download) therefore kept seeing a
+/// missing blob permanently. Copying the warm cache body back to the row's
+/// key closes that gap with no upstream traffic.
+///
+/// Returns the copied byte count, or `None` on a cold/ineligible cache entry
+/// or any storage failure — the caller then falls back to the streaming
+/// repair unchanged (which warms the cache so the next request completes the
+/// heal).
+async fn rematerialize_row_blob_from_proxy_cache(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_key: &str,
+    cache_path: &str,
+    storage: &dyn crate::storage::StorageBackend,
+    artifact_id: uuid::Uuid,
+    dest_key: &str,
+) -> Option<i64> {
+    let (stream, _sidecar_size) = match proxy.open_committed_cache_body(repo_key, cache_path).await
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!(
+                artifact_id = %artifact_id,
+                cache_path = %cache_path,
+                error = %e,
+                "proxy-cache read failed during row blob re-materialization"
+            );
+            return None;
+        }
+    };
+    match storage.put_stream(dest_key, stream).await {
+        Ok(res) => {
+            tracing::info!(
+                artifact_id = %artifact_id,
+                storage_key = %dest_key,
+                bytes = res.bytes_written,
+                "re-materialized missing artifact blob from the warm proxy cache"
+            );
+            Some(res.bytes_written as i64)
+        }
+        Err(e) => {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                storage_key = %dest_key,
+                error = %e,
+                "failed to re-materialize artifact blob from the proxy cache; \
+                 falling back to the streaming repair"
+            );
+            None
+        }
+    }
 }
 
 /// Byte ceiling on a *verified* (buffered) `.nupkg` repair (#2929).
@@ -1600,32 +1669,71 @@ async fn flatcontainer_download(
                         Box::pin(futures::stream::once(async move { Ok(content) }))
                     }
                     None => {
-                        tracing::warn!(
-                            artifact_id = %artifact.id,
-                            storage_key = %artifact.storage_key,
-                            "nuget proxy cache entry is missing on disk; re-fetching from the \
-                             discovered PackageBaseAddress (streaming, no enforceable digest \
-                             recorded)"
-                        );
-                        let response = proxy_v3_flatcontainer(
+                        // #2921: the streaming repair below warms only the
+                        // SHARED proxy cache; the row's own `storage_key`
+                        // stayed dangling forever, so everything that reads
+                        // it directly (scanning, quality gates, replication,
+                        // promotion, signing, backup/export, the V2 OData
+                        // download) kept seeing a missing blob. When a
+                        // previous repair has already committed the body to
+                        // the proxy cache, copy it back to the row's key and
+                        // serve from storage exactly like the primary path —
+                        // no upstream traffic. A cold cache (or any copy
+                        // failure) falls back to the streaming repair, which
+                        // warms the cache so the NEXT request completes the
+                        // heal.
+                        let cache_path = flatcontainer_cache_path(&sub_path);
+                        let healed = match rematerialize_row_blob_from_proxy_cache(
                             proxy,
-                            repo.id,
                             &repo_key,
-                            upstream_url,
-                            &sub_path,
-                            true,
-                        )
-                        .await?;
-                        // Recorded after the upstream body is open so a failed
-                        // repair is not counted as a download; the shared
-                        // `record_download` below is skipped by this early return.
-                        crate::services::artifact_service::record_download(
-                            &state.db,
+                            &cache_path,
+                            storage.as_ref(),
                             artifact.id,
-                            &ctx,
+                            &artifact.storage_key,
                         )
-                        .await;
-                        return Ok(response);
+                        .await
+                        {
+                            Some(copied) => storage
+                                .get_stream(&artifact.storage_key)
+                                .await
+                                .ok()
+                                .map(|s| (s, copied)),
+                            None => None,
+                        };
+                        if let Some((stream, copied)) = healed {
+                            content_length = copied;
+                            // Falls through to the shared `record_download`
+                            // and storage-streaming response below.
+                            stream
+                        } else {
+                            tracing::warn!(
+                                artifact_id = %artifact.id,
+                                storage_key = %artifact.storage_key,
+                                "nuget proxy cache entry is missing on disk; re-fetching from \
+                                 the discovered PackageBaseAddress (streaming, no enforceable \
+                                 digest recorded)"
+                            );
+                            let response = proxy_v3_flatcontainer(
+                                proxy,
+                                repo.id,
+                                &repo_key,
+                                upstream_url,
+                                &sub_path,
+                                true,
+                            )
+                            .await?;
+                            // Recorded after the upstream body is open so a
+                            // failed repair is not counted as a download; the
+                            // shared `record_download` below is skipped by
+                            // this early return.
+                            crate::services::artifact_service::record_download(
+                                &state.db,
+                                artifact.id,
+                                &ctx,
+                            )
+                            .await;
+                            return Ok(response);
+                        }
                     }
                 }
             }
@@ -1878,7 +1986,7 @@ async fn v2_odata(
             };
             let cache_path = format!(
                 "v2/{}",
-                sanitize_cache_segment(&format!("{}_{}", odata, query.as_deref().unwrap_or("")))
+                bounded_cache_segment(&format!("{}_{}", odata, query.as_deref().unwrap_or("")))
             );
             let (content, content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
                 proxy,
@@ -1936,6 +2044,46 @@ fn sanitize_cache_segment(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Byte ceiling for a single proxy-cache path segment (#3291).
+///
+/// Filesystem storage backends cap each path *component* at 255 bytes (Linux
+/// `NAME_MAX`; ext4/xfs/NTFS likewise). `ProxyService::check_cache_key_length`
+/// bounds the whole key at the 1024-byte object-store limit but says nothing
+/// about individual components, so a large Chocolatey/NuGet V2 OData query
+/// sanitized into one segment made every sidecar write fail with `File name
+/// too long (os error 36)` — the entry was then treated as a permanent cache
+/// miss and every search/list re-queried upstream. 200 leaves headroom below
+/// 255 for per-backend path decoration.
+const MAX_CACHE_SEGMENT_BYTES: usize = 200;
+
+/// Number of hex chars of the disambiguating SHA-256 kept in a bounded
+/// segment (128 bits — comfortably collision-free for cache keying).
+const CACHE_SEGMENT_HASH_CHARS: usize = 32;
+
+/// Sanitize `raw` into a single proxy-cache path segment with a bounded
+/// length.
+///
+/// Segments at or under [`MAX_CACHE_SEGMENT_BYTES`] keep the exact historical
+/// [`sanitize_cache_segment`] output, so existing cache entries stay hits. A
+/// longer segment is truncated and suffixed with a SHA-256 prefix of the
+/// *raw* input, so distinct queries that share a long prefix — or that
+/// sanitize to identical bytes — still map to distinct, stable cache entries.
+fn bounded_cache_segment(raw: &str) -> String {
+    let sanitized = sanitize_cache_segment(raw);
+    if sanitized.len() <= MAX_CACHE_SEGMENT_BYTES {
+        return sanitized;
+    }
+    let digest = hex::encode(Sha256::digest(raw.as_bytes()));
+    // `sanitize_cache_segment` output is pure ASCII, so byte slicing cannot
+    // split a code point.
+    let keep = MAX_CACHE_SEGMENT_BYTES - 1 - CACHE_SEGMENT_HASH_CHARS;
+    format!(
+        "{}-{}",
+        &sanitized[..keep],
+        &digest[..CACHE_SEGMENT_HASH_CHARS]
+    )
 }
 
 /// Load hosted V2 feed entries for a repo, optionally filtered by package
@@ -4125,6 +4273,45 @@ mod read_db_tests {
         assert_eq!(ver.as_deref(), Some("2.0.0"));
     }
 
+    /// #3291: short OData cache segments must keep their exact historical
+    /// shape so existing proxy-cache entries stay hits.
+    #[test]
+    fn test_bounded_cache_segment_short_input_unchanged() {
+        let raw = "FindPackagesById()_id='Newtonsoft.Json'";
+        assert_eq!(bounded_cache_segment(raw), sanitize_cache_segment(raw));
+    }
+
+    /// #3291: a large Chocolatey OData `$filter` query used to sanitize into
+    /// a single >255-byte path component, which the filesystem backend
+    /// rejects with `File name too long (os error 36)`; the sidecar write
+    /// then failed on every request and the entry never cached. The bounded
+    /// segment must fit within a 255-byte filesystem component.
+    #[test]
+    fn test_bounded_cache_segment_long_query_fits_filesystem_component() {
+        let query = format!(
+            "Packages()_$filter=((Id ne null) and substringof('7zip',tolower(Id))) or {}",
+            "x".repeat(600)
+        );
+        let seg = bounded_cache_segment(&query);
+        assert_eq!(seg.len(), MAX_CACHE_SEGMENT_BYTES);
+        assert!(seg.len() < 255, "must fit a filesystem path component");
+        // Still a valid single sanitized segment.
+        assert!(seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
+    }
+
+    /// #3291: two long queries sharing a truncation-length prefix must not
+    /// collide, and the bounding must be deterministic per input.
+    #[test]
+    fn test_bounded_cache_segment_disambiguates_shared_prefixes() {
+        let prefix = "Packages()_".to_string() + &"a".repeat(400);
+        let q1 = format!("{prefix}_skip=0");
+        let q2 = format!("{prefix}_skip=30");
+        assert_ne!(bounded_cache_segment(&q1), bounded_cache_segment(&q2));
+        assert_eq!(bounded_cache_segment(&q1), bounded_cache_segment(&q1));
+    }
+
     #[test]
     fn test_rewrite_v2_odata_rebinds_feed_base_to_proxy() {
         let body = r#"<feed xml:base="https://community.chocolatey.org/api/v2/"><entry><id>https://community.chocolatey.org/api/v2/Packages(Id='git',Version='2.0')</id><content type="application/zip" src="https://community.chocolatey.org/api/v2/package/git/2.0"/></entry></feed>"#;
@@ -4920,6 +5107,130 @@ mod read_db_tests {
             &body[..],
             nupkg.as_ref(),
             "repaired .nupkg must match upstream byte for byte"
+        );
+    }
+
+    /// #2921: the streaming (no-enforceable-digest) repair warms only the
+    /// SHARED proxy cache; the row's own `storage_key` stayed dangling
+    /// forever, so every subsystem that reads it directly (scanning, quality
+    /// gates, replication, promotion, signing, backup/export, the V2 OData
+    /// download) kept seeing a missing blob. Once the proxy cache holds a
+    /// committed copy, the next download must copy it back to the row's
+    /// storage key — with NO extra upstream traffic — and serve from storage.
+    #[tokio::test]
+    async fn test_flatcontainer_repair_rematerializes_row_blob_from_warm_proxy_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        mount_v3_index(&upstream).await;
+
+        let package_id = "newtonsoft.json";
+        let version = "13.0.1";
+        let filename = format!("{}.{}.nupkg", package_id, version);
+        let nupkg = b"PK\x03\x04-rematerialized-nupkg-bytes";
+        let discovered_path = format!("/flat/{}/{}/{}", package_id, version, filename);
+
+        // `.expect(1)`: the second request must be served without any further
+        // upstream traffic — from the warm proxy cache via the healed row.
+        Mock::given(method("GET"))
+            .and(path(discovered_path.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(nupkg.as_ref()),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+
+        seed_row_without_blob(&fx, package_id, version, &filename, nupkg.len() as i64).await;
+        let storage_key = format!("nuget/{}/{}/{}", package_id, version, filename);
+
+        let download = || async {
+            let resp = super::flatcontainer_download(
+                axum::extract::State(state.clone()),
+                axum::Extension(tdh::admin_auth_ext()),
+                axum::extract::Path((
+                    fx.repo_key.clone(),
+                    package_id.to_string(),
+                    version.to_string(),
+                    filename.clone(),
+                )),
+                Default::default(),
+            )
+            .await;
+            match resp {
+                Ok(r) => {
+                    let status = r.status();
+                    let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                    Ok((status, body))
+                }
+                Err(r) => Err(r.status()),
+            }
+        };
+
+        // First request: cold cache -> streaming repair pulls from upstream
+        // and tees into the proxy cache.
+        let first = download().await;
+
+        // The cache commit completes as the teed body is drained; wait for
+        // the sidecar so the second request deterministically sees a warm,
+        // committed entry.
+        let sidecar = fx.storage_dir.join(format!(
+            "proxy-cache/{}/v3/flatcontainer/{}/{}/{}/__cache_meta__.json",
+            fx.repo_key, package_id, version, filename
+        ));
+        for _ in 0..100 {
+            if sidecar.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let sidecar_committed = sidecar.exists();
+
+        // Second request: must re-materialize the row's blob from the warm
+        // cache and serve it from storage.
+        let second = download().await;
+        let healed_blob = std::fs::read(fx.storage_dir.join(&storage_key)).ok();
+
+        fx.teardown().await;
+
+        let (status, body) = first.unwrap_or_else(|s| panic!("first repair must succeed: {s}"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], nupkg.as_ref());
+        assert!(
+            sidecar_committed,
+            "streaming repair must commit the proxy-cache sidecar"
+        );
+
+        let (status, body) = second.unwrap_or_else(|s| panic!("second request must succeed: {s}"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            nupkg.as_ref(),
+            "healed serve must match upstream byte for byte"
+        );
+        assert_eq!(
+            healed_blob.as_deref(),
+            Some(nupkg.as_ref()),
+            "the row's own storage_key must be re-materialized from the warm \
+             proxy cache — a dangling row breaks scanning, replication, \
+             backup and the V2 download"
         );
     }
 
