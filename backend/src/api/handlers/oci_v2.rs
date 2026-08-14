@@ -758,10 +758,28 @@ async fn require_oci_repo_read_access(
     claims: &crate::services::auth_service::Claims,
     repo: &OciRepoInfo,
 ) -> Result<(), Response> {
+    oci_read_permitted(state, claims, repo.id, &repo.key, repo.is_public).await
+}
+
+/// Decision core of [`require_oci_repo_read_access`], extracted so the
+/// `_catalog` listing (#3269) can ask THE SAME "may this caller read this
+/// repository" question per candidate row without constructing a throwaway
+/// [`OciRepoInfo`]. The gate only ever consults `repo.{id,key,is_public}`, so
+/// taking those three fields is behavior-preserving. Callers that only need
+/// the boolean (the catalog filter) treat any `Err` — including the fail-closed
+/// 503 on a lookup error — as deny/omit; the per-repository handlers return the
+/// shaped denial (403 `DENIED` vs existence-hiding 404 `NAME_UNKNOWN`) as-is.
+async fn oci_read_permitted(
+    state: &SharedState,
+    claims: &crate::services::auth_service::Claims,
+    repo_id: Uuid,
+    repo_key: &str,
+    is_public: bool,
+) -> Result<(), Response> {
     // Scope ceilings first — before the admin and scanner bypasses, matching
     // the write gate, where `enforce_token_repo_scope` applies even to admins.
-    enforce_scan_pull_scope(claims, &repo.key)?;
-    enforce_token_repo_scope(claims, repo.id)?;
+    enforce_scan_pull_scope(claims, repo_key)?;
+    enforce_token_repo_scope(claims, repo_id)?;
 
     if claims.is_admin || claims.scan_pull_repo.is_some() {
         return Ok(());
@@ -769,7 +787,7 @@ async fn require_oci_repo_read_access(
 
     // #2329: never leave an authenticated caller below the anonymous read
     // baseline a public repository already grants.
-    if crate::api::middleware::auth::public_read_satisfies_acl(repo.is_public, OCI_READ_ACTION) {
+    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, OCI_READ_ACTION) {
         return Ok(());
     }
 
@@ -781,7 +799,7 @@ async fn require_oci_repo_read_access(
     // `repository-owner` row repository creation seeds) always wins.
     match state
         .permission_service
-        .check_repository_action(claims.sub, repo.id, OCI_READ_ACTION, claims.is_admin)
+        .check_repository_action(claims.sub, repo_id, OCI_READ_ACTION, claims.is_admin)
         .await
     {
         Ok(true) => return Ok(()),
@@ -801,7 +819,7 @@ async fn require_oci_repo_read_access(
     // access or turn a firm refusal into a retryable 503.
     let has_rules = state
         .permission_service
-        .has_any_rules_for_target("repository", repo.id)
+        .has_any_rules_for_target("repository", repo_id)
         .await
         .unwrap_or_else(|e| {
             tracing::error!("OCI read denial: rules lookup failed: {}", e);
@@ -813,7 +831,7 @@ async fn require_oci_repo_read_access(
         Err(oci_error(
             StatusCode::NOT_FOUND,
             "NAME_UNKNOWN",
-            &format!("repository not found: {}", repo.key),
+            &format!("repository not found: {}", repo_key),
         ))
     }
 }
@@ -9929,14 +9947,22 @@ async fn fetch_tags_from_remote_member(
 // Catalog handler
 // ---------------------------------------------------------------------------
 
-/// List all repositories visible to the authenticated user.
+/// List the repositories visible to the authenticated user.
 ///
 /// Note: `_catalog` is defined by the Docker Registry HTTP API V2
 /// (distribution/distribution), **not** the OCI Distribution Spec.
 /// Per the Docker spec, the catalog contents are implementation-specific:
 /// registries MAY limit results based on access level. This implementation
-/// returns all repositories to any authenticated user without per-repository
-/// ACL filtering, consistent with Docker Hub and most registry implementations.
+/// scopes the listing to repositories the caller may READ (#3269): each
+/// candidate repository is run through [`oci_read_permitted`] — the same
+/// decision the manifest/blob/tags read handlers enforce — so the catalog
+/// lists exactly the set the caller could pull, no more. A global admin with
+/// no token repo-scope ceiling and no scanner pin skips the filter entirely
+/// (the pre-existing unfiltered query, byte-for-byte).
+///
+/// Anonymous callers keep the pre-existing 401 + `WWW-Authenticate: Bearer`
+/// challenge — the handshake Docker/Podman use to reach `/v2/token` —
+/// deliberately NOT broadened to a public-only listing.
 async fn handle_catalog(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -9944,12 +9970,9 @@ async fn handle_catalog(
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let base_url = base_url.as_str();
-    if authenticate_oci(&state.db, &state.config, &headers)
-        .await
-        .is_err()
-    {
+    let Ok(claims) = authenticate_oci(&state.db, &state.config, &headers).await else {
         return unauthorized_challenge(base_url);
-    }
+    };
 
     let (n, last) = match parse_pagination_params(&query) {
         Ok(v) => v,
@@ -9974,10 +9997,26 @@ async fn handle_catalog(
     // advertise what may exist only upstream.
     // Spec reference:
     // https://github.com/distribution/distribution/blob/v3.0.0/docs/content/spec/api.md#catalog
-    let (page, has_more) = match catalog_local_entries(&state.db, last.as_deref(), n).await {
-        Ok(v) => v,
-        Err(e) => return e,
+    //
+    // Per-repository read filter (#3269): unless the caller's view is
+    // unrestricted, resolve the set of OCI-content repositories the caller may
+    // read and filter INSIDE the paginated query, so `n`/`last`/`Link`
+    // semantics operate on the authorized set only.
+    let authorized_ids = if catalog_view_unrestricted(&claims) {
+        None
+    } else {
+        match authorized_catalog_repo_ids(&state, &claims).await {
+            Ok(ids) => Some(ids),
+            Err(e) => return e,
+        }
     };
+
+    let (page, has_more) =
+        match catalog_local_entries(&state.db, authorized_ids.as_deref(), last.as_deref(), n).await
+        {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -9998,57 +10037,118 @@ async fn handle_catalog(
         .unwrap()
 }
 
+/// True when the caller's catalog view needs no per-repository filtering: a
+/// global admin whose bearer carries no token repo-scope ceiling (#2290) and
+/// no scanner pin (#2093) reads every repository, so the pre-existing
+/// unfiltered catalog query is exact for them. Everyone else — including an
+/// admin holding a scoped or pinned token, whose ceilings apply even to
+/// admins — goes through the per-repository read decision. Pure decision fn
+/// (no I/O) so it is unit-testable.
+fn catalog_view_unrestricted(claims: &crate::services::auth_service::Claims) -> bool {
+    claims.is_admin && claims.allowed_repo_ids.is_none() && claims.scan_pull_repo.is_none()
+}
+
+/// Phase 1 of the catalog read filter (#3269): enumerate the distinct
+/// repositories that currently have OCI content and keep the ids the caller
+/// may READ per [`oci_read_permitted`] — the same choke-point the
+/// manifest/blob/tags handlers enforce, so the catalog and a pull cannot
+/// answer from different predicates. A repository whose decision errors is
+/// OMITTED (reads fail closed). Bounded by the number of OCI repositories,
+/// not tags, and the permission service caches, so this stays cheap on a
+/// cold endpoint.
+async fn authorized_catalog_repo_ids(
+    state: &SharedState,
+    claims: &crate::services::auth_service::Claims,
+) -> Result<Vec<Uuid>, Response> {
+    let candidates: Vec<(Uuid, String, bool)> = sqlx::query_as(
+        "SELECT DISTINCT r.id, r.key, r.is_public \
+         FROM oci_tags t \
+         JOIN repositories r ON r.id = t.repository_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        warn!("Failed to enumerate catalog candidate repositories: {}", e);
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "failed to list catalog",
+        )
+    })?;
+
+    let mut ids = Vec::with_capacity(candidates.len());
+    for (repo_id, repo_key, is_public) in candidates {
+        if oci_read_permitted(state, claims, repo_id, &repo_key, is_public)
+            .await
+            .is_ok()
+        {
+            ids.push(repo_id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Build the catalog page SQL. The repository filter (#3269) is injected
+/// INSIDE the subquery — before `DISTINCT`/`ORDER BY`/`LIMIT` — so cursor
+/// pagination and the `Link` header operate on the authorized set only (a
+/// trailing unauthorized row must never signal `has_more`). Bind order is
+/// cursor (if any), then limit, then the id array (if any).
+fn catalog_page_sql(with_cursor: bool, with_filter: bool) -> String {
+    let filter = match (with_filter, with_cursor) {
+        (false, _) => "",
+        (true, true) => " WHERE r.id = ANY($3)",
+        (true, false) => " WHERE r.id = ANY($2)",
+    };
+    let cursor = if with_cursor {
+        " WHERE (LOWER(name), name) > (LOWER($1), $1)"
+    } else {
+        ""
+    };
+    let limit = if with_cursor { "$2" } else { "$1" };
+    format!(
+        "SELECT name FROM ( \
+             SELECT DISTINCT \
+                 CASE WHEN t.name = r.key OR t.name = '' \
+                      THEN r.key \
+                      ELSE r.key || '/' || t.name \
+                 END AS name \
+             FROM oci_tags t \
+             JOIN repositories r ON r.id = t.repository_id{filter} \
+         ) catalog{cursor} \
+         ORDER BY LOWER(name), name \
+         LIMIT {limit}"
+    )
+}
+
 /// Fetch a single page of catalog entries from oci_tags using SQL-side
 /// cursor pagination. Returns `(page, has_more)`.
+///
+/// `authorized`: `None` = unrestricted view (no filter — the admin fast
+/// path); `Some(ids)` = only entries belonging to those repositories
+/// (`Some(&[])` yields an empty catalog — deny-by-default).
 ///
 /// Sorting uses `LOWER()` for case-insensitive primary order (matching
 /// `oci_lexical_cmp`) with a case-sensitive tiebreaker. The cursor
 /// comparison mirrors this ordering so pagination is consistent.
 async fn catalog_local_entries(
     db: &PgPool,
+    authorized: Option<&[Uuid]>,
     last: Option<&str>,
     n: usize,
 ) -> Result<(Vec<String>, bool), Response> {
     let limit = (n as i64).saturating_add(1);
 
-    let rows: Vec<(String,)> = if let Some(cursor) = last {
-        sqlx::query_as(
-            "SELECT name FROM ( \
-                 SELECT DISTINCT \
-                     CASE WHEN t.name = r.key OR t.name = '' \
-                          THEN r.key \
-                          ELSE r.key || '/' || t.name \
-                     END AS name \
-                 FROM oci_tags t \
-                 JOIN repositories r ON r.id = t.repository_id \
-             ) catalog \
-             WHERE (LOWER(name), name) > (LOWER($1), $1) \
-             ORDER BY LOWER(name), name \
-             LIMIT $2",
-        )
-        .bind(cursor)
-        .bind(limit)
-        .fetch_all(db)
-        .await
-    } else {
-        sqlx::query_as(
-            "SELECT name FROM ( \
-                 SELECT DISTINCT \
-                     CASE WHEN t.name = r.key OR t.name = '' \
-                          THEN r.key \
-                          ELSE r.key || '/' || t.name \
-                     END AS name \
-                 FROM oci_tags t \
-                 JOIN repositories r ON r.id = t.repository_id \
-             ) catalog \
-             ORDER BY LOWER(name), name \
-             LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(db)
-        .await
+    let sql = catalog_page_sql(last.is_some(), authorized.is_some());
+    let mut query = sqlx::query_as::<_, (String,)>(&sql);
+    if let Some(cursor) = last {
+        query = query.bind(cursor);
     }
-    .map_err(|e| {
+    query = query.bind(limit);
+    if let Some(ids) = authorized {
+        query = query.bind(ids.to_vec());
+    }
+
+    let rows: Vec<(String,)> = query.fetch_all(db).await.map_err(|e| {
         warn!("Failed to query local catalog entries: {}", e);
         oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10653,6 +10753,57 @@ mod tests {
         let admin_scope = crate::models::access_scope::AccessScope::Admin;
         let admin_ids: Option<Vec<Uuid>> = admin_scope.into();
         assert_eq!(admin_ids, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // catalog_view_unrestricted / catalog_page_sql (#3269)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_catalog_view_unrestricted_only_for_unscoped_admin() {
+        // Only a global admin with no repo-scope ceiling and no scanner pin
+        // keeps the unfiltered catalog fast path.
+        assert!(catalog_view_unrestricted(&claims_with_repo_scope(
+            None, true
+        )));
+        // A non-admin never bypasses the filter, scoped or not.
+        assert!(!catalog_view_unrestricted(&claims_with_repo_scope(
+            None, false
+        )));
+        // A repo-scope ceiling binds even an admin bearer (#2290 parity).
+        assert!(!catalog_view_unrestricted(&claims_with_repo_scope(
+            Some(vec![Uuid::new_v4()]),
+            true
+        )));
+        // A scanner pin confines the catalog to the pinned repository.
+        assert!(!catalog_view_unrestricted(&claims_with_scan_scope(Some(
+            "repo-a"
+        ))));
+    }
+
+    #[test]
+    fn test_catalog_page_sql_filter_inside_subquery_before_limit() {
+        // Unfiltered branches carry no repository predicate at all.
+        assert!(!catalog_page_sql(false, false).contains("ANY"));
+        assert!(!catalog_page_sql(true, false).contains("ANY"));
+
+        // Filtered branches inject the predicate INSIDE the subquery (before
+        // DISTINCT/ORDER BY/LIMIT), so pagination operates on the authorized
+        // set only, and bind numbering follows cursor -> limit -> ids.
+        let filtered = catalog_page_sql(false, true);
+        let filter_pos = filtered
+            .find("r.id = ANY($2)")
+            .expect("no-cursor filtered SQL must bind ids at $2");
+        assert!(filter_pos < filtered.find(") catalog").unwrap());
+        assert!(filter_pos < filtered.find("LIMIT $1").unwrap());
+
+        let cursor_filtered = catalog_page_sql(true, true);
+        let filter_pos = cursor_filtered
+            .find("r.id = ANY($3)")
+            .expect("cursor filtered SQL must bind ids at $3");
+        assert!(filter_pos < cursor_filtered.find(") catalog").unwrap());
+        assert!(cursor_filtered.contains("(LOWER(name), name) > (LOWER($1), $1)"));
+        assert!(cursor_filtered.contains("LIMIT $2"));
     }
 
     // -----------------------------------------------------------------------
@@ -31487,5 +31638,351 @@ mod direct_credential_repo_scope_regression_3316 {
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
 
         let _ = std::fs::remove_dir_all(&storage);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OCI `/v2/_catalog` READ scoping (#3269).
+//
+// Before this fix `handle_catalog` authenticated the caller and then listed
+// EVERY repository key with OCI content — any authenticated principal could
+// enumerate the full repository namespace, including private repositories it
+// could not pull. These tests drive the real router and assert both
+// directions in one fixture: a non-admin sees only the repositories the read
+// gate permits (its granted repo + public repos), while the admin still sees
+// everything and the anonymous 401 challenge is unchanged. DB-backed: the
+// decision reads `permissions` / `role_assignments` / `oci_tags`; the tests
+// no-op without a database and PANIC under `AK_TESTS_REQUIRE_DB=1` if the
+// pool is missing (revert-proof: a sub-second "pass" means nothing ran).
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod oci_catalog_read_scope_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+
+    /// Insert a user and backdate the credential/privilege watermarks by 60s,
+    /// so a bearer minted immediately after the INSERT cannot lose the race
+    /// against `privileges_changed_at` (migration 131).
+    async fn backdated_user(pool: &PgPool, is_admin: bool) -> Uuid {
+        let (id, _) = tdh::create_user(pool).await;
+        sqlx::query(
+            "UPDATE users SET is_admin = $2, \
+                              password_changed_at = NOW() - INTERVAL '60 seconds', \
+                              privileges_changed_at = NOW() - INTERVAL '60 seconds' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(is_admin)
+        .execute(pool)
+        .await
+        .expect("backdate user watermarks");
+        id
+    }
+
+    /// Seed one `oci_tags` row whose `name` is empty, so the repository's
+    /// catalog entry is exactly `r.key` (the `CASE` branch in the catalog SQL).
+    async fn seed_catalog_tag(pool: &PgPool, repo_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO oci_tags \
+                 (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, '', 'latest', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo_id)
+        .bind(format!("sha256:{:064x}", 0x3269))
+        .execute(pool)
+        .await
+        .expect("seed catalog tag");
+    }
+
+    /// Two PRIVATE hosted docker repositories (A granted to the member, B
+    /// ungranted) plus a PUBLIC one (P), each carrying one OCI tag so all
+    /// three are catalog candidates.
+    struct CatalogFixture {
+        pool: PgPool,
+        state: SharedState,
+        repo_a: Uuid,
+        key_a: String,
+        repo_b: Uuid,
+        key_b: String,
+        repo_p: Uuid,
+        key_p: String,
+        member_id: Uuid,
+        extra_users: Vec<Uuid>,
+        dirs: Vec<std::path::PathBuf>,
+    }
+
+    impl CatalogFixture {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+            let (repo_b, key_b, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+            let (repo_p, key_p, dir_p) = tdh::create_repo(&pool, "local", "docker").await;
+            sqlx::query("UPDATE repositories SET is_public = TRUE WHERE id = $1")
+                .bind(repo_p)
+                .execute(&pool)
+                .await
+                .expect("mark repo public");
+            for repo in [repo_a, repo_b, repo_p] {
+                seed_catalog_tag(&pool, repo).await;
+            }
+            let state = tdh::build_state(pool.clone(), dir_a.to_str().unwrap());
+            let member_id = backdated_user(&pool, false).await;
+            tdh::grant_repo_access(&pool, repo_a, member_id).await;
+            Some(Self {
+                pool,
+                state,
+                repo_a,
+                key_a,
+                repo_b,
+                key_b,
+                repo_p,
+                key_p,
+                member_id,
+                extra_users: Vec::new(),
+                dirs: vec![dir_a, dir_b, dir_p],
+            })
+        }
+
+        async fn add_user(&mut self, is_admin: bool) -> Uuid {
+            let id = backdated_user(&self.pool, is_admin).await;
+            self.extra_users.push(id);
+            id
+        }
+
+        async fn bearer(&self, user_id: Uuid) -> String {
+            tdh::bearer_for(&self.state, user_id).await
+        }
+
+        /// `GET /v2/_catalog{query}` through the real router; `None` = no
+        /// Authorization header (anonymous).
+        async fn catalog(
+            &self,
+            query: &str,
+            authorization: Option<&str>,
+        ) -> (StatusCode, Bytes, HeaderMap) {
+            let mut builder = Request::builder()
+                .method("GET")
+                .uri(format!("/_catalog{query}"));
+            if let Some(auth) = authorization {
+                builder = builder.header(AUTHORIZATION, auth);
+            }
+            let req = builder.body(Body::empty()).expect("build request");
+            tdh::send_with_headers(router().with_state(self.state.clone()), req).await
+        }
+
+        async fn teardown(&self) {
+            for repo in [self.repo_a, self.repo_b, self.repo_p] {
+                let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                    .bind(repo)
+                    .execute(&self.pool)
+                    .await;
+            }
+            for user_id in &self.extra_users {
+                tdh::cleanup_user(&self.pool, *user_id).await;
+            }
+            tdh::cleanup(&self.pool, self.repo_b, self.member_id).await;
+            tdh::cleanup(&self.pool, self.repo_p, self.member_id).await;
+            tdh::cleanup(&self.pool, self.repo_a, self.member_id).await;
+            for dir in &self.dirs {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// Parse the `repositories` array out of a catalog response body.
+    fn repo_list(body: &Bytes) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_slice(body).expect("catalog body is JSON");
+        v["repositories"]
+            .as_array()
+            .expect("repositories array")
+            .iter()
+            .map(|s| s.as_str().expect("string entry").to_string())
+            .collect()
+    }
+
+    /// THE BUG (#3269): a non-admin member with a read grant on A alone saw
+    /// EVERY repository key in `_catalog`, including private B. Now the
+    /// listing is scoped to what the read gate permits — A (granted) and P
+    /// (public) — while the admin, in the same fixture, still sees all three
+    /// (a filter that hid everything from everyone could not pass this).
+    #[tokio::test]
+    async fn catalog_lists_only_readable_repos_for_non_admin() {
+        let Some(mut f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let admin = f.add_user(true).await;
+        let member_bearer = f.bearer(f.member_id).await;
+        let admin_bearer = f.bearer(admin).await;
+
+        let (member_status, member_body, _) = f.catalog("?n=10000", Some(&member_bearer)).await;
+        let (admin_status, admin_body, _) = f.catalog("?n=10000", Some(&admin_bearer)).await;
+        f.teardown().await;
+
+        assert_eq!(member_status, StatusCode::OK);
+        let member_repos = repo_list(&member_body);
+        assert!(
+            member_repos.contains(&f.key_a),
+            "the granted repository must be listed for its member"
+        );
+        assert!(
+            member_repos.contains(&f.key_p),
+            "a public repository must be listed for any authenticated caller"
+        );
+        assert!(
+            !member_repos.contains(&f.key_b),
+            "a private repository the caller cannot read must NOT appear in _catalog"
+        );
+
+        assert_eq!(admin_status, StatusCode::OK);
+        let admin_repos = repo_list(&admin_body);
+        for key in [&f.key_a, &f.key_b, &f.key_p] {
+            assert!(
+                admin_repos.contains(key),
+                "a global admin must still see every repository ({key})"
+            );
+        }
+    }
+
+    /// Parity with the pull gate on the fine-grained store: an applicable
+    /// `permissions` rule naming the caller WITHOUT `read` is authoritative,
+    /// so the repository disappears from the catalog exactly as its manifests
+    /// became unpullable — this is why the role-only visibility helper was
+    /// not reused (it would still leak the name).
+    #[tokio::test]
+    async fn fine_grained_deny_removes_repo_from_catalog() {
+        let Some(mut f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let denied = f.add_user(false).await;
+        tdh::grant_repo_access(&f.pool, f.repo_a, denied).await;
+        tdh::grant_permission(&f.pool, "user", denied, "repository", f.repo_a, &["write"]).await;
+        let bearer = f.bearer(denied).await;
+
+        let (status, body, _) = f.catalog("?n=10000", Some(&bearer)).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let repos = repo_list(&body);
+        assert!(
+            !repos.contains(&f.key_a),
+            "an applicable fine-grained rule without `read` must remove the name"
+        );
+        assert!(
+            repos.contains(&f.key_p),
+            "the public read baseline must survive an unrelated deny"
+        );
+    }
+
+    /// The token repo-scope ceiling (#2290/#3316) confines the catalog set:
+    /// a bearer restricted to P sees only P even though its identity holds a
+    /// role grant on A. Also pins the unscoped Phase-1 set for the member.
+    #[tokio::test]
+    async fn repo_scope_ceiling_confines_catalog_set() {
+        let Some(f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let bearer = f.bearer(f.member_id).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, bearer.parse().expect("bearer header"));
+        let mut claims = authenticate_oci(&f.state.db, &f.state.config, &headers)
+            .await
+            .expect("authenticate member bearer");
+
+        let unscoped = authorized_catalog_repo_ids(&f.state, &claims)
+            .await
+            .expect("resolve unscoped set");
+
+        claims.allowed_repo_ids = Some(vec![f.repo_p]);
+        let scoped = authorized_catalog_repo_ids(&f.state, &claims)
+            .await
+            .expect("resolve scoped set");
+        f.teardown().await;
+
+        assert!(unscoped.contains(&f.repo_a), "granted repo in Phase-1 set");
+        assert!(unscoped.contains(&f.repo_p), "public repo in Phase-1 set");
+        assert!(
+            !unscoped.contains(&f.repo_b),
+            "ungranted private repo must be omitted from the Phase-1 set"
+        );
+        assert_eq!(
+            scoped,
+            vec![f.repo_p],
+            "a repo-scope ceiling must confine the catalog to its allow-list"
+        );
+    }
+
+    /// Anonymous behavior is deliberately UNCHANGED: no credentials still gets
+    /// the 401 + `WWW-Authenticate: Bearer` challenge Docker/Podman use to
+    /// reach `/v2/token` — the fix must not broaden anonymous access to a
+    /// public-only listing.
+    #[tokio::test]
+    async fn anonymous_catalog_keeps_401_challenge() {
+        let Some(f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let (status, _, headers) = f.catalog("", None).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let challenge = headers
+            .get("WWW-Authenticate")
+            .expect("401 must carry the WWW-Authenticate challenge")
+            .to_str()
+            .expect("header is ASCII");
+        assert!(
+            challenge.starts_with("Bearer"),
+            "the Bearer challenge handshake must be preserved, got: {challenge}"
+        );
+    }
+
+    /// `n`/`last` pagination operates on the AUTHORIZED set only: the filter
+    /// is applied inside the query before `LIMIT`, so a trailing unauthorized
+    /// row never signals `has_more`, and the cursor walks the filtered order.
+    #[tokio::test]
+    async fn pagination_operates_on_authorized_set_only() {
+        let Some(f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let both = [f.repo_a, f.repo_p];
+        let (page1, more1) = catalog_local_entries(&f.pool, Some(&both), None, 1)
+            .await
+            .expect("first page");
+        let cursor = page1.first().cloned().expect("first page has one entry");
+        let (page2, more2) = catalog_local_entries(&f.pool, Some(&both), Some(&cursor), 1)
+            .await
+            .expect("second page");
+
+        let only_a = [f.repo_a];
+        let (solo, more_solo) = catalog_local_entries(&f.pool, Some(&only_a), None, 1)
+            .await
+            .expect("single-repo page");
+
+        let (empty, more_empty) = catalog_local_entries(&f.pool, Some(&[]), None, 1)
+            .await
+            .expect("empty allow-list page");
+        f.teardown().await;
+
+        // Keys are lowercase, so plain lexical order matches LOWER()-first SQL order.
+        let mut expected = [f.key_a.clone(), f.key_p.clone()];
+        expected.sort();
+        assert_eq!(page1, vec![expected[0].clone()]);
+        assert!(more1, "one authorized entry remains past the first page");
+        assert_eq!(page2, vec![expected[1].clone()]);
+        assert!(
+            !more2,
+            "unauthorized rows beyond the set must not signal has_more"
+        );
+        assert_eq!(solo, vec![f.key_a.clone()]);
+        assert!(
+            !more_solo,
+            "B and P exist but are outside the allow-list — no has_more"
+        );
+        assert!(empty.is_empty(), "an empty allow-list yields an empty page");
+        assert!(!more_empty);
     }
 }
