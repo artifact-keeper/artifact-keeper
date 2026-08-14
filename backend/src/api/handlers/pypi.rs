@@ -1803,12 +1803,11 @@ async fn download_or_metadata(
     // way: it enqueues only after a version document resolves out of a real
     // packument.
     //
-    // 3xx counts because #1555 answers a fresh proxy-cache hit on a remote member
-    // with a 307 to a presigned URL (`presigned_downloads_enabled`); gating on
-    // `is_success()` alone would silently switch ingestion off for every operator
-    // running object-storage downloads. Both shapes mean the same thing here: the
-    // access check inside `serve_file` passed and the artifact resolved.
-    let served = response.status().is_success() || response.status().is_redirection();
+    // The predicate itself lives in `proxy_helpers` so the relocation is covered
+    // by a test (#3233): `response_admits_ondemand_ingest` documents why 3xx
+    // counts (#1555 presigned redirects) and pins that 401/403/404 do not.
+    let served =
+        crate::api::handlers::proxy_helpers::response_admits_ondemand_ingest(response.status());
     if served && repo.repo_type == RepositoryType::Remote && !filename.ends_with(".metadata") {
         if let Some(version) = requested_version.clone() {
             // `normalized.as_str()` (#3186): the catalog row must key on the same

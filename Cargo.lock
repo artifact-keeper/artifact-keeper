@@ -264,6 +264,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "serde_urlencoded",
  "serde_yaml",
  "sha1",
