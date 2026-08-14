@@ -422,6 +422,107 @@ impl ProxyScanService {
 
         Ok(())
     }
+
+    /// Persist the package inventory the inline proxy scan cataloged, so an
+    /// SBOM can later be generated for this digest without re-fetching or
+    /// re-scanning the bytes.
+    ///
+    /// Digest-keyed and repository-agnostic by design: the inventory is a
+    /// property of the content, so byte-identical artifacts cached in many
+    /// repositories share one set of rows, and no tenant's cache eviction can
+    /// destroy an inventory another tenant is serving.
+    ///
+    /// An empty inventory is a no-op rather than a delete. A scanner that
+    /// reports nothing must not erase a richer inventory recorded earlier for
+    /// the same digest — that would silently downgrade an existing SBOM.
+    ///
+    /// Uses `UNNEST` so the whole inventory is one round trip regardless of
+    /// component count, and `ON CONFLICT DO UPDATE` so a re-scan refreshes
+    /// metadata rather than accumulating duplicates.
+    pub async fn record_packages(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        packages: &[crate::models::security::RawPackage],
+    ) -> Result<()> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
+        let versions: Vec<Option<String>> = packages.iter().map(|p| p.version.clone()).collect();
+        let purls: Vec<Option<String>> = packages.iter().map(|p| p.purl.clone()).collect();
+        let licenses: Vec<Option<String>> = packages.iter().map(|p| p.license.clone()).collect();
+
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_scan_packages (
+                checksum_sha256, scan_type, name, version, purl, license, recorded_at
+            )
+            SELECT $1, $2, u.name, u.version, u.purl, u.license, now()
+            FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[])
+                AS u(name, version, purl, license)
+            ON CONFLICT (checksum_sha256, scan_type, name, COALESCE(version, ''))
+            DO UPDATE SET
+                purl = COALESCE(EXCLUDED.purl, proxy_scan_packages.purl),
+                license = COALESCE(EXCLUDED.license, proxy_scan_packages.license),
+                recorded_at = now()
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(&names)
+        .bind(&versions)
+        .bind(&purls)
+        .bind(&licenses)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Read back the inventory for a digest, for SBOM generation.
+    ///
+    /// Filtered on `scan_type` because the uniqueness key includes it: an
+    /// unfiltered read would merge two engines' inventories into one SBOM the
+    /// day a second scan type is written.
+    ///
+    /// An empty result means "no inventory recorded", which callers must
+    /// render as unknown — never as an empty and therefore falsely clean SBOM.
+    pub async fn fetch_packages(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Vec<crate::models::security::RawPackage>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT name, version, purl, license
+            FROM proxy_scan_packages
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            ORDER BY name, version
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(name, version, purl, license)| crate::models::security::RawPackage {
+                    name,
+                    version,
+                    purl,
+                    license,
+                    source_target: None,
+                },
+            )
+            .collect())
+    }
 }
 
 #[cfg(test)]
