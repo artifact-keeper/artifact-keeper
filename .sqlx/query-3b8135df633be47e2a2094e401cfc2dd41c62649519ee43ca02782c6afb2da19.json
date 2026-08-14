@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM users WHERE email = '' AND auth_provider = 'oidc' AND username LIKE 'stranded\\_%'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "3b8135df633be47e2a2094e401cfc2dd41c62649519ee43ca02782c6afb2da19"
+}

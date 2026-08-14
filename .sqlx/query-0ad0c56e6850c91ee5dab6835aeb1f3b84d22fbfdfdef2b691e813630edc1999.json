@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM users WHERE auth_provider = 'saml' AND username LIKE $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0ad0c56e6850c91ee5dab6835aeb1f3b84d22fbfdfdef2b691e813630edc1999"
+}

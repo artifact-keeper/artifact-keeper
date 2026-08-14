@@ -1,0 +1,84 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                c.path,\n                c.checksum_sha256 AS \"checksum_sha256!\",\n                c.cached_at,\n                r.verdict,\n                r.findings_count,\n                r.critical_count,\n                r.high_count,\n                r.medium_count,\n                r.low_count,\n                r.max_severity,\n                r.scanned_at\n            FROM proxy_cache_artifacts c\n            LEFT JOIN proxy_scan_results r\n                ON r.checksum_sha256 = c.checksum_sha256\n               AND r.scan_type = $3\n            WHERE c.repository_id = $1\n              AND c.path = $2\n              AND c.checksum_sha256 IS NOT NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "checksum_sha256!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "cached_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "verdict",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "findings_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "critical_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "high_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "medium_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "low_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "max_severity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "scanned_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "996ca16083b1c29e8fa8068474b7a3d9fb300df3cea791855b3d091ee5c13951"
+}

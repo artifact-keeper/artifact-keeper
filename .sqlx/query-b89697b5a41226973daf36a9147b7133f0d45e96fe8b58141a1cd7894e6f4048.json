@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM users WHERE auth_provider = 'oidc' AND username LIKE $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b89697b5a41226973daf36a9147b7133f0d45e96fe8b58141a1cd7894e6f4048"
+}
