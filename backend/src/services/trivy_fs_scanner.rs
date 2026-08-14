@@ -101,8 +101,10 @@ impl TrivyFsScanner {
         args.extend_from_slice(&[
             "--format",
             "json",
+            // #3296: the shared allowlist includes UNKNOWN so ungraded CVEs
+            // reach the report instead of being dropped at the CLI.
             "--severity",
-            "CRITICAL,HIGH,MEDIUM,LOW",
+            crate::services::scanner_service::TRIVY_FS_SEVERITY_LIST,
             // #903: enumerate every package the scanner saw (not just
             // CVE-bearing rows) so SBOM generation reflects the complete
             // dependency tree. `convert_trivy_packages` reads from the

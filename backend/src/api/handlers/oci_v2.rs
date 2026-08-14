@@ -4892,10 +4892,12 @@ async fn enforce_blob_scan_reblock(
         // member set, so the virtual cannot become the lax route around a
         // stricter member.
         ref_owners.push((repo.repo_type.as_str(), repo.id));
-        blob_vulnerable_verdict_status_any(state, &gated_ids, lookup_digest).await
+        let severity_gate = blob_severity_gate(&scan_cfg, &ref_owners).await;
+        blob_vulnerable_verdict_status_any(state, &gated_ids, lookup_digest, severity_gate).await
     } else if blob_reblock_applies(&scan_cfg, &repo.repo_type, repo.id).await {
         ref_owners.push((repo.repo_type.as_str(), repo.id));
-        blob_vulnerable_verdict_status(state, repo.id, lookup_digest).await
+        let severity_gate = blob_severity_gate(&scan_cfg, &ref_owners).await;
+        blob_vulnerable_verdict_status(state, repo.id, lookup_digest, severity_gate).await
     } else {
         Ok(BlobVerdictStatus::NoVerdict)
     };
@@ -8123,10 +8125,11 @@ async fn blob_vulnerable_verdict_status(
     state: &SharedState,
     repo_id: Uuid,
     blob_digest: &str,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
 ) -> Result<BlobVerdictStatus, sqlx::Error> {
     let refs = sqlx::query_as::<_, BlobVerdictRef>(
         r#"
-        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version
+        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity
         FROM manifest_blob_refs mbr
         JOIN proxy_scan_results psr
           ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
@@ -8146,6 +8149,7 @@ async fn blob_vulnerable_verdict_status(
     Ok(classify_blob_verdicts(
         &refs,
         current_version.as_deref(),
+        severity_gate,
         chrono::Utc::now(),
     ))
 }
@@ -8167,13 +8171,14 @@ async fn blob_vulnerable_verdict_status_any(
     state: &SharedState,
     member_ids: &[Uuid],
     blob_digest: &str,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
 ) -> Result<BlobVerdictStatus, sqlx::Error> {
     if member_ids.is_empty() {
         return Ok(BlobVerdictStatus::NoVerdict);
     }
     let refs = sqlx::query_as::<_, BlobVerdictRef>(
         r#"
-        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version
+        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity
         FROM manifest_blob_refs mbr
         JOIN proxy_scan_results psr
           ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
@@ -8193,6 +8198,7 @@ async fn blob_vulnerable_verdict_status_any(
     Ok(classify_blob_verdicts(
         &refs,
         current_version.as_deref(),
+        severity_gate,
         chrono::Utc::now(),
     ))
 }
@@ -8204,6 +8210,9 @@ pub(crate) struct BlobVerdictRef {
     pub verdict: String,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
     pub scanner_version: Option<String>,
+    /// Highest observed severity of the referencing manifest's verdict, for
+    /// the #3243 severity-threshold gate. `None` (legacy rows) fails closed.
+    pub max_severity: Option<String>,
 }
 
 /// What the referencing manifests' verdicts say about serving one blob (#3259).
@@ -8271,12 +8280,29 @@ async fn live_cve_scanner_version_for(
 pub(crate) fn classify_blob_verdicts(
     refs: &[BlobVerdictRef],
     current_version: Option<&str>,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     now: chrono::DateTime<chrono::Utc>,
 ) -> BlobVerdictStatus {
-    if refs.is_empty() {
+    // #3243 stage 3: the blob seam applies the SAME severity threshold the
+    // manifest gate applies, so the two halves cannot disagree (a manifest
+    // that serves under the repo's threshold must not have its layers 403).
+    // A ref whose verdict would not block under the gate is out of scope
+    // entirely — it neither blocks nor holds the blob as StaleOnly. A ref
+    // with an absent/unparseable `max_severity` stays in scope (fail closed).
+    let in_scope: Vec<&BlobVerdictRef> = refs
+        .iter()
+        .filter(|r| {
+            severity_gate.blocks(
+                r.max_severity
+                    .as_deref()
+                    .and_then(crate::models::security::Severity::from_str_loose),
+            )
+        })
+        .collect();
+    if in_scope.is_empty() {
         return BlobVerdictStatus::NoVerdict;
     }
-    let any_reusable = refs.iter().any(|r| {
+    let any_reusable = in_scope.iter().any(|r| {
         crate::services::proxy_scan_service::verdict_is_reusable(
             &r.verdict,
             r.scanned_at,
@@ -8381,6 +8407,40 @@ async fn blob_reblock_applies(
         .is_proxy_scan_enabled(repo_id)
         .await
         .unwrap_or(true)
+}
+
+/// The severity gate the blob re-block applies to referencing `vulnerable`
+/// verdicts (#3243 stage 3), derived from the repositories whose refs are in
+/// scope (`ref_owners`, same population `stale_blob_verdicts_still_withhold`
+/// consults).
+///
+/// Hosted (`Local`/`Staging`) owners pin the gate to block-on-any: the
+/// severity threshold is a proxy-gate knob (`scan_configs` is proxy-shaped and
+/// hosted repos normally have no row), and the hosted carve-out in
+/// [`blob_reblock_applies`] must not be weakened through a side door. For
+/// proxy owners the STRICTEST configured gate across the set wins (the same
+/// OR-of-both-sides direction as #3025), and a config read fault fails closed
+/// to block-on-any.
+async fn blob_severity_gate(
+    scan_cfg: &crate::services::scan_config_service::ScanConfigService,
+    ref_owners: &[(&str, Uuid)],
+) -> crate::services::proxy_scan_service::ProxySeverityGate {
+    use crate::services::proxy_scan_service::ProxySeverityGate;
+    let mut gate: Option<ProxySeverityGate> = None;
+    for (repo_type, repo_id) in ref_owners {
+        if *repo_type == RepositoryType::Local || *repo_type == RepositoryType::Staging {
+            return ProxySeverityGate::BlockOnAny;
+        }
+        let g = scan_cfg
+            .proxy_severity_gate(*repo_id)
+            .await
+            .unwrap_or(ProxySeverityGate::BlockOnAny);
+        gate = Some(match gate {
+            Some(acc) => ProxySeverityGate::stricter(acc, g),
+            None => g,
+        });
+    }
+    gate.unwrap_or(ProxySeverityGate::BlockOnAny)
 }
 
 /// True when the authenticated claims are a scanner-scoped pull token
@@ -8682,6 +8742,7 @@ async fn gate_oci_proxy_manifest_scan(
     manifest_body: &Bytes,
     manifest_content_type: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
 ) -> Result<bool, Response> {
     // The verdict key is the CONTENT digest computed over the bytes being
     // served — the same digest `docker pull` pins — never anything the
@@ -8712,6 +8773,7 @@ async fn gate_oci_proxy_manifest_scan(
         synthetic,
         manifest_body,
         action,
+        severity_gate,
         // Content-addressing IS the identity for an image manifest; the
         // "engine actually graded this image" requirement is carried by
         // `require_nonempty_catalog` on the ScanTarget instead.
@@ -8774,10 +8836,7 @@ async fn maybe_gate_remote_manifest_scan(
     if !oci_manifest_requires_proxy_scan(manifest_body) {
         return Ok(false);
     }
-    let action = crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-        .proxy_scan_action(repo.id)
-        .await
-        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+    let (action, severity_gate) = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
     gate_oci_proxy_manifest_scan(
         state,
         repo,
@@ -8785,6 +8844,7 @@ async fn maybe_gate_remote_manifest_scan(
         manifest_body,
         manifest_content_type,
         action,
+        severity_gate,
     )
     .await
 }
@@ -9010,7 +9070,7 @@ async fn handle_get_manifest(
             // Scanner-scoped pull tokens stay exempt, exactly as the Remote gate.
             let mut scan_pending = false;
             if member.repo_type == RepositoryType::Remote && !oci_pull_is_scan_scoped(&claims) {
-                let (enabled, action) =
+                let (enabled, action, severity_gate) =
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
                         .await;
                 if enabled && oci_manifest_requires_proxy_scan(&data) {
@@ -9025,6 +9085,7 @@ async fn handle_get_manifest(
                         &data,
                         &member_ct,
                         action,
+                        severity_gate,
                     )
                     .await
                     {
@@ -28540,17 +28601,26 @@ mod proxy_scan_block_tests {
         .await
         .expect("seed clean verdict");
 
-        let blocked_in_a = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &shared_layer)
-            .await
-            .expect("lookup a")
+        let blocked_in_a = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &shared_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup a")
             == BlobVerdictStatus::Blocking;
         // Repo B references the SAME vulnerable manifest, so the shared layer
         // is blocked there too — same bytes, same image, same verdict.
-        let blocked_in_b_with_same_image =
-            blob_vulnerable_verdict_status(&other.state, other.repo_id, &shared_layer)
-                .await
-                .expect("lookup b")
-                == BlobVerdictStatus::Blocking;
+        let blocked_in_b_with_same_image = blob_vulnerable_verdict_status(
+            &other.state,
+            other.repo_id,
+            &shared_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup b")
+            == BlobVerdictStatus::Blocking;
 
         // Now drop repo B's reference to the vulnerable image. Its only
         // remaining reference to the shared layer is via the CLEAN image, so
@@ -28563,16 +28633,24 @@ mod proxy_scan_block_tests {
         .execute(&other.pool)
         .await
         .expect("drop repo b reference");
-        let blocked_in_b_clean_only =
-            blob_vulnerable_verdict_status(&other.state, other.repo_id, &shared_layer)
-                .await
-                .expect("lookup b again")
-                == BlobVerdictStatus::Blocking;
-        let still_blocked_in_a =
-            blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &shared_layer)
-                .await
-                .expect("lookup a again")
-                == BlobVerdictStatus::Blocking;
+        let blocked_in_b_clean_only = blob_vulnerable_verdict_status(
+            &other.state,
+            other.repo_id,
+            &shared_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup b again")
+            == BlobVerdictStatus::Blocking;
+        let still_blocked_in_a = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &shared_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup a again")
+            == BlobVerdictStatus::Blocking;
 
         for d in [&vuln_digest, &clean_digest] {
             cleanup_proxy_scan_row(&fx.pool, d.strip_prefix("sha256:").unwrap()).await;
@@ -28608,9 +28686,14 @@ mod proxy_scan_block_tests {
             return;
         };
         let unknown = format!("sha256:{}", "9".repeat(64));
-        let status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &unknown)
-            .await
-            .expect("lookup");
+        let status = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &unknown,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup");
         fx.teardown().await;
         assert_eq!(
             status,
@@ -28713,15 +28796,30 @@ mod proxy_scan_block_tests {
         )
         .await;
 
-        let stale_status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &stale_layer)
-            .await
-            .expect("stale lookup");
-        let fresh_status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &fresh_layer)
-            .await
-            .expect("fresh lookup");
-        let clean_status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &clean_layer)
-            .await
-            .expect("clean lookup");
+        let stale_status = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &stale_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("stale lookup");
+        let fresh_status = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &fresh_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("fresh lookup");
+        let clean_status = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &clean_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("clean lookup");
 
         for digest in [&stale_digest, &fresh_digest, &clean_digest] {
             cleanup_proxy_scan_row(&fx.pool, digest.strip_prefix("sha256:").unwrap()).await;
@@ -28830,14 +28928,21 @@ mod proxy_scan_block_tests {
             verdict: "vulnerable".to_string(),
             scanned_at: now - chrono::Duration::days(age_days),
             scanner_version: version.map(|v| v.to_string()),
+            max_severity: Some("critical".to_string()),
         };
+        let gate = crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny;
 
         assert_eq!(
-            classify_blob_verdicts(&[], Some("grype-1.0.0"), now),
+            classify_blob_verdicts(&[], Some("grype-1.0.0"), gate, now),
             BlobVerdictStatus::NoVerdict
         );
         assert_eq!(
-            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], Some("grype-1.0.0"), now),
+            classify_blob_verdicts(
+                &[mk(1, Some("grype-1.0.0"))],
+                Some("grype-1.0.0"),
+                gate,
+                now
+            ),
             BlobVerdictStatus::Blocking,
             "a current verdict blocks"
         );
@@ -28845,6 +28950,7 @@ mod proxy_scan_block_tests {
             classify_blob_verdicts(
                 &[mk(DEDUP_TTL_DAYS as i64 + 1, Some("grype-1.0.0"))],
                 Some("grype-1.0.0"),
+                gate,
                 now
             ),
             BlobVerdictStatus::StaleOnly,
@@ -28852,18 +28958,23 @@ mod proxy_scan_block_tests {
              hold a standing block"
         );
         assert_eq!(
-            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], Some("grype-2.0.0"), now),
+            classify_blob_verdicts(
+                &[mk(1, Some("grype-1.0.0"))],
+                Some("grype-2.0.0"),
+                gate,
+                now
+            ),
             BlobVerdictStatus::StaleOnly,
             "#2976: a scanner-version change invalidates the verdict on this seam too"
         );
         assert_eq!(
-            classify_blob_verdicts(&[mk(1, None)], Some("grype-1.0.0"), now),
+            classify_blob_verdicts(&[mk(1, None)], Some("grype-1.0.0"), gate, now),
             BlobVerdictStatus::Blocking,
             "an unknown stored version cannot PROVE staleness; TTL alone decides, and the \
              block stays on"
         );
         assert_eq!(
-            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], None, now),
+            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], None, gate, now),
             BlobVerdictStatus::Blocking,
             "an unreadable live version cannot prove staleness either — fail closed"
         );
@@ -28874,11 +28985,81 @@ mod proxy_scan_block_tests {
                     mk(1, Some("grype-1.0.0")),
                 ],
                 Some("grype-1.0.0"),
+                gate,
                 now
             ),
             BlobVerdictStatus::Blocking,
             "ANY-not-ALL is preserved: one still-reusable verdict blocks, and a stale \
              sibling must not unlock it"
+        );
+    }
+
+    /// #3243 stage 3: the blob seam applies the repo's severity threshold with
+    /// the same fail-closed edges as the manifest gate — a KNOWN severity
+    /// strictly below the threshold releases the ref, an absent/unparseable
+    /// stored severity keeps blocking, and `BlockOnAny` (the non-opted-in
+    /// posture) ignores severity entirely.
+    #[test]
+    fn classify_blob_verdicts_severity_threshold() {
+        use crate::models::security::Severity;
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        let now = chrono::Utc::now();
+        let mk = |max_severity: Option<&str>| BlobVerdictRef {
+            verdict: "vulnerable".to_string(),
+            scanned_at: now - chrono::Duration::days(1),
+            scanner_version: Some("grype-1.0.0".to_string()),
+            max_severity: max_severity.map(|v| v.to_string()),
+        };
+        let high = ProxySeverityGate::Threshold(Severity::High);
+
+        assert_eq!(
+            classify_blob_verdicts(&[mk(Some("low"))], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::NoVerdict,
+            "a verdict below the opted-in threshold must not block the blob \
+             (the manifest for the same image serves)"
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(Some("critical"))], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::Blocking,
+            "at-or-above the threshold still blocks"
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(None)], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::Blocking,
+            "fail closed: a legacy row with no stored max_severity blocks even \
+             under a configured threshold"
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(Some("bogus"))], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::Blocking,
+            "fail closed: an unparseable stored max_severity blocks"
+        );
+        assert_eq!(
+            classify_blob_verdicts(
+                &[mk(Some("low"))],
+                Some("grype-1.0.0"),
+                ProxySeverityGate::BlockOnAny,
+                now
+            ),
+            BlobVerdictStatus::Blocking,
+            "a repo that has not opted in keeps block-on-any"
+        );
+        assert_eq!(
+            classify_blob_verdicts(
+                &[mk(Some("low")), mk(Some("critical"))],
+                Some("grype-1.0.0"),
+                high,
+                now
+            ),
+            BlobVerdictStatus::Blocking,
+            "ANY-not-ALL survives the threshold: one blocking ref blocks the blob"
+        );
+        // A below-threshold ref is OUT OF SCOPE, not merely stale: it must not
+        // hold the blob in StaleOnly (which would withhold under fail_closed).
+        assert_eq!(
+            classify_blob_verdicts(&[mk(Some("info"))], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::NoVerdict,
+            "a below-threshold ref neither blocks nor withholds"
         );
     }
 
@@ -29384,9 +29565,14 @@ mod virtual_scan_gate_tests {
             .expect("seed vulnerable verdict");
 
         // Empty member set -> never blocks.
-        let empty = blob_vulnerable_verdict_status_any(&fx.state, &[], &config_digest)
-            .await
-            .expect("empty ids lookup");
+        let empty = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &[],
+            &config_digest,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("empty ids lookup");
         assert_eq!(
             empty,
             BlobVerdictStatus::NoVerdict,
@@ -29394,10 +29580,14 @@ mod virtual_scan_gate_tests {
         );
 
         // A member set NOT containing the recording member -> no refs -> false.
-        let other =
-            blob_vulnerable_verdict_status_any(&fx.state, &[Uuid::new_v4()], &config_digest)
-                .await
-                .expect("other ids lookup");
+        let other = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &[Uuid::new_v4()],
+            &config_digest,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("other ids lookup");
         assert_eq!(
             other,
             BlobVerdictStatus::NoVerdict,
@@ -29409,6 +29599,7 @@ mod virtual_scan_gate_tests {
             &fx.state,
             &[Uuid::new_v4(), member_id],
             &config_digest,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
         )
         .await
         .expect("spanning lookup");
@@ -29490,15 +29681,30 @@ mod virtual_scan_gate_tests {
         );
 
         let span = [Uuid::new_v4(), member_id];
-        let stale_status = blob_vulnerable_verdict_status_any(&fx.state, &span, &stale_layer)
-            .await
-            .expect("stale span lookup");
-        let fresh_status = blob_vulnerable_verdict_status_any(&fx.state, &span, &fresh_layer)
-            .await
-            .expect("fresh span lookup");
-        let clean_status = blob_vulnerable_verdict_status_any(&fx.state, &span, &clean_layer)
-            .await
-            .expect("clean span lookup");
+        let stale_status = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &span,
+            &stale_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("stale span lookup");
+        let fresh_status = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &span,
+            &fresh_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("fresh span lookup");
+        let clean_status = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &span,
+            &clean_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("clean span lookup");
 
         for digest in [&stale_digest, &fresh_digest, &clean_digest] {
             cleanup_refs(&fx.pool, member_id, digest).await;

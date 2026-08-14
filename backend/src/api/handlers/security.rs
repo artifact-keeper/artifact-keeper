@@ -583,11 +583,14 @@ pub struct ScanConfigResponse {
     pub scan_enabled: bool,
     pub scan_on_upload: bool,
     pub scan_on_proxy: bool,
-    /// Persisted and returned, but not currently consulted by any enforcement
-    /// gate — blocking is configured via scan policies instead (#3144/#3246).
+    /// Opt-in that makes `severity_threshold` enforced on the proxy/OCI
+    /// inline scan gate (#3243/#3246). When false (default), the gate blocks
+    /// on any finding above `info`. Hosted-artifact blocking remains
+    /// configured via scan policies.
     pub block_on_policy_violation: bool,
-    /// Persisted and returned, but not currently consulted by any enforcement
-    /// gate (#3243).
+    /// Severity floor for the inline proxy scan gate; live only when
+    /// `block_on_policy_violation` is set (#3243/#3246). Findings at or above
+    /// it block the pull.
     pub severity_threshold: String,
     /// #2954: fail-open (default) / fail-closed action for the inline proxy
     /// scan-on-fetch.

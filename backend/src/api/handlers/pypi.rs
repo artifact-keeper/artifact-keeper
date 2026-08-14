@@ -2604,12 +2604,8 @@ async fn serve_file(
                     .await
                     .unwrap_or(false)
                     {
-                        let action = crate::services::scan_config_service::ScanConfigService::new(
-                            state.db.clone(),
-                        )
-                        .proxy_scan_action(repo.id)
-                        .await
-                        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+                        let (action, severity_gate) =
+                            proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                         return serve_scanned_pypi_file(
                             state,
                             proxy,
@@ -2619,6 +2615,7 @@ async fn serve_file(
                             project,
                             filename,
                             action,
+                            severity_gate,
                             ctx,
                         )
                         .await;
@@ -2893,7 +2890,7 @@ async fn serve_file(
                             // a not-found or other error falls through to the next
                             // member. A member with scanning disabled keeps the
                             // untouched streaming cache path below (no regression).
-                            let (scan_enabled, action) =
+                            let (scan_enabled, action, severity_gate) =
                                 proxy_helpers::effective_virtual_scan_policy(
                                     &state.db, repo.id, member.id,
                                 )
@@ -2908,6 +2905,7 @@ async fn serve_file(
                                     project,
                                     filename,
                                     action,
+                                    severity_gate,
                                     ctx,
                                 )
                                 .await
@@ -3698,6 +3696,7 @@ async fn serve_scanned_pypi_file(
     project: &NormalizedProjectName,
     filename: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
@@ -3827,6 +3826,7 @@ async fn serve_scanned_pypi_file(
         synthetic,
         &bytes,
         action,
+        severity_gate,
         identity,
         proxy_helpers::ProxyScanMode::File,
     )
