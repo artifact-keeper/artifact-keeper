@@ -1032,7 +1032,7 @@ async fn download(
         }
     }
 
-    // 2. Check if this is a maven-metadata.xml request
+    // 2a. Check if this is a maven-metadata.xml request
     if MavenHandler::is_metadata(&path) {
         let content =
             fetch_maven_metadata_bytes(&state, &repo, &repo_key, &path, auth.as_ref()).await?;

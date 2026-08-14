@@ -220,7 +220,7 @@ impl MavenHandler {
     }
 
     /// Render a Maven repository prefix file
-    /// (https://links.sonatype.com/products/nxrm3/docs/repository-prefixes)
+    /// (https://maven.apache.org/resolver/remote-repository-filtering.html#the-prefixes-filter)
     /// from groupId path prefixes such as `/org/apache/maven`. Sorts and
     /// dedupes the input.
     pub fn generate_prefixes_txt(mut group_paths: Vec<String>) -> String {
