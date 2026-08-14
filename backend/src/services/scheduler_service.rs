@@ -410,7 +410,8 @@ pub fn spawn_all(
                 };
                 // A pass can outlive the fixed TTL on a large registry; keep
                 // the lease alive for as long as this one runs.
-                let lease_renewal = lease.spawn_renewal(lease_db.clone(), STORAGE_GC_LEASE_TTL_SECS);
+                let lease_renewal =
+                    lease.spawn_renewal(lease_db.clone(), STORAGE_GC_LEASE_TTL_SECS);
 
                 tracing::info!("Running scheduled storage garbage collection");
 
