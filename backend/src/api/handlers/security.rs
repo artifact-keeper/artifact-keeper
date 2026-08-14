@@ -2362,6 +2362,61 @@ mod tests {
         fx.cleanup(&[]).await;
     }
 
+    /// Route registration and the wire status code, over the real URL rather
+    /// than a direct handler call: a typo in the path would make every
+    /// unauthenticated probe 404 instead of 401, which is indistinguishable
+    /// from "this deployment does not have the feature" and would silently
+    /// leave the web on its fallback rendering.
+    #[tokio::test]
+    async fn proxy_scans_route_is_mounted_and_401s_anonymously() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool).await;
+        let app = tdh::router_anon(repo_security_router(), fx.state());
+        let (status, _body) = tdh::send(
+            app,
+            Request::builder()
+                .uri(format!("/{}/security/proxy-scans", fx.key))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the route must be mounted and reject anonymous callers"
+        );
+
+        let app = tdh::router_with_auth(
+            repo_security_router(),
+            fx.state(),
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+        let (status, body) = tdh::send(
+            app,
+            Request::builder()
+                .uri(format!("/{}/security/proxy-scans?per_page=5", fx.key))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["repository_key"], serde_json::json!(fx.key));
+        assert_eq!(json["per_page"], serde_json::json!(5));
+        assert_eq!(json["summary"]["total_digests"], serde_json::json!(0));
+        assert!(
+            !String::from_utf8_lossy(&body).contains("repository_id"),
+            "the wire response must not carry repository_id"
+        );
+
+        fx.cleanup(&[]).await;
+    }
+
     /// Summary counts DISTINCT DIGESTS, not paths: one repository routinely
     /// caches the same bytes at several paths. NULL-checksum placeholders are
     /// excluded from every state and reported as `pending_ingest` so the totals
