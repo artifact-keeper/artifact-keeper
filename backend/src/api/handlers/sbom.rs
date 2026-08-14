@@ -31,11 +31,20 @@ use crate::services::sbom_service::{DependencyInfo, LicenseCheckResult, SbomServ
 /// scanned and blocked at download time under the repository's scan-on-proxy
 /// policy. Messages that describe a capability with a proxy equivalent must
 /// point the caller at it.
-pub(crate) const SBOM_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for SBOM generation: SBOM generation is available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts are still scanned for vulnerabilities at download time when scan-on-proxy is enabled for the repository.";
+pub(crate) const SBOM_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for SBOM generation: SBOM generation is available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository.";
 
-pub(crate) const ON_DEMAND_SCAN_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for on-demand scanning: on-demand scans are available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached remote artifacts are scanned automatically at download time when scan-on-proxy is enabled for the repository.";
+pub(crate) const ON_DEMAND_SCAN_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for on-demand scanning: on-demand scans are available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository.";
 
 pub(crate) const SIGNING_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for signing: signing is available only for artifacts hosted in this registry, not proxy-cached remote artifacts.";
+
+/// CVE history is recorded only for artifacts scanned as part of a hosted
+/// upload or an on-demand scan; there is no `artifacts` row (and therefore no
+/// `scan_results`/`cve_status` history) for a proxy-cached object under its
+/// synthetic id (#1278/#1280). This is the message `ensure_artifact_repo_access`
+/// hands to the three CVE-history endpoints (list/get by artifact, update
+/// status by artifact+CVE) so a caller asking about CVE history is not told
+/// the SBOM-specific "not eligible for SBOM generation" (#3344 finding 2).
+pub(crate) const CVE_HISTORY_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for CVE history: CVE history is recorded only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository.";
 
 /// Emit an audit log entry for an SBOM action against an artifact. Failures
 /// are logged but never propagated: the mutation/read is already complete and
@@ -443,7 +452,7 @@ async fn list_sboms(
     // also enforces access (callers cannot list a repo's SBOMs without
     // having access to that repo).
     if let Some(artifact_id) = query.artifact_id {
-        ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+        ensure_artifact_repo_access(&state.db, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
     }
     // #3174: this branch used to gate on `auth.can_access_repo(repo_id)` alone.
     // That is the caller's TOKEN SCOPE, not repository visibility: it resolves
@@ -594,7 +603,7 @@ async fn get_sbom_by_artifact(
     Path(artifact_id): Path<Uuid>,
     Query(query): Query<ListSbomsQuery>,
 ) -> Result<Json<SbomContentResponse>> {
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
     let service = SbomService::new(state.db.clone());
     let format = query
         .format
@@ -926,7 +935,13 @@ async fn get_cve_history(
 
     match classify_cve_history_path(&id) {
         CveHistoryPath::Artifact(artifact_id) => {
-            ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+            ensure_artifact_repo_access(
+                &state.db,
+                &auth,
+                artifact_id,
+                CVE_HISTORY_NOT_AVAILABLE_MSG,
+            )
+            .await?;
             let entries = service.get_cve_history(artifact_id).await?;
             Ok(Json(entries))
         }
@@ -967,7 +982,8 @@ async fn get_cve_history_by_artifact(
     Path(artifact_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
     let service = SbomService::new(state.db.clone());
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG)
+        .await?;
     let entries = service.get_cve_history(artifact_id).await?;
     Ok(Json(entries))
 }
@@ -1147,7 +1163,8 @@ async fn update_cve_status_by_artifact_cve(
     if !is_valid_vuln_id(&cve_id) {
         return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
     }
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG)
+        .await?;
     let service = SbomService::new(state.db.clone());
     let status = CveStatus::parse(&body.status)
         .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
@@ -1731,10 +1748,21 @@ async fn ensure_repo_visibility(
 
 /// Resolve `artifact_id → (repository_id, is_public)` and apply
 /// [`require_repo_visibility`].
+///
+/// `missing_msg` is caller-supplied rather than hardcoded because this helper
+/// guards endpoints with two different capability contracts: the SBOM read
+/// endpoints (`list_sboms`, `get_sbom_by_artifact`) should 404 with
+/// [`SBOM_NOT_AVAILABLE_MSG`], while the CVE-history endpoints
+/// (`get_cve_history`, `get_cve_history_by_artifact`,
+/// `update_cve_status_by_artifact_cve`) should 404 with
+/// [`CVE_HISTORY_NOT_AVAILABLE_MSG`] — telling a CVE-history caller they're
+/// "not eligible for SBOM generation" names the wrong capability (#3344
+/// finding 2).
 async fn ensure_artifact_repo_access(
     db: &sqlx::PgPool,
     auth: &AuthExtension,
     artifact_id: Uuid,
+    missing_msg: &'static str,
 ) -> Result<()> {
     let repo: Option<(Uuid, bool)> = sqlx::query_as(
         "SELECT r.id, r.is_public FROM artifacts a \
@@ -1746,7 +1774,7 @@ async fn ensure_artifact_repo_access(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    require_repo_visibility(db, auth, repo, SBOM_NOT_AVAILABLE_MSG).await
+    require_repo_visibility(db, auth, repo, missing_msg).await
 }
 
 /// Like [`ensure_artifact_repo_access`] but resolves through `sbom_documents`
@@ -2505,6 +2533,7 @@ mod tests {
             SBOM_NOT_AVAILABLE_MSG,
             ON_DEMAND_SCAN_NOT_AVAILABLE_MSG,
             SIGNING_NOT_AVAILABLE_MSG,
+            CVE_HISTORY_NOT_AVAILABLE_MSG,
         ] {
             assert!(
                 !msg.contains("SBOM generation and security scanning"),
@@ -2517,26 +2546,148 @@ mod tests {
             );
         }
 
-        // The two messages for capabilities that DO have a proxy equivalent
+        // The three messages for capabilities that DO have a proxy equivalent
         // must point the caller at it rather than dead-ending.
         assert!(SBOM_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
         assert!(ON_DEMAND_SCAN_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+        assert!(CVE_HISTORY_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
 
         // Signing has no proxy equivalent, so it must not imply one.
         assert!(!SIGNING_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+
+        // #3344 finding 1: proxy scan-at-download-time is wired only for
+        // PyPI, npm and Docker/OCI. A message that talks about download-time
+        // scanning must name exactly those formats rather than implying it
+        // works for every proxy repo (e.g. Maven, Go, NuGet, RubyGems, none
+        // of which wire scan_on_proxy to anything).
+        for msg in [
+            SBOM_NOT_AVAILABLE_MSG,
+            ON_DEMAND_SCAN_NOT_AVAILABLE_MSG,
+            CVE_HISTORY_NOT_AVAILABLE_MSG,
+        ] {
+            assert!(
+                msg.contains("PyPI, npm and Docker/OCI"),
+                "message describes download-time scanning but does not name \
+                 the only formats it's wired for: {msg}"
+            );
+            assert!(
+                !msg.contains("still"),
+                "message should not claim scanning still/always happens \
+                 for proxy-cached artifacts (overclaims for unsupported \
+                 formats and over-cap artifacts): {msg}"
+            );
+        }
+
+        // Signing has no download-time-scanning claim at all, so it must not
+        // name the format list either.
+        assert!(!SIGNING_NOT_AVAILABLE_MSG.contains("PyPI, npm and Docker/OCI"));
     }
 
+    /// #3344 finding 3: nothing pinned which `*_NOT_AVAILABLE_MSG` constant
+    /// each handler actually passes. `cargo test --lib` (no DB) exercised
+    /// the constants' *content* but never their *wiring* — the eight
+    /// production call sites below could have their constants permuted
+    /// arbitrarily (e.g. `get_cve_history` handed the SBOM message, or
+    /// `sign_artifact` handed the CVE-history message) and every existing
+    /// test would still pass, because the DB-backed tests only assert on
+    /// `AppError::NotFound(_)` variant, never on the message text.
+    ///
+    /// Source-grep because these handlers need a full DB-backed
+    /// `SharedState` to invoke; follows the `body_of` pattern from
+    /// `security.rs`'s `test_repo_security_handlers_enforce_tenant_gate`.
     #[test]
-    fn test_sbom_visibility_denial_uses_the_sbom_message() {
-        // `ensure_artifact_repo_access` guards the SBOM and CVE-history
-        // endpoints, so its denial must be the SBOM-specific message.
-        let auth = make_auth(None, false);
-        let err = require_repo_access(&auth, None, SBOM_NOT_AVAILABLE_MSG).unwrap_err();
-        match err {
-            AppError::NotFound(msg) => assert_eq!(msg, SBOM_NOT_AVAILABLE_MSG),
-            other => panic!("expected NotFound with the SBOM message, got {:?}", other),
+    fn test_endpoint_to_not_available_message_wiring_is_pinned() {
+        fn body_of<'a>(source: &'a str, handler: &str) -> &'a str {
+            let marker = format!("async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+            &rest[..end]
         }
+
+        let sbom_src = include_str!("sbom.rs");
+        // SBOM read/write endpoints: eligible only for hosted artifacts,
+        // with a proxy scan-on-proxy pointer.
+        for handler in ["generate_sbom", "list_sboms", "get_sbom_by_artifact"] {
+            let body = body_of(sbom_src, handler);
+            assert!(
+                body.contains("SBOM_NOT_AVAILABLE_MSG"),
+                "{handler} must use SBOM_NOT_AVAILABLE_MSG for its not-found/\
+                 not-eligible response"
+            );
+            assert!(
+                !body.contains("CVE_HISTORY_NOT_AVAILABLE_MSG")
+                    && !body.contains("ON_DEMAND_SCAN_NOT_AVAILABLE_MSG")
+                    && !body.contains("SIGNING_NOT_AVAILABLE_MSG"),
+                "{handler} must not also reference a different capability's \
+                 not-available constant"
+            );
+        }
+
+        // CVE-history endpoints: must NOT get the SBOM-specific message
+        // (#3344 finding 2 — this is the exact defect this PR fixes).
+        for handler in [
+            "get_cve_history",
+            "get_cve_history_by_artifact",
+            "update_cve_status_by_artifact_cve",
+        ] {
+            let body = body_of(sbom_src, handler);
+            assert!(
+                body.contains("CVE_HISTORY_NOT_AVAILABLE_MSG"),
+                "{handler} must use CVE_HISTORY_NOT_AVAILABLE_MSG, not the \
+                 SBOM-specific message, for its not-found/not-eligible response"
+            );
+            assert!(
+                !body.contains("SBOM_NOT_AVAILABLE_MSG"),
+                "{handler} must not tell a CVE-history caller they're \
+                 \"not eligible for SBOM generation\" (#3344 finding 2)"
+            );
+        }
+
+        // On-demand scan trigger (security.rs) and signing (signing.rs) live
+        // in different files; each must use its own capability's constant.
+        let security_src = include_str!("security.rs");
+        let trigger_scan_body = body_of(security_src, "trigger_scan");
+        assert!(
+            trigger_scan_body.contains("ON_DEMAND_SCAN_NOT_AVAILABLE_MSG"),
+            "trigger_scan must use ON_DEMAND_SCAN_NOT_AVAILABLE_MSG"
+        );
+        assert!(
+            !trigger_scan_body.contains("SBOM_NOT_AVAILABLE_MSG")
+                && !trigger_scan_body.contains("CVE_HISTORY_NOT_AVAILABLE_MSG")
+                && !trigger_scan_body.contains("SIGNING_NOT_AVAILABLE_MSG"),
+            "trigger_scan must not also reference a different capability's \
+             not-available constant"
+        );
+
+        let signing_src = include_str!("signing.rs");
+        let sign_artifact_body = body_of(signing_src, "sign_artifact");
+        assert!(
+            sign_artifact_body.contains("SIGNING_NOT_AVAILABLE_MSG"),
+            "sign_artifact must use SIGNING_NOT_AVAILABLE_MSG"
+        );
+        assert!(
+            !sign_artifact_body.contains("SBOM_NOT_AVAILABLE_MSG")
+                && !sign_artifact_body.contains("CVE_HISTORY_NOT_AVAILABLE_MSG")
+                && !sign_artifact_body.contains("ON_DEMAND_SCAN_NOT_AVAILABLE_MSG"),
+            "sign_artifact must not also reference a different capability's \
+             not-available constant"
+        );
     }
+
+    // A test named `test_sbom_visibility_denial_uses_the_sbom_message` used to
+    // live here. It passed `SBOM_NOT_AVAILABLE_MSG` into `require_repo_access`
+    // and asserted the same constant came back out — tautological, since
+    // `require_repo_access` returns whatever `missing_msg` it is given
+    // (any string would have passed). That propagation behavior is already
+    // covered generically, with two different messages, by
+    // `test_require_repo_access_missing_msg_propagates` below. The actual
+    // question the deleted test's name implied — *which* constant each
+    // handler passes in — is what the source-scanning test
+    // `test_endpoint_to_not_available_message_wiring_is_pinned` now pins.
+    // Deleted rather than renamed (#3344 finding 4).
 
     #[test]
     fn test_require_repo_access_unrestricted_jwt_passes() {
@@ -3580,7 +3731,13 @@ mod tests {
         // Unrestricted JWT (allowed_repo_ids = Admin scope) — passes the old
         // token-scope-only gate but must now fail on private-repo membership.
         let auth = tdh::make_auth(outsider, &outname);
-        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        let res = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
         tdh::cleanup_user(&fx.pool, outsider).await;
         fx.teardown().await;
         assert!(
@@ -3598,7 +3755,13 @@ mod tests {
         };
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         let auth = tdh::make_auth(fx.user_id, &fx.username);
-        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        let res = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
         fx.teardown().await;
         assert!(res.is_ok(), "member must pass: {:?}", res.err());
     }
@@ -3612,7 +3775,13 @@ mod tests {
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         let (admin_id, admin_name) = tdh::create_user(&fx.pool).await;
         let auth = tdh::admin_auth(admin_id, &admin_name);
-        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        let res = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
         tdh::cleanup_user(&fx.pool, admin_id).await;
         fx.teardown().await;
         assert!(res.is_ok(), "admin bypass must pass: {:?}", res.err());
@@ -3628,7 +3797,13 @@ mod tests {
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         let (outsider, outname) = tdh::create_user(&fx.pool).await;
         let auth = tdh::make_auth(outsider, &outname);
-        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        let res = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
         tdh::cleanup_user(&fx.pool, outsider).await;
         fx.teardown().await;
         assert!(
