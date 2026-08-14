@@ -1838,23 +1838,28 @@ mod tests {
     /// Assert the write handler calls `require_repo_write_access` and the read
     /// handlers call `require_visible`. String-grep because the handlers need a
     /// full DB-backed `SharedState` to run.
+    /// Source text of one top-level `async fn` in this module, for the
+    /// authorization guards that cannot instantiate a DB-backed `SharedState`.
+    ///
+    /// The slice is bounded at the function's own closing brace (`\n}\n` at
+    /// column zero), NOT at the next `\nasync fn ` declaration: the async
+    /// helpers inside `mod tests` are indented, so a declaration-bounded slice
+    /// runs to EOF for the last handler in the file and matches the assertions
+    /// against the tests' own source, passing regardless of the handler.
+    fn handler_body(handler: &str) -> &'static str {
+        let source = include_str!("security.rs");
+        let marker = format!("async fn {}(", handler);
+        let start = source
+            .find(&marker)
+            .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+        let rest = &source[start + marker.len()..];
+        let end = rest.find("\n}\n").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
     #[test]
     fn test_repo_security_handlers_enforce_tenant_gate() {
-        let source = include_str!("security.rs");
-        // Bound the slice at the handler's own closing brace (`\n}\n` at column
-        // zero), NOT at the next `\nasync fn ` declaration: the handlers inside
-        // `mod tests` are indented, so a declaration-bounded slice runs to EOF
-        // for the last handler in the file and matches the assertions below
-        // against this test's own source, passing regardless of the handler.
-        let body_of = |handler: &str| -> &str {
-            let marker = format!("async fn {}(", handler);
-            let start = source
-                .find(&marker)
-                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
-            let rest = &source[start + marker.len()..];
-            let end = rest.find("\n}\n").unwrap_or(rest.len());
-            &rest[..end]
-        };
+        let body_of = handler_body;
         assert!(
             body_of("update_repo_security").contains("require_repo_write_access("),
             "update_repo_security must call require_repo_write_access (xtenant)"
@@ -1889,11 +1894,7 @@ mod tests {
     /// `proxy_scans_requires_auth_even_on_public_repo`.
     #[test]
     fn proxy_scans_authenticates_before_visibility_check() {
-        let source = include_str!("security.rs");
-        let marker = "async fn get_repo_proxy_scans(";
-        let start = source.find(marker).expect("handler not found");
-        let rest = &source[start + marker.len()..];
-        let body = &rest[..rest.find("\n}\n").unwrap_or(rest.len())];
+        let body = handler_body("get_repo_proxy_scans");
         let auth_at = body
             .find("auth.ok_or_else(")
             .expect("get_repo_proxy_scans must reject an unauthenticated caller");
@@ -1931,12 +1932,8 @@ mod tests {
             "fetch_proxy_scan_path",
             "fetch_proxy_scan_page",
         ] {
-            let marker = format!("async fn {}(", fetcher);
-            let start = source.find(&marker).expect("fetcher not found");
-            let rest = &source[start + marker.len()..];
-            let body = &rest[..rest.find("\n}\n").unwrap_or(rest.len())];
             assert!(
-                body.contains("PROXY_SCAN_TYPE"),
+                handler_body(fetcher).contains("PROXY_SCAN_TYPE"),
                 "{} must bind PROXY_SCAN_TYPE",
                 fetcher
             );
@@ -2171,6 +2168,438 @@ mod tests {
         assert_eq!(json["proxy_scan_action"], serde_json::json!("fail_open"));
     }
 
+    // -----------------------------------------------------------------------
+    // Proxy scan visibility -- DB-backed
+    // -----------------------------------------------------------------------
+
+    /// A user with visibility into a fresh proxy repository, plus the read that
+    /// every DB-backed case below performs. Factored out so the four tests
+    /// carry only their own fixtures and assertions.
+    struct ProxyScanFixture {
+        pool: PgPool,
+        user_id: Uuid,
+        username: String,
+        repo_id: Uuid,
+        key: String,
+        dir: std::path::PathBuf,
+    }
+
+    impl ProxyScanFixture {
+        async fn new(pool: PgPool) -> Self {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+            tdh::grant_repo_access(&pool, repo_id, user_id).await;
+            Self {
+                pool,
+                user_id,
+                username,
+                repo_id,
+                key,
+                dir,
+            }
+        }
+
+        fn state(&self) -> SharedState {
+            crate::api::handlers::test_db_helpers::build_state(
+                self.pool.clone(),
+                self.dir.to_string_lossy().as_ref(),
+            )
+        }
+
+        async fn read(&self, query: ProxyScansQuery) -> Result<Json<ProxyScansResponse>> {
+            let auth =
+                crate::api::handlers::test_db_helpers::make_auth(self.user_id, &self.username);
+            get_repo_proxy_scans(
+                State(self.state()),
+                Extension(Some(auth)),
+                Path(self.key.clone()),
+                Query(query),
+            )
+            .await
+        }
+
+        /// Read and unwrap, for the cases where a failure is a test bug.
+        async fn read_ok(&self, query: ProxyScansQuery) -> ProxyScansResponse {
+            self.read(query).await.expect("proxy-scan read").0
+        }
+
+        /// `proxy_scan_results` rows survive repository deletion (the FK is
+        /// `ON DELETE SET NULL`), so digest-keyed fixtures are removed by hand.
+        async fn cleanup(self, digests: &[String]) {
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = ANY($1)")
+                .bind(digests)
+                .execute(&self.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+                .bind(self.repo_id)
+                .execute(&self.pool)
+                .await;
+            crate::api::handlers::test_db_helpers::cleanup(&self.pool, self.repo_id, self.user_id)
+                .await;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Insert one `proxy_cache_artifacts` row for `repo_id`.
+    async fn seed_cached_path(
+        pool: &PgPool,
+        repo_id: Uuid,
+        path: &str,
+        checksum: Option<&str>,
+        cached_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts \
+             (repository_id, path, storage_key, metadata_key, size_bytes, \
+              checksum_sha256, cached_at) \
+             VALUES ($1, $2, $3, $4, 1024, $5, $6)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(format!("proxy-cache/{}/{}/__content__", repo_id, path))
+        .bind(format!(
+            "proxy-cache/{}/{}/__cache_meta__.json",
+            repo_id, path
+        ))
+        .bind(checksum)
+        .bind(cached_at)
+        .execute(pool)
+        .await
+        .expect("seed proxy_cache_artifacts");
+    }
+
+    /// Insert one digest-keyed verdict. `scan_type` is a parameter so the
+    /// scan-type filter can be exercised with a second scanner's row.
+    async fn seed_proxy_verdict(
+        pool: &PgPool,
+        checksum: &str,
+        scan_type: &str,
+        verdict: &str,
+        findings: i32,
+        scanned_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let vulnerable = verdict == PROXY_STATE_VULNERABLE;
+        sqlx::query(
+            "INSERT INTO proxy_scan_results \
+             (checksum_sha256, scan_type, verdict, findings_count, critical_count, \
+              max_severity, scanned_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(checksum)
+        .bind(scan_type)
+        .bind(verdict)
+        .bind(findings)
+        .bind(i32::from(vulnerable))
+        .bind(vulnerable.then_some("critical"))
+        .bind(scanned_at)
+        .execute(pool)
+        .await
+        .expect("seed proxy_scan_results");
+    }
+
+    /// Shorthand for seeding a grype verdict, the scan type this endpoint reads.
+    async fn seed_grype_verdict(
+        pool: &PgPool,
+        checksum: &str,
+        verdict: &str,
+        findings: i32,
+        scanned_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        seed_proxy_verdict(
+            pool,
+            checksum,
+            crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+            verdict,
+            findings,
+            scanned_at,
+        )
+        .await;
+    }
+
+    /// A digest unique to this test run: `proxy_scan_results` is global by
+    /// content hash, so fixtures must not collide across parallel tests.
+    fn unique_digest() -> String {
+        format!("{:0>64}", Uuid::new_v4().simple())
+    }
+
+    /// The endpoint must 401 an anonymous caller even on a PUBLIC repository.
+    /// `require_visible` returns `Ok(())` immediately for `is_public`, so a
+    /// handler that gated on visibility alone would publish verdict counts to
+    /// the internet. DB-backed counterpart of
+    /// `proxy_scans_authenticates_before_visibility_check`.
+    #[tokio::test]
+    async fn proxy_scans_requires_auth_even_on_public_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+
+        let anon = get_repo_proxy_scans(
+            State(fx.state()),
+            Extension(None),
+            Path(fx.key.clone()),
+            Query(ProxyScansQuery::default()),
+        )
+        .await;
+        assert!(
+            matches!(anon, Err(AppError::Authentication(_))),
+            "anonymous read of a PUBLIC repo's proxy scans must 401, got {:?}",
+            anon.map(|_| "ok")
+        );
+
+        // The same request authenticated succeeds, proving the 401 came from
+        // the auth gate and not from a missing repository.
+        let ok = fx.read_ok(ProxyScansQuery::default()).await;
+        assert_eq!(ok.summary.expect("summary"), ProxyScanSummary::default());
+
+        fx.cleanup(&[]).await;
+    }
+
+    /// Summary counts DISTINCT DIGESTS, not paths: one repository routinely
+    /// caches the same bytes at several paths. NULL-checksum placeholders are
+    /// excluded from every state and reported as `pending_ingest` so the totals
+    /// still reconcile with the artifact listing.
+    #[tokio::test]
+    async fn proxy_scans_summary_counts_distinct_digests() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool).await;
+        let now = chrono::Utc::now();
+        let (clean, vuln, unscanned) = (unique_digest(), unique_digest(), unique_digest());
+        let seed = |path: &'static str, sum: Option<String>| {
+            let (pool, repo_id) = (fx.pool.clone(), fx.repo_id);
+            async move { seed_cached_path(&pool, repo_id, path, sum.as_deref(), now).await }
+        };
+
+        // The same clean digest cached at two paths is ONE clean digest.
+        seed("simple/a/a-1.0.whl", Some(clean.clone())).await;
+        seed("simple/a/a-1.0-copy.whl", Some(clean.clone())).await;
+        seed("simple/b/b-1.0.whl", Some(vuln.clone())).await;
+        seed("simple/c/c-1.0.whl", Some(unscanned.clone())).await;
+        // Placeholder row: the checksum was never backfilled.
+        seed("simple/d/d-1.0.whl", None).await;
+        seed_grype_verdict(&fx.pool, &clean, PROXY_STATE_CLEAN, 0, now).await;
+        seed_grype_verdict(&fx.pool, &vuln, PROXY_STATE_VULNERABLE, 4, now).await;
+
+        let resp = fx.read_ok(ProxyScansQuery::default()).await;
+
+        let summary = resp.summary.expect("list read carries a summary");
+        assert_eq!(
+            summary,
+            ProxyScanSummary {
+                clean: 1,
+                vulnerable: 1,
+                not_scanned: 1,
+                pending_ingest: 1,
+                total_digests: 3,
+            },
+            "summary must count distinct digests and bucket the placeholder"
+        );
+        assert_eq!(
+            summary.clean + summary.vulnerable + summary.not_scanned,
+            summary.total_digests,
+            "per-state counts must partition the distinct digests"
+        );
+        // The paged list is over PATHS and excludes the placeholder row.
+        assert_eq!(resp.total, 4);
+        assert_eq!(resp.items.len(), 4);
+        assert!(
+            resp.items
+                .iter()
+                .all(|i| i.state != PROXY_STATE_PENDING_INGEST),
+            "NULL-checksum rows must not appear in the paged list"
+        );
+        // Scanning was never configured for this repository -> the absent
+        // `scan_configs` row must read as disabled, not as `unknown`.
+        assert!(!resp.scan_on_proxy);
+        assert_eq!(resp.proxy_scan_action, DEFAULT_PROXY_SCAN_ACTION);
+        let not_scanned = resp
+            .items
+            .iter()
+            .find(|i| i.state == PROXY_STATE_NOT_SCANNED)
+            .expect("one not_scanned entry");
+        assert_eq!(
+            not_scanned.not_scanned_reason.as_deref(),
+            Some(PROXY_REASON_SCANNING_DISABLED)
+        );
+
+        fx.cleanup(&[clean, vuln]).await;
+    }
+
+    /// Two guarantees on the `?path=` read:
+    ///   * it resolves only within the calling repository, so a path cached by
+    ///     someone else 404s with the same body as a path nobody cached;
+    ///   * `scanned_at` is floored at the caller's own `cached_at`, so the
+    ///     response cannot date another tenant's earlier pull of identical
+    ///     bytes.
+    #[tokio::test]
+    async fn proxy_scans_path_lookup_is_repo_scoped_and_floors_scanned_at() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool.clone()).await;
+        let (other_id, _other_key, other_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+
+        let digest = unique_digest();
+        let cached_at = chrono::Utc::now();
+        // Another tenant pulled byte-identical content a month before we did.
+        let scanned_at = cached_at - chrono::Duration::days(30);
+        seed_cached_path(
+            &pool,
+            fx.repo_id,
+            "simple/x/x-1.0.whl",
+            Some(&digest),
+            cached_at,
+        )
+        .await;
+        seed_cached_path(
+            &pool,
+            other_id,
+            "simple/secret/s-1.0.whl",
+            Some(&digest),
+            cached_at,
+        )
+        .await;
+        seed_grype_verdict(&pool, &digest, PROXY_STATE_CLEAN, 0, scanned_at).await;
+
+        let query = |path: &str| ProxyScansQuery {
+            path: Some(path.to_string()),
+            ..Default::default()
+        };
+
+        let mine = fx.read_ok(query("simple/x/x-1.0.whl")).await;
+        assert!(mine.summary.is_none(), "path read omits the summary");
+        assert_eq!(mine.items.len(), 1);
+        assert_eq!(mine.items[0].state, PROXY_STATE_CLEAN);
+        assert_eq!(
+            mine.items[0].scanned_at,
+            Some(cached_at),
+            "scanned_at must be floored at this repository's own cached_at"
+        );
+
+        // The other repository's path is cached, and shares our digest, but is
+        // not ours: the same 404 as a path that was never cached at all.
+        let foreign = fx.read(query("simple/secret/s-1.0.whl")).await;
+        let absent = fx.read(query("simple/never/n-1.0.whl")).await;
+        let msg = |r: Result<Json<ProxyScansResponse>>| match r {
+            Err(AppError::NotFound(m)) => m,
+            other => panic!("expected NotFound, got {:?}", other.map(|_| "ok")),
+        };
+        assert_eq!(msg(foreign), msg(absent), "404 bodies must be identical");
+
+        fx.cleanup(&[digest]).await;
+        tdh::cleanup_member_repo(&pool, other_id, &other_dir).await;
+    }
+
+    /// `uq_proxy_scan` is `(checksum_sha256, scan_type)`, so a second scanner
+    /// writing verdicts for the same digest is legal. The join must filter on
+    /// `PROXY_SCAN_TYPE`: unfiltered, the entry would either duplicate or pick
+    /// up a foreign scanner's verdict.
+    #[tokio::test]
+    async fn proxy_scans_ignore_other_scan_types() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool.clone()).await;
+        let digest = unique_digest();
+        let now = chrono::Utc::now();
+        seed_cached_path(&pool, fx.repo_id, "simple/y/y-1.0.whl", Some(&digest), now).await;
+        // A different scan type only. The grype-keyed read must not see it.
+        seed_proxy_verdict(&pool, &digest, "trivy", PROXY_STATE_CLEAN, 0, now).await;
+
+        // Turn proxy scanning ON so the reason distinguishes "disabled" from
+        // "no row for this scanner".
+        ScanConfigService::new(pool.clone())
+            .upsert_config(
+                fx.repo_id,
+                &UpsertScanConfigRequest {
+                    scan_on_proxy: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("enable scan_on_proxy");
+
+        let resp = fx.read_ok(ProxyScansQuery::default()).await;
+
+        assert!(resp.scan_on_proxy, "enforcement context must be reported");
+        assert_eq!(resp.items.len(), 1, "the join must not duplicate the path");
+        assert_eq!(resp.items[0].state, PROXY_STATE_NOT_SCANNED);
+        assert_eq!(
+            resp.items[0].not_scanned_reason.as_deref(),
+            Some(PROXY_REASON_UNKNOWN),
+            "scanning is enabled, so the reason is unknown -- not disabled"
+        );
+        let summary = resp.summary.expect("summary");
+        assert_eq!(summary.not_scanned, 1);
+        assert_eq!(summary.clean, 0);
+
+        fx.cleanup(&[digest]).await;
+    }
+
+    /// Paging must not run off the end of the catalog, and `total` counts the
+    /// paths the list can return (placeholders excluded), so a client can page
+    /// to exactly the last entry.
+    #[tokio::test]
+    async fn proxy_scans_pages_the_catalog() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool.clone()).await;
+        let base = chrono::Utc::now();
+        let mut digests = Vec::new();
+        for i in 0..3i64 {
+            let d = unique_digest();
+            seed_cached_path(
+                &pool,
+                fx.repo_id,
+                &format!("simple/p/p-{}.whl", i),
+                Some(&d),
+                base - chrono::Duration::minutes(i),
+            )
+            .await;
+            digests.push(d);
+        }
+        seed_cached_path(&pool, fx.repo_id, "simple/p/pending.whl", None, base).await;
+
+        let page = |page: i64| ProxyScansQuery {
+            path: None,
+            page: Some(page),
+            per_page: Some(2),
+        };
+
+        let first = fx.read_ok(page(1)).await;
+        assert_eq!(first.total, 3, "placeholder rows are not listable");
+        assert_eq!(first.per_page, 2);
+        assert_eq!(first.items.len(), 2);
+        // Newest cache entry first.
+        assert_eq!(first.items[0].path, "simple/p/p-0.whl");
+
+        let second = fx.read_ok(page(2)).await;
+        assert_eq!(second.page, 2);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].path, "simple/p/p-2.whl");
+
+        assert!(
+            fx.read_ok(page(9)).await.items.is_empty(),
+            "past the end is empty"
+        );
+
+        fx.cleanup(&digests).await;
+    }
+
     /// DB-backed (#2750, sibling of #2603): a non-admin member holding only
     /// `write` (developer role via `grant_repo_access`, no fine-grained `admin`
     /// grant) is DENIED `update_repo_security`, and the denied request must not
@@ -2264,19 +2693,9 @@ mod tests {
     /// need a full DB-backed `SharedState` to run.
     #[test]
     fn test_global_policy_write_handlers_require_admin() {
-        let source = include_str!("security.rs");
-        let body_of = |handler: &str| -> &str {
-            let marker = format!("async fn {}(", handler);
-            let start = source
-                .find(&marker)
-                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
-            let rest = &source[start + marker.len()..];
-            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
-            &rest[..end]
-        };
         for writer in ["create_policy", "update_policy", "delete_policy"] {
             assert!(
-                body_of(writer).contains("require_admin("),
+                handler_body(writer).contains("require_admin("),
                 "{} must call require_admin (global policy write is admin-only)",
                 writer
             );
