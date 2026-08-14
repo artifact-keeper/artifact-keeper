@@ -56,6 +56,23 @@ pub fn router() -> Router<SharedState> {
         .route("/:repo_key/api/charts/:name/:version", delete(delete_chart))
 }
 
+/// ChartMuseum `cm-push` compatibility router, mounted at `/api/helm` (#2941).
+///
+/// The `cm-push` plugin constructs its push URL as
+/// `{context_path}/api/{repo_path_minus_context}/charts`
+/// (<https://github.com/chartmuseum/helm-push/blob/main/pkg/chartmuseum/upload.go>).
+/// With a repository URL of `https://host/helm/{repo}` and no `--context-path`
+/// that resolves to `POST /api/helm/{repo}/charts` and
+/// `DELETE /api/helm/{repo}/charts/{name}/{version}` — not the native
+/// `/{repo}/api/charts` shape [`router`] serves. This router exposes the same
+/// upload/delete handlers under the plugin's default shape so `helm cm-push`
+/// works against a plain repo URL.
+pub fn cm_push_router() -> Router<SharedState> {
+    Router::new()
+        .route("/:repo_key/charts", post(upload_chart))
+        .route("/:repo_key/charts/:name/:version", delete(delete_chart))
+}
+
 // ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
@@ -1983,6 +2000,62 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
             multipart_body("BOUNDARY", parts),
         );
         tdh::send(app, req).await
+    }
+
+    // -----------------------------------------------------------------------
+    // cm-push default URL shape (#2941)
+    // -----------------------------------------------------------------------
+
+    /// `helm cm-push` POSTs to `{host}/api/helm/{repo}/charts` (the
+    /// ChartMuseum context-path shape), not this registry's native
+    /// `/{repo}/api/charts`. The `/api/helm` alias router must accept the
+    /// plugin's default upload and delete URLs.
+    #[tokio::test]
+    async fn test_cm_push_default_url_shape_uploads_and_deletes() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = build_tgz(
+            "cmpushchart/Chart.yaml",
+            b"apiVersion: v2\nname: cmpushchart\nversion: 0.1.0\n",
+        );
+
+        // POST the exact URL cm-push constructs for repo URL {host}/helm/{repo}.
+        let app =
+            f.router_with_auth(Router::new().nest("/api/helm", super::cm_push_router()));
+        let req = tdh::post(
+            format!("/api/helm/{}/charts", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart_body("BOUNDARY", &[("chart", "cmpushchart-0.1.0.tgz", &tgz)]),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "cm-push's default push URL must be accepted; got body {:?}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // The chart is downloadable at the native path.
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/charts/cmpushchart-0.1.0.tgz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // DELETE via the same ChartMuseum shape.
+        let app =
+            f.router_with_auth(Router::new().nest("/api/helm", super::cm_push_router()));
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/helm/{}/charts/cmpushchart/0.1.0", f.repo_key))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        f.teardown().await;
     }
 
     /// The core of #2635: a `.prov` uploaded next to its chart must be

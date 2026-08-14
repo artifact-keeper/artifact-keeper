@@ -4237,6 +4237,38 @@ mod index_content_encoding_tests {
         Router::new().nest("/cargo", super::router())
     }
 
+    /// #3000: the documented cargo setup points the sparse registry index at
+    /// `sparse+{base}/api/cargo/{repo}/`, so cargo resolves `config.json`
+    /// (and the sparse index files) under the `/api` prefix. The `/api/cargo`
+    /// alias in `routes.rs` mounts this same router there; a newly created
+    /// cargo repo must answer `config.json` through it instead of 404ing
+    /// with cargo's "config.json not found".
+    #[tokio::test]
+    async fn test_config_json_served_under_api_cargo_alias() {
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        let app = fx.router_anon(Router::new().nest("/api/cargo", super::router()));
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/api/cargo/{}/config.json", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "config.json must resolve under the /api/cargo alias; got body {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("config.json body");
+        let dl = json["dl"].as_str().expect("dl field");
+        assert!(
+            dl.ends_with(&format!("/cargo/{}/api/v1/crates", fx.repo_key)),
+            "dl must point at the canonical /cargo download endpoint, got {dl}"
+        );
+        fx.teardown().await;
+    }
+
     /// Builder guard: the coded index builder declares the coding.
     #[test]
     fn test_index_response_coded_forwards_content_encoding() {
