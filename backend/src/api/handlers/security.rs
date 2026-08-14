@@ -19,6 +19,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::security::ScanResult;
 use crate::services::policy_service::PolicyService;
+use crate::services::proxy_catalog;
 use crate::services::repository_service::RepositoryService;
 use crate::services::scan_config_service::{ScanConfigService, UpsertScanConfigRequest};
 use crate::services::scan_result_service::ScanResultService;
@@ -1455,7 +1456,15 @@ const PROXY_PATH_NOT_FOUND_MSG: &str = "No proxy-cached artifact at that path";
 /// mandatory: `uq_proxy_scan` is `(checksum_sha256, scan_type)`, so an
 /// unfiltered join fans a path out into one row per scan type the day a second
 /// scanner writes verdicts.
-const PROXY_SCAN_SELECT: &str = r#"
+///
+/// Cached upstream index responses are excluded through the shared
+/// [`proxy_catalog::not_cached_index_sql`] predicate -- the same one the
+/// artifact listing uses, so the two views cannot disagree. An HTML index page
+/// has no package inventory, so counting it as `not_scanned` is a permanent
+/// false positive with no available remedy.
+fn proxy_scan_select() -> String {
+    format!(
+        r#"
     SELECT pca.path, pca.checksum_sha256, pca.size_bytes, pca.cached_at,
            psr.verdict, psr.findings_count, psr.critical_count, psr.high_count,
            psr.medium_count, psr.low_count, psr.max_severity, psr.scanned_at
@@ -1464,7 +1473,11 @@ const PROXY_SCAN_SELECT: &str = r#"
              ON psr.checksum_sha256 = pca.checksum_sha256
             AND psr.scan_type = $2
      WHERE pca.repository_id = $1
-"#;
+       AND {not_index}
+"#,
+        not_index = proxy_catalog::not_cached_index_sql("pca.path"),
+    )
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ProxyScanRow {
@@ -1628,7 +1641,7 @@ impl ProxyScanEntry {
 
 /// Per-state counts over distinct digests for one repository.
 async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxyScanSummary> {
-    sqlx::query_as::<_, ProxyScanSummary>(
+    sqlx::query_as::<_, ProxyScanSummary>(&format!(
         r#"
         SELECT
             COUNT(DISTINCT pca.checksum_sha256)
@@ -1646,8 +1659,10 @@ async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxySca
                  ON psr.checksum_sha256 = pca.checksum_sha256
                 AND psr.scan_type = $2
          WHERE pca.repository_id = $1
+           AND {not_index}
         "#,
-    )
+        not_index = proxy_catalog::not_cached_index_sql("pca.path"),
+    ))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
     .fetch_one(db)
@@ -1662,7 +1677,7 @@ async fn fetch_proxy_scan_path(
     repo_id: Uuid,
     path: &str,
 ) -> Result<Option<ProxyScanRow>> {
-    sqlx::query_as::<_, ProxyScanRow>(&format!("{PROXY_SCAN_SELECT} AND pca.path = $3"))
+    sqlx::query_as::<_, ProxyScanRow>(&format!("{} AND pca.path = $3", proxy_scan_select()))
         .bind(repo_id)
         .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
         .bind(path)
@@ -1679,8 +1694,9 @@ async fn fetch_proxy_scan_page(
     offset: i64,
 ) -> Result<Vec<ProxyScanRow>> {
     sqlx::query_as::<_, ProxyScanRow>(&format!(
-        "{PROXY_SCAN_SELECT} AND pca.checksum_sha256 IS NOT NULL \
-         ORDER BY pca.cached_at DESC, pca.path ASC LIMIT $3 OFFSET $4"
+        "{} AND pca.checksum_sha256 IS NOT NULL \
+         ORDER BY pca.cached_at DESC, pca.path ASC LIMIT $3 OFFSET $4",
+        proxy_scan_select()
     ))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
@@ -1694,10 +1710,11 @@ async fn fetch_proxy_scan_page(
 /// Paths eligible for the paged list (NULL-checksum placeholders excluded, to
 /// match the rows the page actually returns).
 async fn count_proxy_scan_paths(db: &PgPool, repo_id: Uuid) -> Result<i64> {
-    sqlx::query_scalar::<_, i64>(
+    sqlx::query_scalar::<_, i64>(&format!(
         "SELECT COUNT(*) FROM proxy_cache_artifacts \
-         WHERE repository_id = $1 AND checksum_sha256 IS NOT NULL",
-    )
+         WHERE repository_id = $1 AND checksum_sha256 IS NOT NULL AND {not_index}",
+        not_index = proxy_catalog::not_cached_index_sql("path"),
+    ))
     .bind(repo_id)
     .fetch_one(db)
     .await
@@ -1916,7 +1933,7 @@ mod tests {
     #[test]
     fn proxy_scan_queries_filter_on_scan_type_constant() {
         assert!(
-            PROXY_SCAN_SELECT.contains("psr.scan_type = $2"),
+            proxy_scan_select().contains("psr.scan_type = $2"),
             "the shared projection must filter the join on scan_type"
         );
         let source = include_str!("security.rs");
@@ -1947,7 +1964,8 @@ mod tests {
     /// types.
     #[test]
     fn proxy_scan_projection_never_selects_repository_id() {
-        let (projection, _) = PROXY_SCAN_SELECT
+        let select = proxy_scan_select();
+        let (projection, _) = select
             .split_once("FROM proxy_cache_artifacts")
             .expect("projection must read from the cache catalog");
         assert!(
@@ -1956,7 +1974,7 @@ mod tests {
             projection
         );
         assert!(
-            !PROXY_SCAN_SELECT.contains("psr.repository_id"),
+            !select.contains("psr.repository_id"),
             "proxy_scan_results.repository_id is another tenant's provenance"
         );
         let entry = ProxyScanEntry::from_row(sample_proxy_row(), true);
@@ -2601,6 +2619,131 @@ mod tests {
         assert_eq!(summary.clean, 0);
 
         fx.cleanup(&[digest]).await;
+    }
+
+    /// A pull-through cache stores the upstream INDEX responses beside the
+    /// packages, and they were counted as unscanned items. That is a permanent
+    /// false positive in a security view: an HTML index page has no package
+    /// inventory, so no scan can ever clear it and the operator is shown an
+    /// "unknown" status with no available remedy.
+    ///
+    /// This is the reported fixture exactly -- two packages and their two
+    /// index pages. The true unscanned count is ZERO.
+    #[tokio::test]
+    async fn proxy_scans_exclude_cached_index_responses() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool).await;
+        let now = chrono::Utc::now();
+        let (clean, vuln) = (unique_digest(), unique_digest());
+        let seed = |path: &'static str, sum: Option<String>| {
+            let (pool, repo_id) = (fx.pool.clone(), fx.repo_id);
+            async move { seed_cached_path(&pool, repo_id, path, sum.as_deref(), now).await }
+        };
+
+        seed("simple/idna/", Some(unique_digest())).await;
+        seed(
+            "simple/idna/idna-3.18-py3-none-any.whl",
+            Some(clean.clone()),
+        )
+        .await;
+        seed("simple/pyyaml/", Some(unique_digest())).await;
+        seed("simple/pyyaml/PyYAML-5.3.1.tar.gz", Some(vuln.clone())).await;
+        // The PEP 691 JSON index, which has a basename rather than a trailing
+        // slash. Also a placeholder index row: excluded before it can be
+        // counted as `pending_ingest`.
+        seed("simple/idna/index.v1+json", Some(unique_digest())).await;
+        seed("simple/pyyaml/index.v1+json", None).await;
+        seed_grype_verdict(&fx.pool, &clean, PROXY_STATE_CLEAN, 0, now).await;
+        seed_grype_verdict(&fx.pool, &vuln, PROXY_STATE_VULNERABLE, 3, now).await;
+
+        let resp = fx.read_ok(ProxyScansQuery::default()).await;
+        let summary = resp.summary.expect("summary");
+        assert_eq!(
+            summary,
+            ProxyScanSummary {
+                clean: 1,
+                vulnerable: 1,
+                not_scanned: 0,
+                pending_ingest: 0,
+                total_digests: 2,
+            },
+            "index responses are not artifacts and must not be counted"
+        );
+        let listed: Vec<&str> = resp.items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(
+            listed.len(),
+            2,
+            "only the two packages are listed, got {:?}",
+            listed
+        );
+        assert!(
+            listed.contains(&"simple/idna/idna-3.18-py3-none-any.whl")
+                && listed.contains(&"simple/pyyaml/PyYAML-5.3.1.tar.gz"),
+            "got {:?}",
+            listed
+        );
+        assert_eq!(resp.total, 2, "`total` must match the filtered listing");
+
+        // The single-path read agrees: an index path is not an artifact here.
+        let index_lookup = fx
+            .read(ProxyScansQuery {
+                path: Some("simple/idna/".to_string()),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(index_lookup, Err(AppError::NotFound(_))),
+            "a cached index path must not resolve as an artifact"
+        );
+
+        fx.cleanup(&[clean, vuln]).await;
+    }
+
+    /// The exclusion must be narrow. A package whose name legitimately looks
+    /// index-like still has to list and still has to be scanned -- silently
+    /// dropping a real artifact from a security view is a worse failure than
+    /// the false positive this filter removes.
+    #[tokio::test]
+    async fn proxy_scans_keep_artifacts_with_index_like_names() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool).await;
+        let now = chrono::Utc::now();
+        let seed = |path: &'static str| {
+            let (pool, repo_id) = (fx.pool.clone(), fx.repo_id);
+            let digest = unique_digest();
+            async move {
+                seed_cached_path(&pool, repo_id, path, Some(&digest), now).await;
+                digest
+            }
+        };
+
+        // A package literally named `index`; a file whose basename merely ENDS
+        // with the index basename; and a detached signature over an index.
+        let digests = vec![
+            seed("simple/index/index-1.0.tar.gz").await,
+            seed("simple/foo/my-index.v1+json").await,
+            seed("simple/foo/index.v1+json.asc").await,
+        ];
+
+        let resp = fx.read_ok(ProxyScansQuery::default()).await;
+        let summary = resp.summary.expect("summary");
+        assert_eq!(
+            summary.total_digests, 3,
+            "index-like artifact names must not be filtered out"
+        );
+        assert_eq!(
+            summary.not_scanned, 3,
+            "they are real artifacts with no verdict, so they stay unscanned"
+        );
+        assert_eq!(resp.items.len(), 3);
+
+        fx.cleanup(&digests).await;
     }
 
     /// Paging must not run off the end of the catalog, and `total` counts the
