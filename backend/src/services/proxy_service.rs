@@ -20,7 +20,7 @@ use reqwest::header::{
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -1047,8 +1047,11 @@ enum CacheReadOutcome {
 /// three actions are otherwise identical to the buffered path: serve a body,
 /// return a cached 404, or fetch upstream.
 enum StreamingCacheReadOutcome {
-    /// Serve this cached (or freshly revalidated) streamed body.
-    Hit(StreamingFetchResult),
+    /// Serve this cached (or freshly revalidated) streamed body. Carries the
+    /// sidecar [`CacheMetadata`] that was already loaded to reach this hit, so
+    /// the caller's lazy catalog backfill (#2218/#2270) can reuse it instead
+    /// of re-reading the same sidecar object from storage a second time.
+    Hit(StreamingFetchResult, Box<CacheMetadata>),
     /// A negative-cached upstream 404 is still within its TTL: respond 404.
     NegativeHit,
     /// No usable entry; the caller must elect a streaming leader / fetch
@@ -2949,6 +2952,14 @@ pub struct ProxyService {
     /// //               replaces this field with a wrapping `Coordinator` impl,
     /// //               selected by config via the [`HydrationCoordinator`] enum.
     coordinator: HydrationCoordinator,
+    /// Bounds how many [`Self::spawn_lazy_catalog_backfill`] tasks may be
+    /// in flight at once. Those tasks are opportunistic (#2218/#2270
+    /// self-healing) but draw a connection from the same shared `db` pool
+    /// as real request handlers; left unbounded, a burst of concurrent
+    /// cache hits could spawn enough of them to starve that pool under
+    /// load. Saturating this limiter simply skips the backfill for that
+    /// hit rather than queuing — never blocks the serve.
+    backfill_limiter: Arc<Semaphore>,
 }
 
 impl ProxyService {
@@ -2962,6 +2973,12 @@ impl ProxyService {
     /// denominator so a switch from filesystem to S3 cannot turn an
     /// existing repo into a broken one (#1044).
     const MAX_STORAGE_KEY_BYTES: usize = 1024;
+
+    /// Max concurrent lazy catalog-backfill tasks (see `backfill_limiter`).
+    /// Small relative to `DATABASE_MAX_CONNECTIONS` (default 50) so this
+    /// best-effort background work can never claim more than a slice of the
+    /// pool away from real request handlers, even at full saturation.
+    const MAX_CONCURRENT_CATALOG_BACKFILLS: usize = 8;
 
     /// Create a new proxy service
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
@@ -2981,6 +2998,7 @@ impl ProxyService {
         // with `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`. Call sites are
         // unchanged — both variants implement the same `Coordinator` seam.
         let coordinator = HydrationCoordinator::from_env(db.clone());
+        let backfill_limiter = Arc::new(Semaphore::new(Self::MAX_CONCURRENT_CATALOG_BACKFILLS));
 
         Self {
             db,
@@ -2989,6 +3007,7 @@ impl ProxyService {
             cache_persister,
             upstream_client,
             coordinator,
+            backfill_limiter,
         }
     }
 
@@ -3821,15 +3840,24 @@ impl ProxyService {
             )
             .await?
         {
-            StreamingCacheReadOutcome::Hit(result) => {
+            StreamingCacheReadOutcome::Hit(result, metadata) => {
                 // #2218/#2270 back-compat: a cache hit on an object cached
                 // BEFORE this catalog existed has no `proxy_cache_artifacts`
                 // row. Fire-and-forget a best-effort backfill from the sidecar
                 // so pre-upgrade objects self-heal into the catalog on first
                 // access (also bumps `last_accessed_at`). Never blocks the
                 // serve; `ON CONFLICT DO NOTHING` leaves authoritative rows
-                // untouched.
-                self.spawn_lazy_catalog_backfill(repo.id, cache_path, cache_key, metadata_key);
+                // untouched. Bounded by `backfill_limiter` (#3xxx overload
+                // fix): under a cache-hit burst this is skipped rather than
+                // spawning unbounded tasks that starve the shared DB pool —
+                // it is strictly best-effort self-healing, safe to drop.
+                self.spawn_lazy_catalog_backfill(
+                    repo.id,
+                    cache_path,
+                    cache_key,
+                    metadata_key,
+                    *metadata,
+                );
                 Ok(Some(result))
             }
             StreamingCacheReadOutcome::NegativeHit => Err(AppError::NotFound(format!(
@@ -3842,31 +3870,44 @@ impl ProxyService {
 
     /// Fire-and-forget lazy backfill of the persisted proxy-cache catalog from a
     /// cache-hit's sidecar (#2218/#2270 back-compat). Spawned so it never blocks
-    /// the serve; reads the metadata sidecar for the true size/checksum and
-    /// upserts `ON CONFLICT DO NOTHING` (existing authoritative rows only get
-    /// their `last_accessed_at` bumped). Any failure is logged at `debug` and
-    /// swallowed — a warm-hit backfill is strictly best-effort.
+    /// the serve; upserts `ON CONFLICT DO NOTHING` (existing authoritative rows
+    /// only get their `last_accessed_at` bumped). Any failure is logged at
+    /// `debug` and swallowed — a warm-hit backfill is strictly best-effort.
+    ///
+    /// Takes the [`CacheMetadata`] the caller already loaded to determine the
+    /// hit, instead of re-reading the same sidecar object from storage a
+    /// second time — every cache hit was paying for two storage reads before
+    /// this (one to evaluate freshness, one here).
+    ///
+    /// Bounded by `backfill_limiter`: a burst of concurrent cache hits used to
+    /// spawn an unbounded number of these tasks, each contending with normal
+    /// request handlers for a connection out of the *same* shared DB pool —
+    /// under sustained load this starved the pool for real traffic and fed
+    /// into the global concurrency backstop tripping "Server overloaded". This
+    /// is opportunistic self-healing, not correctness-critical, so it is
+    /// simply skipped (not queued) once the limiter is saturated; the next
+    /// cache hit on the same object will retry.
     fn spawn_lazy_catalog_backfill(
         &self,
         repository_id: Uuid,
         path: &str,
         cache_key: &str,
         metadata_key: &str,
+        metadata: CacheMetadata,
     ) {
+        let Ok(permit) = Arc::clone(&self.backfill_limiter).try_acquire_owned() else {
+            tracing::debug!(
+                cache_key = %cache_key,
+                "skipping proxy-cache catalog backfill: limiter saturated under load"
+            );
+            return;
+        };
         let db = self.db.clone();
-        let storage = Arc::clone(&self.storage);
         let path = path.to_string();
         let cache_key = cache_key.to_string();
         let metadata_key = metadata_key.to_string();
         tokio::spawn(async move {
-            let data = match storage.get(&metadata_key).await {
-                Ok(data) => data,
-                Err(_) => return, // sidecar gone -> nothing to backfill from
-            };
-            let metadata: CacheMetadata = match serde_json::from_slice(&data) {
-                Ok(m) => m,
-                Err(_) => return,
-            };
+            let _permit = permit; // held for the task's lifetime, released on drop
             if let Err(e) = proxy_catalog::backfill_from_sidecar(
                 &db,
                 repository_id,
@@ -3934,7 +3975,7 @@ impl ProxyService {
                 // never degraded to a Miss (which would refetch upstream).
                 check_quarantine_until(metadata.quarantine_until)?;
                 match self.open_cached_stream(cache_key, &metadata).await? {
-                    Some(result) => Ok(StreamingCacheReadOutcome::Hit(result)),
+                    Some(result) => Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata))),
                     None => Ok(StreamingCacheReadOutcome::Miss),
                 }
             }
@@ -3954,7 +3995,9 @@ impl ProxyService {
                         // stale-if-error body the same way as a fresh hit.
                         check_quarantine_until(metadata.quarantine_until)?;
                         match self.open_cached_stream(cache_key, &metadata).await? {
-                            Some(result) => Ok(StreamingCacheReadOutcome::Hit(result)),
+                            Some(result) => {
+                                Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata)))
+                            }
                             None => Ok(StreamingCacheReadOutcome::Miss),
                         }
                     }
@@ -8404,6 +8447,116 @@ mod tests {
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy should not fail");
         ProxyService::new(pool, Arc::new(StorageService::new(storage)))
+    }
+
+    /// Minimal [`CacheMetadata`] for tests that only need `spawn_lazy_catalog_backfill`
+    /// to have something to pass along; the values are not asserted on.
+    fn backfill_test_metadata() -> CacheMetadata {
+        CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at: Utc::now(),
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: Utc::now() + chrono::Duration::hours(24),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: 42,
+            checksum_sha256: "a".repeat(64),
+        }
+    }
+
+    /// Regression test for the overload fix: a burst of concurrent cache hits
+    /// used to call `spawn_lazy_catalog_backfill` with no bound at all, each
+    /// spawning a `tokio::spawn`ed task that grabbed a connection from the
+    /// *same* pool serving real request traffic. `backfill_limiter` caps how
+    /// many of these can be in flight; this asserts a permit is claimed
+    /// synchronously (before the task itself even runs) and released once the
+    /// task completes, so the limiter's count is a true reflection of
+    /// in-flight backfills rather than drifting.
+    #[tokio::test]
+    async fn test_lazy_catalog_backfill_permit_is_acquired_then_released() {
+        let service = ProxyService::new(
+            test_catalog_pool(),
+            Arc::new(StorageService::new(Arc::new(CacheFreshMock::new(
+                None, false,
+            )))),
+        );
+        let before = service.backfill_limiter.available_permits();
+        assert_eq!(before, ProxyService::MAX_CONCURRENT_CATALOG_BACKFILLS);
+
+        service.spawn_lazy_catalog_backfill(
+            Uuid::nil(),
+            "test/path",
+            "cache-key",
+            "cache-key/__cache_meta__.json",
+            backfill_test_metadata(),
+        );
+
+        // `try_acquire_owned` runs synchronously inside `spawn_lazy_catalog_backfill`
+        // itself, so the permit is claimed immediately — before the spawned
+        // task has had any chance to be polled.
+        assert_eq!(
+            service.backfill_limiter.available_permits(),
+            before - 1,
+            "spawning a backfill must claim a limiter permit up front"
+        );
+
+        // Let the spawned task run to completion against the never-connecting
+        // pool (fails fast, logs at debug, drops its permit on the way out).
+        for _ in 0..50 {
+            if service.backfill_limiter.available_permits() == before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            service.backfill_limiter.available_permits(),
+            before,
+            "the permit must be released once the backfill task finishes"
+        );
+    }
+
+    /// Regression test for the overload fix: once `backfill_limiter` is
+    /// saturated (modeling a cache-hit burst where every permit is already
+    /// claimed by in-flight backfills), a further call must be skipped —
+    /// no panic, no additional task spawned, no extra pool contention — rather
+    /// than piling up unboundedly.
+    #[tokio::test]
+    async fn test_lazy_catalog_backfill_is_skipped_when_limiter_saturated() {
+        let service = ProxyService::new(
+            test_catalog_pool(),
+            Arc::new(StorageService::new(Arc::new(CacheFreshMock::new(
+                None, false,
+            )))),
+        );
+
+        // Simulate a burst that has already claimed every permit.
+        let _permits = Arc::clone(&service.backfill_limiter)
+            .acquire_many_owned(ProxyService::MAX_CONCURRENT_CATALOG_BACKFILLS as u32)
+            .await
+            .expect("semaphore is not closed");
+        assert_eq!(service.backfill_limiter.available_permits(), 0);
+
+        service.spawn_lazy_catalog_backfill(
+            Uuid::nil(),
+            "test/path",
+            "cache-key",
+            "cache-key/__cache_meta__.json",
+            backfill_test_metadata(),
+        );
+
+        // Give an (incorrectly) spawned task a chance to run; a correct
+        // implementation never touched the semaphore beyond our own explicit
+        // acquisition above, so the count must not move.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            service.backfill_limiter.available_permits(),
+            0,
+            "a saturated limiter must skip the backfill instead of spawning anyway"
+        );
     }
 
     fn fresh_metadata_bytes() -> Bytes {

@@ -547,9 +547,69 @@ async fn proxy_model_tree(
     proxy_hf_metadata_json(state, repo, &upstream_path).await
 }
 
+/// Object keys removed from proxied Hugging Face metadata documents (#3334).
+///
+/// `xetHash` is per-file and appears on tree entries and model-info siblings;
+/// `xetEnabled` is the repo-level flag on model-info.
+const XET_METADATA_KEYS: [&str; 2] = ["xetHash", "xetEnabled"];
+
+/// Recursively drop [`XET_METADATA_KEYS`] from every object in `value`.
+///
+/// Tree responses are arrays of entries, model-info is an object with a
+/// `siblings` array, and `tree?expand=true` nests further still, so the walk
+/// has to cover objects and arrays at any depth rather than the two shapes
+/// known today.
+fn remove_xet_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|key, _| !XET_METADATA_KEYS.contains(&key.as_str()));
+            for nested in map.values_mut() {
+                remove_xet_keys(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remove_xet_keys(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Strip Xet fields from an upstream metadata document so clients keep using
+/// the ordinary `/resolve/` download path (#3334).
+///
+/// `huggingface_hub >= 1.26` caches the tree listing on disk, reads `xetHash`
+/// back out of that cache, and from then on skips the HEAD call and asks for a
+/// Xet read token at `api/models/{id}/xet-read-token/{rev}` - a route this
+/// proxy does not implement, so the download dies on a bare 404.
+///
+/// Stripping the `X-Xet-Hash` response header would not help: `ProxyService`
+/// already drops it, and on this path the client never reads response headers.
+/// The leak is in the JSON body, which is why the fix lives here.
+///
+/// Proxying `xet-read-token` was considered and rejected. Once a client holds a
+/// Xet token it pulls chunks straight from `cas-server.xethub.hf.co`, bypassing
+/// the proxy entirely: no caching, and every client needs direct egress, which
+/// is the opposite of what an air-gapped or controlled-egress deployment
+/// installs a proxy for.
+///
+/// Bytes that do not parse as JSON come back untouched. A metadata passthrough
+/// that works today must not start failing because of this filter.
+fn strip_xet_metadata(bytes: Bytes) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bytes;
+    };
+    remove_xet_keys(&mut value);
+    match serde_json::to_vec(&value) {
+        Ok(rewritten) => Bytes::from(rewritten),
+        Err(_) => bytes,
+    }
+}
+
 /// Shared body of [`proxy_model_info`] and [`proxy_model_tree`]: fetch a
 /// buffered JSON metadata document from a Remote repo's upstream and hand it
-/// back verbatim.
+/// back with Xet fields removed by [`strip_xet_metadata`].
 ///
 /// Keeping the Remote/upstream/proxy-wired guards and the capped fetch in one
 /// place is what makes the two endpoints propagate upstream failures
@@ -586,7 +646,7 @@ async fn proxy_hf_metadata_json(
         Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(bytes))
+            .body(Body::from(strip_xet_metadata(bytes)))
             .unwrap(),
     ))
 }
@@ -2961,6 +3021,65 @@ mod tests {
         assert_eq!(entries[1]["path"], "model.safetensors");
     }
 
+    /// #3334: the tree passthrough must not forward `xetHash`. A client that
+    /// sees it caches the listing, skips the HEAD call on every later download
+    /// and asks for a Xet read token this proxy does not serve, so the download
+    /// dies on a 404 instead of falling back to `/resolve/`.
+    #[tokio::test]
+    async fn test_huggingface_tree_strips_xet_fields_from_upstream() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/api/models/openai-community/gpt2/tree/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"type": "file", "oid": "abc", "size": 665, "path": "config.json"},
+                {
+                    "type": "file",
+                    "oid": "def",
+                    "size": 548105171,
+                    "path": "model.safetensors",
+                    "xetHash": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+                    "lfs": {"oid": "248dfc39", "size": 548105171, "pointerSize": 135},
+                },
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/models/openai-community/gpt2/tree/main",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !text.contains("xetHash"),
+            "xetHash must not reach the client: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = json.as_array().expect("tree must stay a JSON array");
+        assert_eq!(entries.len(), 2, "stripping must not drop entries");
+        assert_eq!(entries[1]["path"], "model.safetensors");
+        assert_eq!(
+            entries[1]["lfs"]["oid"], "248dfc39",
+            "the /resolve fallback still needs the rest of the entry"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::disallowed_methods)]
     // streaming-invariant: test-only body buffering for assertions (#1608).
@@ -3005,5 +3124,117 @@ mod tests {
             "[]",
             "an empty list would tell the client the revision has no files"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Xet field stripping in proxied metadata (#3334)
+    // -----------------------------------------------------------------------
+
+    /// A tree entry as the Hub actually serves it. `xetHash` is the field that
+    /// sends `huggingface_hub >= 1.26` down the Xet path.
+    #[test]
+    fn test_strip_xet_metadata_removes_xet_hash_from_tree_entry() {
+        let upstream = br#"[
+            {
+                "type": "file",
+                "oid": "7c5d3f4b8b76583b422fcb9189ad6c89d5d97a094541ce8932dce3ecabde1421",
+                "size": 548105171,
+                "path": "model.safetensors",
+                "xetHash": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+                "lfs": {
+                    "oid": "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707",
+                    "size": 548105171,
+                    "pointerSize": 135
+                }
+            }
+        ]"#;
+
+        let stripped = strip_xet_metadata(Bytes::from_static(upstream));
+        let json: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+        let entry = &json[0];
+
+        assert!(entry.get("xetHash").is_none(), "xetHash must not survive");
+        assert_eq!(entry["path"], "model.safetensors");
+        assert_eq!(entry["size"], 548105171u64);
+        assert_eq!(
+            entry["lfs"]["oid"], "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707",
+            "the LFS pointer is what the /resolve fallback needs; it must stay"
+        );
+    }
+
+    /// Model-info carries `xetEnabled` at the top level and one `xetHash` per
+    /// sibling, so the walk has to reach both depths.
+    #[test]
+    fn test_strip_xet_metadata_removes_nested_xet_fields() {
+        let upstream = br#"{
+            "id": "openai-community/gpt2",
+            "sha": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+            "xetEnabled": true,
+            "siblings": [
+                {"rfilename": "config.json"},
+                {"rfilename": "model.safetensors", "xetHash": "abc123"}
+            ],
+            "nested": {"deeper": [[{"xetHash": "def456", "keep": 1}]]}
+        }"#;
+
+        let stripped = strip_xet_metadata(Bytes::from_static(upstream));
+        let json: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+
+        assert!(json.get("xetEnabled").is_none());
+        assert!(json["siblings"][1].get("xetHash").is_none());
+        assert!(
+            json["nested"]["deeper"][0][0].get("xetHash").is_none(),
+            "the walk must descend through arrays of arrays"
+        );
+        assert_eq!(json["nested"]["deeper"][0][0]["keep"], 1);
+        assert_eq!(json["id"], "openai-community/gpt2");
+        assert_eq!(json["sha"], "607a30d783dfa663caf39e06633721c8d4cfcd7e");
+        assert_eq!(json["siblings"][0]["rfilename"], "config.json");
+        assert_eq!(json["siblings"][1]["rfilename"], "model.safetensors");
+    }
+
+    /// Only the two Xet keys go. Lookalike names and any value that merely
+    /// mentions Xet are none of this function's business.
+    #[test]
+    fn test_strip_xet_metadata_preserves_non_xet_keys_and_values() {
+        let upstream = br#"{
+            "xetHashAlgorithm": "blake3",
+            "notXetHash": "keep me",
+            "description": "xetHash appears in this string value",
+            "xet": {"still": "here"}
+        }"#;
+
+        let stripped = strip_xet_metadata(Bytes::from_static(upstream));
+        let json: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+
+        assert_eq!(json["xetHashAlgorithm"], "blake3");
+        assert_eq!(json["notXetHash"], "keep me");
+        assert_eq!(json["description"], "xetHash appears in this string value");
+        assert_eq!(json["xet"]["still"], "here");
+    }
+
+    /// Fail open: anything that is not JSON is handed back untouched rather
+    /// than turned into an error.
+    #[test]
+    fn test_strip_xet_metadata_passes_non_json_through_unchanged() {
+        let raw = Bytes::from_static(b"<html>not json at all</html>");
+        assert_eq!(strip_xet_metadata(raw.clone()), raw);
+
+        let truncated = Bytes::from_static(br#"{"xetHash": "abc"#);
+        assert_eq!(strip_xet_metadata(truncated.clone()), truncated);
+
+        let empty = Bytes::new();
+        assert_eq!(strip_xet_metadata(empty.clone()), empty);
+    }
+
+    /// A document with nothing to strip still has to come back intact.
+    #[test]
+    fn test_strip_xet_metadata_leaves_xet_free_document_intact() {
+        let upstream = Bytes::from_static(br#"[{"type":"file","path":"config.json"}]"#);
+        let stripped = strip_xet_metadata(upstream.clone());
+        let json: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+
+        assert_eq!(json[0]["type"], "file");
+        assert_eq!(json[0]["path"], "config.json");
     }
 }
