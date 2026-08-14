@@ -498,11 +498,18 @@ fn has_artifact_extension(leaf: &str) -> bool {
 }
 
 /// PyPI distribution files: wheels, sdists, eggs (immutable once published).
+///
+/// A PEP 658 `.metadata` sidecar (`<dist>.whl.metadata`) holds the `METADATA`
+/// entry of that distribution, so it is immutable on the same grounds: PyPI
+/// forbids republishing a version. The suffix is stripped before the extension
+/// test, as [`is_maven_artifact_file`] does for its checksum/signature
+/// sidecars (#3300).
 fn is_pypi_package_file(leaf: &str) -> bool {
     const EXTS: &[&str] = &[
         ".whl", ".tar.gz", ".tar.bz2", ".zip", ".egg", ".tgz", ".conda", ".tar.zst",
     ];
-    EXTS.iter().any(|e| leaf.ends_with(e))
+    let base = leaf.strip_suffix(".metadata").unwrap_or(leaf);
+    EXTS.iter().any(|e| base.ends_with(e))
 }
 
 #[cfg(test)]
@@ -600,6 +607,21 @@ mod tests {
                 "simple/requests/requests-2.31.0-py3-none-any.whl",
                 true,
             ),
+            // PEP 658 sidecar: immutable with the distribution it describes.
+            (
+                Pypi,
+                "simple/requests/requests-2.31.0-py3-none-any.whl.metadata",
+                true,
+            ),
+            (
+                Pypi,
+                "simple/requests/requests-2.31.0.tar.gz.metadata",
+                true,
+            ),
+            // `.metadata` on a non-distribution leaf stays mutable: the strip
+            // must not promote an arbitrary path to cache-forever.
+            (Pypi, "simple/requests/index.html.metadata", false),
+            (Pypi, "simple/requests/.metadata", false),
             (Poetry, "simple/black/", false),
             // npm: packument mutable, tarball immutable.
             (Npm, "lodash", false),
