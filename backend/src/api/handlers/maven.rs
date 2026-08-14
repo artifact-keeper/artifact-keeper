@@ -1096,6 +1096,14 @@ async fn download(
                 .header(CONTENT_TYPE, "text/plain")
                 .body(Body::from(checksum))
                 .unwrap());
+        } else if MavenHandler::is_prefixes_file(base_path) {
+            let content = fetch_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
+            let checksum = compute_checksum(&content, checksum_type);
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::from(checksum))
+                .unwrap());
         }
     }
 
@@ -1106,6 +1114,18 @@ async fn download(
         return Ok(cache_headers::cacheable_response(
             content.to_vec(),
             "text/xml",
+            &headers,
+        ));
+    }
+
+    // 2b. `.meta/prefixes.txt` — repository-prefixes file (Nexus/Artifactory
+    // convention) letting clients/groups skip members that can't contain a
+    // given groupId.
+    if MavenHandler::is_prefixes_file(&path) {
+        let content = fetch_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
+        return Ok(cache_headers::cacheable_response(
+            content.to_vec(),
+            "text/plain",
             &headers,
         ));
     }
@@ -1695,6 +1715,117 @@ async fn fetch_maven_metadata_bytes(
     }
 
     Err(AppError::NotFound("Metadata not found".to_string()).into_response())
+}
+
+const MAVEN_PREFIXES_PATH: &str = ".meta/prefixes.txt";
+
+/// Fetch/generate a repository's `.meta/prefixes.txt`. Remote repos proxy it
+/// from upstream; Virtual repos merge the union of members' prefixes (Local/
+/// Staging members generated from stored groupIds, Remote members proxied);
+/// Local/Staging repos generate it from their own stored groupIds.
+///
+/// No cache here (unlike `fetch_maven_metadata_bytes`): this file is fetched
+/// rarely (once per repo by a client/group), not per-GA on every dependency
+/// resolution, so the extra machinery isn't earning its keep yet.
+async fn fetch_maven_prefixes_bytes(
+    state: &SharedState,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+) -> Result<Bytes, Response> {
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let (content, _, _permit) = proxy_helpers::proxy_fetch_capped_budgeted(
+                proxy,
+                repo.id,
+                &repo.key,
+                upstream_url,
+                MAVEN_PREFIXES_PATH,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            )
+            .await?;
+            return Ok(content);
+        }
+        return Err(AppError::NotFound("Prefix file not available".to_string()).into_response());
+    }
+
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let members =
+            proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
+
+        let mut prefixes: Vec<String> = Vec::new();
+        for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+            let batch = futures::future::join_all(chunk.iter().map(|member| async {
+                if member.repo_type == RepositoryType::Remote {
+                    fetch_remote_member_metadata(state, member, MAVEN_PREFIXES_PATH)
+                        .await
+                        .map(|text| parse_prefixes_lines(&text))
+                        .unwrap_or_default()
+                } else {
+                    collect_local_group_prefixes(&state.db, member.id)
+                        .await
+                        .unwrap_or_default()
+                }
+            }))
+            .await;
+            for p in batch {
+                prefixes.extend(p);
+            }
+        }
+
+        return Ok(Bytes::from(MavenHandler::generate_prefixes_txt(prefixes)));
+    }
+
+    // Local/Staging.
+    let prefixes = collect_local_group_prefixes(&state.db, repo.id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+                .into_response()
+        })?;
+    Ok(Bytes::from(MavenHandler::generate_prefixes_txt(prefixes)))
+}
+
+/// Parse a fetched `.meta/prefixes.txt` body into its `/group/path` lines,
+/// dropping the `## repository-prefixes/1.0` header/comment lines.
+fn parse_prefixes_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('/'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Distinct groupIds stored in `repo_id`, rendered as prefix paths
+/// (e.g. `com.example` -> `/com/example`).
+async fn collect_local_group_prefixes(db: &PgPool, repo_id: Uuid) -> Result<Vec<String>, String> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT am.metadata->>'groupId' AS group_id
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'maven'
+          AND am.metadata->>'groupId' IS NOT NULL
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("db error: {}", e))?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.try_get::<Option<String>, _>("group_id").ok().flatten())
+        .map(|g| format!("/{}", g.replace('.', "/")))
+        .collect())
 }
 
 async fn generate_metadata_for_artifact(
@@ -4898,6 +5029,275 @@ mod tests {
             &body[..],
             &jar_bytes[..],
             "virtual-served bytes must match the original jar content"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `.meta/prefixes.txt` (repository prefix file)
+    // -----------------------------------------------------------------------
+
+    async fn insert_maven_artifact_row(
+        pool: &PgPool,
+        repo_id: Uuid,
+        user_id: Uuid,
+        group_id: &str,
+        artifact_id: &str,
+    ) {
+        let group_path = group_id.replace('.', "/");
+        let version = "1.0.0";
+        let path = format!(
+            "{}/{}/{}/{}-{}.jar",
+            group_path, artifact_id, version, artifact_id, version
+        );
+        let artifact_row_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (id, repository_id, path, name, version, size_bytes,
+                 checksum_sha256, content_type, storage_key, uploaded_by, is_deleted)
+            VALUES ($1, $2, $3, $4, $5, 1, $6, 'application/java-archive', $7, $8, false)
+            "#,
+        )
+        .bind(artifact_row_id)
+        .bind(repo_id)
+        .bind(&path)
+        .bind(artifact_id)
+        .bind(version)
+        .bind("deadbeef".repeat(8))
+        .bind(format!("maven/{}", path))
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("insert artifact row");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_metadata (artifact_id, format, metadata)
+            VALUES ($1, 'maven', jsonb_build_object(
+                'groupId', $2::text, 'artifactId', $3::text, 'version', $4::text,
+                'extension', 'jar'
+            ))
+            "#,
+        )
+        .bind(artifact_row_id)
+        .bind(group_id)
+        .bind(artifact_id)
+        .bind(version)
+        .execute(pool)
+        .await
+        .expect("insert artifact_metadata");
+    }
+
+    #[tokio::test]
+    async fn test_local_repo_serves_prefixes_txt() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        insert_maven_artifact_row(&pool, repo_id, user_id, "org.acme.prfx1", "widget").await;
+        insert_maven_artifact_row(&pool, repo_id, user_id, "com.example.prfx1", "gadget").await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/.meta/prefixes.txt", repo_key))
+            .body(Body::empty())
+            .expect("build GET prefixes.txt");
+        let (status, body) = tdh::send(router, req).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 for .meta/prefixes.txt"
+        );
+        let text = String::from_utf8_lossy(&body);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "## repository-prefixes/1.0");
+        assert_eq!(
+            lines[1..],
+            ["/com/example/prfx1", "/org/acme/prfx1"],
+            "expected both groupId prefixes, sorted: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefixes_txt_sha1_matches_body_digest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        insert_maven_artifact_row(&pool, repo_id, user_id, "org.acme.prfxsha", "widget").await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::get(format!("/{repo_key}/.meta/prefixes.txt")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let expected = super::compute_checksum(&body, super::ChecksumType::Sha1);
+
+        let (status, sha1_body) = tdh::send(
+            router,
+            tdh::get(format!("/{repo_key}/.meta/prefixes.txt.sha1")),
+        )
+        .await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 for .meta/prefixes.txt.sha1"
+        );
+        assert_eq!(String::from_utf8_lossy(&sha1_body), expected);
+    }
+
+    #[tokio::test]
+    async fn test_empty_repo_prefixes_txt_is_header_only() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/.meta/prefixes.txt", repo_key))
+            .body(Body::empty())
+            .expect("build GET prefixes.txt");
+        let (status, body) = tdh::send(router, req).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 even with no artifacts"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "## repository-prefixes/1.0\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_repo_merges_prefixes_from_members() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (member_a_id, _member_a_key, member_a_dir) =
+            tdh::create_repo(&pool, "local", "maven").await;
+        let (member_b_id, _member_b_key, member_b_dir) =
+            tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        insert_maven_artifact_row(&pool, member_a_id, user_id, "com.acme.prfxv", "moda").await;
+        insert_maven_artifact_row(&pool, member_b_id, user_id, "org.acme.prfxv", "modb").await;
+
+        let virtual_id = Uuid::new_v4();
+        let virtual_key = format!("v-prfxv-{}", virtual_id.simple());
+        let virtual_dir = std::env::temp_dir().join(format!("prfxv-{}", virtual_id));
+        std::fs::create_dir_all(&virtual_dir).expect("create virtual storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'maven'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(&*virtual_dir.to_string_lossy())
+        .execute(&pool)
+        .await
+        .expect("insert virtual repo");
+
+        tdh::link_virtual_member(&pool, virtual_id, member_a_id, 1).await;
+        tdh::link_virtual_member(&pool, virtual_id, member_b_id, 2).await;
+
+        // `authorize_virtual_members` filters by caller visibility (#3178);
+        // publish the members so this fixture stays about merging, not authz.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![member_a_id, member_b_id])
+            .execute(&pool)
+            .await
+            .expect("publish virtual members");
+
+        let state = tdh::build_state(pool.clone(), member_a_dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/.meta/prefixes.txt", virtual_key))
+            .body(Body::empty())
+            .expect("build GET prefixes.txt");
+        let (status, body) = tdh::send(router, req).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, member_a_id, &member_a_dir).await;
+        tdh::cleanup_member_repo(&pool, member_b_id, &member_b_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 for virtual .meta/prefixes.txt"
+        );
+        let text = String::from_utf8_lossy(&body);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "## repository-prefixes/1.0");
+        assert_eq!(
+            lines[1..],
+            ["/com/acme/prfxv", "/org/acme/prfxv"],
+            "expected merged prefixes from both members, sorted: {}",
+            text
         );
     }
 
