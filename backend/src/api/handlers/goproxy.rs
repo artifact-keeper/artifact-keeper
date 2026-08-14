@@ -398,7 +398,9 @@ async fn try_proxy_go_metadata(
     }
 
     // Virtual repo: try each member in priority order. Same verbatim-forward
-    // contract as the Remote arm above: the member's coding is re-declared.
+    // contract as the Remote arm above: the member's coding is re-declared,
+    // and the member's own `Content-Type` is served (#3281), with the
+    // caller's default only as the fallback for a member that declared none.
     if repo.repo_type == RepositoryType::Virtual {
         let ct = default_content_type.to_string();
         if let Ok(resp) = proxy_helpers::resolve_virtual_metadata(
@@ -406,12 +408,12 @@ async fn try_proxy_go_metadata(
             state.proxy_service.as_deref(),
             repo.id,
             upstream_path,
-            |bytes, content_encoding, _key| {
+            |bytes, content_type, content_encoding, _key| {
                 let ct = ct.clone();
                 async move {
                     Ok(proxy_helpers::forward_verbatim_metadata(
                         bytes,
-                        None,
+                        content_type,
                         &ct,
                         content_encoding,
                     ))
@@ -453,36 +455,28 @@ fn filter_version_list(body: &str, blocked: &std::collections::HashSet<String>) 
 /// virtual repository each member's own gate configuration governs its
 /// contribution (#2264).
 ///
-/// DROPS the upstream `Content-Encoding`, and unlike the verbatim forwards
-/// #3260 fixed ([`try_proxy_go_metadata`] / `get_mod_file`, which re-declare
-/// it) that is NOT sound for both callers today:
+/// Returns `(source_repo_id, body_as_transferred, content_encoding)` (#3280):
+/// the body is the upstream's bytes AS TRANSFERRED — nothing on this path
+/// decodes (`http_client::base_client_builder` disables every codec and
+/// advertises `Accept-Encoding: identity`, but object stores return a
+/// *stored* `Content-Encoding` regardless) — and the coding travels with it
+/// so each caller can act correctly:
 ///
-/// * `@v/list` ([`list_versions`]) does rebuild its document — but through
-///   `String::from_utf8_lossy`, so a coded body is not rejected, it is
-///   replaced character by character with U+FFFD and served as a 200. The
-///   coding is correctly dropped; the body is corrupt.
-/// * `@latest` ([`latest_version`]) does NOT rebuild anything. It parses the
-///   JSON only to run the age gate and then forwards the upstream bytes
-///   verbatim, so it is a verbatim forwarder that drops the coding. It does
-///   not currently mislabel a coded body only because `serde_json::from_slice`
-///   rejects one first and the request 404s — i.e. the endpoint is broken for
-///   exactly the coded-upstream population #3260 is about.
-///
-/// Both are pre-existing (they predate #3260, which changed neither) and both
-/// are tracked in #3280. Fixing them needs this helper to report the coding
-/// AND a decoder on the parse path, which is a larger change than #3260's
-/// re-declare-only fix: it introduces decompression of an upstream-controlled
-/// body, so it needs its own bounds. Until then this comment describes what
-/// the code does rather than what it ought to do.
+/// * a caller that PARSES or rebuilds the document (`@v/list`) must strip the
+///   coding first via [`decode_go_metadata_body`] and drop the header — the
+///   bytes it emits are not the bytes the coding describes;
+/// * a caller that forwards the bytes VERBATIM after parsing a copy
+///   (`@latest`) must re-declare the coding on its response (RFC 9110 §8.4),
+///   e.g. via [`proxy_helpers::forward_verbatim_metadata`].
 async fn fetch_go_metadata_with_source(
     state: &SharedState,
     repo: &RepoInfo,
     upstream_path: &str,
-) -> Option<(uuid::Uuid, Bytes)> {
+) -> Option<(uuid::Uuid, Bytes, Option<String>)> {
     let proxy = state.proxy_service.as_ref()?;
     if repo.repo_type == RepositoryType::Remote {
         let upstream_url = repo.upstream_url.as_deref()?;
-        let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
+        let (content, _content_type, content_encoding) = proxy_helpers::proxy_fetch_capped_encoded(
             proxy,
             repo.id,
             &repo.key,
@@ -492,7 +486,7 @@ async fn fetch_go_metadata_with_source(
         )
         .await
         .ok()?;
-        return Some((repo.id, content));
+        return Some((repo.id, content, content_encoding));
     }
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
@@ -505,21 +499,56 @@ async fn fetch_go_metadata_with_source(
             let Some(upstream_url) = member.upstream_url.as_deref() else {
                 continue;
             };
-            if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch_capped(
-                proxy,
-                member.id,
-                &member.key,
-                upstream_url,
-                upstream_path,
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await
+            if let Ok((content, _content_type, content_encoding)) =
+                proxy_helpers::proxy_fetch_capped_encoded(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    upstream_url,
+                    upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                )
+                .await
             {
-                return Some((member.id, content));
+                return Some((member.id, content, content_encoding));
             }
         }
     }
     None
+}
+
+/// Strip a declared content coding off a buffered Go metadata body so it can
+/// be PARSED (#3280). Runs through the shared bounded decoder
+/// ([`crate::util::content_coding::strip_content_coding`]), so a hostile
+/// upstream cannot inflate past the process-wide decompressed-byte budget.
+///
+/// Fails closed: an upstream that declares a coding this build cannot strip,
+/// or whose coded stream is corrupt, yields a 502 — never a lossily-decoded
+/// run of U+FFFD served as a 200 (the pre-#3280 `@v/list` corruption), and
+/// never a silent parse failure surfacing as a 404 (the pre-#3280 `@latest`).
+#[allow(clippy::result_large_err)]
+fn decode_go_metadata_body(
+    content: &Bytes,
+    content_encoding: Option<&str>,
+) -> Result<Bytes, Response> {
+    use crate::util::content_coding::{strip_content_coding, Decoded};
+    match strip_content_coding(content, content_encoding) {
+        Ok(Decoded::Bytes(std::borrow::Cow::Borrowed(_))) => Ok(content.clone()),
+        Ok(Decoded::Bytes(std::borrow::Cow::Owned(decoded))) => Ok(Bytes::from(decoded)),
+        Ok(Decoded::Unsupported) => Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "upstream metadata declares an unsupported content coding: {}",
+                content_encoding.unwrap_or_default()
+            ),
+        )
+            .into_response()),
+        Err(_) => Err((
+            StatusCode::BAD_GATEWAY,
+            "upstream metadata body failed to decode under its declared content coding",
+        )
+            .into_response()),
+    }
 }
 
 /// Filter a `@v/list` document through the serving repository's download age
@@ -742,10 +771,15 @@ async fn list_versions(
         }
 
         let upstream_path = build_go_upstream_list_path(module);
-        if let Some((source_repo_id, content)) =
+        if let Some((source_repo_id, content, content_encoding)) =
             fetch_go_metadata_with_source(state, repo, &upstream_path).await
         {
-            let upstream_body = String::from_utf8_lossy(&content).into_owned();
+            // This arm REBUILDS the document (parse + age-gate filter), so a
+            // declared coding must be stripped before parsing and dropped from
+            // the response (#3280) — lossily decoding coded bytes served a run
+            // of U+FFFD as a 200.
+            let decoded = decode_go_metadata_body(&content, content_encoding.as_deref())?;
+            let upstream_body = String::from_utf8_lossy(&decoded).into_owned();
             let filtered =
                 filter_go_version_list(state, source_repo_id, module, &upstream_body).await?;
             return Ok(Response::builder()
@@ -1202,14 +1236,18 @@ async fn latest_version(
         Ok(a) => a,
         Err(not_found) => {
             let upstream_path = build_go_upstream_latest_path(module);
-            if let Some((source_repo_id, content)) =
+            if let Some((source_repo_id, content, content_encoding)) =
                 fetch_go_metadata_with_source(state, repo, &upstream_path).await
             {
+                // Parse a DECODED copy for the age gate (#3280): a coded
+                // upstream body used to fail `from_slice` here and 404 the
+                // endpoint for exactly the coded-upstream population.
+                let decoded = decode_go_metadata_body(&content, content_encoding.as_deref())?;
                 // Gate the advertised version: a blocked (or unparseable)
                 // "latest" is withheld as 404 so the client re-resolves from
                 // the filtered version list instead of learning about — and
                 // then failing on — a version this repository will not serve.
-                let json: Option<serde_json::Value> = serde_json::from_slice(&content).ok();
+                let json: Option<serde_json::Value> = serde_json::from_slice(&decoded).ok();
                 let version = json
                     .as_ref()
                     .and_then(|j| j.get("Version"))
@@ -1232,11 +1270,15 @@ async fn latest_version(
                         (StatusCode::NOT_FOUND, "no latest version available").into_response()
                     );
                 }
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(content))
-                    .unwrap());
+                // The response body is the upstream's bytes VERBATIM (the
+                // decoded copy above was for gating only), so the upstream
+                // coding is re-declared when present (RFC 9110 §8.4, #3280).
+                return Ok(proxy_helpers::forward_verbatim_metadata(
+                    content,
+                    None,
+                    "application/json",
+                    content_encoding,
+                ));
             }
             return Err(not_found);
         }
@@ -2717,6 +2759,148 @@ mod tests {
                 .execute(&fx.pool)
                 .await;
         }
+        fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3280: coded upstream bodies on the `@v/list` / `@latest` parse paths.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_go_metadata_body_strips_declared_coding_3280() {
+        let plain = b"v1.0.0\nv1.1.0\n".repeat(8);
+        let coded = Bytes::from(tdh::code_bytes("deflate", &plain));
+        let decoded = super::decode_go_metadata_body(&coded, Some("deflate"))
+            .expect("a supported coding must decode");
+        assert_eq!(&decoded[..], &plain[..]);
+        // Identity / absent codings pass the bytes through untouched.
+        let plain = Bytes::from(plain);
+        let out = super::decode_go_metadata_body(&plain, None).expect("no coding");
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn test_decode_go_metadata_body_fails_closed_3280() {
+        use axum::response::IntoResponse;
+        // An unsupported coding must 502, never parse still-coded bytes.
+        let body = Bytes::from_static(b"\x1b\x0e\x00brotli-ish");
+        let resp = super::decode_go_metadata_body(&body, Some("br"))
+            .expect_err("unsupported coding must fail closed")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // A corrupt stream under a supported coding must 502 too — the
+        // pre-#3280 shape lossily decoded it into U+FFFD and served a 200.
+        let resp = super::decode_go_metadata_body(&Bytes::from_static(b"not-gzip"), Some("gzip"))
+            .expect_err("corrupt coded body must fail closed")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// #3280: when the upstream stores a `Content-Encoding` on its metadata,
+    /// `@v/list` must serve the DECODED, rebuilt document (previously: the
+    /// coded bytes lossily became a run of U+FFFD served as 200), and
+    /// `@latest` must decode for the age gate and then forward the upstream
+    /// bytes VERBATIM with the coding re-declared (previously: the JSON parse
+    /// failed on the coded bytes and the endpoint 404ed).
+    #[tokio::test]
+    async fn test_go_list_and_latest_handle_coded_upstream_3280_db() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        let list_plain = b"v1.0.0\nv1.1.0\n".to_vec();
+        let latest_plain = br#"{"Version":"v1.1.0","Time":"2024-01-02T03:04:05Z"}"#.to_vec();
+        let list_coded = tdh::code_bytes("deflate", &list_plain);
+        let latest_coded = tdh::code_bytes("deflate", &latest_plain);
+
+        let coded_mock = MockServer::start().await;
+        for (upstream_path, body, ct) in [
+            (
+                "/example.com/coded/@v/list",
+                list_coded.clone(),
+                "text/plain; charset=utf-8",
+            ),
+            (
+                "/example.com/coded/@latest",
+                latest_coded.clone(),
+                "application/json",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(upstream_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", ct)
+                        .insert_header("content-encoding", "deflate")
+                        .set_body_bytes(body),
+                )
+                .mount(&coded_mock)
+                .await;
+        }
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &coded_mock.uri()).await;
+
+        // `@v/list`: rebuilt from the decoded document; no coding declared.
+        let uri = format!("/{}/example.com/coded/@v/list", fx.repo_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_ENCODING),
+            None,
+            "@v/list rebuilds its document, so no upstream coding may be declared"
+        );
+        assert_eq!(
+            &body[..],
+            &list_plain[..],
+            "@v/list must serve the DECODED version list, not U+FFFD garbage (#3280)"
+        );
+
+        // `@latest`: 200 (was 404 for coded upstreams), upstream bytes
+        // verbatim with the coding re-declared (RFC 9110 §8.4/§8.6).
+        let uri = format!("/{}/example.com/coded/@latest", fx.repo_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("deflate"),
+            "@latest forwards the upstream bytes verbatim and must re-declare the coding"
+        );
+        assert_eq!(
+            &body[..],
+            &latest_coded[..],
+            "@latest must forward the coded upstream bytes byte-identically"
+        );
+        assert_eq!(
+            tdh::decode_coded("deflate", &body),
+            latest_plain,
+            "the declared coding must decode the served body back to the JSON document"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// #3281: the Virtual arm of `try_proxy_go_metadata` forwards the member
+    /// upstream's body verbatim and must serve the member's own
+    /// `Content-Type`, keeping the caller's default (`application/json` for
+    /// `.info`) only for a member that declares none.
+    #[tokio::test]
+    async fn test_go_virtual_info_forwards_member_content_type_3281_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        let rig = tdh::setup_ct_3281_rig(&fx, "go", b"{\"Version\":\"v1.0.0\"}").await;
+        rig.assert_member_ct_forwarded(
+            super::router(),
+            |key| format!("/{key}/example.com/typed/@v/v1.0.0.info"),
+            "application/json",
+            "goproxy virtual .info",
+        )
+        .await;
+        rig.cleanup(&fx.pool).await;
         fx.teardown().await;
     }
 }

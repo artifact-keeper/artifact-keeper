@@ -2103,6 +2103,23 @@ pub async fn invalidate_cache(
 
     proxy.invalidate_cache(&repo, &query.path).await?;
 
+    // #3290: a PyPI Simple project index is cached once per negotiated
+    // representation (PEP 503 HTML at `.../<project>/`, PEP 691 JSON at
+    // `.../<project>/index.v1+json`). Evicting one representation must evict
+    // the other, or the surviving one keeps serving an older upstream
+    // snapshot and content-negotiating clients (`uv` prefers JSON, `pip`
+    // consumes HTML) see the same project at two different points in time.
+    // Idempotent like the primary eviction: a sibling that was never cached
+    // is a no-op.
+    if matches!(
+        repo.format,
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry
+    ) {
+        if let Some(sibling) = crate::api::handlers::pypi::pep691_sibling_cache_path(&query.path) {
+            proxy.invalidate_cache(&repo, &sibling).await?;
+        }
+    }
+
     Ok(Json(InvalidateCacheResponse {
         repository_key: key,
         path: query.path,
@@ -16237,6 +16254,75 @@ mod tests {
             body_str.contains("\"path\":\"foo/bar-1.2.3.tgz\""),
             "response body must echo the URL-decoded `path` (#1539); got: {}",
             body_str,
+        );
+    }
+
+    /// #3290: on a PyPI Remote repo, invalidating either content-negotiated
+    /// representation of a Simple project index (PEP 503 HTML at
+    /// `simple/<p>/`, PEP 691 JSON at `simple/<p>/index.v1+json`) must evict
+    /// BOTH cache entries — otherwise the surviving variant keeps serving an
+    /// older upstream snapshot and `uv` (JSON) disagrees with `pip` (HTML)
+    /// about which versions exist.
+    #[tokio::test]
+    async fn invalidate_cache_evicts_pep691_sibling_for_pypi_3290() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_service::ProxyService;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+
+        // Materialize both variants' content + sidecar files where the
+        // filesystem cache backend stores them (hierarchical keys map to
+        // `<base>/<key>`, see FilesystemStorage::key_to_path).
+        let html_path = "simple/proj3290/";
+        let json_path = "simple/proj3290/index.v1+json";
+        let mut cached_files = Vec::new();
+        for path in [html_path, json_path] {
+            for key in [
+                ProxyService::cache_storage_key(&fx.repo_key, path).unwrap(),
+                ProxyService::cache_metadata_key(&fx.repo_key, path).unwrap(),
+            ] {
+                let file = fx.storage_dir.join(&key);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, b"{}").unwrap();
+                cached_files.push(file);
+            }
+        }
+
+        // Invalidate the HTML representation only.
+        let router = tdh::router_with_auth(super::router(), state, auth);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/cache/invalidate?path=simple%2Fproj3290%2F",
+                fx.repo_key
+            ))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        let survivors: Vec<_> = cached_files.iter().filter(|f| f.exists()).collect();
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "invalidate must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            survivors.is_empty(),
+            "invalidating one Simple-index representation must evict the \
+             PEP 691 sibling too (#3290); surviving cache files: {survivors:?}"
         );
     }
 
