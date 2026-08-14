@@ -3831,7 +3831,24 @@ async fn serve_metadata(
     let content = storage
         .get(&artifact.storage_key)
         .await
-        .map_err(map_storage_err)?;
+        .map_err(|e| match e {
+            // A NotFound here means the artifacts row promised bytes that
+            // storage cannot produce — durably, not transiently. For the
+            // caller that is "this repository does not have it", the same
+            // stance #3147 takes on the download path for a missing cached
+            // object. Mapping it through the blanket storage-error 500 made
+            // the virtual member loop's non-404 propagation (a deliberate
+            // #3179 dependency-confusion guard against TRANSIENT faults)
+            // pin every retry to a permanent 500 and suppress the same
+            // member's own upstream fallback (#3366). There are no local
+            // bytes for a fallback to mismatch against, so 404 is the one
+            // honest answer.
+            AppError::NotFound(_) => {
+                AppError::NotFound(format!("Metadata source not available: {}", filename))
+                    .into_response()
+            }
+            other => map_storage_err(other),
+        })?;
 
     // #2561: permit-scoped decode on the serve path, fast-fail 503 on
     // saturation. Only taken for the branches that actually decode an archive.
@@ -11882,6 +11899,94 @@ mod tests {
             &body[..],
             metadata,
             "virtual member must return wheel METADATA"
+        );
+    }
+
+    /// A Remote member carrying an `artifacts` row whose `storage_key` object
+    /// no longer exists must not turn the virtual `.metadata` route into a
+    /// permanent 500 (#3366). The member loop's local-first check hits the row,
+    /// storage answers NotFound, and pre-fix `map_storage_err` promoted that to
+    /// a 500 — which the loop deliberately propagates (the #3179 transient-
+    /// fault guard) instead of trying the SAME member's upstream fallback. With
+    /// the NotFound carve-out, the local-first check 404s and the loop falls
+    /// through to `serve_remote_metadata`, which serves the upstream's PEP 658
+    /// metadata. There are no local bytes for that fallback to mismatch
+    /// against, so this does not weaken the #3179 guard for real storage/DB
+    /// faults.
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_missing_storage_object_falls_back_to_remote() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(metadata))
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+
+        // The poisoned state: an artifacts row on the REMOTE member whose
+        // storage_key names an object that was never written (deleted cache
+        // entry, lost object, stale backfill). Nothing is written to the
+        // member's storage on purpose.
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)",
+        )
+        .bind(member_id)
+        .bind(format!("simple/{project}/{wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind("test-orphaned-row")
+        .bind("application/zip")
+        .bind(format!("missing/{wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed orphaned artifacts row");
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an orphaned artifacts row must fall through to the member's \
+             upstream metadata, not pin the route to a 500: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "the upstream's PEP 658 metadata must be served"
         );
     }
 
