@@ -305,6 +305,163 @@ pub(crate) fn parse_cyclonedx_catalog(bom: &[u8]) -> Option<Vec<CatalogedCompone
     )
 }
 
+/// The outputs of ONE grype invocation.
+///
+/// Grype is asked for its `json` report and its `cyclonedx-json` BOM in the
+/// same subprocess: these scans run inline on the proxy download path under a
+/// 30s budget, so a second invocation to obtain the catalogue is not an option.
+struct GrypeRun {
+    /// The findings report. Drives blocking; unaffected by anything below.
+    report: GrypeReport,
+    /// #3003 identity-gate signal: `library` components only. Semantics are
+    /// deliberately unchanged — this gate decides fail-closed serving.
+    cataloged: Option<Vec<CatalogedComponent>>,
+    /// Full package inventory for the SBOM. `None` means the BOM was absent or
+    /// unparseable, and the caller falls back to the match-derived rows.
+    inventory: Option<Vec<RawPackage>>,
+}
+
+/// CycloneDX component types that denote a PACKAGE, and are therefore SBOM
+/// inventory rows.
+///
+/// An allowlist, not a denylist of `file`. Syft also emits a `type: "file"`
+/// component per catalogued file, whose `name` is the ABSOLUTE PATH inside our
+/// scan workspace (`/var/lib/artifact-keeper/scan/<uuid>/foo/bar.py`).
+/// Publishing those into an SBOM would both bury the real components — a
+/// postgres:16-alpine BOM carries 49 packages and 561 file entries — and leak
+/// the server's internal filesystem layout to anyone who can read the SBOM. A
+/// denylist would re-leak the day syft introduces another path-shaped type.
+const CYCLONEDX_PACKAGE_TYPES: &[&str] =
+    &["library", "application", "operating-system", "framework"];
+
+/// Read one CycloneDX `licenses` entry into a display string.
+///
+/// Syft emits three shapes: `{"license": {"id": "MIT"}}` (SPDX id),
+/// `{"license": {"name": "Dual License"}}` (non-SPDX text), and
+/// `{"expression": "MIT OR Apache-2.0"}` (SPDX expression). Taking only `id`
+/// would silently drop the licenses of every package whose declaration is not
+/// a clean SPDX id.
+fn cyclonedx_license(component: &serde_json::Value) -> Option<String> {
+    let entries = component.get("licenses")?.as_array()?;
+    entries.iter().find_map(|entry| {
+        let text = entry
+            .get("license")
+            .and_then(|l| l.get("id").or_else(|| l.get("name")))
+            .or_else(|| entry.get("expression"))
+            .and_then(|v| v.as_str())?;
+        (!text.is_empty()).then(|| text.to_string())
+    })
+}
+
+/// Syft records the ecosystem it catalogued a component from as a property;
+/// it uses the same vocabulary as Grype's `matches[].artifact.type` (`apk`,
+/// `python`, `npm`, ...), so inventory rows from either source carry
+/// comparable `source_target` values.
+fn cyclonedx_package_type(component: &serde_json::Value) -> Option<String> {
+    let props = component.get("properties")?.as_array()?;
+    props.iter().find_map(|p| {
+        (p.get("name").and_then(|n| n.as_str()) == Some("syft:package:type"))
+            .then(|| p.get("value").and_then(|v| v.as_str()))
+            .flatten()
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Extract the FULL package inventory from Grype's `cyclonedx-json` BOM.
+///
+/// This is the fix for the inventory half of #1273. Grype's `json` report only
+/// names CVE-MATCHED artifacts, so [`GrypeScanner::convert_packages`] — which
+/// reads that report — produces an inventory that is empty for a clean
+/// artifact and, for a vulnerable one, lists only the vulnerable components.
+/// Measured against `postgres:16-alpine`: 5 distinct matched packages versus
+/// 49 catalogued libraries. An SBOM claiming 5 of 51 components looks
+/// authoritative and is wrong.
+///
+/// Grype builds the full syft catalog on EVERY scan regardless; the
+/// `cyclonedx-json` presenter is simply the output that carries it, and it is
+/// requested in the same invocation (see
+/// [`GrypeScanner::run_grype_with_catalog`]) so no second scan is spawned.
+///
+/// Returns `None` when the BOM is unparseable or has no `components` array —
+/// deliberately distinct from `Some(vec![])`, so a caller can tell "no signal"
+/// (fall back to the match-derived rows) from "the engine catalogued nothing".
+///
+/// Kept SEPARATE from [`parse_cyclonedx_catalog`] on purpose. That function
+/// feeds the #3003 identity gate, which is load-bearing for fail-closed
+/// serving, and it deliberately counts only `library` components. Widening it
+/// to the package types below would change which artifacts pass that gate.
+pub(crate) fn parse_cyclonedx_packages(bom: &[u8]) -> Option<Vec<RawPackage>> {
+    let v: serde_json::Value = serde_json::from_slice(bom).ok()?;
+    let components = v.get("components")?.as_array()?;
+    let mut seen: std::collections::HashSet<(String, Option<String>)> =
+        std::collections::HashSet::new();
+    let mut packages = Vec::new();
+    for c in components {
+        let component_type = c.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+        if !CYCLONEDX_PACKAGE_TYPES.contains(&component_type) {
+            continue;
+        }
+        let Some(name) = c
+            .get("name")
+            .and_then(|n| n.as_str())
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        let version = c
+            .get("version")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if !seen.insert((name.to_string(), version.clone())) {
+            continue;
+        }
+        packages.push(RawPackage {
+            name: name.to_string(),
+            version,
+            purl: c
+                .get("purl")
+                .and_then(|p| p.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            license: cyclonedx_license(c),
+            source_target: cyclonedx_package_type(c),
+        });
+    }
+    Some(packages)
+}
+
+/// Fold the catalogued inventory together with the match-derived rows.
+///
+/// The match-derived row WINS on a `(name, version)` collision. Every row
+/// today's code produces therefore survives byte-for-byte, and the catalogue
+/// only ever adds components — so this cannot regress an existing SBOM, only
+/// complete it. (Empirically the matched set is a subset of the catalogue, but
+/// relying on that would make an SBOM lose a vulnerable component the day it
+/// stops being true.)
+///
+/// `catalog: None` means the BOM was missing or unparseable; the inventory
+/// then degrades to exactly today's match-derived list rather than failing the
+/// scan. A scan that blocks correctly with a thin inventory is fine; a scan
+/// that fails because SBOM generation broke is not.
+fn merge_inventory(catalog: Option<Vec<RawPackage>>, matched: Vec<RawPackage>) -> Vec<RawPackage> {
+    let Some(catalog) = catalog else {
+        return matched;
+    };
+    let mut seen: std::collections::HashSet<(String, Option<String>)> = matched
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone()))
+        .collect();
+    let mut packages = matched;
+    for p in catalog {
+        if seen.insert((p.name.clone(), p.version.clone())) {
+            packages.push(p);
+        }
+    }
+    packages
+}
+
 fn parse_grype_output(
     success: bool,
     status_display: &str,
@@ -777,8 +934,8 @@ impl GrypeScanner {
         // know the owning repo (production `scan_target` path). Legacy keyless
         // scans pull anonymously (empty env), preserving prior behavior.
         let auth_env = self.registry_auth_env_for_repo(repo_key);
-        let report = match self.run_grype_target(&target, &auth_env).await {
-            Ok(report) => report,
+        let run = match self.run_grype_target(&target, &auth_env).await {
+            Ok(run) => run,
             Err(e) => {
                 return Err(
                     fail_scan("Grype OCI scan", artifact, &e, &self.scan_workspace, None).await,
@@ -786,24 +943,23 @@ impl GrypeScanner {
             }
         };
 
-        let findings = Self::convert_findings(&report);
-        let packages = Self::convert_packages(&report);
+        let findings = Self::convert_findings(&run.report);
+        let packages = merge_inventory(run.inventory, Self::convert_packages(&run.report));
         info!(
             "Grype OCI scan complete for {}: {} vulnerabilities, {} components",
             artifact.name,
             findings.len(),
             packages.len()
         );
-        // #1273: emit a `packages` list (not `findings_only`) so the
-        // vulnerable components Grype matched on appear in the SBOM even when
-        // Trivy did not enumerate them. ScanCompleteness stays Complete
-        // because Grype's catalog of matched packages is the universe it
-        // intends to report on; the partial-scan signal is reserved for
-        // Trivy's parser-skipped lockfiles.
+        // #1273: emit a `packages` list (not `findings_only`) so the SBOM
+        // carries the components Grype cataloged. ScanCompleteness stays
+        // Complete; the partial-scan signal is reserved for Trivy's
+        // parser-skipped lockfiles.
         Ok(ScanOutput {
             findings,
             packages,
             scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+            // Registry mode does not feed the #3003 identity gate; unchanged.
             cataloged: None,
         })
     }
@@ -829,12 +985,13 @@ impl GrypeScanner {
         // catalog side channel (#3003 PR-2) rides the same single invocation
         // so the inline OCI proxy gate can tell "clean" from "graded nothing".
         let result = match self
-            .run_grype_with_catalog(&grype_target, &bom_path, &[])
+            .run_grype_with_catalog(&grype_target, Some(&bom_path), &[])
             .await
         {
-            Ok((report, cataloged)) => {
-                let findings = Self::convert_findings(&report);
-                let packages = Self::convert_packages(&report);
+            Ok(run) => {
+                let findings = Self::convert_findings(&run.report);
+                let packages = merge_inventory(run.inventory, Self::convert_packages(&run.report));
+                let cataloged = run.cataloged;
                 info!(
                     "Grype OCI local layout scan complete for {}: {} vulnerabilities, {} components, {} cataloged",
                     artifact.name,
@@ -1077,15 +1234,14 @@ impl GrypeScanner {
     /// written or parsed we return `None` (rather than failing the scan), and
     /// `None` means "no catalog signal", which the caller's assessment gate
     /// treats as "keep prior behavior".
-    async fn run_grype_dir_with_catalog(
-        &self,
-        workspace: &Path,
-    ) -> Result<(GrypeReport, Option<Vec<CatalogedComponent>>)> {
+    async fn run_grype_dir_with_catalog(&self, workspace: &Path) -> Result<GrypeRun> {
         let dir_arg = format!("dir:{}", workspace.to_string_lossy());
         // Keep the BOM out of the scanned tree: writing it inside `workspace`
-        // would make the next catalog include our own artifact.
+        // would make the next catalog include our own artifact. The parent
+        // directory holds `workspace` itself, so it exists.
         let bom_path = workspace.with_extension("grype-bom.json");
-        self.run_grype_with_catalog(&dir_arg, &bom_path, &[]).await
+        self.run_grype_with_catalog(&dir_arg, Some(&bom_path), &[])
+            .await
     }
 
     /// Target-agnostic core of [`run_grype_dir_with_catalog`], shared with the
@@ -1097,18 +1253,34 @@ impl GrypeScanner {
     async fn run_grype_with_catalog(
         &self,
         scan_arg: &str,
-        bom_path: &Path,
+        bom_path: Option<&Path>,
         auth_env: &[(&'static str, String)],
-    ) -> Result<(GrypeReport, Option<Vec<CatalogedComponent>>)> {
+    ) -> Result<GrypeRun> {
         let mut command = tokio::process::Command::new("grype");
+        // `-o json` on stdout is the findings contract and never changes. The
+        // second `-o` MUST carry `=<path>`: two stdout presenters conflict and
+        // grype refuses the run.
+        //
+        // CAUTION, verified against grype 0.113.0: if the BOM path is not
+        // writable grype exits 1 with EMPTY stdout — the whole scan fails,
+        // findings included. The directory must therefore be known to exist
+        // before the BOM is requested at all, which is why this is an `Option`
+        // and why the callers that cannot guarantee a directory pass `None`.
+        match bom_path {
+            Some(path) => {
+                command.args([
+                    scan_arg,
+                    "-o",
+                    "json",
+                    "-o",
+                    &format!("cyclonedx-json={}", path.to_string_lossy()),
+                ]);
+            }
+            None => {
+                command.args([scan_arg, "-o", "json"]);
+            }
+        }
         command
-            .args([
-                scan_arg,
-                "-o",
-                "json",
-                "-o",
-                &format!("cyclonedx-json={}", bom_path.to_string_lossy()),
-            ])
             .env("GRYPE_DB_AUTO_UPDATE", "false")
             .env("GRYPE_DB_VALIDATE_AGE", "false")
             .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
@@ -1130,20 +1302,51 @@ impl GrypeScanner {
             &output.stderr,
         );
 
-        let catalog = match tokio::fs::read(&bom_path).await {
-            Ok(bytes) => parse_cyclonedx_catalog(&bytes),
-            Err(e) => {
-                debug!(
-                    "Grype catalog BOM unavailable at {}: {}",
-                    bom_path.display(),
-                    e
-                );
-                None
-            }
+        // Both signals come from the SAME BOM bytes and the same invocation.
+        // `cataloged` keeps its #3003 identity-gate semantics (library
+        // components only); `inventory` is the SBOM package list.
+        let (cataloged, inventory) = match bom_path {
+            Some(path) => match tokio::fs::read(path).await {
+                Ok(bytes) => (
+                    parse_cyclonedx_catalog(&bytes),
+                    parse_cyclonedx_packages(&bytes),
+                ),
+                Err(e) => {
+                    debug!("Grype catalog BOM unavailable at {}: {}", path.display(), e);
+                    (None, None)
+                }
+            },
+            None => (None, None),
         };
-        let _ = tokio::fs::remove_file(&bom_path).await;
+        if let Some(path) = bom_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
 
-        Ok((report?, catalog))
+        Ok(GrypeRun {
+            report: report?,
+            cataloged,
+            inventory,
+        })
+    }
+
+    /// A BOM sidecar path for a target with no scan workspace of its own
+    /// (registry mode). Returns `None` — meaning "run without the BOM" — when
+    /// the directory cannot be created, because requesting a BOM at an
+    /// unwritable path fails the ENTIRE scan (see
+    /// [`Self::run_grype_with_catalog`]). Losing the inventory is acceptable;
+    /// losing the findings is not.
+    async fn bom_sidecar_path(&self) -> Option<PathBuf> {
+        let dir = PathBuf::from(&self.scan_workspace).join("grype-bom");
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            tracing::warn!(
+                "Cannot create Grype BOM directory {}: {}. Scanning without a \
+                 component inventory; findings are unaffected.",
+                dir.display(),
+                e
+            );
+            return None;
+        }
+        Some(dir.join(format!("{}.json", uuid::Uuid::new_v4())))
     }
 
     /// Run grype against an arbitrary target string (e.g. `dir:/path`,
@@ -1175,7 +1378,7 @@ impl GrypeScanner {
         &self,
         target: &str,
         auth_env: &[(&'static str, String)],
-    ) -> Result<GrypeReport> {
+    ) -> Result<GrypeRun> {
         // Issue #1465: detect "grype binary missing from PATH" via the
         // io::ErrorKind of the spawn failure, NOT a substring search on
         // stderr. The previous implementation classified any non-zero exit
@@ -1188,29 +1391,16 @@ impl GrypeScanner {
         // ref, sending operators down a wild-goose chase patching their
         // Docker image. The kernel already gives us a precise NotFound
         // signal when execve() cannot resolve "grype"; use that.
-        let mut command = tokio::process::Command::new("grype");
-        command
-            .args([target, "-o", "json"])
-            .env("GRYPE_DB_AUTO_UPDATE", "false")
-            .env("GRYPE_DB_VALIDATE_AGE", "false")
-            .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
-        // Registry-auth env for a scoped private-repo pull (#2093). Applied as
-        // child-process env only — never persisted or logged. Empty for local
-        // (dir-mode) and anonymous registry scans.
-        for (key, value) in auth_env {
-            command.env(key, value);
-        }
-        let output = command
-            .output()
+        // Delegates to the single grype spawn site, which pins the same env
+        // vars, omits `-q` for the same reason, and classifies a missing
+        // binary off the spawn error rather than a stderr substring.
+        //
+        // A registry-mode scan has no workspace directory of its own, so the
+        // BOM sidecar is best-effort: `None` runs exactly today's
+        // `[target, "-o", "json"]` invocation.
+        let bom_path = self.bom_sidecar_path().await;
+        self.run_grype_with_catalog(target, bom_path.as_deref(), auth_env)
             .await
-            .map_err(|e| classify_grype_spawn_error(&e))?;
-
-        parse_grype_output(
-            output.status.success(),
-            &output.status.to_string(),
-            &output.stdout,
-            &output.stderr,
-        )
     }
 
     /// Convert Grype matches into `RawFinding` values.
@@ -1593,8 +1783,8 @@ impl GrypeScanner {
             ScanWorkspace::prepare_pinned(&self.scan_workspace, None, artifact, content, pin)
                 .await?;
 
-        let (report, cataloged) = match self.run_grype_dir_with_catalog(&workspace).await {
-            Ok(pair) => pair,
+        let run = match self.run_grype_dir_with_catalog(&workspace).await {
+            Ok(run) => run,
             Err(e) => {
                 return Err(
                     fail_scan("Grype scan", artifact, &e, &self.scan_workspace, None).await,
@@ -1602,8 +1792,9 @@ impl GrypeScanner {
             }
         };
 
-        let findings = Self::convert_findings(&report);
-        let packages = Self::convert_packages(&report);
+        let cataloged = run.cataloged;
+        let findings = Self::convert_findings(&run.report);
+        let packages = merge_inventory(run.inventory, Self::convert_packages(&run.report));
 
         info!(
             "Grype scan complete for {}: {} vulnerabilities, {} components, {} cataloged",
@@ -1717,6 +1908,194 @@ mod tests {
         );
         assert!(parse_cyclonedx_catalog(b"not json").is_none());
         assert!(parse_cyclonedx_catalog(br#"{"bomFormat":"CycloneDX"}"#).is_none());
+    }
+
+    /// A BOM in the shape grype 0.113.0 actually emits, trimmed from a real
+    /// `postgres:16-alpine` scan (49 libraries, 1 application, 1
+    /// operating-system, 561 file entries) and a real `python-dateutil` wheel
+    /// scan.
+    fn real_shape_bom() -> &'static [u8] {
+        br#"{
+            "bomFormat": "CycloneDX",
+            "components": [
+                {
+                    "type": "library",
+                    "name": "python-dateutil",
+                    "version": "2.9.0.post0",
+                    "purl": "pkg:pypi/python-dateutil@2.9.0.post0",
+                    "licenses": [{"license": {"name": "Dual License"}}],
+                    "properties": [
+                        {"name": "syft:package:foundBy", "value": "python-installed-package-cataloger"},
+                        {"name": "syft:package:type", "value": "python"}
+                    ]
+                },
+                {
+                    "type": "library",
+                    "name": "busybox",
+                    "version": "1.37.0-r31",
+                    "purl": "pkg:apk/alpine/busybox@1.37.0-r31",
+                    "licenses": [{"license": {"id": "GPL-2.0-only"}}],
+                    "properties": [{"name": "syft:package:type", "value": "apk"}]
+                },
+                {
+                    "type": "library",
+                    "name": "dual-licensed",
+                    "version": "1.0",
+                    "licenses": [{"expression": "MIT OR Apache-2.0"}]
+                },
+                {
+                    "type": "file",
+                    "name": "/var/lib/artifact-keeper/scan/9f3/idna/core.py"
+                },
+                {
+                    "type": "file",
+                    "name": "/var/lib/artifact-keeper/scan/9f3/idna-3.10.dist-info/METADATA"
+                },
+                {
+                    "type": "application",
+                    "name": "postgresql",
+                    "version": "16.14",
+                    "purl": "pkg:generic/postgresql@16.14"
+                },
+                {"type": "operating-system", "name": "alpine", "version": "3.24.1"},
+                {"type": "library", "name": "", "version": "9.9"},
+                {"type": "library", "name": "no-version-still-a-component"}
+            ]
+        }"#
+    }
+
+    /// The inventory half of the fix. Grype's json report names only
+    /// CVE-MATCHED artifacts, so the SBOM has to come from the BOM's catalogue.
+    #[test]
+    fn test_parse_cyclonedx_packages_extracts_the_full_catalog() {
+        let packages = parse_cyclonedx_packages(real_shape_bom()).expect("BOM parses");
+        let names: Vec<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "python-dateutil",
+                "busybox",
+                "dual-licensed",
+                "postgresql",
+                "alpine",
+                "no-version-still-a-component",
+            ],
+            "library, application and operating-system are packages; file is not"
+        );
+
+        let dateutil = &packages[0];
+        assert_eq!(dateutil.version.as_deref(), Some("2.9.0.post0"));
+        assert_eq!(
+            dateutil.purl.as_deref(),
+            Some("pkg:pypi/python-dateutil@2.9.0.post0")
+        );
+        // A non-SPDX license arrives under `name`, not `id`; reading only `id`
+        // would silently drop it.
+        assert_eq!(dateutil.license.as_deref(), Some("Dual License"));
+        assert_eq!(dateutil.source_target.as_deref(), Some("python"));
+        assert_eq!(packages[1].license.as_deref(), Some("GPL-2.0-only"));
+        assert_eq!(packages[2].license.as_deref(), Some("MIT OR Apache-2.0"));
+        // An unversioned component is still a component; only the empty name
+        // is dropped.
+        assert_eq!(packages[5].version, None);
+    }
+
+    /// Syft names every catalogued FILE as a component whose `name` is its
+    /// absolute path inside our scan workspace. Publishing those would bury
+    /// the real components and leak the server's filesystem layout to anyone
+    /// who can read the SBOM.
+    #[test]
+    fn test_parse_cyclonedx_packages_never_leaks_workspace_paths() {
+        let packages = parse_cyclonedx_packages(real_shape_bom()).expect("BOM parses");
+        for p in &packages {
+            assert!(
+                !p.name.starts_with('/') && !p.name.contains("/scan/"),
+                "a filesystem path reached the SBOM inventory: {:?}",
+                p
+            );
+        }
+        // The type allowlist is what enforces it -- a denylist of `file` would
+        // re-leak the day syft adds another path-shaped component type.
+        assert!(!CYCLONEDX_PACKAGE_TYPES.contains(&"file"));
+    }
+
+    #[test]
+    fn test_parse_cyclonedx_packages_absent_signal_vs_empty_catalog() {
+        // Same contract as parse_cyclonedx_catalog: None is "no signal" (fall
+        // back to match-derived rows), Some(empty) is "cataloged nothing".
+        assert_eq!(
+            parse_cyclonedx_packages(br#"{"components": []}"#),
+            Some(vec![])
+        );
+        assert!(parse_cyclonedx_packages(b"not json").is_none());
+        assert!(parse_cyclonedx_packages(br#"{"bomFormat":"CycloneDX"}"#).is_none());
+    }
+
+    fn pkg(name: &str, version: Option<&str>, license: Option<&str>) -> RawPackage {
+        RawPackage {
+            name: name.to_string(),
+            version: version.map(str::to_string),
+            purl: None,
+            license: license.map(str::to_string),
+            source_target: None,
+        }
+    }
+
+    /// THE headline case, and the reason this work exists: a CLEAN artifact
+    /// has zero matches, so the match-derived inventory is empty and no SBOM
+    /// is produced at all. The catalogue supplies the components instead.
+    #[test]
+    fn test_clean_artifact_still_gets_a_component_inventory() {
+        let catalog = parse_cyclonedx_packages(real_shape_bom()).expect("BOM parses");
+        let matched: Vec<RawPackage> = Vec::new(); // a clean scan
+        let inventory = merge_inventory(Some(catalog), matched);
+        assert_eq!(
+            inventory.len(),
+            6,
+            "a clean artifact must still report its components"
+        );
+        assert!(inventory.iter().any(|p| p.name == "python-dateutil"));
+    }
+
+    /// The match-derived row wins a collision, so every row today's code
+    /// produces survives unchanged and the catalogue can only add to it.
+    #[test]
+    fn test_merge_inventory_prefers_the_matched_row_and_adds_the_rest() {
+        let matched = vec![
+            pkg("busybox", Some("1.37.0-r31"), Some("from-grype-match")),
+            pkg("only-matched", Some("1.0"), None),
+        ];
+        let catalog = vec![
+            pkg("busybox", Some("1.37.0-r31"), Some("from-catalog")),
+            pkg("only-cataloged", Some("2.0"), None),
+            // Same name, DIFFERENT version: a distinct component, not a dup.
+            pkg("busybox", Some("1.38.0"), None),
+        ];
+        let merged = merge_inventory(Some(catalog), matched);
+        let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["busybox", "only-matched", "only-cataloged", "busybox"]
+        );
+        assert_eq!(
+            merged[0].license.as_deref(),
+            Some("from-grype-match"),
+            "the matched row must win, so no existing SBOM row changes"
+        );
+        assert_eq!(merged[3].version.as_deref(), Some("1.38.0"));
+    }
+
+    /// A missing or unparseable BOM must degrade to exactly today's behaviour,
+    /// never fail the scan: blocking correctly with a thin inventory is fine,
+    /// failing because SBOM generation broke is not.
+    #[test]
+    fn test_merge_inventory_without_a_catalog_is_todays_behaviour() {
+        let matched = vec![pkg("log4j-core", Some("2.14.1"), None)];
+        let merged = merge_inventory(None, matched.clone());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "log4j-core");
+        // And a clean scan with no BOM stays empty, as before.
+        assert!(merge_inventory(None, Vec::new()).is_empty());
     }
 
     /// The catalog-capturing dir invocation must ask grype for BOTH the json
@@ -3602,24 +3981,89 @@ mod tests {
     /// pass. Reading the source is acceptable for a single-line invariant.
     #[test]
     fn test_grype_invocation_does_not_pass_quiet_flag() {
-        let src = include_str!("grype_scanner.rs");
-        // Find the args() line for the grype subprocess. There is exactly
-        // one in this module (run_grype_target).
-        let args_line = src
-            .lines()
-            .find(|l| l.contains(".args([target, \"-o\", \"json\""))
-            .expect(
-                "run_grype_target must invoke grype with .args([target, \"-o\", \"json\", ...]); \
-                 the arg-vector shape changed and this test needs updating",
-            );
+        // `run_grype_with_catalog` is now the single place this module spawns
+        // grype (`run_grype_target` delegates to it), so its body carries the
+        // whole arg vector. Both invocation shapes live here: with a BOM path
+        // and, when no writable directory is available, without one.
+        let body = grype_spawn_body();
         assert!(
-            !args_line.contains("\"-q\"") && !args_line.contains("\"--quiet\""),
+            !body.contains("\"-q\"") && !body.contains("\"--quiet\""),
             "Grype must be invoked WITHOUT -q / --quiet so DB-load and \
              DB-refresh failures appear in stderr. See artifact-keeper#1001 \
              and the followup that traced 'Grype scan failed (exit status: \
              1): ' with an empty stderr slot back to this flag. Offending \
-             line: {}",
-            args_line
+             body: {}",
+            body
+        );
+        assert!(
+            body.contains("\"-o\",\n                    \"json\",")
+                || body.contains("[scan_arg, \"-o\", \"json\"]"),
+            "the findings report must stay `-o json` on stdout: it is the \
+             input to parse_grype_output and it drives blocking. Body: {}",
+            body
+        );
+    }
+
+    /// Source of the one function that spawns grype, for the invocation-shape
+    /// guards. Bounded at the closing brace so a later function's body cannot
+    /// satisfy an assertion about this one.
+    fn grype_spawn_body() -> &'static str {
+        let src = include_str!("grype_scanner.rs");
+        let marker = "async fn run_grype_with_catalog(";
+        let start = src
+            .find(marker)
+            .expect("run_grype_with_catalog must exist: it is the only grype spawn site");
+        let rest = &src[start + marker.len()..];
+        &rest[..rest.find("\n    }\n").unwrap_or(rest.len())]
+    }
+
+    /// The component catalogue must ride the SAME invocation as the findings
+    /// report. These scans are inline on the proxy download path under a 30s
+    /// budget, so a second `grype` spawn to fetch the BOM would double every
+    /// proxy pull's scan cost.
+    #[test]
+    fn test_grype_requests_cyclonedx_in_the_same_invocation() {
+        let body = grype_spawn_body();
+        assert!(
+            body.contains("cyclonedx-json={}"),
+            "the BOM must be requested as a second -o with a `=path` target \
+             (two stdout presenters conflict). Body: {}",
+            body
+        );
+        let spawns = include_str!("grype_scanner.rs")
+            .matches("tokio::process::Command::new(\"grype\")")
+            .count();
+        assert_eq!(
+            spawns, 1,
+            "grype must be spawned from exactly ONE place, so the report and \
+             the BOM cannot drift into two scans of the same artifact"
+        );
+    }
+
+    /// Verified against grype 0.113.0: pointing `cyclonedx-json=` at an
+    /// unwritable path makes grype exit 1 with EMPTY stdout — the findings are
+    /// lost with the BOM. The BOM is therefore only ever requested at a path
+    /// whose directory we just created, and the request is skippable.
+    #[test]
+    fn test_grype_bom_path_is_optional_so_an_unwritable_dir_cannot_fail_the_scan() {
+        let body = grype_spawn_body();
+        assert!(
+            body.contains("match bom_path {") && body.contains("None => {"),
+            "run_grype_with_catalog must accept `bom_path: None` and fall back \
+             to the plain `-o json` invocation. Body: {}",
+            body
+        );
+        let src = include_str!("grype_scanner.rs");
+        let start = src
+            .find("async fn bom_sidecar_path(")
+            .expect("bom_sidecar_path must exist");
+        let rest = &src[start..];
+        let sidecar = &rest[..rest.find("\n    }\n").unwrap_or(rest.len())];
+        assert!(
+            sidecar.contains("create_dir_all") && sidecar.contains("return None"),
+            "bom_sidecar_path must create the directory and return None when it \
+             cannot, rather than handing grype an unwritable path. Body: {}",
+            sidecar
         );
     }
 
