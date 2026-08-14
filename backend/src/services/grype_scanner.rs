@@ -445,21 +445,90 @@ pub(crate) fn parse_cyclonedx_packages(bom: &[u8]) -> Option<Vec<RawPackage>> {
 /// then degrades to exactly today's match-derived list rather than failing the
 /// scan. A scan that blocks correctly with a thin inventory is fine; a scan
 /// that fails because SBOM generation broke is not.
-fn merge_inventory(catalog: Option<Vec<RawPackage>>, matched: Vec<RawPackage>) -> Vec<RawPackage> {
+/// Upper bound on the inventory rows one scan may emit.
+///
+/// Before this change `packages` was the CVE-matched set, implicitly bounded
+/// by the vulnerability database. A full catalogue has no such bound: it is
+/// whatever syft finds, and a hostile artifact can manufacture components
+/// (a tarball of ten thousand one-line `package.json` files). Everything
+/// downstream of here — `dedupe_packages`, the `scan_packages` /
+/// `proxy_scan_packages` INSERT, SBOM rendering — then runs over that count,
+/// INLINE on the proxy download path inside a 30s budget.
+///
+/// Set well above any real catalogue (a `postgres:16-alpine` image catalogues
+/// 49 packages; a Python wheel, one) and below the SBOM read path's
+/// `SBOM_INVENTORY_ROW_CAP` of 50_000, so an inventory that survives this cap
+/// is never silently re-truncated on read.
+pub(crate) const SCAN_INVENTORY_CAP: usize = 10_000;
+
+/// Compile-time bracket on [`SCAN_INVENTORY_CAP`]: it must stay under the SBOM
+/// read path's `sbom::SBOM_INVENTORY_ROW_CAP` (50_000, itself pinned >= 30_000
+/// by a test in that module), or an inventory that survives persistence would
+/// be silently re-truncated on read; and comfortably above a real catalogue.
+const _: () = {
+    assert!(SCAN_INVENTORY_CAP < 50_000);
+    assert!(SCAN_INVENTORY_CAP >= 5_000);
+};
+
+/// Fold the catalogued inventory together with the match-derived rows.
+///
+/// The match-derived row WINS on a `(name, version)` collision. Every row
+/// today's code produces therefore survives byte-for-byte, and the catalogue
+/// only ever adds components — so this cannot regress an existing SBOM, only
+/// complete it. (Empirically the matched set is a subset of the catalogue, but
+/// relying on that would make an SBOM lose a vulnerable component the day it
+/// stops being true.) For the same reason the cap is applied to the CATALOGUE
+/// contribution only: a matched row is a component with a known CVE and must
+/// never be dropped from the inventory to make room.
+///
+/// `catalog: None` means the BOM was missing or unparseable; the inventory
+/// then degrades to exactly today's match-derived list rather than failing the
+/// scan. A scan that blocks correctly with a thin inventory is fine; a scan
+/// that fails because SBOM generation broke is not.
+///
+/// Returns the merged rows and whether the catalogue was truncated, so the
+/// caller can mark the scan `Partial` rather than claim a complete inventory
+/// it does not have.
+fn merge_inventory(
+    catalog: Option<Vec<RawPackage>>,
+    matched: Vec<RawPackage>,
+) -> (Vec<RawPackage>, bool) {
     let Some(catalog) = catalog else {
-        return matched;
+        return (matched, false);
     };
     let mut seen: std::collections::HashSet<(String, Option<String>)> = matched
         .iter()
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect();
     let mut packages = matched;
+    let mut truncated = false;
     for p in catalog {
+        if packages.len() >= SCAN_INVENTORY_CAP {
+            truncated = true;
+            break;
+        }
         if seen.insert((p.name.clone(), p.version.clone())) {
             packages.push(p);
         }
     }
-    packages
+    if truncated {
+        tracing::warn!(
+            "Grype catalogued more than {} components; inventory truncated and \
+             the scan marked partial. Findings are unaffected.",
+            SCAN_INVENTORY_CAP
+        );
+    }
+    (packages, truncated)
+}
+
+/// `Partial` when the inventory was capped, so the SBOM says so instead of
+/// presenting a truncated component list as complete.
+fn completeness_for(truncated: bool) -> crate::services::scanner_service::ScanCompleteness {
+    if truncated {
+        crate::services::scanner_service::ScanCompleteness::Partial
+    } else {
+        crate::services::scanner_service::ScanCompleteness::Complete
+    }
 }
 
 fn parse_grype_output(
@@ -944,7 +1013,8 @@ impl GrypeScanner {
         };
 
         let findings = Self::convert_findings(&run.report);
-        let packages = merge_inventory(run.inventory, Self::convert_packages(&run.report));
+        let (packages, truncated) =
+            merge_inventory(run.inventory, Self::convert_packages(&run.report));
         info!(
             "Grype OCI scan complete for {}: {} vulnerabilities, {} components",
             artifact.name,
@@ -958,7 +1028,7 @@ impl GrypeScanner {
         Ok(ScanOutput {
             findings,
             packages,
-            scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+            scan_completeness: completeness_for(truncated),
             // Registry mode does not feed the #3003 identity gate; unchanged.
             cataloged: None,
         })
@@ -990,7 +1060,8 @@ impl GrypeScanner {
         {
             Ok(run) => {
                 let findings = Self::convert_findings(&run.report);
-                let packages = merge_inventory(run.inventory, Self::convert_packages(&run.report));
+                let (packages, truncated) =
+                    merge_inventory(run.inventory, Self::convert_packages(&run.report));
                 let cataloged = run.cataloged;
                 info!(
                     "Grype OCI local layout scan complete for {}: {} vulnerabilities, {} components, {} cataloged",
@@ -1002,7 +1073,7 @@ impl GrypeScanner {
                 Ok(ScanOutput {
                     findings,
                     packages,
-                    scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+                    scan_completeness: completeness_for(truncated),
                     cataloged,
                 })
             }
@@ -1794,7 +1865,8 @@ impl GrypeScanner {
 
         let cataloged = run.cataloged;
         let findings = Self::convert_findings(&run.report);
-        let packages = merge_inventory(run.inventory, Self::convert_packages(&run.report));
+        let (packages, truncated) =
+            merge_inventory(run.inventory, Self::convert_packages(&run.report));
 
         info!(
             "Grype scan complete for {}: {} vulnerabilities, {} components, {} cataloged",
@@ -1820,7 +1892,7 @@ impl GrypeScanner {
         Ok(ScanOutput {
             findings,
             packages,
-            scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+            scan_completeness: completeness_for(truncated),
             cataloged,
         })
     }
@@ -2048,7 +2120,8 @@ mod tests {
     fn test_clean_artifact_still_gets_a_component_inventory() {
         let catalog = parse_cyclonedx_packages(real_shape_bom()).expect("BOM parses");
         let matched: Vec<RawPackage> = Vec::new(); // a clean scan
-        let inventory = merge_inventory(Some(catalog), matched);
+        let (inventory, truncated) = merge_inventory(Some(catalog), matched);
+        assert!(!truncated);
         assert_eq!(
             inventory.len(),
             6,
@@ -2071,7 +2144,7 @@ mod tests {
             // Same name, DIFFERENT version: a distinct component, not a dup.
             pkg("busybox", Some("1.38.0"), None),
         ];
-        let merged = merge_inventory(Some(catalog), matched);
+        let (merged, _) = merge_inventory(Some(catalog), matched);
         let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
@@ -2085,17 +2158,48 @@ mod tests {
         assert_eq!(merged[3].version.as_deref(), Some("1.38.0"));
     }
 
+    /// The matched set used to bound the inventory implicitly (it is limited by
+    /// the vulnerability database). A full catalogue has no such bound, and a
+    /// hostile artifact can manufacture components. Cap it, mark the scan
+    /// partial rather than presenting a truncated list as complete, and never
+    /// drop a CVE-matched row to make room.
+    #[test]
+    fn test_merge_inventory_caps_a_hostile_catalog_and_reports_partial() {
+        let matched = vec![pkg("log4j-core", Some("2.14.1"), None)];
+        let catalog: Vec<RawPackage> = (0..SCAN_INVENTORY_CAP + 500)
+            .map(|i| pkg(&format!("manufactured-{i}"), Some("1.0"), None))
+            .collect();
+
+        let (merged, truncated) = merge_inventory(Some(catalog), matched);
+        assert!(truncated, "an over-cap catalog must report truncation");
+        assert_eq!(merged.len(), SCAN_INVENTORY_CAP);
+        assert_eq!(
+            merged[0].name, "log4j-core",
+            "a CVE-matched component must never be evicted by the cap"
+        );
+        assert_eq!(
+            completeness_for(truncated),
+            crate::services::scanner_service::ScanCompleteness::Partial,
+            "a truncated inventory must not claim to be complete"
+        );
+        assert_eq!(
+            completeness_for(false),
+            crate::services::scanner_service::ScanCompleteness::Complete
+        );
+    }
+
     /// A missing or unparseable BOM must degrade to exactly today's behaviour,
     /// never fail the scan: blocking correctly with a thin inventory is fine,
     /// failing because SBOM generation broke is not.
     #[test]
     fn test_merge_inventory_without_a_catalog_is_todays_behaviour() {
         let matched = vec![pkg("log4j-core", Some("2.14.1"), None)];
-        let merged = merge_inventory(None, matched.clone());
+        let (merged, truncated) = merge_inventory(None, matched.clone());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "log4j-core");
+        assert!(!truncated, "no catalog is not a truncated catalog");
         // And a clean scan with no BOM stays empty, as before.
-        assert!(merge_inventory(None, Vec::new()).is_empty());
+        assert!(merge_inventory(None, Vec::new()).0.is_empty());
     }
 
     /// The catalog-capturing dir invocation must ask grype for BOTH the json

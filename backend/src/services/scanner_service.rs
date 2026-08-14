@@ -2638,12 +2638,23 @@ struct FindingDedupKey {
 /// keeping. The richer record wins: an entry carrying a `purl`/`license` is
 /// preferred over a bare one for the same coordinate, so merging never discards
 /// metadata the SBOM would otherwise carry.
+/// Deduplicate by `(name, version)`, filling gaps from later records.
+///
+/// Indexed rather than a linear scan per package. This used to be O(n²) over a
+/// list that was implicitly small — the CVE-MATCHED packages — but the CVE
+/// scanner now reports its full component catalogue, and this runs INLINE on
+/// the proxy download path inside a 30s budget. At the
+/// `grype_scanner::SCAN_INVENTORY_CAP` ceiling the quadratic form is 50M
+/// string comparisons; indexed it is linear. Output order and merge semantics
+/// are identical: first occurrence keeps its position, later ones only fill
+/// fields the first left empty.
 fn dedupe_packages(packages: Vec<RawPackage>) -> Vec<RawPackage> {
     let mut out: Vec<RawPackage> = Vec::with_capacity(packages.len());
+    let mut index: std::collections::HashMap<(String, Option<String>), usize> =
+        std::collections::HashMap::with_capacity(packages.len());
     for pkg in packages {
-        let existing = out
-            .iter_mut()
-            .find(|p| p.name == pkg.name && p.version == pkg.version);
+        let key = (pkg.name.clone(), pkg.version.clone());
+        let existing = index.get(&key).map(|i| &mut out[*i]);
         match existing {
             Some(prev) => {
                 // Fill gaps rather than replace wholesale, so a pair of
@@ -2658,7 +2669,10 @@ fn dedupe_packages(packages: Vec<RawPackage>) -> Vec<RawPackage> {
                     prev.source_target = pkg.source_target;
                 }
             }
-            None => out.push(pkg),
+            None => {
+                index.insert(key, out.len());
+                out.push(pkg);
+            }
         }
     }
     out
