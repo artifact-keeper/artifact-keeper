@@ -169,7 +169,8 @@ async fn get_proxy_sbom(
     // audience.
     let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
-    let repo_service = crate::services::repository_service::RepositoryService::new(state.db.clone());
+    let repo_service =
+        crate::services::repository_service::RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     crate::api::handlers::repositories::require_visible(&repo, &Some(auth), &repo_service).await?;
 
@@ -191,7 +192,8 @@ async fn get_proxy_sbom(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let digest = digest.ok_or_else(|| AppError::NotFound(PROXY_SBOM_PATH_NOT_FOUND_MSG.to_string()))?;
+    let digest =
+        digest.ok_or_else(|| AppError::NotFound(PROXY_SBOM_PATH_NOT_FOUND_MSG.to_string()))?;
 
     let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
     let packages = pss
@@ -219,8 +221,8 @@ async fn get_proxy_sbom(
         })
         .collect();
 
-    let document = SbomService::new(state.db.clone())
-        .generate_ephemeral(format, &dependencies, None)?;
+    let document =
+        SbomService::new(state.db.clone()).generate_ephemeral(format, &dependencies, None)?;
 
     Ok(Json(document))
 }
@@ -1980,6 +1982,120 @@ pub struct SbomApiDoc;
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    // -----------------------------------------------------------------------
+    // Proxy SBOM (#3344 follow-up)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn proxy_sbom_format_defaults_to_cyclonedx() {
+        assert!(matches!(
+            parse_proxy_sbom_format(None),
+            Ok(SbomFormat::CycloneDX)
+        ));
+        // An explicitly empty or whitespace-only value is the same as absent:
+        // `?format=` is what a client sends when it has no preference.
+        assert!(matches!(
+            parse_proxy_sbom_format(Some("")),
+            Ok(SbomFormat::CycloneDX)
+        ));
+        assert!(matches!(
+            parse_proxy_sbom_format(Some("   ")),
+            Ok(SbomFormat::CycloneDX)
+        ));
+    }
+
+    #[test]
+    fn proxy_sbom_format_accepts_both_formats_case_insensitively() {
+        for raw in ["cyclonedx", "CycloneDX", "CYCLONEDX", " cyclonedx "] {
+            assert!(
+                matches!(
+                    parse_proxy_sbom_format(Some(raw)),
+                    Ok(SbomFormat::CycloneDX)
+                ),
+                "{raw} should parse as CycloneDX"
+            );
+        }
+        for raw in ["spdx", "SPDX", " Spdx "] {
+            assert!(
+                matches!(parse_proxy_sbom_format(Some(raw)), Ok(SbomFormat::SPDX)),
+                "{raw} should parse as SPDX"
+            );
+        }
+    }
+
+    /// A typo must be rejected, not silently served as the default. Falling
+    /// back would make `format=cyclonedex` indistinguishable from the caller
+    /// getting what they asked for.
+    #[test]
+    fn proxy_sbom_format_rejects_unknown_rather_than_falling_back() {
+        for raw in ["cyclonedex", "spdx2", "json", "xml"] {
+            let err = parse_proxy_sbom_format(Some(raw));
+            assert!(err.is_err(), "{raw} must be rejected");
+        }
+    }
+
+    /// The empty-inventory message must never read as a clean or empty SBOM.
+    /// A zero-component document would assert "this artifact has no
+    /// dependencies", which is the same false-clean failure as the green
+    /// all-clear shield this work exists to remove.
+    #[test]
+    fn proxy_sbom_absent_message_does_not_imply_an_empty_sbom() {
+        let msg = PROXY_SBOM_NOT_RECORDED_MSG;
+        assert!(
+            msg.contains("No SBOM recorded"),
+            "must state that no SBOM exists, not that the SBOM is empty"
+        );
+        // It must tell the operator how to get one, or the feature reports a
+        // problem and offers no remedy.
+        assert!(
+            msg.contains("next time it is pulled"),
+            "must name the remedy: pulling the artifact again records an inventory"
+        );
+        for forbidden in ["no components", "no dependencies", "clean", "empty"] {
+            assert!(
+                !msg.to_ascii_lowercase().contains(forbidden),
+                "message must not imply the artifact has nothing in it: {forbidden}"
+            );
+        }
+    }
+
+    /// The path lookup must be repository-scoped and must exclude placeholder
+    /// rows whose checksum has not been backfilled. `record_proxy_download`
+    /// upserts those before content commits, and they can persist
+    /// indefinitely, so they must resolve to "no inventory" rather than
+    /// joining to nothing and rendering as an empty document.
+    #[test]
+    fn proxy_sbom_path_lookup_is_repo_scoped_and_skips_placeholders() {
+        let source = include_str!("sbom.rs");
+        let marker = "async fn get_proxy_sbom(";
+        let start = source.find(marker).expect("handler not found");
+        let rest = &source[start + marker.len()..];
+        // Bound at a top-level closing brace: later declarations inside
+        // `mod tests` are indented, so slicing to the next `async fn` would
+        // run to EOF and pick up this test's own assertions.
+        let body = &rest[..rest.find("\n}\n").unwrap_or(rest.len())];
+
+        assert!(
+            body.contains("repository_id = $1"),
+            "path resolution must be scoped to the calling repository"
+        );
+        assert!(
+            body.contains("checksum_sha256 IS NOT NULL"),
+            "placeholder rows with a NULL checksum must not resolve"
+        );
+        let auth_at = body
+            .find("auth.ok_or_else(")
+            .expect("must reject an unauthenticated caller");
+        let visible_at = body
+            .find("require_visible(")
+            .expect("must call require_visible");
+        assert!(
+            auth_at < visible_at,
+            "authentication must be enforced BEFORE require_visible, which \
+             returns early for public repositories"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Default functions
