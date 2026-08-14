@@ -2021,8 +2021,7 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         );
 
         // POST the exact URL cm-push constructs for repo URL {host}/helm/{repo}.
-        let app =
-            f.router_with_auth(Router::new().nest("/api/helm", super::cm_push_router()));
+        let app = f.router_with_auth(Router::new().nest("/api/helm", super::cm_push_router()));
         let req = tdh::post(
             format!("/api/helm/{}/charts", f.repo_key),
             "multipart/form-data; boundary=BOUNDARY",
@@ -2046,8 +2045,7 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         assert_eq!(status, StatusCode::OK);
 
         // DELETE via the same ChartMuseum shape.
-        let app =
-            f.router_with_auth(Router::new().nest("/api/helm", super::cm_push_router()));
+        let app = f.router_with_auth(Router::new().nest("/api/helm", super::cm_push_router()));
         let req = axum::http::Request::builder()
             .method("DELETE")
             .uri(format!("/api/helm/{}/charts/cmpushchart/0.1.0", f.repo_key))

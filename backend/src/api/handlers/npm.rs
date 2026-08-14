@@ -1924,7 +1924,13 @@ fn build_npm_metadata_response(
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
     Ok(respond_with_packument(
-        build_npm_metadata_value(artifacts, package_name, base_url, repo_key, stored_dist_tags),
+        build_npm_metadata_value(
+            artifacts,
+            package_name,
+            base_url,
+            repo_key,
+            stored_dist_tags,
+        ),
         want_abbreviated,
     ))
 }
@@ -2737,8 +2743,7 @@ async fn collect_virtual_packument(
     }
 
     merged.ok_or_else(|| {
-        AppError::NotFound("Package not found in any member repository".to_string())
-            .into_response()
+        AppError::NotFound("Package not found in any member repository".to_string()).into_response()
     })
 }
 
@@ -8790,7 +8795,10 @@ mod tests {
             acc["versions"]["1.0.0"]["dist"]["tarball"], "https://a/pkg-1.0.0.tgz",
             "a version both members hold must keep the higher-priority body"
         );
-        assert_eq!(acc["versions"]["2.0.0"]["dist"]["tarball"], "https://b/pkg-2.0.0.tgz");
+        assert_eq!(
+            acc["versions"]["2.0.0"]["dist"]["tarball"],
+            "https://b/pkg-2.0.0.tgz"
+        );
         // `dist-tags` was absent from the accumulator: created from the later
         // member; other top-level fields fill in when missing.
         assert_eq!(acc["dist-tags"]["latest"], "2.0.0");
