@@ -213,6 +213,36 @@ pub async fn get_artifact(
     }))
 }
 
+/// Precondition shared by the by-id sub-resource endpoints (`/metadata`,
+/// `/stats`): the artifact must exist and not be soft-deleted, and the caller
+/// must be allowed to see the repository that owns it.
+///
+/// `get_artifact_metadata` and `get_artifact_stats` carried byte-identical
+/// copies of this guard. The ORDER is load-bearing and is preserved exactly:
+/// the existence check runs first and returns the same generic "Artifact not
+/// found" for a soft-deleted or non-existent id, and only then is
+/// [`check_artifact_visibility`] consulted — so the pair of checks cannot be
+/// used to distinguish "exists but you may not see it" from "does not exist".
+async fn require_existing_visible_artifact(
+    state: &SharedState,
+    auth: &Option<AuthExtension>,
+    id: Uuid,
+) -> Result<()> {
+    let exists = sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1 AND is_deleted = false)",
+        id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if exists != Some(true) {
+        return Err(AppError::NotFound("Artifact not found".to_string()));
+    }
+
+    check_artifact_visibility(auth, id, &state.db).await
+}
+
 /// Get artifact metadata by artifact ID
 #[utoipa::path(
     get,
@@ -232,19 +262,7 @@ pub async fn get_artifact_metadata(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ArtifactMetadataResponse>> {
-    let exists = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1 AND is_deleted = false)",
-        id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    if exists != Some(true) {
-        return Err(AppError::NotFound("Artifact not found".to_string()));
-    }
-
-    check_artifact_visibility(&auth, id, &state.db).await?;
+    require_existing_visible_artifact(&state, &auth, id).await?;
 
     let metadata = sqlx::query!(
         r#"
@@ -286,19 +304,7 @@ pub async fn get_artifact_stats(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ArtifactStatsResponse>> {
-    let exists = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1 AND is_deleted = false)",
-        id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    if exists != Some(true) {
-        return Err(AppError::NotFound("Artifact not found".to_string()));
-    }
-
-    check_artifact_visibility(&auth, id, &state.db).await?;
+    require_existing_visible_artifact(&state, &auth, id).await?;
 
     let stats = sqlx::query!(
         r#"
@@ -341,59 +347,14 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    // ── ArtifactResponse serialization tests ────────────────────────
-    //
-    // The by-id endpoint now serves the canonical repositories.rs
-    // ArtifactResponse (the shape the published OpenAPI spec has always
-    // declared). These tests pin the on-the-wire contract of that shape as
-    // served by GET /api/v1/artifacts/{id}.
-
-    #[test]
-    fn test_artifact_response_serialization_all_fields() {
-        let now = Utc::now();
-        let id = Uuid::new_v4();
-        let resp = ArtifactResponse {
-            revision: None,
-            version_label: None,
-            id,
-            repository_key: "maven-releases".to_string(),
-            path: "com/example/lib/1.0/lib-1.0.jar".to_string(),
-            name: "lib".to_string(),
-            version: Some("1.0".to_string()),
-            size_bytes: 102400,
-            checksum_sha256: "abc123".to_string(),
-            content_type: "application/java-archive".to_string(),
-            download_count: 42,
-            created_at: now,
-            uploaded_by: None,
-            uploaded_by_username: None,
-            metadata: Some(serde_json::json!({"groupId": "com.example"})),
-            analyzable: true,
-            cache_cached_at: None,
-            cache_expires_at: None,
-            quarantine_status: "not_quarantined".to_string(),
-            quarantine_until: None,
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["id"], id.to_string());
-        assert_eq!(json["repository_key"], "maven-releases");
-        assert_eq!(json["path"], "com/example/lib/1.0/lib-1.0.jar");
-        assert_eq!(json["name"], "lib");
-        assert_eq!(json["version"], "1.0");
-        assert_eq!(json["size_bytes"], 102400);
-        assert_eq!(json["checksum_sha256"], "abc123");
-        assert_eq!(json["content_type"], "application/java-archive");
-        // Spec-required fields the by-id endpoint previously omitted (#98).
-        assert_eq!(json["download_count"], 42);
-        assert_eq!(json["analyzable"], true);
-        assert_eq!(json["metadata"]["groupId"], "com.example");
-    }
-
-    #[test]
-    fn test_artifact_response_no_undeclared_fields() {
-        // The previous local ArtifactResponse leaked DB columns the spec
-        // never declared. Pin their absence on the serialized output.
-        let resp = ArtifactResponse {
+    /// Baseline `ArtifactResponse` for the serialization tests below.
+    ///
+    /// The tests differ in only a handful of fields each, so they share one
+    /// constructor and override just what they exercise. Previously every test
+    /// spelled out the whole literal, which meant each field added to the
+    /// struct was duplicated four more times.
+    fn sample_response() -> ArtifactResponse {
+        ArtifactResponse {
             revision: None,
             version_label: None,
             id: Uuid::new_v4(),
@@ -414,7 +375,52 @@ mod tests {
             cache_expires_at: None,
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
+        }
+    }
+
+    // ── ArtifactResponse serialization tests ────────────────────────
+    //
+    // The by-id endpoint now serves the canonical repositories.rs
+    // ArtifactResponse (the shape the published OpenAPI spec has always
+    // declared). These tests pin the on-the-wire contract of that shape as
+    // served by GET /api/v1/artifacts/{id}.
+
+    #[test]
+    fn test_artifact_response_serialization_all_fields() {
+        let id = Uuid::new_v4();
+        let resp = ArtifactResponse {
+            id,
+            repository_key: "maven-releases".to_string(),
+            path: "com/example/lib/1.0/lib-1.0.jar".to_string(),
+            name: "lib".to_string(),
+            version: Some("1.0".to_string()),
+            size_bytes: 102400,
+            checksum_sha256: "abc123".to_string(),
+            content_type: "application/java-archive".to_string(),
+            download_count: 42,
+            metadata: Some(serde_json::json!({"groupId": "com.example"})),
+            ..sample_response()
         };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["id"], id.to_string());
+        assert_eq!(json["repository_key"], "maven-releases");
+        assert_eq!(json["path"], "com/example/lib/1.0/lib-1.0.jar");
+        assert_eq!(json["name"], "lib");
+        assert_eq!(json["version"], "1.0");
+        assert_eq!(json["size_bytes"], 102400);
+        assert_eq!(json["checksum_sha256"], "abc123");
+        assert_eq!(json["content_type"], "application/java-archive");
+        // Spec-required fields the by-id endpoint previously omitted (#98).
+        assert_eq!(json["download_count"], 42);
+        assert_eq!(json["analyzable"], true);
+        assert_eq!(json["metadata"]["groupId"], "com.example");
+    }
+
+    #[test]
+    fn test_artifact_response_no_undeclared_fields() {
+        // The previous local ArtifactResponse leaked DB columns the spec
+        // never declared. Pin their absence on the serialized output.
+        let resp = sample_response();
         let json = serde_json::to_value(&resp).unwrap();
         let obj = json.as_object().unwrap();
         for undeclared in [
@@ -438,27 +444,13 @@ mod tests {
     #[test]
     fn test_artifact_response_zero_size() {
         let resp = ArtifactResponse {
-            revision: None,
-            version_label: None,
-            id: Uuid::new_v4(),
-            repository_key: "generic-local".to_string(),
             path: "empty".to_string(),
             name: "empty".to_string(),
-            version: None,
             size_bytes: 0,
             checksum_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                 .to_string(),
-            content_type: "application/octet-stream".to_string(),
-            download_count: 0,
-            created_at: Utc::now(),
-            uploaded_by: None,
-            uploaded_by_username: None,
-            metadata: None,
             analyzable: false,
-            cache_cached_at: None,
-            cache_expires_at: None,
-            quarantine_status: "not_quarantined".to_string(),
-            quarantine_until: None,
+            ..sample_response()
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["size_bytes"], 0);
@@ -559,28 +551,7 @@ mod tests {
 
     #[test]
     fn test_artifact_response_debug_impl() {
-        let resp = ArtifactResponse {
-            revision: None,
-            version_label: None,
-            id: Uuid::nil(),
-            repository_key: "k".to_string(),
-            path: "p".to_string(),
-            name: "n".to_string(),
-            version: None,
-            size_bytes: 0,
-            checksum_sha256: "s".to_string(),
-            content_type: "t".to_string(),
-            download_count: 0,
-            created_at: Utc::now(),
-            uploaded_by: None,
-            uploaded_by_username: None,
-            metadata: None,
-            analyzable: true,
-            cache_cached_at: None,
-            cache_expires_at: None,
-            quarantine_status: "not_quarantined".to_string(),
-            quarantine_until: None,
-        };
+        let resp = sample_response();
         let debug_str = format!("{:?}", resp);
         assert!(debug_str.contains("ArtifactResponse"));
     }
