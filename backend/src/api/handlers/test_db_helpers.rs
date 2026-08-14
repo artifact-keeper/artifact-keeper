@@ -1941,6 +1941,127 @@ pub fn inflate_deflate(coded: &[u8]) -> Vec<u8> {
     decode_coded("deflate", coded)
 }
 
+// ---------------------------------------------------------------------------
+// #3281: Content-Type forwarding fixtures for Virtual verbatim metadata.
+// ---------------------------------------------------------------------------
+
+/// The distinctive `Content-Type` the [`Ct3281Rig`]'s typed upstream mounts.
+/// Deliberately not any format's default literal, so an assertion against it
+/// can only be satisfied by actually forwarding the MEMBER's type.
+pub const CT_3281_TYPED: &str = "application/x-artifact-keeper-test-3281";
+
+/// Mount an upstream that answers every GET with `body` and, when given,
+/// declares `content_type`. Never declares a coding. `set_body_bytes` sets no
+/// `Content-Type` of its own, so `None` yields a genuinely untyped response.
+pub async fn upstream_with_optional_ct(
+    content_type: Option<&str>,
+    body: &[u8],
+) -> wiremock::MockServer {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mut template = ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    if let Some(ct) = content_type {
+        template = template.insert_header("content-type", ct);
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(template)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Rig for the #3281 Virtual verbatim `Content-Type` probes, shared across
+/// the goproxy / rubygems / hex suites (the jscpd duplication gate scores
+/// changed files).
+///
+/// Holds two (Remote member + Virtual) pairs of one format: one whose member
+/// upstream declares [`CT_3281_TYPED`] on every GET, one whose member
+/// declares no `Content-Type` at all. A Virtual verbatim forward must serve
+/// the member's type for the first and the caller's format default for the
+/// second — the same contract the Remote arms already implement.
+pub struct Ct3281Rig {
+    pub state: crate::api::SharedState,
+    /// Virtual repo whose member declares [`CT_3281_TYPED`].
+    pub typed_virtual_key: String,
+    /// Virtual repo whose member declares no `Content-Type`.
+    pub untyped_virtual_key: String,
+    repo_ids: Vec<Uuid>,
+    _typed_mock: wiremock::MockServer,
+    _untyped_mock: wiremock::MockServer,
+    _cache_dir: tempfile::TempDir,
+}
+
+/// Build a [`Ct3281Rig`] for `format`, serving `body` from both member
+/// upstreams. `fx` supplies only the DB + proxy-carrying state.
+pub async fn setup_ct_3281_rig(fx: &Fixture, format: &str, body: &[u8]) -> Ct3281Rig {
+    let typed_mock = upstream_with_optional_ct(Some(CT_3281_TYPED), body).await;
+    let untyped_mock = upstream_with_optional_ct(None, body).await;
+    let (state, cache_dir) = rewire_remote_proxy(fx, &typed_mock.uri()).await;
+    let (typed_member_id, _tk, typed_virtual_id, typed_virtual_key) =
+        create_remote_and_virtual(&fx.pool, format, &typed_mock.uri()).await;
+    let (untyped_member_id, _uk, untyped_virtual_id, untyped_virtual_key) =
+        create_remote_and_virtual(&fx.pool, format, &untyped_mock.uri()).await;
+    Ct3281Rig {
+        state,
+        typed_virtual_key,
+        untyped_virtual_key,
+        repo_ids: vec![
+            typed_virtual_id,
+            typed_member_id,
+            untyped_virtual_id,
+            untyped_member_id,
+        ],
+        _typed_mock: typed_mock,
+        _untyped_mock: untyped_mock,
+        _cache_dir: cache_dir,
+    }
+}
+
+impl Ct3281Rig {
+    /// Probe `uri` (a 200-serving Virtual metadata endpoint) and assert the
+    /// served `Content-Type`: the member's own [`CT_3281_TYPED`] through the
+    /// typed pair, and `default_ct` (the caller's format literal) through the
+    /// untyped pair. `uri_for` builds the URI from a virtual repo key.
+    pub async fn assert_member_ct_forwarded(
+        &self,
+        router: Router<SharedState>,
+        uri_for: impl Fn(&str) -> String,
+        default_ct: &str,
+        what: &str,
+    ) {
+        for (key, expected, case) in [
+            (&self.typed_virtual_key, CT_3281_TYPED, "member-declared"),
+            (&self.untyped_virtual_key, default_ct, "fallback-to-default"),
+        ] {
+            let app = router_anon(router.clone(), self.state.clone());
+            let (_body, headers) = probe_ok(app, uri_for(key)).await;
+            let served = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
+            assert_eq!(
+                served,
+                Some(expected),
+                "{what} ({case}): a Virtual verbatim forward must serve the member \
+                 upstream's Content-Type, falling back to the format default only \
+                 when the member declares none (#3281)"
+            );
+        }
+    }
+
+    /// Delete the rig's repositories (members cascade out of the virtual
+    /// membership table via FK).
+    pub async fn cleanup(self, pool: &PgPool) {
+        for id in &self.repo_ids {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+}
+
 /// Build a gzip-coded body, returning `(plain, coded)`.
 ///
 /// Retained for the arms that assert GET/HEAD header parity, where the point

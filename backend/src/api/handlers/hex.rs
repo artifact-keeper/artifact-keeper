@@ -412,17 +412,21 @@ async fn package_info(
             // Pass 3: fall through to remote proxy for un-cached packages.
             // Verbatim forward of the member's registry bytes: its
             // `Content-Encoding` is re-declared when present (RFC 9110 §8.4,
-            // #3260).
+            // #3260) and its own `Content-Type` is served (#3281) — the
+            // member's registry blob is a signed protobuf, not JSON, and the
+            // Remote arm of this same endpoint already forwards the
+            // upstream's type. The literal survives only as the fallback for
+            // a member that declared none.
             let upstream_path = format!("packages/{}", name);
             return proxy_helpers::resolve_virtual_metadata(
                 &state.db,
                 state.proxy_service.as_deref(),
                 repo.id,
                 &upstream_path,
-                |content, content_encoding, _member_key| async move {
+                |content, content_type, content_encoding, _member_key| async move {
                     Ok(proxy_helpers::forward_verbatim_metadata(
                         content,
-                        None,
+                        content_type,
                         "application/json",
                         content_encoding,
                     ))
@@ -4054,6 +4058,29 @@ mod tests {
                 .execute(&fx.pool)
                 .await;
         }
+        fx.teardown().await;
+    }
+
+    /// #3281: the Virtual arm of `package_info` (pass 3,
+    /// `resolve_virtual_metadata`) forwards the member's signed registry blob
+    /// verbatim and must serve the member's own `Content-Type` — the Remote
+    /// arm of the same endpoint already does — keeping the `application/json`
+    /// literal only for a member that declares none. Before the fix a `mix`
+    /// client got the member's protobuf labelled `application/json`.
+    #[tokio::test]
+    async fn test_hex_virtual_packages_forwards_member_content_type_3281_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "hex").await else {
+            return;
+        };
+        let rig = tdh::setup_ct_3281_rig(&fx, "hex", b"hex-registry-blob-3281").await;
+        rig.assert_member_ct_forwarded(
+            super::router(),
+            |key| format!("/{key}/packages/pkg3281"),
+            "application/json",
+            "hex virtual packages",
+        )
+        .await;
+        rig.cleanup(&fx.pool).await;
         fx.teardown().await;
     }
 }
