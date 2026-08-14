@@ -1043,7 +1043,7 @@ async fn download(
         ));
     }
 
-    // 2b. `.meta/prefixes.txt` — repository-prefixes file (Nexus/Artifactory
+    // 2b. `.meta/prefixes.txt` — repository-prefixes file (Maven RRF
     // convention) letting clients/groups skip members that can't contain a
     // given groupId.
     if MavenHandler::is_prefixes_file(&path) {
