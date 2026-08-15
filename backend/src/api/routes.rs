@@ -16,8 +16,8 @@ use crate::error::AppError;
 
 use super::handlers;
 use super::middleware::auth::{
-    admin_middleware, auth_middleware, optional_auth_middleware, repo_visibility_middleware,
-    RepoVisibilityState,
+    admin_middleware, auth_middleware, csrf_middleware, optional_auth_middleware,
+    repo_visibility_middleware, RepoVisibilityState,
 };
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
@@ -975,6 +975,13 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Web-UI CSRF contract (#3065): a state-changing request authenticated
+        // by the session cookie must carry the `X-Requested-With` header the
+        // web UI sends. Applied to the whole nest so it also covers the
+        // cookie-writing `/auth/*` routes, which mount no auth middleware.
+        // Token- and Basic-authenticated callers (every native package client)
+        // are exempt — see `violates_csrf_contract`.
+        .layer(middleware::from_fn(csrf_middleware))
         // General API rate limiting (100 req/min per IP/user)
         .layer(middleware::from_fn_with_state(
             api_rate_limit_state,

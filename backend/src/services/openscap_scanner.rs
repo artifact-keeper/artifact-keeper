@@ -251,10 +251,10 @@ impl OpenScapScanner {
                 // therefore near zero, which is what makes the change safe in
                 // a patch.
                 //
-                // Every other token classifies exactly as it did before,
-                // `unknown` included — XCCDF's default rule severity still
-                // lands at `Info`. That is a separate, high-volume fail-open
-                // and it is staged as #3306 (1.8.0).
+                // As of #3306 an unrecognised token — `unknown` included,
+                // XCCDF's default rule severity and the high-volume case on a
+                // typical profile — fails closed at `High` instead of landing
+                // at the `Info` floor where no severity-aware gate saw it.
                 let severity = Severity::from_scanner_token(&f.severity);
 
                 let source_url = f.references.first().cloned();
@@ -465,9 +465,9 @@ mod tests {
     // XCCDF 1.2 (NISTIR 7275r4, §6.4.4.2) defines the Rule `severity`
     // attribute as `unknown | info | low | medium | high`, so `critical` is
     // NOT in the spec's vocabulary and only non-standard content produces it —
-    // which is exactly why closing it is safe in a patch. The spec's DEFAULT
-    // value, `unknown`, is the high-volume case and is deliberately left
-    // classifying at `Info` here; that is #3306 (1.8.0).
+    // which is exactly why closing it was safe in a patch. The spec's DEFAULT
+    // value, `unknown`, is the high-volume case; as of #3306 it fails closed
+    // at `High` (see `test_convert_findings_xccdf_unknown_fails_closed_3306`).
     // -----------------------------------------------------------------------
 
     fn openscap_response_with_severities(sevs: &[&str]) -> OpenScapResponse {
@@ -504,33 +504,34 @@ mod tests {
         assert_eq!(findings[3].severity, Severity::Low);
     }
 
-    /// Neutrality pin: XCCDF's default rule severity, `unknown`, classifies
-    /// exactly where the adapter's private match put it — the lowest bucket.
-    /// That is a fail-open and it is deliberately left in place by this patch
-    /// because it is the high-volume case (Artifact Keeper's own wrapper,
-    /// `scripts/openscap-wrapper.py:211,231`, defaults a rule's severity to
-    /// the literal `unknown`, so most rules on a typical profile arrive
-    /// ungraded). **#3306 must delete this test on purpose.**
+    /// #3306: XCCDF's default rule severity, `unknown`, is an UNGRADED result
+    /// and fails closed at `High`. This is the high-volume case (Artifact
+    /// Keeper's own wrapper, `scripts/openscap-wrapper.py:211,231`, defaults a
+    /// rule's severity to the literal `unknown`, so most rules on a typical
+    /// profile arrive ungraded) — which is exactly why leaving it at the
+    /// `Info` floor was a fail-open at every severity-aware gate. This is the
+    /// deliberate rewrite of the stage-1a pinning test
+    /// (`..._is_unchanged_pending_3306`).
     #[test]
-    fn test_convert_findings_xccdf_unknown_is_unchanged_pending_3306() {
-        let response = openscap_response_with_severities(&["unknown", "info", "high"]);
+    fn test_convert_findings_xccdf_unknown_fails_closed_3306() {
+        let response = openscap_response_with_severities(&["unknown", "info", "low"]);
         let findings = OpenScapScanner::convert_findings(&response);
         assert_eq!(findings.len(), 3);
 
         assert_eq!(
             findings[0].severity,
-            Severity::Info,
-            "XCCDF `unknown` must classify as it did before #3294 — moving it \
-             is #3306, not this patch"
+            Severity::High,
+            "XCCDF `unknown` is an ungraded result and must fail closed at \
+             High (#3306)"
         );
-        // An EXPLICIT `info` grade lands in the same bucket, which is the
-        // whole problem #3306 exists to fix: the two are indistinguishable.
+        // An EXPLICIT `info` grade stays at the floor: the two are now
+        // distinguishable, which is the point of #3306.
         assert_eq!(findings[1].severity, Severity::Info);
 
-        // Positive control in the same fixture: a graded rule is untouched, so
-        // the equalities above cannot be satisfied by a converter that stopped
-        // grading anything.
-        assert_eq!(findings[2].severity, Severity::High);
+        // Positive control in the same fixture: a graded rule below High is
+        // untouched, so the assertions above cannot be satisfied by a
+        // converter that raises everything.
+        assert_eq!(findings[2].severity, Severity::Low);
     }
 
     /// **The one behaviour change in this patch.** The private match this

@@ -1563,6 +1563,86 @@ mod tests {
         }
     }
 
+    /// Source-level drift guard for the SameSite half of the CSRF contract
+    /// (#3065).
+    ///
+    /// `SameSite=Strict` on the session cookies is the *primary* CSRF
+    /// mitigation — the `X-Requested-With` requirement in
+    /// `middleware::auth::violates_csrf_contract` is only the second layer.
+    /// The behavioural tests above cover `set_auth_cookies` /
+    /// `clear_auth_cookies`, but they cannot see a *new* call site that builds
+    /// its own `Set-Cookie` string (an SSO or session handler, say). So every
+    /// `.rs` file in the backend is scanned instead of a hardcoded list, the
+    /// way `config.rs` scans every compose file rather than the one that
+    /// happened to break.
+    ///
+    /// A cookie-shaped literal is one that names a session cookie and sets a
+    /// `Path`; each must pin SameSite to `Strict` or `Lax`, and none may use
+    /// `SameSite=None` (which would send the cookie cross-site and reopen the
+    /// hole outright).
+    #[test]
+    fn every_session_cookie_literal_pins_samesite() {
+        let backend_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+
+        for path in rust_sources(&backend_src) {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for line in source.lines() {
+                let is_cookie_literal = (line.contains("ak_access_token=")
+                    || line.contains("ak_refresh_token="))
+                    && line.contains("Path=");
+                if !is_cookie_literal {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    !line.contains("SameSite=None"),
+                    "{}: a session cookie must never be SameSite=None: {}",
+                    path.display(),
+                    line.trim()
+                );
+                assert!(
+                    line.contains("SameSite=Strict") || line.contains("SameSite=Lax"),
+                    "{}: session cookie literal is missing a SameSite attribute: {}",
+                    path.display(),
+                    line.trim()
+                );
+                assert!(
+                    line.contains("HttpOnly"),
+                    "{}: session cookie literal is missing HttpOnly: {}",
+                    path.display(),
+                    line.trim()
+                );
+            }
+        }
+
+        assert!(
+            checked >= 4,
+            "expected to find the set/clear literals for both cookies, found {checked} \
+             — the scan stopped matching and would silently pass"
+        );
+    }
+
+    /// Every `.rs` file under `dir`, recursively. Test-only.
+    fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            let entries = std::fs::read_dir(&current)
+                .unwrap_or_else(|e| panic!("read {}: {e}", current.display()));
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn test_set_auth_cookies_secure_gated_by_enforce_https() {
         // End-to-end through set_auth_cookies: HttpOnly + SameSite=Strict are
