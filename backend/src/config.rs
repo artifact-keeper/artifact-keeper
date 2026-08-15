@@ -281,6 +281,16 @@ pub struct Config {
     /// JWT secret key for signing tokens
     pub jwt_secret: String,
 
+    /// Validity window, in seconds, stamped onto every OpenPGP repository
+    /// metadata signature as a `SignatureExpirationTime` subpacket (#1327).
+    ///
+    /// Defaults to 7 days, matching the cadence official Debian archives
+    /// re-sign at. Set to `0` to emit no expiration subpacket at all
+    /// (pre-1.8.0 behaviour). Values are clamped into
+    /// `[MIN_SIGNATURE_EXPIRY_SECONDS, MAX_SIGNATURE_EXPIRY_SECONDS]` by
+    /// [`crate::services::signing_service::signature_expiry_duration`].
+    pub signature_expiry_seconds: u64,
+
     /// JWT token expiration in seconds (legacy, use jwt_access_token_expiry_minutes)
     pub jwt_expiration_secs: u64,
 
@@ -976,6 +986,8 @@ impl Default for Config {
             s3_region: None,
             s3_endpoint: None,
             jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
+            signature_expiry_seconds:
+                crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -1115,6 +1127,10 @@ impl Config {
             s3_endpoint: env::var("S3_ENDPOINT").ok(),
             jwt_secret: env::var("JWT_SECRET")
                 .map_err(|_| AppError::Config("JWT_SECRET not set".into()))?,
+            signature_expiry_seconds: env_parse(
+                "SIGNATURE_EXPIRY_SECONDS",
+                crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            ),
             jwt_expiration_secs: env_parse("JWT_EXPIRATION_SECS", 86400),
             jwt_access_token_expiry_minutes: env_parse("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", 30),
             jwt_refresh_token_expiry_days: env_parse("JWT_REFRESH_TOKEN_EXPIRY_DAYS", 7),
@@ -4463,6 +4479,114 @@ mod tests {
         assert_eq!(
             workflow_cancel_in_progress(wf),
             Some("${{ github.event_name == 'push' }}".to_string())
+        );
+    }
+
+    /// List every `docker/Dockerfile*` in the repo. Same rationale as
+    /// [`discover_compose_files`]: the guard below must cover any Dockerfile
+    /// added in future rather than a hardcoded pair that silently misses one.
+    /// Test-only.
+    fn discover_dockerfiles(repo_root: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(repo_root.join("docker"))
+            .expect("read docker/ directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("Dockerfile"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Extract every `ghcr.io/anchore/grype:<tag>` reference in `content`.
+    /// Test-only.
+    fn grype_pins(content: &str) -> Vec<String> {
+        const PREFIX: &str = "ghcr.io/anchore/grype:";
+        let mut pins = Vec::new();
+        for (idx, _) in content.match_indices(PREFIX) {
+            let tag: String = content[idx + PREFIX.len()..]
+                .chars()
+                .take_while(|c| !c.is_whitespace())
+                .collect();
+            if !tag.is_empty() {
+                pins.push(tag);
+            }
+        }
+        pins
+    }
+
+    /// Regression guard for the bundled-grype drift class (#2881 / #3262 /
+    /// #3352).
+    ///
+    /// The backend images vendor the `grype` CLI, and that single Go binary is
+    /// the sole source of the repo's residual CRITICAL/HIGH container findings
+    /// — the 2026-08-10 weekly scan (#3262) reported two, both located at
+    /// `usr/local/bin/grype`. Clearing them means bumping the pin and updating
+    /// `.trivyignore` together.
+    ///
+    /// Two images pin grype independently (`Dockerfile.backend` and
+    /// `Dockerfile.backend.alpine`), which is exactly the shape of drift
+    /// CLAUDE.md calls out from #2126/#2059: bump one, forget the other, and
+    /// the suppressions in `.trivyignore` then describe a version that only
+    /// half the images actually ship. So rather than hardcoding the two files
+    /// known today, every `docker/Dockerfile*` is scanned, and the pin is
+    /// required to agree with the version `.trivyignore` documents its
+    /// suppressions against.
+    ///
+    /// This guard is deliberately version-agnostic: it asserts agreement, not
+    /// a specific tag, so a legitimate grype bump stays a one-line change in
+    /// each Dockerfile plus the `.trivyignore` header.
+    #[test]
+    fn bundled_grype_pin_is_consistent_across_images_and_trivyignore() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        let dockerfiles = discover_dockerfiles(repo_root);
+        assert!(
+            dockerfiles.iter().any(|f| f == "Dockerfile.backend")
+                && dockerfiles.iter().any(|f| f == "Dockerfile.backend.alpine"),
+            "expected to discover both Dockerfile.backend and \
+             Dockerfile.backend.alpine, found: {dockerfiles:?}"
+        );
+
+        // (file name, pinned tag) for every Dockerfile that vendors grype.
+        let mut pinned: Vec<(String, String)> = Vec::new();
+        for file_name in &dockerfiles {
+            let path = repo_root.join("docker").join(file_name);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for tag in grype_pins(&content) {
+                pinned.push((file_name.clone(), tag));
+            }
+        }
+
+        assert!(
+            !pinned.is_empty(),
+            "no Dockerfile pins ghcr.io/anchore/grype. If the bundled grype \
+             binary was removed (#2881) or repointed at a self-built image \
+             (#3352), delete this guard together with the grype blocks in \
+             .trivyignore — do not leave stale suppressions behind."
+        );
+
+        let (_, first_tag) = &pinned[0];
+        for (file_name, tag) in &pinned {
+            assert_eq!(
+                tag, first_tag,
+                "grype pin drift: {file_name} pins {tag} but another Dockerfile \
+                 pins {first_tag}. Every image must vendor the same grype build, \
+                 otherwise the .trivyignore suppressions describe a version only \
+                 some images ship. All pins found: {pinned:?}"
+            );
+        }
+
+        let trivyignore_path = repo_root.join(".trivyignore");
+        let trivyignore = std::fs::read_to_string(&trivyignore_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", trivyignore_path.display()));
+        assert!(
+            trivyignore.contains(first_tag.as_str()),
+            ".trivyignore does not mention the pinned grype version {first_tag}. \
+             Its grype suppressions are justified per-version, so a bump must \
+             update the rationale in that file too (#3262)."
         );
     }
 }

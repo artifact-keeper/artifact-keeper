@@ -1013,7 +1013,8 @@ async fn repomd_xml_asc(
     let rendered = cached_repodata(&state, &repo).await?;
     let repomd_content = rendered.repomd_xml.clone();
 
-    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret)
+        .with_signature_expiry(state.config.signature_expiry_seconds);
     // #2636: this endpoint must emit a real detached OpenPGP signature — the
     // same thing Debian's Release.gpg serves — because that is the only form
     // `dnf` (repo_gpgcheck=1) and `rpm --import` can verify. It previously
