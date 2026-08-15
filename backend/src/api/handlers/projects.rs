@@ -889,13 +889,27 @@ mod tests {
 
             let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
             assert!(
-                svc.user_can_access_repo(repo_id, member_id).await.unwrap(),
+                svc.user_can_access_repo(
+                    repo_id,
+                    member_id,
+                    // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                    // this test was written to assert; the read-action narrowing has its own tests.
+                    crate::services::repository_service::RepoAccess::TenantOnly
+                )
+                .await
+                .unwrap(),
                 "project-read member must reach the assigned repository"
             );
             assert!(
-                !svc.user_can_access_repo(repo_id, outsider_id)
-                    .await
-                    .unwrap(),
+                !svc.user_can_access_repo(
+                    repo_id,
+                    outsider_id,
+                    // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                    // this test was written to assert; the read-action narrowing has its own tests.
+                    crate::services::repository_service::RepoAccess::TenantOnly
+                )
+                .await
+                .unwrap(),
                 "non-member must stay denied on the project repository"
             );
 
@@ -970,7 +984,15 @@ mod tests {
             // inherited access to the project's private repository.
             let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
             assert!(
-                !svc.user_can_access_repo(repo_id, sa_id).await.unwrap(),
+                !svc.user_can_access_repo(
+                    repo_id,
+                    sa_id,
+                    // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                    // this test was written to assert; the read-action narrowing has its own tests.
+                    crate::services::repository_service::RepoAccess::TenantOnly
+                )
+                .await
+                .unwrap(),
                 "a rejected mistyped grant must not make the SA effective on the project repo"
             );
 
@@ -1005,7 +1027,15 @@ mod tests {
 
             let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
             assert!(
-                !svc.user_can_access_repo(repo_id, user_id).await.unwrap(),
+                !svc.user_can_access_repo(
+                    repo_id,
+                    user_id,
+                    // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                    // this test was written to assert; the read-action narrowing has its own tests.
+                    crate::services::repository_service::RepoAccess::TenantOnly
+                )
+                .await
+                .unwrap(),
                 "a grant on a DIFFERENT project must not open this repository"
             );
 
@@ -1030,7 +1060,15 @@ mod tests {
 
             let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
             assert!(
-                !svc.user_can_access_repo(repo_id, user_id).await.unwrap(),
+                !svc.user_can_access_repo(
+                    repo_id,
+                    user_id,
+                    // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                    // this test was written to assert; the read-action narrowing has its own tests.
+                    crate::services::repository_service::RepoAccess::TenantOnly
+                )
+                .await
+                .unwrap(),
                 "project grants must not reach a project-less repository"
             );
 

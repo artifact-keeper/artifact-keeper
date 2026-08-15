@@ -106,9 +106,19 @@ async fn authorize_webhook_access(
     let repo_accessible = if auth.is_admin || created_by == Some(auth.user_id) {
         false
     } else if let Some(repo_id) = repository_id {
+        // TENANT-GATE-ONLY (#3331). A webhook is not repository CONTENT: this
+        // decides who may manage a repo-scoped webhook, and the answer the
+        // surface wants is "someone who holds this repository", the same
+        // boundary its creator/admin arms use. A `read` term would let a
+        // write-only member lose management of a webhook on a repository they
+        // publish to, which is a different policy question than this issue's.
         let repo_service = state.create_repository_service();
         repo_service
-            .user_can_access_repo(repo_id, auth.user_id)
+            .user_can_access_repo(
+                repo_id,
+                auth.user_id,
+                crate::services::repository_service::RepoAccess::TenantOnly,
+            )
             .await?
     } else {
         false
