@@ -245,23 +245,18 @@ impl Ctx {
         let boundary = "----------------------------ansible-galaxy";
         let sha256 = hex::encode(Sha256::digest(body));
 
-        let mut out = Vec::new();
-        out.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-        out.extend_from_slice(b"Content-Disposition: form-data; name=\"sha256\"\r\n\r\n");
-        out.extend_from_slice(sha256.as_bytes());
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-        out.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
-                filename
-            )
-            .as_bytes(),
+        // Built as one preamble + the raw bytes + one epilogue, because the
+        // tarball is binary and must not go through a String.
+        let preamble = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"sha256\"\r\n\r\n{sha256}\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n",
+            b = boundary,
         );
-        out.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        let mut out = Vec::with_capacity(preamble.len() + body.len() + 64);
+        out.extend_from_slice(preamble.as_bytes());
         out.extend_from_slice(body);
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+        out.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
 
         let req = Request::builder()
             .method("POST")
