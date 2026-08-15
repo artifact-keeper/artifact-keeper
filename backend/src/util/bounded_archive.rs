@@ -117,7 +117,22 @@ pub fn max_ingest_decompressed_bytes() -> u64 {
 /// once, across ALL format extractors. Bounds worst-case concurrent decode
 /// memory/CPU to roughly `cap × per-archive-cap`. A small default keeps the
 /// out-of-the-box worst case modest while still allowing parallel uploads.
+#[cfg(not(test))]
 pub const DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS: usize = 8;
+
+/// #3407: the `--lib` test binary runs ~15k tests concurrently against one
+/// process, and the DB-backed ones publish real archives through the real
+/// handlers. Because these caps FAST-FAIL rather than queue, a production-sized
+/// budget of 8 turns "more than eight tests happened to be decoding at the same
+/// instant" into a 503, which is how the NuGet `push_db_tests`/`read_db_tests`
+/// cluster failed intermittently — on transport, not on any assertion.
+///
+/// A test-only budget, never compiled into the shipped binary (`cfg(test)` is
+/// not set for it, and `backend/tests/` links the library without it). The
+/// production defaults, the env overrides, and the fairness behaviour are all
+/// unchanged; only the number of permits the test binary hands itself differs.
+#[cfg(test)]
+pub const DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS: usize = 4096;
 
 /// Env var overriding [`DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS`]. A blank,
 /// non-numeric, or zero value falls back to the default (a zero cap would wedge
@@ -309,7 +324,20 @@ pub enum TenantKey {
 /// may be attributed to a single tenant. Kept below the global default (8) so
 /// one tenant cannot monopolise the global budget; the remainder always stays
 /// available to other tenants.
+#[cfg(not(test))]
 pub const DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT: usize = 4;
+
+/// #3407: the per-tenant sub-limit binds even harder than the global one in the
+/// test binary. `run_with_tenant_scope` is called by `repo_visibility_middleware`,
+/// but the handler tests drive routers built by `tdh::Fixture::router_with_auth`,
+/// which does not include that middleware — so `current_tenant()` returns
+/// [`TenantKey::Unattributed`] for **every** test in the binary and all of them
+/// contend for one shared four-permit bucket. Five concurrent uploads anywhere
+/// in the suite shed the fifth.
+///
+/// See the sibling global default for why this is `cfg(test)`-only.
+#[cfg(test)]
+pub const DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT: usize = 1024;
 
 // Compile-time invariant: the per-tenant sub-limit must be strictly below the
 // global cap, or one tenant could take the whole global budget and the fairness
@@ -1302,6 +1330,37 @@ mod tests {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
+    }
+
+    /// #3407 regression: many concurrent ingest acquires must succeed in the
+    /// test binary.
+    ///
+    /// Every test in this binary shares one tenant bucket. `run_with_tenant_scope`
+    /// is installed by `repo_visibility_middleware`, but the handler tests drive
+    /// routers from `tdh::Fixture::router_with_auth`, which does not include it —
+    /// so `current_tenant()` is `TenantKey::Unattributed` for all of them. With
+    /// the production sub-limit of 4 and a FAST-FAIL acquire, the fifth
+    /// simultaneous decode anywhere in the suite got a 503, which is what the
+    /// NuGet `push_db_tests`/`read_db_tests` cluster was actually failing on.
+    ///
+    /// This drives the real singleton path (`acquire_ingest_extraction`), not
+    /// the explicit-pair unit seam, because the singleton sizing is the thing
+    /// that regressed. It fails on `main`.
+    #[test]
+    fn many_concurrent_unattributed_ingest_acquires_do_not_shed() {
+        let mut guards = Vec::new();
+        for i in 0..64 {
+            match acquire_ingest_extraction() {
+                Ok(g) => guards.push(g),
+                Err(e) => panic!(
+                    "acquire #{i} shed with {e}; the shared Unattributed bucket \
+                     must not bind in the test binary (#3407)"
+                ),
+            }
+        }
+        assert_eq!(guards.len(), 64);
+        // Permits release on drop; holding them all at once is the point.
+        drop(guards);
     }
 
     #[test]

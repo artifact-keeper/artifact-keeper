@@ -45,14 +45,31 @@ permissions: {}
 # - The group is keyed by `event_name` + `ref` so push and workflow_dispatch
 #   for the same branch are in DIFFERENT groups. A manual run (`workflow_dispatch`)
 #   never gets cancelled by an auto run, and vice versa.
-# - `cancel-in-progress` is true ONLY for branch pushes (not tag pushes,
-#   not workflow_dispatch). When a new commit lands on main while an
-#   earlier auto-build is still running, the older one is cancelled so we
-#   stop building stale containers.
-# - Tag pushes (releases) and manual dispatches always run to completion.
+# - `cancel-in-progress` is ALWAYS false. Runs queue behind each other and
+#   every one of them finishes.
+#
+# This workflow *publishes* — it is not a check whose only product is a
+# pass/fail verdict, so a cancelled run is not merely wasted CI time, it is a
+# floating tag left pointing at a stale digest.
+#
+# #2099: it used to cancel superseded branch pushes to "stop building stale
+# containers". The arm64 legs run on GitHub-hosted `ubuntu-24.04-arm` and
+# finish fast, but the amd64 legs run on the capped self-hosted
+# `ak-ci-runners` and were still in flight when the next merge landed. The
+# cancel killed them mid-build, so the multi-arch *manifest* jobs — which fan
+# in from both arches and are the only thing that moves `:dev`/`:main` — never
+# ran at all. After merging #2092, #2090 and #1927 back-to-back on 2026-07-01,
+# `artifact-keeper-scanner-adapter:dev` was simply never published, and iac
+# PR #186's `Verify Image References` gate had nothing to resolve.
+#
+# Queueing is the right trade here: the tail run republishes the floating tags
+# for the newest commit either way, and the intermediate runs cost build
+# minutes but leave the registry consistent at every step. Cancelling saves
+# those minutes by gambling that the *next* run completes — and when merges
+# arrive faster than the amd64 build takes, that gamble loses every time.
 concurrency:
   group: docker-publish-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io

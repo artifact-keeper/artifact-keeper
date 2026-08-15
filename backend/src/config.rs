@@ -4300,6 +4300,188 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // #2099: publishing workflows must not cancel themselves
+    // -----------------------------------------------------------------------
+
+    /// List every workflow file under `.github/workflows`. Scanned rather than
+    /// hardcoded for the same reason `discover_compose_files` is: the compose
+    /// guard only caught `docker-compose.local-dev.yml` because it stopped
+    /// naming one file. Test-only.
+    fn discover_workflow_files(repo_root: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(repo_root.join(".github/workflows"))
+            .expect("read .github/workflows")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".yml") || name.ends_with(".yaml"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Markers that a workflow's product is a *published container image*
+    /// rather than a pass/fail verdict. `push: true` is `docker/build-push-
+    /// action` actually pushing; `imagetools create` and `docker push` are the
+    /// manifest-list and raw-push paths. A workflow matching any of these has
+    /// side effects a cancellation leaves half-applied.
+    ///
+    /// Pure so the classification is unit-testable without touching the repo.
+    fn workflow_publishes_images(workflow: &str) -> bool {
+        workflow
+            .lines()
+            // Ignore comments: `docker-publish.yml` *describes* `imagetools
+            // create` in prose right above the step that runs it, and a
+            // comment is not a publish.
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .any(|line| {
+                let l = line.trim();
+                l.starts_with("push: true")
+                    || l.contains("imagetools create")
+                    || l.contains("docker push")
+            })
+    }
+
+    /// Extract the value of the top-level `concurrency:` block's
+    /// `cancel-in-progress:` key, if the workflow has one. Returns `None` when
+    /// the workflow declares no top-level `concurrency` (which is safe — no
+    /// concurrency block means GitHub never cancels).
+    ///
+    /// Only the top-level block counts: a `concurrency` nested under a job is
+    /// indented and is not what supersedes a whole run. Pure/test-only.
+    fn workflow_cancel_in_progress(workflow: &str) -> Option<String> {
+        let mut in_block = false;
+        for line in workflow.lines() {
+            if line.starts_with("concurrency:") {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                // A new top-level key ends the block.
+                if !line.starts_with(' ') && !line.trim().is_empty() {
+                    break;
+                }
+                if let Some(rest) = line.trim().strip_prefix("cancel-in-progress:") {
+                    return Some(rest.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Regression guard for #2099.
+    ///
+    /// `docker-publish.yml` cancelled superseded branch pushes. Its arm64 legs
+    /// run on fast GitHub-hosted runners while its amd64 legs run on the capped
+    /// self-hosted pool, so a burst of merges to main killed the amd64 builds
+    /// mid-flight and the multi-arch manifest jobs — the only jobs that move
+    /// the `:dev`/`:main` floating tags — never ran. Floating tags silently
+    /// stayed on a stale digest and downstream image-reference gates broke.
+    ///
+    /// The rule this encodes: a workflow whose product is a *published image*
+    /// may not cancel itself, because a cancelled publish is not a re-runnable
+    /// verdict, it is a registry left inconsistent. Every workflow is scanned
+    /// rather than just the one #2099 was reported against, so a future
+    /// publishing workflow cannot reintroduce this the way
+    /// `docker-compose.local-dev.yml` reintroduced #2126.
+    #[test]
+    fn image_publishing_workflows_never_cancel_in_progress() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        let workflows = discover_workflow_files(repo_root);
+        assert!(
+            workflows.iter().any(|f| f == "docker-publish.yml"),
+            "expected to discover docker-publish.yml among the repo's \
+             workflows, found: {workflows:?}"
+        );
+
+        let mut publishers = Vec::new();
+        for file_name in &workflows {
+            let path = repo_root.join(".github/workflows").join(file_name);
+            let workflow = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            if !workflow_publishes_images(&workflow) {
+                continue;
+            }
+            publishers.push(file_name.clone());
+
+            if let Some(value) = workflow_cancel_in_progress(&workflow) {
+                assert_eq!(
+                    value, "false",
+                    "{file_name} publishes container images, so its top-level \
+                     `cancel-in-progress` must be the literal `false` (#2099). \
+                     An expression is not good enough: the one this guard was \
+                     written for evaluated to true on exactly the branch \
+                     pushes that publish the floating tags. Found: {value}"
+                );
+            }
+        }
+
+        assert!(
+            publishers.iter().any(|f| f == "docker-publish.yml"),
+            "docker-publish.yml must be classified as an image publisher, \
+             otherwise this guard silently checks nothing. Classified: \
+             {publishers:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_publishes_images_detects_each_push_form() {
+        assert!(workflow_publishes_images("      push: true\n"));
+        assert!(workflow_publishes_images(
+            "        docker buildx imagetools create -t x y\n"
+        ));
+        assert!(workflow_publishes_images("        docker push foo:bar\n"));
+    }
+
+    #[test]
+    fn workflow_publishes_images_ignores_comments_and_non_publishers() {
+        // Prose describing the publish step is not a publish.
+        assert!(!workflow_publishes_images(
+            "      # docker buildx imagetools create re-points tags\n"
+        ));
+        assert!(!workflow_publishes_images("      push: false\n"));
+        assert!(!workflow_publishes_images(
+            "jobs:\n  test:\n    steps:\n      - run: cargo test\n"
+        ));
+    }
+
+    #[test]
+    fn workflow_cancel_in_progress_reads_only_the_top_level_block() {
+        let wf = "name: x\nconcurrency:\n  group: g\n  cancel-in-progress: false\n\njobs:\n";
+        assert_eq!(
+            workflow_cancel_in_progress(wf),
+            Some("false".to_string()),
+            "top-level cancel-in-progress should be read"
+        );
+
+        // A job-level concurrency block must not be mistaken for the run-level
+        // one; only the run-level block supersedes a whole run.
+        let job_level =
+            "name: x\njobs:\n  build:\n    concurrency:\n      cancel-in-progress: true\n";
+        assert_eq!(workflow_cancel_in_progress(job_level), None);
+
+        // No concurrency block at all is safe — nothing cancels.
+        assert_eq!(
+            workflow_cancel_in_progress("name: x\njobs:\n  a: {}\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_cancel_in_progress_returns_expressions_verbatim() {
+        // The pre-#2099 shape: an expression that evaluates true on branch
+        // pushes. The guard must surface it rather than treat it as absent.
+        let wf =
+            "concurrency:\n  group: g\n  cancel-in-progress: ${{ github.event_name == 'push' }}\n";
+        assert_eq!(
+            workflow_cancel_in_progress(wf),
+            Some("${{ github.event_name == 'push' }}".to_string())
+        );
+    }
+
     /// List every `docker/Dockerfile*` in the repo. Same rationale as
     /// [`discover_compose_files`]: the guard below must cover any Dockerfile
     /// added in future rather than a hardcoded pair that silently misses one.
