@@ -59,7 +59,15 @@ pub(crate) async fn check_artifact_visibility(
                 let repo_service =
                     crate::services::repository_service::RepositoryService::new(db.clone());
                 if !repo_service
-                    .user_can_access_repo(repo_id, ext.user_id)
+                    .user_can_access_repo(
+                        repo_id,
+                        ext.user_id,
+                        // CONTENT path (#3331): this gate fronts the artifact
+                        // bytes and their label / security / SBOM / quality-gate
+                        // siblings, so it asks for `read`, not merely "holds a
+                        // grant".
+                        crate::services::repository_service::RepoAccess::READ,
+                    )
                     .await?
                 {
                     return Err(AppError::NotFound("Artifact not found".to_string()));

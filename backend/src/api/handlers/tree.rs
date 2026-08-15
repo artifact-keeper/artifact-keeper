@@ -88,7 +88,14 @@ async fn authorize_tree_read(
         match auth.as_ref() {
             Some(a) => state
                 .create_repository_service()
-                .user_can_access_repo(repo_id, a.user_id)
+                .user_can_access_repo(
+                    repo_id,
+                    a.user_id,
+                    // CONTENT (#3331): `/tree/content` serves artifact bytes, so
+                    // the grant must carry `read`. Fails closed on error, as
+                    // before.
+                    crate::services::repository_service::RepoAccess::READ,
+                )
                 .await
                 .unwrap_or(false),
             None => false,

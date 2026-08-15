@@ -369,6 +369,36 @@ pub struct RawFinding {
     pub source_url: Option<String>,
 }
 
+/// A CVE-identified finding retained from an inline proxy scan so it can be
+/// persisted into `proxy_scan_findings` and answered back to an operator
+/// asking "which CVE blocked my build?" (#3395).
+///
+/// Deliberately narrower than [`RawFinding`]: only the columns the digest-keyed
+/// table stores. `description`, `source` and `source_url` are dropped because
+/// they are scanner prose that would bloat a row written on every proxied
+/// download, and because none of them identify the vulnerability.
+///
+/// `cve_id` is non-optional here while it is optional on [`RawFinding`]: a
+/// finding a scanner could not attach a CVE id to has nothing to look up, and
+/// the table's identity key is the CVE. Such findings are dropped on the way
+/// in — they still count toward `findings_count` on the verdict, which is
+/// computed from the raw list before this projection runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProxyFinding {
+    /// Canonical vulnerability id, e.g. `CVE-2021-44228` or `GHSA-...`.
+    pub cve_id: String,
+    /// Lowercase severity token (`critical`/`high`/`medium`/`low`/`info`),
+    /// matching the tokens stored on `proxy_scan_results.max_severity`.
+    pub severity: String,
+    /// Component the vulnerability was matched against.
+    pub package_name: Option<String>,
+    pub package_version: Option<String>,
+    /// Version that resolves it, when the scanner reported one — the single
+    /// most actionable field for an operator whose build was just blocked.
+    pub fixed_version: Option<String>,
+    pub title: Option<String>,
+}
+
 /// A package observed by a scanner during inventory enumeration, regardless
 /// of whether it has any active CVEs. Persisted into `scan_packages` and
 /// consumed by SBOM generation so an artifact's component list reflects
@@ -377,7 +407,7 @@ pub struct RawFinding {
 /// `name` is the bare package identifier (e.g. `"body-parser"`); the
 /// scanner-internal context where it was discovered lives in `source_target`
 /// (e.g. `"package-lock.json"`, `"requirements.txt"`, `"Java"`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RawPackage {
     pub name: String,
     pub version: Option<String>,

@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, RawPackage, Severity};
+use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::grype_scanner::GrypeScanner;
@@ -2509,6 +2509,30 @@ pub struct ProxyScanVerdict {
     /// `grype-0.83.0+db-2026-08-10`, #3287), for CVE-DB freshness gating of a
     /// reused verdict.
     pub scanner_version: Option<String>,
+    /// The full package inventory the CVE-authoritative scanner cataloged for
+    /// these bytes, retained so proxy-cached content can have an SBOM
+    /// generated from it without re-fetching or re-scanning.
+    ///
+    /// Distinct from the `cataloged` side channel used by the #3003 identity
+    /// gate, which carries only `{name, version}`. This carries `purl` and
+    /// `license` too, which is what an SBOM document actually needs.
+    ///
+    /// Empty for scanners that report no inventory. Never load-bearing for the
+    /// verdict itself: an empty inventory must not change whether content is
+    /// blocked, only whether an SBOM can be produced for it.
+    pub packages: Vec<RawPackage>,
+    /// Whether the scanner saw a target it could not parse (#1153). Threaded
+    /// into generated SBOMs so a partial inventory does not render as complete.
+    pub scan_completeness: Option<String>,
+    /// The CVE-identified findings behind the counts, retained so the operator
+    /// whose pull was just blocked can be told WHICH CVE did it (#3395).
+    ///
+    /// Exactly like `packages`: populated after aggregation, never load-bearing
+    /// for the verdict itself. The counts above are computed from the raw
+    /// finding list, which includes findings this projection drops (those with
+    /// no CVE id), so `findings.len()` is a LOWER BOUND on `findings_count` and
+    /// the two must not be asserted equal.
+    pub findings: Vec<ProxyFinding>,
 }
 
 impl ProxyScanVerdict {
@@ -2556,6 +2580,207 @@ pub fn severity_token(sev: Severity) -> &'static str {
     }
 }
 
+/// Identity component of a [`RawFinding`] dedup key: the vulnerability itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FindingVulnIdentity {
+    /// Keyed on `cve_id`. Grype always sets this (falling back to the primary
+    /// GHSA alias when no CVE alias exists), so grype findings are safe to
+    /// key this way.
+    Cve(String),
+    /// `DependencyScanner` leaves `cve_id` `None` for a GHSA/OSV-only advisory
+    /// with no CVE alias. Keying every such finding on the same `None` would
+    /// collapse two DIFFERENT CVE-less advisories on one component into a
+    /// single finding, so this falls back to the advisory's own native
+    /// identity — `(source, title)` — instead of `None` itself.
+    NativeAdvisory(Option<String>, String),
+}
+
+/// Component-name component of a [`RawFinding`] dedup key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FindingComponentKey {
+    Named(String),
+    /// `affected_component` is `None` or `""` (the latter produced by
+    /// `DependencyScanner` when its dependency list is empty —
+    /// `deps.first()...unwrap_or_default()`). Treat as ABSENT, not as a
+    /// shared `""` key: two findings that both lack a component are not
+    /// necessarily the same finding, and merging them would silently drop a
+    /// real one. Each gets a unique slot (`usize` = encounter order among
+    /// absent-component findings) so it can never merge with anything else.
+    Absent(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FindingDedupKey {
+    identity: FindingVulnIdentity,
+    component: FindingComponentKey,
+    affected_version: Option<String>,
+}
+
+/// Deduplicate findings that identify the SAME vulnerability against the SAME
+/// component before `aggregate_proxy_verdict` computes counts and severity
+/// buckets from them.
+///
+/// Why this exists (inflated `findings_count` on proxy scans, reproduced at
+/// exactly 2x on PyPI wheels): [`ScanWorkspace::prepare_pinned`] extracts a
+/// wheel archive into a subdirectory and ALSO writes the synthetic component
+/// pin (a `<name>-<version>.dist-info/METADATA`) into the workspace root —
+/// the same cataloger input shape as the wheel's own METADATA. syft catalogs
+/// the component twice and grype matches the same CVE against both copies.
+/// Scoped narrowly to that mechanism:
+/// - PyPI **wheels** double every top-level finding — this is what this
+///   function fixes.
+/// - PyPI **sdists** do NOT inflate: a bare root `PKG-INFO` is not cataloged
+///   by syft, so the pin is the only copy (that is why the pin exists at
+///   all). There is nothing to collapse there.
+/// - **npm** double-counting (overlapping `package-lock.json` /
+///   `npm-shrinkwrap.json` transitives) is a different bug in a different
+///   layer and is NOT addressed here.
+///
+/// Key: `(vuln identity, normalized component name, affected version)`. The
+/// component name is normalized with [`ExpectedComponent::normalize_name`]
+/// (ecosystem-aware: PEP 503 for Python, case-insensitive `@scope/name`-
+/// preserving for npm) so `PyYAML` merges with `pyyaml` and `zope.interface`
+/// merges with `zope-interface`, without mangling npm scoped names. When the
+/// ecosystem is not known (e.g. the OCI image serve path, which has no
+/// `name@version` coordinate to pin), names are compared case-insensitively.
+///
+/// Within a merged group, the finding with the MAXIMUM severity is retained
+/// (not the first). `aggregate_proxy_verdict` folds multiple scanners into
+/// one row, so keep-first would silently lower `critical_count`/
+/// `max_severity` when two scanners report the same vulnerability at
+/// different severities.
+///
+/// Bound: this can never flip a `vulnerable` verdict to `clean`. Every merge
+/// group retains at least one finding, and the proxy verdict token is
+/// `findings_count > 0` — dedup only ever reduces a strictly-positive count,
+/// never zeroes it.
+/// Collapse duplicate inventory entries before they are persisted for SBOM
+/// generation.
+///
+/// Same mechanism as the finding duplication [`dedupe_findings`] addresses: a
+/// PyPI wheel is scanned with its own `METADATA` plus the synthetic pin
+/// `prepare_pinned` writes into the workspace root, so the scanner catalogs the
+/// distribution twice. An SBOM listing the same component twice is visibly
+/// wrong to any consumer.
+///
+/// Keyed on `(name, version)` exactly — NOT normalized the way finding dedup
+/// normalizes, because a purl is ecosystem-qualified already and two entries
+/// that differ only in normalization are genuinely different rows worth
+/// keeping. The richer record wins: an entry carrying a `purl`/`license` is
+/// preferred over a bare one for the same coordinate, so merging never discards
+/// metadata the SBOM would otherwise carry.
+/// Deduplicate by `(name, version)`, filling gaps from later records.
+///
+/// Indexed rather than a linear scan per package. This used to be O(n²) over a
+/// list that was implicitly small — the CVE-MATCHED packages — but the CVE
+/// scanner now reports its full component catalogue, and this runs INLINE on
+/// the proxy download path inside a 30s budget. At the
+/// `grype_scanner::SCAN_INVENTORY_CAP` ceiling the quadratic form is 50M
+/// string comparisons; indexed it is linear. Output order and merge semantics
+/// are identical: first occurrence keeps its position, later ones only fill
+/// fields the first left empty.
+fn dedupe_packages(packages: Vec<RawPackage>) -> Vec<RawPackage> {
+    let mut out: Vec<RawPackage> = Vec::with_capacity(packages.len());
+    let mut index: std::collections::HashMap<(String, Option<String>), usize> =
+        std::collections::HashMap::with_capacity(packages.len());
+    for pkg in packages {
+        let key = (pkg.name.clone(), pkg.version.clone());
+        let existing = index.get(&key).map(|i| &mut out[*i]);
+        match existing {
+            Some(prev) => {
+                // Fill gaps rather than replace wholesale, so a pair of
+                // partial records merges into the most complete one.
+                if prev.purl.is_none() {
+                    prev.purl = pkg.purl;
+                }
+                if prev.license.is_none() {
+                    prev.license = pkg.license;
+                }
+                if prev.source_target.is_none() {
+                    prev.source_target = pkg.source_target;
+                }
+            }
+            None => {
+                index.insert(key, out.len());
+                out.push(pkg);
+            }
+        }
+    }
+    out
+}
+
+fn dedupe_findings(
+    findings: Vec<RawFinding>,
+    ecosystem: Option<ComponentEcosystem>,
+) -> Vec<RawFinding> {
+    let mut deduped: Vec<RawFinding> = Vec::with_capacity(findings.len());
+    let mut index_of: HashMap<FindingDedupKey, usize> = HashMap::with_capacity(findings.len());
+    let mut absent_component_ordinal: usize = 0;
+
+    for finding in findings {
+        let identity = match finding
+            .cve_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(id) => FindingVulnIdentity::Cve(id.to_string()),
+            None => {
+                FindingVulnIdentity::NativeAdvisory(finding.source.clone(), finding.title.clone())
+            }
+        };
+
+        let component = match finding
+            .affected_component
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) => {
+                let normalized = match ecosystem {
+                    Some(eco) => ExpectedComponent::normalize_name(eco, name),
+                    None => name.to_lowercase(),
+                };
+                FindingComponentKey::Named(normalized)
+            }
+            None => {
+                let key = FindingComponentKey::Absent(absent_component_ordinal);
+                absent_component_ordinal += 1;
+                key
+            }
+        };
+
+        let affected_version = finding
+            .affected_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let key = FindingDedupKey {
+            identity,
+            component,
+            affected_version,
+        };
+
+        match index_of.get(&key) {
+            // Severity is ordered Critical=0 .. Info=4 (see
+            // `aggregate_proxy_verdict`), so `<` means MORE severe — retain
+            // the max, not the first.
+            Some(&idx) if finding.severity < deduped[idx].severity => {
+                deduped[idx] = finding;
+            }
+            Some(_) => {}
+            None => {
+                index_of.insert(key, deduped.len());
+                deduped.push(finding);
+            }
+        }
+    }
+
+    deduped
+}
+
 /// Fold a flat list of [`RawFinding`]s (from one or more scanners run over the
 /// same bytes) into a [`ProxyScanVerdict`]. Pure: no DB, no I/O — the security-
 /// relevant verdict logic is unit-testable over a synthetic finding list.
@@ -2574,7 +2799,59 @@ pub fn aggregate_proxy_verdict(
         low_count: count(Severity::Low),
         max_severity,
         scanner_version,
+        // Populated by `run_inline_proxy_scanners_target` after aggregation.
+        // Kept out of this signature deliberately: the verdict contract
+        // (counts and severity) is what every existing caller and test
+        // depends on, and the inventory must never influence it.
+        packages: Vec::new(),
+        scan_completeness: None,
+        findings: Vec::new(),
     }
+}
+
+/// Project the raw finding list onto the rows `proxy_scan_findings` stores
+/// (#3395). Pure, so the two properties that make the write safe are testable
+/// without a database:
+///
+/// 1. **Findings with no CVE id are dropped.** The table's identity is the CVE;
+///    a finding without one has nothing an operator could look up, and NULL
+///    would break the uniqueness key. They still counted toward the verdict —
+///    `aggregate_proxy_verdict` runs over the raw list before this.
+/// 2. **The result is deduplicated on the table's uniqueness key.** Postgres
+///    rejects an `INSERT ... ON CONFLICT DO UPDATE` whose own tuple set hits
+///    the same row twice ("cannot affect row a second time"), which would fail
+///    the whole write. [`dedupe_findings`] already collapses the pin
+///    duplication, but it keys on the NORMALIZED component name, so two raw
+///    spellings of one component survive it and collide here.
+///
+/// First occurrence wins on a duplicate: `dedupe_findings` has already resolved
+/// severity to the most severe of a colliding group, so the survivors are the
+/// values this must preserve.
+pub fn retain_proxy_findings(findings: &[RawFinding]) -> Vec<ProxyFinding> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(findings.len());
+    for f in findings {
+        let Some(cve_id) = f.cve_id.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let key = (
+            cve_id.to_string(),
+            f.affected_component.clone().unwrap_or_default(),
+            f.affected_version.clone().unwrap_or_default(),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(ProxyFinding {
+            cve_id: cve_id.to_string(),
+            severity: severity_token(f.severity).to_string(),
+            package_name: f.affected_component.clone(),
+            package_version: f.affected_version.clone(),
+            fixed_version: f.fixed_version.clone(),
+            title: (!f.title.trim().is_empty()).then(|| f.title.clone()),
+        });
+    }
+    out
 }
 
 /// Run the applicable leaf scanners over raw proxy bytes and fold their output
@@ -2615,6 +2892,9 @@ async fn run_inline_proxy_scanners_target(
     let synthetic = target.artifact;
     let mut findings: Vec<RawFinding> = Vec::new();
     let mut scanner_version: Option<String> = None;
+    // Full package inventory, retained for proxy SBOM generation.
+    let mut packages: Vec<RawPackage> = Vec::new();
+    let mut scan_completeness: Option<String> = None;
     // "did SOME applicable scanner run Ok" — necessary but NOT sufficient.
     let mut any_ran = false;
     // "was a CVE-authoritative scanner applicable" vs "did one complete Ok".
@@ -2649,6 +2929,17 @@ async fn run_inline_proxy_scanners_target(
                 // for CVE-DB freshness (Grype reports one).
                 if scanner_version.is_none() {
                     scanner_version = scanner.version().await;
+                }
+                // Retain the full inventory for SBOM generation. Only the
+                // CVE-authoritative scanner's inventory is kept: supplementary
+                // scanners can report overlapping package sets, and merging
+                // them would produce an SBOM that claims components no single
+                // engine actually cataloged.
+                if is_cve_authoritative {
+                    packages.extend(output.packages);
+                    if output.scan_completeness != ScanCompleteness::Complete {
+                        scan_completeness = Some(output.scan_completeness.as_str().to_string());
+                    }
                 }
                 findings.extend(output.findings);
             }
@@ -2768,7 +3059,22 @@ async fn run_inline_proxy_scanners_target(
         ));
     }
 
-    Ok(aggregate_proxy_verdict(&findings, scanner_version))
+    // Dedup the SAME vulnerability cataloged twice against the SAME
+    // component (e.g. a PyPI wheel's own METADATA plus the synthetic pin
+    // `prepare_pinned` writes into the workspace root) before counts/severity
+    // buckets are computed. See `dedupe_findings` for the mechanism and scope.
+    let ecosystem = target.expected_component.map(|c| c.ecosystem);
+    let findings = dedupe_findings(findings, ecosystem);
+
+    let mut verdict = aggregate_proxy_verdict(&findings, scanner_version);
+    // Attach the retained inventory. Deliberately after aggregation so the
+    // counts/severity contract is computed from findings alone.
+    verdict.packages = dedupe_packages(packages);
+    verdict.scan_completeness = scan_completeness;
+    // Same contract as `packages`: attached after aggregation so the counts are
+    // computed from the raw findings and this projection cannot move them.
+    verdict.findings = retain_proxy_findings(&findings);
+    Ok(verdict)
 }
 
 /// Live version string of the CVE-authoritative scanner (Grype), e.g.
@@ -4940,6 +5246,19 @@ impl ScannerService {
                     scan_completeness,
                     cataloged: _,
                 }) => {
+                    // Deliberately NOT deduped with `dedupe_findings`
+                    // (see its docs): this is one scanner's own output for
+                    // one hosted artifact scan, not the proxy path's
+                    // multi-scanner fold over an in-memory pin+archive. The
+                    // proxy inflation comes from `prepare_pinned` cataloging
+                    // one component twice; the hosted upload flow never
+                    // builds an `expected_component` pin (`expected_component:
+                    // None` at every hosted call site), so there is no
+                    // synthetic second copy for a single scanner to double
+                    // here. `findings` is also persisted verbatim via
+                    // `create_findings` below, so deduping only the count
+                    // without deduping the persisted rows would desync the
+                    // two — a larger change than this fix's scope.
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
                         findings.iter().filter(|f| f.severity == sev).count() as i32
@@ -10924,6 +11243,554 @@ mod tests {
         assert!(!crate::services::proxy_scan_service::verdict_blocks(
             empty.verdict_token()
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // dedupe_findings — proxy scan findings_count inflation fix
+    //
+    // Mechanism under test: `ScanWorkspace::prepare_pinned` catalogs a PyPI
+    // wheel's component twice (its own METADATA + the synthetic pin), so
+    // grype reports the same CVE against both copies and `findings.len()`
+    // doubles the true count. `dedupe_findings` runs before
+    // `aggregate_proxy_verdict` to collapse those duplicates.
+    // -----------------------------------------------------------------------
+
+    fn dedup_finding(
+        cve_id: Option<&str>,
+        component: Option<&str>,
+        version: Option<&str>,
+        severity: Severity,
+        source: Option<&str>,
+        title: &str,
+    ) -> RawFinding {
+        RawFinding {
+            severity,
+            title: title.to_string(),
+            description: None,
+            cve_id: cve_id.map(str::to_string),
+            affected_component: component.map(str::to_string),
+            affected_version: version.map(str::to_string),
+            fixed_version: None,
+            source: source.map(str::to_string),
+            source_url: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // retain_proxy_findings — per-CVE detail for proxy content (#3395)
+    // -----------------------------------------------------------------------
+
+    /// The projection must never move the verdict. A scanner that reports a
+    /// finding with no CVE id still contributed to `findings_count` (computed
+    /// from the raw list) but has nothing to persist, so the two numbers
+    /// legitimately differ — and the projection is the side that shrinks.
+    ///
+    /// This is the property that keeps #3395 safe to ship: an operator reading
+    /// "4 findings, 3 CVEs listed" is seeing an incomplete EXPLANATION, never
+    /// an under-reported verdict.
+    #[test]
+    fn retain_proxy_findings_drops_id_less_findings_without_touching_the_counts() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("werkzeug"),
+                Some("0.15.0"),
+                Severity::High,
+                None,
+                "high one",
+            ),
+            // No CVE id: nothing an operator could look up, and NULL would
+            // break the table's identity key.
+            dedup_finding(
+                None,
+                Some("werkzeug"),
+                Some("0.15.0"),
+                Severity::High,
+                None,
+                "unnamed",
+            ),
+            // Whitespace-only id is the same case wearing a disguise.
+            dedup_finding(
+                Some("   "),
+                Some("werkzeug"),
+                Some("0.15.0"),
+                Severity::Low,
+                None,
+                "blank id",
+            ),
+        ];
+
+        let verdict = aggregate_proxy_verdict(&findings, None);
+        assert_eq!(verdict.findings_count, 3, "the verdict counts all three");
+        assert_eq!(verdict.high_count, 2);
+
+        let retained = retain_proxy_findings(&findings);
+        assert_eq!(retained.len(), 1, "only the identified finding persists");
+        assert_eq!(retained[0].cve_id, "CVE-2021-1");
+        assert_eq!(retained[0].severity, "high");
+        assert_eq!(retained[0].package_name.as_deref(), Some("werkzeug"));
+        assert_eq!(retained[0].package_version.as_deref(), Some("0.15.0"));
+        assert!(
+            retained.len() < verdict.findings_count as usize,
+            "findings.len() is a LOWER BOUND on findings_count; asserting \
+             equality anywhere would encode the opposite"
+        );
+    }
+
+    /// Postgres rejects an `INSERT ... ON CONFLICT DO UPDATE` whose own tuple
+    /// set hits one row twice, which would fail the ENTIRE write and lose the
+    /// detail for every CVE in the batch. `dedupe_findings` collapses on the
+    /// NORMALIZED component name, so two raw spellings of one component reach
+    /// here intact and must be collapsed on the table's own key.
+    #[test]
+    fn retain_proxy_findings_dedupes_on_the_tables_uniqueness_key() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("Werkzeug"),
+                Some("0.15.0"),
+                Severity::High,
+                None,
+                "first",
+            ),
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("Werkzeug"),
+                Some("0.15.0"),
+                Severity::Medium,
+                Some("other-scanner"),
+                "second",
+            ),
+            // Same CVE, DIFFERENT component: legitimately two rows.
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("jinja2"),
+                Some("2.0"),
+                Severity::High,
+                None,
+                "third",
+            ),
+        ];
+
+        let retained = retain_proxy_findings(&findings);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(
+            retained[0].title.as_deref(),
+            Some("first"),
+            "first occurrence wins: dedupe_findings already resolved severity"
+        );
+        assert_eq!(retained[0].severity, "high");
+        assert_eq!(retained[1].package_name.as_deref(), Some("jinja2"));
+
+        // The uniqueness key the write relies on, restated over the output.
+        let mut keys: Vec<_> = retained
+            .iter()
+            .map(|f| {
+                (
+                    f.cve_id.clone(),
+                    f.package_name.clone().unwrap_or_default(),
+                    f.package_version.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let before = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "output must be key-unique");
+    }
+
+    /// An empty title is dropped rather than persisted as `""`: the column is
+    /// nullable precisely so "the scanner said nothing" and "the scanner said
+    /// nothing useful" are the same state on read.
+    #[test]
+    fn retain_proxy_findings_normalizes_absent_metadata() {
+        let findings = vec![dedup_finding(
+            Some("CVE-2021-2"),
+            None,
+            None,
+            Severity::Info,
+            None,
+            "  ",
+        )];
+        let retained = retain_proxy_findings(&findings);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].severity, "info");
+        assert!(retained[0].title.is_none());
+        assert!(retained[0].package_name.is_none());
+        assert!(retained[0].package_version.is_none());
+    }
+
+    /// `dedupe_packages` was reimplemented from a per-package linear scan to
+    /// an index when the CVE scanner started reporting its full component
+    /// catalogue (the quadratic form ran inline on the proxy download path).
+    /// The observable contract must be identical: `(name, version)` identity,
+    /// FIRST occurrence keeps its position, later duplicates only fill fields
+    /// the first left empty — they never overwrite.
+    #[test]
+    fn test_dedupe_packages_merges_partial_records_without_reordering() {
+        let p = |name: &str,
+                 version: Option<&str>,
+                 purl: Option<&str>,
+                 license: Option<&str>,
+                 source: Option<&str>| RawPackage {
+            name: name.to_string(),
+            version: version.map(str::to_string),
+            purl: purl.map(str::to_string),
+            license: license.map(str::to_string),
+            source_target: source.map(str::to_string),
+        };
+
+        let deduped = dedupe_packages(vec![
+            p("zlib", Some("1.3"), None, Some("Zlib"), None),
+            p("acme", Some("1.0"), Some("pkg:pypi/acme@1.0"), None, None),
+            // Duplicate of `zlib`: fills purl and source_target, and must NOT
+            // overwrite the license the first record already carried.
+            p(
+                "zlib",
+                Some("1.3"),
+                Some("pkg:apk/zlib@1.3"),
+                Some("OVERWRITE-ME"),
+                Some("apk"),
+            ),
+            // Same name, different version: a distinct component.
+            p("zlib", Some("1.4"), None, None, None),
+            // Same name, NO version: distinct again (None is its own key).
+            p("zlib", None, None, None, None),
+        ]);
+
+        let identity: Vec<(&str, Option<&str>)> = deduped
+            .iter()
+            .map(|x| (x.name.as_str(), x.version.as_deref()))
+            .collect();
+        assert_eq!(
+            identity,
+            vec![
+                ("zlib", Some("1.3")),
+                ("acme", Some("1.0")),
+                ("zlib", Some("1.4")),
+                ("zlib", None),
+            ],
+            "first occurrence keeps its position; only exact (name, version) \
+             duplicates collapse"
+        );
+        assert_eq!(deduped[0].purl.as_deref(), Some("pkg:apk/zlib@1.3"));
+        assert_eq!(deduped[0].source_target.as_deref(), Some("apk"));
+        assert_eq!(
+            deduped[0].license.as_deref(),
+            Some("Zlib"),
+            "a later duplicate fills gaps, it never overwrites"
+        );
+        assert!(dedupe_packages(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn test_dedupe_findings_merges_the_pinned_wheel_duplicate() {
+        // The reproducer from the bug report: `requests 2.32.5`, one real
+        // CVE, cataloged twice (wheel METADATA + prepare_pinned's synthetic
+        // pin) so grype emits the identical finding twice.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "CVE-2026-25645 in requests",
+            ),
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "CVE-2026-25645 in requests",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].cve_id.as_deref(), Some("CVE-2026-25645"));
+
+        // And the fix is visible end-to-end through the verdict counts too.
+        let verdict = aggregate_proxy_verdict(&deduped, None);
+        assert_eq!(verdict.findings_count, 1);
+    }
+
+    /// Reproduces the exact shape `prepare_pinned` produces: the wheel's own
+    /// METADATA and the synthetic pin can disagree on name casing (syft's
+    /// own catalog entry vs. the literal `<name>-<version>.dist-info`
+    /// directory name we write), so this pins the dedup key on PEP 503
+    /// normalization rather than on the two copies happening to share an
+    /// identical string. Live symptom this fixes: `proxy_scan_results` for
+    /// `requests 2.32.5` (one real CVE, CVE-2026-25645) recorded
+    /// `findings_count: 2`.
+    #[test]
+    fn test_aggregate_proxy_verdict_collapses_pin_duplicate_with_non_canonical_name() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "CVE-2026-25645 in requests",
+            ),
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                // Non-canonical variant of the SAME package — this is what
+                // makes the test meaningful: a naive exact-string key would
+                // fail to merge this, and PEP 503 normalization is what
+                // `ExpectedComponent::normalize_name` provides.
+                Some("Requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "CVE-2026-25645 in requests",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        let verdict = aggregate_proxy_verdict(&deduped, None);
+        assert_eq!(verdict.findings_count, 1);
+        assert_eq!(verdict.medium_count, 1);
+    }
+
+    #[test]
+    fn test_dedupe_findings_merges_canonical_and_pep503_python_names() {
+        // syft reports `PyYAML` as `pyyaml`; the wheel copy and the pin copy
+        // can disagree on casing/separators for the SAME package.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-1111"),
+                Some("PyYAML"),
+                Some("6.0"),
+                Severity::High,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-1111"),
+                Some("pyyaml"),
+                Some("6.0"),
+                Severity::High,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+
+        // `zope.interface` / `zope-interface` — PEP 503 collapses `.`/`_`/`-`
+        // runs to a single `-`.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-2222"),
+                Some("zope.interface"),
+                Some("5.0"),
+                Severity::Low,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-2222"),
+                Some("zope-interface"),
+                Some("5.0"),
+                Severity::Low,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+    }
+
+    #[test]
+    fn test_dedupe_findings_npm_scoped_name_merges_case_insensitively_not_mangled() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-3333"),
+                Some("@scope/Name"),
+                Some("1.0.0"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-3333"),
+                Some("@scope/name"),
+                Some("1.0.0"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Npm));
+        assert_eq!(deduped.len(), 1);
+        // Not mangled: the `@scope/` structure survives normalization (npm
+        // normalization is a pure lowercase, not PEP 503 separator-folding).
+        assert_eq!(
+            deduped[0].affected_component.as_deref(),
+            Some("@scope/Name")
+        );
+
+        // A DIFFERENT scoped package under the same scope must NOT merge.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-3333"),
+                Some("@scope/name-a"),
+                Some("1.0.0"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-3333"),
+                Some("@scope/name-b"),
+                Some("1.0.0"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Npm));
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn test_dedupe_findings_none_cve_id_with_different_native_advisories_does_not_merge() {
+        // Two DIFFERENT GHSA/OSV-only advisories (no CVE alias) on the same
+        // component must NOT collapse under a shared `(None, ...)` key.
+        let findings = vec![
+            dedup_finding(
+                None,
+                Some("left-pad"),
+                Some("1.0.0"),
+                Severity::High,
+                Some("osv"),
+                "GHSA-aaaa-bbbb-cccc: something bad",
+            ),
+            dedup_finding(
+                None,
+                Some("left-pad"),
+                Some("1.0.0"),
+                Severity::High,
+                Some("osv"),
+                "GHSA-dddd-eeee-ffff: something else",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Npm));
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn test_dedupe_findings_empty_string_component_does_not_merge_unrelated_findings() {
+        // `affected_component: Some("")` (DependencyScanner's
+        // `deps.first()...unwrap_or_default()` when the dependency list is
+        // empty) must be treated as ABSENT — not as a shared "" key that
+        // merges two otherwise-unrelated findings.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-4444"),
+                Some(""),
+                None,
+                Severity::Medium,
+                Some("osv"),
+                "advisory one",
+            ),
+            dedup_finding(
+                Some("CVE-2024-4444"),
+                Some(""),
+                None,
+                Severity::Medium,
+                Some("osv"),
+                "advisory two",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        assert_eq!(
+            deduped.len(),
+            2,
+            "empty-string affected_component must not act as a mergeable key"
+        );
+    }
+
+    #[test]
+    fn test_dedupe_findings_retains_max_severity_within_a_merged_group() {
+        // Two scanners (or two catalog copies) reporting the SAME
+        // vulnerability at DIFFERENT severities: the merged finding must
+        // keep the worse (higher) one, not whichever came first.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-5555"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Low,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-5555"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings.clone(), Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].severity, Severity::Critical);
+
+        // Order independence: the same population, reversed, must produce
+        // the same retained severity.
+        let mut reversed = findings;
+        reversed.reverse();
+        let deduped_reversed = dedupe_findings(reversed, Some(ComponentEcosystem::Python));
+        assert_eq!(deduped_reversed.len(), 1);
+        assert_eq!(deduped_reversed[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn test_dedupe_findings_single_finding_is_unchanged() {
+        let findings = vec![dedup_finding(
+            Some("CVE-2026-25645"),
+            Some("requests"),
+            Some("2.32.5"),
+            Severity::Medium,
+            Some("grype"),
+            "CVE-2026-25645 in requests",
+        )];
+        let deduped = dedupe_findings(findings.clone(), Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].cve_id, findings[0].cve_id);
+        assert_eq!(deduped[0].severity, findings[0].severity);
+    }
+
+    #[test]
+    fn test_dedupe_findings_never_zeroes_a_vulnerable_verdict() {
+        // Bound stated on `dedupe_findings`: it can only ever REDUCE a
+        // strictly-positive findings_count, never zero it, because every
+        // merge group retains at least one member.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        let verdict = aggregate_proxy_verdict(&deduped, None);
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "vulnerable");
     }
 
     #[test]
