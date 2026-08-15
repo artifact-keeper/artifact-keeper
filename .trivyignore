@@ -130,6 +130,34 @@ CVE-2026-41567
 CVE-2026-41568
 CVE-2026-42306
 
+# ---------------------------------------------------------------------------
+# DELIBERATELY NOT SUPPRESSED (#3262) — go-git in the PUBLISHED images only.
+#
+# The 2026-08-10 weekly scan reported two findings against
+# ghcr.io/.../artifact-keeper-backend:latest, both at usr/local/bin/grype:
+#
+#   CVE-2026-71556  HIGH    github.com/go-git/go-git/v5 v5.19.1 -> 5.19.2
+#   CVE-2026-71557  MEDIUM  github.com/go-git/go-git/v5 v5.19.1 -> 5.19.2
+#
+# Neither belongs in this file. Measured 2026-08-15 with trivy 0.69.3,
+# --ignore-unfixed:
+#
+#   * ghcr.io/anchore/grype:v0.117.0 — the tag BOTH backend Dockerfiles pin
+#     today — does not contain the go-git package at all. No finding.
+#   * artifact-keeper-backend:latest is v1.6.3, built 2026-07-24, and
+#     :dev was built 2026-08-07. Both predate the v0.116.0 -> v0.117.0 bump
+#     (#3307), so both still carry the older grype that vendored go-git
+#     v5.19.1 (and grpc-go v1.80.0, which is why GHSA-hrxh-6v49-42gf still
+#     shows against those images while being correctly tombstoned below for
+#     main).
+#
+# So these findings are already fixed on main and clear on the next publish.
+# Suppressing them would record an exception for a build we no longer produce
+# — the precise failure mode this file's header warns about. If they ever
+# appear against a backend image whose version label matches current main,
+# that is a real regression: investigate, do not add a line here.
+# ---------------------------------------------------------------------------
+
 # ===========================================================================
 # RETIRED tombstones (#3309) — deliberate removals, machine-read by
 # scripts/ci/release-preflight.sh check 1.

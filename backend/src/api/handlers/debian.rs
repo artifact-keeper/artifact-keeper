@@ -41,7 +41,7 @@ use xz2::read::XzDecoder;
 use crate::api::handlers::error_helpers::require_signing_key;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
-use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
+use crate::api::{SharedState, SignedReleaseCacheEntry, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
 use crate::formats::debian::{
     DebControl, DebianHandler, DebianRepositoryConfig, DEBIAN_CONFIG_KEY,
 };
@@ -51,7 +51,9 @@ use crate::services::artifact_service::ArtifactService;
 use crate::services::cache_classifier;
 use crate::services::package_service::PackageService;
 use crate::services::proxy_service::{ProxyService, DEFAULT_DISTS_INDEX_TTL_SECS};
-use crate::services::signing_service::SigningService;
+use crate::services::signing_service::{
+    signed_cache_entry_is_fresh, signed_cache_max_age, SigningService,
+};
 
 const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
 
@@ -1836,9 +1838,35 @@ fn signed_release_cache_key(
 }
 
 /// Look up a previously-signed Release artifact in the in-process cache.
+///
+/// An entry older than the signature-expiry-derived max age is treated as a
+/// miss and dropped (#1327), so the caller re-signs and the client always
+/// receives a signature comfortably inside its validity window. When signature
+/// expiry is disabled (`SIGNATURE_EXPIRY_SECONDS=0`) there is no age bound and
+/// only content-keyed invalidation applies, as before.
 async fn signed_release_cache_get(state: &SharedState, cache_key: &str) -> Option<Bytes> {
-    let cache = state.signed_release_cache.read().await;
-    cache.get(cache_key).cloned()
+    let max_age = signed_cache_max_age(state.config.signature_expiry_seconds);
+    let now = chrono::Utc::now();
+
+    {
+        let cache = state.signed_release_cache.read().await;
+        match cache.get(cache_key) {
+            Some(entry) if signed_cache_entry_is_fresh(entry.inserted_at, now, max_age) => {
+                return Some(entry.bytes.clone());
+            }
+            Some(_) => {} // stale: fall through to the eviction below
+            None => return None,
+        }
+    }
+
+    // Stale. Drop it so the entry cannot accumulate, then report a miss.
+    let mut cache = state.signed_release_cache.write().await;
+    if let Some(entry) = cache.get(cache_key) {
+        if !signed_cache_entry_is_fresh(entry.inserted_at, now, max_age) {
+            cache.remove(cache_key);
+        }
+    }
+    None
 }
 
 /// Insert a freshly-signed Release artifact into the cache and update the
@@ -1859,7 +1887,13 @@ async fn signed_release_cache_put(
         let mut idx = state.signed_release_cache_index.write().await;
         idx.clear();
     }
-    cache.insert(cache_key.clone(), bytes);
+    cache.insert(
+        cache_key.clone(),
+        SignedReleaseCacheEntry {
+            bytes,
+            inserted_at: chrono::Utc::now(),
+        },
+    );
     drop(cache);
 
     let mut idx = state.signed_release_cache_index.write().await;
@@ -2266,7 +2300,8 @@ async fn in_release_file(
 
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
 
-    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret)
+        .with_signature_expiry(state.config.signature_expiry_seconds);
     // Resolve the signing key up front so we can both (a) return 404 when
     // none is configured and (b) include the fingerprint in the cache key.
     // The previous `.unwrap_or(release)` fallback silently served unsigned
@@ -2331,7 +2366,8 @@ async fn release_gpg(
 
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
 
-    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret)
+        .with_signature_expiry(state.config.signature_expiry_seconds);
     let key = require_active_signing_key(&signing_svc, repo.id).await?;
     let fingerprint = key.fingerprint.as_deref().unwrap_or("unknown");
     let cache_key =
@@ -4736,6 +4772,113 @@ mod tests {
         let a = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "abcd");
         let b = signed_release_cache_key(SignedReleaseVariant::InRelease, "Release\n", "ef01");
         assert_ne!(a, b);
+    }
+
+    // ---------------------------------------------------------------------
+    // signed-Release cache expiry (#1327)
+    //
+    // The cache is keyed by content hash, so a distribution whose Release
+    // never changes would keep serving one signature indefinitely — straight
+    // past the expiration subpacket that signature now carries. These tests
+    // pin the age bound. `build_state` needs no live database for these
+    // functions (they only touch `state.config` and the in-process maps), so
+    // a lazy pool keeps them running everywhere.
+    // ---------------------------------------------------------------------
+
+    /// Build a state whose signature expiry is `expiry_seconds`.
+    fn cache_test_state(expiry_seconds: u64) -> (SharedState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+            .expect("connect_lazy");
+        let state = crate::api::handlers::test_db_helpers::build_state_with(
+            pool,
+            dir.path().to_str().expect("utf-8 temp path"),
+            |cfg| cfg.signature_expiry_seconds = expiry_seconds,
+        );
+        (state, dir)
+    }
+
+    /// Overwrite an entry's `inserted_at` to simulate the passage of time
+    /// without sleeping.
+    async fn backdate(state: &SharedState, cache_key: &str, age: chrono::Duration) {
+        let mut cache = state.signed_release_cache.write().await;
+        let entry = cache.get_mut(cache_key).expect("entry present");
+        entry.inserted_at = chrono::Utc::now() - age;
+    }
+
+    #[tokio::test]
+    async fn signed_release_cache_serves_a_fresh_entry() {
+        let (state, _dir) = cache_test_state(604_800);
+        signed_release_cache_put(
+            &state,
+            "repo",
+            "bookworm",
+            "k1".to_string(),
+            Bytes::from_static(b"signed"),
+        )
+        .await;
+        assert_eq!(
+            signed_release_cache_get(&state, "k1").await,
+            Some(Bytes::from_static(b"signed")),
+            "an entry just inserted must be served"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_release_cache_evicts_an_entry_past_the_signature_window() {
+        let (state, _dir) = cache_test_state(604_800);
+        signed_release_cache_put(
+            &state,
+            "repo",
+            "bookworm",
+            "k1".to_string(),
+            Bytes::from_static(b"signed"),
+        )
+        .await;
+
+        // Six days: inside 7d - 1h, still served.
+        backdate(&state, "k1", chrono::Duration::days(6)).await;
+        assert!(
+            signed_release_cache_get(&state, "k1").await.is_some(),
+            "an entry inside the window must still be served"
+        );
+
+        // Seven days: past 7d - 1h. Must miss AND be dropped, so the caller
+        // re-signs rather than serving a signature at or past its expiry.
+        backdate(&state, "k1", chrono::Duration::days(7)).await;
+        assert!(
+            signed_release_cache_get(&state, "k1").await.is_none(),
+            "an entry past the signature window must not be served"
+        );
+        assert!(
+            !state.signed_release_cache.read().await.contains_key("k1"),
+            "a stale entry must be evicted, not left to accumulate"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_release_cache_has_no_age_bound_when_expiry_is_disabled() {
+        let (state, _dir) = cache_test_state(0);
+        signed_release_cache_put(
+            &state,
+            "repo",
+            "bookworm",
+            "k1".to_string(),
+            Bytes::from_static(b"signed"),
+        )
+        .await;
+        backdate(&state, "k1", chrono::Duration::days(3650)).await;
+        assert!(
+            signed_release_cache_get(&state, "k1").await.is_some(),
+            "with SIGNATURE_EXPIRY_SECONDS=0 only content-keyed invalidation \
+             applies, exactly as before #1327"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_release_cache_miss_on_unknown_key_is_not_an_eviction() {
+        let (state, _dir) = cache_test_state(604_800);
+        assert!(signed_release_cache_get(&state, "absent").await.is_none());
     }
 }
 
