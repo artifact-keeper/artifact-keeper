@@ -113,6 +113,13 @@ const GALLERY_METADATA_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// gallery queries rather than several GiB of real memory.
 const GALLERY_METADATA_BUDGET_RESERVATION_BYTES: usize = GALLERY_METADATA_MAX_BYTES * 32;
 const GALLERY_QUERY_BODY_MAX_BYTES: usize = 1024 * 1024;
+/// Exact-version age-gate resolution only reads `version`, `targetPlatform`,
+/// and `lastUpdated`. Requesting the full client response here makes Open VSX
+/// return every version's files, properties, and statistics, which can be
+/// several MiB for a single extension. `IncludeVersions` retains the evidence
+/// this internal check needs; asset URLs are derived from the configured
+/// gallery root rather than trusted from this response.
+const GALLERY_EXACT_VERSION_QUERY_FLAGS: u32 = 1;
 const DEFAULT_TARGET_PLATFORM: &str = "universal";
 
 #[derive(serde::Deserialize)]
@@ -739,7 +746,7 @@ async fn enforce_gallery_age_gate(
             "sortBy": 0,
             "sortOrder": 0,
         }],
-        "flags": 511,
+        "flags": GALLERY_EXACT_VERSION_QUERY_FLAGS,
     });
     let raw = fetch_gallery_query(
         state,
@@ -1960,7 +1967,7 @@ mod tests {
     #[tokio::test]
     async fn gallery_delivery_age_gate_blocks_before_cache_then_honors_manual_review() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{body_json, method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};
 
         let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
@@ -1968,8 +1975,19 @@ mod tests {
         };
         let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
         let young = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let expected_metadata_query = serde_json::json!({
+            "filters": [{
+                "criteria": [{ "filterType": 7, "value": "redhat.vscode-yaml" }],
+                "pageNumber": 1,
+                "pageSize": 1,
+                "sortBy": 0,
+                "sortOrder": 0,
+            }],
+            "flags": GALLERY_EXACT_VERSION_QUERY_FLAGS,
+        });
         Mock::given(method("POST"))
             .and(path("/vscode/gallery/extensionquery"))
+            .and(body_json(expected_metadata_query))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(gallery_extension_response(
                     serde_json::json!([{
