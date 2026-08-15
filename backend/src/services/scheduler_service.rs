@@ -29,13 +29,6 @@ const LIFECYCLE_LEASE_TTL_SECS: f64 = 3600.0;
 /// TTL for the curation-sync singleton lease (#2357 S11), kept slightly above
 /// the 300s tick so the job stays pinned to its current holder between ticks.
 const CURATION_SYNC_LEASE_TTL_SECS: f64 = 360.0;
-/// TTL for the storage-GC singleton lease. Without it, every replica fires
-/// the same cron tick simultaneously and runs the Maven flat-object orphan
-/// scan concurrently (production observed via `pg_stat_activity`: multiple
-/// identical, 20+ minute queries sharing one `xact_start`). Matches the GC's
-/// own default hourly cadence so a crashed holder's lease lapses in time for
-/// the next natural tick rather than blocking it.
-const STORAGE_GC_LEASE_TTL_SECS: f64 = 3600.0;
 
 /// Database gauge stats for Prometheus metrics.
 #[derive(Debug, sqlx::FromRow)]
@@ -343,10 +336,9 @@ pub fn spawn_all(
         let gc_registry = storage_registry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(jittered_startup_delay(120)).await;
-            // Kept for the blob-GC readiness gate below and the scheduler
-            // lease; the pool itself is also moved into the GC service below.
+            // Kept for the blob-GC readiness gate below; the pool itself is
+            // also moved into the GC service below.
             let gate_db = db.clone();
-            let lease_db = db.clone();
             // Post-GC storage-stats refresher (#2056): recompute the
             // deduplicated `repository_storage_stats` right after each GC pass
             // so the materialized numbers settle once reclaim has run. This is
@@ -394,60 +386,11 @@ pub fn spawn_all(
                 // the same `next` occurrence and fires this tick at the same
                 // instant, running the Maven flat-object orphan scan (and the
                 // rest of `run_gc`) concurrently on every replica. Only the
-                // scheduled tick is gated here — the on-demand admin/per-repo
-                // GC endpoints call `run_gc`/`run_gc_for_repository` directly
-                // and must keep working even while a scheduled tick holds
-                // this lease.
-                let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
-                    &lease_db,
-                    "storage_gc",
-                    STORAGE_GC_LEASE_TTL_SECS,
-                )
-                .await
-                else {
-                    tracing::debug!("Another replica owns the storage GC lease; skipping tick");
-                    continue;
-                };
-                // A pass can outlive the fixed TTL on a large registry; keep
-                // the lease alive for as long as this one runs.
-                let lease_renewal =
-                    lease.spawn_renewal(lease_db.clone(), STORAGE_GC_LEASE_TTL_SECS);
-
-                tracing::info!("Running scheduled storage garbage collection");
-
-                match service.run_gc(false).await {
-                    Ok(result) => {
-                        if result.storage_keys_deleted > 0 {
-                            tracing::info!(
-                                "Storage GC: deleted {} keys, removed {} artifacts, freed {} bytes",
-                                result.storage_keys_deleted,
-                                result.artifacts_removed,
-                                result.bytes_freed
-                            );
-                            metrics_service::record_cleanup(
-                                "storage_gc",
-                                result.artifacts_removed as u64,
-                            );
-                        }
-                        if !result.errors.is_empty() {
-                            tracing::warn!(
-                                "Storage GC completed with {} errors",
-                                result.errors.len()
-                            );
-                            // Surface the actual messages, not just the count,
-                            // so the orchestration-layer log is actionable.
-                            for err in &result.errors {
-                                tracing::warn!(gc_error = %err, "Storage GC error");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Storage garbage collection failed: {}", e);
-                    }
-                }
-
-                drop(lease_renewal);
-                lease.release(&lease_db).await;
+                // scheduled tick is gated — the on-demand admin/per-repo GC
+                // endpoints call `run_gc`/`run_gc_for_repository` directly and
+                // must keep working even while a scheduled tick holds this
+                // lease. See `StorageGcService::run_scheduled_tick`.
+                service.run_scheduled_tick("storage_gc").await;
 
                 // Blob layer GC runs in the same tick: the manifest GC pass
                 // above frees `oci-manifests/...` storage keys, this pass
