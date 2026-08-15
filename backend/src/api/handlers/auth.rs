@@ -1152,13 +1152,19 @@ mod tests {
     }
 
     /// #2805, DB-backed: the whole point of the policy is what `POST /login`
-    /// does with it. Under `required_for_admins` a covered admin who has not
-    /// enrolled must get an enrollment ticket instead of a session — and must
-    /// NOT get a hard rejection, which is the shape that would lock an
-    /// operator out. The same account under `disabled` gets an ordinary
-    /// session, proving the default path is untouched.
+    /// does with it. A covered user who has not enrolled must get an enrollment
+    /// ticket instead of a session — and must NOT get a hard rejection, which
+    /// is the shape that would lock an operator out. The same account under
+    /// `disabled` gets an ordinary session, proving the default path is
+    /// untouched.
+    ///
+    /// Uses `required_for_all` and a NON-admin account deliberately: the
+    /// handler wiring under test is identical for both policies, the
+    /// admin-vs-everyone split is exhaustively covered without a database by
+    /// `services::totp_policy`, and seeding an extra active admin here would
+    /// make `admin_security`'s global accessible-user count race.
     #[tokio::test]
-    async fn test_login_diverts_unenrolled_admin_into_enrollment_under_policy() {
+    async fn test_login_diverts_unenrolled_user_into_enrollment_under_policy() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::body::to_bytes;
 
@@ -1173,7 +1179,7 @@ mod tests {
         let hash = AuthService::hash_password(password).await.unwrap();
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, \
-             is_admin) VALUES ($1, $2, $3, $4, 'local', true, true)",
+             is_admin) VALUES ($1, $2, $3, $4, 'local', true, false)",
         )
         .bind(user_id)
         .bind(&username)
@@ -1181,14 +1187,14 @@ mod tests {
         .bind(&hash)
         .execute(&pool)
         .await
-        .expect("seed admin");
+        .expect("seed user");
 
         let dir = std::env::temp_dir().join(format!("ph-2805-{user_id}"));
         // The policy is pinned through config so this test does not contend
         // for the shared `system_settings` row.
         let enforcing =
             tdh::build_state_with(pool.clone(), dir.to_string_lossy().as_ref(), |cfg| {
-                cfg.totp_policy = Some(totp_policy::TotpPolicy::RequiredForAdmins)
+                cfg.totp_policy = Some(totp_policy::TotpPolicy::RequiredForAll)
             });
         let permissive = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
         // Same signing key the handler used, so the ticket below actually

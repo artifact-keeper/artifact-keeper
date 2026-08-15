@@ -2250,12 +2250,13 @@ mod tests {
         let _guard = tdh::totp_policy_serial_lock().await;
         let restore = totp_policy::stored_policy(&pool).await;
 
+        // Deliberately NOT flagged `is_admin` in the database: the admin check
+        // is route middleware, and `admin_security`'s accessible-users test
+        // asserts a global count that every active admin enters. Creating one
+        // here would make that pre-existing race fire. Nothing under test reads
+        // the column -- `check_policy_activation` keys on the actor's TOTP
+        // state, not their role.
         let (user_id, username) = tdh::create_user(&pool).await;
-        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("promote to admin");
         totp_policy::store_policy(&pool, TotpPolicy::Disabled, user_id)
             .await
             .expect("seed disabled");
@@ -2325,9 +2326,10 @@ mod tests {
 
         let read = read.expect("read policy").0;
         assert_eq!(read.policy, TotpPolicy::Disabled);
-        // The blast-radius counts must at least see the admin we created.
-        assert!(read.local_admins >= 1);
-        assert!(read.local_users >= read.local_admins);
+        // The blast-radius counts must see the local user we created, and the
+        // admin subset can never exceed the whole.
+        assert!(read.local_users >= 1);
+        assert!(read.local_admins <= read.local_users);
     }
 
     /// While `TOTP_POLICY` pins the policy, the API reports it as
@@ -2343,11 +2345,12 @@ mod tests {
         let _guard = tdh::totp_policy_serial_lock().await;
 
         let (user_id, username) = tdh::create_user(&pool).await;
-        sqlx::query("UPDATE users SET is_admin = true, totp_enabled = true WHERE id = $1")
+        // `is_admin` is deliberately left alone -- see the sibling test.
+        sqlx::query("UPDATE users SET totp_enabled = true WHERE id = $1")
             .bind(user_id)
             .execute(&pool)
             .await
-            .expect("promote + enrol");
+            .expect("enrol caller");
 
         let state = tdh::build_state_with(pool.clone(), "/tmp/admin-totp-pinned", |cfg| {
             cfg.totp_policy = Some(TotpPolicy::RequiredForAll);

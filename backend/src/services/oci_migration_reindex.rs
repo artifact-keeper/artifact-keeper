@@ -757,6 +757,10 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // #3402: `run_repair` is instance-wide, and every test in this module
+        // calls it. Serialize the module so a sibling's repair cannot register
+        // or reconcile the rows this test just seeded.
+        let _serial = tdh::oci_reindex_serial_lock().await;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo_id = Uuid::new_v4();
@@ -919,6 +923,10 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // #3402: `run_repair` is instance-wide, and every test in this module
+        // calls it. Serialize the module so a sibling's repair cannot register
+        // or reconcile the rows this test just seeded.
+        let _serial = tdh::oci_reindex_serial_lock().await;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo_id = Uuid::new_v4();
@@ -1039,6 +1047,10 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // #3402: `run_repair` is instance-wide, and every test in this module
+        // calls it. Serialize the module so a sibling's repair cannot register
+        // or reconcile the rows this test just seeded.
+        let _serial = tdh::oci_reindex_serial_lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo_id = Uuid::new_v4();
         let repo_key = format!("reidxorph-{}", &repo_id.to_string()[..8]);

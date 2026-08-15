@@ -147,6 +147,48 @@ pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
     }
 }
 
+/// Advisory-lock key for [`oci_reindex_serial_lock`] (#3402).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the OCI-reindex test cluster serializes only against itself.
+const OCI_REINDEX_TEST_LOCK_KEY: i64 = 0x4F43_3402; // "OC" + issue #3402
+
+/// Cross-process serialization guard for the DB-backed OCI migration-reindex
+/// tests (#3402).
+///
+/// Exactly the [`blob_gc_serial_lock`] shape, for exactly the same reason:
+/// `oci_migration_reindex::run_repair` scans and mutates `oci_tags` and
+/// `artifacts` **instance-wide** — its queries join `repositories` rather than
+/// binding a repository id, because in production it legitimately repairs the
+/// whole instance. Every test in the module calls it. Run concurrently against
+/// one shared database, sibling A's `run_repair` registers or reconciles the
+/// rows sibling B seeded before B asserts on them, so B sees
+/// `orphan_tags_reconciled: 0` for an orphan that was already cleaned up. The
+/// observable tell is that `candidates_scanned` varies run to run (2, 3, …) for
+/// a test that seeds a fixed number of candidates.
+///
+/// Serializing the module is the fix that does not change production
+/// behaviour. Scoping `run_repair` to one repository would make the test pass
+/// by narrowing a repair job whose whole purpose is to be instance-wide.
+///
+/// The lock releases when the guard drops (connection closes), including on
+/// panic.
+pub struct OciReindexSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide OCI-reindex test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`]. Call this as the first line
+/// of a DB-backed `oci_migration_reindex` test and bind the result for the
+/// whole test body.
+pub async fn oci_reindex_serial_lock() -> OciReindexSerialGuard {
+    OciReindexSerialGuard {
+        _conn: serial_lock_session(OCI_REINDEX_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Advisory-lock key for [`totp_policy_serial_lock`] (#2805).
 ///
 /// Distinct from the other test lock keys and from the application advisory
