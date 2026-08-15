@@ -143,6 +143,29 @@ fn parse_opt_out_flag(value: Option<&str>) -> bool {
     )
 }
 
+/// Parse the `TOTP_POLICY` env pin (#2805).
+///
+/// `None` (unset, or set to something unrecognized) means "no pin": the stored
+/// `security.totp_policy` setting is used instead. An unparseable value is
+/// deliberately *ignored with a warning* rather than defaulted either way — a
+/// typo must neither silently disable enforcement an operator already stored in
+/// the database, nor silently lock an instance down. Pure so the truth table is
+/// unit-testable without touching the environment.
+fn parse_totp_policy_env(value: Option<&str>) -> Option<crate::services::totp_policy::TotpPolicy> {
+    let raw = value?;
+    match crate::services::totp_policy::TotpPolicy::parse(raw) {
+        Some(policy) => Some(policy),
+        None => {
+            tracing::warn!(
+                value = %raw,
+                "TOTP_POLICY is set but not one of disabled|required_for_admins|required_for_all; \
+                 ignoring the pin and using the stored security.totp_policy setting"
+            );
+            None
+        }
+    }
+}
+
 /// Minimum reap-threshold for the stuck-scan janitor.
 ///
 /// `STUCK_SCAN_THRESHOLD_SECS=0` would match every `running` row on every
@@ -490,6 +513,21 @@ pub struct Config {
     /// `false`, preserving the historical break-glass behaviour so existing
     /// deployments are unchanged. Env var: `SSO_DISABLE_ADMIN_BREAK_GLASS`.
     pub sso_disable_admin_break_glass: bool,
+
+    /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
+    ///
+    /// When set, this value overrides the `security.totp_policy` row in
+    /// `system_settings` and the admin API refuses to change the policy. That
+    /// makes `TOTP_POLICY=disabled` plus a restart an offline break-glass: an
+    /// operator who cannot complete the enrollment exchange (for example because
+    /// their web UI predates it) can turn enforcement off without needing a
+    /// working login first.
+    ///
+    /// Env var: `TOTP_POLICY`. Accepted: `disabled`, `required_for_admins`,
+    /// `required_for_all`. An unparseable value is ignored (with a warning) so a
+    /// typo can neither lock the instance down nor silently disable enforcement
+    /// that is already stored in the database.
+    pub totp_policy: Option<crate::services::totp_policy::TotpPolicy>,
 
     /// Port for the unauthenticated Prometheus metrics-only listener.
     ///
@@ -867,6 +905,7 @@ redacted_debug!(Config {
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show sso_disable_admin_break_glass,
+    show totp_policy,
     show metrics_port,
     show database_max_connections,
     show database_min_connections,
@@ -980,6 +1019,7 @@ impl Default for Config {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
+            totp_policy: None,
             metrics_port: None,
             database_max_connections: 50,
             database_min_connections: 5,
@@ -1206,6 +1246,11 @@ impl Config {
             sso_disable_admin_break_glass: matches!(
                 env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").as_deref(),
                 Ok("true" | "1")
+            ),
+            totp_policy: parse_totp_policy_env(
+                env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
+                    .ok()
+                    .as_deref(),
             ),
             metrics_port: match env::var("METRICS_PORT") {
                 Ok(val) => match val.parse::<u16>() {
@@ -2713,6 +2758,37 @@ mod tests {
         restore_env("DATABASE_URL", saved_db);
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("PLUGINS_TRUSTED_PUBKEY", saved_key);
+    }
+
+    /// #2805: the `TOTP_POLICY` pin. Pure, so it needs no environment
+    /// manipulation and no `ENV_MUTEX`.
+    #[test]
+    fn test_parse_totp_policy_env() {
+        use crate::services::totp_policy::TotpPolicy;
+
+        // Unset => no pin; the stored setting governs.
+        assert_eq!(parse_totp_policy_env(None), None);
+
+        assert_eq!(
+            parse_totp_policy_env(Some("required_for_admins")),
+            Some(TotpPolicy::RequiredForAdmins)
+        );
+        assert_eq!(
+            parse_totp_policy_env(Some(" REQUIRED_FOR_ALL ")),
+            Some(TotpPolicy::RequiredForAll)
+        );
+        // Pinning to `disabled` is the documented offline break-glass, so it
+        // must be a real pin — not "unset".
+        assert_eq!(
+            parse_totp_policy_env(Some("disabled")),
+            Some(TotpPolicy::Disabled)
+        );
+
+        // A typo must not silently read as either extreme: no pin, and the
+        // stored setting keeps governing.
+        assert_eq!(parse_totp_policy_env(Some("requird_for_all")), None);
+        assert_eq!(parse_totp_policy_env(Some("true")), None);
+        assert_eq!(parse_totp_policy_env(Some("")), None);
     }
 
     #[test]

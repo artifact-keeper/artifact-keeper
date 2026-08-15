@@ -614,7 +614,7 @@ pub(crate) fn is_foreign_key_violation(sqlstate: Option<&str>) -> bool {
 
 /// Operator-actionable message for a user DELETE refused by a referencing row.
 ///
-/// Migration 198 gives every `REFERENCES users(id)` an explicit ON DELETE
+/// Migration 200 gives every `REFERENCES users(id)` an explicit ON DELETE
 /// action, so this should no longer fire; it exists so that a *future* table
 /// added with a bare `REFERENCES users(id)` reports which relationship blocked
 /// the delete instead of the opaque "db operation failed" from #2878.
@@ -1801,7 +1801,7 @@ mod tests {
     // `REFERENCES users(id)` with no ON DELETE clause defaults to NO ACTION
     // (RESTRICT semantics), so any user who had created a migration job or a
     // signing key could never be deleted -- the DELETE aborted with a
-    // foreign-key violation surfaced as "db operation failed". Migration 198
+    // foreign-key violation surfaced as "db operation failed". Migration 200
     // gives every such column an explicit disposition; these tests keep the
     // remediation list honest and make the residual failure legible.
     // -----------------------------------------------------------------------
@@ -1862,8 +1862,15 @@ mod tests {
         found
     }
 
-    /// `(table, column)` pairs migration 198 gives an explicit ON DELETE
-    /// action, parsed from its remediation VALUES list.
+    /// Filename of the migration that carries the #2878 remediation. Matched
+    /// by NAME rather than by number: migration numbers get reassigned when two
+    /// in-flight PRs collide on one (as #3401 and this change did on 198), and a
+    /// number-based lookup would then silently bind to an unrelated migration
+    /// and pass vacuously.
+    const REMEDIATION_MIGRATION: &str = "_users_fk_on_delete_actions.sql";
+
+    /// `(table, column)` pairs the remediation migration gives an explicit
+    /// ON DELETE action, parsed from its VALUES list.
     fn remediated_pairs(sql: &str) -> Vec<(String, String)> {
         sql.lines()
             .filter_map(|line| {
@@ -1882,9 +1889,9 @@ mod tests {
         let migrations = read_migrations();
         let remediation = migrations
             .iter()
-            .find(|(name, _)| name.starts_with("198_"))
+            .find(|(name, _)| name.ends_with(REMEDIATION_MIGRATION))
             .map(|(_, sql)| remediated_pairs(sql))
-            .expect("migration 198 (users FK ON DELETE actions) must exist");
+            .expect("the users-FK ON DELETE remediation migration must exist");
 
         // Remediated before #2878 by 083_download_tickets_cascade.sql.
         let mut covered = remediation.clone();
@@ -1902,7 +1909,7 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "these columns REFERENCE users(id) with no ON DELETE action and are \
-             not remediated by migration 198; a user owning any such row cannot \
+             not remediated by migration 200; a user owning any such row cannot \
              be deleted (#2878): {offenders:?}"
         );
 
@@ -1923,7 +1930,7 @@ mod tests {
             );
             assert!(
                 remediation.contains(&pair),
-                "{pair:?} must be remediated by migration 198 (#2878)"
+                "{pair:?} must be remediated by migration 200 (#2878)"
             );
         }
     }
@@ -1933,8 +1940,8 @@ mod tests {
         let migrations = read_migrations();
         let (_, sql) = migrations
             .iter()
-            .find(|(name, _)| name.starts_with("198_"))
-            .expect("migration 198 must exist");
+            .find(|(name, _)| name.ends_with(REMEDIATION_MIGRATION))
+            .expect("the users-FK ON DELETE remediation migration must exist");
         // Provenance columns keep their row and lose the pointer; NOT NULL
         // transient upload-session rows cascade. Nothing else is allowed.
         assert!(sql.contains("'SET NULL'"), "SET NULL disposition missing");

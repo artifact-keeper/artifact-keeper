@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, storage_key, size_bytes\n        FROM artifacts\n        WHERE repository_id = ANY($1::uuid[])\n          AND is_deleted = false\n          AND LOWER(name) = $2\n          AND version = $3\n        LIMIT 1\n        ",
+  "query": "\n        SELECT id, repository_id, storage_key, size_bytes\n        FROM artifacts\n        WHERE repository_id = ANY($1::uuid[])\n          AND is_deleted = false\n          AND LOWER(name) = $2\n          AND version = $3\n        LIMIT 1\n        ",
   "describe": {
     "columns": [
       {
@@ -10,11 +10,16 @@
       },
       {
         "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
         "name": "storage_key",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "size_bytes",
         "type_info": "Int8"
       }
@@ -29,8 +34,9 @@
     "nullable": [
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "e4b714e599653462eed1944592c201474bc3335c6ee7b7958aca30182794da0b"
+  "hash": "b327fcf2e136e8e2b74caa2e07884c75421e9cb83ebc777c4b4f0aadb248626f"
 }

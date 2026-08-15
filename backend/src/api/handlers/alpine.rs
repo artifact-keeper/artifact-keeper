@@ -50,9 +50,11 @@ pub fn router() -> Router<SharedState> {
         )
         // Alternative upload endpoint
         .route("/:repo_key/upload", post(upload_package_post))
-        // Public key endpoint for signature verification
+        // Public key endpoint for signature verification. The filename is the
+        // one apk derives from the `.SIGN.RSA.` tar entry and looks up in
+        // `/etc/apk/keys/`, so both come from the same constant.
         .route(
-            "/:repo_key/:branch/keys/artifact-keeper.rsa.pub",
+            &format!("/:repo_key/:branch/keys/{APK_SIGNING_KEY_FILENAME}"),
             get(public_key),
         )
 }
@@ -582,94 +584,124 @@ fn push_optional_field(
     }
 }
 
-/// Create an APKINDEX.tar.gz from the text content with an optional RSA signature.
+/// Filename of the public key apk must have in `/etc/apk/keys/` to verify our
+/// index, and therefore the suffix of the `.SIGN.RSA.` tar entry: apk derives
+/// the key file to load from everything after the `.SIGN.RSA.` prefix. Must
+/// stay identical to the filename served by the `public_key` route.
+const APK_SIGNING_KEY_FILENAME: &str = "artifact-keeper.rsa.pub";
+
+/// Tar block size. Every tar entry is a 512-byte header followed by its content
+/// zero-padded up to a multiple of this.
+const TAR_BLOCK_SIZE: usize = 512;
+
+/// Bytes of zero padding that follow `content_len` bytes of tar entry content.
+fn tar_block_padding(content_len: usize) -> usize {
+    (TAR_BLOCK_SIZE - content_len % TAR_BLOCK_SIZE) % TAR_BLOCK_SIZE
+}
+
+/// Build the 512-byte tar header for one entry of an apk index archive.
 ///
-/// When `signature` is `Some`, the archive contains:
-///   1. `.SIGN.RSA.artifact-keeper.rsa.pub` — raw RSA signature bytes
-///   2. `APKINDEX` — the package index
-///
-/// When `signature` is `None`, only the `APKINDEX` entry is included.
-#[allow(clippy::result_large_err)]
-fn create_apkindex_tar_gz(
-    apkindex_text: &str,
-    signature: Option<&[u8]>,
-) -> Result<Vec<u8>, Response> {
-    let gz_buf = Vec::new();
-    let gz_encoder = GzEncoder::new(gz_buf, Compression::default());
-    let mut tar_builder = tar::Builder::new(gz_encoder);
-
-    let mtime = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // If a signature is available, add .SIGN file FIRST (apk verifies order)
-    if let Some(sig_bytes) = signature {
-        let mut sig_header = tar::Header::new_gnu();
-        sig_header
-            .set_path(".SIGN.RSA.artifact-keeper.rsa.pub")
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to set tar path for signature: {}", e),
-                )
-                    .into_response()
-            })?;
-        sig_header.set_size(sig_bytes.len() as u64);
-        sig_header.set_mode(0o644);
-        sig_header.set_mtime(mtime);
-        // A bare GNU header defaults to a NUL typeflag; apk-tools only accepts
-        // index entries that are marked as regular files.
-        sig_header.set_entry_type(tar::EntryType::Regular);
-        sig_header.set_cksum();
-
-        tar_builder.append(&sig_header, sig_bytes).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to append signature to tar: {}", e),
-            )
-                .into_response()
-        })?;
-    }
-
-    let content_bytes = apkindex_text.as_bytes();
+/// A bare GNU header defaults to a NUL typeflag; apk-tools only accepts entries
+/// that are marked as regular files.
+fn apk_tar_header(path: &str, size: usize, mtime: u64) -> std::io::Result<tar::Header> {
     let mut header = tar::Header::new_gnu();
-    header.set_path("APKINDEX").map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to set tar path: {}", e),
-        )
-            .into_response()
-    })?;
-    header.set_size(content_bytes.len() as u64);
+    header.set_path(path)?;
+    header.set_size(size as u64);
     header.set_mode(0o644);
     header.set_mtime(mtime);
     header.set_entry_type(tar::EntryType::Regular);
     header.set_cksum();
+    Ok(header)
+}
 
-    tar_builder.append(&header, content_bytes).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to append to tar: {}", e),
-        )
-            .into_response()
-    })?;
+/// Build the **index segment**: a complete gzip stream wrapping a tar that
+/// holds the single `APKINDEX` entry.
+///
+/// These exact compressed bytes are what an apk `.SIGN.RSA` signature covers
+/// (see [`build_apk_signature_segment`]) and what is served verbatim when the
+/// repository has no signing key, so the bytes must not be rebuilt between
+/// signing and serving.
+fn build_apkindex_segment(apkindex_text: &str, mtime: u64) -> std::io::Result<Vec<u8>> {
+    let content = apkindex_text.as_bytes();
+    let header = apk_tar_header("APKINDEX", content.len(), mtime)?;
 
-    let gz_encoder = tar_builder.into_inner().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to finalize tar: {}", e),
-        )
-            .into_response()
-    })?;
+    let mut tar_builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+    tar_builder.append(&header, content)?;
+    // `into_inner` finishes the tar, appending the end-of-archive blocks that a
+    // normal `apk index` output carries.
+    tar_builder.into_inner()?.finish()
+}
 
-    gz_encoder.finish().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to finalize gzip: {}", e),
-        )
-            .into_response()
-    })
+/// Build the **signature segment**: the leading gzip stream that carries the
+/// RSA signature over an index segment.
+///
+/// apk's `.SIGN.RSA` contract, as implemented by `abuild-sign` and apk-tools'
+/// `apk_sign_ctx_*` multipart gzip reader, is *not* "an extra file inside the
+/// index tar". A signed `APKINDEX.tar.gz` is a concatenation of two independent
+/// gzip streams:
+///
+/// ```text
+///   [gzip stream 1]  tar: `.SIGN.RSA.<pubkey filename>` = raw RSA signature
+///   [gzip stream 2]  tar: `APKINDEX` (+ end-of-archive blocks)
+/// ```
+///
+/// Three details are load-bearing, and getting any of them wrong yields the
+/// `BAD signature` that #3021 reported:
+///
+/// * The signature covers the **compressed** bytes of stream 2 exactly as
+///   served — apk digests each gzip segment's raw input, not its inflated
+///   contents. (`abuild-sign` correspondingly signs the whole unsigned
+///   `APKINDEX.tar.gz` file.)
+/// * The digest is **SHA-1**, which apk fixes for the `RSA` infix. That is
+///   handled by `SigningService::sign_apk_index`.
+/// * The signature tar is **cut**: it ends immediately after the padded entry,
+///   with no end-of-archive blocks (`abuild-tar --cut`). The zero blocks would
+///   terminate apk's tar reader before it ever reached the index entry.
+fn build_apk_signature_segment(signature: &[u8], mtime: u64) -> std::io::Result<Vec<u8>> {
+    let entry_name = format!(".SIGN.RSA.{APK_SIGNING_KEY_FILENAME}");
+    let header = apk_tar_header(&entry_name, signature.len(), mtime)?;
+
+    let mut tar = Vec::with_capacity(TAR_BLOCK_SIZE * 2 + signature.len());
+    tar.extend_from_slice(&header.as_bytes()[..]);
+    tar.extend_from_slice(signature);
+    tar.resize(tar.len() + tar_block_padding(signature.len()), 0);
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    std::io::Write::write_all(&mut encoder, &tar)?;
+    encoder.finish()
+}
+
+/// Assemble the served `APKINDEX.tar.gz` from an already-built index segment
+/// and, when the repository signs, a signature over *those* bytes.
+///
+/// Concatenation order matters: apk reads the signature segment first and
+/// verifies it against everything that follows.
+fn assemble_apkindex(index_segment: Vec<u8>, signature_segment: Option<Vec<u8>>) -> Vec<u8> {
+    match signature_segment {
+        Some(mut out) => {
+            out.extend_from_slice(&index_segment);
+            out
+        }
+        None => index_segment,
+    }
+}
+
+/// Current wall-clock seconds, for tar entry mtimes.
+fn tar_mtime_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Map an archive-construction failure onto a 500 response.
+#[allow(clippy::result_large_err)]
+fn apkindex_build_error(what: &str, e: std::io::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Failed to build {what}: {e}"),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -796,15 +828,23 @@ async fn apk_index(
 
     let apkindex_text = generate_apkindex_text(&artifacts, &arch);
 
-    // Sign the APKINDEX content if signing is configured for this repository.
-    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let signature = resolve_apkindex_signature(
-        signing_svc
-            .sign_data(repo.id, apkindex_text.as_bytes())
-            .await,
-    )?;
+    // Build the index segment first: apk's signature covers these exact
+    // compressed bytes, so they are signed and then served unchanged (#3021).
+    let mtime = tar_mtime_now();
+    let index_segment = build_apkindex_segment(&apkindex_text, mtime)
+        .map_err(|e| apkindex_build_error("the APKINDEX archive", e))?;
 
-    let tar_gz = create_apkindex_tar_gz(&apkindex_text, signature.as_deref())?;
+    // Sign the index segment if signing is configured for this repository.
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signature =
+        resolve_apkindex_signature(signing_svc.sign_apk_index(repo.id, &index_segment).await)?;
+
+    let signature_segment = signature
+        .map(|sig| build_apk_signature_segment(&sig, mtime))
+        .transpose()
+        .map_err(|e| apkindex_build_error("the APKINDEX signature segment", e))?;
+
+    let tar_gz = assemble_apkindex(index_segment, signature_segment);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -2442,50 +2482,244 @@ mod tests {
         assert!(text.is_empty());
     }
 
-    #[test]
-    fn test_create_apkindex_tar_gz_empty() {
-        let result = create_apkindex_tar_gz("", None);
-        assert!(result.is_ok());
-        let tar_gz = result.unwrap();
-        assert!(!tar_gz.is_empty());
+    // -----------------------------------------------------------------------
+    // apk-verifiable index signing (#3021)
+    //
+    // These pin the three properties apk-tools actually checks. They were
+    // derived from `abuild-sign` + apk-tools output rather than from this
+    // implementation: a reference `APKINDEX.tar.gz` signed by `abuild-sign`
+    // (apk-tools 2.14, alpine:3.20) decomposes into a 2-gzip-member file whose
+    // signature member inflates to exactly 1024 tar bytes for a 256-byte
+    // signature, whose tail is byte-identical to the unsigned index, and whose
+    // signature verifies with `openssl dgst -sha1 -verify` against those tail
+    // bytes.
+    // -----------------------------------------------------------------------
+
+    const SAMPLE_APKINDEX: &str =
+        "C:Q1abc\nP:curl\nV:8.5.0-r0\nA:x86_64\nS:1234\nI:5678\nT:tool\nL:MIT\n\n";
+
+    /// A 2048-bit RSA key pair, as `(private, public)`.
+    fn test_rsa_keypair() -> (rsa::RsaPrivateKey, rsa::RsaPublicKey) {
+        let mut rng = rsa::rand_core::OsRng;
+        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
+        let public = rsa::RsaPublicKey::from(&private);
+        (private, public)
+    }
+
+    /// Sign exactly the way `SigningService::sign_apk_index` does: RSA PKCS#1
+    /// v1.5 over SHA-1.
+    fn sign_sha1(private: &rsa::RsaPrivateKey, data: &[u8]) -> Vec<u8> {
+        use rsa::signature::{SignatureEncoding, Signer};
+        rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(private.clone())
+            .sign(data)
+            .to_bytes()
+            .to_vec()
+    }
+
+    /// Inflate only the FIRST gzip member of `bytes` and report how many
+    /// compressed bytes that member consumed.
+    ///
+    /// `GzDecoder` (unlike `MultiGzDecoder`) stops at the end of one member,
+    /// which is exactly the segment boundary apk's multipart reader uses.
+    fn first_gzip_member(bytes: &[u8]) -> (Vec<u8>, usize) {
+        // `bufread` (not `read`) so the source slice is advanced by exactly the
+        // bytes the member consumed — a `BufReader` in between would read ahead
+        // into the next member and lose the boundary.
+        let mut src: &[u8] = bytes;
+        let mut decoder = flate2::bufread::GzDecoder::new(&mut src);
+        let mut inflated = Vec::new();
+        decoder.read_to_end(&mut inflated).expect("inflate member");
+        drop(decoder);
+        // Whatever the decoder did not consume belongs to the next member.
+        (inflated, bytes.len() - src.len())
     }
 
     #[test]
-    fn test_create_apkindex_tar_gz_with_content() {
-        let content = "C:abc123\nP:curl\nV:8.5.0-r0\nA:x86_64\nS:1234\nI:5678\nT:URL retrieval utility\nU:https://curl.se\nL:MIT\n\n";
-        let result = create_apkindex_tar_gz(content, None);
-        assert!(result.is_ok());
-
-        // Verify it's a valid tar.gz by decompressing
-        let tar_gz = result.unwrap();
-        let gz = flate2::read::GzDecoder::new(&tar_gz[..]);
-        let mut archive = tar::Archive::new(gz);
-        let entries: Vec<_> = archive.entries().unwrap().collect();
-        assert_eq!(entries.len(), 1);
-    }
-
-    #[test]
-    fn test_create_apkindex_tar_gz_with_signature() {
-        let content = "C:abc123\nP:curl\nV:8.5.0-r0\nA:x86_64\nS:1234\nI:5678\nT:URL retrieval utility\nU:https://curl.se\nL:MIT\n\n";
-        let fake_signature = b"fake-rsa-signature-bytes";
-        let result = create_apkindex_tar_gz(content, Some(fake_signature));
-        assert!(result.is_ok());
-
-        // Verify both entries exist in the correct order
-        let tar_gz = result.unwrap();
-        let gz = flate2::read::GzDecoder::new(&tar_gz[..]);
-        let mut archive = tar::Archive::new(gz);
-        let entry_names: Vec<String> = archive
+    fn unsigned_apkindex_is_a_single_index_entry() {
+        let segment = build_apkindex_segment(SAMPLE_APKINDEX, 0).expect("build index");
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&segment[..]));
+        let names: Vec<String> = archive
             .entries()
             .unwrap()
-            .filter_map(|e| {
-                let e = e.ok()?;
-                e.path().ok().map(|p| p.to_string_lossy().to_string())
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["APKINDEX".to_string()]);
+    }
+
+    #[test]
+    fn empty_apkindex_still_produces_a_valid_archive() {
+        let segment = build_apkindex_segment("", 0).expect("build index");
+        assert!(!segment.is_empty());
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&segment[..]));
+        assert_eq!(archive.entries().unwrap().count(), 1);
+    }
+
+    /// The signature must travel as its own leading gzip stream, and the index
+    /// segment must survive into the served bytes untouched — apk verifies the
+    /// signature against those exact compressed bytes.
+    #[test]
+    fn signed_apkindex_is_a_signature_stream_prepended_to_the_index() {
+        let index = build_apkindex_segment(SAMPLE_APKINDEX, 0).expect("build index");
+        let sig_segment = build_apk_signature_segment(&[0x5au8; 256], 0).expect("build sig");
+        let signed = assemble_apkindex(index.clone(), Some(sig_segment.clone()));
+
+        let (_, first_len) = first_gzip_member(&signed);
+        assert_eq!(
+            first_len,
+            sig_segment.len(),
+            "the first gzip member must be the signature segment"
+        );
+        assert_eq!(
+            &signed[first_len..],
+            &index[..],
+            "the bytes after the signature stream must be the signed index, unmodified"
+        );
+    }
+
+    /// `abuild-tar --cut`: the signature tar ends after the padded entry, with
+    /// no end-of-archive blocks. A 256-byte signature therefore inflates to
+    /// exactly 512 (header) + 512 (padded content) bytes. Trailing zero blocks
+    /// would stop apk's tar reader before it reached the index entry.
+    #[test]
+    fn signature_segment_tar_is_cut_after_the_entry() {
+        let segment = build_apk_signature_segment(&[0x11u8; 256], 0).expect("build sig");
+        let (tar_bytes, _) = first_gzip_member(&segment);
+
+        assert_eq!(tar_bytes.len(), 1024, "expected header + one padded block");
+        assert_eq!(&tar_bytes[512..512 + 256], &[0x11u8; 256][..]);
+        assert!(
+            tar_bytes[512 + 256..].iter().all(|b| *b == 0),
+            "content must be zero-padded to the block size"
+        );
+
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&segment[..]));
+        let entries: Vec<(String, u64)> = archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.path().unwrap().to_string_lossy().into_owned(),
+                    e.header().size().unwrap(),
+                )
             })
             .collect();
-        assert_eq!(entry_names.len(), 2);
-        assert_eq!(entry_names[0], ".SIGN.RSA.artifact-keeper.rsa.pub");
-        assert_eq!(entry_names[1], "APKINDEX");
+        assert_eq!(
+            entries,
+            vec![(".SIGN.RSA.artifact-keeper.rsa.pub".to_string(), 256)]
+        );
+    }
+
+    /// The end-to-end contract, checked the way apk-tools checks it: RSA
+    /// PKCS#1 v1.5 / SHA-1 over the compressed bytes of the index segment.
+    ///
+    /// Fails on the pre-#3021 implementation, which signed the *uncompressed*
+    /// APKINDEX text with SHA-256 and buried the result inside the index tar.
+    #[test]
+    fn served_signature_verifies_the_way_apk_verifies_it() {
+        use rsa::signature::Verifier;
+
+        let (private, public) = test_rsa_keypair();
+        let index = build_apkindex_segment(SAMPLE_APKINDEX, 0).expect("build index");
+        let signature = sign_sha1(&private, &index);
+        let signed = assemble_apkindex(
+            index.clone(),
+            Some(build_apk_signature_segment(&signature, 0).expect("build sig")),
+        );
+
+        // Recover the signature the way apk does: read the leading segment's
+        // single tar entry, then verify it over everything that follows.
+        let (first_len, recovered) = {
+            let (_, len) = first_gzip_member(&signed);
+            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&signed[..len]));
+            let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+            assert!(entry
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".SIGN.RSA."));
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            (len, bytes)
+        };
+
+        let signed_bytes = &signed[first_len..];
+        let verifying = rsa::pkcs1v15::VerifyingKey::<sha1::Sha1>::new(public.clone());
+        verifying
+            .verify(
+                signed_bytes,
+                &rsa::pkcs1v15::Signature::try_from(recovered.as_slice()).unwrap(),
+            )
+            .expect("apk verifies SHA-1 over the compressed index segment");
+
+        // The digest is not interchangeable: apk maps the `RSA` infix to SHA-1
+        // only, so a SHA-256 signature under the same entry name is rejected.
+        let sha256_verifier = rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(public);
+        assert!(
+            sha256_verifier
+                .verify(
+                    signed_bytes,
+                    &rsa::pkcs1v15::Signature::try_from(recovered.as_slice()).unwrap(),
+                )
+                .is_err(),
+            "the signature must be a SHA-1 signature, not a SHA-256 one"
+        );
+    }
+
+    /// Regression pin for the shape #3021 reported: the signature must NOT be
+    /// an extra member of the index tar. apk digests the index segment as it
+    /// stands, so a `.SIGN.*` entry inside it changes the signed bytes and can
+    /// never verify.
+    #[test]
+    fn signature_is_not_an_entry_inside_the_index_tar() {
+        let index = build_apkindex_segment(SAMPLE_APKINDEX, 0).expect("build index");
+        let signed = assemble_apkindex(
+            index,
+            Some(build_apk_signature_segment(&[7u8; 256], 0).expect("build sig")),
+        );
+
+        // Skip the signature segment and inspect the index segment alone.
+        let (_, first_len) = first_gzip_member(&signed);
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&signed[first_len..]));
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["APKINDEX".to_string()]);
+    }
+
+    #[test]
+    fn apkindex_build_failure_is_a_500() {
+        let resp = apkindex_build_error(
+            "the APKINDEX archive",
+            std::io::Error::other("disk went away"),
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn tar_mtime_now_is_a_plausible_wall_clock() {
+        // 2020-01-01; only a broken clock or a broken conversion lands below it.
+        assert!(tar_mtime_now() > 1_577_836_800);
+    }
+
+    #[test]
+    fn tar_block_padding_rounds_up_to_the_block_size() {
+        assert_eq!(tar_block_padding(0), 0);
+        assert_eq!(tar_block_padding(1), 511);
+        assert_eq!(tar_block_padding(256), 256);
+        assert_eq!(tar_block_padding(512), 0);
+        assert_eq!(tar_block_padding(513), 511);
+    }
+
+    /// apk turns the `.SIGN.RSA.` entry's suffix into the `/etc/apk/keys/`
+    /// filename it loads, and the `public_key` route publishes that same
+    /// filename. Both read this constant, so this pins the value operators
+    /// have already installed.
+    #[test]
+    fn signature_entry_name_matches_the_published_public_key_filename() {
+        assert_eq!(APK_SIGNING_KEY_FILENAME, "artifact-keeper.rsa.pub");
     }
 
     /// Typeflag byte of every tar header in an uncompressed tar stream.
@@ -2516,14 +2750,14 @@ mod tests {
     fn test_apkindex_tar_entry_is_a_regular_file() {
         // apk-tools rejects the index unless the entry is typeflag '0'; a bare GNU
         // header would leave a NUL here.
-        let tar_gz = create_apkindex_tar_gz("C:Q1abc\nP:curl\n\n", None).unwrap();
-        assert_eq!(tar_typeflags(&tar_gz), vec![b'0']);
+        let segment = build_apkindex_segment("C:Q1abc\nP:curl\n\n", 0).unwrap();
+        assert_eq!(tar_typeflags(&segment), vec![b'0']);
     }
 
     #[test]
     fn test_apkindex_signature_tar_entry_is_a_regular_file() {
-        let tar_gz = create_apkindex_tar_gz("C:Q1abc\nP:curl\n\n", Some(b"sig-bytes")).unwrap();
-        assert_eq!(tar_typeflags(&tar_gz), vec![b'0', b'0']);
+        let segment = build_apk_signature_segment(b"sig-bytes", 0).unwrap();
+        assert_eq!(tar_typeflags(&segment), vec![b'0']);
     }
 
     // -----------------------------------------------------------------------

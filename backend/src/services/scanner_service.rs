@@ -1969,11 +1969,10 @@ pub(crate) fn convert_trivy_findings(
                 .map(move |vuln| RawFinding {
                     // #3294: shared classifier, replacing this call site's own
                     // `from_str_loose(..).unwrap_or(Severity::Info)`.
-                    // Behaviour is unchanged token for token: `Negligible`
-                    // (from proxied Harbor / distro reports) still maps to Info
-                    // and is now RECOGNISED rather than a parse miss, and an
-                    // ungraded `UNKNOWN` still maps to Info — that fail-open is
-                    // #3306, not this patch.
+                    // `Negligible` (from proxied Harbor / distro reports) is
+                    // RECOGNISED and maps to Info on purpose; an ungraded
+                    // `UNKNOWN` fails closed at High as of #3306, so it can no
+                    // longer slip past severity-aware gates at the floor.
                     severity: Severity::from_scanner_token(&vuln.severity),
                     title: vuln.title.clone().unwrap_or_else(|| {
                         format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name)
@@ -4111,6 +4110,11 @@ impl Scanner for DependencyScanner {
             seen_ids.insert(advisory_match.id.clone());
             seen_ids.extend(advisory_match.aliases.iter().cloned());
 
+            // Deliberately independent of `Severity::UNRECOGNIZED_SCANNER_SEVERITY`
+            // (#3306): advisory feeds (OSV/GHSA) are a graded vocabulary that
+            // rarely omits severity, so `Medium` is a neutral guess for a
+            // missing grade here — unlike a scanner's ungraded finding, which
+            // must fail closed at a configured gate.
             let severity =
                 Severity::from_str_loose(&advisory_match.severity).unwrap_or(Severity::Medium);
 
@@ -11943,12 +11947,10 @@ mod tests {
     // .Severity`: UNKNOWN, LOW, MEDIUM, HIGH, CRITICAL (uppercase, per
     // aquasecurity/trivy `pkg/types`).
     //
-    // This adapter's classification is UNCHANGED by #3294 — it is a pure
-    // consolidation here, and these tests are the evidence: every one of them
-    // passes against the pre-#3294 expression
-    // `Severity::from_str_loose(&vuln.severity).unwrap_or(Severity::Info)` as
-    // well. Separating UNKNOWN — a CVE with no NVD/vendor grade yet — from an
-    // explicitly negligible one is #3306 (1.8.0).
+    // #3294 was a pure consolidation here; #3306 then moved the unrecognised
+    // bucket to `High`, so UNKNOWN — a CVE with no NVD/vendor grade yet — is
+    // now separated from an explicitly negligible one and fails closed at
+    // severity-aware gates instead of landing at the floor.
     // -----------------------------------------------------------------------
 
     fn trivy_report_with_severities(sevs: &[&str]) -> crate::services::image_scanner::TrivyReport {
@@ -12009,25 +12011,26 @@ mod tests {
         assert_eq!(findings[1].severity, Severity::Low);
     }
 
-    /// Neutrality pin: `UNKNOWN`, an empty string and an unheard-of token all
-    /// classify exactly where they did before #3294 — the lowest bucket, the
-    /// same one an explicitly-negligible finding lands in. That collapse is a
-    /// fail-open and it is deliberately left in place by this patch;
-    /// **#3306 must delete this test on purpose.**
+    /// #3306: `UNKNOWN`, an empty string and an unheard-of token — all
+    /// ungraded — fail closed at `High` through the real Trivy parse path,
+    /// instead of collapsing into the `Info` floor where no severity-aware
+    /// gate could see them. This is the deliberate rewrite of the stage-1a
+    /// pinning test (`..._is_unchanged_pending_3306`).
     #[test]
-    fn test_convert_trivy_findings_unrecognized_severity_is_unchanged_pending_3306() {
-        let report = trivy_report_with_severities(&["UNKNOWN", "", "SEVERE", "HIGH"]);
+    fn test_convert_trivy_findings_unrecognized_severity_fails_closed_3306() {
+        let report = trivy_report_with_severities(&["UNKNOWN", "", "SEVERE", "LOW"]);
         let findings = convert_trivy_findings(&report, "trivy");
         assert_eq!(findings.len(), 4);
         for f in &findings[..3] {
             assert_eq!(
                 f.severity,
-                Severity::Info,
-                "ungraded Trivy token must classify as it did before #3294"
+                Severity::High,
+                "ungraded Trivy token must fail closed at High (#3306)"
             );
         }
-        // Positive control in the same fixture.
-        assert_eq!(findings[3].severity, Severity::High);
+        // Positive control in the same fixture: a graded row below High is
+        // untouched, so a converter that raised everything cannot pass.
+        assert_eq!(findings[3].severity, Severity::Low);
     }
 
     /// #3296: an ungraded (`UNKNOWN`) finding must be PRESENT in the converted

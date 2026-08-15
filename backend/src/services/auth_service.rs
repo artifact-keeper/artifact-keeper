@@ -203,6 +203,11 @@ impl Claims {
     }
 }
 
+/// `token_type` claim of a forced-TOTP-enrollment ticket (#2805). Kept distinct
+/// from `totp_pending` so an enrollment ticket can never be redeemed at
+/// `/auth/totp/verify` for a session, and vice versa.
+pub const TOTP_ENROLLMENT_TOKEN_TYPE: &str = "totp_enroll";
+
 /// Token pair response
 #[derive(Debug, Serialize)]
 pub struct TokenPair {
@@ -3088,6 +3093,60 @@ impl AuthService {
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
     }
 
+    /// Generate a short-lived *enrollment* ticket for the forced-enrollment
+    /// flow introduced by the 2FA policy (#2805).
+    ///
+    /// Distinct from [`AuthService::generate_totp_pending_token`] in two ways
+    /// that matter:
+    ///
+    /// * A different `token_type` (`totp_enroll`), so an enrollment ticket can
+    ///   never be presented to `/auth/totp/verify` (which would let a user who
+    ///   has *not* proven possession of a second factor obtain a session), and a
+    ///   verify ticket can never be presented to the enrollment endpoints.
+    /// * A slightly longer life (10 minutes rather than 5) because enrolling
+    ///   means installing/scanning a QR code, not typing a code you already
+    ///   have. It is still far shorter than a session.
+    ///
+    /// The `jti` is claimed by the *completing* call only
+    /// ([`AuthService::consume_totp_pending_jti`], shared table): the ticket
+    /// authorizes `/auth/totp/enroll/setup` any number of times (regenerating a
+    /// secret is harmless and idempotent) but yields a session exactly once.
+    pub fn generate_totp_enrollment_token(&self, user: &User) -> Result<String> {
+        let now = Utc::now();
+        let exp = now + Duration::minutes(10);
+        let claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            allowed_repo_ids: None,
+            iat: now.timestamp(),
+            iat_ms: Some(now.timestamp_millis()),
+            exp: exp.timestamp(),
+            token_type: TOTP_ENROLLMENT_TOKEN_TYPE.to_string(),
+            jti: Some(Uuid::new_v4()),
+            family_id: None,
+            scan_pull_repo: None,
+            scopes: None,
+        };
+        encode(&Header::default(), &claims, &self.encoding_key)
+            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
+    }
+
+    /// Validate a TOTP enrollment ticket and return its claims.
+    ///
+    /// Rejects any other `token_type` — in particular a full access token, so
+    /// the enrollment endpoints cannot be used as an unauthenticated
+    /// "enroll on behalf of" oracle with a leaked session token, and a
+    /// `totp_pending` ticket, so the verify and enroll flows stay disjoint.
+    pub fn validate_totp_enrollment_token(&self, token: &str) -> Result<Claims> {
+        let token_data = self.decode_token(token)?;
+        if token_data.claims.token_type != TOTP_ENROLLMENT_TOKEN_TYPE {
+            return Err(AppError::Authentication("Invalid token type".to_string()));
+        }
+        Ok(token_data.claims)
+    }
+
     /// Validate a TOTP pending token and return claims.
     ///
     /// Verifies the JWT signature/expiry and that `token_type == "totp_pending"`.
@@ -3640,6 +3699,7 @@ mod tests {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
+            totp_policy: None,
             metrics_port: None,
             database_max_connections: 20,
             database_min_connections: 5,

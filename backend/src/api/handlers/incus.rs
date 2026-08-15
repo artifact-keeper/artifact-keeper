@@ -1448,7 +1448,7 @@ pub(crate) const LEGACY_FINALIZE_MESSAGE: &str =
 /// states are identical, so reclaiming a legacy row with the new algorithm can
 /// append the final body a second time and publish a corrupt image.
 ///
-/// `finalize_phase` (migration 199) is the discriminator: post-#3072 code
+/// `finalize_phase` (migration 201) is the discriminator: post-#3072 code
 /// stamps it on EVERY write that puts a row into `finalizing` (the lease claim
 /// and the monolithic-upload insert), so a `finalizing` row that still has NULL
 /// there can only have been written by the old code path. New sessions never

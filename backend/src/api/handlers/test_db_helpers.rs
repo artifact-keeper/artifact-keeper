@@ -147,6 +147,35 @@ pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
     }
 }
 
+/// Advisory-lock key for [`totp_policy_serial_lock`] (#2805).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the 2FA-policy tests serialize only against themselves.
+const TOTP_POLICY_TEST_LOCK_KEY: i64 = 0x5450_2805; // "TP" + issue #2805
+
+/// Cross-process serialization guard for the DB-backed 2FA-policy tests
+/// (#2805).
+///
+/// `security.totp_policy` is ONE row in `system_settings` shared by the whole
+/// database, and the login/disable/admin paths all read it. Under the coverage
+/// job's process-per-test parallelism (`cargo nextest`) one test's write would
+/// be observed by another test's read. Mirrors [`scan_dedup_serial_lock`]:
+/// every 2FA-policy test contends for one key, and the lock releases when the
+/// guard drops (connection closes), including on panic.
+pub struct TotpPolicySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide 2FA-policy test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`].
+pub async fn totp_policy_serial_lock() -> TotpPolicySerialGuard {
+    TotpPolicySerialGuard {
+        _conn: serial_lock_session(TOTP_POLICY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
 ///
 /// Distinct from the other test lock keys and from the application advisory
@@ -427,6 +456,7 @@ fn cfg(storage_path: &str) -> Config {
         stuck_scan_reap_limit: 1000,
         allow_local_admin_login: false,
         sso_disable_admin_break_glass: false,
+        totp_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
         database_max_connections: 20,
