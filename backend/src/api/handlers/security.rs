@@ -20,6 +20,7 @@ use crate::error::{AppError, Result};
 use crate::models::security::ScanResult;
 use crate::services::policy_service::PolicyService;
 use crate::services::proxy_catalog;
+use crate::services::proxy_scan_service::ProxyScanService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::scan_config_service::{ScanConfigService, UpsertScanConfigRequest};
 use crate::services::scan_result_service::ScanResultService;
@@ -77,6 +78,10 @@ pub fn repo_security_router() -> Router<SharedState> {
         )
         .route("/:key/security/scans", get(list_repo_scans))
         .route("/:key/security/proxy-scans", get(get_repo_proxy_scans))
+        .route(
+            "/:key/security/proxy-scans/rescan",
+            post(rescan_proxy_cached_path),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,6 +1458,11 @@ const DEFAULT_PROXY_SCAN_ACTION: &str = "fail_open";
 /// another repository" so the endpoint is not a cross-tenant existence oracle.
 const PROXY_PATH_NOT_FOUND_MSG: &str = "No proxy-cached artifact at that path";
 
+/// Upper bound on the per-CVE detail returned for one path (#3395). A base
+/// image can carry thousands of findings; the endpoint reports counts for the
+/// true total and this list for the actionable head of it.
+const MAX_PROXY_FINDINGS: i64 = 200;
+
 /// Projection shared by the single-path and paged reads.
 ///
 /// `$1` is the repository id and `$2` the scan type. The scan-type filter is
@@ -1542,6 +1552,21 @@ pub struct ProxyScanEntry {
     pub scanned_at: Option<chrono::DateTime<chrono::Utc>>,
     pub cached_at: chrono::DateTime<chrono::Utc>,
     pub size_bytes: i64,
+    /// The CVEs behind the counts (#3395), most severe first and bounded to
+    /// [`MAX_PROXY_FINDINGS`].
+    ///
+    /// Populated ONLY for a single-path (`?path=`) read, and only for a
+    /// `vulnerable` entry. Two reasons it is absent from the paged listing:
+    /// one query per row would make the list an N+1, and the listing is a
+    /// per-repository overview whose job is to point at the entry to open.
+    ///
+    /// `None` (omitted) means "not requested at this granularity"; an empty
+    /// vector means "requested, and this digest has no recorded detail" --
+    /// which is the real state for anything cached before #3395 shipped. The
+    /// two must stay distinguishable or a pre-#3395 artifact renders as having
+    /// no CVEs, which reads as clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub findings: Option<Vec<crate::models::security::ProxyFinding>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1638,7 +1663,23 @@ impl ProxyScanEntry {
             },
             cached_at: row.cached_at,
             size_bytes: row.size_bytes,
+            findings: None,
         }
+    }
+
+    /// Attach per-CVE detail to a single-path entry (#3395).
+    ///
+    /// Suppressed unless the entry is `vulnerable`, mirroring the count
+    /// suppression above and for the same reason: attaching an empty CVE list
+    /// to a `not_scanned` or `pending_ingest` entry renders as "we looked and
+    /// found nothing", which is exactly the false all-clear this whole surface
+    /// exists to remove. A `clean` entry is also left alone -- its detail is
+    /// the absence of findings, already carried by `findings_count: 0`.
+    fn with_findings(mut self, findings: Vec<crate::models::security::ProxyFinding>) -> Self {
+        if self.state == PROXY_STATE_VULNERABLE {
+            self.findings = Some(findings);
+        }
+        self
     }
 }
 
@@ -1775,7 +1816,24 @@ async fn get_repo_proxy_scans(
             let row = fetch_proxy_scan_path(&state.db, repo_id, path)
                 .await?
                 .ok_or_else(|| AppError::NotFound(PROXY_PATH_NOT_FOUND_MSG.to_string()))?;
+            let digest = row.checksum_sha256.clone();
             let entry = ProxyScanEntry::from_row(row, scan_on_proxy);
+            // Per-CVE detail (#3395). Read by DIGEST, but only a digest this
+            // repository's own catalog row already resolved to -- the caller
+            // never supplies one, preserving the path-keyed property above.
+            let entry = match digest {
+                Some(d) if entry.state == PROXY_STATE_VULNERABLE => {
+                    let findings = ProxyScanService::new(state.db.clone())
+                        .fetch_findings(
+                            &d,
+                            crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                            MAX_PROXY_FINDINGS,
+                        )
+                        .await?;
+                    entry.with_findings(findings)
+                }
+                _ => entry,
+            };
             (None, vec![entry], 1, 1, 1)
         }
         None => {
@@ -1803,6 +1861,229 @@ async fn get_repo_proxy_scans(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// On-demand rescan of an already-cached path (#3396)
+//
+// An artifact cached before inventory/CVE recording shipped has no SBOM and no
+// per-CVE detail, and before this the only remedy was for someone to pull it
+// again through a repository with scan-on-proxy enabled -- which the operator
+// cannot force. `proxy_cache_artifacts.storage_key` is NOT NULL, so the bytes
+// are already in object storage and a rescan reads them directly: no upstream
+// fetch, no dependency on the artifact being requested again.
+//
+// The write path is `proxy_helpers::proxy_scan_and_record` -- the SAME function
+// the inline gate calls. There is deliberately no second recording path, so a
+// rescanned verdict and a pulled verdict cannot disagree.
+// ---------------------------------------------------------------------------
+
+/// Minimum interval between rescans **per repository**.
+///
+/// This endpoint converts one authenticated request into a full scanner run
+/// over up to [`PROXY_SCAN_MAX_BYTES`](crate::services::scanner_service::PROXY_SCAN_MAX_BYTES)
+/// of content, which is the most expensive thing a non-admin can ask this
+/// service to do. The throttle is per repository rather than per path because
+/// the cost being bounded is scanner work, and a caller cycling through 10 000
+/// distinct cached paths would defeat a per-path limit entirely.
+const PROXY_RESCAN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Last rescan per repository, for [`PROXY_RESCAN_COOLDOWN`].
+///
+/// In-process on purpose: this is a courtesy throttle on an authenticated,
+/// write-gated endpoint, not a security control, and a shared-state limiter
+/// would put a database round trip in front of every call. A multi-replica
+/// deployment therefore allows one rescan per replica per window, which is
+/// still bounded.
+static PROXY_RESCAN_LAST: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Whether a rescan is due, and if not, how long is left. Pure so the throttle
+/// direction is testable without a clock or a request.
+///
+/// `None` (never rescanned) is always allowed. A `last` in the future -- which
+/// `Instant` makes impossible in practice but a saturating subtraction would
+/// silently absorb -- yields the full cooldown rather than allowing.
+fn rescan_cooldown_remaining(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    cooldown: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let last = last?;
+    let elapsed = now.saturating_duration_since(last);
+    (elapsed < cooldown).then(|| cooldown - elapsed)
+}
+
+/// Claim the rescan slot for `repo_id`, or report the remaining cooldown.
+fn claim_rescan_slot(repo_id: Uuid) -> std::result::Result<(), std::time::Duration> {
+    let now = std::time::Instant::now();
+    let mut guard = PROXY_RESCAN_LAST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(remaining) =
+        rescan_cooldown_remaining(guard.get(&repo_id).copied(), now, PROXY_RESCAN_COOLDOWN)
+    {
+        return Err(remaining);
+    }
+    guard.insert(repo_id, now);
+    Ok(())
+}
+
+/// 429 for a rescan asked for inside the cooldown, with `Retry-After`.
+fn rescan_throttled_response(remaining: std::time::Duration) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let secs = remaining.as_secs().max(1);
+    (
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, secs.to_string())],
+        Json(serde_json::json!({
+            "error": "RESCAN_THROTTLED",
+            "message": format!(
+                "A proxy rescan was already run for this repository; retry in {secs}s"
+            ),
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ProxyRescanRequest {
+    /// Cache path within this repository, e.g.
+    /// `simple/click/click-8.0.0-py3-none-any.whl`. Path-keyed for the same
+    /// cross-tenant reason the read endpoint is.
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyRescanResponse {
+    pub repository_key: String,
+    pub path: String,
+    pub digest: String,
+    /// `clean` | `vulnerable` -- the verdict just recorded.
+    pub state: String,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub max_severity: Option<String>,
+    /// Components cataloged and persisted, i.e. how much SBOM this rescan
+    /// produced. Zero means the scanner reported no inventory for these bytes.
+    pub package_count: usize,
+    /// Per-CVE detail from this run, bounded to [`MAX_PROXY_FINDINGS`].
+    pub findings: Vec<crate::models::security::ProxyFinding>,
+}
+
+/// Rescan bytes already in the proxy cache, recording the verdict, package
+/// inventory and per-CVE detail exactly as an inline gated pull would (#3396).
+#[utoipa::path(
+    post,
+    path = "/{key}/security/proxy-scans/rescan",
+    context_path = "/api/v1/repositories",
+    tag = "security",
+    params(("key" = String, Path, description = "Repository key")),
+    request_body = ProxyRescanRequest,
+    responses(
+        (status = 200, description = "Rescan completed", body = ProxyRescanResponse),
+        (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository or path not found", body = crate::api::openapi::ErrorResponse),
+        (status = 429, description = "Rescan cooldown in effect"),
+        (status = 503, description = "No scanner configured, or the scan was inconclusive"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn rescan_proxy_cached_path(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(body): Json<ProxyRescanRequest>,
+) -> Result<axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    // Write access, not merely visibility: this spends scanner CPU and
+    // rewrites a verdict that gates every tenant pulling the same digest.
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
+
+    let path = body.path.trim().to_string();
+    if path.is_empty() {
+        return Err(AppError::Validation("path must not be empty".to_string()));
+    }
+
+    // Resolve the path in THIS repository's catalog. Same canonical 404 as the
+    // read endpoint, so a rescan cannot probe another tenant's cache.
+    let entry = proxy_catalog::find_cached_entry(&state.db, repo.id, &path)
+        .await?
+        .ok_or_else(|| AppError::NotFound(PROXY_PATH_NOT_FOUND_MSG.to_string()))?;
+
+    if let Err(remaining) = claim_rescan_slot(repo.id) {
+        return Ok(rescan_throttled_response(remaining));
+    }
+
+    let bytes = state
+        .storage
+        .get(&entry.storage_key)
+        .await
+        .map_err(|e| AppError::NotFound(format!("Cached bytes are no longer readable: {e}")))?;
+
+    // The digest is recomputed from the bytes we just read rather than trusted
+    // from the catalog row: the verdict is keyed on content, and recording a
+    // verdict for these bytes under a stale row's digest would attach a scan
+    // result to content nobody scanned.
+    let digest = crate::api::handlers::proxy_helpers::sha256_hex(&bytes);
+    let synthetic = crate::api::handlers::proxy_helpers::proxy_rescan_synthetic_artifact(
+        repo.id,
+        &path,
+        &digest,
+        bytes.len() as i64,
+        entry.content_type.as_deref(),
+    );
+
+    // Identity is deliberately NOT asserted here. The inline gate can name the
+    // coordinate a client asked for; a rescan of stored bytes cannot, and
+    // inventing one would let a rescan record a `clean` verdict against an
+    // identity the engine never graded (#3003). Passing `None` runs the same
+    // code without the expected-component assertion.
+    let verdict = crate::api::handlers::proxy_helpers::proxy_scan_and_record(
+        &state,
+        repo.id,
+        &digest,
+        &synthetic,
+        &bytes,
+        None,
+        &crate::api::handlers::proxy_helpers::ProxyScanMode::File,
+    )
+    .await
+    .ok_or_else(|| {
+        AppError::ServiceUnavailable(
+            "Rescan was inconclusive: no scanner is configured, or the scan failed or \
+             exceeded its budget. The stored verdict is unchanged."
+                .to_string(),
+        )
+    })?;
+
+    let mut findings = verdict.findings.clone();
+    findings.truncate(MAX_PROXY_FINDINGS as usize);
+
+    Ok(Json(ProxyRescanResponse {
+        repository_key: key,
+        path,
+        digest,
+        state: verdict.verdict_token().to_string(),
+        findings_count: verdict.findings_count,
+        critical_count: verdict.critical_count,
+        high_count: verdict.high_count,
+        medium_count: verdict.medium_count,
+        low_count: verdict.low_count,
+        max_severity: verdict.max_severity_token().map(str::to_string),
+        package_count: verdict.packages.len(),
+        findings,
+    })
+    .into_response())
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -1825,6 +2106,7 @@ async fn get_repo_proxy_scans(
         list_artifact_scans,
         list_repo_scans,
         get_repo_proxy_scans,
+        rescan_proxy_cached_path,
     ),
     components(schemas(
         DashboardResponse,
@@ -1844,6 +2126,9 @@ async fn get_repo_proxy_scans(
         ProxyScansResponse,
         ProxyScanSummary,
         ProxyScanEntry,
+        ProxyRescanRequest,
+        ProxyRescanResponse,
+        crate::models::security::ProxyFinding,
     ))
 )]
 pub struct SecurityApiDoc;
@@ -1880,10 +2165,17 @@ mod tests {
     #[test]
     fn test_repo_security_handlers_enforce_tenant_gate() {
         let body_of = handler_body;
-        assert!(
-            body_of("update_repo_security").contains("require_repo_write_access("),
-            "update_repo_security must call require_repo_write_access (xtenant)"
-        );
+        // Class-level, not per-site: every repo-scoped WRITE handler in this
+        // module must carry the tenant write gate. Listing them here means a
+        // handler added later fails this test by omission rather than by
+        // someone remembering to extend it.
+        for writer in ["update_repo_security", "rescan_proxy_cached_path"] {
+            assert!(
+                body_of(writer).contains("require_repo_write_access("),
+                "{} must call require_repo_write_access (xtenant)",
+                writer
+            );
+        }
         assert!(
             body_of("update_repo_security").contains("require_repo_admin("),
             "update_repo_security must call require_repo_admin (#2750): scan \
@@ -2187,6 +2479,175 @@ mod tests {
         // ambiguous between "pulls are blocked" and "served anyway".
         assert_eq!(json["scan_on_proxy"], serde_json::json!(false));
         assert_eq!(json["proxy_scan_action"], serde_json::json!("fail_open"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-CVE detail attachment (#3395) -- pure
+    // -----------------------------------------------------------------------
+
+    fn sample_proxy_finding() -> crate::models::security::ProxyFinding {
+        crate::models::security::ProxyFinding {
+            cve_id: "CVE-2019-14806".to_string(),
+            severity: "high".to_string(),
+            package_name: Some("werkzeug".to_string()),
+            package_version: Some("0.15.0".to_string()),
+            fixed_version: Some("0.15.3".to_string()),
+            title: Some("Pallets Werkzeug insecure default".to_string()),
+        }
+    }
+
+    /// Detail is attached ONLY to a `vulnerable` entry.
+    ///
+    /// The failure this prevents is specific: attaching an empty CVE list to a
+    /// `not_scanned` or `pending_ingest` entry renders in a UI as "we looked
+    /// and found nothing", which is the false all-clear this whole surface
+    /// exists to remove. A `clean` entry is excluded too — its detail is the
+    /// absence of findings, already carried by `findings_count: 0`.
+    #[test]
+    fn proxy_findings_attach_only_to_a_vulnerable_entry() {
+        let detail = vec![sample_proxy_finding()];
+
+        let mut row = sample_proxy_row();
+        row.verdict = Some(PROXY_STATE_VULNERABLE.to_string());
+        let vulnerable = ProxyScanEntry::from_row(row, true).with_findings(detail.clone());
+        assert_eq!(vulnerable.state, PROXY_STATE_VULNERABLE);
+        assert_eq!(vulnerable.findings.as_deref(), Some(&detail[..]));
+
+        for (verdict, expected_state) in [
+            (Some(PROXY_STATE_CLEAN.to_string()), PROXY_STATE_CLEAN),
+            (None, PROXY_STATE_NOT_SCANNED),
+        ] {
+            let mut row = sample_proxy_row();
+            row.verdict = verdict;
+            let entry = ProxyScanEntry::from_row(row, true).with_findings(detail.clone());
+            assert_eq!(entry.state, expected_state);
+            assert!(
+                entry.findings.is_none(),
+                "{expected_state} must not carry a CVE list"
+            );
+        }
+
+        // pending_ingest: NULL checksum, so there is nothing to look up.
+        let mut row = sample_proxy_row();
+        row.checksum_sha256 = None;
+        row.verdict = Some(PROXY_STATE_VULNERABLE.to_string());
+        let pending = ProxyScanEntry::from_row(row, true).with_findings(detail);
+        assert_eq!(pending.state, PROXY_STATE_PENDING_INGEST);
+        assert!(pending.findings.is_none());
+    }
+
+    /// `None` and `Some([])` must stay distinguishable on the wire.
+    ///
+    /// `None` (the field omitted) means "not requested at this granularity" —
+    /// which is every row of the paged listing. `Some([])` means "requested,
+    /// and this digest has no recorded detail", the real state of anything
+    /// cached before #3395 shipped. Collapsing the two makes a pre-#3395
+    /// artifact render as a vulnerable artifact with no CVEs.
+    #[test]
+    fn absent_and_empty_proxy_findings_are_different_on_the_wire() {
+        let mut row = sample_proxy_row();
+        row.verdict = Some(PROXY_STATE_VULNERABLE.to_string());
+        let listed = ProxyScanEntry::from_row(row.clone(), true);
+        let json = serde_json::to_value(&listed).expect("serialize");
+        assert!(
+            json.get("findings").is_none(),
+            "the paged listing omits the field entirely: {json}"
+        );
+
+        let detailed = ProxyScanEntry::from_row(row, true).with_findings(vec![]);
+        let json = serde_json::to_value(&detailed).expect("serialize");
+        assert_eq!(
+            json["findings"],
+            serde_json::json!([]),
+            "an empty list is present, not omitted: {json}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rescan throttle (#3396) -- pure
+    // -----------------------------------------------------------------------
+
+    /// The throttle direction, over every shape the clock can produce.
+    ///
+    /// A never-rescanned repository is always allowed; inside the window the
+    /// REMAINING time is reported (it becomes `Retry-After`, so an inverted
+    /// subtraction would advertise a wait longer than the cooldown); at and
+    /// after the boundary it is allowed again.
+    #[test]
+    fn rescan_cooldown_allows_first_call_and_reports_remaining_inside_the_window() {
+        let cooldown = std::time::Duration::from_secs(30);
+        let now = std::time::Instant::now();
+
+        assert!(
+            rescan_cooldown_remaining(None, now, cooldown).is_none(),
+            "a repository that has never been rescanned is never throttled"
+        );
+
+        let just_now = now - std::time::Duration::from_secs(1);
+        let remaining =
+            rescan_cooldown_remaining(Some(just_now), now, cooldown).expect("inside the window");
+        assert_eq!(remaining, std::time::Duration::from_secs(29));
+        assert!(
+            remaining <= cooldown,
+            "remaining can never exceed the cooldown itself"
+        );
+
+        // Exactly at the boundary is allowed: `elapsed < cooldown` is strict,
+        // so a caller polling `Retry-After` succeeds on its first retry rather
+        // than being told to wait again.
+        assert!(rescan_cooldown_remaining(Some(now - cooldown), now, cooldown).is_none());
+        assert!(rescan_cooldown_remaining(
+            Some(now - cooldown - std::time::Duration::from_secs(1)),
+            now,
+            cooldown
+        )
+        .is_none());
+
+        // A `last` in the future must not underflow into "allowed forever".
+        let future = now + std::time::Duration::from_secs(5);
+        assert_eq!(
+            rescan_cooldown_remaining(Some(future), now, cooldown),
+            Some(cooldown),
+            "saturating subtraction yields the full cooldown, never an allow"
+        );
+    }
+
+    /// Claiming the slot is one-shot per window and per repository: two
+    /// different repositories do not throttle each other.
+    #[test]
+    fn claim_rescan_slot_is_per_repository_and_one_shot() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert!(claim_rescan_slot(a).is_ok(), "first claim wins");
+        let denied = claim_rescan_slot(a).expect_err("second claim inside the window");
+        assert!(denied <= PROXY_RESCAN_COOLDOWN);
+        assert!(
+            claim_rescan_slot(b).is_ok(),
+            "a different repository has its own budget"
+        );
+    }
+
+    /// The throttle response is a 429 carrying `Retry-After`, not a 4xx a
+    /// client would retry immediately or treat as permanent.
+    #[test]
+    fn rescan_throttled_response_is_429_with_retry_after() {
+        let resp = rescan_throttled_response(std::time::Duration::from_secs(7));
+        assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("7")
+        );
+        // Sub-second remainders must not advertise `Retry-After: 0`, which
+        // invites an immediate retry that is guaranteed to fail.
+        let resp = rescan_throttled_response(std::time::Duration::from_millis(200));
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2527,7 +2988,13 @@ mod tests {
         let (other_id, _other_key, other_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
 
         let digest = unique_digest();
-        let cached_at = chrono::Utc::now();
+        // Truncated to MICROSECONDS at the source. `Utc::now()` carries
+        // nanoseconds; `timestamptz` stores microseconds, so a raw `now()`
+        // compares unequal to its own round trip whenever the clock hands back
+        // a non-zero nanosecond remainder -- which is most of the time on CI
+        // and rarely on a developer's machine. That asymmetry is what made this
+        // assertion look flaky rather than wrong.
+        let cached_at = chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 6);
         // Another tenant pulled byte-identical content a month before we did.
         let scanned_at = cached_at - chrono::Duration::days(30);
         seed_cached_path(
@@ -2572,6 +3039,165 @@ mod tests {
             other => panic!("expected NotFound, got {:?}", other.map(|_| "ok")),
         };
         assert_eq!(msg(foreign), msg(absent), "404 bodies must be identical");
+
+        fx.cleanup(&[digest]).await;
+        tdh::cleanup_member_repo(&pool, other_id, &other_dir).await;
+    }
+
+    /// End to end for #3395: the `?path=` read answers "which CVE blocked my
+    /// build?" for a vulnerable proxy-cached path, and stays silent for a
+    /// clean one.
+    ///
+    /// The digest is never accepted from the caller — it comes from THIS
+    /// repository's own catalog row — so the detail read inherits the
+    /// path-keyed scoping the listing already has. That is asserted here by
+    /// reading a path another repository cached at the same digest: it 404s
+    /// rather than yielding the detail.
+    #[tokio::test]
+    async fn proxy_scan_path_read_returns_per_cve_detail_for_a_vulnerable_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool.clone()).await;
+        let (other_id, _other_key, other_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+
+        let vuln = unique_digest();
+        let clean = unique_digest();
+        let now = chrono::Utc::now();
+        seed_cached_path(&pool, fx.repo_id, "simple/w/w-0.15.0.whl", Some(&vuln), now).await;
+        seed_cached_path(&pool, fx.repo_id, "simple/c/c-1.0.whl", Some(&clean), now).await;
+        // Another tenant holds the same vulnerable bytes at its own path.
+        seed_cached_path(&pool, other_id, "simple/secret/s.whl", Some(&vuln), now).await;
+        seed_grype_verdict(&pool, &vuln, PROXY_STATE_VULNERABLE, 2, now).await;
+        seed_grype_verdict(&pool, &clean, PROXY_STATE_CLEAN, 0, now).await;
+
+        ProxyScanService::new(pool.clone())
+            .record_findings(
+                &vuln,
+                crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                &[
+                    crate::models::security::ProxyFinding {
+                        cve_id: "CVE-2019-14806".to_string(),
+                        severity: "high".to_string(),
+                        package_name: Some("werkzeug".to_string()),
+                        package_version: Some("0.15.0".to_string()),
+                        fixed_version: Some("0.15.3".to_string()),
+                        title: Some("insecure default".to_string()),
+                    },
+                    crate::models::security::ProxyFinding {
+                        cve_id: "CVE-2020-28724".to_string(),
+                        severity: "critical".to_string(),
+                        package_name: Some("werkzeug".to_string()),
+                        package_version: Some("0.15.0".to_string()),
+                        fixed_version: None,
+                        title: None,
+                    },
+                ],
+            )
+            .await
+            .expect("record findings");
+
+        let query = |path: &str| ProxyScansQuery {
+            path: Some(path.to_string()),
+            ..Default::default()
+        };
+
+        let detail = fx.read_ok(query("simple/w/w-0.15.0.whl")).await;
+        let entry = &detail.items[0];
+        assert_eq!(entry.state, PROXY_STATE_VULNERABLE);
+        let findings = entry
+            .findings
+            .as_ref()
+            .expect("vulnerable path carries CVEs");
+        assert_eq!(
+            findings
+                .iter()
+                .map(|f| f.cve_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CVE-2020-28724", "CVE-2019-14806"],
+            "most severe first, so a truncated render shows what matters"
+        );
+        assert_eq!(findings[1].fixed_version.as_deref(), Some("0.15.3"));
+
+        // Clean: no list at all, so it can never render as "we looked".
+        let clean_read = fx.read_ok(query("simple/c/c-1.0.whl")).await;
+        assert_eq!(clean_read.items[0].state, PROXY_STATE_CLEAN);
+        assert!(clean_read.items[0].findings.is_none());
+
+        // The paged listing never carries detail (N+1 avoidance, and it is an
+        // overview surface).
+        let listed = fx.read_ok(ProxyScansQuery::default()).await;
+        assert!(
+            listed.items.iter().all(|i| i.findings.is_none()),
+            "the listing must not fan out one detail query per row"
+        );
+
+        // Cross-tenant: same digest, another repository's path, still a 404.
+        match fx.read(query("simple/secret/s.whl")).await {
+            Err(AppError::NotFound(m)) => assert_eq!(m, PROXY_PATH_NOT_FOUND_MSG),
+            other => panic!("expected NotFound, got {:?}", other.map(|_| "ok")),
+        }
+
+        let _ = sqlx::query("DELETE FROM proxy_scan_findings WHERE checksum_sha256 = $1")
+            .bind(&vuln)
+            .execute(&pool)
+            .await;
+        fx.cleanup(&[vuln, clean]).await;
+        tdh::cleanup_member_repo(&pool, other_id, &other_dir).await;
+    }
+
+    /// The rescan endpoint resolves its path in the CALLER's catalog only, and
+    /// answers the canonical proxy 404 for anything else — so it cannot be
+    /// used to probe another tenant's cache, and cannot be used to spend
+    /// scanner CPU on a path the caller cannot see. Asserted before the
+    /// throttle is claimed, so a probe cannot even consume the caller's own
+    /// rescan budget.
+    #[tokio::test]
+    async fn rescan_rejects_paths_outside_the_callers_catalog() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool.clone()).await;
+        let (other_id, _other_key, other_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let digest = unique_digest();
+        let now = chrono::Utc::now();
+        seed_cached_path(&pool, other_id, "simple/secret/s.whl", Some(&digest), now).await;
+
+        let rescan = |path: &str| {
+            let state = fx.state();
+            let auth = tdh::make_auth(fx.user_id, &fx.username);
+            let key = fx.key.clone();
+            let body = ProxyRescanRequest {
+                path: path.to_string(),
+            };
+            async move {
+                rescan_proxy_cached_path(State(state), Extension(Some(auth)), Path(key), Json(body))
+                    .await
+            }
+        };
+
+        let msg = |r: Result<axum::response::Response>| match r {
+            Err(AppError::NotFound(m)) => m,
+            other => panic!("expected NotFound, got {:?}", other.map(|_| "ok")),
+        };
+        assert_eq!(
+            msg(rescan("simple/secret/s.whl").await),
+            PROXY_PATH_NOT_FOUND_MSG,
+            "another tenant's cached path is indistinguishable from an absent one"
+        );
+        assert_eq!(
+            msg(rescan("simple/never/n.whl").await),
+            PROXY_PATH_NOT_FOUND_MSG
+        );
+
+        // An empty path is a client error, not a 404 — a 404 would imply the
+        // server looked something up.
+        match rescan("   ").await {
+            Err(AppError::Validation(_)) => {}
+            other => panic!("expected Validation, got {:?}", other.map(|_| "ok")),
+        }
 
         fx.cleanup(&[digest]).await;
         tdh::cleanup_member_repo(&pool, other_id, &other_dir).await;

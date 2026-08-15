@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, RawPackage, Severity};
+use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::grype_scanner::GrypeScanner;
@@ -2524,6 +2524,15 @@ pub struct ProxyScanVerdict {
     /// Whether the scanner saw a target it could not parse (#1153). Threaded
     /// into generated SBOMs so a partial inventory does not render as complete.
     pub scan_completeness: Option<String>,
+    /// The CVE-identified findings behind the counts, retained so the operator
+    /// whose pull was just blocked can be told WHICH CVE did it (#3395).
+    ///
+    /// Exactly like `packages`: populated after aggregation, never load-bearing
+    /// for the verdict itself. The counts above are computed from the raw
+    /// finding list, which includes findings this projection drops (those with
+    /// no CVE id), so `findings.len()` is a LOWER BOUND on `findings_count` and
+    /// the two must not be asserted equal.
+    pub findings: Vec<ProxyFinding>,
 }
 
 impl ProxyScanVerdict {
@@ -2796,7 +2805,53 @@ pub fn aggregate_proxy_verdict(
         // depends on, and the inventory must never influence it.
         packages: Vec::new(),
         scan_completeness: None,
+        findings: Vec::new(),
     }
+}
+
+/// Project the raw finding list onto the rows `proxy_scan_findings` stores
+/// (#3395). Pure, so the two properties that make the write safe are testable
+/// without a database:
+///
+/// 1. **Findings with no CVE id are dropped.** The table's identity is the CVE;
+///    a finding without one has nothing an operator could look up, and NULL
+///    would break the uniqueness key. They still counted toward the verdict —
+///    `aggregate_proxy_verdict` runs over the raw list before this.
+/// 2. **The result is deduplicated on the table's uniqueness key.** Postgres
+///    rejects an `INSERT ... ON CONFLICT DO UPDATE` whose own tuple set hits
+///    the same row twice ("cannot affect row a second time"), which would fail
+///    the whole write. [`dedupe_findings`] already collapses the pin
+///    duplication, but it keys on the NORMALIZED component name, so two raw
+///    spellings of one component survive it and collide here.
+///
+/// First occurrence wins on a duplicate: `dedupe_findings` has already resolved
+/// severity to the most severe of a colliding group, so the survivors are the
+/// values this must preserve.
+pub fn retain_proxy_findings(findings: &[RawFinding]) -> Vec<ProxyFinding> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(findings.len());
+    for f in findings {
+        let Some(cve_id) = f.cve_id.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let key = (
+            cve_id.to_string(),
+            f.affected_component.clone().unwrap_or_default(),
+            f.affected_version.clone().unwrap_or_default(),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(ProxyFinding {
+            cve_id: cve_id.to_string(),
+            severity: severity_token(f.severity).to_string(),
+            package_name: f.affected_component.clone(),
+            package_version: f.affected_version.clone(),
+            fixed_version: f.fixed_version.clone(),
+            title: (!f.title.trim().is_empty()).then(|| f.title.clone()),
+        });
+    }
+    out
 }
 
 /// Run the applicable leaf scanners over raw proxy bytes and fold their output
@@ -3016,6 +3071,9 @@ async fn run_inline_proxy_scanners_target(
     // counts/severity contract is computed from findings alone.
     verdict.packages = dedupe_packages(packages);
     verdict.scan_completeness = scan_completeness;
+    // Same contract as `packages`: attached after aggregation so the counts are
+    // computed from the raw findings and this projection cannot move them.
+    verdict.findings = retain_proxy_findings(&findings);
     Ok(verdict)
 }
 
@@ -11216,6 +11274,150 @@ mod tests {
             source: source.map(str::to_string),
             source_url: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // retain_proxy_findings — per-CVE detail for proxy content (#3395)
+    // -----------------------------------------------------------------------
+
+    /// The projection must never move the verdict. A scanner that reports a
+    /// finding with no CVE id still contributed to `findings_count` (computed
+    /// from the raw list) but has nothing to persist, so the two numbers
+    /// legitimately differ — and the projection is the side that shrinks.
+    ///
+    /// This is the property that keeps #3395 safe to ship: an operator reading
+    /// "4 findings, 3 CVEs listed" is seeing an incomplete EXPLANATION, never
+    /// an under-reported verdict.
+    #[test]
+    fn retain_proxy_findings_drops_id_less_findings_without_touching_the_counts() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("werkzeug"),
+                Some("0.15.0"),
+                Severity::High,
+                None,
+                "high one",
+            ),
+            // No CVE id: nothing an operator could look up, and NULL would
+            // break the table's identity key.
+            dedup_finding(
+                None,
+                Some("werkzeug"),
+                Some("0.15.0"),
+                Severity::High,
+                None,
+                "unnamed",
+            ),
+            // Whitespace-only id is the same case wearing a disguise.
+            dedup_finding(
+                Some("   "),
+                Some("werkzeug"),
+                Some("0.15.0"),
+                Severity::Low,
+                None,
+                "blank id",
+            ),
+        ];
+
+        let verdict = aggregate_proxy_verdict(&findings, None);
+        assert_eq!(verdict.findings_count, 3, "the verdict counts all three");
+        assert_eq!(verdict.high_count, 2);
+
+        let retained = retain_proxy_findings(&findings);
+        assert_eq!(retained.len(), 1, "only the identified finding persists");
+        assert_eq!(retained[0].cve_id, "CVE-2021-1");
+        assert_eq!(retained[0].severity, "high");
+        assert_eq!(retained[0].package_name.as_deref(), Some("werkzeug"));
+        assert_eq!(retained[0].package_version.as_deref(), Some("0.15.0"));
+        assert!(
+            retained.len() < verdict.findings_count as usize,
+            "findings.len() is a LOWER BOUND on findings_count; asserting \
+             equality anywhere would encode the opposite"
+        );
+    }
+
+    /// Postgres rejects an `INSERT ... ON CONFLICT DO UPDATE` whose own tuple
+    /// set hits one row twice, which would fail the ENTIRE write and lose the
+    /// detail for every CVE in the batch. `dedupe_findings` collapses on the
+    /// NORMALIZED component name, so two raw spellings of one component reach
+    /// here intact and must be collapsed on the table's own key.
+    #[test]
+    fn retain_proxy_findings_dedupes_on_the_tables_uniqueness_key() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("Werkzeug"),
+                Some("0.15.0"),
+                Severity::High,
+                None,
+                "first",
+            ),
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("Werkzeug"),
+                Some("0.15.0"),
+                Severity::Medium,
+                Some("other-scanner"),
+                "second",
+            ),
+            // Same CVE, DIFFERENT component: legitimately two rows.
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("jinja2"),
+                Some("2.0"),
+                Severity::High,
+                None,
+                "third",
+            ),
+        ];
+
+        let retained = retain_proxy_findings(&findings);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(
+            retained[0].title.as_deref(),
+            Some("first"),
+            "first occurrence wins: dedupe_findings already resolved severity"
+        );
+        assert_eq!(retained[0].severity, "high");
+        assert_eq!(retained[1].package_name.as_deref(), Some("jinja2"));
+
+        // The uniqueness key the write relies on, restated over the output.
+        let mut keys: Vec<_> = retained
+            .iter()
+            .map(|f| {
+                (
+                    f.cve_id.clone(),
+                    f.package_name.clone().unwrap_or_default(),
+                    f.package_version.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let before = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "output must be key-unique");
+    }
+
+    /// An empty title is dropped rather than persisted as `""`: the column is
+    /// nullable precisely so "the scanner said nothing" and "the scanner said
+    /// nothing useful" are the same state on read.
+    #[test]
+    fn retain_proxy_findings_normalizes_absent_metadata() {
+        let findings = vec![dedup_finding(
+            Some("CVE-2021-2"),
+            None,
+            None,
+            Severity::Info,
+            None,
+            "  ",
+        )];
+        let retained = retain_proxy_findings(&findings);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].severity, "info");
+        assert!(retained[0].title.is_none());
+        assert!(retained[0].package_name.is_none());
+        assert!(retained[0].package_version.is_none());
     }
 
     /// `dedupe_packages` was reimplemented from a per-package linear scan to

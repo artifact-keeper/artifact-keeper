@@ -643,6 +643,145 @@ impl ProxyScanService {
             )
             .collect())
     }
+
+    /// Persist the per-CVE detail behind a proxy verdict (#3395).
+    ///
+    /// `proxy_scan_results` stores counts and a max severity; it cannot answer
+    /// "which CVE blocked my build?". These rows can. Same shape and same
+    /// reasoning as [`record_packages`](Self::record_packages): digest-keyed
+    /// (no `repository_id`, so one copy serves every tenant caching identical
+    /// bytes), one `UNNEST` round trip regardless of finding count, and
+    /// `ON CONFLICT DO UPDATE` so a rescan refreshes rather than accumulates.
+    ///
+    /// An empty list is a no-op rather than a delete, for the same reason: a
+    /// scanner that reports nothing must not erase detail recorded earlier for
+    /// the same digest. The consequence is that a digest whose CVEs were
+    /// genuinely all fixed keeps stale rows until it is rescanned with
+    /// findings — acceptable, because the VERDICT (which is what gates
+    /// distribution) is replaced unconditionally by `record_verdict`, and a
+    /// clean verdict suppresses this detail on the read path.
+    ///
+    /// The caller MUST pass a list already deduplicated on
+    /// `(cve_id, package_name, package_version)` — see
+    /// [`crate::services::scanner_service::retain_proxy_findings`]. Postgres
+    /// rejects an upsert whose own tuple set hits one row twice.
+    pub async fn record_findings(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        findings: &[crate::models::security::ProxyFinding],
+    ) -> Result<()> {
+        if findings.is_empty() {
+            return Ok(());
+        }
+
+        let cve_ids: Vec<String> = findings.iter().map(|f| f.cve_id.clone()).collect();
+        let severities: Vec<String> = findings.iter().map(|f| f.severity.clone()).collect();
+        let names: Vec<Option<String>> = findings.iter().map(|f| f.package_name.clone()).collect();
+        let versions: Vec<Option<String>> =
+            findings.iter().map(|f| f.package_version.clone()).collect();
+        let fixed: Vec<Option<String>> = findings.iter().map(|f| f.fixed_version.clone()).collect();
+        let titles: Vec<Option<String>> = findings.iter().map(|f| f.title.clone()).collect();
+
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_scan_findings (
+                checksum_sha256, scan_type, cve_id, severity,
+                package_name, package_version, fixed_version, title, recorded_at
+            )
+            SELECT $1, $2, u.cve_id, u.severity,
+                   u.package_name, u.package_version, u.fixed_version, u.title, now()
+            FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[])
+                AS u(cve_id, severity, package_name, package_version, fixed_version, title)
+            ON CONFLICT (
+                checksum_sha256, scan_type, cve_id,
+                COALESCE(package_name, ''), COALESCE(package_version, '')
+            )
+            DO UPDATE SET
+                severity = EXCLUDED.severity,
+                fixed_version = COALESCE(EXCLUDED.fixed_version, proxy_scan_findings.fixed_version),
+                title = COALESCE(EXCLUDED.title, proxy_scan_findings.title),
+                recorded_at = now()
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(&cve_ids)
+        .bind(&severities)
+        .bind(&names)
+        .bind(&versions)
+        .bind(&fixed)
+        .bind(&titles)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Read back the per-CVE detail for a digest (#3395).
+    ///
+    /// Ordered most severe first so a truncated UI rendering shows the finding
+    /// that matters. `severity` is a token, not an enum, in the database, so
+    /// the ordering is an explicit CASE rather than a column sort — an unknown
+    /// token sorts last rather than in the middle of the real severities.
+    ///
+    /// `scan_type`-filtered for the same reason as
+    /// [`fetch_packages`](Self::fetch_packages).
+    pub async fn fetch_findings(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::models::security::ProxyFinding>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT cve_id, severity, package_name, package_version, fixed_version, title
+            FROM proxy_scan_findings
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            ORDER BY CASE severity
+                         WHEN 'critical' THEN 0
+                         WHEN 'high' THEN 1
+                         WHEN 'medium' THEN 2
+                         WHEN 'low' THEN 3
+                         WHEN 'info' THEN 4
+                         ELSE 5
+                     END,
+                     cve_id, package_name
+            LIMIT $3
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(cve_id, severity, package_name, package_version, fixed_version, title)| {
+                    crate::models::security::ProxyFinding {
+                        cve_id,
+                        severity,
+                        package_name,
+                        package_version,
+                        fixed_version,
+                        title,
+                    }
+                },
+            )
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1245,6 +1384,129 @@ mod tests {
             30,
             now
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-CVE detail (#3395)
+    // -----------------------------------------------------------------------
+
+    /// DB-backed round trip against the real `proxy_scan_findings` schema:
+    /// write → read back in severity order → rewrite (the rescan case) → read.
+    ///
+    /// Four contracts, each of which broke a real read path when absent:
+    ///   * severity ordering is by MEANING, not alphabetical — `critical`
+    ///     sorts before `high` before `low`, and an unrecognized token sorts
+    ///     LAST rather than into the middle of the real severities;
+    ///   * `scan_type` scopes the read, so a second engine's rows never merge
+    ///     into the first's list;
+    ///   * a re-record upserts in place rather than accumulating duplicates;
+    ///   * an EMPTY list is a no-op, not a delete — a scanner that reports
+    ///     nothing must not erase detail recorded earlier for the same digest.
+    #[tokio::test]
+    async fn record_and_fetch_findings_roundtrip_orders_scopes_and_upserts() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::security::ProxyFinding;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = ProxyScanService::new(pool.clone());
+        let digest = format!("{:0>64}", uuid::Uuid::new_v4().simple());
+
+        let mk = |cve: &str, sev: &str, pkg: &str| ProxyFinding {
+            cve_id: cve.to_string(),
+            severity: sev.to_string(),
+            package_name: Some(pkg.to_string()),
+            package_version: Some("0.15.0".to_string()),
+            fixed_version: Some("0.15.3".to_string()),
+            title: Some(format!("{cve} in {pkg}")),
+        };
+
+        assert!(
+            svc.fetch_findings(&digest, "grype", 50)
+                .await
+                .expect("fetch empty")
+                .is_empty(),
+            "unknown digest has no detail"
+        );
+
+        // Inserted in a deliberately unhelpful order, including a token the
+        // CASE does not know.
+        svc.record_findings(
+            &digest,
+            "grype",
+            &[
+                mk("CVE-2021-30", "low", "werkzeug"),
+                mk("CVE-2021-10", "critical", "werkzeug"),
+                mk("CVE-2021-40", "banana", "werkzeug"),
+                mk("CVE-2021-20", "high", "werkzeug"),
+            ],
+        )
+        .await
+        .expect("record findings");
+
+        let rows = svc
+            .fetch_findings(&digest, "grype", 50)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            rows.iter().map(|r| r.severity.as_str()).collect::<Vec<_>>(),
+            vec!["critical", "high", "low", "banana"],
+            "most severe first; an unknown token sorts LAST, never in the middle"
+        );
+        assert_eq!(rows[0].cve_id, "CVE-2021-10");
+        assert_eq!(rows[0].fixed_version.as_deref(), Some("0.15.3"));
+
+        // A different scan type is a different inventory.
+        svc.record_findings(&digest, "trivy", &[mk("CVE-9999-1", "critical", "other")])
+            .await
+            .expect("record other scan type");
+        let grype = svc
+            .fetch_findings(&digest, "grype", 50)
+            .await
+            .expect("fetch");
+        assert_eq!(grype.len(), 4, "the trivy row must not join this list");
+
+        // Rescan: same keys, refreshed severity — upsert, not accumulate.
+        svc.record_findings(&digest, "grype", &[mk("CVE-2021-30", "medium", "werkzeug")])
+            .await
+            .expect("re-record");
+        let rows = svc
+            .fetch_findings(&digest, "grype", 50)
+            .await
+            .expect("fetch");
+        assert_eq!(rows.len(), 4, "upsert in place");
+        let updated = rows
+            .iter()
+            .find(|r| r.cve_id == "CVE-2021-30")
+            .expect("row still present");
+        assert_eq!(updated.severity, "medium");
+
+        // Empty is a no-op, never a delete.
+        svc.record_findings(&digest, "grype", &[])
+            .await
+            .expect("empty record");
+        assert_eq!(
+            svc.fetch_findings(&digest, "grype", 50)
+                .await
+                .expect("fetch")
+                .len(),
+            4,
+            "an empty report must not erase detail recorded earlier"
+        );
+
+        // The limit is applied, and applied AFTER the ordering, so a truncated
+        // list keeps the most severe findings rather than an arbitrary slice.
+        let capped = svc
+            .fetch_findings(&digest, "grype", 2)
+            .await
+            .expect("fetch");
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].severity, "critical");
+
+        let _ = sqlx::query("DELETE FROM proxy_scan_findings WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await;
     }
 
     #[test]

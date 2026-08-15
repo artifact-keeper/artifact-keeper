@@ -6425,6 +6425,61 @@ pub(crate) struct OciImageScanCtx {
     pub upstream_url: Option<String>,
 }
 
+/// Filename a cache path is scanned under: the last path segment.
+///
+/// Pure and separately tested because scanner applicability and archive
+/// extraction are driven by the filename, so getting this wrong makes a rescan
+/// silently catalog nothing rather than fail. Returns `None` for a path whose
+/// last segment is empty (a trailing slash) -- there is no file to scan.
+pub(crate) fn cache_path_filename(path: &str) -> Option<&str> {
+    path.rsplit('/').find(|seg| !seg.is_empty())
+}
+
+/// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
+/// for an on-demand rescan of already-cached bytes (#3396).
+///
+/// The per-format serve paths build their own (`pypi_synthetic_artifact`,
+/// `npm_synthetic_artifact`, ...) because they know the coordinate the client
+/// asked for. A rescan has only a stored path and the content type recorded at
+/// cache time, so it reconstructs the minimum the scanners actually consume:
+/// filename (applicability + archive extraction) and content type.
+///
+/// `version` is deliberately `None`. The format-specific builders derive it
+/// from the filename to name a coordinate for the #3003 identity assertion; a
+/// rescan makes no such assertion (see the caller), and a guessed version here
+/// would be a claim about identity that nothing verified.
+pub(crate) fn proxy_rescan_synthetic_artifact(
+    repo_id: Uuid,
+    path: &str,
+    digest: &str,
+    size: i64,
+    content_type: Option<&str>,
+) -> crate::models::artifact::Artifact {
+    let filename = cache_path_filename(path).unwrap_or(path).to_string();
+    let now = Utc::now();
+    crate::models::artifact::Artifact {
+        id: Uuid::new_v4(),
+        repository_id: repo_id,
+        path: filename.clone(),
+        name: filename,
+        version: None,
+        size_bytes: size,
+        checksum_sha256: digest.to_string(),
+        checksum_md5: None,
+        checksum_sha1: None,
+        content_type: content_type
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+        storage_key: String::new(),
+        is_deleted: false,
+        uploaded_by: None,
+        quarantine_status: None,
+        quarantine_until: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 /// Run the leaf scanners over the buffered bytes within the inline budget and
 /// persist the digest-keyed verdict. The caller supplies the format-specific
 /// `synthetic` [`Artifact`](crate::models::artifact::Artifact) (filename /
@@ -6517,6 +6572,23 @@ pub(crate) async fn proxy_scan_and_record(
                 repo_id = %repo_id, file = %filename, error = %e,
                 "failed to persist proxy scan package inventory; SBOM will be \
                  unavailable for this digest until it is pulled again"
+            );
+        }
+    }
+
+    // Persist the per-CVE detail (#3395), under exactly the same contract as
+    // the inventory above: after the verdict, independently fallible. The
+    // verdict is what gates distribution; losing the detail costs the operator
+    // an explanation, never a block.
+    if !verdict.findings.is_empty() {
+        if let Err(e) = pss
+            .record_findings(digest, PROXY_SCAN_TYPE, &verdict.findings)
+            .await
+        {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, error = %e,
+                "failed to persist proxy scan CVE detail; the verdict counts \
+                 stand but the CVE list will be unavailable for this digest"
             );
         }
     }
@@ -6740,6 +6812,62 @@ pub(crate) async fn gate_proxy_scan_serve(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // ── #3396: rescan of already-cached bytes ──
+
+    /// Scanner applicability and archive extraction are driven by the
+    /// FILENAME, so a rescan that derives the wrong one does not fail — it
+    /// silently catalogs nothing and records a clean verdict. Every shape a
+    /// stored cache path can take is pinned here.
+    #[test]
+    fn cache_path_filename_takes_the_last_real_segment() {
+        assert_eq!(
+            cache_path_filename("simple/click/click-8.0.0-py3-none-any.whl"),
+            Some("click-8.0.0-py3-none-any.whl")
+        );
+        // A bare filename is already the last segment.
+        assert_eq!(cache_path_filename("pkg.tgz"), Some("pkg.tgz"));
+        // Trailing slashes are skipped rather than yielding "".
+        assert_eq!(cache_path_filename("a/b/c.whl/"), Some("c.whl"));
+        // Leading slash does not become an empty name.
+        assert_eq!(cache_path_filename("/x.whl"), Some("x.whl"));
+        // Nothing to scan.
+        assert_eq!(cache_path_filename(""), None);
+        assert_eq!(cache_path_filename("///"), None);
+    }
+
+    /// The rescan synthetic artifact must carry the filename and the recorded
+    /// content type (both drive scanner applicability) and must NOT invent a
+    /// version: the rescan makes no #3003 identity assertion, and a guessed
+    /// version would be an unverified claim about what these bytes are.
+    #[test]
+    fn proxy_rescan_synthetic_artifact_carries_filename_not_a_guessed_identity() {
+        let repo = Uuid::new_v4();
+        let a = proxy_rescan_synthetic_artifact(
+            repo,
+            "simple/click/click-8.0.0-py3-none-any.whl",
+            "deadbeef",
+            4096,
+            Some("application/zip"),
+        );
+        assert_eq!(a.name, "click-8.0.0-py3-none-any.whl");
+        assert_eq!(a.path, "click-8.0.0-py3-none-any.whl");
+        assert_eq!(a.content_type, "application/zip");
+        assert_eq!(a.checksum_sha256, "deadbeef");
+        assert_eq!(a.size_bytes, 4096);
+        assert_eq!(a.repository_id, repo);
+        assert!(a.version.is_none(), "a rescan asserts no coordinate");
+        assert!(
+            a.storage_key.is_empty(),
+            "there is no artifacts row for proxy content (#1278/#1280)"
+        );
+
+        // No recorded content type falls back to a generic binary rather than
+        // to an empty string, which some scanners treat as "text".
+        let b = proxy_rescan_synthetic_artifact(repo, "x/y.tgz", "d", 1, None);
+        assert_eq!(b.content_type, "application/octet-stream");
+        assert_eq!(b.name, "y.tgz");
+    }
 
     // ── #3243 stage 3 / #3246: severity gate over a stored verdict ──
 

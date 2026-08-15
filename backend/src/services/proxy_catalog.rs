@@ -494,6 +494,42 @@ pub async fn list_paged(
         .collect())
 }
 
+/// One catalog row by `(repository_id, path)` -- the exact uniqueness key --
+/// for the on-demand rescan path (#3396).
+///
+/// Scoped to `repository_id` and returning `None` for both "no such path" and
+/// "that path is another repository's", so the caller's 404 is not a
+/// cross-tenant existence oracle.
+pub async fn find_cached_entry(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+) -> Result<Option<ProxyCacheEntry>> {
+    let row = sqlx::query!(
+        r#"
+        SELECT id, repository_id, path, storage_key, size_bytes,
+               checksum_sha256, content_type
+        FROM proxy_cache_artifacts
+        WHERE repository_id = $1 AND path = $2
+        "#,
+        repository_id,
+        path,
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row.map(|r| ProxyCacheEntry {
+        id: r.id,
+        repository_id: r.repository_id,
+        path: r.path,
+        storage_key: r.storage_key,
+        size_bytes: r.size_bytes,
+        checksum_sha256: r.checksum_sha256,
+        content_type: r.content_type,
+    }))
+}
+
 /// Record one proxy-served download into the sibling `proxy_download_statistics`
 /// table (#2270 / #2260), counted against the `proxy_cache_artifacts` catalog
 /// row for `(repository_id, path)`.

@@ -31,9 +31,9 @@ use crate::services::sbom_service::{DependencyInfo, LicenseCheckResult, SbomServ
 /// scanned and blocked at download time under the repository's scan-on-proxy
 /// policy. Messages that describe a capability with a proxy equivalent must
 /// point the caller at it.
-pub(crate) const SBOM_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for SBOM generation: SBOM generation is available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository.";
+pub(crate) const SBOM_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for SBOM generation: SBOM generation is available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository. Their verdicts and per-CVE detail are served by GET /api/v1/repositories/{key}/security/proxy-scans?path=<cache path>, their SBOM by GET /api/v1/repositories/{key}/security/proxy-sbom, and either can be regenerated with POST /api/v1/repositories/{key}/security/proxy-scans/rescan.";
 
-pub(crate) const ON_DEMAND_SCAN_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for on-demand scanning: on-demand scans are available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository.";
+pub(crate) const ON_DEMAND_SCAN_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for on-demand scanning: on-demand scans are available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository. Their verdicts and per-CVE detail are served by GET /api/v1/repositories/{key}/security/proxy-scans?path=<cache path>, their SBOM by GET /api/v1/repositories/{key}/security/proxy-sbom, and either can be regenerated with POST /api/v1/repositories/{key}/security/proxy-scans/rescan.";
 
 pub(crate) const SIGNING_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for signing: signing is available only for artifacts hosted in this registry, not proxy-cached remote artifacts.";
 
@@ -44,7 +44,7 @@ pub(crate) const SIGNING_NOT_AVAILABLE_MSG: &str = "Artifact not found or not el
 /// hands to the three CVE-history endpoints (list/get by artifact, update
 /// status by artifact+CVE) so a caller asking about CVE history is not told
 /// the SBOM-specific "not eligible for SBOM generation" (#3344 finding 2).
-pub(crate) const CVE_HISTORY_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for CVE history: CVE history is recorded only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository.";
+pub(crate) const CVE_HISTORY_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for CVE history: CVE history is recorded only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository. Their verdicts and per-CVE detail are served by GET /api/v1/repositories/{key}/security/proxy-scans?path=<cache path>, their SBOM by GET /api/v1/repositories/{key}/security/proxy-sbom, and either can be regenerated with POST /api/v1/repositories/{key}/security/proxy-scans/rescan.";
 
 /// Emit an audit log entry for an SBOM action against an artifact. Failures
 /// are logged but never propagated: the mutation/read is already complete and
@@ -2811,6 +2811,28 @@ mod tests {
 
         // Signing has no proxy equivalent, so it must not imply one.
         assert!(!SIGNING_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+
+        // #3344 point 2: the message's value is that it explains the expected
+        // case rather than saying "not found", so it must name the endpoint
+        // that DOES answer the question — not merely assert that an answer
+        // exists somewhere. Each route named here is mounted in
+        // `security::repo_security_router` / `sbom::proxy_repo_router`; the
+        // route-registration tests in those modules are what keep these
+        // strings from naming a 404.
+        for (msg, route) in [
+            (SBOM_NOT_AVAILABLE_MSG, "/security/proxy-sbom"),
+            (ON_DEMAND_SCAN_NOT_AVAILABLE_MSG, "/security/proxy-scans/rescan"),
+            (CVE_HISTORY_NOT_AVAILABLE_MSG, "/security/proxy-scans?path="),
+        ] {
+            assert!(
+                msg.contains(route),
+                "message must point the caller at {route}: {msg}"
+            );
+        }
+        // Signing still dead-ends deliberately: there is no proxy signing
+        // endpoint to point at, and inventing a pointer would be the same
+        // class of stale claim #3344 was filed about.
+        assert!(!SIGNING_NOT_AVAILABLE_MSG.contains("/security/proxy-"));
 
         // #3344 finding 1: proxy scan-at-download-time is wired only for
         // PyPI, npm and Docker/OCI. A message that talks about download-time
