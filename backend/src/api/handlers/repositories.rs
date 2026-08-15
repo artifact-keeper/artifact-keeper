@@ -660,6 +660,11 @@ pub fn router() -> Router<SharedState> {
         )
         // Upstream auth management for remote repositories
         .route("/:key/upstream-auth", put(set_upstream_auth))
+        // Per-repository outbound egress proxy (#2469, #2811)
+        .route(
+            "/:key/egress-proxy",
+            put(set_egress_proxy).get(get_egress_proxy),
+        )
         .route("/:key/test-upstream", post(test_upstream))
         // Virtual repository member management
         .route(
@@ -9508,6 +9513,198 @@ pub async fn set_upstream_auth(
     ))
 }
 
+/// Per-repository egress proxy settings (#2469, #2811).
+///
+/// `proxy_url` is **write-only**: it is encrypted at rest and never returned.
+/// [`EgressProxyResponse`] echoes a redacted form (`http://***@proxy:3128`)
+/// so an operator can confirm the host and port without recovering the
+/// credentials, exactly as `upstream_auth_configured` does for upstream
+/// credentials.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct EgressProxyRequest {
+    /// `inherit` (follow the process `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`
+    /// environment — the default), `direct` (never proxy this repository, even
+    /// when the environment sets one), or `explicit` (use `proxy_url`, ignoring
+    /// the environment entirely).
+    pub mode: String,
+    /// Proxy endpoint, `scheme://host[:port]`, http or https. May embed
+    /// `user:pass@` credentials. Required when `mode` is `explicit`.
+    /// Write-only, never returned in responses.
+    pub proxy_url: Option<String>,
+    /// Comma-separated hosts / domain suffixes / CIDRs that bypass the proxy
+    /// for this repository. Only meaningful when `mode` is `explicit`.
+    pub no_proxy: Option<String>,
+}
+
+/// Read-back of a repository's egress-proxy settings. Carries no secret.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EgressProxyResponse {
+    /// `inherit`, `direct` or `explicit`.
+    pub mode: String,
+    /// The configured proxy with any credentials replaced by `***`. `None`
+    /// unless `mode` is `explicit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// The configured bypass list, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+    /// Whether the configured proxy URL carries credentials. The credentials
+    /// themselves are never returned.
+    pub proxy_credentials_configured: bool,
+}
+
+impl From<crate::services::egress_proxy::EgressProxyConfig> for EgressProxyResponse {
+    fn from(config: crate::services::egress_proxy::EgressProxyConfig) -> Self {
+        Self {
+            mode: config.mode.as_str().to_string(),
+            proxy_url: config.redacted_proxy_url(),
+            no_proxy: config.no_proxy.clone(),
+            proxy_credentials_configured: config.has_proxy_credentials(),
+        }
+    }
+}
+
+/// Validate an egress-proxy request and turn it into a storable config.
+///
+/// Pure (no DB, no network) so the mode/URL/`no_proxy` rules are unit-testable
+/// without a database, and so the handler body stays thin.
+pub(crate) fn build_egress_proxy_config(
+    mode: &str,
+    proxy_url: Option<&str>,
+    no_proxy: Option<&str>,
+) -> Result<crate::services::egress_proxy::EgressProxyConfig> {
+    use crate::services::egress_proxy::{
+        validate_no_proxy, validate_proxy_url, EgressProxyConfig, EgressProxyMode,
+    };
+
+    let mode = EgressProxyMode::parse(mode).ok_or_else(|| {
+        AppError::Validation("Invalid mode. Must be 'inherit', 'direct', or 'explicit'".to_string())
+    })?;
+
+    match mode {
+        EgressProxyMode::Explicit => {
+            let url = proxy_url
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    AppError::Validation(
+                        "proxy_url is required when mode is 'explicit'".to_string(),
+                    )
+                })?;
+            validate_proxy_url(url)?;
+            let no_proxy = no_proxy.map(str::trim).filter(|l| !l.is_empty());
+            if let Some(list) = no_proxy {
+                validate_no_proxy(list)?;
+            }
+            Ok(EgressProxyConfig {
+                mode,
+                proxy_url: Some(url.to_string()),
+                no_proxy: no_proxy.map(str::to_string),
+            })
+        }
+        // Reject rather than silently drop a URL the caller clearly meant to
+        // apply: a request that says `direct` AND carries a proxy_url is
+        // self-contradictory, and guessing which half was intended is how an
+        // egress control ends up not doing what its author believed.
+        _ => {
+            if proxy_url.is_some_and(|u| !u.trim().is_empty()) {
+                return Err(AppError::Validation(format!(
+                    "proxy_url is only valid when mode is 'explicit' (got '{}')",
+                    mode.as_str()
+                )));
+            }
+            Ok(EgressProxyConfig {
+                mode,
+                proxy_url: None,
+                no_proxy: None,
+            })
+        }
+    }
+}
+
+/// Configure the outbound egress proxy for a remote repository
+#[utoipa::path(
+    put,
+    path = "/{key}/egress-proxy",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = EgressProxyRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Egress proxy updated", body = EgressProxyResponse),
+        (status = 400, description = "Invalid mode or proxy URL"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_egress_proxy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<EgressProxyRequest>,
+) -> Result<Json<EgressProxyResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    let repo = load_remote_repo(&state, &auth, &key).await?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // Egress routing is a security control, and the proxy URL may carry
+    // credentials: same admin tier as `set_upstream_auth` (#2603).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+
+    let config = build_egress_proxy_config(
+        &payload.mode,
+        payload.proxy_url.as_deref(),
+        payload.no_proxy.as_deref(),
+    )?;
+
+    crate::services::egress_proxy::save_egress_proxy(&state.db, repo.id, &config).await?;
+    // Apply immediately in this process rather than after the cache TTL. Other
+    // replicas pick the change up within `EGRESS_CLIENT_CACHE_TTL_SECS`.
+    if let Some(proxy_service) = state.proxy_service.as_ref() {
+        proxy_service.invalidate_egress_client(repo.id).await;
+    }
+
+    Ok(Json(config.into()))
+}
+
+/// Read the outbound egress proxy configuration of a remote repository
+#[utoipa::path(
+    get,
+    path = "/{key}/egress-proxy",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Egress proxy configuration", body = EgressProxyResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_egress_proxy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<EgressProxyResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("read")?;
+    let repo = load_remote_repo(&state, &auth, &key).await?;
+    // Read is admin-gated too: the redacted URL still discloses the internal
+    // proxy host and port, which is infrastructure topology.
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+
+    let config = crate::services::egress_proxy::load_egress_proxy(&state.db, repo.id).await?;
+    Ok(Json(config.into()))
+}
+
 /// Test connectivity to the upstream URL of a remote repository
 #[utoipa::path(
     post,
@@ -9798,6 +9995,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         remove_virtual_member,
         update_virtual_members,
         set_upstream_auth,
+        set_egress_proxy,
+        get_egress_proxy,
         test_upstream,
         get_routing_rules,
         set_routing_rules,
@@ -9837,6 +10036,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         VirtualMembersListResponse,
         CreateVirtualMemberInput,
         UpstreamAuthRequest,
+        EgressProxyRequest,
+        EgressProxyResponse,
         SetRoutingRulesRequest,
         RoutingRulesResponse,
         RoutingRule,
@@ -16087,6 +16288,7 @@ mod tests {
             "set_routing_rules",
             "delete_routing_rules",
             "set_upstream_auth",
+            "set_egress_proxy",
             "upload_artifact",
             "delete_artifact",
         ] {
@@ -16113,6 +16315,108 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Per-repository egress proxy request validation (#2469, #2811)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn egress_proxy_request_accepts_the_three_modes() {
+        use crate::services::egress_proxy::EgressProxyMode;
+
+        let cfg = build_egress_proxy_config("inherit", None, None).expect("inherit");
+        assert_eq!(cfg.mode, EgressProxyMode::Inherit);
+        assert_eq!(cfg.proxy_url, None);
+
+        let cfg = build_egress_proxy_config("direct", None, None).expect("direct");
+        assert_eq!(cfg.mode, EgressProxyMode::Direct);
+
+        let cfg = build_egress_proxy_config(
+            "explicit",
+            Some("http://proxy.corp.example.com:3128"),
+            Some("*.internal.example"),
+        )
+        .expect("explicit");
+        assert_eq!(cfg.mode, EgressProxyMode::Explicit);
+        assert_eq!(
+            cfg.proxy_url.as_deref(),
+            Some("http://proxy.corp.example.com:3128")
+        );
+        assert_eq!(cfg.no_proxy.as_deref(), Some("*.internal.example"));
+    }
+
+    #[test]
+    fn egress_proxy_request_rejects_an_unknown_mode() {
+        let err = build_egress_proxy_config("socks", None, None).expect_err("must reject");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+    }
+
+    #[test]
+    fn egress_proxy_request_requires_a_url_for_explicit() {
+        assert!(build_egress_proxy_config("explicit", None, None).is_err());
+        assert!(build_egress_proxy_config("explicit", Some("   "), None).is_err());
+    }
+
+    #[test]
+    fn egress_proxy_request_rejects_a_url_on_a_non_explicit_mode() {
+        // Self-contradictory input fails loudly instead of silently dropping
+        // half of what the caller asked for.
+        for mode in ["inherit", "direct"] {
+            assert!(
+                build_egress_proxy_config(mode, Some("http://proxy.corp:3128"), None).is_err(),
+                "mode {mode} silently accepted a proxy_url"
+            );
+        }
+    }
+
+    #[test]
+    fn egress_proxy_request_rejects_ssrf_targets() {
+        for url in [
+            "http://169.254.169.254",
+            "http://127.0.0.1:3128",
+            "http://localhost:3128",
+            "socks5://proxy.corp:1080",
+        ] {
+            assert!(
+                build_egress_proxy_config("explicit", Some(url), None).is_err(),
+                "accepted an SSRF-prone proxy target: {url}"
+            );
+        }
+    }
+
+    /// The response DTO must never carry the configured credentials — this is
+    /// the API-surface half of the redaction contract.
+    #[test]
+    fn egress_proxy_response_never_serializes_credentials() {
+        const SECRET: &str = "api-resp-secret";
+        let cfg = build_egress_proxy_config(
+            "explicit",
+            Some(&format!("http://svc:{SECRET}@proxy.corp.example.com:3128")),
+            None,
+        )
+        .expect("valid");
+
+        let response: EgressProxyResponse = cfg.into();
+        let json = serde_json::to_string(&response).expect("serialize");
+        assert!(
+            !json.contains(SECRET),
+            "response leaked the password: {json}"
+        );
+        assert!(
+            !json.contains("svc"),
+            "response leaked the username: {json}"
+        );
+        assert!(
+            json.contains("proxy.corp.example.com"),
+            "response should still show the host: {json}"
+        );
+        assert!(
+            json.contains("\"proxy_credentials_configured\":true"),
+            "response must report that credentials exist: {json}"
+        );
+        // And the Debug rendering of the response is safe too.
+        assert!(!format!("{response:?}").contains(SECRET));
+    }
+
     /// Repository administration / configuration subresources (#2603, area 3):
     ///
     /// Reconfiguring a repository's proxy/supply-chain behavior (upstream-auth
@@ -16129,6 +16433,11 @@ mod tests {
 
         for handler in [
             "set_upstream_auth",
+            // Egress routing is a security control and its URL may carry
+            // credentials, so both the write and the read are admin-tier
+            // (#2469).
+            "set_egress_proxy",
+            "get_egress_proxy",
             "set_routing_rules",
             "delete_routing_rules",
             "put_pypi_track",
