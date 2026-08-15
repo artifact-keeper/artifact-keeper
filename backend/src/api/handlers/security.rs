@@ -1913,6 +1913,22 @@ fn rescan_cooldown_remaining(
     (elapsed < cooldown).then(|| cooldown - elapsed)
 }
 
+/// Whether a cached object is small enough to rescan inline.
+///
+/// The same cap the download-time gate applies
+/// ([`PROXY_SCAN_MAX_BYTES`](crate::services::scanner_service::PROXY_SCAN_MAX_BYTES)),
+/// checked against the catalog row BEFORE any bytes are read. Without it this
+/// endpoint would be the one place in the product that buffers an unbounded
+/// proxy object into memory — and it would do so for an object the gate
+/// declines to scan anyway, so the work could never produce a verdict worth
+/// having.
+///
+/// A negative or absurd `size_bytes` (a corrupt catalog row) is refused rather
+/// than treated as small.
+fn rescan_size_is_scannable(size_bytes: i64) -> bool {
+    (0..=crate::services::scanner_service::PROXY_SCAN_MAX_BYTES as i64).contains(&size_bytes)
+}
+
 /// Claim the rescan slot for `repo_id`, or report the remaining cooldown.
 fn claim_rescan_slot(repo_id: Uuid) -> std::result::Result<(), std::time::Duration> {
     let now = std::time::Instant::now();
@@ -1986,6 +2002,7 @@ pub struct ProxyRescanResponse {
         (status = 200, description = "Rescan completed", body = ProxyRescanResponse),
         (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository or path not found", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "Cached object is above the inline scan cap", body = crate::api::openapi::ErrorResponse),
         (status = 429, description = "Rescan cooldown in effect"),
         (status = 503, description = "No scanner configured, or the scan was inconclusive"),
     ),
@@ -2018,15 +2035,32 @@ async fn rescan_proxy_cached_path(
         .await?
         .ok_or_else(|| AppError::NotFound(PROXY_PATH_NOT_FOUND_MSG.to_string()))?;
 
+    // Refuse an over-cap object BEFORE claiming the throttle slot or reading a
+    // byte: the inline gate refuses these too, so buffering one here would be
+    // the one place in the product where an unbounded proxy object is pulled
+    // fully into memory.
+    if !rescan_size_is_scannable(entry.size_bytes) {
+        return Err(AppError::UnprocessableEntity(format!(
+            "Cached object is {} bytes, above the {} byte inline scan cap; \
+             the download-time gate does not scan it either",
+            entry.size_bytes,
+            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES
+        )));
+    }
+
     if let Err(remaining) = claim_rescan_slot(repo.id) {
         return Ok(rescan_throttled_response(remaining));
     }
 
-    let bytes = state
-        .storage
-        .get(&entry.storage_key)
-        .await
-        .map_err(|e| AppError::NotFound(format!("Cached bytes are no longer readable: {e}")))?;
+    // The storage error text is deliberately not echoed: it names storage keys
+    // and backend internals, and the caller can act on none of it.
+    let bytes = state.storage.get(&entry.storage_key).await.map_err(|e| {
+        tracing::warn!(
+            repo_id = %repo.id, path = %path, error = %e,
+            "proxy rescan: cached bytes are no longer readable"
+        );
+        AppError::NotFound(PROXY_PATH_NOT_FOUND_MSG.to_string())
+    })?;
 
     // The digest is recomputed from the bytes we just read rather than trusted
     // from the catalog row: the verdict is keyed on content, and recording a
@@ -2610,6 +2644,21 @@ mod tests {
             Some(cooldown),
             "saturating subtraction yields the full cooldown, never an allow"
         );
+    }
+
+    /// The rescan size cap mirrors the download-time gate exactly, and a
+    /// corrupt catalog row (negative size) is refused rather than treated as
+    /// small — the direction that would otherwise let a bad row through the
+    /// one check standing between this endpoint and an unbounded buffer.
+    #[test]
+    fn rescan_size_cap_matches_the_download_gate_and_rejects_absurd_rows() {
+        let cap = crate::services::scanner_service::PROXY_SCAN_MAX_BYTES as i64;
+        assert!(rescan_size_is_scannable(0));
+        assert!(rescan_size_is_scannable(1024));
+        assert!(rescan_size_is_scannable(cap), "the cap itself is inclusive");
+        assert!(!rescan_size_is_scannable(cap + 1));
+        assert!(!rescan_size_is_scannable(-1));
+        assert!(!rescan_size_is_scannable(i64::MAX));
     }
 
     /// Claiming the slot is one-shot per window and per repository: two

@@ -386,7 +386,8 @@ async fn proxy_blast_radius(
          COUNT(DISTINCT pca.repository_id) AS affected_repo_count, \
          COUNT(pd.id) AS download_count, \
          COUNT(DISTINCT pd.user_id) AS downloader_user_count, \
-         bool_or(pd.user_id IS NULL) AS anonymous_download_present \
+         bool_or(pd.id IS NOT NULL AND pd.user_id IS NULL) \
+             AS anonymous_download_present \
          FROM (SELECT DISTINCT checksum_sha256 FROM proxy_scan_findings WHERE cve_id = ",
     );
     builder.push_bind(cve_id.as_str());
@@ -399,6 +400,12 @@ async fn proxy_blast_radius(
     // JOIN rather than in a WHERE clause — a WHERE on the nullable side of an
     // outer join would silently drop every cached-but-never-pulled digest and
     // undercount exposure.
+    //
+    // The `pd.id IS NOT NULL` guard on the anonymous flag above is the price of
+    // that choice: on an unmatched outer-join row every `pd` column is NULL, so
+    // a bare `bool_or(pd.user_id IS NULL)` reports "an anonymous user pulled
+    // this" for a digest nobody pulled at all. The counts are immune (`COUNT`
+    // skips NULLs); only the boolean needed pinning down.
     if let Some(from) = from {
         builder.push(" AND pd.downloaded_at >= ").push_bind(from);
     }
@@ -1362,6 +1369,10 @@ mod tests {
         .await
         .expect("windowed");
         assert_eq!(windowed.proxy_exposure.download_count, 0);
+        // Zero downloads must not report an anonymous one. On an unmatched
+        // LEFT JOIN row every `pd` column is NULL, so a bare
+        // `bool_or(pd.user_id IS NULL)` claims an anonymous pull of a digest
+        // nobody pulled — a fabricated exposure event in a security report.
         assert!(!windowed.proxy_exposure.anonymous_download_present);
         assert_eq!(
             windowed.proxy_exposure.affected_digest_count, 1,

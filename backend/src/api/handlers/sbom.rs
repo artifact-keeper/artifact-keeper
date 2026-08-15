@@ -2821,7 +2821,10 @@ mod tests {
         // strings from naming a 404.
         for (msg, route) in [
             (SBOM_NOT_AVAILABLE_MSG, "/security/proxy-sbom"),
-            (ON_DEMAND_SCAN_NOT_AVAILABLE_MSG, "/security/proxy-scans/rescan"),
+            (
+                ON_DEMAND_SCAN_NOT_AVAILABLE_MSG,
+                "/security/proxy-scans/rescan",
+            ),
             (CVE_HISTORY_NOT_AVAILABLE_MSG, "/security/proxy-scans?path="),
         ] {
             assert!(
