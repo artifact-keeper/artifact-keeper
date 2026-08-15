@@ -3729,7 +3729,7 @@ mod tests {
                 database_acquire_timeout_secs: 30,
                 database_idle_timeout_secs: 600,
                 database_max_lifetime_secs: 1800,
-                auth_max_concurrency: 8,
+                auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
                 global_max_concurrency: 512,
                 global_request_timeout_secs: 120,
                 rate_limit_enabled: true,
