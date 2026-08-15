@@ -1440,6 +1440,112 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
 /// OIDC-managed memberships never strip each other, and operator-managed
 /// groups (NULL `external_source`) are never modified by this sync.
 /// (Issues #1094, #2333, #2759.)
+/// Maximum length of `groups.name` (`VARCHAR(255)`, see
+/// `018_groups_permissions.sql`). Postgres counts characters, not bytes, for
+/// `varchar(n)`.
+pub(crate) const MAX_GROUP_NAME_CHARS: usize = 255;
+
+/// Why a provider-supplied group name cannot be synced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupNameRejection {
+    /// Blank / whitespace-only claim entry — silently skipped, as before.
+    Empty,
+    /// Longer than `groups.name` can hold. Pre-#2835 this aborted the whole
+    /// transaction with `value too long for type character varying(255)`, so a
+    /// single oversized claim entry dropped **all** of the user's groups.
+    TooLong { chars: usize },
+}
+
+/// Validate one IdP-supplied group name against what `groups.name` can store.
+///
+/// Returns `None` when the name is syncable. The name itself is returned to the
+/// caller untouched (not trimmed) so an existing group created from the raw
+/// claim value still matches on the `ON CONFLICT (name)` upsert.
+pub(crate) fn federated_group_name_rejection(name: &str) -> Option<GroupNameRejection> {
+    if name.trim().is_empty() {
+        return Some(GroupNameRejection::Empty);
+    }
+    let chars = name.chars().count();
+    if chars > MAX_GROUP_NAME_CHARS {
+        return Some(GroupNameRejection::TooLong { chars });
+    }
+    None
+}
+
+/// Savepoint name wrapping one group's DB work so a single failure rolls back
+/// only that group rather than aborting the whole sync transaction (#2835).
+const GROUP_SYNC_SAVEPOINT: &str = "federated_group_sync";
+
+/// Upsert one federated group and ensure the user's membership in it.
+///
+/// Returns the group id, or `None` when the name collides with a group outside
+/// this provider's namespace (the #2759 ownership refusal).
+async fn sync_one_federated_group(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    provider_id: Uuid,
+    source: &str,
+    name: &str,
+) -> Result<Option<Uuid>> {
+    // Find-or-create the group atomically, scoped to THIS provider's
+    // namespace. Concurrent first-logins for the same brand-new group
+    // name from different users would race a separate SELECT + INSERT,
+    // with the loser of the race hitting the UNIQUE constraint on
+    // `groups.name` and aborting the transaction. ON CONFLICT (name)
+    // DO UPDATE … RETURNING id collapses the race into a single atomic
+    // upsert; the no-op `DO UPDATE` assignment is what makes RETURNING
+    // populate for the conflicting row.
+    //
+    // The DO UPDATE … WHERE clause is the #2759 ownership guard: the
+    // conflicting row is "updated" (and therefore returned) ONLY when it
+    // is already tagged with this same source + provider id. A collision
+    // with an operator-managed group (NULL external_source — the
+    // NULL = $3 comparison is never true) or with a group owned by a
+    // different source/provider returns no row, and membership is
+    // refused by the caller instead of silently attaching the federated
+    // user to a same-named — potentially privileged — local group.
+    let group_id: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+            INSERT INTO groups (name, description, external_source, external_provider_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            WHERE groups.external_source = EXCLUDED.external_source
+              AND groups.external_provider_id = EXCLUDED.external_provider_id
+            RETURNING id
+            "#,
+    )
+    .bind(name)
+    .bind(match source {
+        "saml" => format!("Auto-created from SAML group attribute: {name}"),
+        "ldap" => format!("Auto-created from LDAP group: {name}"),
+        _ => format!("Auto-created from OIDC group claim: {name}"),
+    })
+    .bind(source)
+    .bind(provider_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let Some((group_id,)) = group_id else {
+        return Ok(None);
+    };
+
+    sqlx::query(
+        r#"
+            INSERT INTO user_group_members (user_id, group_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, group_id) DO NOTHING
+            "#,
+    )
+    .bind(user_id)
+    .bind(group_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Some(group_id))
+}
+
 pub(crate) async fn sync_federated_groups_to_local_groups(
     pool: &sqlx::PgPool,
     user_id: Uuid,
@@ -1453,78 +1559,80 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     // Upsert each external group: find-or-create, then ensure membership.
+    //
+    // Each group's DB work runs inside its own SAVEPOINT (#2835). Before this,
+    // one bad group name aborted the whole transaction, so a user whose IdP
+    // emitted a single oversized name lost ALL of their group memberships —
+    // including the legitimate ones from the id_token. Names that cannot fit
+    // `groups.name` are now rejected up front (no statement is issued, so the
+    // transaction is never poisoned), and any residual per-group failure is
+    // logged and rolled back to the savepoint so the remaining groups still
+    // sync.
     let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(idp_groups.len());
     for name in idp_groups {
-        if name.trim().is_empty() {
-            continue;
+        match federated_group_name_rejection(name) {
+            None => {}
+            Some(GroupNameRejection::Empty) => continue,
+            Some(GroupNameRejection::TooLong { chars }) => {
+                tracing::warn!(
+                    source = %source,
+                    provider_id = %provider_id,
+                    user_id = %user_id,
+                    name_chars = chars,
+                    max_chars = MAX_GROUP_NAME_CHARS,
+                    "Skipping federated group: name exceeds groups.name capacity; \
+                     the user's remaining groups still sync (#2835)"
+                );
+                continue;
+            }
         }
 
-        // Find-or-create the group atomically, scoped to THIS provider's
-        // namespace. Concurrent first-logins for the same brand-new group
-        // name from different users would race a separate SELECT + INSERT,
-        // with the loser of the race hitting the UNIQUE constraint on
-        // `groups.name` and aborting the transaction. ON CONFLICT (name)
-        // DO UPDATE … RETURNING id collapses the race into a single atomic
-        // upsert; the no-op `DO UPDATE` assignment is what makes RETURNING
-        // populate for the conflicting row.
-        //
-        // The DO UPDATE … WHERE clause is the #2759 ownership guard: the
-        // conflicting row is "updated" (and therefore returned) ONLY when it
-        // is already tagged with this same source + provider id. A collision
-        // with an operator-managed group (NULL external_source — the
-        // NULL = $3 comparison is never true) or with a group owned by a
-        // different source/provider returns no row, and membership is
-        // refused below instead of silently attaching the federated user to
-        // a same-named — potentially privileged — local group.
-        let group_id: Option<(Uuid,)> = sqlx::query_as(
-            r#"
-            INSERT INTO groups (name, description, external_source, external_provider_id)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-            WHERE groups.external_source = EXCLUDED.external_source
-              AND groups.external_provider_id = EXCLUDED.external_provider_id
-            RETURNING id
-            "#,
-        )
-        .bind(name)
-        .bind(match source {
-            "saml" => format!("Auto-created from SAML group attribute: {name}"),
-            "ldap" => format!("Auto-created from LDAP group: {name}"),
-            _ => format!("Auto-created from OIDC group claim: {name}"),
-        })
-        .bind(source)
-        .bind(provider_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query(&format!("SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let Some((group_id,)) = group_id else {
-            tracing::warn!(
-                group = %name,
-                source = %source,
-                provider_id = %provider_id,
-                user_id = %user_id,
-                "Refusing to add federated user to name-colliding group not \
-                 managed by this provider (operator-managed or foreign-source \
-                 group of the same name exists); membership not granted (#2759)"
-            );
-            continue;
-        };
-
-        sqlx::query(
-            r#"
-            INSERT INTO user_group_members (user_id, group_id)
-            VALUES ($1, $2)
-            ON CONFLICT (user_id, group_id) DO NOTHING
-            "#,
-        )
-        .bind(user_id)
-        .bind(group_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        current_group_ids.push(group_id);
+        match sync_one_federated_group(&mut tx, user_id, provider_id, source, name).await {
+            // (savepoint bookkeeping below keeps one bad group from poisoning
+            // the transaction the rest of the sync runs in)
+            Ok(Some(group_id)) => {
+                sqlx::query(&format!("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                current_group_ids.push(group_id);
+            }
+            Ok(None) => {
+                sqlx::query(&format!("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                tracing::warn!(
+                    group = %name,
+                    source = %source,
+                    provider_id = %provider_id,
+                    user_id = %user_id,
+                    "Refusing to add federated user to name-colliding group not \
+                     managed by this provider (operator-managed or foreign-source \
+                     group of the same name exists); membership not granted (#2759)"
+                );
+            }
+            Err(e) => {
+                sqlx::query(&format!("ROLLBACK TO SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                tracing::warn!(
+                    group = %name,
+                    source = %source,
+                    provider_id = %provider_id,
+                    user_id = %user_id,
+                    error = %e,
+                    "Federated group sync failed for one group; continuing with \
+                     the rest (#2835)"
+                );
+            }
+        }
     }
 
     // Remove the user from any group managed by this same source (and same
@@ -1915,6 +2023,117 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+
+    // -----------------------------------------------------------------------
+    // #2835: federated group sync must validate name length and stay resilient
+    //
+    // `groups.name` is VARCHAR(255). A provider-controlled group name longer
+    // than that used to reach Postgres and abort the whole sync transaction
+    // ("value too long for type character varying(255)"), so ALL of the user's
+    // groups — including the legitimate id_token ones — failed to sync.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ordinary_group_names_are_syncable() {
+        for name in [
+            "developers",
+            "acme/team-a",
+            "CN=Admins,OU=Corp,DC=acme,DC=com",
+        ] {
+            assert_eq!(
+                federated_group_name_rejection(name),
+                None,
+                "{name} must sync"
+            );
+        }
+        // Exactly at the column width is still fine.
+        let at_limit = "g".repeat(MAX_GROUP_NAME_CHARS);
+        assert_eq!(federated_group_name_rejection(&at_limit), None);
+    }
+
+    #[test]
+    fn oversized_group_name_is_rejected_not_sent_to_postgres() {
+        let too_long = "g".repeat(MAX_GROUP_NAME_CHARS + 1);
+        assert_eq!(
+            federated_group_name_rejection(&too_long),
+            Some(GroupNameRejection::TooLong {
+                chars: MAX_GROUP_NAME_CHARS + 1
+            }),
+            "an oversized IdP group name must be rejected before it reaches \
+             Postgres, or it aborts the transaction and drops every other \
+             group the user has (#2835)"
+        );
+
+        // A hostile provider can send something far larger; still just a skip.
+        let huge = "x".repeat(64 * 1024);
+        assert!(matches!(
+            federated_group_name_rejection(&huge),
+            Some(GroupNameRejection::TooLong { .. })
+        ));
+    }
+
+    /// `varchar(n)` counts characters, not bytes: a 200-char name of 3-byte
+    /// characters fits even though it is 600 bytes, and must not be dropped.
+    #[test]
+    fn group_name_length_is_measured_in_characters() {
+        let multibyte = "é".repeat(MAX_GROUP_NAME_CHARS);
+        assert!(
+            multibyte.len() > MAX_GROUP_NAME_CHARS,
+            "fixture is multibyte"
+        );
+        assert_eq!(federated_group_name_rejection(&multibyte), None);
+
+        let over = "é".repeat(MAX_GROUP_NAME_CHARS + 1);
+        assert_eq!(
+            federated_group_name_rejection(&over),
+            Some(GroupNameRejection::TooLong {
+                chars: MAX_GROUP_NAME_CHARS + 1
+            })
+        );
+    }
+
+    #[test]
+    fn blank_group_names_are_skipped_as_before() {
+        for name in ["", "   ", "\t\n"] {
+            assert_eq!(
+                federated_group_name_rejection(name),
+                Some(GroupNameRejection::Empty)
+            );
+        }
+    }
+
+    /// The whole point of #2835: one bad name must cost only that name. This
+    /// pins the partition a claim set is split into, which is what the sync
+    /// loop consumes.
+    #[test]
+    fn one_bad_name_does_not_drop_the_others() {
+        let claimed = [
+            "developers".to_string(),
+            "g".repeat(MAX_GROUP_NAME_CHARS + 1),
+            String::new(),
+            "release-managers".to_string(),
+        ];
+        let syncable: Vec<&String> = claimed
+            .iter()
+            .filter(|n| federated_group_name_rejection(n).is_none())
+            .collect();
+        assert_eq!(
+            syncable,
+            vec!["developers", "release-managers"],
+            "the legitimate groups must still sync alongside a rejected one"
+        );
+    }
+
+    /// Structural guard: each group's DB work must run inside its own
+    /// savepoint, so a residual per-group failure rolls back only that group
+    /// instead of poisoning the surrounding transaction.
+    #[test]
+    fn group_sync_wraps_each_group_in_a_savepoint() {
+        const SSO_RS_SRC: &str = include_str!("sso.rs");
+        assert!(SSO_RS_SRC.contains("SAVEPOINT {GROUP_SYNC_SAVEPOINT}"));
+        assert!(SSO_RS_SRC.contains("ROLLBACK TO SAVEPOINT {GROUP_SYNC_SAVEPOINT}"));
+        assert!(SSO_RS_SRC.contains("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"));
+    }
 
     /// Helper: build a fake JWT token with the given payload JSON.
     fn make_jwt(payload: &serde_json::Value) -> String {
@@ -3941,6 +4160,56 @@ mod tests {
             assert!(group_id_by_name(&pool, "   ").await.is_none());
 
             cleanup_groups(&pool, &[real_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// #2835 regression: a single group name longer than `groups.name`
+        /// (VARCHAR(255)) used to abort the whole sync transaction with
+        /// "value too long for type character varying(255)", so NONE of the
+        /// user's groups synced — the legitimate id_token ones included. The
+        /// oversized name must now be skipped and everything else must land.
+        #[tokio::test]
+        async fn test_oversized_group_name_does_not_drop_the_users_other_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let before = rand_group_name("oidc-before");
+            let after = rand_group_name("oidc-after");
+            // Provider-controlled and far past the column width. Placed BETWEEN
+            // two good names so a transaction abort would be unmistakable: the
+            // pre-fix code lost `before` (rolled back) as well as `after`.
+            let oversized = "x".repeat(super::MAX_GROUP_NAME_CHARS + 50);
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "oidc",
+                &[before.clone(), oversized.clone(), after.clone()],
+            )
+            .await
+            .expect("sync must succeed despite one unusable group name");
+
+            let before_id = group_id_by_name(&pool, &before)
+                .await
+                .expect("the group claimed before the bad one must still sync");
+            let after_id = group_id_by_name(&pool, &after)
+                .await
+                .expect("the group claimed after the bad one must still sync");
+            assert!(user_is_in_group(&pool, user_id, before_id).await);
+            assert!(user_is_in_group(&pool, user_id, after_id).await);
+            // The oversized name is skipped outright — no truncated row either,
+            // which would silently create a group under a different identity.
+            assert!(group_id_by_name(&pool, &oversized).await.is_none());
+            assert!(
+                group_id_by_name(&pool, &oversized[..super::MAX_GROUP_NAME_CHARS])
+                    .await
+                    .is_none()
+            );
+
+            cleanup_groups(&pool, &[before_id, after_id]).await;
             cleanup_user(&pool, user_id).await;
         }
     }

@@ -2280,21 +2280,72 @@ pub async fn guard_foreign_storage_key(
     repository_id: Uuid,
     storage_key: &str,
 ) -> Result<()> {
+    guard_foreign_storage_key_excluding(db, &[repository_id], storage_key).await
+}
+
+/// The repositories that may legitimately already own `storage_key` when an
+/// artifact is **promoted** from `source_repo_id` into `target_repo_id`.
+///
+/// A promotion copies the source artifact's own content-addressed
+/// `storage_key` into the target, so the source is by construction a valid
+/// owner of that key: the bytes it names are exactly the bytes being
+/// promoted. Passing only the target to the ownership query (the pre-#3266
+/// behaviour) therefore made every promotion inside a shared S3 namespace
+/// return the *source* as a "foreign owner" and fail with 409 — a false
+/// positive on the single most common promote shape
+/// (`generic-staging` -> `generic-local`).
+///
+/// Deduplicated so a self-promotion (target == source) does not produce a
+/// degenerate two-element list. Pure, so the exemption policy is unit-testable
+/// without a database.
+pub fn promotion_storage_key_owner_exemptions(
+    target_repo_id: Uuid,
+    source_repo_id: Uuid,
+) -> Vec<Uuid> {
+    if target_repo_id == source_repo_id {
+        vec![target_repo_id]
+    } else {
+        vec![target_repo_id, source_repo_id]
+    }
+}
+
+/// Whether a discovered owner blocks the write, given the set of repositories
+/// allowed to already own the key. Pure decision seam for the guard below.
+pub fn foreign_owner_blocks_write(owner: Option<Uuid>, allowed_owners: &[Uuid]) -> bool {
+    match owner {
+        Some(owner) => !allowed_owners.contains(&owner),
+        None => false,
+    }
+}
+
+/// [`guard_foreign_storage_key`] with an explicit allow-list of repositories
+/// that may already own `storage_key`.
+///
+/// Direct uploads pass a single-element list (the writing repository). Promote
+/// / approval-execute copies pass [`promotion_storage_key_owner_exemptions`] so
+/// the source repository — the legitimate owner of the content-addressed key
+/// being copied — is not mistaken for a third-party collision (#3266).
+pub async fn guard_foreign_storage_key_excluding(
+    db: &PgPool,
+    allowed_owners: &[Uuid],
+    storage_key: &str,
+) -> Result<()> {
     // Runtime-checked query (no compile-time sqlx cache needed): return the
-    // owning repository id of any *other* repository holding a row at this exact
-    // key — live or soft-deleted (the physical object persists past soft-delete).
+    // owning repository id of any repository outside the allow-list holding a
+    // row at this exact key — live or soft-deleted (the physical object
+    // persists past soft-delete).
     let foreign: Option<Uuid> = sqlx::query_scalar(
         "SELECT repository_id FROM artifacts \
-         WHERE storage_key = $1 AND repository_id <> $2 \
+         WHERE storage_key = $1 AND repository_id <> ALL($2) \
          LIMIT 1",
     )
     .bind(storage_key)
-    .bind(repository_id)
+    .bind(allowed_owners)
     .fetch_optional(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    if foreign.is_some() {
+    if foreign_owner_blocks_write(foreign, allowed_owners) {
         return Err(AppError::Conflict(format!(
             "storage key '{storage_key}' is already owned by another repository; \
              refusing cross-repository overwrite"
@@ -2328,6 +2379,30 @@ pub async fn guard_foreign_storage_key_for_backend(
         return Ok(());
     }
     guard_foreign_storage_key(db, repository_id, storage_key).await
+}
+
+/// Promotion-aware variant of [`guard_foreign_storage_key_for_backend`] (#3266).
+///
+/// A promote copies the SOURCE artifact's content-addressed `storage_key` into
+/// the TARGET repository, so the source legitimately owns that key for the
+/// duration of the copy. The plain guard excludes only the writer (the target)
+/// from its ownership query, so it returned the source as a "foreign owner" and
+/// 409'd every promotion within a shared-namespace (cloud) backend.
+///
+/// This variant exempts both ends of the promotion and keeps the guard's real
+/// job intact: a *third* repository owning the key still blocks the write.
+pub async fn guard_foreign_storage_key_for_promotion(
+    db: &PgPool,
+    target_repo_id: Uuid,
+    source_repo_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<()> {
+    if crate::storage::backend_is_repo_isolated(storage_backend) {
+        return Ok(());
+    }
+    let allowed = promotion_storage_key_owner_exemptions(target_repo_id, source_repo_id);
+    guard_foreign_storage_key_excluding(db, &allowed, storage_key).await
 }
 
 /// Best-effort recorder for a completed local-artifact download (#2365).
@@ -2696,6 +2771,103 @@ mod tests {
         guard_foreign_storage_key_for_backend(&pool, target_repo, "s3", &key)
             .await
             .expect("same-repo promotion must be allowed on cloud");
+    }
+
+    // -- #3266: the guard must not treat the promotion SOURCE as a foreign owner
+    //
+    // A promote copies the source artifact's own content-addressed storage_key
+    // into the target. Excluding only the target from the ownership query made
+    // the source come back as an "other owner", so every
+    // `generic-staging -> generic-local` promotion inside a shared S3 namespace
+    // 409'd. These pin the corrected policy: source exempt, third party still
+    // blocked.
+
+    #[test]
+    fn promotion_exemptions_cover_both_ends_of_the_copy() {
+        let target = Uuid::new_v4();
+        let source = Uuid::new_v4();
+        let allowed = promotion_storage_key_owner_exemptions(target, source);
+        assert!(allowed.contains(&target), "target must be exempt");
+        assert!(
+            allowed.contains(&source),
+            "source owns the key being promoted and must be exempt (#3266)"
+        );
+        assert_eq!(allowed.len(), 2);
+    }
+
+    #[test]
+    fn promotion_exemptions_dedupe_self_promotion() {
+        let repo = Uuid::new_v4();
+        assert_eq!(
+            promotion_storage_key_owner_exemptions(repo, repo),
+            vec![repo]
+        );
+    }
+
+    #[test]
+    fn foreign_owner_decision_is_allow_list_based() {
+        let target = Uuid::new_v4();
+        let source = Uuid::new_v4();
+        let third_party = Uuid::new_v4();
+        let allowed = promotion_storage_key_owner_exemptions(target, source);
+
+        // No owner at all -> nothing to collide with.
+        assert!(!foreign_owner_blocks_write(None, &allowed));
+        // Either end of the promotion -> legitimate.
+        assert!(!foreign_owner_blocks_write(Some(target), &allowed));
+        assert!(!foreign_owner_blocks_write(Some(source), &allowed));
+        // Anyone else -> still blocked; the guard keeps doing its #2511 job.
+        assert!(foreign_owner_blocks_write(Some(third_party), &allowed));
+        // And a direct upload's single-element allow-list still blocks the
+        // source, which for a plain write really is a foreign repository.
+        assert!(foreign_owner_blocks_write(Some(source), &[target]));
+    }
+
+    #[tokio::test]
+    async fn test_promotion_guard_allows_source_owned_key_on_cloud_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_repo, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (source_repo, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        // The source repo owns the content-addressed key; the target owns
+        // nothing yet. This is the exact shape from #3266.
+        let key = format!("generic/{}/payload.bin", Uuid::new_v4());
+        seed_artifact(&pool, source_repo, "payload.bin", &key).await;
+
+        // Pre-#3266 behaviour: the plain guard sees the source and 409s.
+        let err = guard_foreign_storage_key_for_backend(&pool, target_repo, "s3", &key)
+            .await
+            .expect_err("regression fixture: plain guard must still see the source");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+
+        // Fixed behaviour: the promotion-aware guard lets the copy through.
+        guard_foreign_storage_key_for_promotion(&pool, target_repo, source_repo, "s3", &key)
+            .await
+            .expect("promotion from the key's owner must be allowed (#3266)");
+    }
+
+    #[tokio::test]
+    async fn test_promotion_guard_still_blocks_third_party_key_on_cloud_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_repo, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (source_repo, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (third_party, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let key = format!("generic/{}/payload.bin", Uuid::new_v4());
+        // Both the source AND an unrelated repo hold the key; the unrelated
+        // owner must still veto the write (#2511 is not weakened by #3266).
+        seed_artifact(&pool, source_repo, "payload.bin", &key).await;
+        seed_artifact(&pool, third_party, "other/payload.bin", &key).await;
+
+        let err =
+            guard_foreign_storage_key_for_promotion(&pool, target_repo, source_repo, "s3", &key)
+                .await
+                .expect_err("a third-party owner must still block the promotion");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
     }
 
     // -----------------------------------------------------------------------

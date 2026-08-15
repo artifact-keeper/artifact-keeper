@@ -547,8 +547,16 @@ pub struct Config {
     /// this is aborted with 503 so a single wedged/CPU-bound request cannot
     /// hold a worker indefinitely.
     ///
-    /// Must exceed the slowest legitimate request — large multi-GB artifact
-    /// uploads — or they will be killed. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
+    /// Artifact **byte-transfer** routes are exempt (#3263): the timeout clock
+    /// covers the time the client spends streaming the body, so applying it to
+    /// uploads and downloads turns a duration cap into an effective size cap —
+    /// a ~90 MB upload over a slow link was aborted mid-body and the client saw
+    /// only a connection reset. See `api::routes::is_byte_transfer_path` for the
+    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE` and
+    /// their concurrency by `GLOBAL_MAX_CONCURRENCY`.
+    ///
+    /// This value therefore only has to exceed the slowest legitimate
+    /// *non-transfer* request. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
 

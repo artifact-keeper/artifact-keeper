@@ -760,9 +760,10 @@ pub async fn promote_artifact(
     // it is skipped for repo-isolated (filesystem) backends where each repo has
     // its own directory tree. `require_promotion_tenant_access` above already
     // gates who may promote — this closes the residual write attribution hole.
-    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+    crate::services::artifact_service::guard_foreign_storage_key_for_promotion(
         &state.db,
         target_repo.id,
+        source_repo.id,
         &target_repo.storage_backend,
         &artifact.storage_key,
     )
@@ -1021,9 +1022,10 @@ pub async fn promote_artifacts_bulk(
         // repository on a shared-namespace cloud backend. Same guard the
         // per-format upload handlers apply; skipped for repo-isolated
         // (filesystem) backends. See the single-promote path for the rationale.
-        if let Err(e) = crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+        if let Err(e) = crate::services::artifact_service::guard_foreign_storage_key_for_promotion(
             &state.db,
             target_repo.id,
+            source_repo.id,
             &target_repo.storage_backend,
             &artifact.storage_key,
         )
