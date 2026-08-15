@@ -82,6 +82,11 @@ pub enum AuditAction {
     TotpEnabled,
     TotpDisabled,
     SessionsInvalidated,
+    /// A login was diverted into forced TOTP enrollment by the 2FA enforcement
+    /// policy (#2805): the password was correct but no session was issued.
+    TotpEnrollmentRequired,
+    /// An administrator changed the system-wide 2FA enforcement policy (#2805).
+    TotpPolicyChanged,
 
     // Age gate
     AgeGateQueued,
@@ -170,6 +175,8 @@ impl AuditAction {
             AuditAction::TotpEnabled => "TOTP_ENABLED",
             AuditAction::TotpDisabled => "TOTP_DISABLED",
             AuditAction::SessionsInvalidated => "SESSIONS_INVALIDATED",
+            AuditAction::TotpEnrollmentRequired => "TOTP_ENROLLMENT_REQUIRED",
+            AuditAction::TotpPolicyChanged => "TOTP_POLICY_CHANGED",
             AuditAction::AgeGateQueued => "AGE_GATE_QUEUED",
             AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",

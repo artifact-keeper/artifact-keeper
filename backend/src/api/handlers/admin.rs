@@ -1,5 +1,9 @@
 //! Admin handlers (backups, system settings).
 
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
+use crate::services::totp_policy::{self, check_policy_activation, TotpPolicy, TotpPolicySource};
 use axum::{
     extract::{Extension, Path, Query, State},
     routing::{get, post},
@@ -29,6 +33,10 @@ pub fn router() -> Router<SharedState> {
         .route("/backups/:id/restore", post(restore_backup))
         .route("/backups/:id/cancel", post(cancel_backup))
         .route("/settings", get(get_settings).post(update_settings))
+        .route(
+            "/settings/totp-policy",
+            get(get_totp_policy).put(update_totp_policy),
+        )
         .route("/stats", get(get_system_stats))
         .route("/downloads", get(list_downloads))
         .route("/downloads/by-ip/:ip", get(list_downloads_by_ip))
@@ -816,6 +824,185 @@ pub async fn update_settings(
     }
 
     Ok(Json(settings))
+}
+
+// ---------------------------------------------------------------------------
+// TOTP (2FA) enforcement policy (#2805)
+// ---------------------------------------------------------------------------
+
+/// Current 2FA enforcement policy plus the context an operator needs before
+/// tightening it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TotpPolicyResponse {
+    /// The policy in force.
+    pub policy: TotpPolicy,
+    /// Whether it comes from the `TOTP_POLICY` environment variable (in which
+    /// case `PUT` is refused) or from the database.
+    pub source: TotpPolicySource,
+    /// Whether `PUT` can change the policy at all right now.
+    pub editable: bool,
+    /// Local (password-authenticating, non-service) administrators.
+    pub local_admins: i64,
+    /// How many of those already have TOTP enabled. Under
+    /// `required_for_admins`, `local_admins - local_admins_with_totp` is the
+    /// number of administrators who will be sent through forced enrollment at
+    /// their next sign-in.
+    pub local_admins_with_totp: i64,
+    /// Local (password-authenticating, non-service) users, admins included.
+    pub local_users: i64,
+    /// How many of those already have TOTP enabled.
+    pub local_users_with_totp: i64,
+    /// Whether the *calling* administrator has TOTP enabled. Tightening the
+    /// policy requires this.
+    pub caller_totp_enabled: bool,
+}
+
+/// Request body for `PUT /admin/settings/totp-policy`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateTotpPolicyRequest {
+    pub policy: TotpPolicy,
+}
+
+/// Counts of local (password) accounts and how many have TOTP enrolled.
+struct LocalTotpCounts {
+    admins: i64,
+    admins_with_totp: i64,
+    users: i64,
+    users_with_totp: i64,
+}
+
+/// Population the policy can actually apply to: active, local-provider,
+/// non-service accounts. SSO/LDAP/CI users and service accounts are exempt, so
+/// counting them here would overstate the blast radius of a policy change.
+async fn local_totp_counts(db: &sqlx::PgPool) -> Result<LocalTotpCounts> {
+    let row = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE is_admin)                     as "admins!",
+            COUNT(*) FILTER (WHERE is_admin AND totp_enabled)    as "admins_with_totp!",
+            COUNT(*)                                             as "users!",
+            COUNT(*) FILTER (WHERE totp_enabled)                 as "users_with_totp!"
+        FROM users
+        WHERE is_active = true
+          AND is_service_account = false
+          AND auth_provider = 'local'
+        "#
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(LocalTotpCounts {
+        admins: row.admins,
+        admins_with_totp: row.admins_with_totp,
+        users: row.users,
+        users_with_totp: row.users_with_totp,
+    })
+}
+
+async fn build_totp_policy_response(
+    state: &SharedState,
+    caller_id: Uuid,
+) -> Result<TotpPolicyResponse> {
+    let (policy, source) = totp_policy::effective_policy(&state.db, state.config.totp_policy).await;
+    let counts = local_totp_counts(&state.db).await?;
+    let caller_totp_enabled =
+        sqlx::query_scalar!("SELECT totp_enabled FROM users WHERE id = $1", caller_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .unwrap_or(false);
+
+    Ok(TotpPolicyResponse {
+        policy,
+        source,
+        editable: source == TotpPolicySource::Database,
+        local_admins: counts.admins,
+        local_admins_with_totp: counts.admins_with_totp,
+        local_users: counts.users,
+        local_users_with_totp: counts.users_with_totp,
+        caller_totp_enabled,
+    })
+}
+
+/// Read the system-wide 2FA enforcement policy.
+#[utoipa::path(
+    get,
+    path = "/settings/totp-policy",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Current 2FA enforcement policy", body = TotpPolicyResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_totp_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<TotpPolicyResponse>> {
+    Ok(Json(
+        build_totp_policy_response(&state, auth.user_id).await?,
+    ))
+}
+
+/// Change the system-wide 2FA enforcement policy.
+///
+/// Tightening the policy requires the calling administrator to have TOTP
+/// enabled — that is the lockout-safety guard: it guarantees at least one
+/// administrator whose (pre-existing, already-working) sign-in path survives the
+/// change. Loosening is never refused. A policy change does **not** invalidate
+/// existing sessions or refresh tokens; it takes effect at the next interactive
+/// password login, so the administrator making the change keeps their session.
+#[utoipa::path(
+    put,
+    path = "/settings/totp-policy",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = UpdateTotpPolicyRequest,
+    responses(
+        (status = 200, description = "Policy updated", body = TotpPolicyResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Refused: policy pinned by TOTP_POLICY, or the calling admin has not enrolled in TOTP", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_totp_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<UpdateTotpPolicyRequest>,
+) -> Result<Json<TotpPolicyResponse>> {
+    let current = build_totp_policy_response(&state, auth.user_id).await?;
+
+    if let Err(refusal) = check_policy_activation(
+        current.policy,
+        payload.policy,
+        current.source == TotpPolicySource::Environment,
+        current.caller_totp_enabled,
+    ) {
+        return Err(AppError::Conflict(refusal.message().to_string()));
+    }
+
+    totp_policy::store_policy(&state.db, payload.policy, auth.user_id).await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::TotpPolicyChanged, ResourceType::User)
+            .user(auth.user_id)
+            .resource(auth.user_id)
+            .actor_name(&auth.username)
+            .details(serde_json::json!({
+                "from": current.policy.as_str(),
+                "to": payload.policy.as_str(),
+                "local_admins": current.local_admins,
+                "local_admins_with_totp": current.local_admins_with_totp,
+            })),
+    )
+    .await;
+
+    Ok(Json(
+        build_totp_policy_response(&state, auth.user_id).await?,
+    ))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1674,6 +1861,8 @@ pub async fn delete_proxy_scan_verdicts(
         delete_backup,
         get_settings,
         update_settings,
+        get_totp_policy,
+        update_totp_policy,
         get_system_stats,
         list_downloads,
         list_downloads_by_ip,
@@ -1694,6 +1883,10 @@ pub async fn delete_proxy_scan_verdicts(
         RestoreRequest,
         RestoreResponse,
         SystemSettings,
+        TotpPolicyResponse,
+        UpdateTotpPolicyRequest,
+        TotpPolicy,
+        TotpPolicySource,
         SystemStats,
         ListDownloadsQuery,
         DownloadRecord,
@@ -2022,6 +2215,167 @@ mod tests {
         let Json(settings) = get_settings(State(state)).await.unwrap();
 
         assert_eq!(settings.environment, "development");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2805 — 2FA enforcement policy endpoints (DB-backed; no-op without
+    // DATABASE_URL). Serialized on the shared policy-row advisory lock.
+    // -----------------------------------------------------------------------
+
+    /// Build an `AuthExtension` for `user_id` as an admin caller.
+    fn admin_auth(user_id: Uuid, username: &str) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{username}@test.local"),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
+        }
+    }
+
+    /// The lockout-safety guard, end to end: an admin who has not enrolled
+    /// cannot tighten the policy; the same admin, once enrolled, can; and
+    /// loosening never requires enrollment.
+    #[tokio::test]
+    async fn test_totp_policy_put_enforces_the_you_first_guard() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::totp_policy_serial_lock().await;
+        let restore = totp_policy::stored_policy(&pool).await;
+
+        let (user_id, username) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("promote to admin");
+        totp_policy::store_policy(&pool, TotpPolicy::Disabled, user_id)
+            .await
+            .expect("seed disabled");
+
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-totp-policy");
+        let auth = admin_auth(user_id, &username);
+
+        // 1. Not enrolled -> tightening is refused with 409.
+        let refused = update_totp_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::RequiredForAdmins,
+            }),
+        )
+        .await;
+        let refused_err = refused.err();
+
+        // 2. Enrol the caller, then the same change is accepted.
+        sqlx::query("UPDATE users SET totp_enabled = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("enrol caller");
+        let accepted = update_totp_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::RequiredForAll,
+            }),
+        )
+        .await;
+
+        // 3. Loosening never requires enrollment.
+        sqlx::query("UPDATE users SET totp_enabled = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("un-enrol caller");
+        let loosened = update_totp_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::Disabled,
+            }),
+        )
+        .await;
+
+        let read = get_totp_policy(State(state), Extension(auth)).await;
+
+        totp_policy::store_policy(&pool, restore, user_id)
+            .await
+            .expect("restore policy");
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            matches!(refused_err, Some(AppError::Conflict(_))),
+            "an unenrolled admin must not be able to tighten the policy: {refused_err:?}"
+        );
+        let accepted = accepted.expect("an enrolled admin may tighten").0;
+        assert_eq!(accepted.policy, TotpPolicy::RequiredForAll);
+        assert_eq!(accepted.source, TotpPolicySource::Database);
+        assert!(accepted.editable);
+
+        let loosened = loosened.expect("loosening must never be refused").0;
+        assert_eq!(loosened.policy, TotpPolicy::Disabled);
+
+        let read = read.expect("read policy").0;
+        assert_eq!(read.policy, TotpPolicy::Disabled);
+        // The blast-radius counts must at least see the admin we created.
+        assert!(read.local_admins >= 1);
+        assert!(read.local_users >= read.local_admins);
+    }
+
+    /// While `TOTP_POLICY` pins the policy, the API reports it as
+    /// non-editable and refuses every change — including a loosening one,
+    /// because the write would silently do nothing.
+    #[tokio::test]
+    async fn test_totp_policy_put_is_refused_while_pinned_by_env() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::totp_policy_serial_lock().await;
+
+        let (user_id, username) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true, totp_enabled = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("promote + enrol");
+
+        let state = tdh::build_state_with(pool.clone(), "/tmp/admin-totp-pinned", |cfg| {
+            cfg.totp_policy = Some(TotpPolicy::RequiredForAll);
+        });
+        let auth = admin_auth(user_id, &username);
+
+        let read = get_totp_policy(State(state.clone()), Extension(auth.clone())).await;
+        let write = update_totp_policy(
+            State(state),
+            Extension(auth),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::Disabled,
+            }),
+        )
+        .await;
+        let write_err = write.err();
+
+        tdh::cleanup_user(&pool, user_id).await;
+
+        let read = read.expect("read policy").0;
+        assert_eq!(read.policy, TotpPolicy::RequiredForAll);
+        assert_eq!(read.source, TotpPolicySource::Environment);
+        assert!(!read.editable);
+        assert!(read.caller_totp_enabled);
+        assert!(
+            matches!(write_err, Some(AppError::Conflict(_))),
+            "a pinned policy must refuse writes: {write_err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

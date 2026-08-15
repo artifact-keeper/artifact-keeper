@@ -1379,6 +1379,58 @@ async fn simple_project(
 /// HTML (PEP 503) or JSON (PEP 691) based on the Accept header.
 /// URLs in the response always point through `repo_key` (the virtual or
 /// direct repo the client originally requested).
+/// Render ONE local-member distribution as a PEP 691 `files[]` entry.
+///
+/// The single source of truth for what a locally-stored artifact looks like in
+/// JSON, shared by the direct emitter ([`build_simple_project_response`]) and
+/// the virtual union ([`merge_local_into_remote_simple_json`]) (#2748).
+///
+/// They used to be separate copies, and they had drifted: only the direct copy
+/// advertised the PEP 658/714 `core-metadata` flag. Because the virtual repo
+/// picks its emitter at request time — [`build_simple_project_response`] when no
+/// remote member answered, this one when one did, and a remote fetch miss is a
+/// silent `debug!` — the *same* URL advertised `core-metadata` or not depending
+/// on whether an upstream happened to respond. Installers that use the flag
+/// (pip, uv) therefore lost the metadata fast path through a virtual repository
+/// and had to download whole wheels to read `Requires-Dist`.
+fn local_simple_file_json(
+    a: &SimpleProjectArtifact,
+    repo_key: &str,
+    normalized: &str,
+) -> serde_json::Value {
+    let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+    let mut file = serde_json::json!({
+        "filename": filename,
+        "url": format!("/pypi/{}/simple/{}/{}", repo_key, normalized, filename),
+        "hashes": { "sha256": &a.checksum_sha256 },
+        "size": a.size_bytes,
+    });
+    if let Some(rp) = a
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("pkg_info"))
+        .and_then(|pi| pi.get("requires_python"))
+        .and_then(|v| v.as_str())
+    {
+        file["requires-python"] = serde_json::Value::String(rp.to_owned());
+    }
+    // PEP 658/714: a wheel ships its METADATA and AK already serves it at
+    // `<file>.metadata`, so advertise `core-metadata` here so installers
+    // (pip/uv) can fetch metadata without downloading the whole wheel. sdists
+    // carry no such metadata, so they must not advertise it. Surfaced by the
+    // conformance corpus (pip harvest).
+    if filename.ends_with(".whl") {
+        file["core-metadata"] = serde_json::Value::Bool(true);
+    }
+    // PEP 700: surface the distribution's upload timestamp as an RFC 3339 /
+    // ISO 8601 `upload-time` field (#1773).
+    if let Some(ut) = a.upload_time {
+        file["upload-time"] =
+            serde_json::Value::String(ut.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    }
+    file
+}
+
 #[allow(clippy::result_large_err)]
 fn build_simple_project_response(
     headers: &HeaderMap,
@@ -1396,65 +1448,11 @@ fn build_simple_project_response(
         // PEP 691 JSON response
         let files: Vec<serde_json::Value> = artifacts
             .iter()
-            .map(|a| {
-                let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
-                let requires_python = a
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("pkg_info"))
-                    .and_then(|pi| pi.get("requires_python"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-
-                let mut file = serde_json::json!({
-                    "filename": filename,
-                    "url": format!("/pypi/{}/simple/{}/{}", repo_key, normalized, filename),
-                    "hashes": { "sha256": &a.checksum_sha256 },
-                    "size": a.size_bytes,
-                });
-                if let Some(rp) = requires_python {
-                    file["requires-python"] = serde_json::Value::String(rp);
-                }
-                // PEP 658/714: a wheel ships its METADATA and AK already serves
-                // it at `<file>.metadata`, so advertise `core-metadata` here so
-                // installers (pip/uv) can fetch metadata without downloading the
-                // whole wheel. sdists carry no such metadata, so they must not
-                // advertise it. Surfaced by the conformance corpus (pip harvest).
-                if filename.ends_with(".whl") {
-                    file["core-metadata"] = serde_json::Value::Bool(true);
-                }
-                // PEP 700: surface the distribution's upload timestamp as an
-                // RFC 3339 / ISO 8601 `upload-time` field (#1773).
-                if let Some(ut) = a.upload_time {
-                    file["upload-time"] =
-                        serde_json::Value::String(ut.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-                }
-                file
-            })
+            .map(|a| local_simple_file_json(a, repo_key, normalized))
             .collect();
 
-        // PEP 691 `versions`: dedupe, then order by PEP 440 instead of
-        // lexicographically, so `1.9` precedes `1.10` (#3106). Anything that
-        // does not parse as PEP 440 has no defined position, so it sorts after
-        // every parseable version (by string, for stability) rather than
-        // interleaving with them.
-        let mut versions: Vec<String> = artifacts
-            .iter()
-            .filter_map(|a| a.version.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        versions.sort_by(|a, b| {
-            match (
-                PypiHandler::pep440_sort_key(a),
-                PypiHandler::pep440_sort_key(b),
-            ) {
-                (Some(ka), Some(kb)) => ka.cmp(&kb),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.cmp(b),
-            }
-        });
+        // PEP 691 `versions`: dedupe, then order by PEP 440 (#3106).
+        let versions = sorted_pep440_versions(artifacts.iter().filter_map(|a| a.version.clone()));
 
         // PEP 708 / Simple API v1.2: advertise v1.2 and, when the project has
         // operator `tracks` declarations, emit them under meta.tracks so
@@ -4415,6 +4413,146 @@ static SIMPLE_DATA_ATTR_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?is)\b(data-[a-z0-9-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?"#).unwrap()
 });
 
+/// The file identity carried by one upstream simple-index anchor: its
+/// distribution filename and the `#fragment` (normally `#sha256=...`) that must
+/// survive the rebuild so `pip`/`uv` can verify the bytes AK proxies.
+struct SimpleAnchorTarget {
+    filename: String,
+    fragment: String,
+}
+
+/// Extract the download target of one anchor START-tag, quote-agnostically and
+/// case-insensitively, deriving the identity from the href's URL basename —
+/// never from the anchor text.
+///
+/// Shared by [`rewrite_upstream_urls`] and [`filter_remote_case_a_html`] (#2748)
+/// so the two rebuilds cannot disagree about what an anchor means. They used to
+/// carry independent copies, and the copies drifted: the ownership filter's had
+/// no metacharacter check, so it would emit an anchor the proxy rebuild rejects.
+///
+/// Returns `None` when the anchor is not a file link (navigation, `../`, a bare
+/// host), or when the "filename" contains HTML metacharacters, whitespace or
+/// control characters — that is no filename at all, it is an attribute-breakout
+/// payload riding the href (GHSA-4cw7-mgqj-hgmg), and the anchor is dropped
+/// rather than escaped-and-emitted (the same posture `is_safe_upload_filename`
+/// takes at the ingest choke-point, #3107).
+fn simple_anchor_target(tag: &str) -> Option<SimpleAnchorTarget> {
+    let href_caps = SIMPLE_HREF_ATTR_RE.captures(tag)?;
+    let href_raw = href_caps
+        .get(1)
+        .or_else(|| href_caps.get(2))
+        .or_else(|| href_caps.get(3))
+        .map(|m| m.as_str())
+        .unwrap_or("");
+    // Minimal entity-decode BEFORE deriving the file identity from the href;
+    // everything re-emitted by the callers is escaped again.
+    let href = decode_html_entities_minimal(href_raw);
+    let fragment = match href.find('#') {
+        Some(pos) => href[pos..].to_owned(),
+        None => String::new(),
+    };
+    let url_part = href.split('#').next().unwrap_or(&href);
+    let url_no_query = url_part.split('?').next().unwrap_or(url_part);
+    let filename = url_no_query.rsplit('/').next().unwrap_or("").trim();
+    if filename.is_empty()
+        || filename
+            .chars()
+            .any(|c| matches!(c, '<' | '>' | '"' | '\'') || c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(SimpleAnchorTarget {
+        filename: filename.to_owned(),
+        fragment,
+    })
+}
+
+/// Preserve ONLY an anchor's `data-*` attributes, each re-emitted escaped into a
+/// double-quoted value (or bare, as PEP 714 permits).
+///
+/// This is what carries `data-requires-python` (PEP 503), `data-yanked` (PEP
+/// 592) and `data-core-metadata` / `data-dist-info-metadata` (PEP 658/714)
+/// through a rebuild. Dropping them is not cosmetic: without
+/// `data-requires-python` an installer is offered a wheel its interpreter cannot
+/// run, and without `data-yanked` a withdrawn release becomes an ordinary
+/// resolution candidate.
+///
+/// Shared by [`rewrite_upstream_urls`] and [`filter_remote_case_a_html`] (#2748)
+/// — the ownership filter previously emitted a bare `<a href>` and silently lost
+/// all of them, so the same distribution advertised through a virtual repo
+/// looked installable-anywhere and un-yanked, while the direct repo said
+/// otherwise.
+fn simple_anchor_data_attrs(tag: &str) -> String {
+    let mut data_attrs = String::new();
+    for attr in SIMPLE_DATA_ATTR_RE.captures_iter(tag) {
+        let name = attr[1].to_ascii_lowercase();
+        let value = attr
+            .get(2)
+            .or_else(|| attr.get(3))
+            .or_else(|| attr.get(4))
+            .map(|m| m.as_str());
+        match value {
+            Some(v) => data_attrs.push_str(&format!(
+                " {}=\"{}\"",
+                name,
+                html_escape(&decode_html_entities_minimal(v))
+            )),
+            None => data_attrs.push_str(&format!(" {}", name)),
+        }
+    }
+    data_attrs
+}
+
+/// Emit one rebuilt PEP 503 anchor on an Artifact Keeper path.
+///
+/// No upstream host, scheme, query or non-`data-*` attribute survives; the
+/// filename and fragment are escaped so neither can break out of the attribute.
+fn emit_simple_anchor(
+    repo_key: &str,
+    normalized: &str,
+    target: &SimpleAnchorTarget,
+    data_attrs: &str,
+) -> String {
+    format!(
+        "<a href=\"/pypi/{}/simple/{}/{}{}\"{}>{}</a><br/>\n",
+        repo_key,
+        normalized,
+        html_escape(&target.filename),
+        html_escape(&target.fragment),
+        data_attrs,
+        html_escape(&target.filename),
+    )
+}
+
+/// Order PEP 691 `versions` by PEP 440 rather than lexicographically, so `1.9`
+/// precedes `1.10` (#3106).
+///
+/// Anything that does not parse as PEP 440 has no defined position, so it sorts
+/// after every parseable version (by string, for stability) rather than
+/// interleaving with them. Shared by the direct emitter and the virtual merge /
+/// ownership-filter emitters (#2748) — the virtual paths built a
+/// `BTreeSet<String>` and emitted it raw, so the *same repository* ordered its
+/// versions differently depending on whether a remote member answered.
+fn sorted_pep440_versions<I: IntoIterator<Item = String>>(versions: I) -> Vec<String> {
+    let mut versions: Vec<String> = versions
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    versions.sort_by(|a, b| {
+        match (
+            PypiHandler::pep440_sort_key(a),
+            PypiHandler::pep440_sort_key(b),
+        ) {
+            (Some(ka), Some(kb)) => ka.cmp(&kb),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(b),
+        }
+    });
+    versions
+}
+
 /// Split a URL into its base (scheme + host) and path components.
 ///
 /// For example, `https://files.pythonhosted.org/packages/ab/cd/file.whl` splits
@@ -4637,72 +4775,15 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     let mut anchors = String::new();
     for tag in SIMPLE_ANCHOR_START_RE.find_iter(html) {
         let tag = tag.as_str();
-        let Some(href_caps) = SIMPLE_HREF_ATTR_RE.captures(tag) else {
+        let Some(target) = simple_anchor_target(tag) else {
             continue;
         };
-        let href_raw = href_caps
-            .get(1)
-            .or_else(|| href_caps.get(2))
-            .or_else(|| href_caps.get(3))
-            .map(|m| m.as_str())
-            .unwrap_or("");
-        // Minimal entity-decode BEFORE deriving the file identity from the
-        // href — the same treatment the #2967 rebuild gives it; everything
-        // re-emitted below is escaped again.
-        let href = decode_html_entities_minimal(href_raw);
-        // Keep the upstream fragment (#sha256=...) so pip can verify the
-        // bytes AK proxies; strip it — and any query — before taking the
-        // basename.
-        let fragment = match href.find('#') {
-            Some(pos) => &href[pos..],
-            None => "",
-        };
-        let url_part = href.split('#').next().unwrap_or(&href);
-        let url_no_query = url_part.split('?').next().unwrap_or(url_part);
-        let filename = url_no_query.rsplit('/').next().unwrap_or("").trim();
-        // Not a file link (navigation, `../`, a bare host): there is no
-        // download entry to rebuild, and nothing else about the anchor may
-        // survive either. A "filename" containing HTML metacharacters or
-        // whitespace is no filename at all — it is an attribute-breakout
-        // payload riding the href (GHSA-4cw7-mgqj-hgmg), and the anchor is
-        // dropped rather than escaped-and-emitted (the same posture
-        // `is_safe_upload_filename` takes at the ingest choke-point, #3107).
-        if filename.is_empty()
-            || filename
-                .chars()
-                .any(|c| matches!(c, '<' | '>' | '"' | '\'') || c.is_whitespace() || c.is_control())
-        {
-            continue;
-        }
-
-        // Preserve ONLY the anchor's `data-*` attributes, each re-emitted
-        // escaped into a double-quoted value (or bare, as PEP 714 permits).
-        let mut data_attrs = String::new();
-        for attr in SIMPLE_DATA_ATTR_RE.captures_iter(tag) {
-            let name = attr[1].to_ascii_lowercase();
-            let value = attr
-                .get(2)
-                .or_else(|| attr.get(3))
-                .or_else(|| attr.get(4))
-                .map(|m| m.as_str());
-            match value {
-                Some(v) => data_attrs.push_str(&format!(
-                    " {}=\"{}\"",
-                    name,
-                    html_escape(&decode_html_entities_minimal(v))
-                )),
-                None => data_attrs.push_str(&format!(" {}", name)),
-            }
-        }
-
-        anchors.push_str(&format!(
-            "<a href=\"/pypi/{}/simple/{}/{}{}\"{}>{}</a><br/>\n",
+        let data_attrs = simple_anchor_data_attrs(tag);
+        anchors.push_str(&emit_simple_anchor(
             repo_key,
-            normalized,
-            html_escape(filename),
-            html_escape(fragment),
-            data_attrs,
-            html_escape(filename),
+            &normalized,
+            &target,
+            &data_attrs,
         ));
     }
 
@@ -4835,35 +4916,22 @@ fn merge_local_into_remote_simple_json(
         if let Some(v) = &a.version {
             local_versions.insert(v.clone());
         }
-        let mut file = serde_json::json!({
-            "filename": filename,
-            "url": format!("/pypi/{}/simple/{}/{}", repo_key, normalized, filename),
-            "hashes": { "sha256": &a.checksum_sha256 },
-            "size": a.size_bytes,
-        });
-        if let Some(rp) = a
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("pkg_info"))
-            .and_then(|pi| pi.get("requires_python"))
-            .and_then(|v| v.as_str())
-        {
-            file["requires-python"] = serde_json::Value::String(rp.to_owned());
-        }
-        if let Some(ut) = a.upload_time {
-            file["upload-time"] =
-                serde_json::Value::String(ut.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        }
-        appended.push(file);
+        // Shared with the direct emitter (#2748) so a local wheel advertises the
+        // same fields — `core-metadata` above all — whether or not a remote
+        // member happened to answer for this project.
+        appended.push(local_simple_file_json(a, repo_key, normalized));
     }
 
     if let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) {
         files.extend(appended);
     }
 
-    // Union the local distributions' versions into the advertised list.
+    // Union the local distributions' versions into the advertised list, ordered
+    // by PEP 440 exactly as the direct emitter orders it (#2748/#3106) — a
+    // plain `BTreeSet` put `1.10` before `1.9`, so the same repository ordered
+    // its versions differently depending on whether a remote member answered.
     if !local_versions.is_empty() {
-        let mut versions: std::collections::BTreeSet<String> = doc
+        let upstream_versions: Vec<String> = doc
             .get("versions")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -4872,7 +4940,7 @@ fn merge_local_into_remote_simple_json(
                     .collect()
             })
             .unwrap_or_default();
-        versions.extend(local_versions);
+        let versions = sorted_pep440_versions(upstream_versions.into_iter().chain(local_versions));
         if let Some(obj) = doc.as_object_mut() {
             obj.insert(
                 "versions".to_owned(),
@@ -5077,18 +5145,20 @@ fn filter_remote_case_a_json(json: &str, owned: &OwnedWheelProfile, normalized: 
             .unwrap_or(false)
     });
     // Rebuild `versions` from the surviving files so the index cannot advertise
-    // a version only the remote has for a locally-owned name.
-    let versions: std::collections::BTreeSet<String> = doc
-        .get("files")
-        .and_then(|f| f.as_array())
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(|f| f.get("filename").and_then(|n| n.as_str()))
-                .filter_map(version_from_pypi_filename)
-                .collect()
-        })
-        .unwrap_or_default();
+    // a version only the remote has for a locally-owned name. PEP 440-ordered
+    // for parity with every other emitter (#2748/#3106).
+    let versions = sorted_pep440_versions(
+        doc.get("files")
+            .and_then(|f| f.as_array())
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|f| f.get("filename").and_then(|n| n.as_str()))
+                    .filter_map(version_from_pypi_filename)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
     if let Some(obj) = doc.as_object_mut() {
         obj.insert(
             "versions".to_owned(),
@@ -5132,41 +5202,31 @@ fn filter_remote_case_a_html(
     let mut survivors = String::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for tag in SIMPLE_ANCHOR_START_RE.find_iter(html) {
-        let Some(href_caps) = SIMPLE_HREF_ATTR_RE.captures(tag.as_str()) else {
+        let tag = tag.as_str();
+        let Some(target) = simple_anchor_target(tag) else {
             continue;
         };
-        let href_raw = href_caps
-            .get(1)
-            .or_else(|| href_caps.get(2))
-            .or_else(|| href_caps.get(3))
-            .map(|m| m.as_str())
-            .unwrap_or("");
-        let href = decode_html_entities_minimal(href_raw);
-        // File identity = URL basename (never the anchor text). Keep the upstream
-        // sha256 fragment so pip can verify the bytes AK proxies; strip the
-        // fragment and any query before taking the basename.
-        let fragment = match href.find('#') {
-            Some(pos) => &href[pos..],
-            None => "",
-        };
-        let url_part = href.split('#').next().unwrap_or(&href);
-        let url_no_query = url_part.split('?').next().unwrap_or(url_part);
-        let filename = url_no_query.rsplit('/').next().unwrap_or("").trim();
-        if filename.is_empty() || !owned.admits(filename) {
+        if !owned.admits(&target.filename) {
             continue;
         }
-        if !seen.insert(filename.to_string()) {
+        if !seen.insert(target.filename.clone()) {
             continue;
         }
-        // AK path ONLY — no upstream host survives. filename + fragment are
-        // escaped so neither can break out of the attribute.
-        survivors.push_str(&format!(
-            "<a href=\"/pypi/{}/simple/{}/{}{}\">{}</a><br/>\n",
+        // AK path ONLY — no upstream host survives — but the anchor's `data-*`
+        // attributes DO (#2748). A Case-A wheel is a real, installable
+        // distribution of a version the local owner already ships; emitting it
+        // stripped of `data-requires-python` offers an incompatible build to
+        // every interpreter, and stripped of `data-yanked` (PEP 592) presents a
+        // withdrawn release as an ordinary candidate. The JSON sibling
+        // (`filter_remote_case_a_json`) only `retain`s entries and so always
+        // kept these fields; the two representations of the same virtual index
+        // disagreed about installability until this shared the emitter.
+        let data_attrs = simple_anchor_data_attrs(tag);
+        survivors.push_str(&emit_simple_anchor(
             repo_key,
             normalized,
-            html_escape(filename),
-            html_escape(fragment),
-            html_escape(filename),
+            &target,
+            &data_attrs,
         ));
     }
 
@@ -7209,6 +7269,182 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(meta_tracks, vec!["https://pypi.org/simple/pkg/"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2748: the virtual union must describe a distribution the SAME way the
+    // direct repository does. Each of these fails on main.
+    // -----------------------------------------------------------------------
+
+    /// The reporter's topology in miniature: a local member owns the name, a
+    /// remote member answers, so the virtual renders through the merge emitter.
+    /// The local wheel must still advertise the PEP 658/714 `core-metadata`
+    /// flag it advertises on the direct path — otherwise the same URL gains or
+    /// loses the metadata fast path depending on whether an upstream happened to
+    /// respond (a remote fetch miss is a silent `debug!`).
+    #[test]
+    fn test_merge_local_into_remote_simple_json_advertises_core_metadata_for_local_wheels() {
+        let upstream = r#"{"meta":{"api-version":"1.1"},"name":"pkg","versions":[],"files":[]}"#;
+        let local = vec![
+            SimpleProjectArtifact {
+                path: "pkg/1.0.0/pkg-1.0.0-cp39-cp39-manylinux_2_17_x86_64.whl".to_string(),
+                version: Some("1.0.0".to_string()),
+                size_bytes: 9,
+                checksum_sha256: "h".to_string(),
+                metadata: None,
+                upload_time: None,
+            },
+            SimpleProjectArtifact {
+                path: "pkg/1.0.0/pkg-1.0.0.tar.gz".to_string(),
+                version: Some("1.0.0".to_string()),
+                size_bytes: 5,
+                checksum_sha256: "s".to_string(),
+                metadata: None,
+                upload_time: None,
+            },
+        ];
+
+        let out = merge_local_into_remote_simple_json(upstream.as_bytes(), "v", "pkg", &local, &[])
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let files = json["files"].as_array().unwrap();
+
+        let wheel = files
+            .iter()
+            .find(|f| f["filename"] == "pkg-1.0.0-cp39-cp39-manylinux_2_17_x86_64.whl")
+            .expect("local wheel spliced in");
+        assert_eq!(
+            wheel["core-metadata"], true,
+            "a local wheel must advertise PEP 658 core-metadata through the virtual union, \
+             exactly as it does through the direct repository"
+        );
+
+        // An sdist ships no METADATA sidecar, so it must NOT advertise one —
+        // advertising it would make both pip and uv hard-fail on the 404.
+        let sdist = files
+            .iter()
+            .find(|f| f["filename"] == "pkg-1.0.0.tar.gz")
+            .expect("local sdist spliced in");
+        assert!(sdist.get("core-metadata").is_none());
+    }
+
+    /// The direct emitter and the virtual merge emitter must produce
+    /// byte-identical `files[]` entries for the same local artifact. Pinning the
+    /// equality (rather than one field) is what stops the next field added to
+    /// one emitter from silently missing on the other.
+    #[test]
+    fn test_local_file_json_is_identical_on_the_direct_and_virtual_paths() {
+        let upload_time = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let artifact = SimpleProjectArtifact {
+            path: "pkg/1.2.3/pkg-1.2.3-py3-none-any.whl".to_string(),
+            version: Some("1.2.3".to_string()),
+            size_bytes: 42,
+            checksum_sha256: "abc".to_string(),
+            metadata: Some(serde_json::json!({"pkg_info": {"requires_python": ">=3.9"}})),
+            upload_time: Some(upload_time),
+        };
+
+        let direct = local_simple_file_json(&artifact, "v", "pkg");
+
+        let upstream = r#"{"meta":{"api-version":"1.1"},"name":"pkg","versions":[],"files":[]}"#;
+        let merged = merge_local_into_remote_simple_json(
+            upstream.as_bytes(),
+            "v",
+            "pkg",
+            std::slice::from_ref(&artifact),
+            &[],
+        )
+        .unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(merged["files"][0], direct);
+    }
+
+    /// A suppressed Remote member's Case-A wheel is a real, installable
+    /// distribution. Rebuilding its anchor without `data-requires-python` offers
+    /// an incompatible build to every interpreter, and without `data-yanked`
+    /// (PEP 592) presents a withdrawn release as an ordinary candidate. The JSON
+    /// sibling always kept both, so the two representations of one virtual index
+    /// disagreed about installability.
+    #[test]
+    fn test_filter_remote_case_a_html_preserves_data_attributes() {
+        let owned = linux_owner_profile();
+        let upstream = concat!(
+            "<!DOCTYPE html><html><body>\n",
+            "<a href=\"https://files.pythonhosted.org/p/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa\"",
+            " data-requires-python=\"&gt;=3.12\"",
+            " data-core-metadata=\"sha256=bb\"",
+            " data-yanked=\"CVE-2026-0001\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</a><br/>\n",
+            "</body></html>\n",
+        );
+
+        let out = filter_remote_case_a_html(upstream, &owned, "virt", "pydantic-core");
+
+        assert!(
+            out.contains("data-requires-python=\"&gt;=3.12\""),
+            "PEP 503 requires-python must survive the ownership rebuild: {out}"
+        );
+        assert!(
+            out.contains("data-yanked=\"CVE-2026-0001\""),
+            "PEP 592 yanked must survive the ownership rebuild: {out}"
+        );
+        assert!(
+            out.contains("data-core-metadata=\"sha256=bb\""),
+            "PEP 658 core-metadata must survive the ownership rebuild: {out}"
+        );
+        // Unchanged invariants: AK-pathed href, fragment kept, no upstream host.
+        assert!(out.contains(
+            "href=\"/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa\""
+        ));
+        assert!(!out.contains("files.pythonhosted"));
+    }
+
+    /// Sharing the anchor rebuilder also gives the ownership filter the proxy
+    /// rebuild's filename-metacharacter check, which it previously lacked.
+    #[test]
+    fn test_filter_remote_case_a_html_drops_attribute_breakout_filenames() {
+        let owned = linux_owner_profile();
+        let upstream = "<a href='https://x/p/\"><script>alert(1)</script>.whl'>x</a>";
+        let out = filter_remote_case_a_html(upstream, &owned, "virt", "pydantic-core");
+        assert!(!out.contains("script"), "{out}");
+    }
+
+    /// `versions` must be PEP 440-ordered on every emitter (#3106), not just the
+    /// direct one — a `BTreeSet<String>` puts `1.10` before `1.9`.
+    #[test]
+    fn test_merge_local_into_remote_simple_json_orders_versions_by_pep440() {
+        let upstream =
+            r#"{"meta":{"api-version":"1.1"},"name":"pkg","versions":["1.9","1.10"],"files":[]}"#;
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg-1.2-py3-none-any.whl".to_string(),
+            version: Some("1.2".to_string()),
+            size_bytes: 1,
+            checksum_sha256: "h".to_string(),
+            metadata: None,
+            upload_time: None,
+        }];
+        let out = merge_local_into_remote_simple_json(upstream.as_bytes(), "v", "pkg", &local, &[])
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let versions: Vec<&str> = json["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(versions, vec!["1.2", "1.9", "1.10"]);
+    }
+
+    #[test]
+    fn test_sorted_pep440_versions_dedupes_and_parks_unparseable_last() {
+        let out = sorted_pep440_versions(
+            ["1.10", "1.9", "1.9", "not-a-version", "2.0"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert_eq!(out, vec!["1.9", "1.10", "2.0", "not-a-version"]);
     }
 
     // -----------------------------------------------------------------------

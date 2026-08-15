@@ -79,6 +79,11 @@ impl AuditAction {
                 Outcome::Failure
             }
             AuditAction::PermissionDenied | AuditAction::AgeGateRejected => Outcome::Denied,
+            // #2805: the password was correct, but the 2FA enforcement policy
+            // withheld the session pending enrollment. Not a success (no session
+            // was issued) and not a credential failure — it is a policy denial,
+            // which is what `Denied` means in this envelope.
+            AuditAction::TotpEnrollmentRequired => Outcome::Denied,
             AuditAction::Login
             | AuditAction::Logout
             | AuditAction::PasswordChanged
@@ -119,6 +124,7 @@ impl AuditAction {
             | AuditAction::TotpEnabled
             | AuditAction::TotpDisabled
             | AuditAction::SessionsInvalidated
+            | AuditAction::TotpPolicyChanged
             | AuditAction::AgeGateQueued
             | AuditAction::AgeGateApproved
             | AuditAction::AgeGateReopened

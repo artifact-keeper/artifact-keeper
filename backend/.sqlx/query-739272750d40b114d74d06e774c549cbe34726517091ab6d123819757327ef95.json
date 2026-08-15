@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(*) FILTER (WHERE is_admin)                     as \"admins!\",\n            COUNT(*) FILTER (WHERE is_admin AND totp_enabled)    as \"admins_with_totp!\",\n            COUNT(*)                                             as \"users!\",\n            COUNT(*) FILTER (WHERE totp_enabled)                 as \"users_with_totp!\"\n        FROM users\n        WHERE is_active = true\n          AND is_service_account = false\n          AND auth_provider = 'local'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "admins!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "admins_with_totp!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "users!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "users_with_totp!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "739272750d40b114d74d06e774c549cbe34726517091ab6d123819757327ef95"
+}

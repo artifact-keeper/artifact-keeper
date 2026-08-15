@@ -28,6 +28,7 @@ use crate::services::audit_service::{
 };
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_service::AuthService;
+use crate::services::totp_policy;
 
 /// Fire-and-forget auth audit log. Failures are silently ignored so audit
 /// issues never break the auth flow.
@@ -65,6 +66,7 @@ fn login_response(
         token_type: "Bearer".to_string(),
         must_change_password,
         totp_required: None,
+        totp_enrollment_required: None,
         totp_token: None,
     };
     let mut response = Json(body).into_response();
@@ -167,6 +169,17 @@ pub struct LoginResponse {
     pub must_change_password: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub totp_required: Option<bool>,
+    /// Set when the 2FA enforcement policy (#2805) requires this user to enrol
+    /// in TOTP before a session can be issued. `totp_token` then carries an
+    /// *enrollment ticket* rather than a verification ticket: redeem it at
+    /// `POST /auth/totp/enroll/setup` followed by
+    /// `POST /auth/totp/enroll/complete`, which returns the real session.
+    ///
+    /// A client that does not understand this field sees no `access_token` and
+    /// must not treat the response as a successful login. It is never set at the
+    /// same time as `totp_required`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totp_enrollment_required: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub totp_token: Option<String>,
 }
@@ -340,19 +353,68 @@ pub async fn login(
         );
     }
 
-    // If TOTP is enabled, return a pending token instead of real tokens
-    if user.totp_enabled {
-        let totp_token = auth_service.generate_totp_pending_token(&user)?;
-        let body = LoginResponse {
-            access_token: String::new(),
-            refresh_token: String::new(),
-            expires_in: tokens.expires_in,
-            token_type: "Bearer".to_string(),
-            must_change_password: user.must_change_password,
-            totp_required: Some(true),
-            totp_token: Some(totp_token),
-        };
-        return Ok(Json(body).into_response());
+    // 2FA gate. Either the user has already enrolled (challenge them, the
+    // historical behaviour) or the system-wide enforcement policy (#2805)
+    // requires them to enrol before a session exists at all.
+    //
+    // Evaluated here, after the password is verified, so the response cannot be
+    // used to probe which accounts are admins or which have 2FA. The policy read
+    // is a single primary-key lookup on `system_settings`.
+    let (policy, _) = totp_policy::effective_policy(&state.db, state.config.totp_policy).await;
+    match totp_policy::totp_login_requirement(
+        policy,
+        totp_policy::TotpSubject {
+            auth_provider: user.auth_provider,
+            is_admin: user.is_admin,
+            is_service_account: user.is_service_account,
+            totp_enabled: user.totp_enabled,
+        },
+    ) {
+        // If TOTP is enabled, return a pending token instead of real tokens
+        totp_policy::TotpLoginRequirement::ChallengeExisting => {
+            let totp_token = auth_service.generate_totp_pending_token(&user)?;
+            let body = LoginResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_in: tokens.expires_in,
+                token_type: "Bearer".to_string(),
+                must_change_password: user.must_change_password,
+                totp_required: Some(true),
+                totp_enrollment_required: None,
+                totp_token: Some(totp_token),
+            };
+            return Ok(Json(body).into_response());
+        }
+        // Policy applies and this user has not enrolled. Hand back an
+        // enrollment ticket rather than a session — and rather than a 403.
+        // Refusing outright is what would let an operator lock every admin out;
+        // the whole grace here is "finish enrolling inside this login".
+        totp_policy::TotpLoginRequirement::EnrollmentRequired => {
+            let totp_token = auth_service.generate_totp_enrollment_token(&user)?;
+            audit_auth(
+                &state,
+                AuditAction::TotpEnrollmentRequired,
+                Some(user.id),
+                Some(&user.username),
+                serde_json::json!({
+                    "username": user.username,
+                    "policy": policy.as_str(),
+                }),
+            )
+            .await;
+            let body = LoginResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_in: tokens.expires_in,
+                token_type: "Bearer".to_string(),
+                must_change_password: user.must_change_password,
+                totp_required: None,
+                totp_enrollment_required: Some(true),
+                totp_token: Some(totp_token),
+            };
+            return Ok(Json(body).into_response());
+        }
+        totp_policy::TotpLoginRequirement::NotRequired => {}
     }
 
     let mut login_details = serde_json::json!({ "username": user.username });
@@ -956,7 +1018,7 @@ pub struct AuthApiDoc;
 mod tests {
     use super::*;
     use axum::http::header::{COOKIE, SET_COOKIE};
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, StatusCode};
 
     // -----------------------------------------------------------------------
     // local_login_gate — SSO local-login policy (issues #213 / #443)
@@ -1089,6 +1151,87 @@ mod tests {
             .await;
     }
 
+    /// #2805, DB-backed: the whole point of the policy is what `POST /login`
+    /// does with it. Under `required_for_admins` a covered admin who has not
+    /// enrolled must get an enrollment ticket instead of a session — and must
+    /// NOT get a hard rejection, which is the shape that would lock an
+    /// operator out. The same account under `disabled` gets an ordinary
+    /// session, proving the default path is untouched.
+    #[tokio::test]
+    async fn test_login_diverts_unenrolled_admin_into_enrollment_under_policy() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::to_bytes;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::sso_provider_serial_lock().await;
+
+        let user_id = Uuid::new_v4();
+        let username = format!("ph-2805-{user_id}");
+        let password = "Correct!Horse9Battery";
+        let hash = AuthService::hash_password(password).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, \
+             is_admin) VALUES ($1, $2, $3, $4, 'local', true, true)",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@example.test"))
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("seed admin");
+
+        let dir = std::env::temp_dir().join(format!("ph-2805-{user_id}"));
+        // The policy is pinned through config so this test does not contend
+        // for the shared `system_settings` row.
+        let enforcing =
+            tdh::build_state_with(pool.clone(), dir.to_string_lossy().as_ref(), |cfg| {
+                cfg.totp_policy = Some(totp_policy::TotpPolicy::RequiredForAdmins)
+            });
+        let permissive = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        // Same signing key the handler used, so the ticket below actually
+        // validates -- `Config::test_config()` would mint a different secret.
+        let enforcing_config = enforcing.config.clone();
+
+        let req = || LoginRequest {
+            username: username.clone(),
+            password: password.to_string(),
+        };
+
+        let gated = login(State(enforcing), HeaderMap::new(), Json(req())).await;
+        let ungated = login(State(permissive), HeaderMap::new(), Json(req())).await;
+
+        tdh::cleanup_user(&pool, user_id).await;
+
+        // Enforcing: 200 with an enrollment ticket and no session material.
+        let gated = gated.expect("a correct password must never be rejected by the policy");
+        assert_eq!(gated.status(), StatusCode::OK);
+        let body = to_bytes(gated.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["totp_enrollment_required"], true);
+        assert!(body.get("totp_required").is_none());
+        assert_eq!(body["access_token"], "");
+        let ticket = body["totp_token"].as_str().expect("enrollment ticket");
+        assert!(!ticket.is_empty());
+
+        // And it really is an enrollment ticket, not a verification one.
+        let svc = AuthService::new(pool.clone(), Arc::new(enforcing_config));
+        assert!(svc.validate_totp_enrollment_token(ticket).is_ok());
+        assert!(svc.validate_totp_pending_token(ticket).is_err());
+
+        // Disabled (the default): an ordinary session, unchanged.
+        let ungated = ungated.expect("login must succeed with the policy disabled");
+        let body = to_bytes(ungated.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body.get("totp_enrollment_required").is_none());
+        assert!(
+            !body["access_token"].as_str().unwrap_or("").is_empty(),
+            "a session must be issued when the policy is disabled"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // LoginRequest deserialization
     // -----------------------------------------------------------------------
@@ -1165,6 +1308,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             must_change_password: false,
             totp_required: None,
+            totp_enrollment_required: None,
             totp_token: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -1187,6 +1331,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             must_change_password: false,
             totp_required: Some(true),
+            totp_enrollment_required: None,
             totp_token: Some("pending-token-123".to_string()),
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -1203,12 +1348,38 @@ mod tests {
             token_type: "Bearer".to_string(),
             must_change_password: true,
             totp_required: Some(false),
+            totp_enrollment_required: None,
             totp_token: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["must_change_password"], true);
         assert_eq!(json["totp_required"], false);
         assert!(json.get("totp_token").is_none());
+        // #2805: absent unless the enforcement policy diverted this login.
+        assert!(json.get("totp_enrollment_required").is_none());
+    }
+
+    /// #2805: an enrollment-required login must be unambiguous — no session
+    /// material, `totp_enrollment_required` set, and `totp_required` absent so a
+    /// client cannot mistake it for the ordinary 2FA challenge.
+    #[test]
+    fn test_login_response_serialize_enrollment_required() {
+        let resp = LoginResponse {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_in: 1800,
+            token_type: "Bearer".to_string(),
+            must_change_password: false,
+            totp_required: None,
+            totp_enrollment_required: Some(true),
+            totp_token: Some("enroll-ticket".to_string()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["totp_enrollment_required"], true);
+        assert!(json.get("totp_required").is_none());
+        assert_eq!(json["totp_token"], "enroll-ticket");
+        assert_eq!(json["access_token"], "");
+        assert_eq!(json["refresh_token"], "");
     }
 
     // -----------------------------------------------------------------------
