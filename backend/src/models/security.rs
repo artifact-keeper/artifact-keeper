@@ -377,7 +377,7 @@ pub struct RawFinding {
 /// `name` is the bare package identifier (e.g. `"body-parser"`); the
 /// scanner-internal context where it was discovered lives in `source_target`
 /// (e.g. `"package-lock.json"`, `"requirements.txt"`, `"Java"`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RawPackage {
     pub name: String,
     pub version: Option<String>,

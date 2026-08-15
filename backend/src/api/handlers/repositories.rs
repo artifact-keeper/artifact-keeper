@@ -5431,6 +5431,13 @@ fn build_catalog_artifact_response(
 /// every sidecar before slicing. `per_page` is treated as at least 1 so a
 /// `per_page == 0` query cannot wedge pagination. Pure / unit-testable
 /// without a storage backend.
+///
+/// Cached upstream index responses are dropped first, through the same
+/// [`proxy_catalog::is_cached_index_path`] predicate the catalog-backed
+/// listing pushes into SQL. This legacy path only runs for a cold pre-catalog
+/// cache, but it renders the same listing, so filtering only the catalog path
+/// would leave the empty-name rows visible on exactly the repositories nobody
+/// has touched since migration 159.
 fn filter_and_paginate_paths(
     paths: Vec<String>,
     path_prefix: Option<&str>,
@@ -5445,6 +5452,7 @@ fn filter_and_paginate_paths(
 
     let mut matched: Vec<String> = paths
         .into_iter()
+        .filter(|p| !crate::services::proxy_catalog::is_cached_index_path(p))
         .filter(|p| match path_prefix {
             Some(prefix) if !prefix.is_empty() => p.starts_with(prefix),
             _ => true,
@@ -11465,6 +11473,31 @@ mod tests {
         // Sorted by path.
         assert_eq!(page[0], "is-odd/-/is-odd-3.0.1.tgz");
         assert_eq!(page[1], "lodash/-/lodash-4.17.21.tgz");
+    }
+
+    /// The legacy pre-catalog listing path must drop cached index responses
+    /// on the same terms as the catalog-backed one, or a cold cache still
+    /// renders the empty-name rows. `total` must drop with them, since it
+    /// drives the pager.
+    #[test]
+    fn test_filter_and_paginate_paths_drops_cached_index_responses() {
+        let input = paths(&[
+            "simple/idna/",
+            "simple/idna/idna-3.18-py3-none-any.whl",
+            "simple/pyyaml/",
+            "simple/pyyaml/index.v1+json",
+            // Near-miss: a real package named `index`, which must survive.
+            "simple/index/index-1.0.tar.gz",
+        ]);
+        let (page, total) = filter_and_paginate_paths(input, None, None, 1, 20);
+        assert_eq!(total, 2, "index responses are not artifacts");
+        assert_eq!(
+            page,
+            vec![
+                "simple/idna/idna-3.18-py3-none-any.whl",
+                "simple/index/index-1.0.tar.gz",
+            ]
+        );
     }
 
     #[test]

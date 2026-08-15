@@ -546,7 +546,7 @@ async fn sign_artifact(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     let (repository_id, storage_key, backend, path) = row.ok_or_else(|| {
-        AppError::NotFound(crate::api::handlers::sbom::ARTIFACT_NOT_ANALYZABLE_MSG.to_string())
+        AppError::NotFound(crate::api::handlers::sbom::SIGNING_NOT_AVAILABLE_MSG.to_string())
     })?;
 
     // Fetch the artifact bytes and sign the content.

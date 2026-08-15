@@ -6502,6 +6502,25 @@ pub(crate) async fn proxy_scan_and_record(
     {
         tracing::warn!(repo_id = %repo_id, file = %filename, error = %e, "failed to persist proxy scan verdict");
     }
+
+    // Persist the inventory for SBOM generation. Deliberately after the
+    // verdict and independently fallible: the verdict is what gates
+    // distribution, so an inventory write failure must never prevent a
+    // vulnerable artifact from being recorded as vulnerable. The worst case
+    // is that this digest has no SBOM until it is pulled again.
+    if !verdict.packages.is_empty() {
+        if let Err(e) = pss
+            .record_packages(digest, PROXY_SCAN_TYPE, &verdict.packages)
+            .await
+        {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, error = %e,
+                "failed to persist proxy scan package inventory; SBOM will be \
+                 unavailable for this digest until it is pulled again"
+            );
+        }
+    }
+
     Some(verdict)
 }
 

@@ -221,11 +221,81 @@ pub async fn sum_by_repo(db: &PgPool, repository_id: Uuid) -> Result<i64> {
     Ok(sum)
 }
 
+// ---------------------------------------------------------------------------
+// Cached INDEX responses vs cached ARTIFACTS
+// ---------------------------------------------------------------------------
+//
+// A pull-through cache stores the upstream INDEX responses next to the package
+// files, in the same table and with the same shape:
+//
+//     simple/idna/                           text/html              26281
+//     simple/idna/idna-3.18-py3-none-any.whl binary/octet-stream    65455
+//
+// The `simple/<pkg>/` row is a cached HTML index page, not an artifact. Left
+// unfiltered it renders in the artifact listing with an EMPTY name column, and
+// -- worse -- it counts as an unscanned item in the proxy scan summary, where
+// it is a permanent false positive: an HTML index has no package inventory, so
+// no scan can ever clear it and the operator is shown an "unknown" status with
+// no available remedy.
+//
+// These rows are NOT deleted and caching them is not changed: they are real
+// cache entries occupying real bytes, so storage accounting
+// ([`sum_by_repo`] and the repository usage rollups) deliberately still counts
+// them. Only their PRESENTATION as artifacts and their inclusion in scan counts
+// is wrong.
+//
+// CONSEQUENCE, and it is the correct trade: a repository's storage total no
+// longer reconciles with the sum of its listed artifacts' sizes. The listing
+// answers "what packages are cached here", storage answers "what bytes are on
+// disk", and index responses are bytes that are not packages. Any future
+// reconciliation check between the two must account for index rows rather than
+// "fixing" this filter.
+//
+// The definition lives HERE, once, and is consumed by both the artifact listing
+// ([`browse_page`] / [`browse_count`]) and every proxy-scan query in
+// `api::handlers::security`. Two copies would drift and the two views would
+// disagree again, which is the bug this exists to prevent --
+// `cached_index_sql_and_rust_agree` pins the SQL and Rust forms to each other.
+
+/// Basename of the PEP 691 JSON index response. Its HTML sibling has no
+/// basename of its own -- the upstream URL ends in `/`, so the cached path
+/// does too, which is the other half of [`is_cached_index_path`].
+pub const CACHED_INDEX_BASENAME: &str = "index.v1+json";
+
+/// True when `path` names a cached upstream index/metadata response rather
+/// than a package artifact.
+///
+/// Deliberately narrow. It matches a trailing `/` and an EXACT basename, never
+/// a substring: `simple/index/index-1.0.whl` and `pkg/my-index.v1+json` are
+/// real artifacts and must keep listing and scanning normally.
+pub fn is_cached_index_path(path: &str) -> bool {
+    path.ends_with('/') || path.rsplit('/').next() == Some(CACHED_INDEX_BASENAME)
+}
+
+/// The SQL form of [`is_cached_index_path`], for `path_column` (pass a
+/// qualified `alias.path` when the query joins). Interpolated rather than
+/// bound because it is composed into projections shared across several
+/// queries; [`CACHED_INDEX_BASENAME`] is a compile-time constant containing no
+/// quote or `LIKE` metacharacter, which `cached_index_basename_is_sql_safe`
+/// enforces.
+pub fn cached_index_sql(path_column: &str) -> String {
+    format!(
+        "({c} LIKE '%/' OR {c} = '{b}' OR {c} LIKE '%/{b}')",
+        c = path_column,
+        b = CACHED_INDEX_BASENAME
+    )
+}
+
+/// Negation of [`cached_index_sql`], i.e. "this row is a real artifact".
+pub fn not_cached_index_sql(path_column: &str) -> String {
+    format!("NOT {}", cached_index_sql(path_column))
+}
+
 /// One catalog row as surfaced by the remote-repository browse listing
 /// (PF-002 / #2519). Unlike [`ProxyCacheEntry`] this carries `cached_at`, so
 /// the listing can render the cache timestamp without reading the storage
 /// sidecar for each page item.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ProxyCacheBrowseRow {
     pub path: String,
     pub size_bytes: i64,
@@ -266,6 +336,10 @@ pub async fn has_rows(db: &PgPool, repository_id: Uuid) -> Result<bool> {
 /// legacy `page=N` addressing when no cursor is supplied (pass 0 with a
 /// cursor). The caller passes `limit = per_page + 1` and uses the extra row
 /// as the authoritative `has_more` signal (#2520 pattern).
+///
+/// Cached index responses ([`is_cached_index_path`]) are excluded: they are
+/// cache entries, not artifacts, and listing them produced rows with an empty
+/// name. They remain in the table and in storage accounting.
 pub async fn browse_page(
     db: &PgPool,
     repository_id: Uuid,
@@ -275,7 +349,9 @@ pub async fn browse_page(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<ProxyCacheBrowseRow>> {
-    let rows = sqlx::query!(
+    // Composed rather than a `query!` literal so the index-response filter is
+    // the SAME expression the scan queries use -- see the module note above.
+    let rows = sqlx::query_as::<_, ProxyCacheBrowseRow>(&format!(
         r#"
         SELECT path, size_bytes, checksum_sha256, content_type, cached_at
         FROM proxy_cache_artifacts
@@ -283,53 +359,51 @@ pub async fn browse_page(
           AND ($2::TEXT IS NULL OR path LIKE $2 ESCAPE '\')
           AND ($3::TEXT IS NULL OR path ILIKE $3 ESCAPE '\')
           AND ($4::TEXT IS NULL OR path > $4)
+          AND {not_index}
         ORDER BY path
         LIMIT $5 OFFSET $6
         "#,
-        repository_id,
-        prefix_like,
-        q_like,
-        after_path,
-        limit,
-        offset,
-    )
+        not_index = not_cached_index_sql("path"),
+    ))
+    .bind(repository_id)
+    .bind(prefix_like)
+    .bind(q_like)
+    .bind(after_path)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| ProxyCacheBrowseRow {
-            path: r.path,
-            size_bytes: r.size_bytes,
-            checksum_sha256: r.checksum_sha256,
-            content_type: r.content_type,
-            cached_at: r.cached_at,
-        })
-        .collect())
+    Ok(rows)
 }
 
 /// Exact match count for [`browse_page`]'s filters, behind the listing's
 /// explicit `?count=exact` opt-in (#2520 pattern): the default response
 /// reports a cheap lower-bound total plus an authoritative `has_more`.
+///
+/// Excludes cached index responses on the same terms as [`browse_page`], so
+/// the count matches the rows the listing actually returns.
 pub async fn browse_count(
     db: &PgPool,
     repository_id: Uuid,
     prefix_like: Option<&str>,
     q_like: Option<&str>,
 ) -> Result<i64> {
-    let count = sqlx::query_scalar!(
+    let count = sqlx::query_scalar::<_, i64>(&format!(
         r#"
-        SELECT COUNT(*)::BIGINT AS "count!"
+        SELECT COUNT(*)::BIGINT
         FROM proxy_cache_artifacts
         WHERE repository_id = $1
           AND ($2::TEXT IS NULL OR path LIKE $2 ESCAPE '\')
           AND ($3::TEXT IS NULL OR path ILIKE $3 ESCAPE '\')
+          AND {not_index}
         "#,
-        repository_id,
-        prefix_like,
-        q_like,
-    )
+        not_index = not_cached_index_sql("path"),
+    ))
+    .bind(repository_id)
+    .bind(prefix_like)
+    .bind(q_like)
     .fetch_one(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -575,6 +649,168 @@ mod tests {
             .bind(id)
             .execute(pool)
             .await;
+    }
+
+    /// Sample paths spanning both sides of the index/artifact boundary,
+    /// including the near-misses that a substring match would wrongly catch.
+    /// Shared by the Rust-side and SQL-side assertions so both are pinned to
+    /// exactly the same expectations.
+    const INDEX_PATH_SAMPLES: &[(&str, bool)] = &[
+        // Cached upstream index responses.
+        ("simple/idna/", true),
+        ("simple/pyyaml/", true),
+        ("simple/", true),
+        ("simple/idna/index.v1+json", true),
+        ("index.v1+json", true),
+        // Real artifacts. None of these may ever be filtered out.
+        ("simple/idna/idna-3.18-py3-none-any.whl", false),
+        ("simple/pyyaml/PyYAML-5.3.1.tar.gz", false),
+        // Near-misses: a package literally named `index`, and a file whose
+        // name merely ENDS with the index basename. Substring matching would
+        // silently hide both from the listing and from the scan counts.
+        ("simple/index/index-1.0.tar.gz", false),
+        ("simple/foo/my-index.v1+json", false),
+        ("simple/foo/index.v1+json.asc", false),
+        ("simple/foo/bar.whl", false),
+    ];
+
+    #[test]
+    fn is_cached_index_path_matches_indexes_and_spares_artifacts() {
+        for (path, expected) in INDEX_PATH_SAMPLES {
+            assert_eq!(
+                is_cached_index_path(path),
+                *expected,
+                "is_cached_index_path({:?}) should be {}",
+                path,
+                expected
+            );
+        }
+    }
+
+    /// [`cached_index_sql`] interpolates [`CACHED_INDEX_BASENAME`] into a SQL
+    /// string literal and into `LIKE` patterns. Guard the two assumptions that
+    /// makes: no quote (which would break out of the literal) and no `LIKE`
+    /// metacharacter (which would silently widen the match).
+    #[test]
+    fn cached_index_basename_is_sql_safe() {
+        for bad in ['\'', '%', '_', '\\'] {
+            assert!(
+                !CACHED_INDEX_BASENAME.contains(bad),
+                "CACHED_INDEX_BASENAME must not contain {:?}; it is interpolated \
+                 into a SQL literal and a LIKE pattern",
+                bad
+            );
+        }
+        let sql = cached_index_sql("pca.path");
+        assert!(sql.contains("pca.path LIKE '%/'"));
+        assert!(not_cached_index_sql("path").starts_with("NOT ("));
+    }
+
+    /// THE anti-drift test. [`is_cached_index_path`] and [`cached_index_sql`]
+    /// are two encodings of one definition -- one used in Rust, one pushed into
+    /// Postgres -- and the whole point of this predicate is that the artifact
+    /// listing and the proxy-scan counts agree about what an artifact is.
+    /// Evaluate the SQL form in the database over every sample and require it
+    /// to return exactly what the Rust form returns.
+    #[tokio::test]
+    async fn cached_index_sql_and_rust_agree() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let paths: Vec<String> = INDEX_PATH_SAMPLES
+            .iter()
+            .map(|(p, _)| (*p).to_string())
+            .collect();
+        // Evaluate the predicate in Postgres against the samples as a values
+        // list, so no catalog rows (and no repository fixture) are needed.
+        let sql = format!(
+            "SELECT s.path, {} AS is_index FROM UNNEST($1::TEXT[]) AS s(path) ORDER BY s.path",
+            cached_index_sql("s.path")
+        );
+        let rows: Vec<(String, bool)> = sqlx::query_as(&sql)
+            .bind(&paths)
+            .fetch_all(&pool)
+            .await
+            .expect("evaluate cached_index_sql in postgres");
+        assert_eq!(rows.len(), INDEX_PATH_SAMPLES.len());
+        for (path, sql_says) in rows {
+            assert_eq!(
+                sql_says,
+                is_cached_index_path(&path),
+                "SQL and Rust disagree about {:?}: SQL={}, Rust={}",
+                path,
+                sql_says,
+                is_cached_index_path(&path)
+            );
+        }
+    }
+
+    /// The artifact listing must not surface cached index responses -- they
+    /// rendered with an empty Name column -- while storage accounting must
+    /// still count their bytes. Both halves in one test so a "fix" that simply
+    /// stops caching or deletes the rows fails here.
+    #[tokio::test]
+    async fn browse_excludes_index_responses_but_storage_still_counts_them() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let seed = |path: &'static str, size: i64| {
+            let pool = pool.clone();
+            async move {
+                upsert(
+                    &pool,
+                    repo,
+                    path,
+                    &format!("proxy-cache/idx/{path}/__content__"),
+                    &format!("proxy-cache/idx/{path}/__cache_meta__.json"),
+                    size,
+                    Some("d"),
+                    Some("text/html"),
+                    None,
+                )
+                .await
+                .expect("seed");
+            }
+        };
+        seed("simple/idna/", 26281).await;
+        seed("simple/idna/index.v1+json", 1000).await;
+        seed("simple/idna/idna-3.18-py3-none-any.whl", 65455).await;
+        // Near-miss artifact: must survive the filter.
+        seed("simple/index/index-1.0.tar.gz", 20).await;
+
+        let rows = browse_page(&pool, repo, None, None, None, 0, 50)
+            .await
+            .expect("browse");
+        let listed: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            listed,
+            vec![
+                "simple/idna/idna-3.18-py3-none-any.whl",
+                "simple/index/index-1.0.tar.gz"
+            ],
+            "only real artifacts are listed"
+        );
+        assert!(
+            rows.iter().all(|r| !r.path.ends_with('/')),
+            "no empty-name rows"
+        );
+        assert_eq!(
+            browse_count(&pool, repo, None, None).await.expect("count"),
+            2,
+            "the exact count must match the rows the listing returns"
+        );
+
+        // Storage accounting is deliberately NOT filtered: the index responses
+        // are real cached bytes on disk. This is why a repository's storage
+        // total no longer reconciles with the sum of its listed artifacts.
+        assert_eq!(
+            sum_by_repo(&pool, repo).await.expect("sum"),
+            26281 + 1000 + 65455 + 20,
+            "storage accounting must still see cached index responses"
+        );
+
+        cleanup_repo(&pool, repo).await;
     }
 
     #[tokio::test]

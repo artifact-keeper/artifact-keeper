@@ -316,6 +316,93 @@ pub fn decide_serve(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Proxy scan visibility (#3348): pure state-mapping + staleness helpers
+// ---------------------------------------------------------------------------
+//
+// GET /api/v1/repositories/:key/security/proxy-scans reads this same table
+// but must never invent a state the write path cannot produce. These helpers
+// are the single source for that mapping so the handler and its tests share
+// one definition instead of re-deriving it inline.
+
+/// The three states the read endpoint may report. `error` is deliberately
+/// excluded: `VERDICT_ERROR` has zero production writers (see module docs on
+/// [`decide_inconclusive`]), so surfacing it as a fourth state would document
+/// dead code as a real UI affordance.
+pub const STATE_CLEAN: &str = "clean";
+pub const STATE_VULNERABLE: &str = "vulnerable";
+pub const STATE_NOT_SCANNED: &str = "not_scanned";
+
+/// `not_scanned` reason: `scan_configs.scan_on_proxy` is `false`, INCLUDING
+/// when the row is absent (the default state — see
+/// [`ScanConfigService::is_proxy_scan_enabled`](crate::services::scan_config_service::ScanConfigService::is_proxy_scan_enabled)).
+pub const NOT_SCANNED_REASON_SCANNING_DISABLED: &str = "scanning_disabled";
+/// `not_scanned` reason: everything else — over the size cap, identity
+/// unestablished, a failed scan, or (defensively) an unrecognized verdict
+/// token. Must never be worded to imply the content is safe.
+pub const NOT_SCANNED_REASON_UNKNOWN: &str = "unknown";
+
+/// Derive `(state, reason)` for one proxy-cached digest from its verdict (if
+/// any row was found by the `checksum_sha256 + scan_type` join) and whether
+/// proxy scanning is enabled for the calling repository.
+///
+/// `reason` is `Some` iff `state == STATE_NOT_SCANNED`; `None` for `clean` /
+/// `vulnerable`. A naive `WHERE scan_on_proxy = false` join on an absent
+/// `scan_configs` row would return no rows at all and misfile the repo's
+/// default (never-configured) state as `unknown` instead of
+/// `scanning_disabled` — callers must resolve `scan_on_proxy` via
+/// `is_proxy_scan_enabled`'s `unwrap_or(false)` BEFORE calling this, not via
+/// a raw join, so that default is captured correctly.
+pub fn derive_proxy_scan_state(
+    verdict: Option<&str>,
+    scan_on_proxy: bool,
+) -> (&'static str, Option<&'static str>) {
+    match verdict {
+        Some(VERDICT_CLEAN) => (STATE_CLEAN, None),
+        Some(VERDICT_VULNERABLE) => (STATE_VULNERABLE, None),
+        // VERDICT_ERROR or any other unrecognized token: no writer produces
+        // this today, but fold defensively into not_scanned/unknown rather
+        // than panicking or fabricating a fourth state.
+        Some(_) => (STATE_NOT_SCANNED, Some(NOT_SCANNED_REASON_UNKNOWN)),
+        None if !scan_on_proxy => (
+            STATE_NOT_SCANNED,
+            Some(NOT_SCANNED_REASON_SCANNING_DISABLED),
+        ),
+        None => (STATE_NOT_SCANNED, Some(NOT_SCANNED_REASON_UNKNOWN)),
+    }
+}
+
+/// Age-based staleness for the read endpoint: `scanned_at < now - ttl_days`.
+///
+/// Deliberately NOT [`verdict_is_reusable`]: that function is policy-
+/// contaminated (factors in `fail_closed`, so the same row would render stale
+/// in one repository and fresh in another) and needs a live scanner-version
+/// probe, neither of which a read-only summary aggregate can do.
+///
+/// Boundary: the serve-path freshness gate ([`verdict_is_fresh`]) tests
+/// `now < scanned_at + ttl` (strict). The equivalent strict form of this
+/// staleness test is `now > scanned_at + ttl`, so at exact equality
+/// (`scanned_at + ttl == now`) a verdict is reported as neither fresh nor
+/// stale by either function — consistent, not a gap.
+///
+/// A digest with no verdict row (`not_scanned`) is never stale: there is
+/// nothing to have gone stale. Callers with a nullable `scanned_at` from a
+/// `LEFT JOIN` must route it through this function (or an equivalent
+/// `COALESCE(..., false)`) rather than a raw SQL comparison — a raw
+/// `scanned_at < now() - interval` against a NULL `scanned_at` evaluates to
+/// SQL NULL, which — if ever used as a `GROUP BY` key — creates a spurious
+/// third group alongside `true`/`false`.
+pub fn is_proxy_scan_stale(
+    scanned_at: Option<DateTime<Utc>>,
+    ttl_days: i64,
+    now: DateTime<Utc>,
+) -> bool {
+    match scanned_at {
+        Some(t) => t < now - Duration::days(ttl_days),
+        None => false,
+    }
+}
+
 pub struct ProxyScanService {
     db: PgPool,
 }
@@ -454,6 +541,107 @@ impl ProxyScanService {
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Persist the package inventory the inline proxy scan cataloged, so an
+    /// SBOM can later be generated for this digest without re-fetching or
+    /// re-scanning the bytes.
+    ///
+    /// Digest-keyed and repository-agnostic by design: the inventory is a
+    /// property of the content, so byte-identical artifacts cached in many
+    /// repositories share one set of rows, and no tenant's cache eviction can
+    /// destroy an inventory another tenant is serving.
+    ///
+    /// An empty inventory is a no-op rather than a delete. A scanner that
+    /// reports nothing must not erase a richer inventory recorded earlier for
+    /// the same digest — that would silently downgrade an existing SBOM.
+    ///
+    /// Uses `UNNEST` so the whole inventory is one round trip regardless of
+    /// component count, and `ON CONFLICT DO UPDATE` so a re-scan refreshes
+    /// metadata rather than accumulating duplicates.
+    pub async fn record_packages(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        packages: &[crate::models::security::RawPackage],
+    ) -> Result<()> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
+        let versions: Vec<Option<String>> = packages.iter().map(|p| p.version.clone()).collect();
+        let purls: Vec<Option<String>> = packages.iter().map(|p| p.purl.clone()).collect();
+        let licenses: Vec<Option<String>> = packages.iter().map(|p| p.license.clone()).collect();
+
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_scan_packages (
+                checksum_sha256, scan_type, name, version, purl, license, recorded_at
+            )
+            SELECT $1, $2, u.name, u.version, u.purl, u.license, now()
+            FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[])
+                AS u(name, version, purl, license)
+            ON CONFLICT (checksum_sha256, scan_type, name, COALESCE(version, ''))
+            DO UPDATE SET
+                purl = COALESCE(EXCLUDED.purl, proxy_scan_packages.purl),
+                license = COALESCE(EXCLUDED.license, proxy_scan_packages.license),
+                recorded_at = now()
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(&names)
+        .bind(&versions)
+        .bind(&purls)
+        .bind(&licenses)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Read back the inventory for a digest, for SBOM generation.
+    ///
+    /// Filtered on `scan_type` because the uniqueness key includes it: an
+    /// unfiltered read would merge two engines' inventories into one SBOM the
+    /// day a second scan type is written.
+    ///
+    /// An empty result means "no inventory recorded", which callers must
+    /// render as unknown — never as an empty and therefore falsely clean SBOM.
+    pub async fn fetch_packages(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+    ) -> Result<Vec<crate::models::security::RawPackage>> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT name, version, purl, license
+            FROM proxy_scan_packages
+            WHERE checksum_sha256 = $1 AND scan_type = $2
+            ORDER BY name, version
+            "#,
+        )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(name, version, purl, license)| crate::models::security::RawPackage {
+                    name,
+                    version,
+                    purl,
+                    license,
+                    source_target: None,
+                },
+            )
+            .collect())
     }
 }
 
@@ -952,6 +1140,111 @@ mod tests {
             decide_serve(Some(&vuln), None, ProxyScanAction::FailClosed, 30, now),
             ServeDecision::BlockCached
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Proxy scan visibility (#3348): state mapping + staleness
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn derive_state_clean_and_vulnerable_have_no_reason() {
+        assert_eq!(
+            derive_proxy_scan_state(Some(VERDICT_CLEAN), true),
+            (STATE_CLEAN, None)
+        );
+        assert_eq!(
+            derive_proxy_scan_state(Some(VERDICT_CLEAN), false),
+            (STATE_CLEAN, None),
+            "a stored clean verdict is reported as clean regardless of the \
+             calling repo's current scan_on_proxy setting (verdicts are global)"
+        );
+        assert_eq!(
+            derive_proxy_scan_state(Some(VERDICT_VULNERABLE), true),
+            (STATE_VULNERABLE, None)
+        );
+        assert_eq!(
+            derive_proxy_scan_state(Some(VERDICT_VULNERABLE), false),
+            (STATE_VULNERABLE, None)
+        );
+    }
+
+    #[test]
+    fn derive_state_no_row_scanning_disabled() {
+        assert_eq!(
+            derive_proxy_scan_state(None, false),
+            (
+                STATE_NOT_SCANNED,
+                Some(NOT_SCANNED_REASON_SCANNING_DISABLED)
+            )
+        );
+    }
+
+    /// The absent-`scan_configs` row case: the caller resolves
+    /// `scan_on_proxy` via `is_proxy_scan_enabled`'s `unwrap_or(false)`
+    /// BEFORE calling this function, so "no config row ever saved" arrives
+    /// here as `scan_on_proxy = false` — identical to an explicit disable —
+    /// and must resolve to `scanning_disabled`, matching what the proxy gate
+    /// actually does for that repository.
+    #[test]
+    fn derive_state_absent_config_row_resolves_scanning_disabled() {
+        let never_configured_default = false; // is_proxy_scan_enabled().unwrap_or(false)
+        assert_eq!(
+            derive_proxy_scan_state(None, never_configured_default),
+            (
+                STATE_NOT_SCANNED,
+                Some(NOT_SCANNED_REASON_SCANNING_DISABLED)
+            )
+        );
+    }
+
+    #[test]
+    fn derive_state_no_row_scanning_enabled_is_unknown() {
+        assert_eq!(
+            derive_proxy_scan_state(None, true),
+            (STATE_NOT_SCANNED, Some(NOT_SCANNED_REASON_UNKNOWN))
+        );
+    }
+
+    #[test]
+    fn derive_state_unrecognized_verdict_token_folds_to_unknown() {
+        // Defensive: VERDICT_ERROR (and anything else unrecognized) has zero
+        // production writers but must not panic or invent a fourth state.
+        assert_eq!(
+            derive_proxy_scan_state(Some(VERDICT_ERROR), true),
+            (STATE_NOT_SCANNED, Some(NOT_SCANNED_REASON_UNKNOWN))
+        );
+        assert_eq!(
+            derive_proxy_scan_state(Some("garbage"), false),
+            (STATE_NOT_SCANNED, Some(NOT_SCANNED_REASON_UNKNOWN))
+        );
+    }
+
+    #[test]
+    fn stale_not_scanned_row_is_never_stale() {
+        assert!(!is_proxy_scan_stale(None, 30, Utc::now()));
+    }
+
+    #[test]
+    fn stale_age_based_boundary() {
+        let now = Utc::now();
+        // Well within the TTL: fresh.
+        assert!(!is_proxy_scan_stale(Some(now - Duration::days(1)), 30, now));
+        // Well past the TTL: stale.
+        assert!(is_proxy_scan_stale(Some(now - Duration::days(31)), 30, now));
+        // Exact boundary (`scanned_at == now - ttl_days`): the formula is a
+        // strict `<`, so equality is NOT stale. Pick a side, per the design
+        // doc, matching the serve-path gate's strict `now < scanned_at + ttl`.
+        assert!(!is_proxy_scan_stale(
+            Some(now - Duration::days(30)),
+            30,
+            now
+        ));
+        // One nanosecond past the boundary: stale.
+        assert!(is_proxy_scan_stale(
+            Some(now - Duration::days(30) - Duration::nanoseconds(1)),
+            30,
+            now
+        ));
     }
 
     #[test]
