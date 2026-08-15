@@ -573,13 +573,33 @@ fn session_cookie_token(headers: &HeaderMap) -> Option<&str> {
 /// cannot make the browser omit it, so the contract has to be decided on the
 /// request's shape, before any credential is resolved.
 fn credential_is_session_cookie(headers: &HeaderMap) -> bool {
-    let has_header_credential = headers
+    !has_header_credential(headers) && session_cookie_token(headers).is_some()
+}
+
+/// Whether the request presents a credential in a HEADER (`Authorization` or
+/// `X-API-Key`), as opposed to the session cookie.
+fn has_header_credential(headers: &HeaderMap) -> bool {
+    headers
         .get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .is_some_and(|h| !matches!(extract_token_from_auth_header(h), ExtractedToken::None))
-        || headers.contains_key(&X_API_KEY);
+        || headers.contains_key(&X_API_KEY)
+}
 
-    !has_header_credential && session_cookie_token(headers).is_some()
+/// Whether this request carries ANY caller credential — `Authorization`,
+/// `X-API-Key`, or the `ak_access_token` session cookie.
+///
+/// The single source of truth for "is this request credentialed", so a
+/// caller-dependent response's cacheability (`cache_headers::
+/// negotiated_cache_control`, #3406) cannot drift from the set of carriers
+/// [`extract_token`] actually accepts. Adding a fourth carrier there without
+/// updating this would let a shared cache store and replay a response built
+/// for one caller.
+///
+/// Like [`credential_is_session_cookie`], this is a test on the request's
+/// SHAPE, not on whether the credential authenticates.
+pub fn request_carries_credentials(headers: &HeaderMap) -> bool {
+    has_header_credential(headers) || session_cookie_token(headers).is_some()
 }
 
 /// Whether `method` can change server state, and therefore falls under the
@@ -4066,6 +4086,40 @@ mod tests {
                 "{method} is not state-changing and must stay unaffected"
             );
         }
+    }
+
+    /// #3406: `request_carries_credentials` must recognise EVERY carrier
+    /// [`extract_token`] accepts. It decides whether a caller-dependent
+    /// response may be stored by a shared cache, so a carrier missing here is
+    /// a credentialed response handed a `public` directive.
+    #[test]
+    fn request_carries_credentials_covers_every_carrier() {
+        // (header, value, is a credential?)
+        let cases: [(&HeaderName, &str, bool); 7] = [
+            (&AUTHORIZATION, "Bearer ak_token_abc", true),
+            (&AUTHORIZATION, "Basic dXNlcjpwYXNz", true),
+            // The scheme-less raw token the cargo credential provider sends.
+            (&AUTHORIZATION, "ak_raw_cargo_token", true),
+            (&X_API_KEY, "ak_key_abc", true),
+            (&COOKIE, "ak_access_token=jwt-here", true),
+            // A cookie jar carrying no session token is not a credential.
+            (&COOKIE, "theme=dark; lang=en", false),
+            // A malformed `Authorization` still counts. That is the safe
+            // direction for both consumers: the CSRF contract treats it as a
+            // header credential, and the cache decision falls to `private`.
+            (&AUTHORIZATION, "", true),
+        ];
+        for (header, value, expected) in cases {
+            let mut h = HeaderMap::new();
+            h.insert(header, value.parse().unwrap());
+            assert_eq!(
+                request_carries_credentials(&h),
+                expected,
+                "{header}: {value:?}"
+            );
+        }
+        // Anonymous.
+        assert!(!request_carries_credentials(&HeaderMap::new()));
     }
 
     /// The exemption that keeps every native package-manager client working:

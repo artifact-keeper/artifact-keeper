@@ -12,7 +12,9 @@
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, VARY,
+};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,7 +30,8 @@ use std::future::Future;
 use tracing::{debug, info, warn};
 
 use crate::api::handlers::cache_headers::{
-    cacheable_response, check_conditional_request, compute_etag, DEFAULT_CACHE_CONTROL,
+    check_conditional_request_with, compute_etag, negotiated_cache_control,
+    negotiated_cacheable_response, VARY_ACCEPT,
 };
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -672,7 +675,7 @@ fn build_simple_root_response(
         // HTTP caching (#2773): serve the JSON root index through the shared
         // cacheable_response helper so it carries an ETag + Cache-Control and
         // honors If-None-Match (-> 304), matching conda/maven.
-        return Ok(cacheable_response(
+        return Ok(negotiated_cacheable_response(
             serde_json::to_vec(&json).unwrap(),
             "application/vnd.pypi.simple.v1+json",
             headers,
@@ -694,9 +697,17 @@ fn build_simple_root_response(
     // HTTP caching (#2773): compute a strong ETag over the rendered body and
     // honor If-None-Match here (rather than via the shared cacheable_response)
     // so the PEP 503 security headers below are preserved on the 200 path.
+    //
+    // #3406: this arm is the HTML half of an `Accept`-negotiated pair, so it
+    // carries the same `Vary`/`Cache-Control` the shared helper emits for the
+    // JSON half above. Open-coding the response must not open-code a weaker
+    // cache contract.
+    let cache_control = negotiated_cache_control(headers);
     let body = html.into_bytes();
     let etag = compute_etag(&body);
-    if let Some(not_modified) = check_conditional_request(headers, &etag) {
+    if let Some(not_modified) =
+        check_conditional_request_with(headers, &etag, cache_control, Some(VARY_ACCEPT))
+    {
         return Ok(not_modified);
     }
 
@@ -711,7 +722,8 @@ fn build_simple_root_response(
         )
         .header("X-Content-Type-Options", "nosniff")
         .header(ETAG, &etag)
-        .header(CACHE_CONTROL, DEFAULT_CACHE_CONTROL)
+        .header(CACHE_CONTROL, cache_control)
+        .header(VARY, VARY_ACCEPT)
         .body(Body::from(body))
         .unwrap())
 }
@@ -860,7 +872,7 @@ async fn simple_project(
                         )
                         .await;
                         // HTTP caching (#2773): ETag + Cache-Control + 304.
-                        return Ok(cacheable_response(
+                        return Ok(negotiated_cacheable_response(
                             json.into_bytes(),
                             PEP691_JSON_CONTENT_TYPE,
                             &headers,
@@ -881,7 +893,11 @@ async fn simple_project(
                     )
                     .await;
                     // HTTP caching (#2773): ETag + Cache-Control + 304.
-                    return Ok(cacheable_response(rewritten.into_bytes(), &ct, &headers));
+                    return Ok(negotiated_cacheable_response(
+                        rewritten.into_bytes(),
+                        &ct,
+                        &headers,
+                    ));
                 }
 
                 // #2801: the upstream Content-Type is neither JSON (handled
@@ -903,7 +919,7 @@ async fn simple_project(
                                     json,
                                 )
                                 .await;
-                                Ok(cacheable_response(
+                                Ok(negotiated_cacheable_response(
                                     json.into_bytes(),
                                     PEP691_JSON_CONTENT_TYPE,
                                     &headers,
@@ -924,7 +940,7 @@ async fn simple_project(
                             rewritten,
                         )
                         .await;
-                        Ok(cacheable_response(
+                        Ok(negotiated_cacheable_response(
                             rewritten.into_bytes(),
                             "text/html; charset=utf-8",
                             &headers,
@@ -1249,7 +1265,7 @@ async fn simple_project(
                                     &tracks,
                                 )
                                 .unwrap_or_else(|| empty_pep691_listing(normalized.as_str()));
-                                Ok(cacheable_response(
+                                Ok(negotiated_cacheable_response(
                                     merged.into_bytes(),
                                     PEP691_JSON_CONTENT_TYPE,
                                     &headers,
@@ -1265,7 +1281,7 @@ async fn simple_project(
                                     &local_artifacts,
                                     &tracks,
                                 );
-                                Ok(cacheable_response(
+                                Ok(negotiated_cacheable_response(
                                     merged.into_bytes(),
                                     "text/html; charset=utf-8",
                                     &headers,
@@ -1282,7 +1298,7 @@ async fn simple_project(
                                     &tracks,
                                 )
                                 .unwrap_or_else(|| empty_pep691_listing(normalized.as_str()));
-                                Ok(cacheable_response(
+                                Ok(negotiated_cacheable_response(
                                     merged.into_bytes(),
                                     PEP691_JSON_CONTENT_TYPE,
                                     &headers,
@@ -1304,7 +1320,7 @@ async fn simple_project(
                             &tracks,
                         ) {
                             // HTTP caching (#2773): ETag + Cache-Control + 304.
-                            return Ok(cacheable_response(
+                            return Ok(negotiated_cacheable_response(
                                 json.into_bytes(),
                                 PEP691_JSON_CONTENT_TYPE,
                                 &headers,
@@ -1324,7 +1340,11 @@ async fn simple_project(
                             &tracks,
                         );
                         // HTTP caching (#2773): ETag + Cache-Control + 304.
-                        return Ok(cacheable_response(merged.into_bytes(), &ct, &headers));
+                        return Ok(negotiated_cacheable_response(
+                            merged.into_bytes(),
+                            &ct,
+                            &headers,
+                        ));
                     }
 
                     // #2801: the upstream Content-Type is neither JSON (handled
@@ -1342,7 +1362,7 @@ async fn simple_project(
                                 &local_artifacts,
                                 &tracks,
                             ) {
-                                Some(json) => Ok(cacheable_response(
+                                Some(json) => Ok(negotiated_cacheable_response(
                                     json.into_bytes(),
                                     PEP691_JSON_CONTENT_TYPE,
                                     &headers,
@@ -1361,7 +1381,7 @@ async fn simple_project(
                                 &local_artifacts,
                                 &tracks,
                             );
-                            Ok(cacheable_response(
+                            Ok(negotiated_cacheable_response(
                                 merged.into_bytes(),
                                 "text/html; charset=utf-8",
                                 &headers,
@@ -1490,7 +1510,7 @@ fn build_simple_project_response(
 
         // HTTP caching (#2773): ETag + Cache-Control + 304, via the shared
         // helper used by conda/maven.
-        return Ok(cacheable_response(
+        return Ok(negotiated_cacheable_response(
             serde_json::to_vec(&json).unwrap(),
             "application/vnd.pypi.simple.v1+json",
             headers,
@@ -1562,7 +1582,7 @@ fn build_simple_project_response(
 
     // HTTP caching (#2773): ETag + Cache-Control + 304. This HTML variant
     // carries no extra security headers, so the shared helper suffices.
-    Ok(cacheable_response(
+    Ok(negotiated_cacheable_response(
         html.into_bytes(),
         "text/html; charset=utf-8",
         headers,
@@ -1906,25 +1926,33 @@ async fn serve_virtual_metadata(
     // admitted Case-A platform wheel. Without this gate, a direct or stale
     // `.metadata` URL could expose a remote-only Case-B version that neither
     // the index advertises nor the download route serves.
-    let owning_local_min_priority = proxy_helpers::pypi_virtual_isolates_name(
+    let guard = PypiOwnershipGuard::resolve(
         &state.db,
         virtual_repo.id,
+        &members,
         normalized_project.as_str(),
     )
     .await?;
-    let member_priorities = if owning_local_min_priority.is_some() {
-        proxy_helpers::fetch_virtual_member_priorities(&state.db, virtual_repo.id).await?
-    } else {
-        Default::default()
-    };
-    let owned_profile = if owning_local_min_priority.is_some() {
-        pypi_owned_wheel_profile(&state.db, &members, normalized_project.as_str()).await
-    } else {
-        OwnedWheelProfile::default()
-    };
 
     let mut first_member_error: Option<Response> = None;
     for member in members {
+        // #3404 (sibling of the `serve_file` fix): apply the guard BEFORE the
+        // local-first `serve_metadata` call below, not after it.
+        //
+        // The check used to live inside the Remote branch further down, so a
+        // suppressed member's locally-cached `artifacts` row was read — and its
+        // METADATA returned — by the local-first lookup that runs for every
+        // member. Fixing only the wheel path would have left the sidecar
+        // exposing exactly the suppressed distribution the wheel now 404s for.
+        if guard.suppresses(member.id, &member.repo_type, filename) {
+            debug!(
+                member_key = %member.key,
+                %filename,
+                "virtual pypi member suppressed by ownership guard; skipping metadata"
+            );
+            continue;
+        }
+
         let member_info = proxy_helpers::repo_info_from_member(&member);
         if enforce_pypi_curation(
             state,
@@ -1993,20 +2021,7 @@ async fn serve_virtual_metadata(
         }
 
         let result = if member.repo_type == RepositoryType::Remote {
-            let remote_suppressed = match owning_local_min_priority {
-                Some(local_min) => {
-                    local_min
-                        < member_priorities
-                            .get(&member.id)
-                            .copied()
-                            .unwrap_or(i32::MAX)
-                        && !owned_profile.admits(filename)
-                }
-                None => false,
-            };
-            if remote_suppressed {
-                continue;
-            }
+            // Suppression already applied at the top of the loop (#3404).
             match (&member.upstream_url, state.proxy_service.as_ref()) {
                 (Some(upstream_url), Some(proxy)) => {
                     serve_remote_metadata(
@@ -2755,30 +2770,59 @@ async fn serve_file(
                 // member at equal or higher priority than the owning local
                 // still serves, mirroring the simple-index decision above so
                 // every version the index lists is downloadable.
-                let owning_local_min_priority =
-                    proxy_helpers::pypi_virtual_isolates_name(&state.db, repo.id, project.as_str())
+                // #2937: the guard also carries the owning local's per-version
+                // wheel-tag profile, so a suppressed Remote member can still
+                // serve a Case-A distribution (a platform/ABI-distinct wheel of
+                // a version the owner already provides) while a Case-B one (a
+                // remote-only version, or a same-platform rebuild) stays
+                // suppressed. Built from the same local-owner query the simple
+                // index uses, keeping the two paths symmetric: every
+                // distribution the index lists is downloadable and every one it
+                // hides 404s here.
+                let guard =
+                    PypiOwnershipGuard::resolve(&state.db, repo.id, &members, project.as_str())
                         .await?;
-                let member_priorities = if owning_local_min_priority.is_some() {
-                    proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?
-                } else {
-                    Default::default()
-                };
-
-                // #2937: the owning local's per-version wheel-tag profile, so a
-                // suppressed Remote member can still serve a Case-A distribution
-                // (a platform/ABI-distinct wheel of a version the owner already
-                // provides) while a Case-B one (a remote-only version, or a
-                // same-platform rebuild) stays suppressed. Built from the same
-                // local-owner query the simple index uses, keeping the two paths
-                // symmetric: every distribution the index lists is downloadable
-                // and every one it hides 404s here.
-                let owned_profile = if owning_local_min_priority.is_some() {
-                    pypi_owned_wheel_profile(&state.db, &members, project.as_str()).await
-                } else {
-                    OwnedWheelProfile::default()
-                };
 
                 for member in &members {
+                    // #3404: apply the ownership guard BEFORE this member is
+                    // consulted at all — not just before its upstream fetch.
+                    //
+                    // The local-first lookup below runs for EVERY member,
+                    // Remote included, because Remote-typed repos legitimately
+                    // carry `artifacts` rows (direct upload, replication,
+                    // promotion). The suppression decision used to be computed
+                    // ~50 lines further down and consulted only by the upstream
+                    // branch, so a suppressed member's *cached* row was served
+                    // straight out of the local branch. Any request that
+                    // legitimately resolved the distribution once — before a
+                    // local member claimed the name, while the remote was
+                    // ranked equal-or-higher, or under a since-removed PEP 708
+                    // `tracks` declaration — leaves such a row behind and
+                    // bypassed the guard for that exact file permanently.
+                    //
+                    // That broke the invariant #2937 states it maintains: the
+                    // index and download paths make the identical decision, so
+                    // a distribution the index hides 404s here too. A stale
+                    // `uv.lock` / hashed `requirements.txt` pins exact
+                    // filenames, so a resolution made while the remote was
+                    // permitted otherwise kept succeeding long after the
+                    // operator re-ranked the members to stop it.
+                    //
+                    // Skipping the whole member (rather than only its local
+                    // branch) is deliberate: a member the guard suppresses gets
+                    // no say in the response, so its per-member age gate must
+                    // not answer either. The #3220 fail-closed block below is
+                    // unaffected — it can only fire for a member that is still
+                    // allowed to supply the file.
+                    if guard.suppresses(member.id, &member.repo_type, filename) {
+                        debug!(
+                            member_key = %member.key,
+                            %filename,
+                            "virtual pypi member suppressed by ownership guard; skipping"
+                        );
+                        continue;
+                    }
+
                     // #2066: enforce THIS member's download age gate before any
                     // of its bytes can be served — including from a local
                     // `artifacts` cache row below (parity with the direct
@@ -2864,33 +2908,11 @@ async fn serve_file(
                     // that resolves the real download URL via the simple index.
                     //
                     // Shadowing guard (#1217 follow-up, ak-hv3s; priority-aware
-                    // per #2311): skip this Remote member when a local member
-                    // that owns the normalized PEP 503 name outranks it, so an
-                    // upstream cannot serve a project a higher-priority local
-                    // member already owns. A member missing from the priority
-                    // map cannot outrank the owning local: it is treated as
-                    // lowest priority (fail closed, suppressed).
-                    let mut remote_suppressed = match owning_local_min_priority {
-                        Some(local_min) => {
-                            local_min
-                                < member_priorities
-                                    .get(&member.id)
-                                    .copied()
-                                    .unwrap_or(i32::MAX)
-                        }
-                        None => false,
-                    };
-                    // #2937: a suppressed Remote member may still serve a Case-A
-                    // distribution — a platform/ABI-distinct wheel of a version
-                    // the owning local already provides — so the requested file
-                    // resolves iff the simple index would have listed it. A
-                    // Case-B request (a remote-only version, or a same-platform
-                    // rebuild of an owned version) stays suppressed and 404s,
-                    // preserving the #1600 dependency-confusion boundary.
-                    if remote_suppressed && owned_profile.admits(filename) {
-                        remote_suppressed = false;
-                    }
-                    if member.repo_type == RepositoryType::Remote && !remote_suppressed {
+                    // per #2311, distribution-granular per #2937): already
+                    // applied at the top of the loop by `guard.suppresses`,
+                    // which skips a suppressed Remote member outright — so
+                    // reaching here means this member is permitted to serve.
+                    if member.repo_type == RepositoryType::Remote {
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
                         {
@@ -3867,22 +3889,21 @@ async fn serve_metadata(
     location: &crate::storage::StorageLocation,
     filename: &str,
 ) -> Result<Response, Response> {
-    // Find the artifact
-    let artifact = sqlx::query!(
-        r#"
-        SELECT a.id, a.storage_key
-        FROM artifacts a
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND a.path LIKE '%/' || $2 ESCAPE '\'
-        LIMIT 1
-        "#,
-        repo_id,
-        super::escape_filename_for_like(filename)
+    // Find the artifact through the SAME resolver the distribution download
+    // uses (#3405).
+    //
+    // This used to open-code `path LIKE '%/' || $2`, which requires a `/`
+    // before the filename and therefore cannot match an artifact stored at its
+    // bare path (generic uploads, imports/migrations that synthesise no
+    // `{name}/{version}/` prefix, and replicas of those). The download path
+    // resolves those through `resolve_local_artifact_by_suffix`'s exact-path
+    // fallback, so such a distribution downloaded fine while its PEP 658
+    // sidecar 404'd — a hard `pip`/`uv` failure, since the index advertises
+    // `core-metadata: true` for every `.whl`. One resolver, one rule, no drift.
+    let artifact = crate::api::handlers::proxy_helpers::resolve_local_artifact_by_suffix(
+        db, repo_id, filename,
     )
-    .fetch_optional(db)
-    .await
-    .map_err(map_db_err)?
+    .await?
     .ok_or_else(|| AppError::NotFound("File not found".to_string()).into_response())?;
 
     // Try to extract METADATA from the package file
@@ -5292,11 +5313,95 @@ async fn pypi_owned_wheel_profile(
     )
 }
 
+/// The virtual-PyPI ownership (dependency-confusion) decision, resolved once
+/// per request and then applied per member (#1600 / #2311 / #2937).
+///
+/// Bundles the three inputs the decision needs — which local member owns the
+/// name and at what priority, the member priority map, and the owner's
+/// per-version wheel-tag profile — so the *download* (`serve_file`) and *PEP
+/// 658 metadata* (`serve_virtual_metadata`) paths cannot compute it
+/// differently. They previously carried separate open-coded copies, which is
+/// how the ordering bug in #3404 stayed invisible in one of them.
+#[derive(Debug, Default)]
+struct PypiOwnershipGuard {
+    owning_local_min_priority: Option<i32>,
+    member_priorities: std::collections::HashMap<uuid::Uuid, i32>,
+    owned_profile: OwnedWheelProfile,
+}
+
+impl PypiOwnershipGuard {
+    /// Resolve the guard for `normalized` within `virtual_repo_id`.
+    ///
+    /// `members` is used only to build the owning local's wheel profile. Note
+    /// the isolation decision and priority map deliberately consult EVERY
+    /// member (not just the caller-authorized ones, #3323/#3399): narrowing an
+    /// isolation decision by caller visibility would drop the isolation a
+    /// member the caller cannot see asserts, and re-expose the upstream name.
+    /// Passing the authorized member list for the profile only ever *shrinks*
+    /// the admitted Case-A set, which fails closed.
+    async fn resolve(
+        db: &PgPool,
+        virtual_repo_id: uuid::Uuid,
+        members: &[crate::models::repository::Repository],
+        normalized: &str,
+    ) -> Result<Self, Response> {
+        let owning_local_min_priority =
+            proxy_helpers::pypi_virtual_isolates_name(db, virtual_repo_id, normalized).await?;
+        let (member_priorities, owned_profile) = if owning_local_min_priority.is_some() {
+            (
+                proxy_helpers::fetch_virtual_member_priorities(db, virtual_repo_id).await?,
+                pypi_owned_wheel_profile(db, members, normalized).await,
+            )
+        } else {
+            Default::default()
+        };
+        Ok(Self {
+            owning_local_min_priority,
+            member_priorities,
+            owned_profile,
+        })
+    }
+
+    /// Whether this member must not supply `filename` at all.
+    ///
+    /// True only for a Remote member that an owning local member strictly
+    /// outranks and whose requested distribution is not an admitted Case-A
+    /// platform wheel. A member missing from the priority map cannot outrank
+    /// the owning local — it is treated as lowest priority, i.e. suppressed
+    /// (fail closed). Local/Staging members are never the suppressed side.
+    ///
+    /// Pure given the resolved inputs, so the decision table is unit-testable
+    /// without a database.
+    fn suppresses(
+        &self,
+        member_id: uuid::Uuid,
+        repo_type: &RepositoryType,
+        filename: &str,
+    ) -> bool {
+        if *repo_type != RepositoryType::Remote {
+            return false;
+        }
+        let Some(local_min) = self.owning_local_min_priority else {
+            return false;
+        };
+        let member_priority = self
+            .member_priorities
+            .get(&member_id)
+            .copied()
+            .unwrap_or(i32::MAX);
+        // #2937 Case-A carve-out: a platform/ABI-distinct wheel of a version
+        // the owner already provides is what the simple index still lists for
+        // a suppressed member, so it must remain downloadable here.
+        local_min < member_priority && !self.owned_profile.admits(filename)
+    }
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::cache_headers::{DEFAULT_CACHE_CONTROL, PRIVATE_CACHE_CONTROL};
     use crate::api::handlers::proxy_helpers::scan_blocked_response;
     use sha2::{Digest, Sha256};
 
@@ -7503,6 +7608,110 @@ mod tests {
         assert!(!owned.admits("pydantic_core-2.0-cp39-cp39-manylinux_2_17_x86_64.whl"));
         // An sdist of an owned version is NOT platform-distinct -> reject.
         assert!(!owned.admits("pydantic_core-2.0.tar.gz"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #3404: the per-member ownership decision, as a pure table. The download
+    // and PEP 658 metadata paths both route through `suppresses`, so this is
+    // the single place the decision is specified.
+    // -----------------------------------------------------------------------
+
+    /// Guard for a virtual whose local owner sits at priority `local_min` and
+    /// whose one Remote member `remote_id` sits at `remote_priority`.
+    fn guard_with(
+        local_min: Option<i32>,
+        remote_id: uuid::Uuid,
+        remote_priority: Option<i32>,
+    ) -> PypiOwnershipGuard {
+        let mut member_priorities = std::collections::HashMap::new();
+        if let Some(p) = remote_priority {
+            member_priorities.insert(remote_id, p);
+        }
+        PypiOwnershipGuard {
+            owning_local_min_priority: local_min,
+            member_priorities,
+            owned_profile: linux_owner_profile(),
+        }
+    }
+
+    const CASE_B_WHEEL: &str = "pydantic_core-9.9.9-cp39-cp39-win_amd64.whl";
+    const CASE_A_WHEEL: &str = "pydantic_core-2.0-cp39-cp39-win_amd64.whl";
+
+    #[test]
+    fn test_guard_suppresses_outranked_remote_for_case_b() {
+        let remote = uuid::Uuid::new_v4();
+        let guard = guard_with(Some(0), remote, Some(10));
+        assert!(
+            guard.suppresses(remote, &RepositoryType::Remote, CASE_B_WHEEL),
+            "a remote-only version of a locally-owned name is the dependency-confusion \
+             vector the guard exists to stop"
+        );
+    }
+
+    /// The #2937 carve-out survives the reordering: a Case-A platform wheel is
+    /// still listed by the index for a suppressed member, so it must still
+    /// download (and its `.metadata` must still resolve).
+    #[test]
+    fn test_guard_admits_case_a_wheel_from_suppressed_remote() {
+        let remote = uuid::Uuid::new_v4();
+        let guard = guard_with(Some(0), remote, Some(10));
+        assert!(!guard.suppresses(remote, &RepositoryType::Remote, CASE_A_WHEEL));
+    }
+
+    /// #2311: a Remote the operator ranked equal-or-higher than the owning
+    /// local was deliberately put there, and still serves.
+    #[test]
+    fn test_guard_does_not_suppress_equal_or_higher_priority_remote() {
+        let remote = uuid::Uuid::new_v4();
+        assert!(!guard_with(Some(0), remote, Some(0)).suppresses(
+            remote,
+            &RepositoryType::Remote,
+            CASE_B_WHEEL
+        ));
+        assert!(!guard_with(Some(5), remote, Some(1)).suppresses(
+            remote,
+            &RepositoryType::Remote,
+            CASE_B_WHEEL
+        ));
+    }
+
+    /// No local member owns the name (or a `tracks` declaration permits the
+    /// merge) -> nothing is suppressed.
+    #[test]
+    fn test_guard_does_not_suppress_without_local_owner() {
+        let remote = uuid::Uuid::new_v4();
+        assert!(!guard_with(None, remote, Some(10)).suppresses(
+            remote,
+            &RepositoryType::Remote,
+            CASE_B_WHEEL
+        ));
+    }
+
+    /// Local/Staging members are never the suppressed side — they are the
+    /// owning side. This is what keeps the reordered check from 404ing the
+    /// owner's own distributions.
+    #[test]
+    fn test_guard_never_suppresses_local_or_staging_member() {
+        let member = uuid::Uuid::new_v4();
+        let guard = guard_with(Some(0), member, Some(10));
+        for repo_type in [RepositoryType::Local, RepositoryType::Staging] {
+            assert!(
+                !guard.suppresses(member, &repo_type, CASE_B_WHEEL),
+                "{repo_type:?} member must never be suppressed"
+            );
+        }
+    }
+
+    /// Fail closed: a member absent from the priority map cannot outrank the
+    /// owning local, so it is treated as lowest priority and suppressed.
+    #[test]
+    fn test_guard_suppresses_member_missing_from_priority_map() {
+        let remote = uuid::Uuid::new_v4();
+        assert!(guard_with(Some(0), remote, None).suppresses(
+            remote,
+            &RepositoryType::Remote,
+            CASE_B_WHEEL
+        ));
     }
 
     #[test]
@@ -11064,6 +11273,154 @@ mod tests {
         assert!(body_string(response).is_empty(), "304 must have no body");
     }
 
+    // -----------------------------------------------------------------------
+    // #3406: the Simple index is negotiated on `Accept`, so every emitter must
+    // declare `Vary: Accept` and must not hand a credentialed caller's body a
+    // shared-cache directive.
+    // -----------------------------------------------------------------------
+
+    fn json_accept() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("accept", PEP691_JSON_CONTENT_TYPE.parse().unwrap());
+        h
+    }
+
+    /// Both halves of both negotiated emitters must declare the selecting
+    /// header. The HTML root arm is the one that matters most here: it builds
+    /// its response by hand (to keep the PEP 503 CSP headers) and so does not
+    /// inherit the shared helper's contract automatically.
+    #[test]
+    fn test_negotiated_simple_index_declares_vary_accept() {
+        let packages = vec!["flask".to_string()];
+        let artifacts = vec![project_artifact("pkg-1.0.0.tar.gz", "aaa")];
+
+        let cases: Vec<(&str, Response)> = vec![
+            (
+                "root/html",
+                build_simple_root_response(&HeaderMap::new(), "repo", &packages).unwrap(),
+            ),
+            (
+                "root/json",
+                build_simple_root_response(&json_accept(), "repo", &packages).unwrap(),
+            ),
+            (
+                "project/html",
+                build_simple_project_response(&HeaderMap::new(), "repo", "pkg", &artifacts, &[])
+                    .unwrap(),
+            ),
+            (
+                "project/json",
+                build_simple_project_response(&json_accept(), "repo", "pkg", &artifacts, &[])
+                    .unwrap(),
+            ),
+        ];
+
+        for (label, response) in cases {
+            assert_eq!(
+                response.headers().get(VARY).map(|v| v.to_str().unwrap()),
+                Some("Accept"),
+                "{label}: a body selected by Accept must declare Vary: Accept, or a shared \
+                 cache may serve it to a client that asked for the other representation"
+            );
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL).unwrap(),
+                DEFAULT_CACHE_CONTROL,
+                "{label}: an anonymous read stays publicly cacheable"
+            );
+        }
+    }
+
+    /// The HTML root arm must keep its PEP 503 security headers while gaining
+    /// the cache contract — the open-coded builder is easy to regress.
+    #[test]
+    fn test_root_html_keeps_security_headers_alongside_vary() {
+        let packages = vec!["flask".to_string()];
+        let r = build_simple_root_response(&HeaderMap::new(), "repo", &packages).unwrap();
+        assert_eq!(r.headers().get(VARY).unwrap(), "Accept");
+        assert!(r.headers().get("Content-Security-Policy").is_some());
+        assert_eq!(
+            r.headers().get("X-Content-Type-Options").unwrap(),
+            "nosniff"
+        );
+    }
+
+    /// A virtual repo's index is built from the members the CALLER may read
+    /// (#2073 / #3323 / #3399) and a private repo's requires credentials at
+    /// all, so a credentialed response must not be shared-cacheable. `Vary`
+    /// stays regardless: the negotiation is orthogonal to the caller.
+    #[test]
+    fn test_credentialed_simple_index_is_private() {
+        let packages = vec!["internal-lib".to_string()];
+        let artifacts = vec![project_artifact("pkg-1.0.0.tar.gz", "aaa")];
+
+        let mut auth = json_accept();
+        auth.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic dXNlcjpwYXNz".parse().unwrap(),
+        );
+        let mut auth_html = HeaderMap::new();
+        auth_html.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer ak_token".parse().unwrap(),
+        );
+
+        for (label, response) in [
+            (
+                "root/json",
+                build_simple_root_response(&auth, "repo", &packages).unwrap(),
+            ),
+            (
+                "root/html",
+                build_simple_root_response(&auth_html, "repo", &packages).unwrap(),
+            ),
+            (
+                "project/json",
+                build_simple_project_response(&auth, "repo", "pkg", &artifacts, &[]).unwrap(),
+            ),
+            (
+                "project/html",
+                build_simple_project_response(&auth_html, "repo", "pkg", &artifacts, &[]).unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL).unwrap(),
+                PRIVATE_CACHE_CONTROL,
+                "{label}: a credentialed caller's index must not be stored by a shared cache"
+            );
+            assert_eq!(response.headers().get(VARY).unwrap(), "Accept", "{label}");
+        }
+    }
+
+    /// The 304 shortcut must carry the same cache-key metadata as the 200 it
+    /// stands in for, on the open-coded HTML arm too.
+    #[test]
+    fn test_negotiated_304_carries_vary_accept() {
+        let packages = vec!["flask".to_string()];
+        for accept in [None, Some(PEP691_JSON_CONTENT_TYPE)] {
+            let mut h = HeaderMap::new();
+            if let Some(a) = accept {
+                h.insert("accept", a.parse().unwrap());
+            }
+            let first = build_simple_root_response(&h, "repo", &packages).unwrap();
+            let etag = first
+                .headers()
+                .get(ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            h.insert(axum::http::header::IF_NONE_MATCH, etag.parse().unwrap());
+            let second = build_simple_root_response(&h, "repo", &packages).unwrap();
+            assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(
+                second.headers().get(VARY).unwrap(),
+                "Accept",
+                "accept={accept:?}: a 304 without Vary refreshes the wrong stored representation"
+            );
+        }
+    }
+
     #[test]
     fn test_project_etag_changes_when_package_set_changes_and_stale_conditional_is_200() {
         let before = vec![project_artifact("pkg-1.0.0.tar.gz", "aaa")];
@@ -14459,6 +14816,349 @@ mod tests {
             "negative control: removing the policy must restore the download"
         );
         assert_eq!(&after_body[..], cached_wheel);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3404: the ownership guard must gate a suppressed Remote member's LOCAL
+    // `artifacts` row, not only its upstream fetch.
+    // -----------------------------------------------------------------------
+
+    /// Seed one distribution on `member_id`: the payload bytes into storage and
+    /// a matching `artifacts` row.
+    ///
+    /// `dir_prefix` controls the row's `path`. `Some(p)` stores it under
+    /// `{p}/{filename}`; `None` stores it at its BARE filename — the shape
+    /// generic uploads and imports produce, and the one #3405's `.metadata`
+    /// lookup could not resolve.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_distribution(
+        state: &crate::api::SharedState,
+        pool: &sqlx::PgPool,
+        user_id: uuid::Uuid,
+        member_info: &proxy_helpers::RepoInfo,
+        project: &str,
+        version: &str,
+        filename: &str,
+        dir_prefix: Option<&str>,
+        bytes: &[u8],
+    ) {
+        let storage_key = format!("pypi/{}/{}/{}", project, version, filename);
+        let artifact_path = match dir_prefix {
+            Some(prefix) => format!("{prefix}/{filename}"),
+            None => filename.to_string(),
+        };
+        proxy_helpers::put_artifact_bytes(
+            state,
+            member_info,
+            &storage_key,
+            Bytes::copy_from_slice(bytes),
+        )
+        .await
+        .expect("seed payload");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(member_info.id)
+        .bind(&artifact_path)
+        .bind(project)
+        .bind(version)
+        .bind(bytes.len() as i64)
+        .bind(format!("sha-{filename}"))
+        .bind("application/zip")
+        .bind(&storage_key)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed artifact row");
+    }
+
+    /// #3404: a SUPPRESSED Remote member's locally-cached `artifacts` row must
+    /// not be served through the virtual repo.
+    ///
+    /// The virtual member loop tries local storage FIRST for every member,
+    /// Remote included, because Remote-typed repos legitimately carry
+    /// `artifacts` rows. The suppression decision was computed ~50 lines below
+    /// that local-first serve and consulted only by the upstream branch, so a
+    /// Case-B distribution the dependency-confusion guard hides from the simple
+    /// index stayed downloadable from any member that had ever cached it — the
+    /// exact shape a stale `uv.lock` or hashed `requirements.txt` keeps
+    /// requesting long after the operator re-ranked the members.
+    ///
+    /// FAILS ON MAIN: the guarded request returns 200 with the cached bytes.
+    ///
+    /// The upstream mock serves nothing, so a 200 can ONLY have come from the
+    /// cached row — this cannot pass by accidentally proxying. The positive
+    /// control (before a local member owns the name) runs in the same fixture,
+    /// so a change that 404s everything fails too. The PEP 658 sidecar is
+    /// asserted alongside: fixing only the wheel would leave `.metadata`
+    /// exposing precisely the suppressed distribution.
+    #[tokio::test]
+    async fn test_virtual_serve_file_gates_suppressed_member_cached_row_3404() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "confpkg";
+        // Case B: a version ONLY the remote has for a locally-owned name.
+        let remote_only = "confpkg-9.9.9-py3-none-any.whl";
+        let remote_wheel = wheel_with_metadata(
+            "confpkg-9.9.9",
+            b"Metadata-Version: 2.1\nName: confpkg\nVersion: 9.9.9\n",
+        );
+
+        // No mounts: the upstream has nothing, so any 200 came from the row.
+        let upstream = MockServer::start().await;
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        let member_info = tdh::make_repo_info(
+            member_id,
+            &member_key,
+            &member_dir,
+            "remote",
+            Some(&upstream.uri()),
+        );
+        seed_distribution(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            &member_info,
+            project,
+            "9.9.9",
+            remote_only,
+            Some("simple/confpkg"),
+            &remote_wheel,
+        )
+        .await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let project_name = proj(project);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let serve = || {
+            super::serve_file(
+                &state,
+                &virtual_info,
+                &fx.repo_key,
+                &project_name,
+                remote_only,
+                None,
+                &ctx,
+            )
+        };
+        let serve_meta = || {
+            super::serve_virtual_metadata(
+                &state,
+                None,
+                &virtual_info,
+                &project_name,
+                Some("9.9.9"),
+                remote_only,
+            )
+        };
+
+        // POSITIVE CONTROL: no local member owns the name yet, so nothing is
+        // suppressed and the member's cached row serves.
+        let (before_status, before_body) = collect_serve_3220(serve().await).await;
+        let (before_meta_status, _) = collect_serve_3220(serve_meta().await).await;
+
+        // Attach a PUBLIC Local member at priority 0 that OWNS `confpkg`, so it
+        // strictly outranks the Remote member (priority 1) and the guard
+        // engages for every distribution outside its Case-A profile.
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish local member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach local member");
+        let local_info = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        seed_distribution(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            &local_info,
+            project,
+            "1.0.0",
+            "confpkg-1.0.0-py3-none-any.whl",
+            Some("simple/confpkg"),
+            &wheel_with_metadata(
+                "confpkg-1.0.0",
+                b"Metadata-Version: 2.1\nName: confpkg\nVersion: 1.0.0\n",
+            ),
+        )
+        .await;
+
+        let (guarded_status, guarded_body) = collect_serve_3220(serve().await).await;
+        let (guarded_meta_status, guarded_meta_body) = collect_serve_3220(serve_meta().await).await;
+
+        // The owner's own distribution must still resolve — the reordered check
+        // must not 404 the member that does the owning.
+        let owned_result = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            &project_name,
+            "confpkg-1.0.0-py3-none-any.whl",
+            None,
+            &ctx,
+        )
+        .await;
+        let (owned_status, _) = collect_serve_3220(owned_result).await;
+
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            before_status,
+            StatusCode::OK,
+            "positive control: with no local owner the cached member row must serve"
+        );
+        assert_eq!(
+            &before_body[..],
+            &remote_wheel[..],
+            "positive control: the cached row's bytes are what serve"
+        );
+        assert_eq!(
+            before_meta_status,
+            StatusCode::OK,
+            "positive control: the PEP 658 sidecar resolves from the same row"
+        );
+
+        assert_eq!(
+            guarded_status,
+            StatusCode::NOT_FOUND,
+            "#3404: a Case-B distribution the simple index refuses to advertise must \
+             404 on download too, even when the suppressed member has it cached; got \
+             {guarded_status}"
+        );
+        assert_ne!(
+            &guarded_body[..],
+            &remote_wheel[..],
+            "#3404: the suppressed member's cached bytes must not be served"
+        );
+        assert_eq!(
+            guarded_meta_status,
+            StatusCode::NOT_FOUND,
+            "#3404: the PEP 658 sidecar must make the same decision as the wheel, or the \
+             suppressed distribution is still described through the virtual repo"
+        );
+        assert!(
+            !String::from_utf8_lossy(&guarded_meta_body).contains("9.9.9"),
+            "#3404: the suppressed distribution's METADATA must not leak"
+        );
+        assert_eq!(
+            owned_status,
+            StatusCode::OK,
+            "negative control: the owning local member's own distribution must still serve"
+        );
+    }
+
+    /// #3405: the PEP 658 `.metadata` resource must resolve an artifact stored
+    /// at its BARE path, exactly as the distribution download does.
+    ///
+    /// `serve_metadata` open-coded `path LIKE '%/' || $2`, which requires a `/`
+    /// before the filename, while the download path resolves through
+    /// `resolve_local_artifact_by_suffix` and falls back to an exact
+    /// `path = $2`. A bare-path artifact therefore downloaded fine and 404'd on
+    /// its sidecar — and since the simple index advertises `core-metadata:
+    /// true` for every `.whl`, pip and uv treat that as a hard install failure
+    /// rather than falling back to the wheel.
+    ///
+    /// FAILS ON MAIN on the bare-path case. The directory-path case is the
+    /// control that proves the shared resolver did not regress the shape every
+    /// existing fixture uses.
+    #[tokio::test]
+    async fn test_serve_metadata_resolves_bare_path_artifact_3405() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let repo_info = fx.repo_info("local", None);
+        let location = repo_info.storage_location();
+
+        // Same project, two storage shapes: one bare, one directory-prefixed.
+        let bare = "barepkg-1.0.0-py3-none-any.whl";
+        let nested = "barepkg-2.0.0-py3-none-any.whl";
+        for (filename, version, prefix) in [
+            (bare, "1.0.0", None),
+            (nested, "2.0.0", Some("simple/barepkg")),
+        ] {
+            seed_distribution(
+                &state,
+                &fx.pool,
+                fx.user_id,
+                &repo_info,
+                "barepkg",
+                version,
+                filename,
+                prefix,
+                &wheel_with_metadata(
+                    &format!("barepkg-{version}"),
+                    format!("Metadata-Version: 2.1\nName: barepkg\nVersion: {version}\n")
+                        .as_bytes(),
+                ),
+            )
+            .await;
+        }
+
+        let bare_meta = super::serve_metadata(&state, &fx.pool, fx.repo_id, &location, bare).await;
+        let nested_meta =
+            super::serve_metadata(&state, &fx.pool, fx.repo_id, &location, nested).await;
+        // The wheel itself resolved fine before this fix; assert the pair stays
+        // consistent rather than trusting that separately.
+        let bare_wheel = proxy_helpers::local_fetch_or_redirect_by_suffix(
+            &fx.pool,
+            &state,
+            fx.repo_id,
+            &location,
+            bare,
+            &Default::default(),
+        )
+        .await;
+
+        let (bare_status, bare_body) = collect_serve_3220(bare_meta).await;
+        let (nested_status, nested_body) = collect_serve_3220(nested_meta).await;
+        let (bare_wheel_status, _) = collect_serve_3220(bare_wheel).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            bare_wheel_status,
+            StatusCode::OK,
+            "premise: a bare-path artifact's DISTRIBUTION already downloads"
+        );
+        assert_eq!(
+            bare_status,
+            StatusCode::OK,
+            "#3405: the index advertises core-metadata for this wheel and the wheel \
+             downloads, so its .metadata must not 404; got {bare_status}"
+        );
+        assert!(
+            String::from_utf8_lossy(&bare_body).contains("Version: 1.0.0"),
+            "#3405: the sidecar must carry the bare-path distribution's own METADATA"
+        );
+        assert_eq!(
+            nested_status,
+            StatusCode::OK,
+            "control: the directory-prefixed shape every existing fixture uses must \
+             keep resolving"
+        );
+        assert!(String::from_utf8_lossy(&nested_body).contains("Version: 2.0.0"));
     }
 
     /// Clean via virtual -> 200 (no over-block).

@@ -3801,10 +3801,10 @@ fn reverse_suffix_for_like(path_suffix: &str) -> String {
 }
 
 /// Row resolved by [`resolve_local_artifact_by_suffix`].
-struct ResolvedLocalArtifact {
-    id: Uuid,
-    path: String,
-    storage_key: String,
+pub struct ResolvedLocalArtifact {
+    pub id: Uuid,
+    pub path: String,
+    pub storage_key: String,
 }
 
 /// Resolve a single local artifact by trailing path-suffix, with an
@@ -3821,7 +3821,16 @@ struct ResolvedLocalArtifact {
 /// succeeded returns the identical row and every currently-passing caller is
 /// unaffected. The exact match also can't produce a substring false positive
 /// (a request for `b.rpm` will not resolve a root-stored `ab.rpm`).
-async fn resolve_local_artifact_by_suffix(
+///
+/// #3405: this is THE filename->artifact rule for a format handler, and every
+/// resource derived from one distribution must use it. PyPI's PEP 658
+/// `<distribution>.metadata` route open-coded its own `path LIKE '%/' || $2`
+/// and so had only half of it: a bare-path artifact's wheel downloaded while
+/// its `.metadata` sidecar 404'd, and because the simple index advertises
+/// `core-metadata: true` for every `.whl`, pip and uv treat that 404 on an
+/// advertised sidecar as a hard install failure rather than falling back to
+/// the wheel. Route new callers here instead of re-deriving the rule.
+pub async fn resolve_local_artifact_by_suffix(
     db: &PgPool,
     repository_id: Uuid,
     path_suffix: &str,
