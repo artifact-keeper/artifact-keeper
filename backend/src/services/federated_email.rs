@@ -11,8 +11,9 @@
 //! shipped twice: OIDC defaulted every claim-less user to a shared `""`
 //! (#3119, fixed in #3161) and SAML defaulted to `{username}@unknown`, built
 //! from the *pre-uniquification* username, so two NameIDs whose username
-//! attribute matched collided on `users_email_key` (#3167). This module is the
-//! single implementation both now call, so a third variant cannot drift.
+//! attribute matched collided on `users_email_key` (#3167), and LDAP defaulted
+//! to `{username}@unknown` in two more places (#3416). This module is the
+//! single implementation all of them now call, so a new variant cannot drift.
 //!
 //! A synthetic address must satisfy four properties. Getting any one wrong
 //! reintroduces a bug rather than fixing one:
@@ -44,6 +45,18 @@ pub(crate) const OIDC_NO_EMAIL_DOMAIN: &str = "no-email.oidc.invalid";
 /// email attribute.
 pub(crate) const SAML_NO_EMAIL_DOMAIN: &str = "no-email.saml.invalid";
 
+/// Domain for the synthetic address stored when an LDAP directory entry
+/// carries no usable mail attribute (#3416).
+///
+/// The stable subject for LDAP is the entry's **DN**, not the username: the DN
+/// is what `LdapService::get_or_create_user` stores in `users.external_id` and
+/// looks the account up by, whereas the username is run through
+/// `generate_unique_username` afterwards — so two directory entries whose
+/// username attribute matches are stored as `alice` and `alice_1` while both
+/// would derive the same username-keyed address and collide on
+/// `users_email_key`.
+pub(crate) const LDAP_NO_EMAIL_DOMAIN: &str = "no-email.ldap.invalid";
+
 /// Longest sanitized subject prefix kept in the synthetic local-part. Bounds
 /// the result well inside `users.email VARCHAR(255)` for arbitrarily long
 /// subjects.
@@ -56,8 +69,9 @@ const MAX_SYNTHETIC_LOCAL_PREFIX: usize = 48;
 /// value, which some IdPs send for machine identities and which collides
 /// exactly the same way a missing one does.
 ///
-/// `subject` must be the IdP's stable per-user identifier: the OIDC `sub`, or
-/// the SAML `NameID`. See the module docs for why nothing else will do.
+/// `subject` must be the IdP's stable per-user identifier: the OIDC `sub`, the
+/// SAML `NameID`, or the LDAP entry's DN. See the module docs for why nothing
+/// else will do.
 pub(crate) fn resolve_federated_email(claim: Option<&str>, subject: &str, domain: &str) -> String {
     match claim.map(str::trim).filter(|s| !s.is_empty()) {
         Some(email) => email.to_string(),
@@ -154,15 +168,58 @@ mod tests {
     }
 
     #[test]
-    fn the_two_providers_use_distinct_reserved_domains() {
-        assert_ne!(OIDC_NO_EMAIL_DOMAIN, SAML_NO_EMAIL_DOMAIN);
-        for domain in [OIDC_NO_EMAIL_DOMAIN, SAML_NO_EMAIL_DOMAIN] {
+    fn every_provider_uses_a_distinct_reserved_domain() {
+        let domains = [
+            OIDC_NO_EMAIL_DOMAIN,
+            SAML_NO_EMAIL_DOMAIN,
+            LDAP_NO_EMAIL_DOMAIN,
+        ];
+        for domain in domains {
             assert!(
                 domain.ends_with(".invalid"),
                 "{} must sit under the RFC 2606 reserved TLD so it can never \
                  resolve to, or collide with, a real mailbox",
                 domain
             );
+        }
+        let mut unique = domains.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            domains.len(),
+            "each provider needs its own domain, so an operator reading a \
+             synthetic address can tell which directory it came from"
+        );
+    }
+
+    /// The same subject under two different providers must not collide: the
+    /// domain is the only thing separating them, so it has to be load-bearing.
+    #[test]
+    fn one_subject_under_two_providers_yields_two_addresses() {
+        assert_ne!(
+            synthetic_email_for_subject("shared-subject", LDAP_NO_EMAIL_DOMAIN),
+            synthetic_email_for_subject("shared-subject", OIDC_NO_EMAIL_DOMAIN)
+        );
+    }
+
+    /// LDAP subjects are DNs, which are long and full of characters that are
+    /// invalid in an address local-part. Two DNs differing only past the
+    /// sanitized prefix must still get distinct, column-sized addresses.
+    #[test]
+    fn ldap_dns_are_distinct_and_fit_the_column() {
+        let a = synthetic_email_for_subject(
+            "uid=alice,ou=engineering,ou=people,dc=corp,dc=example,dc=com",
+            LDAP_NO_EMAIL_DOMAIN,
+        );
+        let b = synthetic_email_for_subject(
+            "uid=alice,ou=support,ou=people,dc=corp,dc=example,dc=com",
+            LDAP_NO_EMAIL_DOMAIN,
+        );
+        assert_ne!(a, b, "two DNs for two identities must not share an address");
+        for email in [&a, &b] {
+            assert!(email.len() <= 255, "must fit users.email: {}", email);
+            assert!(email.ends_with(LDAP_NO_EMAIL_DOMAIN));
         }
     }
 }
