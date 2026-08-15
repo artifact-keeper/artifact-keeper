@@ -1616,7 +1616,7 @@ fn is_non_mutating_format_post(path: &str) -> bool {
 /// anonymous caller. Widening that is a separate decision from shipping a
 /// gallery, and would need its own tests.
 fn is_anonymous_readable_format_post(path: &str) -> bool {
-    let trimmed = path.trim_start_matches('/');
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
     let mut segments = trimmed.split('/');
     match segments.next() {
         // /vscode/<repo_key>/gallery/extensionquery
@@ -1886,7 +1886,9 @@ pub async fn repo_visibility_middleware(
     // exactly as before, and are exempted only from the *permission* check
     // further down (`non_mutating_post`).
     let non_mutating_post = is_non_mutating_format_post(&path);
-    let is_write = is_write_method(request.method()) && !is_anonymous_readable_format_post(&path);
+    let anonymous_readable_post =
+        request.method() == Method::POST && is_anonymous_readable_format_post(&path);
+    let is_write = is_write_method(request.method()) && !anonymous_readable_post;
 
     // Perform optional auth (shared with optional_auth_middleware). Conda
     // token channels carry the credential in the URL path, so fall back to it
@@ -5840,8 +5842,25 @@ mod tests {
             "/vscode/openvsx/api/extensions",
             "/vscode/openvsx/gallery/extensionquery/trailing",
             "/vscode//gallery/extensionquery",
+            "//vscode/openvsx/gallery/extensionquery",
         ] {
             assert!(!is_anonymous_readable_format_post(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_vscode_gallery_non_post_writes_require_auth() {
+        let key = "openvsx";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        for method in [Method::PUT, Method::PATCH, Method::DELETE] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri("/vscode/openvsx/gallery/extensionquery")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         }
     }
 

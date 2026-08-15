@@ -25,9 +25,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::borrow::Cow;
 use tracing::info;
 
-use crate::api::extractors::RequestBaseUrl;
+use crate::api::extractors::{request_base_url_from_host_header, RequestBaseUrl};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
@@ -143,12 +144,23 @@ struct BufferedGalleryQuery {
     _budget_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-fn unsupported_gallery_repo(repo: &RepoInfo, requirement: &str) -> Response {
+fn unsupported_gallery_repo_type(repo: &RepoInfo) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
         format!(
-            "VS Code Open VSX gallery gateway currently supports public Remote repositories only ({} is {}; {})",
-            repo.key, repo.repo_type, requirement
+            "VS Code gallery routes require a Remote repository ({} is {})",
+            repo.key, repo.repo_type
+        ),
+    )
+        .into_response()
+}
+
+fn private_gallery_forbidden(repo: &RepoInfo) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        format!(
+            "VS Code gallery routes are public-only: repository {} is private. Gallery clients cannot present a credential, so private galleries are not supported. Make the repository public or use the /vscode/{}/extensions/... routes.",
+            repo.key, repo.key
         ),
     )
         .into_response()
@@ -157,10 +169,7 @@ fn unsupported_gallery_repo(repo: &RepoInfo, requirement: &str) -> Response {
 #[allow(clippy::result_large_err)]
 async fn gallery_upstream<'a>(db: &PgPool, repo: &'a RepoInfo) -> Result<&'a str, Response> {
     if repo.repo_type != RepositoryType::Remote {
-        return Err(unsupported_gallery_repo(
-            repo,
-            "gallery access requires Remote",
-        ));
+        return Err(unsupported_gallery_repo_type(repo));
     }
     // The visibility middleware intentionally permits authenticated reads from
     // private repositories. Gallery clients cannot safely configure that auth,
@@ -175,10 +184,7 @@ async fn gallery_upstream<'a>(db: &PgPool, repo: &'a RepoInfo) -> Result<&'a str
             .map_err(crate::api::handlers::db_err)?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
     if !is_public {
-        return Err(unsupported_gallery_repo(
-            repo,
-            "private gallery access is unsupported in this prototype",
-        ));
+        return Err(private_gallery_forbidden(repo));
     }
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         (
@@ -237,10 +243,16 @@ fn gallery_asset_base_url(
     )
 }
 
-fn normal_target_platform(platform: Option<&str>) -> &str {
-    platform
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(DEFAULT_TARGET_PLATFORM)
+fn normal_target_platform(platform: Option<&str>) -> Cow<'_, str> {
+    let value = platform
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_TARGET_PLATFORM);
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(value.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 /// Identity used by the shared age-gate policy. Gallery publisher and
@@ -252,11 +264,7 @@ fn vscode_age_gate_package(publisher: &str, name: &str) -> String {
 }
 
 fn vscode_age_gate_version(version: &str, target_platform: Option<&str>) -> String {
-    format!(
-        "{}@{}",
-        version,
-        normal_target_platform(target_platform).to_ascii_lowercase()
-    )
+    format!("{}@{}", version, normal_target_platform(target_platform))
 }
 
 /// `lastUpdated` is Open VSX gallery's publish-time evidence. Deliberately
@@ -289,6 +297,28 @@ fn validate_gallery_request_segment(value: &str) -> Result<(), Response> {
         Ok(())
     } else {
         Err((StatusCode::BAD_REQUEST, "Invalid VS Code gallery path").into_response())
+    }
+}
+
+fn is_safe_target_platform(value: &str) -> bool {
+    value.len() <= 64
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+        })
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_target_platform(value: &str, upstream_response: bool) -> Result<(), Response> {
+    if is_safe_target_platform(value) {
+        Ok(())
+    } else if upstream_response {
+        Err(invalid_gallery_response())
+    } else {
+        Err((StatusCode::BAD_REQUEST, "Invalid VS Code target platform").into_response())
     }
 }
 
@@ -372,14 +402,14 @@ fn rewrite_gallery_asset_urls(
                         .get("targetPlatform")
                         .and_then(|value| value.as_str()),
                 );
-                validate_gallery_response_segment(target_platform)?;
+                validate_target_platform(target_platform.as_ref(), true)?;
                 let asset_base = gallery_asset_base_url(
                     base_url,
                     repo_key,
                     &publisher,
                     &name,
                     &version_name,
-                    target_platform,
+                    target_platform.as_ref(),
                 );
 
                 for field in ["assetUri", "fallbackAssetUri"] {
@@ -514,8 +544,8 @@ fn gallery_version_coordinate(version: &serde_json::Value) -> Option<String> {
             .and_then(serde_json::Value::as_str),
     );
     validate_gallery_response_segment(name).ok()?;
-    validate_gallery_response_segment(platform).ok()?;
-    Some(vscode_age_gate_version(name, Some(platform)))
+    validate_target_platform(platform.as_ref(), true).ok()?;
+    Some(vscode_age_gate_version(name, Some(platform.as_ref())))
 }
 
 /// Reconcile the gallery's per-result count after age-gate filtering. Gallery
@@ -650,7 +680,7 @@ fn find_gallery_exact_version(
     version: &str,
     target_platform: &str,
 ) -> Option<Option<DateTime<Utc>>> {
-    let target = normal_target_platform(Some(target_platform)).to_ascii_lowercase();
+    let target = normal_target_platform(Some(target_platform));
     for result in response.get("results")?.as_array()? {
         for extension in result.get("extensions")?.as_array()? {
             let publisher = extension.get("publisher")?.get("publisherName")?.as_str()?;
@@ -664,8 +694,7 @@ fn find_gallery_exact_version(
                     candidate
                         .get("targetPlatform")
                         .and_then(serde_json::Value::as_str),
-                )
-                .to_ascii_lowercase();
+                );
                 if candidate_version == version && candidate_platform == target {
                     return Some(gallery_last_updated(candidate));
                 }
@@ -754,12 +783,16 @@ async fn enforce_gallery_age_gate(
     Ok(())
 }
 
+fn gallery_response_base_url(headers: &HeaderMap) -> RequestBaseUrl {
+    RequestBaseUrl(request_base_url_from_host_header(headers))
+}
+
 fn build_gallery_manifest(base_url: &RequestBaseUrl, repo_key: &str) -> serde_json::Value {
     let gallery = gallery_base_url(base_url, repo_key);
     let item = format!(
         "{}/vscode/{}/item",
         base_url.as_str().trim_end_matches('/'),
-        repo_key
+        urlencoding::encode(repo_key)
     );
     serde_json::json!({
         "version": "",
@@ -811,23 +844,25 @@ fn build_gallery_manifest(base_url: &RequestBaseUrl, repo_key: &str) -> serde_js
 
 async fn gallery_manifest(
     Path(repo_key): Path<String>,
-    base_url: RequestBaseUrl,
+    headers: HeaderMap,
     State(state): State<SharedState>,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     gallery_upstream(&state.db, &repo).await?;
+    let base_url = gallery_response_base_url(&headers);
     Ok(json_response(&build_gallery_manifest(&base_url, &repo_key)))
 }
 
 async fn gallery_extension_query(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    base_url: RequestBaseUrl,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     let mut response = fetch_gallery_query(&state, &repo, &repo_key, body).await?;
     filter_gallery_response_age_gate(&state, &repo, &mut response.value).await?;
+    let base_url = gallery_response_base_url(&headers);
     rewrite_gallery_asset_urls(&mut response.value, &base_url, &repo_key)?;
     Ok(json_response(&response.value))
 }
@@ -835,7 +870,7 @@ async fn gallery_extension_query(
 async fn gallery_latest_version(
     State(state): State<SharedState>,
     Path((repo_key, publisher, name)): Path<(String, String, String)>,
-    base_url: RequestBaseUrl,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     validate_gallery_request_segment(&publisher)?;
@@ -862,6 +897,7 @@ async fn gallery_latest_version(
     )
     .await?;
     filter_gallery_response_age_gate(&state, &repo, &mut response.value).await?;
+    let base_url = gallery_response_base_url(&headers);
     rewrite_gallery_asset_urls(&mut response.value, &base_url, &repo_key)?;
     // `ExtensionLatestVersionUriTemplate` is consumed by VS Code as a
     // single raw gallery extension, unlike the POST extensionquery envelope.
@@ -886,10 +922,11 @@ async fn gallery_vspackage(
         publisher.as_str(),
         name.as_str(),
         version.as_str(),
-        target_platform,
+        target_platform.as_ref(),
     ] {
         validate_gallery_request_segment(segment)?;
     }
+    validate_target_platform(target_platform.as_ref(), false)?;
     // Send the SAME normalized platform the cache key is built from. Deriving
     // the upstream query from the raw `Option` instead made "no targetPlatform"
     // and "targetPlatform=universal" two different upstream URLs sharing one
@@ -901,14 +938,14 @@ async fn gallery_vspackage(
         urlencoding::encode(&publisher),
         urlencoding::encode(&name),
         urlencoding::encode(&version),
-        urlencoding::encode(target_platform),
+        urlencoding::encode(target_platform.as_ref()),
     );
     let cache_path = format!(
         "gallery/{}/{}/{}/{}/vspackage",
         urlencoding::encode(&publisher),
         urlencoding::encode(&name),
         urlencoding::encode(&version),
-        urlencoding::encode(target_platform),
+        urlencoding::encode(target_platform.as_ref()),
     );
     let upstream_asset_url = format!(
         "{}/{}",
@@ -920,7 +957,7 @@ async fn gallery_vspackage(
         publisher: &publisher,
         name: &name,
         version: &version,
-        target_platform,
+        target_platform: target_platform.as_ref(),
     };
     let source = GalleryAssetSource {
         upstream_url: &upstream_asset_url,
@@ -948,25 +985,26 @@ async fn gallery_asset(
         publisher.as_str(),
         name.as_str(),
         version.as_str(),
-        target_platform,
+        target_platform.as_ref(),
         asset_type.as_str(),
     ] {
         validate_gallery_request_segment(segment)?;
     }
+    validate_target_platform(target_platform.as_ref(), false)?;
     let upstream_url = openvsx_asset_url(
         upstream_url,
         &publisher,
         &name,
         &version,
         &asset_type,
-        target_platform,
+        target_platform.as_ref(),
     )?;
     let cache_path = format!(
         "gallery/{}/{}/{}/{}/asset-{:x}",
         urlencoding::encode(&publisher),
         urlencoding::encode(&name),
         urlencoding::encode(&version),
-        urlencoding::encode(target_platform),
+        urlencoding::encode(target_platform.as_ref()),
         Sha256::digest(asset_type.as_bytes()),
     );
     let coordinate = GalleryAssetCoordinate {
@@ -974,7 +1012,7 @@ async fn gallery_asset(
         publisher: &publisher,
         name: &name,
         version: &version,
-        target_platform,
+        target_platform: target_platform.as_ref(),
     };
     let source = GalleryAssetSource {
         upstream_url: &upstream_url,
@@ -1086,18 +1124,11 @@ fn openvsx_asset_url(
 async fn gallery_item(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
-    // Extracted but intentionally unused: the redirect below is relative on
-    // purpose (see the comment there). Keep the extractor so the route's
-    // signature stays uniform with its siblings.
-    _base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     gallery_upstream(&state.db, &repo).await?;
-    // Deliberately relative. `RequestBaseUrl` falls back to `X-Forwarded-Host`
-    // / `Host` when `AK_EXTERNAL_URL` is unset, which is fine for a
-    // self-referential URL inside a JSON body but becomes a header-controlled
-    // open redirect the moment it lands in a `Location` a browser follows.
-    // A relative target reaches the same page and cannot leave the origin.
+    // Deliberately relative: a redirect built from forwarding headers would be
+    // header-controlled. This reaches the same page and cannot leave origin.
     Ok(
         Redirect::temporary(&format!("/repositories/{}", urlencoding::encode(&repo_key)))
             .into_response(),
@@ -1197,6 +1228,23 @@ fn reject_ungateable_legacy_pull_through(repo: &RepoInfo) -> Result<(), Response
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+fn legacy_download_upstream_path(
+    publisher: &str,
+    name: &str,
+    version: &str,
+) -> Result<String, Response> {
+    for segment in [publisher, name, version] {
+        validate_gallery_request_segment(segment)?;
+    }
+    Ok(format!(
+        "extensions/{}/{}/{}/download",
+        urlencoding::encode(publisher),
+        urlencoding::encode(name),
+        urlencoding::encode(version),
+    ))
+}
+
 async fn download_vsix(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1240,12 +1288,18 @@ async fn download_vsix(
             // route. Locally-hosted artifacts (the `Ok` arm) are unaffected —
             // the gate governs proxy pull-through only.
             reject_ungateable_legacy_pull_through(&repo)?;
+            let upstream_path = legacy_download_upstream_path(&publisher, &name, &version)?;
+            proxy_helpers::enforce_curation(
+                &state.db,
+                &repo,
+                &vscode_age_gate_package(&publisher, &name),
+                Some(&version),
+            )
+            .await?;
             if repo.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let upstream_path =
-                        format!("extensions/{}/{}/{}/download", publisher, name, version);
                     // #1608 Phase 4: stream the extension archive (.vsix) to the
                     // client while teeing to the proxy cache, instead of
                     // buffering the whole extension in memory. Single-flight via
@@ -1264,8 +1318,6 @@ async fn download_vsix(
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
                 let db = state.db.clone();
-                let upstream_path =
-                    format!("extensions/{}/{}/{}/download", publisher, name, version);
                 let vname = extension_id.clone();
                 let vversion = version.clone();
                 let result = proxy_helpers::resolve_virtual_download(
@@ -1623,6 +1675,7 @@ mod tests {
             "1.24.0@universal"
         );
         assert_eq!(vscode_age_gate_version("1.24.0", None), "1.24.0@universal");
+        assert_eq!(normal_target_platform(Some(" Linux-X64 ")), "linux-x64");
     }
 
     #[test]
@@ -2104,6 +2157,44 @@ mod tests {
     }
 
     #[test]
+    fn gallery_manifest_encodes_repo_key_in_every_resource_url() {
+        let manifest = build_gallery_manifest(
+            &RequestBaseUrl("https://ak.example".to_string()),
+            "team/extensions",
+        );
+        for resource in manifest["resources"].as_array().unwrap() {
+            assert!(resource["id"]
+                .as_str()
+                .unwrap()
+                .contains("team%2Fextensions"));
+        }
+    }
+
+    #[test]
+    fn gallery_manifest_ignores_forged_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "registry.example".parse().unwrap());
+        headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        let base_url = gallery_response_base_url(&headers);
+        let manifest = build_gallery_manifest(&base_url, "extensions");
+        for resource in manifest["resources"].as_array().unwrap() {
+            let id = resource["id"].as_str().unwrap();
+            assert!(id.starts_with("https://registry.example/"), "{id}");
+            assert!(!id.contains("evil.example"), "{id}");
+        }
+    }
+
+    #[test]
+    fn legacy_download_upstream_path_validates_then_percent_encodes() {
+        assert_eq!(
+            legacy_download_upstream_path("Publisher Name", "My Extension", "1.0.0+build").unwrap(),
+            "extensions/Publisher%20Name/My%20Extension/1.0.0%2Bbuild/download"
+        );
+        assert!(legacy_download_upstream_path("bad?publisher", "extension", "1.0.0").is_err());
+    }
+
+    #[test]
     fn openvsx_asset_url_uses_gallery_adapter_sibling_and_platform() {
         assert_eq!(
             openvsx_asset_url(
@@ -2176,6 +2267,11 @@ mod tests {
             "Microsoft.VisualStudio.Services.VSIXPackage"
         ));
         assert!(is_safe_gallery_segment("linux-x64"));
+        assert!(is_safe_target_platform("linux-x64"));
+        assert!(is_safe_target_platform("future.web-2"));
+        assert!(!is_safe_target_platform("Linux-X64"));
+        assert!(!is_safe_target_platform("linux_x64"));
+        assert!(!is_safe_target_platform(&"x".repeat(65)));
     }
 
     #[test]
@@ -2286,18 +2382,8 @@ mod tests {
                 ),
             ] {
                 let app = fx.router_anon(super::router());
-                let (status, body) = tdh::send(app, request).await;
+                let (status, _) = tdh::send(app, request).await;
                 assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{repo_type}");
-                // `unsupported_gallery_repo` emits 501 for BOTH the non-Remote
-                // and the non-public check, and `create_repo` leaves
-                // `is_public` at its `false` default — so the status alone is
-                // satisfied by either guard. Pin the discriminating clause.
-                assert!(
-                    String::from_utf8_lossy(&body).contains("gallery access requires Remote"),
-                    "{repo_type}: must be rejected by the repo-type guard, not incidentally by \
-                     the public-only guard: {}",
-                    String::from_utf8_lossy(&body)
-                );
             }
             fx.teardown().await;
         }
@@ -2353,12 +2439,13 @@ mod tests {
                     .parse::<axum::http::HeaderValue>()
                     .expect("valid bearer header"),
             );
-            let (status, _) = tdh::send(app.clone(), request).await;
+            let (status, body) = tdh::send(app.clone(), request).await;
             assert_eq!(
                 status,
-                StatusCode::NOT_IMPLEMENTED,
-                "private Remote gallery route must remain unsupported"
+                StatusCode::FORBIDDEN,
+                "private Remote gallery route is forbidden by the public-only contract"
             );
+            assert!(!String::from_utf8_lossy(&body).contains("prototype"));
         }
         fx.teardown().await;
     }
@@ -2499,21 +2586,29 @@ mod tests {
         let gallery_root = format!("{}/vscode/gallery", server.uri());
         let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
         let app = tdh::router_anon(super::router(), state.clone());
-        let (status, body) = tdh::send(
-            app,
-            tdh::post(
-                format!("/{}/gallery/extensionquery", fx.repo_key),
-                "application/json",
-                Bytes::from(serde_json::to_vec(&query).unwrap()),
-            ),
-        )
-        .await;
+        let mut request = tdh::post(
+            format!("/{}/gallery/extensionquery", fx.repo_key),
+            "application/json",
+            Bytes::from(serde_json::to_vec(&query).unwrap()),
+        );
+        request
+            .headers_mut()
+            .insert("host", "registry.example".parse().expect("valid Host"));
+        request.headers_mut().insert(
+            "x-forwarded-host",
+            "evil.example".parse().expect("valid forwarded host"),
+        );
+        request.headers_mut().insert(
+            "x-forwarded-proto",
+            "https".parse().expect("valid forwarded proto"),
+        );
+        let (status, body) = tdh::send(app, request).await;
 
         assert_eq!(status, StatusCode::OK, "gateway must return query result");
         let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let version = &response["results"][0]["extensions"][0]["versions"][0];
         let expected_base = format!(
-            "http://localhost/vscode/{}/asset/publisher/extension/1.2.3/linux-x64",
+            "https://registry.example/vscode/{}/asset/publisher/extension/1.2.3/linux-x64",
             fx.repo_key
         );
         assert_eq!(version["assetUri"], expected_base);
@@ -2533,6 +2628,9 @@ mod tests {
         assert!(!body
             .windows(b"cdn.example".len())
             .any(|w| w == b"cdn.example"));
+        assert!(!body
+            .windows(b"evil.example".len())
+            .any(|w| w == b"evil.example"));
 
         // VS Code composes normal resources as `assetUri + '/' + assetType`.
         // A trailing slash in our base would make this `//README.md` and miss
@@ -2705,7 +2803,7 @@ mod tests {
         };
         let (linux_status, linux_body) = tdh::send(
             tdh::router_anon(super::router(), state.clone()),
-            request("linux-x64"),
+            request("LINUX-X64"),
         )
         .await;
         assert_eq!(linux_status, StatusCode::OK);
@@ -2730,6 +2828,80 @@ mod tests {
         // Each mock has expect(1): the final Linux request must use the
         // completed cache entry rather than refetching the binary upstream.
         drop(server);
+        fx.teardown().await;
+    }
+
+    /// Curation must cover the legacy Remote pull-through as well as the new
+    /// gallery delivery paths. Otherwise an emergency deny blocks the gallery
+    /// URL while the same VSIX remains downloadable through `/extensions`.
+    #[tokio::test]
+    async fn legacy_remote_download_honors_curation_before_upstream_fetch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let allowed_bytes = b"allowed-legacy-vsix";
+        Mock::given(method("GET"))
+            .and(path("/extensions/Other/extension/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(allowed_bytes))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/extensions/Blocked/extension/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        enable_curation_block(&fx, "blocked.extension").await;
+        let request = |publisher: &str| {
+            tdh::get(format!(
+                "/{}/extensions/{publisher}/extension/1.0.0/download",
+                fx.repo_key
+            ))
+        };
+
+        let (blocked_status, blocked_body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            request("Blocked"),
+        )
+        .await;
+        assert_eq!(blocked_status, StatusCode::FORBIDDEN);
+        let blocked: serde_json::Value = serde_json::from_slice(&blocked_body).unwrap();
+        assert_eq!(blocked["error"], "curation_blocked");
+        assert_eq!(blocked["package"], "blocked.extension");
+
+        let (allowed_status, allowed_body) =
+            tdh::send(tdh::router_anon(super::router(), state), request("Other")).await;
+        assert_eq!(allowed_status, StatusCode::OK);
+        assert_eq!(&allowed_body[..], allowed_bytes);
+
+        drop(server);
+        drop_curation_rules(&fx).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_remote_download_rejects_unsafe_decoded_path_segments() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (status, _) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!(
+                "/{}/extensions/bad%3Fpublisher/extension/1.0.0/download",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         fx.teardown().await;
     }
 
@@ -2831,9 +3003,16 @@ mod tests {
         };
         let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
         let allowed_bytes = b"allowed-vsix";
-        // Only the ALLOWED extension has an upstream mock. The blocked one has
-        // none, and any stray request would 404 rather than 200 — but the
-        // `expect(1)` below is the real proof that exactly one fetch happened.
+        Mock::given(method("GET"))
+            .and(path(
+                "/vscode/gallery/publishers/Blocked/vsextensions/extension/1.0.0/vspackage",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // The blocked path's `expect(0)` pins that curation runs before any
+        // fetch. The allowed path's `expect(1)` is the positive control.
         Mock::given(method("GET"))
             // The upstream path keeps the caller's casing; only the curation /
             // age-gate identity is casefolded.
