@@ -101,9 +101,10 @@ async fn resolve_vscode_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Re
 
 /// Gallery metadata is forwarded, parsed for URL rewriting, and serialized
 /// again, so it needs a deliberately smaller cap than the large package-index
-/// formats. The live Open VSX dogfood latest/query response was about 400 KiB;
-/// 2 MiB leaves five times the observed live-query headroom without admitting
-/// 128 MiB JSON documents.
+/// formats. Every document buffered under this cap is a bounded shape: a
+/// per-extension detail query measures ~25 KiB and a client search page
+/// ~1.2 MiB. A whole version history is never buffered here — that document is
+/// projected through the skeleton path below, under its own cap.
 const GALLERY_METADATA_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// One gallery query can simultaneously retain wire bytes, a parsed JSON tree,
 /// and serialized output. Charge a conservative multiple of the wire cap
@@ -113,13 +114,148 @@ const GALLERY_METADATA_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// gallery queries rather than several GiB of real memory.
 const GALLERY_METADATA_BUDGET_RESERVATION_BYTES: usize = GALLERY_METADATA_MAX_BYTES * 32;
 const GALLERY_QUERY_BODY_MAX_BYTES: usize = 1024 * 1024;
-/// Exact-version age-gate resolution only reads `version`, `targetPlatform`,
-/// and `lastUpdated`. Requesting the full client response here makes Open VSX
-/// return every version's files, properties, and statistics, which can be
-/// several MiB for a single extension. `IncludeVersions` retains the evidence
-/// this internal check needs; asset URLs are derived from the configured
-/// gallery root rather than trusted from this response.
-const GALLERY_EXACT_VERSION_QUERY_FLAGS: u32 = 1;
+/// The version skeleton is the only gallery document whose size scales with an
+/// extension's release history rather than with the client's page size. The
+/// worst known case, rust-analyzer's 12,592 versions, measures 9.95 MiB at
+/// [`GALLERY_SKELETON_QUERY_FLAGS`] (~790 B/version). 16 MiB admits it with
+/// headroom while still refusing an unbounded document.
+const GALLERY_SKELETON_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Skeleton bytes are deserialized into [`GallerySkeletonVersion`] rather than
+/// into a `serde_json::Value` tree, so the 32× DOM allowance behind
+/// [`GALLERY_METADATA_BUDGET_RESERVATION_BYTES`] does not apply. The honest
+/// peak is still three things resident at once: the wire buffer (up to the
+/// cap), serde's full materialization of every version's `properties` into
+/// owned `String`s before this module discards all but two of them, and the
+/// retained projection. For the measured 12,592-version worst case that is
+/// ~10 MiB + ~11 MiB + ~2 MiB, so charge 4× the cap rather than pretending the
+/// discarded properties are free.
+const GALLERY_SKELETON_BUDGET_MULTIPLE: usize = 4;
+const GALLERY_SKELETON_BUDGET_RESERVATION_BYTES: usize =
+    GALLERY_SKELETON_MAX_BYTES * GALLERY_SKELETON_BUDGET_MULTIPLE;
+/// `IncludeVersions`: the flag that makes Open VSX attach an extension's whole
+/// version history to a result.
+const GALLERY_INCLUDE_VERSIONS_FLAG: u32 = 1;
+/// `IncludeFiles`: VS Code resolves an asset by filtering `versions[].files`
+/// FIRST, so a version served without it is not installable.
+const GALLERY_INCLUDE_FILES_FLAG: u32 = 2;
+/// `IncludeVersionProperties`: carries the `PreRelease` and `Engine` properties
+/// that decide channel and engine compatibility.
+const GALLERY_VERSION_PROPERTIES_FLAG: u32 = 16;
+/// `IncludeAssetUri`: without it Open VSX emits explicit `null` asset URIs, and
+/// a synthesized version must match that shape rather than invent one.
+const GALLERY_INCLUDE_ASSET_URI_FLAG: u32 = 128;
+/// `IncludeLatestVersionOnly`. Open VSX honours it for single-ID queries
+/// (`filterType` 4 or 7) and ignores it for every other query shape, which is
+/// why bounding a multi-ID or search query means composing per identity rather
+/// than rewriting the client's flags in place.
+const GALLERY_LATEST_VERSION_ONLY_FLAG: u32 = 512;
+/// The smallest query that still carries every version's `lastUpdated` and its
+/// `PreRelease`/`Engine` properties. Files, asset URIs, statistics, and
+/// categories are deliberately not requested: AK derives every asset reference
+/// from repository configuration, so per-version upstream delivery metadata is
+/// never needed and only inflates the buffered document.
+const GALLERY_SKELETON_QUERY_FLAGS: u32 =
+    GALLERY_INCLUDE_VERSIONS_FLAG | GALLERY_VERSION_PROPERTIES_FLAG;
+/// Exact-version age-gate resolution reads only `version`, `targetPlatform`,
+/// and `lastUpdated`, so it asks for nothing else: this runs on every gated
+/// asset request — every icon on a search results page — and is never cached.
+/// Dropping the properties measures 2.12 MiB against 9.95 MiB for the worst
+/// known history. It still travels the skeleton path rather than the gallery
+/// metadata path, because 2.12 MiB does not fit under the 2 MiB metadata cap.
+const GALLERY_EXACT_VERSION_QUERY_FLAGS: u32 = GALLERY_INCLUDE_VERSIONS_FLAG;
+/// The latest-version route serves one extension record with the same
+/// client-visible metadata the previous 511 query returned;
+/// `IncludeLatestVersionOnly` keeps Open VSX from attaching the whole version
+/// history to it. This route addresses a single extension by name, which is a
+/// shape Open VSX honours the flag for.
+const GALLERY_LATEST_VERSION_QUERY_FLAGS: u32 = 511 | GALLERY_LATEST_VERSION_ONLY_FLAG;
+/// `ExtensionId` and `ExtensionName`: the two criteria that address exactly one
+/// extension, and therefore the two Open VSX honours
+/// [`GALLERY_LATEST_VERSION_ONLY_FLAG`] for.
+const GALLERY_EXTENSION_ID_FILTER: u64 = 4;
+const GALLERY_EXTENSION_NAME_FILTER: u64 = 7;
+/// `Target` and `ExcludeWithFlags` do not select extensions, they qualify the
+/// selection — VS Code sends both alongside its identity criteria on a normal
+/// update check. They neither prevent composition nor address an extension, so
+/// they are repeated verbatim on every per-identity sub-query instead.
+const GALLERY_TARGET_FILTER: u64 = 8;
+const GALLERY_EXCLUDE_WITH_FLAGS_FILTER: u64 = 12;
+/// Versions retained per (target platform, release channel) when a version
+/// history is projected into a response. Upstream returns newest-first, so the
+/// first K of each bucket are its newest; bucketing by platform AND channel is
+/// what keeps the newest *stable* build reachable for an extension that
+/// publishes mostly pre-releases (rust-analyzer's newest stable sits at index
+/// 10,970 of 12,592, so any positional truncation loses the stable channel).
+/// K = 30 bounds one extension's output to roughly 10 platforms × 2 channels ×
+/// 30 × ~350 B ≈ 210 KiB.
+const GALLERY_VERSIONS_PER_CHANNEL: usize = 30;
+/// Composition issues two upstream queries per requested extension. Bound how
+/// many extensions are in flight so a client query cannot fan out into
+/// simultaneous upstream requests and budget reservations without limit.
+const GALLERY_COMPOSITION_CONCURRENCY: usize = 4;
+/// Composed responses admitted at once.
+///
+/// A composed page accumulates during the fan-out, before it can be charged
+/// against the shared byte budget (see [`serve_composed_gallery_response`] for
+/// why that charge cannot wrap the fan-out). This bounds how many such
+/// accumulations exist at once, capping their total at
+/// `GALLERY_COMPOSITION_ADMISSION × GALLERY_COMPOSED_IDENTITY_CAP ×
+/// GALLERY_COMPOSED_EXTENSION_BYTES`.
+///
+/// It is deliberately a DIFFERENT resource from the byte budget, acquired in a
+/// strict order — admission, then per-sub-query byte reservations, then the
+/// composed byte reservation — and nothing that holds a byte reservation ever
+/// waits for admission. A cycle, and therefore a deadlock, cannot form.
+const GALLERY_COMPOSITION_ADMISSION: usize = 20;
+/// Qualifier criteria one composed query may carry.
+///
+/// Every qualifier is replayed verbatim on every per-identity sub-query, so an
+/// unbounded list multiplies into the outbound bodies: a full
+/// [`GALLERY_QUERY_BODY_MAX_BYTES`] of qualifiers over a full identity page is
+/// ~50 MiB of upstream requests. A body carrying more than this is NOT
+/// composed with a truncated list — a qualifier changes which versions
+/// upstream resolves, so composing without one answers a different question
+/// than the client asked. It falls back to passthrough instead. VS Code sends
+/// at most two.
+const GALLERY_COMPOSED_QUALIFIER_CAP: usize = 8;
+/// Ceiling on how many extensions one composed response may carry.
+///
+/// Concurrency bounds simultaneity, not total work: a
+/// [`GALLERY_QUERY_BODY_MAX_BYTES`] body admits roughly 36,000 identity
+/// criteria, which composition would turn into ~72,000 upstream round-trips,
+/// as many repository lookups, and an unbounded composed document. The gallery
+/// protocol is paged, so truncating to a page is the protocol-shaped answer
+/// rather than an error; 50 is the largest `pageSize` VS Code sends.
+const GALLERY_COMPOSED_IDENTITY_CAP: usize = 50;
+/// Bounded serialized output for one composed extension: roughly 10 target
+/// platforms × 2 release channels × [`GALLERY_VERSIONS_PER_CHANNEL`] entries ×
+/// ~750 B per entry (coordinate, timestamp, two properties, and the four
+/// synthesized file references) ≈ 450 KiB. Rounded up to 512 KiB.
+const GALLERY_COMPOSED_EXTENSION_BYTES: usize = 512 * 1024;
+/// The composed page is held as a `serde_json::Value` tree AND as the
+/// serialized response body at the same time, so charge twice the bounded
+/// output of a full page. At the default 1 GiB budget this admits 20
+/// concurrent composed responses.
+const GALLERY_COMPOSITION_BUDGET_RESERVATION_BYTES: usize =
+    GALLERY_COMPOSED_IDENTITY_CAP * GALLERY_COMPOSED_EXTENSION_BYTES * 2;
+/// The two version properties VS Code reads to resolve release channel and
+/// engine compatibility, and therefore the only two the skeleton retains.
+const GALLERY_PRERELEASE_PROPERTY: &str = "Microsoft.VisualStudio.Code.PreRelease";
+const GALLERY_ENGINE_PROPERTY: &str = "Microsoft.VisualStudio.Code.Engine";
+/// Asset types a synthesized version advertises in its `files` list.
+///
+/// VS Code's asset resolution filters `versions[].files` BEFORE it looks at
+/// `assetUri`, so a version served without a file list is not installable no
+/// matter how correct its asset URI is. Every entry is derived from the same
+/// AK asset base the rewrite pass builds, so a synthesized list is
+/// byte-identical in shape to a rewritten one and resolves through the same
+/// [`gallery_asset`] route.
+const GALLERY_SYNTHESIZED_ASSET_TYPES: [&str; 4] = [
+    "Microsoft.VisualStudio.Services.VSIXPackage",
+    "Microsoft.VisualStudio.Code.Manifest",
+    "Microsoft.VisualStudio.Services.Content.Details",
+    "Microsoft.VisualStudio.Services.Icons.Default",
+];
 const DEFAULT_TARGET_PLATFORM: &str = "universal";
 
 #[derive(serde::Deserialize)]
@@ -250,6 +386,35 @@ fn gallery_asset_base_url(
     )
 }
 
+/// Validate one upstream version coordinate and return the AK asset base URL it
+/// maps to. Both the rewrite pass over an upstream document and the synthesis
+/// of a version entry AK builds itself go through this, so a synthesized
+/// `assetUri` cannot drift from a rewritten one — a drift would send clients to
+/// a URL shape [`gallery_asset`] does not route. `target_platform` must already
+/// be normalized by [`normal_target_platform`]; the coordinate reaches both a
+/// client-visible URL and a proxy cache key, so it is validated as untrusted
+/// upstream input regardless of which caller supplied it.
+#[allow(clippy::result_large_err)]
+fn gallery_version_asset_base(
+    base_url: &RequestBaseUrl,
+    repo_key: &str,
+    publisher: &str,
+    name: &str,
+    version: &str,
+    target_platform: &str,
+) -> Result<String, Response> {
+    validate_gallery_response_segment(version)?;
+    validate_target_platform(target_platform, true)?;
+    Ok(gallery_asset_base_url(
+        base_url,
+        repo_key,
+        publisher,
+        name,
+        version,
+        target_platform,
+    ))
+}
+
 fn normal_target_platform(platform: Option<&str>) -> Cow<'_, str> {
     let value = platform
         .map(str::trim)
@@ -282,7 +447,12 @@ fn gallery_last_updated(version: &serde_json::Value) -> Option<DateTime<Utc>> {
     version
         .get("lastUpdated")
         .and_then(serde_json::Value::as_str)
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .and_then(gallery_parse_last_updated)
+}
+
+fn gallery_parse_last_updated(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
         .map(|value| value.with_timezone(&Utc))
 }
 
@@ -291,7 +461,11 @@ fn gallery_last_updated(version: &serde_json::Value) -> Option<DateTime<Utc>> {
 /// explicit boundary for decoded paths and for values supplied by upstream
 /// metadata before we rewrite them into AK URLs.
 fn is_safe_gallery_segment(value: &str) -> bool {
+    // Coordinates also become filesystem path components under the proxy cache
+    // root, where a component over 255 bytes is ENAMETOOLONG on ext4 and xfs.
+    // Refuse them here rather than surfacing a storage error later.
     !value.is_empty()
+        && value.len() <= 255
         && value != "."
         && value != ".."
         && !value.contains(['/', '\\', '?', '#'])
@@ -403,24 +577,28 @@ fn rewrite_gallery_asset_urls(
                     .and_then(|value| value.as_str())
                     .map(str::to_owned)
                     .ok_or_else(invalid_gallery_response)?;
-                validate_gallery_response_segment(&version_name)?;
                 let target_platform = normal_target_platform(
                     version
                         .get("targetPlatform")
                         .and_then(|value| value.as_str()),
                 );
-                validate_target_platform(target_platform.as_ref(), true)?;
-                let asset_base = gallery_asset_base_url(
+                let asset_base = gallery_version_asset_base(
                     base_url,
                     repo_key,
                     &publisher,
                     &name,
                     &version_name,
                     target_platform.as_ref(),
-                );
+                )?;
 
                 for field in ["assetUri", "fallbackAssetUri"] {
                     if let Some(value) = version.get(field) {
+                        // Open VSX emits explicit nulls when a client omits
+                        // IncludeAssetUri. A null carries no fetch capability,
+                        // so preserve it; rewrite only real asset references.
+                        if value.is_null() {
+                            continue;
+                        }
                         if !value.is_string() {
                             return Err(invalid_gallery_response());
                         }
@@ -468,12 +646,35 @@ fn rewrite_gallery_asset_urls(
     Ok(())
 }
 
-async fn fetch_gallery_query(
+fn gallery_response_too_large() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        "Open VSX gallery response exceeded the gateway's buffered-metadata ceiling",
+    )
+        .into_response()
+}
+
+fn malformed_gallery_json() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        "Open VSX gallery returned malformed JSON",
+    )
+        .into_response()
+}
+
+/// POST one `extensionquery` and buffer its response under `limits`.
+///
+/// `Ok(None)` reports the byte-ceiling abort specifically, so callers that can
+/// re-ask upstream for a bounded projection of the same query act on the wire
+/// shape rather than on a rendered error. Every other upstream failure keeps
+/// its own status.
+async fn post_gallery_query(
     state: &SharedState,
     repo: &RepoInfo,
     repo_key: &str,
     body: Bytes,
-) -> Result<BufferedGalleryQuery, Response> {
+    limits: proxy_helpers::MetadataWorkingSetLimits,
+) -> Result<Option<(Bytes, tokio::sync::OwnedSemaphorePermit)>, Response> {
     let upstream_url = gallery_upstream(&state.db, repo).await?;
     // Validate client input before it is eligible to reach an upstream. This
     // also makes the contract explicit: the gateway forwards JSON semantics,
@@ -493,37 +694,873 @@ async fn fetch_gallery_query(
         )
             .into_response()
     })?;
-    let (content, _content_type, budget_permit) =
-        proxy_helpers::proxy_post_json_uncached_capped_budgeted(
-            proxy,
-            repo.id,
-            repo_key,
-            upstream_url,
-            "extensionquery",
-            body,
-            proxy_helpers::MetadataWorkingSetLimits {
-                max_bytes: GALLERY_METADATA_MAX_BYTES,
-                reservation_bytes: GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
-            },
-        )
-        .await?;
-    let response: serde_json::Value = serde_json::from_slice(&content).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Open VSX gallery returned malformed JSON",
-        )
-            .into_response()
-    })?;
+    match proxy_helpers::proxy_post_json_uncached_capped_budgeted(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        "extensionquery",
+        body,
+        limits,
+    )
+    .await?
+    {
+        proxy_helpers::CappedMetadataPost::Buffered {
+            content,
+            budget_permit,
+            ..
+        } => Ok(Some((content, budget_permit))),
+        proxy_helpers::CappedMetadataPost::OverCap => Ok(None),
+    }
+}
+
+/// Buffer and parse one gallery query under the shared metadata cap.
+/// `Ok(None)` is the byte-ceiling abort; see [`post_gallery_query`].
+async fn fetch_gallery_query_bounded(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    body: Bytes,
+) -> Result<Option<BufferedGalleryQuery>, Response> {
+    let Some((content, budget_permit)) = post_gallery_query(
+        state,
+        repo,
+        repo_key,
+        body,
+        proxy_helpers::MetadataWorkingSetLimits {
+            max_bytes: GALLERY_METADATA_MAX_BYTES,
+            reservation_bytes: GALLERY_METADATA_BUDGET_RESERVATION_BYTES,
+        },
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let response: serde_json::Value =
+        serde_json::from_slice(&content).map_err(|_| malformed_gallery_json())?;
     if !response
         .get("results")
         .is_some_and(serde_json::Value::is_array)
     {
         return Err(invalid_gallery_response());
     }
-    Ok(BufferedGalleryQuery {
+    Ok(Some(BufferedGalleryQuery {
         value: response,
         _budget_permit: budget_permit,
+    }))
+}
+
+/// [`fetch_gallery_query_bounded`] for the AK-generated queries whose shape is
+/// already bounded by construction (single identity, `IncludeLatestVersionOnly`
+/// or versions-only). Hitting the ceiling there is an upstream fault, not a
+/// query the gateway can narrow further.
+async fn fetch_gallery_query(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    body: Bytes,
+) -> Result<BufferedGalleryQuery, Response> {
+    fetch_gallery_query_bounded(state, repo, repo_key, body)
+        .await?
+        .ok_or_else(gallery_response_too_large)
+}
+
+/// Build the one-identity `extensionquery` AK issues on a client's behalf.
+///
+/// Open VSX requires the paging fields on every filter, including a one-result
+/// lookup; VS Code clients normally include them, so AK-generated queries must
+/// supply them too. `qualifiers` are the client's own non-selecting criteria
+/// (`Target`, `ExcludeWithFlags`) repeated verbatim, so a sub-query resolves
+/// the same version set the client's original query would have.
+fn gallery_single_id_query(
+    identity: &GalleryCriterion,
+    qualifiers: &[GalleryCriterion],
+    flags: u32,
+) -> serde_json::Value {
+    let mut criteria = vec![gallery_criterion_json(identity)];
+    criteria.extend(qualifiers.iter().map(gallery_criterion_json));
+    let mut query = serde_json::json!({
+        "filters": [{
+            "criteria": [],
+            "pageNumber": 1,
+            "pageSize": 1,
+            "sortBy": 0,
+            "sortOrder": 0,
+        }],
+        "flags": flags,
+    });
+    query["filters"][0]["criteria"] = serde_json::Value::Array(criteria);
+    query
+}
+
+fn gallery_criterion_json(criterion: &GalleryCriterion) -> serde_json::Value {
+    serde_json::json!({
+        "filterType": criterion.filter_type,
+        "value": criterion.value,
     })
+}
+
+fn gallery_query_body(query: &serde_json::Value) -> Bytes {
+    Bytes::from(serde_json::to_vec(query).expect("gallery query serializes"))
+}
+
+/// Read `flags` off a client body without depending on the whole typed
+/// projection parsing.
+fn gallery_query_flags(body: &Bytes) -> Option<u32> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("flags")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|flags| u32::try_from(flags).ok())
+}
+
+/// Re-issue a client's own query under different flags, preserving every other
+/// field it carried (paging, sorting, asset types) so the extensions it matches
+/// stay the ones the original query would have matched.
+fn gallery_query_with_flags(body: &Bytes, flags: u32) -> Option<Bytes> {
+    let mut query: serde_json::Value = serde_json::from_slice(body).ok()?;
+    query
+        .as_object_mut()?
+        .insert("flags".to_string(), serde_json::json!(flags));
+    serde_json::to_vec(&query).ok().map(Bytes::from)
+}
+
+/// One `extensionquery` filter criterion, in the protocol's own wire shape.
+struct GalleryCriterion {
+    filter_type: u64,
+    value: String,
+}
+
+/// The plan for answering a pure-identity query by composition: which
+/// extensions to compose, in the client's order, and the qualifier criteria
+/// every per-identity sub-query must repeat.
+struct GalleryComposition {
+    identities: Vec<GalleryCriterion>,
+    qualifiers: Vec<GalleryCriterion>,
+}
+
+/// The subset of an `extensionquery` body this gateway reasons about. Unknown
+/// fields are ignored: a query is only ever re-shaped by rewriting `flags` on
+/// the client's own JSON, never by reserializing this projection.
+#[derive(serde::Deserialize)]
+struct GalleryQueryRequest {
+    #[serde(default)]
+    filters: Vec<GalleryQueryFilter>,
+    #[serde(default)]
+    flags: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct GalleryQueryFilter {
+    #[serde(default)]
+    criteria: Vec<GalleryQueryCriterion>,
+    #[serde(rename = "pageSize", default)]
+    page_size: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct GalleryQueryCriterion {
+    #[serde(rename = "filterType", default)]
+    filter_type: u64,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+/// How many extensions a composed answer to `request` may carry: the client's
+/// own page size, clamped into `1..=GALLERY_COMPOSED_IDENTITY_CAP`.
+///
+/// Honouring `pageSize` here is protocol-consistent rather than a liberty:
+/// upstream applies it to the same query, so a client that asks for a page and
+/// receives one is getting what the gallery protocol promises. It is also what
+/// makes the identity bound a truncation instead of an error.
+fn gallery_composed_identity_limit(request: &GalleryQueryRequest) -> usize {
+    request
+        .filters
+        .first()
+        .and_then(|filter| filter.page_size)
+        .and_then(|page_size| usize::try_from(page_size).ok())
+        .unwrap_or(GALLERY_COMPOSED_IDENTITY_CAP)
+        .clamp(1, GALLERY_COMPOSED_IDENTITY_CAP)
+}
+
+/// The composition plan for a pure-identity query.
+///
+/// `None` means the query is not one this gateway composes: it mixes in a
+/// selecting criterion this gateway cannot address one extension at a time
+/// (search text, category, featured), does not ask for versions, or already
+/// asked for latest-only — Open VSX bounds that last shape itself for a
+/// single-identity query, so composing it would change what the client receives
+/// for no benefit.
+///
+/// Identities beyond the page limit are truncated rather than refused, matching
+/// the paging semantics the protocol already has.
+fn gallery_composable_criteria(request: &GalleryQueryRequest) -> Option<GalleryComposition> {
+    if request.flags & GALLERY_INCLUDE_VERSIONS_FLAG == 0
+        || request.flags & GALLERY_LATEST_VERSION_ONLY_FLAG != 0
+    {
+        return None;
+    }
+    let limit = gallery_composed_identity_limit(request);
+    let mut identities: Vec<GalleryCriterion> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for filter in &request.filters {
+        for criterion in &filter.criteria {
+            let selects = criterion.filter_type == GALLERY_EXTENSION_ID_FILTER
+                || criterion.filter_type == GALLERY_EXTENSION_NAME_FILTER;
+            let qualifies = criterion.filter_type == GALLERY_TARGET_FILTER
+                || criterion.filter_type == GALLERY_EXCLUDE_WITH_FLAGS_FILTER;
+            if !selects && !qualifies {
+                return None;
+            }
+            let value = criterion.value.as_deref().unwrap_or_default();
+            if value.is_empty() {
+                return None;
+            }
+            if !selects || !seen.insert((criterion.filter_type, value.to_string())) {
+                continue;
+            }
+            // Identities beyond the page are dropped, not refused: the protocol
+            // already pages, so a client can ask for the rest.
+            if identities.len() < limit {
+                identities.push(GalleryCriterion {
+                    filter_type: criterion.filter_type,
+                    value: value.to_string(),
+                });
+            }
+        }
+    }
+    if identities.is_empty() {
+        return None;
+    }
+    Some(GalleryComposition {
+        identities,
+        qualifiers: gallery_query_qualifiers(request)?,
+    })
+}
+
+/// The client's non-selecting criteria — the ones that qualify a selection
+/// rather than making one — deduplicated and in the client's order.
+///
+/// Both composition paths need these: every per-identity sub-query repeats them
+/// verbatim, so a sub-query issued without them resolves a different version
+/// set than the client's original query would have. `None` means there are more
+/// than [`GALLERY_COMPOSED_QUALIFIER_CAP`] of them, which callers must treat as
+/// "do not compose" rather than "compose unqualified" — dropping a qualifier
+/// answers a different question, where dropping an identity merely answers a
+/// shorter page of the same one.
+fn gallery_query_qualifiers(request: &GalleryQueryRequest) -> Option<Vec<GalleryCriterion>> {
+    let mut qualifiers: Vec<GalleryCriterion> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for filter in &request.filters {
+        for criterion in &filter.criteria {
+            if criterion.filter_type != GALLERY_TARGET_FILTER
+                && criterion.filter_type != GALLERY_EXCLUDE_WITH_FLAGS_FILTER
+            {
+                continue;
+            }
+            let value = criterion.value.as_deref().unwrap_or_default();
+            if value.is_empty() || !seen.insert((criterion.filter_type, value.to_string())) {
+                continue;
+            }
+            if qualifiers.len() >= GALLERY_COMPOSED_QUALIFIER_CAP {
+                return None;
+            }
+            qualifiers.push(GalleryCriterion {
+                filter_type: criterion.filter_type,
+                value: value.to_string(),
+            });
+        }
+    }
+    Some(qualifiers)
+}
+
+/// The identities an upstream result page names, as single-extension criteria,
+/// deduplicated and bounded by the same page cap composition applies to a
+/// client's own identity list.
+#[allow(clippy::result_large_err)]
+fn gallery_response_identities(
+    response: &serde_json::Value,
+    limit: usize,
+) -> Result<Vec<GalleryCriterion>, Response> {
+    let results = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(invalid_gallery_response)?;
+    let mut criteria = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for result in results {
+        let extensions = result
+            .get("extensions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(invalid_gallery_response)?;
+        for extension in extensions {
+            if criteria.len() >= limit {
+                return Ok(criteria);
+            }
+            let (publisher, name, _) =
+                gallery_extension_identity(extension).ok_or_else(invalid_gallery_response)?;
+            let value = format!("{publisher}.{name}");
+            if !seen.insert(value.clone()) {
+                continue;
+            }
+            criteria.push(GalleryCriterion {
+                filter_type: GALLERY_EXTENSION_NAME_FILTER,
+                value,
+            });
+        }
+    }
+    Ok(criteria)
+}
+
+/// One version as [`GALLERY_SKELETON_QUERY_FLAGS`] returns it. Everything this
+/// gateway does not need is dropped at deserialize time; that is what keeps a
+/// 12,592-version history a bounded typed working set instead of a
+/// `serde_json::Value` tree carrying a node per JSON key.
+#[derive(serde::Deserialize)]
+struct GallerySkeletonWireVersion {
+    version: String,
+    #[serde(rename = "targetPlatform", default)]
+    target_platform: Option<String>,
+    #[serde(rename = "lastUpdated", default)]
+    last_updated: Option<String>,
+    #[serde(default)]
+    properties: Option<Vec<GallerySkeletonWireProperty>>,
+}
+
+#[derive(serde::Deserialize)]
+struct GallerySkeletonWireProperty {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GallerySkeletonWireExtension {
+    #[serde(default)]
+    publisher: Option<GallerySkeletonWirePublisher>,
+    #[serde(rename = "extensionName", default)]
+    extension_name: Option<String>,
+    #[serde(default)]
+    versions: Vec<GallerySkeletonWireVersion>,
+}
+
+#[derive(serde::Deserialize)]
+struct GallerySkeletonWirePublisher {
+    #[serde(rename = "publisherName", default)]
+    publisher_name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GallerySkeletonWireResult {
+    #[serde(default)]
+    extensions: Vec<GallerySkeletonWireExtension>,
+}
+
+#[derive(serde::Deserialize)]
+struct GallerySkeletonWireDocument {
+    #[serde(default)]
+    results: Vec<GallerySkeletonWireResult>,
+}
+
+/// A validated skeleton entry. `target_platform` is already normalized, so
+/// `universal` covers both an explicit value and an absent one — Open VSX omits
+/// the field for platform-independent builds.
+#[derive(Debug)]
+struct GallerySkeletonVersion {
+    version: String,
+    target_platform: String,
+    last_updated: Option<DateTime<Utc>>,
+    prerelease: bool,
+    engine: Option<String>,
+}
+
+/// Validate and normalize the version skeleton of ONE extension.
+///
+/// Every caller attributes these versions to `package` — as the publish-time
+/// evidence behind a gated download, or as the version list spliced into that
+/// extension's detail record. Open VSX is not obliged to answer a
+/// single-identity lookup with exactly one extension, so a page that names
+/// others must not contribute: without this guard a gated request for
+/// `a.b@1.0.0` could take its publish time from a different extension that
+/// happens to have published a `1.0.0`, which is an age-gate bypass.
+///
+/// Coordinates become AK URL and proxy cache-key components, so they are
+/// checked here exactly as the rewrite pass checks an upstream document's own
+/// version entries. An entry that fails is SKIPPED rather than failing the
+/// document: one malformed coordinate anywhere in a 12,592-version history
+/// would otherwise permanently 502 both search and `/latest` for that
+/// extension, and every entry that does reach a client still passes through
+/// [`gallery_version_asset_base`].
+fn gallery_skeleton_versions(
+    document: GallerySkeletonWireDocument,
+    package: &str,
+) -> Vec<GallerySkeletonVersion> {
+    let mut versions = Vec::new();
+    let mut other_extensions = 0usize;
+    for result in document.results {
+        for extension in result.extensions {
+            let publisher = extension
+                .publisher
+                .and_then(|publisher| publisher.publisher_name)
+                .unwrap_or_default();
+            let name = extension.extension_name.unwrap_or_default();
+            if vscode_age_gate_package(&publisher, &name) != package {
+                other_extensions += 1;
+                continue;
+            }
+            for wire in extension.versions {
+                let target_platform =
+                    normal_target_platform(wire.target_platform.as_deref()).into_owned();
+                if validate_gallery_response_segment(&wire.version).is_err()
+                    || validate_target_platform(&target_platform, true).is_err()
+                {
+                    continue;
+                }
+                let mut prerelease = false;
+                let mut engine = None;
+                for property in wire.properties.unwrap_or_default() {
+                    let GallerySkeletonWireProperty { key, value } = property;
+                    if key.as_deref() == Some(GALLERY_PRERELEASE_PROPERTY) {
+                        prerelease = value.as_deref() == Some("true");
+                    } else if key.as_deref() == Some(GALLERY_ENGINE_PROPERTY) {
+                        engine = value;
+                    }
+                }
+                versions.push(GallerySkeletonVersion {
+                    version: wire.version,
+                    target_platform,
+                    last_updated: wire
+                        .last_updated
+                        .as_deref()
+                        .and_then(gallery_parse_last_updated),
+                    prerelease,
+                    engine,
+                });
+            }
+        }
+    }
+    if versions.is_empty() && other_extensions > 0 {
+        // Distinguishes "upstream has no such extension" from "the identity
+        // guard rejected everything it did return", which otherwise look
+        // identical downstream (a 404 on a gated fetch, an empty walk-back).
+        tracing::debug!(
+            "Open VSX version skeleton for {} named only other extensions ({} skipped)",
+            package,
+            other_extensions
+        );
+    }
+    versions
+}
+
+/// Fetch and project `package`'s whole version history.
+///
+/// `flags` selects how much of each version upstream attaches: callers that
+/// resolve channel and engine compatibility ask for
+/// [`GALLERY_SKELETON_QUERY_FLAGS`], while the publish-time-only lookup asks
+/// for [`GALLERY_EXACT_VERSION_QUERY_FLAGS`] and pays roughly a fifth of the
+/// bytes. Both deserialize into the same typed projection — absent properties
+/// are simply absent.
+///
+/// The wire document is buffered under [`GALLERY_SKELETON_MAX_BYTES`] and
+/// deserialized straight into that projection; the wire buffer and its budget
+/// reservation are released when this returns, so only the projection survives
+/// into selection and composition.
+async fn fetch_gallery_skeleton(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    identity: &GalleryCriterion,
+    qualifiers: &[GalleryCriterion],
+    flags: u32,
+    package: &str,
+) -> Result<Vec<GallerySkeletonVersion>, Response> {
+    let query = gallery_single_id_query(identity, qualifiers, flags);
+    let Some((content, _budget_permit)) = post_gallery_query(
+        state,
+        repo,
+        repo_key,
+        gallery_query_body(&query),
+        proxy_helpers::MetadataWorkingSetLimits {
+            max_bytes: GALLERY_SKELETON_MAX_BYTES,
+            reservation_bytes: GALLERY_SKELETON_BUDGET_RESERVATION_BYTES,
+        },
+    )
+    .await?
+    else {
+        return Err(gallery_response_too_large());
+    };
+    let document: GallerySkeletonWireDocument =
+        serde_json::from_slice(&content).map_err(|_| malformed_gallery_json())?;
+    Ok(gallery_skeleton_versions(document, package))
+}
+
+/// Order gallery versions newest-first, entries without trustworthy
+/// publish-time evidence last.
+///
+/// Open VSX normally returns a version history in this order already, but
+/// nothing in the protocol guarantees it, and every bound in this module is
+/// positional: a single non-monotonic page would silently make the bounded
+/// selection keep the OLDEST entries of each bucket and make the `/latest`
+/// walk-back serve the oldest allowed release. Undated entries sort last
+/// because they are exactly the ones the age gate treats as ineligible.
+fn sort_skeleton_newest_first(versions: &mut [GallerySkeletonVersion]) {
+    versions.sort_by_key(|version| std::cmp::Reverse(version.last_updated));
+}
+
+/// [`sort_skeleton_newest_first`] for already-rendered gallery version entries.
+/// This is also what gives a coordinate the detail query reported but the
+/// skeleton did not — a publish that landed between the two round-trips — a
+/// correct position instead of an arbitrary one.
+fn sort_gallery_versions_newest_first(versions: &mut [serde_json::Value]) {
+    versions.sort_by_key(|version| std::cmp::Reverse(gallery_last_updated(version)));
+}
+
+/// Keep the newest [`GALLERY_VERSIONS_PER_CHANNEL`] entries of every
+/// (target platform, release channel) bucket.
+fn select_bounded_gallery_versions(
+    mut versions: Vec<GallerySkeletonVersion>,
+) -> Vec<GallerySkeletonVersion> {
+    sort_skeleton_newest_first(&mut versions);
+    let mut per_bucket: std::collections::HashMap<(String, bool), usize> =
+        std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut selected = Vec::new();
+    for version in versions {
+        // A platform variant is one coordinate. An upstream that lists it twice
+        // must not spend two of that bucket's slots or emit two entries the
+        // client would have to disambiguate.
+        if !seen.insert(vscode_age_gate_version(
+            &version.version,
+            Some(&version.target_platform),
+        )) {
+            continue;
+        }
+        let kept = per_bucket
+            .entry((version.target_platform.clone(), version.prerelease))
+            .or_insert(0);
+        if *kept >= GALLERY_VERSIONS_PER_CHANNEL {
+            continue;
+        }
+        *kept += 1;
+        selected.push(version);
+    }
+    selected
+}
+
+/// Build the gallery `versions[]` entry AK serves for a skeleton selection.
+///
+/// Asset delivery metadata mirrors what the client asked for, exactly as
+/// upstream would have answered: `assetUri`/`fallbackAssetUri` only under
+/// `IncludeAssetUri`, `files` only under `IncludeFiles`. The file list is not
+/// optional decoration — VS Code filters `versions[].files` before it looks at
+/// `assetUri`, so a synthesized version without it is not installable.
+fn synthesize_gallery_version(
+    version: &GallerySkeletonVersion,
+    asset_base: &str,
+    flags: u32,
+) -> serde_json::Value {
+    let mut properties = Vec::new();
+    if version.prerelease {
+        properties.push(serde_json::json!({
+            "key": GALLERY_PRERELEASE_PROPERTY,
+            "value": "true",
+        }));
+    }
+    if let Some(engine) = version.engine.as_deref() {
+        properties.push(serde_json::json!({
+            "key": GALLERY_ENGINE_PROPERTY,
+            "value": engine,
+        }));
+    }
+    let mut synthesized = serde_json::json!({
+        "version": version.version,
+        "properties": properties,
+    });
+    // Upstream omits `targetPlatform` on a platform-independent build. Match
+    // that shape so one coordinate never reaches a client in two encodings.
+    if version.target_platform != DEFAULT_TARGET_PLATFORM {
+        synthesized["targetPlatform"] = serde_json::json!(version.target_platform);
+    }
+    if let Some(last_updated) = version.last_updated {
+        synthesized["lastUpdated"] = serde_json::json!(last_updated.to_rfc3339());
+    }
+    if flags & GALLERY_INCLUDE_ASSET_URI_FLAG != 0 {
+        synthesized["assetUri"] = serde_json::json!(asset_base);
+        synthesized["fallbackAssetUri"] = serde_json::json!(asset_base);
+    }
+    if flags & GALLERY_INCLUDE_FILES_FLAG != 0 {
+        let files = GALLERY_SYNTHESIZED_ASSET_TYPES
+            .iter()
+            .copied()
+            .map(|asset_type| {
+                serde_json::json!({
+                    "assetType": asset_type,
+                    // Byte-identical to what `rewrite_gallery_asset_urls`
+                    // produces for a detail-derived entry.
+                    "source": format!("{}/{}", asset_base, urlencoding::encode(asset_type)),
+                })
+            })
+            .collect::<Vec<_>>();
+        synthesized["files"] = serde_json::Value::Array(files);
+    }
+    synthesized
+}
+
+/// Wrap composed extensions in the `results` envelope clients expect.
+///
+/// `result_metadata` carries an upstream page's own metadata forward when
+/// composition answered a query upstream had already counted — its `TotalCount`
+/// is the total across every page, which the composed page length would
+/// silently replace with "this page is everything" and stop a paging client
+/// early. Composition driven by the client's own identity list has no such
+/// upstream count, so the composed length is the honest answer there.
+/// [`reconcile_gallery_result_count`] adjusts either shape if the age gate
+/// removes extensions.
+fn gallery_results_envelope(
+    extensions: Vec<serde_json::Value>,
+    result_metadata: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let total = extensions.len();
+    // Assign the extensions rather than interpolating them: `json!` serializes
+    // an interpolated value, which would deep-copy the whole composed payload
+    // that the bounded selection exists to keep small.
+    let mut envelope = serde_json::json!({
+        "results": [{
+            "extensions": [],
+            "resultMetadata": [{
+                "metadataType": "ResultCount",
+                "metadataItems": [{ "name": "TotalCount", "count": total }],
+            }],
+        }],
+    });
+    envelope["results"][0]["extensions"] = serde_json::Value::Array(extensions);
+    if let Some(result_metadata) = result_metadata {
+        envelope["results"][0]["resultMetadata"] = result_metadata;
+    }
+    envelope
+}
+
+/// Compose one extension's bounded record from a detail query and a skeleton.
+///
+/// The detail query supplies the extension envelope and its fully detailed
+/// latest-per-platform versions; the skeleton supplies the rest of the bounded
+/// selection, and a detail entry wins wherever both describe the same
+/// coordinate — it carries the files and statistics the synthesized entry
+/// deliberately omits. `Ok(None)` means upstream knows no such extension.
+async fn compose_gallery_extension(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    base_url: &RequestBaseUrl,
+    identity: &GalleryCriterion,
+    qualifiers: &[GalleryCriterion],
+    flags: u32,
+) -> Result<Option<serde_json::Value>, Response> {
+    let detail_query = gallery_single_id_query(
+        identity,
+        qualifiers,
+        flags | GALLERY_LATEST_VERSION_ONLY_FLAG,
+    );
+    let detail =
+        fetch_gallery_query(state, repo, repo_key, gallery_query_body(&detail_query)).await?;
+    let extension = detail.value.pointer("/results/0/extensions/0").cloned();
+    // The detail document has served its purpose. Release its share of the
+    // shared buffered-metadata budget before the skeleton fetch reserves its
+    // own, rather than holding both across the second round-trip.
+    drop(detail);
+    let Some(mut extension) = extension else {
+        return Ok(None);
+    };
+    let (publisher, name, package) =
+        gallery_extension_identity(&extension).ok_or_else(invalid_gallery_response)?;
+    // The skeleton is keyed on the identity the DETAIL response reported, not
+    // on the criterion the client sent: a `filterType` 4 criterion is a GUID,
+    // and either shape can match a page that also names other extensions.
+    let skeleton = select_bounded_gallery_versions(
+        fetch_gallery_skeleton(
+            state,
+            repo,
+            repo_key,
+            identity,
+            qualifiers,
+            GALLERY_SKELETON_QUERY_FLAGS,
+            &package,
+        )
+        .await?,
+    );
+
+    let detailed = match extension
+        .get_mut("versions")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(detailed) => std::mem::take(detailed),
+        None => Vec::new(),
+    };
+    let mut detailed_by_coordinate = std::collections::HashMap::new();
+    for version in detailed {
+        let coordinate =
+            gallery_version_coordinate(&version).ok_or_else(invalid_gallery_response)?;
+        detailed_by_coordinate.insert(coordinate, version);
+    }
+
+    let mut versions = Vec::with_capacity(skeleton.len() + detailed_by_coordinate.len());
+    for selected in &skeleton {
+        let coordinate =
+            vscode_age_gate_version(&selected.version, Some(&selected.target_platform));
+        if let Some(detailed) = detailed_by_coordinate.remove(&coordinate) {
+            versions.push(detailed);
+            continue;
+        }
+        let asset_base = gallery_version_asset_base(
+            base_url,
+            repo_key,
+            &publisher,
+            &name,
+            &selected.version,
+            &selected.target_platform,
+        )?;
+        versions.push(synthesize_gallery_version(selected, &asset_base, flags));
+    }
+    // A version the detail query reported but the skeleton did not — a publish
+    // that landed between the two round-trips — is the one a client is most
+    // likely to install, so it must not be dropped by the merge. The sort below
+    // is what puts it in the right place rather than at an arbitrary end.
+    versions.extend(detailed_by_coordinate.into_values());
+    sort_gallery_versions_newest_first(&mut versions);
+    extension["versions"] = serde_json::Value::Array(versions);
+    Ok(Some(extension))
+}
+
+/// Compose one bounded `results` envelope for a set of identities.
+///
+/// One identity that fails fails the whole response, deliberately: a partial
+/// page is indistinguishable to a client from an authoritative "these are the
+/// extensions", and silently dropping an extension a client asked about is a
+/// worse failure than a visible one.
+async fn compose_gallery_query(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    base_url: &RequestBaseUrl,
+    composition: &GalleryComposition,
+    flags: u32,
+    result_metadata: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Response> {
+    let mut extensions = Vec::with_capacity(composition.identities.len());
+    // Chunked joins keep at most GALLERY_COMPOSITION_CONCURRENCY extensions —
+    // and therefore that many upstream requests and budget reservations — in
+    // flight, while preserving the client's criteria order in the output. The
+    // TOTAL is bounded separately, by GALLERY_COMPOSED_IDENTITY_CAP.
+    for chunk in composition
+        .identities
+        .chunks(GALLERY_COMPOSITION_CONCURRENCY)
+    {
+        let composed = futures::future::join_all(chunk.iter().map(|identity| {
+            compose_gallery_extension(
+                state,
+                repo,
+                repo_key,
+                base_url,
+                identity,
+                &composition.qualifiers,
+                flags,
+            )
+        }))
+        .await;
+        for extension in composed {
+            if let Some(extension) = extension? {
+                extensions.push(extension);
+            }
+        }
+    }
+    Ok(gallery_results_envelope(extensions, result_metadata))
+}
+
+/// The passthrough seam: age-gate an upstream `results` envelope, then render
+/// it. Composed responses run the same two steps with a budget reservation
+/// between them — see [`serve_composed_gallery_response`].
+async fn finish_gallery_response(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    base_url: &RequestBaseUrl,
+    mut response: serde_json::Value,
+) -> Result<Response, Response> {
+    filter_gallery_response_age_gate(state, repo, &mut response).await?;
+    render_gallery_response(&mut response, base_url, repo_key)
+}
+
+/// Rewrite every asset reference onto AK and serialize.
+///
+/// Nothing reaches a client except through here, and the age gate always runs
+/// before it — for a composed document and a passed-through one alike — so a
+/// synthesized version can never skip the gate or keep an upstream asset
+/// reference. Split out from [`finish_gallery_response`] because this is the
+/// only phase whose memory a composed page needs to reserve for: the parsed
+/// tree and the serialized body are resident together here, and nowhere else.
+#[allow(clippy::result_large_err)]
+fn render_gallery_response(
+    response: &mut serde_json::Value,
+    base_url: &RequestBaseUrl,
+    repo_key: &str,
+) -> Result<Response, Response> {
+    rewrite_gallery_asset_urls(response, base_url, repo_key)?;
+    Ok(json_response(response))
+}
+
+/// Process-wide admission control for composed responses. Sized once and never
+/// closed, mirroring [`proxy_helpers::proxy_metadata_budget`].
+fn gallery_composition_admission() -> &'static tokio::sync::Semaphore {
+    static ADMISSION: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    ADMISSION.get_or_init(|| tokio::sync::Semaphore::new(GALLERY_COMPOSITION_ADMISSION))
+}
+
+/// Compose a bounded page and serve it under two separate bounds.
+///
+/// [`GALLERY_COMPOSITION_ADMISSION`] is taken first and held throughout: the
+/// composed page accumulates during the fan-out, and that accumulation needs a
+/// bound of its own because the byte reservation below deliberately does not
+/// cover it. Wrapping the fan-out in a byte reservation instead would turn a
+/// strictly nested pattern into hold-and-wait — every sub-query reserves from
+/// the same shared byte semaphore, so enough outer holders could leave less
+/// free budget than one sub-query needs and none of them could ever proceed.
+/// A counting admission semaphore has no such interaction: it is a different
+/// resource, always acquired before any byte reservation and never after one.
+///
+/// The byte reservation then covers exactly the phase that holds the parsed
+/// tree and the serialized body at the same time. The age gate runs BEFORE it,
+/// because gate filtering is up to [`GALLERY_COMPOSED_IDENTITY_CAP`]
+/// sequential database round-trips, and charging the shared memory budget for
+/// that latency would shrink it for everyone without bounding any memory.
+async fn serve_composed_gallery_response(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    base_url: &RequestBaseUrl,
+    composition: &GalleryComposition,
+    flags: u32,
+    result_metadata: Option<serde_json::Value>,
+) -> Result<Response, Response> {
+    let _admission = gallery_composition_admission()
+        .acquire()
+        .await
+        .expect("gallery composition admission semaphore is never closed");
+    let mut composed = compose_gallery_query(
+        state,
+        repo,
+        repo_key,
+        base_url,
+        composition,
+        flags,
+        result_metadata,
+    )
+    .await?;
+    filter_gallery_response_age_gate(state, repo, &mut composed).await?;
+    let _budget_permit = proxy_helpers::proxy_metadata_budget()
+        .reserve(GALLERY_COMPOSITION_BUDGET_RESERVATION_BYTES)
+        .await;
+    render_gallery_response(&mut composed, base_url, repo_key)
 }
 
 fn gallery_extension_identity(extension: &serde_json::Value) -> Option<(String, String, String)> {
@@ -591,6 +1628,46 @@ fn reconcile_gallery_result_count(result: &mut serde_json::Value, removed: usize
     }
 }
 
+/// Surfaces named in the shared fail-closed age-gate response. They identify
+/// which capability was refused, so an operator can tell a withheld listing
+/// apart from a withheld download.
+const GALLERY_METADATA_GATE_SURFACE: &str = "VS Code gallery metadata";
+const GALLERY_ASSET_GATE_SURFACE: &str = "VS Code gallery asset";
+
+/// Resolve the age-gate policy seam for a gallery request.
+///
+/// `Ok(None)` means this repository never asked for gating. Every other
+/// non-`Ok(Some)` outcome is terminal and fails closed: a gate that is enabled
+/// but unenforceable for this (format, mode) pair, or an enabled gate with no
+/// service behind it, must never degrade into serving ungated metadata.
+#[allow(clippy::result_large_err)]
+async fn gallery_age_gate_seam<'a>(
+    state: &'a SharedState,
+    repo: &RepoInfo,
+    surface: &str,
+) -> Result<
+    Option<(
+        crate::services::age_gate_service::AgeGateRepoParams,
+        &'a crate::services::age_gate_service::AgeGateService,
+    )>,
+    Response,
+> {
+    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+
+    let params = resolve_repo_params(&state.db, repo.id)
+        .await
+        .map_err(|error| error.into_response())?;
+    if !AgeGateService::gating_requested(&params) {
+        return Ok(None);
+    }
+    AgeGateService::require_enforceable(&params).map_err(|error| error.into_response())?;
+    let service = state
+        .age_gate_service
+        .as_deref()
+        .ok_or_else(|| proxy_helpers::age_gate_unavailable_response(&params.key, surface))?;
+    Ok(Some((params, service)))
+}
+
 /// Apply the shared age-gate listing semantics to every returned extension
 /// identity before asset URLs are rewritten. This is intentionally separate
 /// from `fetch_gallery_query`: delivery must be able to fetch raw gallery
@@ -607,18 +1684,11 @@ async fn filter_gallery_response_age_gate(
     repo: &RepoInfo,
     response: &mut serde_json::Value,
 ) -> Result<(), Response> {
-    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
-
-    let params = resolve_repo_params(&state.db, repo.id)
-        .await
-        .map_err(|error| error.into_response())?;
-    if !AgeGateService::gating_requested(&params) {
+    let Some((params, service)) =
+        gallery_age_gate_seam(state, repo, GALLERY_METADATA_GATE_SURFACE).await?
+    else {
         return Ok(());
-    }
-    AgeGateService::require_enforceable(&params).map_err(|error| error.into_response())?;
-    let service = state.age_gate_service.as_deref().ok_or_else(|| {
-        proxy_helpers::age_gate_unavailable_response(&params.key, "VS Code gallery metadata")
-    })?;
+    };
 
     let results = response
         .get_mut("results")
@@ -678,43 +1748,37 @@ async fn filter_gallery_response_age_gate(
     Ok(())
 }
 
-/// Locate one platform-qualified version in an unfiltered Open VSX gallery
-/// response. `Some(None)` means it exists but lacks trustworthy publish-time
-/// evidence; callers must pass that through to the shared fail-closed seam.
+/// Locate one platform-qualified version in an extension's version skeleton.
+/// `Some(None)` means it exists but lacks trustworthy publish-time evidence;
+/// callers must pass that through to the shared fail-closed seam.
 fn find_gallery_exact_version(
-    response: &serde_json::Value,
-    package: &str,
+    skeleton: &[GallerySkeletonVersion],
     version: &str,
     target_platform: &str,
 ) -> Option<Option<DateTime<Utc>>> {
     let target = normal_target_platform(Some(target_platform));
-    for result in response.get("results")?.as_array()? {
-        for extension in result.get("extensions")?.as_array()? {
-            let publisher = extension.get("publisher")?.get("publisherName")?.as_str()?;
-            let name = extension.get("extensionName")?.as_str()?;
-            if vscode_age_gate_package(publisher, name) != package {
-                continue;
-            }
-            for candidate in extension.get("versions")?.as_array()? {
-                let candidate_version = candidate.get("version")?.as_str()?;
-                let candidate_platform = normal_target_platform(
-                    candidate
-                        .get("targetPlatform")
-                        .and_then(serde_json::Value::as_str),
-                );
-                if candidate_version == version && candidate_platform == target {
-                    return Some(gallery_last_updated(candidate));
-                }
-            }
-        }
-    }
-    None
+    skeleton
+        .iter()
+        .find(|candidate| {
+            // `*target` derefs the `Cow` to `str`: `typed_path` and `bstr` add
+            // competing `AsRef`/`PartialEq` impls that make `target.as_ref()`
+            // ambiguous (E0283) here.
+            candidate.version == version && *candidate.target_platform == *target
+        })
+        .map(|candidate| candidate.last_updated)
 }
 
 /// Re-resolve exact gallery metadata before every cache lookup or upstream
 /// byte fetch. The raw query is deliberately not passed through the listing
 /// filter, which avoids recursive policy evaluation and gives first-seen mode
 /// positive existence evidence for precisely the requested platform variant.
+///
+/// This check only needs `version`, `targetPlatform`, and `lastUpdated`, which
+/// is exactly the version skeleton — and the skeleton is the only shape of that
+/// evidence with a cap it actually fits under. rust-analyzer's history measures
+/// 2,120,608 bytes as a plain `IncludeVersions` query, just over the 2 MiB
+/// gallery metadata ceiling, so resolving it that way would have turned every
+/// gated asset request for such an extension into a 502.
 async fn enforce_gallery_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
@@ -724,45 +1788,34 @@ async fn enforce_gallery_age_gate(
     version: &str,
     target_platform: &str,
 ) -> Result<(), Response> {
-    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+    use crate::services::age_gate_service::AgeGateService;
 
-    let params = resolve_repo_params(&state.db, repo.id)
-        .await
-        .map_err(|error| error.into_response())?;
-    if !AgeGateService::gating_requested(&params) {
+    let Some((params, service)) =
+        gallery_age_gate_seam(state, repo, GALLERY_ASSET_GATE_SURFACE).await?
+    else {
         return Ok(());
-    }
-    AgeGateService::require_enforceable(&params).map_err(|error| error.into_response())?;
-    let service = state.age_gate_service.as_deref().ok_or_else(|| {
-        proxy_helpers::age_gate_unavailable_response(&params.key, "VS Code gallery asset")
-    })?;
+    };
     let package = vscode_age_gate_package(publisher, name);
     let coordinate = vscode_age_gate_version(version, Some(target_platform));
-    let query = serde_json::json!({
-        "filters": [{
-            "criteria": [{ "filterType": 7, "value": package }],
-            "pageNumber": 1,
-            "pageSize": 1,
-            "sortBy": 0,
-            "sortOrder": 0,
-        }],
-        "flags": GALLERY_EXACT_VERSION_QUERY_FLAGS,
-    });
-    let raw = fetch_gallery_query(
+    let identity = GalleryCriterion {
+        filter_type: GALLERY_EXTENSION_NAME_FILTER,
+        value: package.clone(),
+    };
+    let skeleton = fetch_gallery_skeleton(
         state,
         repo,
         repo_key,
-        Bytes::from(serde_json::to_vec(&query).expect("gallery query serializes")),
+        &identity,
+        &[],
+        GALLERY_EXACT_VERSION_QUERY_FLAGS,
+        &package,
     )
     .await?;
-    let published_at = find_gallery_exact_version(&raw.value, &package, version, target_platform)
-        .ok_or_else(|| {
-        (StatusCode::NOT_FOUND, "Extension version not found").into_response()
-    })?;
-    // The parsed gallery document has served its purpose. Release its share of
-    // the shared buffered-metadata budget before the age-gate DB round-trips
-    // below rather than holding 32× the wire cap across them.
-    drop(raw);
+    let published_at = find_gallery_exact_version(&skeleton, version, target_platform)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Extension version not found").into_response())?;
+    // The projected history has served its purpose. Release it before the
+    // age-gate DB round-trips below rather than holding it across them.
+    drop(skeleton);
     let basis = service
         .download_basis(&params, &package, &coordinate, published_at, true)
         .await
@@ -867,11 +1920,97 @@ async fn gallery_extension_query(
     body: Bytes,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
-    let mut response = fetch_gallery_query(&state, &repo, &repo_key, body).await?;
-    filter_gallery_response_age_gate(&state, &repo, &mut response.value).await?;
     let base_url = gallery_response_base_url(&headers);
-    rewrite_gallery_asset_urls(&mut response.value, &base_url, &repo_key)?;
-    Ok(json_response(&response.value))
+    // A body this projection cannot read is still a body the upstream may
+    // accept, so an unreadable query degrades to passthrough rather than to a
+    // rejection this gateway would be inventing.
+    let request = serde_json::from_slice::<GalleryQueryRequest>(&body).ok();
+    // Flags decide whether a ceiling abort is recoverable, so read them off the
+    // JSON directly when the whole projection did not parse: one unexpected
+    // field shape elsewhere in the body must not silently disable recovery.
+    let flags = request
+        .as_ref()
+        .map(|request| request.flags)
+        .or_else(|| gallery_query_flags(&body))
+        .unwrap_or(0);
+
+    // Named extensions WITH their version history is the VSCodium update
+    // follow-up. Open VSX answers it with the complete history — 28 MiB for one
+    // popular extension, 55 MiB for a ten-extension page — so compose the
+    // bounded equivalent instead of attempting a passthrough whose only
+    // outcomes are a multi-second stall and the metadata ceiling.
+    if let Some(composition) = request.as_ref().and_then(gallery_composable_criteria) {
+        return serve_composed_gallery_response(
+            &state,
+            &repo,
+            &repo_key,
+            &base_url,
+            &composition,
+            flags,
+            None,
+        )
+        .await;
+    }
+
+    if let Some(response) =
+        fetch_gallery_query_bounded(&state, &repo, &repo_key, body.clone()).await?
+    {
+        return finish_gallery_response(&state, &repo, &repo_key, &base_url, response.value).await;
+    }
+
+    // The passthrough hit the ceiling. A text search that asked for versions is
+    // recoverable: the SAME query with identities only is bounded, and each
+    // identity it names composes into the bounded per-extension record. Without
+    // `IncludeVersions` the response is already as narrow as it can be asked
+    // for, so there is nothing left to narrow.
+    if flags & GALLERY_INCLUDE_VERSIONS_FLAG == 0 {
+        return Err(gallery_response_too_large());
+    }
+    let identity_flags =
+        (flags | GALLERY_LATEST_VERSION_ONLY_FLAG) & !GALLERY_INCLUDE_VERSIONS_FLAG;
+    let identity_body =
+        gallery_query_with_flags(&body, identity_flags).ok_or_else(gallery_response_too_large)?;
+    let identities = fetch_gallery_query(&state, &repo, &repo_key, identity_body).await?;
+    let limit = request.as_ref().map_or(
+        GALLERY_COMPOSED_IDENTITY_CAP,
+        gallery_composed_identity_limit,
+    );
+    // Upstream chose these identities under the client's qualifiers, so the
+    // per-identity sub-queries must carry them too — otherwise composition
+    // answers a differently-qualified question than the search did. A body with
+    // more qualifiers than one composed query may replay surfaces the ceiling
+    // rather than composing an unqualified answer.
+    let qualifiers = match request.as_ref() {
+        Some(request) => {
+            gallery_query_qualifiers(request).ok_or_else(gallery_response_too_large)?
+        }
+        None => Vec::new(),
+    };
+    let composition = GalleryComposition {
+        identities: gallery_response_identities(&identities.value, limit)?,
+        qualifiers,
+    };
+    // Upstream already counted this query across every page. Carry that count
+    // forward rather than replacing it with the composed page length.
+    let result_metadata = identities
+        .value
+        .pointer("/results/0/resultMetadata")
+        .cloned();
+    drop(identities);
+    serve_composed_gallery_response(
+        &state,
+        &repo,
+        &repo_key,
+        &base_url,
+        &composition,
+        flags,
+        result_metadata,
+    )
+    .await
+}
+
+fn gallery_extension_not_found() -> Response {
+    (StatusCode::NOT_FOUND, "Extension not found").into_response()
 }
 
 async fn gallery_latest_version(
@@ -882,39 +2021,131 @@ async fn gallery_latest_version(
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     validate_gallery_request_segment(&publisher)?;
     validate_gallery_request_segment(&name)?;
-    let query = serde_json::json!({
-        // Open VSX requires the paging fields on every filter, including this
-        // one-result latest-version lookup. VS Code clients normally include
-        // them on `extensionquery`; supply them here because this request is
-        // generated by AK itself.
-        "filters": [{
-            "criteria": [{ "filterType": 7, "value": format!("{publisher}.{name}") }],
-            "pageNumber": 1,
-            "pageSize": 1,
-            "sortBy": 0,
-            "sortOrder": 0,
-        }],
-        "flags": 511,
-    });
-    let mut response = fetch_gallery_query(
-        &state,
-        &repo,
-        &repo_key,
-        Bytes::from(serde_json::to_vec(&query).expect("gallery query serializes")),
-    )
-    .await?;
+    let identity = GalleryCriterion {
+        filter_type: GALLERY_EXTENSION_NAME_FILTER,
+        value: format!("{publisher}.{name}"),
+    };
+    let query = gallery_single_id_query(&identity, &[], GALLERY_LATEST_VERSION_QUERY_FLAGS);
+    let mut response =
+        fetch_gallery_query(&state, &repo, &repo_key, gallery_query_body(&query)).await?;
+    // Keep the pre-filter record: when the gate withholds every latest version,
+    // the walk-back below reuses this extension's envelope — display name,
+    // publisher, statistics — and replaces only its versions.
+    let unfiltered = response.value.pointer("/results/0/extensions/0").cloned();
     filter_gallery_response_age_gate(&state, &repo, &mut response.value).await?;
     let base_url = gallery_response_base_url(&headers);
     rewrite_gallery_asset_urls(&mut response.value, &base_url, &repo_key)?;
     // `ExtensionLatestVersionUriTemplate` is consumed by VS Code as a
     // single raw gallery extension, unlike the POST extensionquery envelope.
     // An empty query result is the ordinary "extension not found" case.
-    let extension = response
-        .value
-        .pointer("/results/0/extensions/0")
-        .cloned()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Extension not found").into_response())?;
-    Ok(json_response(&extension))
+    if let Some(extension) = response.value.pointer("/results/0/extensions/0").cloned() {
+        return Ok(json_response(&extension));
+    }
+    drop(response);
+    let Some(extension) = unfiltered else {
+        return Err(gallery_extension_not_found());
+    };
+    let walked_back =
+        gallery_latest_walk_back(&state, &repo, &repo_key, &base_url, &identity, extension)
+            .await?
+            .ok_or_else(gallery_extension_not_found)?;
+    Ok(json_response(&walked_back))
+}
+
+/// Resolve the newest gate-allowed version per target platform after the gate
+/// withheld every latest version.
+///
+/// Open VSX reports latest-per-platform only, so the version a gated repository
+/// should actually serve is not in the detail response at all: without this the
+/// route 404s an extension whose older releases are perfectly servable. The
+/// skeleton is the bounded way to see those releases — the alternative, asking
+/// upstream for the full history in client shape, is the 28 MiB document this
+/// gateway exists to avoid buffering. `Ok(None)` means the gate allows nothing,
+/// which is the only outcome that is genuinely a 404.
+///
+/// The gate is batch-evaluated over the whole bounded selection (up to
+/// ~10 platforms × 2 channels × [`GALLERY_VERSIONS_PER_CHANNEL`] coordinates)
+/// rather than the single latest coordinate the route used to resolve. That is
+/// deliberate and bounded: in `first_seen` mode it also records a first-seen
+/// observation for each of those coordinates, which is what lets a later
+/// request serve them once they have aged.
+async fn gallery_latest_walk_back(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    base_url: &RequestBaseUrl,
+    identity: &GalleryCriterion,
+    mut extension: serde_json::Value,
+) -> Result<Option<serde_json::Value>, Response> {
+    let Some((params, service)) =
+        gallery_age_gate_seam(state, repo, GALLERY_METADATA_GATE_SURFACE).await?
+    else {
+        return Ok(None);
+    };
+    let (publisher, name, package) =
+        gallery_extension_identity(&extension).ok_or_else(invalid_gallery_response)?;
+    let skeleton = select_bounded_gallery_versions(
+        fetch_gallery_skeleton(
+            state,
+            repo,
+            repo_key,
+            identity,
+            &[],
+            GALLERY_SKELETON_QUERY_FLAGS,
+            &package,
+        )
+        .await?,
+    );
+    let candidates = skeleton
+        .iter()
+        .map(|version| {
+            (
+                vscode_age_gate_version(&version.version, Some(&version.target_platform)),
+                version.last_updated,
+            )
+        })
+        .collect::<Vec<_>>();
+    let blocked = service
+        .evaluate_versions_batch(&params, &package, &candidates)
+        .await
+        .map_err(|error| error.into_response())?;
+
+    let mut served_platforms = std::collections::HashSet::new();
+    let mut versions = Vec::new();
+    for version in &skeleton {
+        let coordinate = vscode_age_gate_version(&version.version, Some(&version.target_platform));
+        if blocked.contains(&coordinate) {
+            continue;
+        }
+        // Upstream order is newest-first, so the first survivor of a platform
+        // is the newest release the gate allows for it.
+        if !served_platforms.insert(version.target_platform.clone()) {
+            continue;
+        }
+        let asset_base = gallery_version_asset_base(
+            base_url,
+            repo_key,
+            &publisher,
+            &name,
+            &version.version,
+            &version.target_platform,
+        )?;
+        versions.push(synthesize_gallery_version(
+            version,
+            &asset_base,
+            GALLERY_LATEST_VERSION_QUERY_FLAGS,
+        ));
+    }
+    if versions.is_empty() {
+        return Ok(None);
+    }
+    extension["versions"] = serde_json::Value::Array(versions);
+    // This envelope came from the raw upstream document, so it has not been
+    // through the rewrite pass. Run it now over the same wrapper shape the
+    // served paths use, so no upstream asset reference survives on it.
+    let mut envelope = gallery_results_envelope(vec![extension], None);
+    rewrite_gallery_asset_urls(&mut envelope, base_url, repo_key)?;
+    Ok(envelope.pointer("/results/0/extensions/0").cloned())
 }
 
 async fn gallery_vspackage(
@@ -1693,40 +2924,39 @@ mod tests {
         assert!(gallery_last_updated(&serde_json::json!({ "lastUpdated": "yesterday" })).is_none());
     }
 
+    fn skeleton_version(
+        version: &str,
+        target_platform: Option<&str>,
+        last_updated: Option<&str>,
+    ) -> GallerySkeletonVersion {
+        GallerySkeletonVersion {
+            version: version.to_string(),
+            target_platform: normal_target_platform(target_platform).into_owned(),
+            last_updated: last_updated.and_then(gallery_parse_last_updated),
+            prerelease: false,
+            engine: None,
+        }
+    }
+
     #[test]
     fn exact_gallery_lookup_keeps_platform_variants_independent() {
-        let response = serde_json::json!({
-            "results": [{ "extensions": [{
-                "publisher": { "publisherName": "RedHat" },
-                "extensionName": "VSCode-YAML",
-                "versions": [
-                    { "version": "1.24.0", "targetPlatform": "linux-x64", "lastUpdated": "2024-01-02T03:04:05Z" },
-                    { "version": "1.24.0", "targetPlatform": "win32-x64", "lastUpdated": "not-a-time" },
-                    { "version": "1.24.0", "lastUpdated": "2024-01-02T03:04:05Z" }
-                ]
-            }] }]
-        });
-        assert!(
-            find_gallery_exact_version(&response, "redhat.vscode-yaml", "1.24.0", "linux-x64")
-                .flatten()
-                .is_some()
-        );
+        let skeleton = [
+            skeleton_version("1.24.0", Some("linux-x64"), Some("2024-01-02T03:04:05Z")),
+            skeleton_version("1.24.0", Some("win32-x64"), Some("not-a-time")),
+            skeleton_version("1.24.0", None, Some("2024-01-02T03:04:05Z")),
+        ];
+        assert!(find_gallery_exact_version(&skeleton, "1.24.0", "linux-x64")
+            .flatten()
+            .is_some());
         assert_eq!(
-            find_gallery_exact_version(&response, "redhat.vscode-yaml", "1.24.0", "win32-x64"),
-            Some(None)
+            find_gallery_exact_version(&skeleton, "1.24.0", "win32-x64"),
+            Some(None),
+            "a platform variant without trustworthy evidence must reach the fail-closed seam"
         );
-        assert!(find_gallery_exact_version(
-            &response,
-            "redhat.vscode-yaml",
-            "1.24.0",
-            "darwin-arm64"
-        )
-        .is_none());
-        assert!(
-            find_gallery_exact_version(&response, "redhat.vscode-yaml", "1.24.0", "")
-                .flatten()
-                .is_some()
-        );
+        assert!(find_gallery_exact_version(&skeleton, "1.24.0", "darwin-arm64").is_none());
+        assert!(find_gallery_exact_version(&skeleton, "1.24.0", "")
+            .flatten()
+            .is_some());
     }
 
     #[test]
@@ -1858,30 +3088,37 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// The 404 leg of the walk-back: a 404 must mean "the gate allows nothing
+    /// at all", so it is only correct once the whole version history has been
+    /// consulted and every coordinate in it was withheld.
     #[tokio::test]
     async fn gallery_latest_returns_not_found_when_age_filter_leaves_no_version() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
 
         let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
             return;
         };
         let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
-        Mock::given(method("POST"))
-            .and(path("/vscode/gallery/extensionquery"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(gallery_extension_response(
-                    serde_json::json!([{
-                        "version": "1.0.0",
-                        "targetPlatform": "linux-x64",
-                        "lastUpdated": (Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
-                        "assetUri": "https://upstream/young"
-                    }]),
-                )),
-            )
-            .mount(&server)
-            .await;
+        let young = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let also_young = (Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        // Both latest routes are exercised below, so each sub-query runs twice.
+        mount_gallery_query(
+            &server,
+            expected_single_id_query("RedHat.VSCode-YAML", 1023),
+            detail_query_response("RedHat", "VSCode-YAML", &[("2.0.0", "linux-x64", &young)]),
+            2,
+        )
+        .await;
+        mount_gallery_query(
+            &server,
+            expected_single_id_query("RedHat.VSCode-YAML", 17),
+            dated_skeleton_wire_versions(&[
+                ("2.0.0", "linux-x64", &young),
+                ("1.0.0", "linux-x64", &also_young),
+            ]),
+            2,
+        )
+        .await;
         let gallery_root = format!("{}/vscode/gallery", server.uri());
         let (state, _cache) =
             rewire_remote_gallery_with_age_gate(&fx, &gallery_root, "upstream_publish_time", 30)
@@ -1897,6 +3134,9 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::NOT_FOUND);
         }
+        // The skeleton mock's expect(2) is what proves the walk-back ran and
+        // found nothing, rather than the route 404ing before consulting it.
+        drop(server);
         fx.teardown().await;
     }
 
@@ -1975,16 +3215,12 @@ mod tests {
         };
         let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
         let young = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
-        let expected_metadata_query = serde_json::json!({
-            "filters": [{
-                "criteria": [{ "filterType": 7, "value": "redhat.vscode-yaml" }],
-                "pageNumber": 1,
-                "pageSize": 1,
-                "sortBy": 0,
-                "sortOrder": 0,
-            }],
-            "flags": GALLERY_EXACT_VERSION_QUERY_FLAGS,
-        });
+        // The exact-version check resolves publish time through the skeleton
+        // path — a 16 MiB cap and a typed projection, because a large history
+        // does not fit under the 2 MiB gallery metadata cap — but asks only for
+        // `IncludeVersions`: this runs on every gated asset request, and the
+        // properties it would otherwise pay for are never read here.
+        let expected_metadata_query = expected_single_id_query("redhat.vscode-yaml", 1);
         Mock::given(method("POST"))
             .and(path("/vscode/gallery/extensionquery"))
             .and(body_json(expected_metadata_query))
@@ -2255,6 +3491,68 @@ mod tests {
     }
 
     #[test]
+    fn gallery_rewrite_preserves_null_asset_references() {
+        let mut response = serde_json::json!({
+            "results": [{ "extensions": [{
+                "publisher": { "publisherName": "publisher" },
+                "extensionName": "extension",
+                "versions": [{
+                    "version": "1.2.3",
+                    "targetPlatform": "universal",
+                    "assetUri": null,
+                    "fallbackAssetUri": null,
+                    "files": [{
+                        "assetType": "Microsoft.VisualStudio.Code.Manifest",
+                        "source": "https://upstream.example/manifest"
+                    }]
+                }]
+            }] }]
+        });
+
+        rewrite_gallery_asset_urls(
+            &mut response,
+            &RequestBaseUrl("https://ak.example".to_string()),
+            "extensions",
+        )
+        .unwrap();
+
+        let version = &response["results"][0]["extensions"][0]["versions"][0];
+        assert!(version["assetUri"].is_null());
+        assert!(version["fallbackAssetUri"].is_null());
+        assert_eq!(
+            version["files"][0]["source"],
+            "https://ak.example/vscode/extensions/asset/publisher/extension/1.2.3/universal/Microsoft.VisualStudio.Code.Manifest"
+        );
+    }
+
+    #[test]
+    fn gallery_rewrite_rejects_non_string_non_null_asset_references() {
+        for malformed_value in [serde_json::json!({}), serde_json::json!(1)] {
+            for field in ["assetUri", "fallbackAssetUri"] {
+                let mut response = serde_json::json!({
+                    "results": [{ "extensions": [{
+                        "publisher": { "publisherName": "publisher" },
+                        "extensionName": "extension",
+                        "versions": [{
+                            "version": "1.2.3",
+                            "targetPlatform": "universal",
+                            (field): malformed_value.clone(),
+                        }]
+                    }] }]
+                });
+
+                let error = rewrite_gallery_asset_urls(
+                    &mut response,
+                    &RequestBaseUrl("https://ak.example".to_string()),
+                    "extensions",
+                )
+                .expect_err("non-string asset fields must fail closed");
+                assert_eq!(error.status(), StatusCode::BAD_GATEWAY, "{field}");
+            }
+        }
+    }
+
+    #[test]
     fn gallery_rewrite_rejects_unsafe_upstream_coordinates() {
         let mut response = serde_json::json!({
             "results": [{ "extensions": [{
@@ -2285,6 +3583,10 @@ mod tests {
             "Microsoft.VisualStudio.Services.VSIXPackage"
         ));
         assert!(is_safe_gallery_segment("linux-x64"));
+        // A coordinate is also a cache-path component, and a component past the
+        // filesystem name limit is a storage error waiting to happen.
+        assert!(is_safe_gallery_segment(&"x".repeat(255)));
+        assert!(!is_safe_gallery_segment(&"x".repeat(256)));
         assert!(is_safe_target_platform("linux-x64"));
         assert!(is_safe_target_platform("future.web-2"));
         assert!(!is_safe_target_platform("Linux-X64"));
@@ -2326,6 +3628,488 @@ mod tests {
             "a third concurrent parsed gallery response exceeds its reserved working-set budget"
         );
         drop((first, second));
+    }
+
+    /// The skeleton is the one gallery document sized by an extension's release
+    /// history, so its cap, its reservation multiple, and the per-channel
+    /// selection bound are pinned together: relaxing any one of them alone
+    /// reopens the unbounded-history path this design closed.
+    #[test]
+    fn gallery_skeleton_bounds_are_pinned_to_the_measured_worst_case() {
+        assert_eq!(
+            GALLERY_SKELETON_MAX_BYTES,
+            16 * 1024 * 1024,
+            "the skeleton cap admits the measured 9.95 MiB worst-case version history"
+        );
+        assert_eq!(
+            GALLERY_SKELETON_BUDGET_MULTIPLE, 4,
+            "wire buffer, serde's full property materialization, and the retained projection"
+        );
+        assert_eq!(
+            GALLERY_SKELETON_BUDGET_RESERVATION_BYTES,
+            GALLERY_SKELETON_MAX_BYTES * GALLERY_SKELETON_BUDGET_MULTIPLE
+        );
+        assert_eq!(GALLERY_SKELETON_BUDGET_RESERVATION_BYTES, 64 * 1024 * 1024);
+        assert_eq!(GALLERY_METADATA_BUDGET_RESERVATION_BYTES, 64 * 1024 * 1024);
+        assert_eq!(GALLERY_VERSIONS_PER_CHANNEL, 30);
+        assert_eq!(GALLERY_COMPOSITION_CONCURRENCY, 4);
+        assert_eq!(
+            GALLERY_SKELETON_QUERY_FLAGS, 17,
+            "IncludeVersions | IncludeVersionProperties: lastUpdated plus PreRelease/Engine"
+        );
+        assert_eq!(GALLERY_LATEST_VERSION_QUERY_FLAGS, 1023);
+        assert_eq!(
+            GALLERY_EXACT_VERSION_QUERY_FLAGS, 1,
+            "the per-gated-download lookup asks for nothing it does not read"
+        );
+    }
+
+    /// Concurrency bounds simultaneity; these bound TOTAL work and total
+    /// resident bytes for one composed response. Both are load-bearing: a 1 MiB
+    /// client body can name tens of thousands of identities.
+    #[test]
+    fn gallery_composition_bounds_total_work_and_resident_bytes() {
+        assert_eq!(GALLERY_COMPOSED_IDENTITY_CAP, 50);
+        assert_eq!(GALLERY_COMPOSED_EXTENSION_BYTES, 512 * 1024);
+        assert_eq!(GALLERY_COMPOSED_QUALIFIER_CAP, 8);
+        assert_eq!(
+            GALLERY_COMPOSITION_BUDGET_RESERVATION_BYTES,
+            GALLERY_COMPOSED_IDENTITY_CAP * GALLERY_COMPOSED_EXTENSION_BYTES * 2
+        );
+        assert_eq!(
+            proxy_helpers::DEFAULT_PROXY_METADATA_BUDGET_BYTES
+                / GALLERY_COMPOSITION_BUDGET_RESERVATION_BYTES,
+            20,
+            "the default shared budget admits at most 20 concurrent composed responses"
+        );
+        // The accumulation phase is bounded by admission rather than by bytes,
+        // so its worst case must be stated in bytes here instead.
+        assert_eq!(GALLERY_COMPOSITION_ADMISSION, 20);
+        assert_eq!(
+            GALLERY_COMPOSITION_ADMISSION
+                * GALLERY_COMPOSED_IDENTITY_CAP
+                * GALLERY_COMPOSED_EXTENSION_BYTES,
+            500 * 1024 * 1024,
+            "concurrent composed pages accumulate at most 500 MiB before any is charged"
+        );
+
+        let page_size = |value: serde_json::Value| {
+            gallery_composed_identity_limit(
+                &serde_json::from_value::<GalleryQueryRequest>(value).expect("query parses"),
+            )
+        };
+        assert_eq!(
+            page_size(serde_json::json!({ "filters": [{ "pageSize": 10 }], "flags": 1 })),
+            10,
+            "a client that asked for ten extensions gets ten"
+        );
+        assert_eq!(
+            page_size(serde_json::json!({ "filters": [{ "pageSize": 5000 }], "flags": 1 })),
+            GALLERY_COMPOSED_IDENTITY_CAP
+        );
+        assert_eq!(
+            page_size(serde_json::json!({ "filters": [{ "pageSize": 0 }], "flags": 1 })),
+            1
+        );
+        assert_eq!(
+            page_size(serde_json::json!({ "filters": [{}], "flags": 1 })),
+            GALLERY_COMPOSED_IDENTITY_CAP
+        );
+    }
+
+    #[test]
+    fn gallery_composition_only_claims_pure_identity_version_queries() {
+        let request = |body: serde_json::Value| {
+            serde_json::from_value::<GalleryQueryRequest>(body).expect("query parses")
+        };
+        let names = |criteria: &[GalleryCriterion]| {
+            criteria
+                .iter()
+                .map(|criterion| (criterion.filter_type, criterion.value.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // The VSCodium update follow-up, in the shape VS Code really sends it:
+        // identity selectors interleaved with Target/ExcludeWithFlags
+        // qualifiers.
+        let composition = gallery_composable_criteria(&request(serde_json::json!({
+            "filters": [{ "criteria": [
+                { "filterType": 8, "value": "Microsoft.VisualStudio.Code" },
+                { "filterType": 7, "value": "redhat.vscode-yaml" },
+                { "filterType": 4, "value": "guid-1" },
+                { "filterType": 7, "value": "redhat.vscode-yaml" },
+                { "filterType": 12, "value": "4096" }
+            ]}],
+            "flags": 439
+        })))
+        .expect("pure-identity version query composes");
+        assert_eq!(
+            names(composition.identities.as_slice()),
+            vec![
+                (7, "redhat.vscode-yaml".to_string()),
+                (4, "guid-1".to_string())
+            ],
+            "client order is preserved and repeated identities collapse"
+        );
+        assert_eq!(
+            names(composition.qualifiers.as_slice()),
+            vec![
+                (8, "Microsoft.VisualStudio.Code".to_string()),
+                (12, "4096".to_string())
+            ],
+            "qualifiers do not select an extension, so they are carried, not counted"
+        );
+
+        // The identity list is truncated to the client's page, never refused.
+        let paged = gallery_composable_criteria(&request(serde_json::json!({
+            "filters": [{
+                "criteria": [
+                    { "filterType": 7, "value": "a.a" },
+                    { "filterType": 7, "value": "b.b" },
+                    { "filterType": 7, "value": "c.c" }
+                ],
+                "pageSize": 2
+            }],
+            "flags": 439
+        })))
+        .expect("a paged identity query still composes");
+        assert_eq!(
+            names(paged.identities.as_slice()),
+            vec![(7, "a.a".to_string()), (7, "b.b".to_string())]
+        );
+
+        let mut too_many_qualifiers = serde_json::json!({
+            "filters": [{ "criteria": [] }],
+            "flags": 439
+        });
+        let mut criteria = (0..=GALLERY_COMPOSED_QUALIFIER_CAP)
+            .map(|index| serde_json::json!({ "filterType": 12, "value": index.to_string() }))
+            .collect::<Vec<_>>();
+        criteria.push(serde_json::json!({ "filterType": 7, "value": "a.b" }));
+        too_many_qualifiers["filters"][0]["criteria"] = serde_json::Value::Array(criteria);
+
+        for (case, body) in [
+            (
+                "search text is not an identity",
+                serde_json::json!({
+                    "filters": [{ "criteria": [{ "filterType": 10, "value": "yaml" }]}],
+                    "flags": 439
+                }),
+            ),
+            (
+                "no IncludeVersions leaves nothing to bound",
+                serde_json::json!({
+                    "filters": [{ "criteria": [{ "filterType": 7, "value": "a.b" }]}],
+                    "flags": 438
+                }),
+            ),
+            (
+                "IncludeLatestVersionOnly is already bounded upstream",
+                serde_json::json!({
+                    "filters": [{ "criteria": [{ "filterType": 7, "value": "a.b" }]}],
+                    "flags": 951
+                }),
+            ),
+            (
+                "an empty identity cannot address an extension",
+                serde_json::json!({
+                    "filters": [{ "criteria": [{ "filterType": 7, "value": "" }]}],
+                    "flags": 439
+                }),
+            ),
+            (
+                "no criteria at all",
+                serde_json::json!({ "filters": [], "flags": 439 }),
+            ),
+            (
+                // Qualifiers are replayed on every sub-query and each one
+                // changes what upstream resolves, so a list too long to replay
+                // falls back to passthrough rather than being truncated.
+                "more qualifiers than one composed query may replay",
+                too_many_qualifiers,
+            ),
+        ] {
+            assert!(
+                gallery_composable_criteria(&request(body)).is_none(),
+                "{case}"
+            );
+        }
+    }
+
+    /// The identity [`skeleton_wire_versions`] attributes its versions to.
+    const SKELETON_PACKAGE: &str = "redhat.vscode-yaml";
+
+    /// Build a skeleton wire document with one version per `(version,
+    /// platform, prerelease)` triple, newest first, as Open VSX returns it.
+    fn skeleton_wire_versions(entries: &[(&str, Option<&str>, bool)]) -> serde_json::Value {
+        skeleton_wire_versions_for("RedHat", "VSCode-YAML", entries)
+    }
+
+    fn skeleton_wire_versions_for(
+        publisher: &str,
+        name: &str,
+        entries: &[(&str, Option<&str>, bool)],
+    ) -> serde_json::Value {
+        let versions = entries
+            .iter()
+            .map(|(version, platform, prerelease)| {
+                let mut entry = serde_json::json!({
+                    "version": version,
+                    "lastUpdated": "2024-01-02T03:04:05Z",
+                    "properties": [
+                        { "key": GALLERY_PRERELEASE_PROPERTY, "value": prerelease.to_string() },
+                        { "key": GALLERY_ENGINE_PROPERTY, "value": "^1.90.0" },
+                        { "key": "Microsoft.VisualStudio.Services.Links.Source", "value": "https://upstream.example/src" }
+                    ],
+                    "assetUri": serde_json::Value::Null,
+                    "fallbackAssetUri": serde_json::Value::Null,
+                    "files": serde_json::Value::Null,
+                });
+                if let Some(platform) = platform {
+                    entry["targetPlatform"] = serde_json::json!(platform);
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        let mut document = serde_json::json!({
+            "results": [{ "extensions": [{
+                "publisher": { "publisherName": publisher },
+                "extensionName": name,
+                "versions": []
+            }] }]
+        });
+        document["results"][0]["extensions"][0]["versions"] = serde_json::Value::Array(versions);
+        document
+    }
+
+    fn parse_skeleton(entries: &[(&str, Option<&str>, bool)]) -> Vec<GallerySkeletonVersion> {
+        let document: GallerySkeletonWireDocument =
+            serde_json::from_value(skeleton_wire_versions(entries)).expect("skeleton parses");
+        gallery_skeleton_versions(document, SKELETON_PACKAGE)
+    }
+
+    #[test]
+    fn gallery_skeleton_keeps_only_the_fields_synthesis_needs() {
+        let parsed = parse_skeleton(&[("2.0.0", Some("LINUX-X64"), true), ("1.0.0", None, false)]);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].version, "2.0.0");
+        assert_eq!(parsed[0].target_platform, "linux-x64");
+        assert!(parsed[0].prerelease);
+        assert_eq!(parsed[0].engine.as_deref(), Some("^1.90.0"));
+        assert!(parsed[0].last_updated.is_some());
+        // An absent targetPlatform is the universal build, not a missing one.
+        assert_eq!(parsed[1].target_platform, DEFAULT_TARGET_PLATFORM);
+        assert!(!parsed[1].prerelease);
+
+        // A coordinate that would escape a path segment is dropped, not fatal:
+        // one bad entry in a 12,592-version history must not take the whole
+        // extension offline for search AND /latest.
+        let mixed = parse_skeleton(&[
+            ("1.0.0", Some("../escape"), false),
+            ("1.0.0", Some("linux-x64"), false),
+        ]);
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].target_platform, "linux-x64");
+    }
+
+    /// A version list is only evidence about the extension it belongs to.
+    /// Upstream may answer a single-identity lookup with a page that names
+    /// others; borrowing their publish times would let a gated download for one
+    /// extension inherit another's age.
+    #[test]
+    fn gallery_skeleton_ignores_versions_of_other_extensions() {
+        let mut document =
+            skeleton_wire_versions_for("Someone", "Else", &[("9.9.9", Some("linux-x64"), false)]);
+        let wanted = skeleton_wire_versions(&[("1.0.0", Some("linux-x64"), false)]);
+        document["results"][0]["extensions"]
+            .as_array_mut()
+            .unwrap()
+            .push(wanted["results"][0]["extensions"][0].clone());
+
+        let parsed: GallerySkeletonWireDocument =
+            serde_json::from_value(document).expect("skeleton parses");
+        let versions = gallery_skeleton_versions(parsed, SKELETON_PACKAGE);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "1.0.0");
+    }
+
+    #[test]
+    fn gallery_selection_orders_by_publish_time_not_upstream_position() {
+        let selected = select_bounded_gallery_versions(vec![
+            skeleton_version("1.0.0", Some("linux-x64"), Some("2024-01-01T00:00:00Z")),
+            skeleton_version("3.0.0", Some("linux-x64"), None),
+            skeleton_version("2.0.0", Some("linux-x64"), Some("2025-01-01T00:00:00Z")),
+            skeleton_version("2.0.0", Some("linux-x64"), Some("2025-01-01T00:00:00Z")),
+        ]);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|version| version.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2.0.0", "1.0.0", "3.0.0"],
+            "newest first, undated last, and a coordinate listed twice spends one slot"
+        );
+    }
+
+    #[test]
+    fn gallery_selection_is_bounded_per_platform_and_channel() {
+        let prerelease_versions = (0..GALLERY_VERSIONS_PER_CHANNEL + 5)
+            .map(|index| format!("2.0.{index}"))
+            .collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for version in &prerelease_versions {
+            entries.push((version.as_str(), Some("linux-x64"), true));
+            entries.push((version.as_str(), Some("win32-x64"), true));
+        }
+        // The one stable build sits below every pre-release, exactly like
+        // rust-analyzer's newest stable at index 10,970 of 12,592.
+        entries.push(("1.0.0", Some("linux-x64"), false));
+
+        let selected = select_bounded_gallery_versions(parse_skeleton(&entries));
+        let linux_prerelease = selected
+            .iter()
+            .filter(|version| version.target_platform == "linux-x64" && version.prerelease)
+            .collect::<Vec<_>>();
+        assert_eq!(linux_prerelease.len(), GALLERY_VERSIONS_PER_CHANNEL);
+        assert_eq!(
+            linux_prerelease[0].version, "2.0.0",
+            "upstream newest-first order is preserved"
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|version| version.target_platform == "win32-x64")
+                .count(),
+            GALLERY_VERSIONS_PER_CHANNEL
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|version| version.version == "1.0.0" && !version.prerelease),
+            "bucketing by channel keeps the stable build a positional cut would lose"
+        );
+    }
+
+    #[test]
+    fn gallery_synthesis_owns_every_asset_reference_it_emits() {
+        let base_url = RequestBaseUrl("https://ak.example".to_string());
+        let parsed = parse_skeleton(&[("1.2.3", Some("linux-x64"), true), ("1.0.0", None, false)]);
+        let platform_base = gallery_version_asset_base(
+            &base_url,
+            "extensions",
+            "RedHat",
+            "VSCode-YAML",
+            "1.2.3",
+            "linux-x64",
+        )
+        .unwrap();
+        let synthesized = synthesize_gallery_version(&parsed[0], &platform_base, 1023);
+        assert_eq!(
+            synthesized["assetUri"],
+            "https://ak.example/vscode/extensions/asset/RedHat/VSCode-YAML/1.2.3/linux-x64"
+        );
+        assert_eq!(synthesized["fallbackAssetUri"], synthesized["assetUri"]);
+        assert_eq!(synthesized["targetPlatform"], "linux-x64");
+        assert_eq!(
+            synthesized["properties"],
+            serde_json::json!([
+                { "key": GALLERY_PRERELEASE_PROPERTY, "value": "true" },
+                { "key": GALLERY_ENGINE_PROPERTY, "value": "^1.90.0" }
+            ]),
+            "only the two properties that decide channel and engine survive"
+        );
+        // VS Code filters `files` BEFORE it consults `assetUri`, so a version
+        // without a file list is not installable however correct its URI is.
+        let files = synthesized["files"].as_array().expect("synthesized files");
+        assert_eq!(files.len(), GALLERY_SYNTHESIZED_ASSET_TYPES.len());
+        assert_eq!(
+            files[0],
+            serde_json::json!({
+                "assetType": "Microsoft.VisualStudio.Services.VSIXPackage",
+                "source": format!("{platform_base}/Microsoft.VisualStudio.Services.VSIXPackage"),
+            })
+        );
+
+        // Asset metadata mirrors what the client asked for, exactly as upstream
+        // would have answered a query without those flags.
+        let bare = synthesize_gallery_version(&parsed[0], &platform_base, 1);
+        for field in ["assetUri", "fallbackAssetUri", "files"] {
+            assert!(bare.get(field).is_none(), "{field}");
+        }
+
+        let universal_base = gallery_version_asset_base(
+            &base_url,
+            "extensions",
+            "RedHat",
+            "VSCode-YAML",
+            "1.0.0",
+            DEFAULT_TARGET_PLATFORM,
+        )
+        .unwrap();
+        let universal = synthesize_gallery_version(&parsed[1], &universal_base, 1023);
+        assert!(
+            universal.get("targetPlatform").is_none(),
+            "a universal build keeps upstream's own omitted-platform shape"
+        );
+        assert_eq!(
+            universal["properties"],
+            serde_json::json!([{ "key": GALLERY_ENGINE_PROPERTY, "value": "^1.90.0" }])
+        );
+    }
+
+    #[test]
+    fn gallery_results_envelope_counts_what_it_carries() {
+        let composed =
+            gallery_results_envelope(vec![serde_json::json!({ "extensionName": "a" })], None);
+        assert_eq!(
+            composed["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"],
+            1
+        );
+        assert_eq!(
+            composed["results"][0]["extensions"][0]["extensionName"],
+            "a"
+        );
+
+        // An upstream page already counted every page of the query. Replacing
+        // that with the composed page length would tell a paging client it had
+        // reached the end.
+        let upstream = gallery_results_envelope(
+            vec![serde_json::json!({ "extensionName": "a" })],
+            Some(serde_json::json!([{
+                "metadataType": "ResultCount",
+                "metadataItems": [{ "name": "TotalCount", "count": 4096 }]
+            }])),
+        );
+        assert_eq!(
+            upstream["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"],
+            4096
+        );
+    }
+
+    #[test]
+    fn gallery_query_flag_rewrite_refuses_a_body_it_cannot_reshape() {
+        let versions_and_latest_only = 1 | 512;
+        let rewritten = gallery_query_with_flags(
+            &Bytes::from_static(b"{\"filters\":[],\"flags\":439,\"assetTypes\":[\"x\"]}"),
+            versions_and_latest_only,
+        )
+        .expect("an object body is reshaped in place");
+        let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(rewritten["flags"], versions_and_latest_only);
+        assert_eq!(
+            rewritten["assetTypes"][0], "x",
+            "every other field the client sent is preserved"
+        );
+
+        // A body that is valid JSON but not an object has no `flags` member to
+        // rewrite, and one that is not JSON at all never had one.
+        assert!(gallery_query_with_flags(&Bytes::from_static(b"[1,2]"), 1).is_none());
+        assert!(gallery_query_with_flags(&Bytes::from_static(b"nope"), 1).is_none());
+        assert_eq!(
+            gallery_query_flags(&Bytes::from_static(b"{\"flags\":439}")),
+            Some(439)
+        );
+        assert!(gallery_query_flags(&Bytes::from_static(b"{}")).is_none());
     }
 
     #[tokio::test]
@@ -2668,6 +4452,680 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// The single-identity `extensionquery` wire shape AK issues on a client's
+    /// behalf, restated here independently of the production builder.
+    fn expected_single_id_query(value: &str, flags: u32) -> serde_json::Value {
+        expected_qualified_id_query(value, &[], flags)
+    }
+
+    /// [`expected_single_id_query`] with the client's own non-selecting
+    /// criteria repeated after the identity, in that order.
+    fn expected_qualified_id_query(
+        value: &str,
+        qualifiers: &[(u64, &str)],
+        flags: u32,
+    ) -> serde_json::Value {
+        let mut criteria = vec![serde_json::json!({ "filterType": 7, "value": value })];
+        criteria.extend(qualifiers.iter().map(
+            |(filter_type, value)| serde_json::json!({ "filterType": filter_type, "value": value }),
+        ));
+        let mut query = serde_json::json!({
+            "filters": [{
+                "criteria": [],
+                "pageNumber": 1,
+                "pageSize": 1,
+                "sortBy": 0,
+                "sortOrder": 0,
+            }],
+            "flags": flags,
+        });
+        query["filters"][0]["criteria"] = serde_json::Value::Array(criteria);
+        query
+    }
+
+    /// A client query naming extensions and asking for their whole version
+    /// history — the VSCodium update follow-up shape.
+    fn client_identity_query(values: &[&str], flags: u32) -> serde_json::Value {
+        let criteria = values
+            .iter()
+            .map(|value| serde_json::json!({ "filterType": 7, "value": value }))
+            .collect::<Vec<_>>();
+        let mut filter = serde_json::json!({
+            "criteria": [],
+            "pageNumber": 1,
+            "pageSize": 50,
+            "sortBy": 0,
+            "sortOrder": 0,
+        });
+        filter["criteria"] = serde_json::Value::Array(criteria);
+        let mut query = serde_json::json!({ "filters": [], "flags": flags });
+        query["filters"] = serde_json::Value::Array(vec![filter]);
+        query
+    }
+
+    /// One extension as an `IncludeLatestVersionOnly` detail query returns it:
+    /// a full envelope plus its latest-per-platform versions, each carrying the
+    /// upstream delivery URLs the gateway must rewrite. Entries are
+    /// `(version, targetPlatform, lastUpdated)`.
+    fn detail_query_response(
+        publisher: &str,
+        name: &str,
+        versions: &[(&str, &str, &str)],
+    ) -> serde_json::Value {
+        let versions = versions
+            .iter()
+            .map(|(version, platform, last_updated)| {
+                serde_json::json!({
+                    "version": version,
+                    "targetPlatform": platform,
+                    "lastUpdated": last_updated,
+                    "assetUri": "https://upstream.example/assets",
+                    "fallbackAssetUri": "https://cdn.example/assets",
+                    "files": [{
+                        "assetType": "README.md",
+                        "source": "https://cdn.example/README.md"
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut response = serde_json::json!({
+            "results": [{ "extensions": [{
+                "publisher": { "publisherName": publisher },
+                "extensionName": name,
+                "displayName": name,
+                "versions": []
+            }] }]
+        });
+        response["results"][0]["extensions"][0]["versions"] = serde_json::Value::Array(versions);
+        response
+    }
+
+    /// [`skeleton_wire_versions`] with an explicit publish time per entry:
+    /// `(version, targetPlatform, lastUpdated)`.
+    fn dated_skeleton_wire_versions(entries: &[(&str, &str, &str)]) -> serde_json::Value {
+        let platforms = entries
+            .iter()
+            .map(|(version, platform, _)| (*version, Some(*platform), false))
+            .collect::<Vec<_>>();
+        let mut document = skeleton_wire_versions(&platforms);
+        for (index, (_, _, last_updated)) in entries.iter().enumerate() {
+            document["results"][0]["extensions"][0]["versions"][index]["lastUpdated"] =
+                serde_json::json!(last_updated);
+        }
+        document
+    }
+
+    async fn mount_gallery_query(
+        server: &wiremock::MockServer,
+        request_body: serde_json::Value,
+        response_body: serde_json::Value,
+        expected_calls: u64,
+    ) {
+        use wiremock::matchers::{body_json, method, path};
+
+        wiremock::Mock::given(method("POST"))
+            .and(path("/vscode/gallery/extensionquery"))
+            .and(body_json(request_body))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(response_body))
+            .expect(expected_calls)
+            .mount(server)
+            .await;
+    }
+
+    fn gallery_versions_of(response: &serde_json::Value, index: usize) -> Vec<serde_json::Value> {
+        response["results"][0]["extensions"][index]["versions"]
+            .as_array()
+            .expect("composed extension carries versions")
+            .clone()
+    }
+
+    fn assert_no_upstream_hosts(body: &Bytes) {
+        for host in [b"upstream.example".as_slice(), b"cdn.example".as_slice()] {
+            assert!(
+                !body.windows(host.len()).any(|window| window == host),
+                "composed response must not retain an upstream host: {}",
+                String::from_utf8_lossy(host)
+            );
+        }
+    }
+
+    /// The VSCodium update follow-up must never be forwarded as-is: upstream
+    /// answers it with the whole version history (28.1 MiB for one popular
+    /// extension). It is answered from a bounded detail + skeleton pair, and the
+    /// stable build deep in a pre-release-heavy history must survive.
+    #[tokio::test]
+    async fn gallery_query_composes_bounded_versions_instead_of_the_full_history() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let client_query = client_identity_query(&["redhat.vscode-yaml"], 439);
+        // `expect(0)` is what makes this an assertion rather than a claim: the
+        // unbounded query must not reach upstream at all.
+        Mock::given(method("POST"))
+            .and(path("/vscode/gallery/extensionquery"))
+            .and(body_json(client_query.clone()))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        mount_gallery_query(
+            &server,
+            expected_single_id_query("redhat.vscode-yaml", 951),
+            detail_query_response(
+                "RedHat",
+                "VSCode-YAML",
+                &[
+                    // Newer than anything the skeleton lists: a publish that
+                    // landed between the two round-trips.
+                    ("4.0.0", "linux-x64", "2025-06-01T00:00:00Z"),
+                    ("3.0.0-rc.1", "linux-x64", "2024-06-01T00:00:00Z"),
+                ],
+            ),
+            1,
+        )
+        .await;
+        mount_gallery_query(
+            &server,
+            expected_single_id_query("redhat.vscode-yaml", 17),
+            skeleton_wire_versions(&[
+                ("3.0.0-rc.1", Some("linux-x64"), true),
+                ("2.0.0-rc.1", Some("linux-x64"), true),
+                ("1.5.0", Some("linux-x64"), false),
+            ]),
+            1,
+        )
+        .await;
+
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from(serde_json::to_vec(&client_query).unwrap()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = gallery_versions_of(&response, 0);
+        assert_eq!(versions.len(), 4);
+
+        let asset_prefix = format!("/vscode/{}/asset/RedHat/VSCode-YAML/", fx.repo_key);
+        for version in &versions {
+            for field in ["assetUri", "fallbackAssetUri"] {
+                let value = version[field].as_str().expect("AK-owned asset reference");
+                assert!(value.contains(&asset_prefix), "{field}: {value}");
+            }
+        }
+        // Newest first by publish time, so the coordinate only the detail query
+        // knew about leads rather than trailing the merge.
+        assert_eq!(
+            versions
+                .iter()
+                .map(|version| version["version"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["4.0.0", "3.0.0-rc.1", "2.0.0-rc.1", "1.5.0"]
+        );
+        // Detail-derived entries keep the files the skeleton never carried,
+        // rewritten onto AK.
+        assert!(versions[0]["files"][0]["source"]
+            .as_str()
+            .expect("rewritten file source")
+            .ends_with(&format!("{asset_prefix}4.0.0/linux-x64/README.md")));
+        // The stable build below every pre-release is still reachable, and a
+        // synthesized entry advertises the file list VS Code resolves an
+        // install through.
+        assert_eq!(
+            versions[3]["properties"],
+            serde_json::json!([{ "key": GALLERY_ENGINE_PROPERTY, "value": "^1.90.0" }]),
+            "a stable synthesized entry carries no PreRelease property"
+        );
+        let synthesized_files = versions[3]["files"]
+            .as_array()
+            .expect("a synthesized entry must be installable");
+        assert_eq!(
+            synthesized_files.len(),
+            GALLERY_SYNTHESIZED_ASSET_TYPES.len()
+        );
+        assert!(synthesized_files[0]["source"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!(
+                "{asset_prefix}1.5.0/linux-x64/Microsoft.VisualStudio.Services.VSIXPackage"
+            )));
+        assert_eq!(
+            response["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"],
+            1
+        );
+        assert_no_upstream_hosts(&body);
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// Real VS Code bodies carry `Target` and `ExcludeWithFlags` qualifiers
+    /// alongside their identity selectors. Treating those as "not an identity
+    /// query" would send the whole update check back down the 28 MiB
+    /// passthrough, so they qualify composition instead of disqualifying it —
+    /// and every sub-query must repeat them or it resolves a different set.
+    #[tokio::test]
+    async fn gallery_query_composes_through_target_and_exclude_qualifiers() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let qualifiers: [(u64, &str); 2] = [(8, "Microsoft.VisualStudio.Code"), (12, "4096")];
+        let mut client_query = client_identity_query(&["redhat.vscode-yaml"], 439);
+        client_query["filters"][0]["criteria"] = serde_json::json!([
+            { "filterType": 8, "value": "Microsoft.VisualStudio.Code" },
+            { "filterType": 7, "value": "redhat.vscode-yaml" },
+            { "filterType": 12, "value": "4096" }
+        ]);
+        mount_gallery_query(
+            &server,
+            expected_qualified_id_query("redhat.vscode-yaml", &qualifiers, 951),
+            detail_query_response(
+                "RedHat",
+                "VSCode-YAML",
+                &[("2.0.0", "linux-x64", "2024-06-01T00:00:00Z")],
+            ),
+            1,
+        )
+        .await;
+        mount_gallery_query(
+            &server,
+            expected_qualified_id_query("redhat.vscode-yaml", &qualifiers, 17),
+            skeleton_wire_versions(&[
+                ("2.0.0", Some("linux-x64"), false),
+                ("1.0.0", Some("linux-x64"), false),
+            ]),
+            1,
+        )
+        .await;
+
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from(serde_json::to_vec(&client_query).unwrap()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(gallery_versions_of(&response, 0).len(), 2);
+        // Both mocks carry expect(1): the qualifiers reached upstream on both
+        // sub-queries, which is the whole point of this test.
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// A text search that also asks for versions cannot be composed up front —
+    /// only upstream knows which extensions it matches. When its passthrough
+    /// aborts on the metadata ceiling, an identity-only pre-pass of the SAME
+    /// query recovers those identities and each one composes.
+    #[tokio::test]
+    async fn gallery_query_recovers_from_the_ceiling_with_an_identity_pre_pass() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        // A real search body carries the same Target qualifier an update check
+        // does. Upstream picked its results under that qualifier, so the
+        // per-identity sub-queries below must carry it too.
+        let qualifiers: [(u64, &str); 1] = [(8, "Microsoft.VisualStudio.Code")];
+        let search_query = serde_json::json!({
+            "filters": [{
+                "criteria": [
+                    { "filterType": 10, "value": "yaml" },
+                    { "filterType": 8, "value": "Microsoft.VisualStudio.Code" }
+                ],
+                "pageNumber": 1,
+                "pageSize": 50,
+                "sortBy": 0,
+                "sortOrder": 0,
+            }],
+            "flags": 439
+        });
+        let mut identity_query = search_query.clone();
+        // (439 | IncludeLatestVersionOnly) & !IncludeVersions
+        identity_query["flags"] = serde_json::json!(950);
+
+        Mock::given(method("POST"))
+            .and(path("/vscode/gallery/extensionquery"))
+            .and(body_json(search_query.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("x".repeat(GALLERY_METADATA_MAX_BYTES + 1024)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_gallery_query(
+            &server,
+            identity_query,
+            serde_json::json!({
+                "results": [{
+                    "extensions": [{
+                        "publisher": { "publisherName": "RedHat" },
+                        "extensionName": "VSCode-YAML"
+                    }],
+                    "resultMetadata": [{
+                        "metadataType": "ResultCount",
+                        "metadataItems": [{ "name": "TotalCount", "count": 4096 }]
+                    }]
+                }]
+            }),
+            1,
+        )
+        .await;
+        mount_gallery_query(
+            &server,
+            expected_qualified_id_query("RedHat.VSCode-YAML", &qualifiers, 951),
+            detail_query_response(
+                "RedHat",
+                "VSCode-YAML",
+                &[("2.0.0", "linux-x64", "2024-06-01T00:00:00Z")],
+            ),
+            1,
+        )
+        .await;
+        mount_gallery_query(
+            &server,
+            expected_qualified_id_query("RedHat.VSCode-YAML", &qualifiers, 17),
+            skeleton_wire_versions(&[
+                ("2.0.0", Some("linux-x64"), false),
+                ("1.0.0", Some("linux-x64"), false),
+            ]),
+            1,
+        )
+        .await;
+
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from(serde_json::to_vec(&search_query).unwrap()),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a ceiling abort on a versions query must recover, not 502"
+        );
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = gallery_versions_of(&response, 0);
+        assert_eq!(versions.len(), 2);
+        assert!(versions[1]["assetUri"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("/vscode/{}/asset/", fx.repo_key)));
+        // The pre-pass response counted every page of the search. Composing one
+        // page must not overwrite that with "1" and stop a paging client.
+        assert_eq!(
+            response["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"], 4096,
+            "the upstream cross-page count is carried forward, not replaced"
+        );
+        assert_no_upstream_hosts(&body);
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// A ceiling abort is only recoverable because the client asked for
+    /// versions. Without that flag the response is already as narrow as the
+    /// protocol lets it be asked for, and there is nothing to compose.
+    #[tokio::test]
+    async fn gallery_query_without_versions_surfaces_the_ceiling() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("POST"))
+            .and(path("/vscode/gallery/extensionquery"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("x".repeat(GALLERY_METADATA_MAX_BYTES + 1024)),
+            )
+            // Exactly one attempt: there is no identity pre-pass to make.
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from_static(b"{\"filters\":[],\"flags\":438}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// The skeleton has its own, much larger cap, but it is still a cap: an
+    /// extension whose history exceeds it fails visibly rather than being
+    /// buffered without bound.
+    #[tokio::test]
+    async fn gallery_skeleton_over_its_own_cap_fails_closed() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let client_query = client_identity_query(&["redhat.vscode-yaml"], 439);
+        mount_gallery_query(
+            &server,
+            expected_single_id_query("redhat.vscode-yaml", 951),
+            detail_query_response(
+                "RedHat",
+                "VSCode-YAML",
+                &[("2.0.0", "linux-x64", "2024-06-01T00:00:00Z")],
+            ),
+            1,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/vscode/gallery/extensionquery"))
+            .and(body_json(expected_single_id_query(
+                "redhat.vscode-yaml",
+                17,
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("x".repeat(GALLERY_SKELETON_MAX_BYTES + 1024)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from(serde_json::to_vec(&client_query).unwrap()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// Composition answers every identity the client listed, in the order it
+    /// listed them, and `TotalCount` reports what the envelope actually
+    /// carries — an identity upstream does not know is simply absent.
+    #[tokio::test]
+    async fn gallery_query_composes_multiple_identities_in_client_order() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let client_query = client_identity_query(
+            &["second.extension", "missing.extension", "first.extension"],
+            3,
+        );
+        for (identity, publisher, name) in [
+            ("second.extension", "Second", "Extension"),
+            ("first.extension", "First", "Extension"),
+        ] {
+            mount_gallery_query(
+                &server,
+                expected_single_id_query(identity, 3 | 512),
+                detail_query_response(
+                    publisher,
+                    name,
+                    &[("1.0.0", "linux-x64", "2024-06-01T00:00:00Z")],
+                ),
+                1,
+            )
+            .await;
+            mount_gallery_query(
+                &server,
+                expected_single_id_query(identity, 17),
+                // The skeleton must name the SAME extension the detail query
+                // reported, or its versions are not evidence about it.
+                skeleton_wire_versions_for(publisher, name, &[("1.0.0", Some("linux-x64"), false)]),
+                1,
+            )
+            .await;
+        }
+        // The unknown identity costs one detail query and no skeleton query.
+        mount_gallery_query(
+            &server,
+            expected_single_id_query("missing.extension", 3 | 512),
+            serde_json::json!({ "results": [{ "extensions": [] }] }),
+            1,
+        )
+        .await;
+
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) = rewire_remote_gallery(&fx, &gallery_root).await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                Bytes::from(serde_json::to_vec(&client_query).unwrap()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let extensions = response["results"][0]["extensions"]
+            .as_array()
+            .expect("composed envelope carries extensions");
+        assert_eq!(extensions.len(), 2);
+        assert_eq!(extensions[0]["publisher"]["publisherName"], "Second");
+        assert_eq!(extensions[1]["publisher"]["publisherName"], "First");
+        assert_eq!(
+            response["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"], 2,
+            "TotalCount reports the composed envelope, not the client's identity list"
+        );
+        drop(server);
+        fx.teardown().await;
+    }
+
+    /// With the gate on, the latest version is frequently too young to serve.
+    /// Open VSX only reports latest-per-platform, so without a walk-back the
+    /// route 404s an extension whose older releases are perfectly servable.
+    #[tokio::test]
+    async fn gallery_latest_walks_back_to_the_newest_gate_allowed_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let young = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let old = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        mount_gallery_query(
+            &server,
+            expected_single_id_query("RedHat.VSCode-YAML", 1023),
+            detail_query_response("RedHat", "VSCode-YAML", &[("2.0.0", "linux-x64", &young)]),
+            1,
+        )
+        .await;
+        mount_gallery_query(
+            &server,
+            expected_single_id_query("RedHat.VSCode-YAML", 17),
+            dated_skeleton_wire_versions(&[
+                ("2.0.0", "linux-x64", &young),
+                ("1.0.0", "linux-x64", &old),
+            ]),
+            1,
+        )
+        .await;
+
+        let gallery_root = format!("{}/vscode/gallery", server.uri());
+        let (state, _cache) =
+            rewire_remote_gallery_with_age_gate(&fx, &gallery_root, "upstream_publish_time", 7)
+                .await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/gallery/RedHat/VSCode-YAML/latest",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a gated latest lookup resolves an older allowed release"
+        );
+        let extension: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(extension["displayName"], "VSCode-YAML");
+        let versions = extension["versions"].as_array().expect("versions");
+        assert_eq!(versions.len(), 1, "one release per target platform");
+        assert_eq!(versions[0]["version"], "1.0.0");
+        assert_eq!(versions[0]["targetPlatform"], "linux-x64");
+        assert!(versions[0]["assetUri"]
+            .as_str()
+            .expect("AK-owned asset reference")
+            .ends_with(&format!(
+                "/vscode/{}/asset/RedHat/VSCode-YAML/1.0.0/linux-x64",
+                fx.repo_key
+            )));
+        assert_no_upstream_hosts(&body);
+        drop(server);
+        fx.teardown().await;
+    }
+
     #[tokio::test]
     async fn gallery_extensionquery_maps_malformed_upstream_json_to_bad_gateway() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -2717,7 +5175,7 @@ mod tests {
                 "sortBy": 0,
                 "sortOrder": 0,
             }],
-            "flags": 511,
+            "flags": 1023,
         });
         Mock::given(method("POST"))
             .and(path("/vscode/gallery/extensionquery"))
