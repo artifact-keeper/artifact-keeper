@@ -42,6 +42,19 @@ static X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 /// NuGet push route honours it (see [`extract_nuget_push_api_key`]).
 static X_NUGET_API_KEY: HeaderName = HeaderName::from_static("x-nuget-apikey");
 
+/// Custom header the web UI attaches to every API request as the CSRF
+/// defense-in-depth signal (#3065).
+///
+/// The *value* is irrelevant — only that the header is present. A cross-site
+/// HTML form (the classic cookie-riding CSRF vector) cannot set any custom
+/// request header at all, and a cross-origin `fetch()`/XHR that tries to set
+/// one is forced into a CORS preflight that this server does not approve. So
+/// presence alone proves the request was issued by same-origin script.
+static X_REQUESTED_WITH: HeaderName = HeaderName::from_static("x-requested-with");
+
+/// Name of the httpOnly cookie that carries a web-UI session's access token.
+const SESSION_COOKIE_NAME: &str = "ak_access_token=";
+
 /// Extension that holds authenticated user information
 ///
 /// `Default` derives a deny-by-default principal (anonymous, non-admin,
@@ -525,16 +538,129 @@ pub(crate) fn extract_token(request: &Request) -> ExtractedToken<'_> {
     }
 
     // Check cookie as fallback (for browser sessions with httpOnly cookies)
-    if let Some(cookie_header) = request.headers().get(COOKIE).and_then(|h| h.to_str().ok()) {
-        for cookie in cookie_header.split(';') {
-            let cookie = cookie.trim();
-            if let Some(token) = cookie.strip_prefix("ak_access_token=") {
-                return ExtractedToken::Bearer(token);
-            }
-        }
+    if let Some(token) = session_cookie_token(request.headers()) {
+        return ExtractedToken::Bearer(token);
     }
 
     ExtractedToken::None
+}
+
+/// The web-UI session access token carried in the `ak_access_token` cookie,
+/// if the request has one.
+///
+/// Single source for "is there a session cookie", shared by [`extract_token`]
+/// (which turns it into a credential) and [`credential_is_session_cookie`]
+/// (which decides whether the CSRF contract applies).
+fn session_cookie_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(COOKIE)
+        .and_then(|h| h.to_str().ok())?
+        .split(';')
+        .find_map(|cookie| cookie.trim().strip_prefix(SESSION_COOKIE_NAME))
+}
+
+/// Whether this request would be authenticated by the browser session cookie
+/// rather than by an explicitly-presented header credential.
+///
+/// Mirrors [`extract_token`]'s precedence exactly, and that is the whole
+/// point: `Authorization` wins, then `X-API-Key`, and only then the cookie.
+/// Native package-manager clients (pip, npm, cargo, docker, maven, …)
+/// authenticate with HTTP Basic or a Bearer/API-key token, so they take one of
+/// the earlier branches and are never treated as cookie-authenticated — which
+/// is what keeps the CSRF header requirement off them.
+///
+/// Deliberately does not care whether the cookie is *valid*: an attacker
+/// cannot make the browser omit it, so the contract has to be decided on the
+/// request's shape, before any credential is resolved.
+fn credential_is_session_cookie(headers: &HeaderMap) -> bool {
+    let has_header_credential = headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| !matches!(extract_token_from_auth_header(h), ExtractedToken::None))
+        || headers.contains_key(&X_API_KEY);
+
+    !has_header_credential && session_cookie_token(headers).is_some()
+}
+
+/// Whether `method` can change server state, and therefore falls under the
+/// CSRF contract. `GET`/`HEAD`/`OPTIONS` (and anything else safe) do not.
+fn is_state_changing_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
+/// Whether this request breaks the web-UI CSRF contract and must be refused
+/// (#3065).
+///
+/// All four conditions must hold, and each one is load-bearing:
+///
+/// 1. **State-changing method.** Reads are not the CSRF threat.
+/// 2. **Cookie-authenticated** ([`credential_is_session_cookie`]). This is the
+///    exemption that keeps native package-manager clients and every
+///    token-authenticated API call working: they present a Basic/Bearer/API-key
+///    header, so the contract never applies to them. Only the credential a
+///    browser attaches *automatically* — and which the attacker therefore does
+///    not need to know — is in scope.
+/// 3. **Browser-originated** ([`is_browser_request`], the detector added in
+///    #3389; reused rather than duplicated). This costs nothing in security:
+///    a forged cookie-riding request is by construction issued by the victim's
+///    browser, which stamps `Sec-Fetch-*` on every request in a secure context
+///    and sends `Accept: text/html` on a form navigation. A non-browser client
+///    can set any header it likes, so requiring one of it would prove nothing.
+/// 4. **No custom header** ([`X_REQUESTED_WITH`]) — the actual signal, see that
+///    constant.
+///
+/// This is belt-and-suspenders behind the primary mitigation, `SameSite=Strict`
+/// on the session cookie (`handlers::auth::set_auth_cookies`), and exists so a
+/// future weakening of that attribute cannot silently re-open cross-site
+/// mutations.
+///
+/// Pure and header-only, so the decision is unit-testable without a request.
+fn violates_csrf_contract(method: &Method, headers: &HeaderMap) -> bool {
+    is_state_changing_method(method)
+        && credential_is_session_cookie(headers)
+        && is_browser_request(headers)
+        && !headers.contains_key(&X_REQUESTED_WITH)
+}
+
+/// 403 for a cookie-authenticated mutation that did not carry the custom
+/// header. Distinct from 401: the caller *is* authenticated, the request shape
+/// is what was refused, so retrying with the header is the fix.
+fn csrf_forbidden_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "Cookie-authenticated state-changing requests must send the \
+         X-Requested-With header (CSRF protection). Use a Bearer or API token \
+         for non-browser clients.",
+    )
+        .into_response()
+}
+
+/// Enforce the CSRF contract for one request, if it applies.
+///
+/// Returns `Some(403)` for a request to refuse, `None` to continue. Called at
+/// the head of every authentication middleware so the check cannot be skipped
+/// by whichever one a route happens to mount.
+fn csrf_guard(request: &Request) -> Option<Response> {
+    violates_csrf_contract(request.method(), request.headers()).then(csrf_forbidden_response)
+}
+
+/// Standalone CSRF layer for the whole `/api/v1` surface (#3065).
+///
+/// Deliberately overlaps with the [`csrf_guard`] call inside each
+/// authentication middleware, because neither alone covers everything:
+/// this layer reaches the `/api/v1` routes that carry no auth middleware at
+/// all (`/auth/login`, `/auth/refresh`, `/auth/logout` — all cookie-writing
+/// and all worth protecting), while the in-middleware calls reach the
+/// auth-gated routes mounted *outside* `/api/v1`. Running the predicate twice
+/// on the overlap costs one header lookup.
+pub async fn csrf_middleware(request: Request, next: Next) -> Response {
+    match csrf_guard(&request) {
+        Some(refusal) => refusal,
+        None => next.run(request).await,
+    }
 }
 
 /// Decode a base64-encoded Basic auth string into (username, password).
@@ -624,6 +750,12 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // CSRF contract for cookie-authenticated browser mutations (#3065). Header
+    // -only and credential-independent, so it runs before anything is resolved.
+    if let Some(refusal) = csrf_guard(&request) {
+        return refusal;
+    }
+
     // Extract token from request headers
     let extracted = extract_token(&request);
 
@@ -1277,6 +1409,12 @@ pub async fn optional_auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // See `auth_middleware`: the CSRF contract applies wherever a session
+    // cookie can authenticate a mutation (#3065).
+    if let Some(refusal) = csrf_guard(&request) {
+        return refusal;
+    }
+
     let extracted = extract_token(&request);
     // /api/v1 optional-auth route: an API token is NOT accepted as the Basic
     // password (`allow_basic_api_token=false`) — the /api/v1 Basic-auth boundary
@@ -1339,6 +1477,12 @@ pub async fn admin_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // See `auth_middleware`: the CSRF contract applies wherever a session
+    // cookie can authenticate a mutation (#3065).
+    if let Some(refusal) = csrf_guard(&request) {
+        return refusal;
+    }
+
     let extracted = extract_token(&request);
 
     if matches!(extracted, ExtractedToken::Basic(encoded) if decode_basic_credentials(encoded).is_none())
@@ -3855,6 +3999,192 @@ mod tests {
         assert!(challenges.iter().any(|v| v.starts_with("Basic")));
         assert!(challenges.iter().any(|v| v.starts_with("Bearer")));
         assert!(challenges.iter().any(|v| v.starts_with("Cargo")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Web-UI CSRF contract (#3065)
+    //
+    // The contract: a state-changing request that is authenticated by the
+    // session cookie and comes from a browser must carry `X-Requested-With`.
+    // Everything else — reads, token/Basic-authenticated calls, non-browser
+    // clients — is untouched.
+    // -----------------------------------------------------------------------
+
+    /// Headers of a same-site browser `fetch()` carrying the session cookie.
+    fn browser_cookie_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        headers.insert(COOKIE, "ak_access_token=session-jwt".parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn csrf_cookie_mutation_without_the_custom_header_is_refused() {
+        assert!(violates_csrf_contract(
+            &Method::POST,
+            &browser_cookie_headers()
+        ));
+        for method in [Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(
+                violates_csrf_contract(&method, &browser_cookie_headers()),
+                "{method} must be covered by the CSRF contract"
+            );
+        }
+    }
+
+    /// The cross-site HTML form: the shape the contract exists to stop. It
+    /// rides the cookie, cannot set a custom header, and announces itself with
+    /// `Sec-Fetch-Site: cross-site` plus an HTML navigation `Accept`.
+    #[test]
+    fn csrf_cross_site_form_post_is_refused() {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        headers.insert("accept", "text/html,*/*;q=0.8".parse().unwrap());
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        headers.insert(COOKIE, "ak_access_token=session-jwt".parse().unwrap());
+        assert!(violates_csrf_contract(&Method::POST, &headers));
+        assert_eq!(csrf_forbidden_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn csrf_cookie_mutation_with_the_custom_header_is_allowed() {
+        let mut headers = browser_cookie_headers();
+        headers.insert(&X_REQUESTED_WITH, "XMLHttpRequest".parse().unwrap());
+        assert!(!violates_csrf_contract(&Method::POST, &headers));
+    }
+
+    #[test]
+    fn csrf_contract_does_not_apply_to_safe_methods() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(
+                !violates_csrf_contract(&method, &browser_cookie_headers()),
+                "{method} is not state-changing and must stay unaffected"
+            );
+        }
+    }
+
+    /// The exemption that keeps every native package-manager client working:
+    /// they authenticate with a header credential, never with the cookie.
+    #[test]
+    fn csrf_contract_does_not_apply_to_header_authenticated_clients() {
+        // docker / npm / cargo: Bearer token.
+        let mut bearer = HeaderMap::new();
+        bearer.insert(AUTHORIZATION, "Bearer ak_token_abc".parse().unwrap());
+        assert!(!violates_csrf_contract(&Method::PUT, &bearer));
+
+        // pip / twine / maven: HTTP Basic.
+        let mut basic = HeaderMap::new();
+        basic.insert(AUTHORIZATION, "Basic dXNlcjpwYXNz".parse().unwrap());
+        assert!(!violates_csrf_contract(&Method::POST, &basic));
+
+        // API key header.
+        let mut api_key = HeaderMap::new();
+        api_key.insert(&X_API_KEY, "ak_key_abc".parse().unwrap());
+        assert!(!violates_csrf_contract(&Method::DELETE, &api_key));
+
+        // The scheme-less raw token the cargo credential provider sends.
+        let mut cargo = HeaderMap::new();
+        cargo.insert(AUTHORIZATION, "ak_raw_cargo_token".parse().unwrap());
+        assert!(!violates_csrf_contract(&Method::PUT, &cargo));
+
+        // No credential at all: nothing to ride, and the request will be
+        // rejected as unauthenticated on its own merits.
+        assert!(!violates_csrf_contract(&Method::POST, &HeaderMap::new()));
+    }
+
+    /// A header credential wins over a stale cookie, exactly as it does in
+    /// `extract_token` — so a package client on a machine that once used the
+    /// web UI is not caught by the contract.
+    #[test]
+    fn csrf_header_credential_beats_a_stale_session_cookie() {
+        let mut headers = browser_cookie_headers();
+        headers.insert(AUTHORIZATION, "Bearer ak_token_abc".parse().unwrap());
+        assert!(!credential_is_session_cookie(&headers));
+        assert!(!violates_csrf_contract(&Method::POST, &headers));
+    }
+
+    /// Precedence is mirrored from `extract_token` including its edge cases: a
+    /// present-but-malformed `Authorization` header short-circuits there as
+    /// `Invalid` (a 401 the cookie never gets to rescue), so it is not
+    /// cookie-authenticated either. A header value that is not even UTF-8 is
+    /// skipped by both, leaving the cookie in charge.
+    #[test]
+    fn csrf_precedence_matches_extract_token_on_malformed_headers() {
+        let mut malformed = browser_cookie_headers();
+        malformed.insert(AUTHORIZATION, "".parse().unwrap());
+        assert!(matches!(
+            extract_token_from_auth_header(""),
+            ExtractedToken::Invalid
+        ));
+        assert!(!credential_is_session_cookie(&malformed));
+        assert!(!violates_csrf_contract(&Method::POST, &malformed));
+
+        let mut non_utf8 = browser_cookie_headers();
+        non_utf8.insert(
+            AUTHORIZATION,
+            axum::http::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+        );
+        assert!(credential_is_session_cookie(&non_utf8));
+        assert!(violates_csrf_contract(&Method::POST, &non_utf8));
+    }
+
+    #[test]
+    fn csrf_contract_does_not_apply_to_non_browser_cookie_clients() {
+        // No Fetch Metadata and no text/html Accept: not a browser, so it can
+        // set any header it wants and requiring one would prove nothing.
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, "ak_access_token=session-jwt".parse().unwrap());
+        headers.insert("accept", "application/json".parse().unwrap());
+        assert!(!violates_csrf_contract(&Method::POST, &headers));
+    }
+
+    #[test]
+    fn csrf_other_cookies_do_not_trigger_the_contract() {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+        headers.insert(COOKIE, "theme=dark; consent=1".parse().unwrap());
+        assert!(!credential_is_session_cookie(&headers));
+        assert!(!violates_csrf_contract(&Method::POST, &headers));
+    }
+
+    /// `csrf_guard` is what the middlewares actually call: it must turn the
+    /// predicate into a 403 and otherwise get out of the way.
+    #[test]
+    fn csrf_guard_refuses_only_the_requests_the_predicate_flags() {
+        let build = |method: Method, with_header: bool| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri("/api/v1/repositories")
+                .header("sec-fetch-mode", "cors")
+                .header(COOKIE, "ak_access_token=session-jwt");
+            if with_header {
+                builder = builder.header("x-requested-with", "XMLHttpRequest");
+            }
+            builder.body(axum::body::Body::empty()).unwrap()
+        };
+
+        let refusal = csrf_guard(&build(Method::POST, false)).expect("must refuse");
+        assert_eq!(refusal.status(), StatusCode::FORBIDDEN);
+        assert!(csrf_guard(&build(Method::POST, true)).is_none());
+        assert!(csrf_guard(&build(Method::GET, false)).is_none());
+    }
+
+    #[test]
+    fn session_cookie_token_reads_the_session_cookie_among_others() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            "theme=dark; ak_access_token=abc123; ak_refresh_token=xyz"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(session_cookie_token(&headers), Some("abc123"));
+        assert!(session_cookie_token(&HeaderMap::new()).is_none());
     }
 
     #[test]

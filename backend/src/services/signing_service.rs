@@ -19,6 +19,7 @@ use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::{RsaPrivateKey, RsaPublicKey};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -43,6 +44,27 @@ pub const HEX_REGISTRY_KEY_ALGORITHM: &str = "rsa2048";
 /// per-artifact preparer lock). The class keeps this lock space disjoint
 /// from theirs.
 const HEX_REGISTRY_KEY_LOCK_CLASS: i32 = 0x4845_5801; // "HEX\x01"
+
+/// Digest algorithm for an RSA PKCS#1 v1.5 signature.
+///
+/// The digest is **not** a free choice: each consuming ecosystem fixes it, and
+/// a signature made with the wrong one is well-formed but rejected by the
+/// client that has to verify it. The variants exist because three different
+/// clients disagree:
+///
+/// * [`RsaDigest::Sha1`] — apk's `.SIGN.RSA.` index signature. apk-tools maps
+///   the signature entry's `RSA` infix to SHA-1 (`RSA256`/`RSA512` select the
+///   others); `abuild-sign` correspondingly runs `openssl dgst -sha1 -sign`.
+///   Only used for that index signature, where the format leaves no choice.
+/// * [`RsaDigest::Sha256`] — the Debian/Conda metadata default.
+/// * [`RsaDigest::Sha512`] — fixed by the hex registry protocol, whose client
+///   verifies with `public_key:verify(Payload, sha512, ...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsaDigest {
+    Sha1,
+    Sha256,
+    Sha512,
+}
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
@@ -603,12 +625,43 @@ impl SigningService {
 
     /// Sign data with the repository's active signing key (RSA PKCS#1 v1.5 SHA-256).
     pub async fn sign_data(&self, repo_id: Uuid, data: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.sign_data_with_digest(repo_id, data, RsaDigest::Sha256)
+            .await
+    }
+
+    /// Sign an Alpine `APKINDEX` segment with the repository's active signing
+    /// key, using the digest apk fixes for a `.SIGN.RSA.` entry: **SHA-1**.
+    ///
+    /// `data` must be the *compressed* bytes of the index gzip stream — apk
+    /// digests the raw segment bytes as they appear on the wire, not the
+    /// APKINDEX text. See `alpine::build_apk_signature_segment` for the
+    /// framing that carries the result.
+    ///
+    /// Cannot reuse [`SigningService::sign_data`]: a SHA-256 signature under a
+    /// `.SIGN.RSA.` entry is well-formed but apk verifies it against a SHA-1
+    /// digest and fails with `BAD signature` (#3021).
+    pub async fn sign_apk_index(&self, repo_id: Uuid, data: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.sign_data_with_digest(repo_id, data, RsaDigest::Sha1)
+            .await
+    }
+
+    /// Shared body of [`Self::sign_data`] / [`Self::sign_apk_index`]: resolve
+    /// the repository's active key, sign, and stamp `last_used_at`.
+    ///
+    /// `Ok(None)` when the repository has no active key — the caller decides
+    /// whether that is "serve unsigned" or an error.
+    async fn sign_data_with_digest(
+        &self,
+        repo_id: Uuid,
+        data: &[u8],
+        digest: RsaDigest,
+    ) -> Result<Option<Vec<u8>>> {
         let key = match self.get_active_key_for_repo(repo_id).await? {
             Some(k) => k,
             None => return Ok(None),
         };
 
-        let signature = self.sign_with_key(&key, data)?;
+        let signature = self.sign_with_key_digest(&key, data, digest)?;
 
         // Update last_used_at
         sqlx::query!(
@@ -716,31 +769,62 @@ impl SigningService {
         Ok(())
     }
 
-    /// Sign data with a specific key.
+    /// Sign data with a specific key: RSA PKCS#1 v1.5, **SHA-256** digest —
+    /// the Debian/Conda metadata default.
+    ///
+    /// Key material handling (zeroization, #1328) lives in
+    /// [`SigningService::load_rsa_private_key`].
+    pub fn sign_with_key(&self, key: &SigningKey, data: &[u8]) -> Result<Vec<u8>> {
+        self.sign_with_key_digest(key, data, RsaDigest::Sha256)
+    }
+
+    /// Decrypt and parse `key`'s RSA private half.
     ///
     /// The decrypted PEM bytes are held in a `Zeroizing<Vec<u8>>` so the
     /// plaintext private-key material is wiped from memory when the buffer
     /// drops, rather than waiting for the allocator to reuse the slot
-    /// (artifact-keeper #1328). The parsed `RsaPrivateKey` and the derived
-    /// `RsaSigningKey<Sha256>` both already implement `ZeroizeOnDrop` upstream
-    /// in the `rsa` crate, so they self-clean when this function returns.
-    pub fn sign_with_key(&self, key: &SigningKey, data: &[u8]) -> Result<Vec<u8>> {
-        // Decrypt private key into a zeroizing buffer.
+    /// (artifact-keeper #1328). The returned `RsaPrivateKey` already
+    /// implements `ZeroizeOnDrop` upstream in the `rsa` crate, so it
+    /// self-cleans when the caller drops it.
+    ///
+    /// Single source for every RSA signing path so the zeroization discipline
+    /// cannot drift between them.
+    fn load_rsa_private_key(&self, key: &SigningKey) -> Result<RsaPrivateKey> {
         let private_pem: Zeroizing<Vec<u8>> =
             Zeroizing::new(self.encryption.decrypt(&key.private_key_enc).map_err(|e| {
                 AppError::Internal(format!("Failed to decrypt private key: {}", e))
             })?);
 
-        let private_key = RsaPrivateKey::from_pkcs8_pem(
+        RsaPrivateKey::from_pkcs8_pem(
             std::str::from_utf8(&private_pem)
                 .map_err(|e| AppError::Internal(format!("Invalid UTF-8 in key: {}", e)))?,
         )
-        .map_err(|e| AppError::Internal(format!("Failed to parse private key: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to parse private key: {}", e)))
+    }
 
-        let signing_key = RsaSigningKey::<Sha256>::new(private_key);
-        let signature = signing_key.sign(data);
-
-        Ok(signature.to_bytes().to_vec())
+    /// Sign `data` with `key` using RSA PKCS#1 v1.5 over `digest`.
+    ///
+    /// The digest is a parameter rather than a constant because the verifying
+    /// client fixes it per format — see [`RsaDigest`].
+    pub fn sign_with_key_digest(
+        &self,
+        key: &SigningKey,
+        data: &[u8],
+        digest: RsaDigest,
+    ) -> Result<Vec<u8>> {
+        let private_key = self.load_rsa_private_key(key)?;
+        let signature = match digest {
+            RsaDigest::Sha1 => RsaSigningKey::<Sha1>::new(private_key)
+                .sign(data)
+                .to_bytes(),
+            RsaDigest::Sha256 => RsaSigningKey::<Sha256>::new(private_key)
+                .sign(data)
+                .to_bytes(),
+            RsaDigest::Sha512 => RsaSigningKey::<Sha512>::new(private_key)
+                .sign(data)
+                .to_bytes(),
+        };
+        Ok(signature.to_vec())
     }
 
     /// Sign hex registry bytes with `key`: RSA PKCS#1 v1.5, **SHA-512** digest.
@@ -751,24 +835,8 @@ impl SigningService {
     /// [`SigningService::sign_with_key`], which signs with SHA-256 for the
     /// Debian/Conda metadata paths: a SHA-256 signature is well-formed but the
     /// hex client rejects it.
-    ///
-    /// Mirrors `sign_with_key`'s handling of the decrypted private key: the PEM
-    /// plaintext lives in a `Zeroizing` buffer and the parsed key self-cleans on
-    /// drop (#1328).
     pub fn sign_hex_registry(&self, key: &SigningKey, data: &[u8]) -> Result<Vec<u8>> {
-        let private_pem: Zeroizing<Vec<u8>> =
-            Zeroizing::new(self.encryption.decrypt(&key.private_key_enc).map_err(|e| {
-                AppError::Internal(format!("Failed to decrypt private key: {}", e))
-            })?);
-
-        let private_key = RsaPrivateKey::from_pkcs8_pem(
-            std::str::from_utf8(&private_pem)
-                .map_err(|e| AppError::Internal(format!("Invalid UTF-8 in key: {}", e)))?,
-        )
-        .map_err(|e| AppError::Internal(format!("Failed to parse private key: {}", e)))?;
-
-        let signing_key = RsaSigningKey::<Sha512>::new(private_key);
-        Ok(signing_key.sign(data).to_bytes().to_vec())
+        self.sign_with_key_digest(key, data, RsaDigest::Sha512)
     }
 
     /// Look up a repository's dedicated hex registry key, if it has one.
