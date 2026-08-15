@@ -177,6 +177,29 @@ pub fn ssrf_guard_resolver() -> Arc<dyn Resolve> {
     Arc::new(SsrfGuardResolver::with_mode(ResolverMode::Upstream))
 }
 
+/// `Arc<dyn Resolve>` for the fail-closed upstream trust class with an
+/// EXPLICIT proxy-host exempt set instead of the process-environment one.
+///
+/// Used by the per-repository egress proxy (#2469 / #2811): when a repository
+/// routes through its own proxy, the process-wide `HTTP_PROXY` env is
+/// deliberately NOT in force for that client, so exempting the env-derived
+/// hosts would be wrong — the set must name exactly that repository's proxy
+/// host (or be empty, for a repository pinned to direct egress).
+///
+/// The exemption semantics are unchanged from [`ssrf_guard_resolver`]: exact,
+/// case-insensitive, full-host equality only (see [`host_is_exempt`]), applied
+/// solely so the proxy's own — usually private — address is dialable. Every
+/// other target still goes through the fail-closed upstream filter.
+pub fn ssrf_guard_resolver_exempting(exempt_proxy_hosts: HashSet<String>) -> Arc<dyn Resolve> {
+    Arc::new(SsrfGuardResolver {
+        mode: ResolverMode::Upstream,
+        exempt_proxy_hosts: exempt_proxy_hosts
+            .into_iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect(),
+    })
+}
+
 /// `Arc<dyn Resolve>` for trusted operator-configured internal-service
 /// clients (e.g. the scanner-adapter): permits private/CGNAT/ULA targets but
 /// retains the metadata/loopback/link-local hard-blocks (issue #2389).

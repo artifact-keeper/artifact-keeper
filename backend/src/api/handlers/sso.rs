@@ -30,6 +30,7 @@ use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
 use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
 use crate::services::ldap_service::LdapService;
+use crate::services::oidc_service::resolve_federated_email;
 use crate::services::saml_service::SamlService;
 
 /// Create public SSO routes (no auth required)
@@ -492,7 +493,7 @@ async fn oidc_callback_inner(
         .ok_or_else(|| AppError::Internal("ID token missing sub claim".into()))?
         .to_string();
 
-    let email = claims[email_claim].as_str().unwrap_or_default().to_string();
+    let email = oidc_provisioning_email(&claims, email_claim, &sub);
 
     let preferred_username = claims[username_claim]
         .as_str()
@@ -1227,6 +1228,30 @@ pub(crate) fn resolve_oidc_claim_name<'a>(
         .get(key)
         .and_then(|v| v.as_str())
         .unwrap_or(default)
+}
+
+/// Address to store in `users.email` for a user arriving through the
+/// **DB-configured** OIDC provider callback (#3416).
+///
+/// The `email` claim is OPTIONAL in OIDC: it is released only when the `email`
+/// scope is granted *and* the IdP chooses to disclose it. `users.email` is
+/// `VARCHAR(255) UNIQUE NOT NULL`, so this callback used to read it as
+/// `claims[email_claim].as_str().unwrap_or_default()` — collapsing "absent" to
+/// a shared `""`. Only the FIRST claim-less user could then provision; the
+/// SECOND died on `users_email_key`, so a login broke later, for a different
+/// user, for a reason with no visible connection to the one who caused it, and
+/// the row holding `""` stayed put so it never self-healed.
+///
+/// That is bug #3119 verbatim, living in a code path the #3161 fix never
+/// touched: #3161 fixed `services/oidc_service.rs`, while this handler is a
+/// second, independent OIDC implementation for providers configured in the
+/// database. Route it through the same derivation both service paths already
+/// use, keyed on the OIDC `sub` — which is also what this callback provisions
+/// `external_id` against. `Option<&str>` is passed through deliberately so
+/// "claim absent" stays distinguishable from "claim present and empty"
+/// (`resolve_federated_email` treats blank as missing, rather than storing it).
+fn oidc_provisioning_email(claims: &serde_json::Value, email_claim: &str, sub: &str) -> String {
+    resolve_federated_email(claims[email_claim].as_str(), sub)
 }
 
 /// Delimiters used to split a scalar (string) OIDC groups claim into
@@ -2849,6 +2874,85 @@ mod tests {
         assert_eq!(
             resolve_oidc_claim_name(&attr, "email_claim", "email"),
             "email"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3416: the DB-configured OIDC callback's `users.email` derivation.
+    //
+    // This handler is a SECOND, independent OIDC implementation; the #3161 fix
+    // for the same defect (#3119) only reached `services/oidc_service.rs`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oidc_provisioning_email_returns_the_claim_when_present() {
+        let claims = serde_json::json!({ "sub": "guid-abc", "email": "alice@corp.com" });
+        assert_eq!(
+            oidc_provisioning_email(&claims, "email", "guid-abc"),
+            "alice@corp.com"
+        );
+    }
+
+    #[test]
+    fn oidc_provisioning_email_honours_a_custom_email_claim() {
+        let claims = serde_json::json!({ "sub": "guid-abc", "mail": "bob@corp.com" });
+        assert_eq!(
+            oidc_provisioning_email(&claims, "mail", "guid-abc"),
+            "bob@corp.com"
+        );
+    }
+
+    /// The defect itself. `""` is a single value and `users.email` is UNIQUE,
+    /// so the old `.unwrap_or_default()` let exactly one claim-less user
+    /// provision and broke every later one — a delayed, misattributed failure.
+    #[test]
+    fn oidc_provisioning_email_never_collapses_a_missing_claim_to_empty() {
+        let one = serde_json::json!({ "sub": "guid-one" });
+        let two = serde_json::json!({ "sub": "guid-two" });
+
+        let email_one = oidc_provisioning_email(&one, "email", "guid-one");
+        let email_two = oidc_provisioning_email(&two, "email", "guid-two");
+
+        assert!(
+            !email_one.is_empty() && !email_two.is_empty(),
+            "a missing claim must never resolve to the empty string"
+        );
+        assert_ne!(
+            email_one, email_two,
+            "two claim-less users must get two addresses, or the second one \
+             fails on the users_email_key UNIQUE constraint"
+        );
+        for email in [&email_one, &email_two] {
+            assert!(
+                email.ends_with(".invalid"),
+                "synthetic addresses must be non-routable: {}",
+                email
+            );
+            assert!(email.len() <= 255, "must fit users.email: {}", email);
+        }
+    }
+
+    /// A blank claim collides exactly the way a missing one does, and some IdPs
+    /// send it for machine identities.
+    #[test]
+    fn oidc_provisioning_email_treats_a_blank_claim_as_missing() {
+        let blank = serde_json::json!({ "sub": "guid-abc", "email": "   " });
+        let absent = serde_json::json!({ "sub": "guid-abc" });
+        assert_eq!(
+            oidc_provisioning_email(&blank, "email", "guid-abc"),
+            oidc_provisioning_email(&absent, "email", "guid-abc")
+        );
+    }
+
+    /// Re-login rewrites `users.email` from this value, so it must be a pure
+    /// function of the subject — a per-login value would rewrite (or, on the
+    /// provisioning path, duplicate) the account every time.
+    #[test]
+    fn oidc_provisioning_email_is_stable_for_one_subject() {
+        let claims = serde_json::json!({ "sub": "guid-abc" });
+        assert_eq!(
+            oidc_provisioning_email(&claims, "email", "guid-abc"),
+            oidc_provisioning_email(&claims, "email", "guid-abc")
         );
     }
 
