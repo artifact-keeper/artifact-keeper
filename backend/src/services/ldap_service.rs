@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
+use crate::services::federated_email::{resolve_federated_email, LDAP_NO_EMAIL_DOMAIN};
 
 /// LDAP configuration parsed from environment
 #[derive(Clone)]
@@ -630,12 +631,26 @@ impl LdapService {
     ///
     /// Pure synchronous helper that maps LDAP attributes to an `LdapUserInfo`.
     fn extract_user_from_entry(&self, entry: ldap3::SearchEntry, username: &str) -> LdapUserInfo {
-        let email = entry
-            .attrs
-            .get(&self.config.email_attr)
-            .and_then(|v| v.first())
-            .cloned()
-            .unwrap_or_else(|| format!("{}@unknown", username));
+        // A directory entry need not carry a mail attribute, but `users.email`
+        // is `VARCHAR(255) UNIQUE NOT NULL`, so something has to be stored.
+        // Keyed on the entry's DN, never the username (#3416): the DN is what
+        // `get_or_create_user` writes to `users.external_id` and looks the
+        // account up by, so the synthetic address is unique and stable in
+        // exactly the cases the account row itself is. The previous
+        // `{username}@unknown` was keyed on the *pre-uniquification* username
+        // — two entries whose username attribute matched derived the same
+        // address and the second provisioning died on `users_email_key` — and
+        // `.unknown` is not a reserved TLD, so the address could in principle
+        // resolve. See `services::federated_email`.
+        let email = resolve_federated_email(
+            entry
+                .attrs
+                .get(&self.config.email_attr)
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            &entry.dn,
+            LDAP_NO_EMAIL_DOMAIN,
+        );
 
         let display_name = entry
             .attrs
@@ -756,11 +771,16 @@ impl LdapService {
             }
         }
 
-        // Fallback: construct basic info from the bind identity.
+        // Fallback: construct basic info from the bind identity. This arm runs
+        // exactly when the directory search has already failed, so it must not
+        // add a second failure of its own: key the synthetic address on the
+        // bind DN — the same value this fallback puts in `dn`, and so the same
+        // value `get_or_create_user` matches on — rather than the username
+        // (#3416).
         Ok(LdapUserInfo {
             dn: user_dn.to_string(),
             username: username.to_string(),
-            email: format!("{}@unknown", username),
+            email: resolve_federated_email(None, user_dn, LDAP_NO_EMAIL_DOMAIN),
             display_name: None,
             groups: Vec::new(),
         })
@@ -2099,7 +2119,50 @@ mod tests {
             bin_attrs: HashMap::new(),
         };
         let info = svc.extract_user_from_entry(entry, "nomail");
-        assert_eq!(info.email, "nomail@unknown");
+        // #3416: was `nomail@unknown` — keyed on the pre-uniquification
+        // username, under a TLD that is not reserved. Now keyed on the DN,
+        // under the RFC 2606 `.invalid` domain.
+        assert_eq!(
+            info.email,
+            resolve_federated_email(None, "uid=nomail,dc=example,dc=com", LDAP_NO_EMAIL_DOMAIN)
+        );
+        assert!(info.email.ends_with(LDAP_NO_EMAIL_DOMAIN));
+    }
+
+    /// The #3416 defect itself: two directory entries that are distinct
+    /// identities (distinct DNs, so distinct `users.external_id`) but whose
+    /// username attribute normalizes alike used to derive the SAME
+    /// `{username}@unknown` address, so the second one to log in died on the
+    /// `users_email_key` UNIQUE constraint.
+    #[tokio::test]
+    async fn test_two_dns_sharing_a_username_get_distinct_emails() {
+        use std::collections::HashMap;
+
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        let entry_for = |dn: &str| ldap3::SearchEntry {
+            dn: dn.to_string(),
+            attrs: HashMap::from([("uid".to_string(), vec!["alice".to_string()])]),
+            bin_attrs: HashMap::new(),
+        };
+
+        let a =
+            svc.extract_user_from_entry(entry_for("uid=alice,ou=eng,dc=example,dc=com"), "alice");
+        let b =
+            svc.extract_user_from_entry(entry_for("uid=alice,ou=ops,dc=example,dc=com"), "alice");
+
+        assert_eq!(a.username, b.username, "same username attribute");
+        assert_ne!(
+            a.email, b.email,
+            "two DNs are two accounts; a shared synthetic address would make \
+             the second provisioning fail on users_email_key"
+        );
+        // Re-login rewrites `users.email` from this value, so it must also be a
+        // pure function of the DN — a per-login value would rewrite the row
+        // every time, and on the provisioning path would mint a new account.
+        let a_again =
+            svc.extract_user_from_entry(entry_for("uid=alice,ou=eng,dc=example,dc=com"), "alice");
+        assert_eq!(a.email, a_again.email, "stable across logins");
     }
 
     #[tokio::test]
@@ -2456,7 +2519,12 @@ mod tests {
         let info = svc.extract_user_from_entry(entry, "fallback_user");
         assert_eq!(info.dn, "uid=empty,dc=example,dc=com");
         assert_eq!(info.username, "fallback_user");
-        assert_eq!(info.email, "fallback_user@unknown");
+        // #3416: was `fallback_user@unknown`. The address now follows the DN,
+        // not the caller-supplied username fallback.
+        assert_eq!(
+            info.email,
+            resolve_federated_email(None, "uid=empty,dc=example,dc=com", LDAP_NO_EMAIL_DOMAIN)
+        );
         assert!(info.display_name.is_none());
         assert!(info.groups.is_empty());
     }

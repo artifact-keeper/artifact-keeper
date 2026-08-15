@@ -326,18 +326,50 @@ fn extract_oci_credential(headers: &HeaderMap) -> Option<OciCredential> {
     None
 }
 
-/// Authenticate an OCI request by trying Bearer token first, then falling back
-/// to Basic credentials (username/password or username/api-token).  This mirrors
-/// the `version_check` logic so that Docker, Podman, and plain HTTP clients can
-/// all authenticate regardless of whether they went through the token exchange.
-async fn authenticate_oci(
-    db: &PgPool,
-    config: &crate::config::Config,
+/// Authenticate a `/v2` **read** request and enforce the presented API token's
+/// ACTION ceiling before anything else looks at the request (#3408).
+///
+/// Every `/v2` verb except the read path already ran an `oci_scopes_grant`
+/// check for the action it performs; the read path ran none, so a token minted
+/// with `write:artifacts` and nothing else could pull anything its owner could
+/// read. This is that missing gate, in the same shape and the same position as
+/// the six write/delete ones: immediately after authentication, so it precedes
+/// the admin bypass in [`oci_read_permitted`] — an action ceiling the principal
+/// asked for binds them regardless of `is_admin`, for the same reason
+/// [`enforce_token_repo_scope`] is documented as applying to admins. The
+/// answer is a 403 naming the missing scope (matching the write gate), never a
+/// 404: an operator whose token is too narrow needs to be told that, and a 404
+/// on `docker pull` is indistinguishable from a deleted repository.
+///
+/// This helper is the ONLY authenticator on the read path — the previous
+/// `authenticate_oci` wrapper, which discarded the scopes tuple, was deleted so
+/// no future read handler can reacquire claims without also acquiring the
+/// ceiling that governs them (#3408). `Claims.scopes` is deliberately NOT
+/// involved: threading the ceiling there would deliver it by demoting
+/// `is_admin` through `with_scope_gated_admin`, which ~34 raw handler checks
+/// also read (decided on #3322).
+///
+/// Returns `Ok(None)` for the anonymous pull token — it carries no scopes to
+/// enforce, and callers apply their own public-repository restriction — and
+/// `Err` with a ready 401 challenge when the credential does not authenticate.
+async fn authenticate_oci_read(
+    state: &SharedState,
     headers: &HeaderMap,
-) -> Result<crate::services::auth_service::Claims, ()> {
-    authenticate_oci_with_scopes(db, config, headers)
-        .await
-        .map(|(claims, _)| claims)
+    base_url: &str,
+    scope: &str,
+) -> Result<Option<crate::services::auth_service::Claims>, Response> {
+    if is_anonymous_token(headers) {
+        return Ok(None);
+    }
+    let (claims, token_scopes) =
+        match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
+            Ok(pair) => pair,
+            Err(()) => return Err(unauthorized_challenge_with_scope(base_url, Some(scope))),
+        };
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_READ) {
+        return Err(oci_forbidden_scope(OCI_SCOPE_READ));
+    }
+    Ok(Some(claims))
 }
 
 /// Authenticate an OCI request and also return the API-token scopes if the
@@ -516,11 +548,28 @@ async fn authenticate_oci_with_scopes(
     }
 }
 
+/// The API-token action scope a `/v2` **pull** requires (#3408).
+///
+/// Every other verb on this surface already names its action ceiling; the read
+/// path did not, so a token minted with `write:artifacts` and nothing else
+/// could `docker pull` anything its owner could read — a push-only CI
+/// credential was silently a read credential.
+const OCI_SCOPE_READ: &str = "read:artifacts";
+
+/// The API-token action scope a `/v2` blob or manifest **push** requires
+/// (GHSA-vvc3-h39c-mrq5).
+const OCI_SCOPE_WRITE: &str = "write:artifacts";
+
+/// The API-token action scope a `/v2` manifest **delete** requires
+/// (GHSA-vvc3-h39c-mrq5).
+const OCI_SCOPE_DELETE: &str = "delete:artifacts";
+
 /// Verify that the resolved OCI credential scopes (if any) grant the given
 /// permission. Returns `false` if an API token is present but lacks the
 /// requested scope. Defers to the single canonical wildcard-aware decision
 /// in `token_service::scopes_grant_access` (the same helper backing
-/// `AuthExtension::has_scope`): `*` and `admin` count as wildcards, and a
+/// `AuthExtension::has_scope`): `*` and `admin` count as wildcards, a bare
+/// parent (`read`) satisfies its qualified child (`read:artifacts`), and a
 /// `None` scopes set (JWT / password) passes through.
 fn oci_scopes_grant(scopes: &Option<Vec<String>>, required: &str) -> bool {
     match scopes {
@@ -4991,14 +5040,11 @@ async fn handle_head_blob(
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
     // Bind the authenticated claims (don't discard) so scanner-scoped pull
-    // tokens can be enforced per-repository below (#2093).
-    let claims = if is_anon {
-        None
-    } else {
-        match authenticate_oci(&state.db, &state.config, headers).await {
-            Ok(c) => Some(c),
-            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
-        }
+    // tokens can be enforced per-repository below (#2093). The helper also
+    // enforces the token's `read:artifacts` action ceiling (#3408).
+    let claims = match authenticate_oci_read(state, headers, base_url, &scope).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
     };
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -5189,14 +5235,11 @@ async fn handle_get_blob(
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
     // Bind the authenticated claims (don't discard) so scanner-scoped pull
-    // tokens can be enforced per-repository below (#2093).
-    let claims = if is_anon {
-        None
-    } else {
-        match authenticate_oci(&state.db, &state.config, headers).await {
-            Ok(c) => Some(c),
-            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
-        }
+    // tokens can be enforced per-repository below (#2093). The helper also
+    // enforces the token's `read:artifacts` action ceiling (#3408).
+    let claims = match authenticate_oci_read(state, headers, base_url, &scope).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
     };
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -5489,8 +5532,8 @@ async fn handle_start_upload(
         };
     // GHSA-vvc3-h39c-mrq5: a read-scoped API token must not be accepted
     // for an OCI blob upload (`docker push`). Enforce the write scope.
-    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
-        return oci_forbidden_scope("write:artifacts");
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
+        return oci_forbidden_scope(OCI_SCOPE_WRITE);
     }
 
     let repo = match resolve_repo_for_write(&state.db, image_name).await {
@@ -5911,8 +5954,8 @@ async fn handle_patch_upload(
             Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: PATCH on an upload session is a write operation.
-    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
-        return oci_forbidden_scope("write:artifacts");
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
+        return oci_forbidden_scope(OCI_SCOPE_WRITE);
     }
 
     let session_id: Uuid = match uuid_str.parse() {
@@ -6160,8 +6203,8 @@ async fn handle_cancel_upload(
             Ok(c) => c,
             Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
-    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
-        return oci_forbidden_scope("write:artifacts");
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
+        return oci_forbidden_scope(OCI_SCOPE_WRITE);
     }
 
     let session_id: Uuid = match uuid_str.parse() {
@@ -6404,8 +6447,8 @@ async fn handle_get_upload_status(
             Ok(c) => c,
             Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
-    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
-        return oci_forbidden_scope("write:artifacts");
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
+        return oci_forbidden_scope(OCI_SCOPE_WRITE);
     }
 
     let session_id: Uuid = match uuid_str.parse() {
@@ -6463,8 +6506,8 @@ async fn handle_complete_upload(
             Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: completing an upload session writes the blob.
-    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
-        return oci_forbidden_scope("write:artifacts");
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
+        return oci_forbidden_scope(OCI_SCOPE_WRITE);
     }
 
     let requested_digest = match digest_query {
@@ -7723,14 +7766,11 @@ async fn handle_head_manifest(
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
     // Bind the authenticated claims (don't discard) so scanner-scoped pull
-    // tokens can be enforced per-repository below (#2093).
-    let claims = if is_anon {
-        None
-    } else {
-        match authenticate_oci(&state.db, &state.config, headers).await {
-            Ok(c) => Some(c),
-            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
-        }
+    // tokens can be enforced per-repository below (#2093). The helper also
+    // enforces the token's `read:artifacts` action ceiling (#3408).
+    let claims = match authenticate_oci_read(state, headers, base_url, &scope).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
     };
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -8893,14 +8933,11 @@ async fn handle_get_manifest(
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
     // Bind the authenticated claims (don't discard) so scanner-scoped pull
-    // tokens can be enforced per-repository below (#2093).
-    let claims = if is_anon {
-        None
-    } else {
-        match authenticate_oci(&state.db, &state.config, headers).await {
-            Ok(c) => Some(c),
-            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
-        }
+    // tokens can be enforced per-repository below (#2093). The helper also
+    // enforces the token's `read:artifacts` action ceiling (#3408).
+    let claims = match authenticate_oci_read(state, headers, base_url, &scope).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
     };
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -9334,8 +9371,8 @@ async fn handle_put_manifest(
             Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: PUT manifest is the final step of `docker push`.
-    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
-        return oci_forbidden_scope("write:artifacts");
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_WRITE) {
+        return oci_forbidden_scope(OCI_SCOPE_WRITE);
     }
 
     let repo = match resolve_repo_for_write(&state.db, image_name).await {
@@ -9585,14 +9622,11 @@ async fn authorize_oci_repo_read(
 ) -> Result<(OciRepoInfo, Option<crate::services::auth_service::Claims>), Response> {
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    let claims = if is_anon {
-        None
-    } else {
-        match authenticate_oci(&state.db, &state.config, headers).await {
-            Ok(c) => Some(c),
-            Err(()) => return Err(unauthorized_challenge_with_scope(base_url, Some(&scope))),
-        }
-    };
+    // Enforces the token's `read:artifacts` action ceiling (#3408) for the
+    // `tags/list` and `referrers` verbs, which is where the scan-token pin
+    // omission of #3268 was found too: a shared entry point is the only way
+    // these two stay in step with the manifest/blob handlers.
+    let claims = authenticate_oci_read(state, headers, base_url, &scope).await?;
 
     let repo = resolve_repo(&state.db, image_name).await?;
 
@@ -10449,9 +10483,19 @@ async fn handle_catalog(
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let base_url = base_url.as_str();
-    let Ok(claims) = authenticate_oci(&state.db, &state.config, &headers).await else {
+    let Ok((claims, token_scopes)) =
+        authenticate_oci_with_scopes(&state.db, &state.config, &headers).await
+    else {
         return unauthorized_challenge(base_url);
     };
+    // #3408: `_catalog` is a read verb, so it takes the same action ceiling as
+    // every other pull. Gated here rather than left to the per-repository
+    // filter below, which would answer a too-narrow token with an empty
+    // listing — indistinguishable from "you may read nothing" and no help to
+    // the operator.
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_READ) {
+        return oci_forbidden_scope(OCI_SCOPE_READ);
+    }
 
     let (n, last) = match parse_pagination_params(&query) {
         Ok(v) => v,
@@ -10698,8 +10742,8 @@ async fn handle_delete_manifest(
         };
     // GHSA-vvc3-h39c-mrq5: deleting a manifest is destructive. Require the
     // delete scope on API tokens. JWT/password callers pass through.
-    if !oci_scopes_grant(&token_scopes, "delete:artifacts") {
-        return oci_forbidden_scope("delete:artifacts");
+    if !oci_scopes_grant(&token_scopes, OCI_SCOPE_DELETE) {
+        return oci_forbidden_scope(OCI_SCOPE_DELETE);
     }
 
     let repo = match resolve_repo_for_write(&state.db, image_name).await {
@@ -11774,6 +11818,51 @@ mod tests {
         // Destructive operations need the delete scope, not just write.
         let scopes = Some(vec!["write".to_string()]);
         assert!(!oci_scopes_grant(&scopes, "delete"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #3408: `read:artifacts` on the pull path.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_only_scopes_do_not_grant_read() {
+        let write_only = Some(vec![OCI_SCOPE_WRITE.to_string()]);
+        assert!(
+            !oci_scopes_grant(&write_only, OCI_SCOPE_READ),
+            "#3408: a push-only CI credential must not also be a pull credential"
+        );
+        assert!(oci_scopes_grant(&write_only, OCI_SCOPE_WRITE));
+    }
+
+    #[test]
+    fn read_scopes_grant_read() {
+        for held in [
+            vec![OCI_SCOPE_READ.to_string()],
+            vec!["*".to_string()],
+            vec!["admin".to_string()],
+            // Bare-parent satisfaction (#2989): held `read` covers
+            // `read:artifacts`. Not mintable today, but `scopes_grant_access`
+            // honours it and a JWT ceiling can carry it.
+            vec!["read".to_string()],
+            vec![OCI_SCOPE_WRITE.to_string(), OCI_SCOPE_READ.to_string()],
+        ] {
+            assert!(
+                oci_scopes_grant(&Some(held.clone()), OCI_SCOPE_READ),
+                "{held:?} must grant a pull"
+            );
+        }
+    }
+
+    #[test]
+    fn unscoped_credentials_still_grant_read() {
+        // `None` = JWT login session or password auth: no ceiling to enforce,
+        // and the compatibility promise in the upgrade note.
+        assert!(oci_scopes_grant(&None, OCI_SCOPE_READ));
+    }
+
+    #[test]
+    fn an_empty_scope_list_grants_no_read() {
+        assert!(!oci_scopes_grant(&Some(vec![]), OCI_SCOPE_READ));
     }
 
     #[test]
@@ -16424,14 +16513,14 @@ mod token_lockout_regression_tests {
     }
 
     /// Regression for #1195. The `/v2/token` exchange was reordered in #1145
-    /// so API tokens are tried first, but `authenticate_oci` (used by every
+    /// so API tokens are tried first, but `authenticate_oci_with_scopes` (used by every
     /// non-token verb: manifest GET, blob HEAD, blob PUT, catalog, etc.) had
     /// the same bug: it called `authenticate(user, api_token)` before
     /// `validate_api_token(api_token)`. Clients that skip the token exchange
     /// and send `Basic <user>:<api_token>` on every verb (curl, some CI
     /// runners, registry mirrors) bumped `failed_login_attempts` once per
     /// request and locked the account out after `account_lockout_threshold`
-    /// calls. This test exercises `authenticate_oci` directly and asserts
+    /// calls. This test exercises `authenticate_oci_with_scopes` directly and asserts
     /// the counter stays at zero across many requests.
     #[tokio::test]
     async fn authenticate_oci_verb_basic_auth_does_not_bump_failed_login_attempts() {
@@ -16464,7 +16553,7 @@ mod token_lockout_regression_tests {
             .await
             .expect("generate API token");
 
-        // Drive `authenticate_oci` directly: that is the function the bug
+        // Drive `authenticate_oci_with_scopes` directly: that is the function the bug
         // lives in, and it does not need a repository row to exercise.
         let basic_value = format!(
             "Basic {}",
@@ -16481,10 +16570,10 @@ mod token_lockout_regression_tests {
         // defaults to a low number, so even 5 calls is enough to lock out
         // pre-fix.
         for _ in 0..5 {
-            let result = authenticate_oci(&state.db, &state.config, &headers).await;
+            let result = authenticate_oci_with_scopes(&state.db, &state.config, &headers).await;
             assert!(
                 result.is_ok(),
-                "API-token Basic auth must succeed via authenticate_oci",
+                "API-token Basic auth must succeed via authenticate_oci_with_scopes",
             );
         }
 
@@ -16507,7 +16596,7 @@ mod token_lockout_regression_tests {
 
         assert_eq!(
             counter, 0,
-            "authenticate_oci with Basic <user>:<api_token> must not bump \
+            "authenticate_oci_with_scopes with Basic <user>:<api_token> must not bump \
              failed_login_attempts (got {counter} after 5 requests)"
         );
     }
@@ -33228,9 +33317,10 @@ mod oci_catalog_read_scope_tests {
         let bearer = f.bearer(f.member_id).await;
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, bearer.parse().expect("bearer header"));
-        let mut claims = authenticate_oci(&f.state.db, &f.state.config, &headers)
-            .await
-            .expect("authenticate member bearer");
+        let (mut claims, _scopes) =
+            authenticate_oci_with_scopes(&f.state.db, &f.state.config, &headers)
+                .await
+                .expect("authenticate member bearer");
 
         let unscoped = authorized_catalog_repo_ids(&f.state, &claims)
             .await
@@ -33323,5 +33413,502 @@ mod oci_catalog_read_scope_tests {
         );
         assert!(empty.is_empty(), "an empty allow-list yields an empty page");
         assert!(!more_empty);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3408: the CLASS-level gate on the `/v2` action ceiling.
+//
+// The defect was not one careless handler. `oci_scopes_grant` — the API-token
+// ACTION ceiling for a directly-presented credential — was called at seven
+// sites, and every one of them asked for `write:artifacts` or
+// `delete:artifacts`. The read path asked for nothing, so a token minted with
+// `write:artifacts` alone could `docker pull` everything its owner could read:
+// a push-only CI credential was silently a read credential.
+//
+// A test pinned to the manifest GET this PR fixes would go green while the next
+// `/v2` verb someone adds re-opens the hole, exactly as #3399 found for the
+// virtual member walks and #3331 for the action-blind repository checks. So the
+// property is enforced structurally instead, by two layers:
+//
+//   1. The compiler. `authenticate_oci`, the wrapper that returned claims and
+//      DISCARDED the scope tuple, is gone. Every `/v2` handler that
+//      authenticates now receives the ceiling alongside the identity, so a new
+//      route cannot inherit the action-blind behaviour by omission — it has to
+//      hold the scopes and decide what to do with them.
+//   2. This module. Holding them is not using them, so every production call
+//      site must also run an `oci_scopes_grant` check naming an `OCI_SCOPE_*`
+//      constant, or carry a written `OCI-SCOPE-EXEMPT` justification — the same
+//      greppable-exemption shape #3399 used for `UNFILTERED-ENFORCEMENT` and
+//      #3331 for `TENANT-GATE-ONLY`, so the judgement stays in review rather
+//      than in an allowlist that drifts.
+//
+// Needs no database and runs in the offline lib suite.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod action_scope_structural_tests {
+    /// Bytes after an `authenticate_oci_with_scopes(` call in which the
+    /// handler's action-scope check must appear. Every existing gate lands
+    /// within ~8 lines of the authenticator; this spans that comfortably while
+    /// staying far short of the next handler.
+    const SCOPE_WINDOW: usize = 900;
+
+    /// Bytes BEFORE the call in which an exemption may be justified.
+    const MARKER_WINDOW: usize = 900;
+
+    const CALL: &str = "authenticate_oci_with_scopes(";
+    const GATE: &str = "oci_scopes_grant(";
+    const SCOPE_CONST: &str = "OCI_SCOPE_";
+    const MARKER: &str = "OCI-SCOPE-EXEMPT";
+
+    /// The production call sites at the time this gate was written: six
+    /// write gates, one delete gate, `authenticate_oci_read`, and `_catalog`.
+    /// Adding routes may only raise this.
+    const MIN_PRODUCTION_SITES: usize = 9;
+
+    const SRC: &str = include_str!("oci_v2.rs");
+
+    /// Largest index `<= at` that is a UTF-8 char boundary — this file carries
+    /// em dashes, and slicing mid-codepoint would panic.
+    fn floor_boundary(at: usize) -> usize {
+        let mut at = at.min(SRC.len());
+        while at > 0 && !SRC.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    /// A real call, as opposed to the function's own definition, a doc-comment,
+    /// or a string mention of the name (this module's own text included).
+    fn is_call_site(at: usize) -> bool {
+        let line_start = SRC[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let prefix = &SRC[line_start..at];
+        !prefix.trim_start().starts_with("//") && !prefix.contains('"') && !prefix.contains("fn ")
+    }
+
+    /// Whether `at` sits in production code rather than a test module.
+    ///
+    /// Production items in this file are declared at column 0; everything
+    /// inside a `#[cfg(test)] mod ...` is indented. So a site is production iff
+    /// the nearest preceding column-0 item declaration comes AFTER the nearest
+    /// preceding column-0 `#[cfg(test)]`.
+    fn is_production_site(at: usize) -> bool {
+        let head = &SRC[..at];
+        let last_item = [
+            "\nasync fn ",
+            "\nfn ",
+            "\npub async fn ",
+            "\npub fn ",
+            "\npub(crate) async fn ",
+            "\npub(crate) fn ",
+        ]
+        .iter()
+        .filter_map(|pat| head.rfind(pat))
+        .max();
+        match (last_item, head.rfind("\n#[cfg(test)]")) {
+            (Some(item), Some(cfg_test)) => item > cfg_test,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// THE gate: every `/v2` handler that authenticates must declare the action
+    /// its verb performs.
+    #[test]
+    fn every_oci_v2_authentication_declares_its_action_scope() {
+        let mut undeclared: Vec<usize> = Vec::new();
+        let mut seen = 0usize;
+
+        let mut from = 0usize;
+        while let Some(rel) = SRC[from..].find(CALL) {
+            let at = from + rel;
+            from = at + CALL.len();
+            if !is_call_site(at) || !is_production_site(at) {
+                continue;
+            }
+            seen += 1;
+
+            let line_no = SRC[..at].bytes().filter(|b| *b == b'\n').count() + 1;
+            let after = &SRC[at..floor_boundary(at + SCOPE_WINDOW)];
+            let before = &SRC[floor_boundary(at.saturating_sub(MARKER_WINDOW))..at];
+
+            let declared = after.contains(GATE) && after.contains(SCOPE_CONST);
+            let exempt = after.contains(MARKER) || before.contains(MARKER);
+            if !declared && !exempt {
+                undeclared.push(line_no);
+            }
+        }
+
+        assert!(
+            seen >= MIN_PRODUCTION_SITES,
+            "#3408: found only {seen} production `{CALL}` call sites, expected at \
+             least {MIN_PRODUCTION_SITES} — the scan is broken, not the code, and \
+             a broken scan passes vacuously"
+        );
+        assert!(
+            undeclared.is_empty(),
+            "#3408: these `/v2` handlers authenticate a credential but never check \
+             the ACTION ceiling it carries (oci_v2.rs lines {undeclared:?}). That is \
+             the exact defect this gate exists to stop coming back: for years the \
+             read path held the token's scope list and asked it nothing, so a \
+             `write:artifacts`-only CI token could pull every image its owner could \
+             read. Add `if !oci_scopes_grant(&token_scopes, OCI_SCOPE_<ACTION>) {{ \
+             return oci_forbidden_scope(OCI_SCOPE_<ACTION>); }}` right after the \
+             authenticator — or, if the verb genuinely carries no action ceiling, \
+             write an `{MARKER}` comment at the call site saying why."
+        );
+    }
+
+    /// The scope-discarding wrapper must stay deleted. Reintroducing a helper
+    /// that hands back claims WITHOUT the ceiling restores the action-blind
+    /// read path in one line, while the gate above keeps passing — it would
+    /// find no `authenticate_oci_with_scopes` call to demand a scope check of.
+    #[test]
+    fn no_oci_authenticator_discards_the_scope_ceiling() {
+        // Built at runtime: writing the needle as one literal would put it in
+        // this very file and make the assertion permanently false.
+        let discarding_wrapper = format!("async fn {}(", "authenticate_oci");
+        assert!(
+            !SRC.contains(&discarding_wrapper),
+            "#3408: `authenticate_oci` returned the identity and threw away the \
+             action ceiling that governs it, which is how the read path ended up \
+             unable to enforce `read:artifacts` at all. `/v2` handlers must take \
+             both from `authenticate_oci_with_scopes` (reads go through \
+             `authenticate_oci_read`, which applies the read ceiling for them)."
+        );
+    }
+
+    /// The read gate must precede the admin bypass. `oci_read_permitted` lets a
+    /// global admin through unconditionally, so a ceiling checked after it would
+    /// not bind an admin-owned token — and an action ceiling the principal
+    /// themselves asked for binds them regardless of `is_admin`, exactly as
+    /// `enforce_token_repo_scope` is documented to.
+    #[test]
+    fn the_read_scope_gate_precedes_the_admin_bypass() {
+        let gate = SRC
+            .find("async fn authenticate_oci_read(")
+            .expect("authenticate_oci_read must exist");
+        let bypass = SRC
+            .find("if claims.is_admin || claims.scan_pull_repo.is_some()")
+            .expect("the oci_read_permitted admin bypass must exist");
+        let body_end = gate + SRC[gate..].find("\n}\n").expect("body must terminate");
+        let body = &SRC[gate..body_end];
+
+        assert!(
+            body.contains("OCI_SCOPE_READ"),
+            "#3408: the read authenticator must name the read scope"
+        );
+        assert!(
+            gate < bypass,
+            "#3408: `authenticate_oci_read` must run before `oci_read_permitted`'s \
+             admin bypass"
+        );
+        assert!(
+            !body.contains("is_admin"),
+            "#3408: the read ceiling must not be conditioned on `is_admin`"
+        );
+    }
+
+    /// The three scope names are the wire vocabulary `docker`/`podman` users
+    /// put in their tokens; a typo would silently widen (an unknown required
+    /// scope is simply never held, so it would DENY — but the READ constant
+    /// diverging from what token minting offers locks every scoped token out
+    /// of pulling).
+    #[test]
+    fn the_scope_constants_match_the_token_vocabulary() {
+        assert_eq!(super::OCI_SCOPE_READ, "read:artifacts");
+        assert_eq!(super::OCI_SCOPE_WRITE, "write:artifacts");
+        assert_eq!(super::OCI_SCOPE_DELETE, "delete:artifacts");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3408: the `read:artifacts` ceiling on the `/v2` read path, end to end.
+//
+// DB-backed, driven through the real OCI router with real API tokens so the
+// gate is proven where it actually runs rather than at the helper. Skips
+// cleanly with no DATABASE_URL; CI always has one.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod read_scope_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const SOME_DIGEST: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// The image path used throughout: `<repo_key>/app`.
+    const IMAGE: &str = "app";
+
+    /// Give the fixture repository one OCI tag under [`IMAGE`], so `tags/list`
+    /// has something to answer 200 with. Without it the verb answers a
+    /// spec-mandated 404 `NAME_UNKNOWN` and the positive controls below could
+    /// not tell "allowed" from "denied".
+    async fn seed_tag(fx: &tdh::Fixture) {
+        sqlx::query(
+            "INSERT INTO oci_tags \
+                 (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, $2, 'latest', $3, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(fx.repo_id)
+        .bind(IMAGE)
+        .bind(format!("sha256:{:064x}", 0x3408))
+        .execute(&fx.pool)
+        .await
+        .expect("seed OCI tag");
+    }
+
+    /// `Fixture::teardown` does not know about `oci_tags`.
+    async fn teardown(fx: &tdh::Fixture) {
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+    }
+
+    /// Mint a real API token for the fixture user carrying exactly `scopes`,
+    /// and return it in the `Authorization: Bearer` form Docker uses for
+    /// `docker login --password-stdin` with an API token.
+    async fn token_with_scopes(fx: &tdh::Fixture, scopes: &[&str]) -> String {
+        let auth = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let (token, _id) = auth
+            .generate_api_token(
+                fx.user_id,
+                &format!("scoped-3408-{}", Uuid::new_v4()),
+                scopes.iter().map(|s| s.to_string()).collect(),
+                None,
+            )
+            .await
+            .expect("mint scoped API token");
+        format!("Bearer {}", token)
+    }
+
+    /// A JWT login session — `Claims.scopes == None`, the unrestricted case the
+    /// upgrade note promises is unaffected.
+    async fn session_bearer(fx: &tdh::Fixture) -> String {
+        tdh::bearer_for(&fx.state, fx.user_id).await
+    }
+
+    async fn get(fx: &tdh::Fixture, path: String, auth: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header(AUTHORIZATION, auth)
+            .body(Body::empty())
+            .expect("build request");
+        let resp = router()
+            .with_state(fx.state.clone())
+            .oneshot(req)
+            .await
+            .expect("oneshot");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn assert_insufficient_scope(status: StatusCode, body: &serde_json::Value, what: &str) {
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{what} must answer 403, not 404: a 404 on `docker pull` is \
+             indistinguishable from a deleted repository and tells the operator \
+             nothing about their token. Body: {body}"
+        );
+        assert_eq!(body["errors"][0]["code"], "DENIED", "OCI error envelope");
+        assert!(
+            body["errors"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("read:artifacts"),
+            "the denial must name the missing scope so it is actionable: {body}"
+        );
+    }
+
+    /// THE BUG: a `write:artifacts`-only token — a push-only CI publish
+    /// credential — could pull anything its owner could read, on every read
+    /// verb. All five are asserted together because the gate is shared and a
+    /// per-verb fix is exactly what left `tags/list` behind in #3268.
+    #[tokio::test]
+    async fn write_only_token_cannot_read_on_any_v2_verb() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        seed_tag(&fx).await;
+        let auth = token_with_scopes(&fx, &["write:artifacts"]).await;
+        let key = &fx.repo_key;
+
+        for (what, path) in [
+            ("manifest GET", format!("/{key}/{IMAGE}/manifests/latest")),
+            ("blob GET", format!("/{key}/{IMAGE}/blobs/{SOME_DIGEST}")),
+            ("tags list", format!("/{key}/{IMAGE}/tags/list")),
+            (
+                "referrers",
+                format!("/{key}/{IMAGE}/referrers/{SOME_DIGEST}"),
+            ),
+            ("catalog", "/_catalog".to_string()),
+        ] {
+            let (status, body) = get(&fx, path, &auth).await;
+            assert_insufficient_scope(status, &body, what);
+        }
+
+        teardown(&fx).await;
+    }
+
+    /// HEAD carries no body, so it is asserted on the status alone — but it
+    /// must not disagree with GET, which is the #3258 lesson.
+    #[tokio::test]
+    async fn write_only_token_cannot_head_a_manifest_or_blob() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let auth = token_with_scopes(&fx, &["write:artifacts"]).await;
+        let key = &fx.repo_key;
+
+        for path in [
+            format!("/{key}/{IMAGE}/manifests/latest"),
+            format!("/{key}/{IMAGE}/blobs/{SOME_DIGEST}"),
+        ] {
+            let req = Request::builder()
+                .method(Method::HEAD)
+                .uri(path.clone())
+                .header(AUTHORIZATION, &auth)
+                .body(Body::empty())
+                .expect("build request");
+            let resp = router()
+                .with_state(fx.state.clone())
+                .oneshot(req)
+                .await
+                .expect("oneshot");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "HEAD {path} must answer exactly what GET answers"
+            );
+        }
+
+        teardown(&fx).await;
+    }
+
+    /// The positive control, without which the test above is satisfied by a
+    /// gate that refuses everything: a `read:artifacts` token still reads.
+    /// `tags/list` on the fixture repository is a real 200; the manifest GET
+    /// reaches the (absent) manifest and answers 404, proving it got past the
+    /// scope gate rather than being stopped by it.
+    #[tokio::test]
+    async fn read_scoped_token_still_reads() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        seed_tag(&fx).await;
+        let auth = token_with_scopes(&fx, &["read:artifacts"]).await;
+        let key = &fx.repo_key;
+
+        let (tags_status, _) = get(&fx, format!("/{key}/{IMAGE}/tags/list"), &auth).await;
+        assert_eq!(
+            tags_status,
+            StatusCode::OK,
+            "read-scoped tags/list must 200"
+        );
+
+        let (manifest_status, body) =
+            get(&fx, format!("/{key}/{IMAGE}/manifests/latest"), &auth).await;
+        assert_ne!(
+            manifest_status,
+            StatusCode::FORBIDDEN,
+            "a read-scoped token must reach the manifest lookup: {body}"
+        );
+
+        // The wildcards are the other shapes `scopes_grant_access` accepts;
+        // a gate that only matched the literal would lock them out of pulling.
+        // (The bare `read` parent is covered by the pure unit test — it is not
+        // mintable, since it is absent from `ALLOWED_SCOPES`.)
+        for scopes in [vec!["*"], vec!["admin"]] {
+            let wild = token_with_scopes(&fx, &scopes).await;
+            let (status, body) = get(&fx, format!("/{key}/{IMAGE}/tags/list"), &wild).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a {scopes:?} token must still pull: {body}"
+            );
+        }
+
+        teardown(&fx).await;
+    }
+
+    /// The gate must precede the admin bypass: an action ceiling the principal
+    /// asked for binds them regardless of `is_admin`, the same way
+    /// `enforce_token_repo_scope` does. Without this, the CI credential of
+    /// anyone who happens to be an admin keeps the pull capability the fix is
+    /// supposed to remove — and admins are exactly who mints publish tokens.
+    #[tokio::test]
+    async fn admin_owned_write_only_token_is_refused_too() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        seed_tag(&fx).await;
+        sqlx::query("UPDATE users SET is_admin = TRUE WHERE id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await
+            .expect("promote fixture user to admin");
+
+        let auth = token_with_scopes(&fx, &["write:artifacts"]).await;
+        let (status, body) = get(
+            &fx,
+            format!("/{}/{IMAGE}/manifests/latest", fx.repo_key),
+            &auth,
+        )
+        .await;
+        assert_insufficient_scope(status, &body, "an admin-owned write-only token");
+
+        // Positive control in the same fixture: the admin's UNSCOPED session
+        // still reads, so the assertion above is about the ceiling and not
+        // about the promotion having broken the fixture.
+        let session = session_bearer(&fx).await;
+        let (ok_status, ok_body) =
+            get(&fx, format!("/{}/{IMAGE}/tags/list", fx.repo_key), &session).await;
+        assert_eq!(
+            ok_status,
+            StatusCode::OK,
+            "an unscoped session must be unaffected: {ok_body}"
+        );
+
+        teardown(&fx).await;
+    }
+
+    /// The compatibility half of the upgrade note: a JWT login session carries
+    /// `scopes: None`, which `oci_scopes_grant` passes through. `docker login`
+    /// with a password, and every interactive session, must be untouched.
+    #[tokio::test]
+    async fn unscoped_session_is_unaffected() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        seed_tag(&fx).await;
+        let session = session_bearer(&fx).await;
+        let key = &fx.repo_key;
+
+        let (tags_status, body) = get(&fx, format!("/{key}/{IMAGE}/tags/list"), &session).await;
+        assert_eq!(tags_status, StatusCode::OK, "session tags/list: {body}");
+
+        let (manifest_status, body) =
+            get(&fx, format!("/{key}/{IMAGE}/manifests/latest"), &session).await;
+        assert_ne!(
+            manifest_status,
+            StatusCode::FORBIDDEN,
+            "an unscoped session must not be scope-gated: {body}"
+        );
+
+        teardown(&fx).await;
     }
 }

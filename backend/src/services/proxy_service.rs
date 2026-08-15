@@ -2205,12 +2205,42 @@ pub(crate) struct UpstreamClient {
     /// In-memory cache for per-repo custom user-agents. TTL: 60 s.
     /// Key: repo_id, Value: (custom_ua, cached_at)
     user_agent_cache: RwLock<HashMap<Uuid, (Option<String>, Instant)>>,
+    /// In-memory cache of per-repository egress-proxy clients (#2469, #2811).
+    /// TTL: 60 s, mirroring `user_agent_cache`.
+    ///
+    /// `None` means "this repository is on [`EgressProxyMode::Inherit`]" — the
+    /// shared `http_client` is used and no per-repo client is built. Building a
+    /// `reqwest::Client` allocates a fresh TLS configuration and connection
+    /// pool, so doing it per request would be a real regression on the
+    /// remote-download hot path.
+    ///
+    /// The TTL bounds how long a routing change takes to apply (and is the only
+    /// mechanism across replicas, exactly as for `user_agent_cache`); the
+    /// write path additionally invalidates in-process for an immediate effect.
+    /// No secret is cached in plaintext beyond what the live `reqwest::Client`
+    /// already holds internally to authenticate to the proxy.
+    ///
+    egress_client_cache: EgressClientCache,
 }
+
+/// A repository's own outbound client, plus whether it actually routes through
+/// a proxy (`Explicit`) as opposed to being pinned to direct egress (`Direct`).
+/// Only the proxied case needs the destination SSRF re-check in
+/// [`UpstreamClient::client_for`].
+type RepoEgressClient = (Client, bool);
+
+/// Cache of per-repository egress clients. A `None` value means "this
+/// repository is on `Inherit`" — the shared client is used and nothing per-repo
+/// was built.
+type EgressClientCache = RwLock<HashMap<Uuid, (Option<RepoEgressClient>, Instant)>>;
 
 const CUSTOM_USER_AGENT_KEY: &str = "custom_user_agent";
 
 /// TTL for cached custom user-agent entries.
 const USER_AGENT_CACHE_TTL_SECS: u64 = 60;
+
+/// TTL for cached per-repository egress-proxy clients.
+const EGRESS_CLIENT_CACHE_TTL_SECS: u64 = 60;
 
 /// Apply a custom User-Agent header to a request builder if one is configured.
 fn apply_custom_ua(req: reqwest::RequestBuilder, ua: Option<&str>) -> reqwest::RequestBuilder {
@@ -2230,7 +2260,84 @@ impl UpstreamClient {
             http_client,
             token_cache: RwLock::new(HashMap::new()),
             user_agent_cache: RwLock::new(HashMap::new()),
+            egress_client_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Resolve the HTTP client this repository's outbound requests must use,
+    /// honoring its per-repository egress-proxy configuration (#2469, #2811).
+    ///
+    /// Returns the shared `http_client` for repositories on
+    /// [`EgressProxyMode::Inherit`] (the default and, before this feature, the
+    /// only behaviour), so the common path allocates nothing.
+    ///
+    /// # SSRF
+    ///
+    /// `target_url` is re-validated against the upstream SSRF guard only when
+    /// the request actually goes through a proxy. This is NOT redundant with
+    /// the connect-time guard: routing through a proxy means `reqwest` never
+    /// resolves the destination host locally — it dials the proxy and hands
+    /// over the name — so the DNS guard (`ssrf_dns`) does not see the
+    /// destination and would silently stop protecting this repository. A
+    /// repository on `Direct` still resolves locally, so the guard covers it
+    /// and the extra check (which performs a blocking `getaddrinfo`) is
+    /// deliberately skipped there. See
+    /// [`egress_proxy::ensure_proxied_destination_allowed`] for the residual
+    /// DNS-rebinding gap this cannot close.
+    async fn client_for(&self, repo_id: Uuid, target_url: &str) -> Result<Client> {
+        let entry = match self.cached_egress_client(repo_id).await {
+            Some(hit) => hit,
+            None => {
+                let config =
+                    crate::services::egress_proxy::load_egress_proxy(&self.db, repo_id).await?;
+                let built = if config.overrides_default_routing() {
+                    let proxied = matches!(
+                        config.mode,
+                        crate::services::egress_proxy::EgressProxyMode::Explicit
+                    );
+                    Some((
+                        crate::services::egress_proxy::build_repo_client(&config)?,
+                        proxied,
+                    ))
+                } else {
+                    None
+                };
+                self.egress_client_cache
+                    .write()
+                    .await
+                    .insert(repo_id, (built.clone(), Instant::now()));
+                built
+            }
+        };
+
+        match entry {
+            Some((client, proxied)) => {
+                if proxied {
+                    crate::services::egress_proxy::ensure_proxied_destination_allowed(target_url)?;
+                }
+                Ok(client)
+            }
+            None => Ok(self.http_client.clone()),
+        }
+    }
+
+    /// Read the egress-client cache, returning `Some(entry)` on a live hit.
+    /// The outer `Option` is cache presence; the inner one is "per-repo client
+    /// (plus whether it is proxied) or shared client".
+    async fn cached_egress_client(&self, repo_id: Uuid) -> Option<Option<RepoEgressClient>> {
+        let cache = self.egress_client_cache.read().await;
+        let (client, cached_at) = cache.get(&repo_id)?;
+        if cached_at.elapsed() < Duration::from_secs(EGRESS_CLIENT_CACHE_TTL_SECS) {
+            return Some(client.clone());
+        }
+        None
+    }
+
+    /// Drop the cached egress client for a repository so a routing change made
+    /// through the API takes effect immediately in this process instead of
+    /// after [`EGRESS_CLIENT_CACHE_TTL_SECS`].
+    pub(crate) async fn invalidate_egress_client(&self, repo_id: Uuid) {
+        self.egress_client_cache.write().await.remove(&repo_id);
     }
 
     /// Buffered upstream fetch. Relocated verbatim from
@@ -2270,8 +2377,11 @@ impl UpstreamClient {
         )
         .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
+        // Per-repository egress proxy (#2469, #2811): the shared client unless
+        // this repo pins its own routing.
+        let client = self.client_for(repo_id, url).await?;
 
-        let mut request = self.http_client.get(url);
+        let mut request = client.get(url);
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
@@ -2297,7 +2407,7 @@ impl UpstreamClient {
             // helper itself never touches these headers; the closure owns that
             // decision so the buffered/streaming asymmetry is preserved (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
                     let req = apply_custom_ua(req, custom_ua.as_deref());
                     if let Some(accept_value) = accept {
                         req.header(ACCEPT, accept_value)
@@ -2451,8 +2561,10 @@ impl UpstreamClient {
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
+        // Per-repository egress proxy (#2469, #2811); see `client_for`.
+        let client = self.client_for(repo_id, url).await?;
 
-        let mut request = self.http_client.get(url);
+        let mut request = client.get(url);
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
@@ -2473,7 +2585,7 @@ impl UpstreamClient {
             // but adds NO `Accept` header, preserving the asymmetry with the
             // buffered path (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
                     apply_custom_ua(req, custom_ua.as_deref())
                 })
                 .await?
@@ -2519,11 +2631,17 @@ impl UpstreamClient {
     /// owned entirely by the caller's `build_request` closure: the buffered
     /// caller re-adds `Accept` on the retry, the streaming caller adds nothing.
     /// Do NOT "helpfully" add `Accept` here (#1618 S8 review).
+    ///
+    /// `client` is the caller's already-resolved outbound client (shared, or
+    /// this repository's egress-proxy client). Both the token exchange and the
+    /// retry go through it, so a repository pinned to an egress proxy cannot
+    /// leak a direct connection out of the OCI bearer flow (#2469).
     async fn exchange_bearer_then<F>(
         &self,
         response: reqwest::Response,
         url: &str,
         upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+        client: &Client,
         build_request: F,
     ) -> Result<Option<reqwest::Response>>
     where
@@ -2579,7 +2697,7 @@ impl UpstreamClient {
                 };
 
                 let token = self
-                    .obtain_bearer_token(realm, &service, &scope, &realm_auth)
+                    .obtain_bearer_token(realm, &service, &scope, &realm_auth, client)
                     .await?;
 
                 // Retry with the bearer token only. The original upstream
@@ -2590,7 +2708,7 @@ impl UpstreamClient {
                 // The caller's `build_request` closure decides whether to
                 // re-add `Accept` (buffered: yes; streaming: no) — see the
                 // method doc on the intentional asymmetry (#1618 S8).
-                let retry_request = build_request(self.http_client.get(url).bearer_auth(&token));
+                let retry_request = build_request(client.get(url).bearer_auth(&token));
 
                 let retry_diagnostic_url = redact_url_for_diagnostics(url);
                 let retry_response = retry_request.send().await.map_err(|e| {
@@ -2651,6 +2769,7 @@ impl UpstreamClient {
         service: &str,
         scope: &str,
         upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+        client: &Client,
     ) -> Result<String> {
         let cache_key = format!("{}\0{}\0{}", realm, service, scope);
 
@@ -2674,7 +2793,7 @@ impl UpstreamClient {
                 format!("{}{}{}", realm, sep, parts.join("&"))
             }
         };
-        let mut token_request = self.http_client.get(&token_url);
+        let mut token_request = client.get(&token_url);
 
         // Forward configured Basic credentials for private registries.
         if let Some(crate::services::upstream_auth::UpstreamAuthType::Basic {
@@ -2862,11 +2981,11 @@ impl UpstreamClient {
     ) -> Result<bool> {
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        // Conditional revalidation is an outbound upstream request like any
+        // other, so it must honor this repository's egress routing (#2469).
+        let client = self.client_for(repo_id, url).await?;
 
-        let mut request = self
-            .http_client
-            .head(url)
-            .header(IF_NONE_MATCH, cached_etag);
+        let mut request = client.head(url).header(IF_NONE_MATCH, cached_etag);
         if let Some(accept) = accept {
             request = request.header(ACCEPT, accept);
         }
@@ -2963,6 +3082,13 @@ pub struct ProxyService {
 }
 
 impl ProxyService {
+    /// Drop this process's cached egress client for `repo_id` so an
+    /// egress-proxy change made through the API takes effect on the next
+    /// upstream fetch instead of after the cache TTL (#2469, #2811).
+    pub async fn invalidate_egress_client(&self, repo_id: Uuid) {
+        self.upstream_client.invalidate_egress_client(repo_id).await;
+    }
+
     /// Maximum cache-key length in bytes.
     ///
     /// All major object stores cap object key length at 1024 bytes:
@@ -4691,11 +4817,12 @@ impl ProxyService {
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
 
-        let mut request = self
-            .upstream_client
-            .http_client
-            .get(url)
-            .header(IF_NONE_MATCH, etag);
+        // Conditional metadata refresh is an outbound upstream request, so it
+        // routes through this repository's egress proxy like every other
+        // (#2469).
+        let client = self.upstream_client.client_for(repo_id, url).await?;
+
+        let mut request = client.get(url).header(IF_NONE_MATCH, etag);
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
@@ -4718,7 +4845,7 @@ impl ProxyService {
             StatusCode::UNAUTHORIZED => {
                 if let Some(retry_response) = self
                     .upstream_client
-                    .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                    .exchange_bearer_then(response, url, &upstream_auth, &client, |req| {
                         req.header(IF_NONE_MATCH, etag)
                     })
                     .await?
@@ -14554,7 +14681,7 @@ mod tests {
             cache.insert(key, ("cached-bearer".to_string(), Instant::now(), 1000));
         }
         let token = client
-            .obtain_bearer_token(realm, service, scope, &None)
+            .obtain_bearer_token(realm, service, scope, &None, &client.http_client)
             .await
             .expect("cache hit must return Ok without contacting the realm");
         assert_eq!(token, "cached-bearer");
@@ -14586,7 +14713,13 @@ mod tests {
         let realm = format!("{}/token", server.uri());
 
         let token = client
-            .obtain_bearer_token(&realm, "reg.test", "repository:img:pull", &None)
+            .obtain_bearer_token(
+                &realm,
+                "reg.test",
+                "repository:img:pull",
+                &None,
+                &client.http_client,
+            )
             .await
             .expect("token exchange against a 200 token endpoint must succeed");
         assert_eq!(token, "exchanged-token");
@@ -14594,7 +14727,13 @@ mod tests {
         // The entry is now cached with the capped TTL, so a second call is a
         // cache hit (no second request is registered on the mock).
         let again = client
-            .obtain_bearer_token(&realm, "reg.test", "repository:img:pull", &None)
+            .obtain_bearer_token(
+                &realm,
+                "reg.test",
+                "repository:img:pull",
+                &None,
+                &client.http_client,
+            )
             .await
             .expect("second call must hit the cache");
         assert_eq!(again, "exchanged-token");
@@ -14704,7 +14843,7 @@ mod tests {
         });
         let realm = format!("{}/token", server.uri());
         client
-            .obtain_bearer_token(&realm, "", "", &auth)
+            .obtain_bearer_token(&realm, "", "", &auth, &client.http_client)
             .await
             .expect("credentialed token exchange must succeed");
 
@@ -14712,7 +14851,7 @@ mod tests {
         // `None`, and the token request must carry NO Authorization header.
         let anon_realm = format!("{}/token-anon", server.uri());
         client
-            .obtain_bearer_token(&anon_realm, "", "", &None)
+            .obtain_bearer_token(&anon_realm, "", "", &None, &client.http_client)
             .await
             .expect("anonymous token exchange must succeed");
 
@@ -14762,7 +14901,7 @@ mod tests {
         let realm = format!("{}/realm", server.uri());
 
         let token = client
-            .obtain_bearer_token(&realm, "", "", &None)
+            .obtain_bearer_token(&realm, "", "", &None, &client.http_client)
             .await
             .expect("access_token alias must be accepted");
         assert_eq!(token, "alias-token");
@@ -14794,7 +14933,7 @@ mod tests {
         let realm = format!("{}/token", server.uri());
 
         let err = client
-            .obtain_bearer_token(&realm, "", "", &None)
+            .obtain_bearer_token(&realm, "", "", &None, &client.http_client)
             .await
             .expect_err("a 403 from the token endpoint must surface as an error");
         assert!(
@@ -14822,7 +14961,7 @@ mod tests {
         let realm = format!("{}/token", server.uri());
 
         let err = client
-            .obtain_bearer_token(&realm, "", "", &None)
+            .obtain_bearer_token(&realm, "", "", &None, &client.http_client)
             .await
             .expect_err("a token response with neither token nor access_token must error");
         assert!(matches!(err, AppError::Storage(_)));
@@ -17378,6 +17517,113 @@ mod tests {
             uc2.get_custom_user_agent(repo_id).await.as_deref(),
             Some("Cached/3.0"),
             "within the TTL the cached value must be served after the row is gone",
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -- per-repository egress proxy client selection (#2469, #2811) ---------
+
+    /// `client_for` contract against a real database:
+    ///
+    /// * an UNCONFIGURED repository (the default, `inherit`) gets the SHARED
+    ///   client — no per-repo client is built and the destination re-check is
+    ///   not run, so the pre-existing hot path is untouched;
+    /// * a repository pinned to `direct` gets its OWN client; and
+    /// * a repository routed through an `explicit` proxy gets its own client
+    ///   AND has the destination SSRF re-check applied, so a proxied fetch
+    ///   cannot reach a target the upstream guard would refuse.
+    #[tokio::test]
+    async fn test_client_for_honors_per_repo_egress_proxy() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::egress_proxy::{
+            save_egress_proxy, EgressProxyConfig, EgressProxyMode,
+        };
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+
+        // 1. Unconfigured => the shared client.
+        let shared = Client::new();
+        let uc = UpstreamClient::new(pool.clone(), shared.clone());
+        uc.client_for(repo_id, "https://repo.maven.apache.org/maven2/")
+            .await
+            .expect("inherit must resolve");
+        assert!(
+            uc.cached_egress_client(repo_id)
+                .await
+                .expect("the lookup must have populated the cache")
+                .is_none(),
+            "an unconfigured repository must reuse the SHARED client, so the \
+             default hot path allocates no per-repo client and skips the \
+             destination re-check",
+        );
+
+        // 2. `direct` => a per-repo client is built (cache miss then hit).
+        save_egress_proxy(
+            &pool,
+            repo_id,
+            &EgressProxyConfig {
+                mode: EgressProxyMode::Direct,
+                proxy_url: None,
+                no_proxy: None,
+            },
+        )
+        .await
+        .expect("save direct");
+        let uc = UpstreamClient::new(pool.clone(), shared.clone());
+        uc.client_for(repo_id, "https://repo.maven.apache.org/maven2/")
+            .await
+            .expect("direct must resolve");
+        assert!(
+            uc.cached_egress_client(repo_id)
+                .await
+                .expect("cached")
+                .is_some(),
+            "a `direct` repository must get its own client, not the shared one",
+        );
+
+        // 3. `explicit` => proxied, and the destination re-check is enforced.
+        save_egress_proxy(
+            &pool,
+            repo_id,
+            &EgressProxyConfig {
+                mode: EgressProxyMode::Explicit,
+                proxy_url: Some("http://proxy.corp.example.com:3128".to_string()),
+                no_proxy: None,
+            },
+        )
+        .await
+        .expect("save explicit");
+        let uc = UpstreamClient::new(pool.clone(), shared.clone());
+        uc.client_for(repo_id, "https://repo.maven.apache.org/maven2/")
+            .await
+            .expect("explicit must resolve for a public destination");
+        let (_, proxied) = uc
+            .cached_egress_client(repo_id)
+            .await
+            .expect("cached")
+            .expect("per-repo client");
+        assert!(proxied, "an `explicit` repository must be marked proxied");
+
+        // The whole point of the re-check: a proxy must not become a way to
+        // reach a destination the upstream SSRF guard would otherwise refuse.
+        let err = uc
+            .client_for(repo_id, "http://169.254.169.254/latest/meta-data/")
+            .await
+            .expect_err("a proxied fetch to the metadata endpoint must be refused");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "expected a validation error, got {err:?}",
         );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")

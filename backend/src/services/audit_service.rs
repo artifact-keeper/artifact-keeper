@@ -301,6 +301,12 @@ fn audit_detail_key_is_sensitive(key: &str) -> bool {
             | "private_key"
             | "saml_response"
             | "upstream_password"
+            // A per-repository egress proxy URL may embed `user:pass@`
+            // userinfo, so the whole value is credential material (#2469).
+            // The API only ever hands out the redacted form, but an audit
+            // payload must not be able to carry the raw one either.
+            | "proxy_url"
+            | "egress_proxy_url"
     )
 }
 

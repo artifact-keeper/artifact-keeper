@@ -36,10 +36,19 @@ fn log_proxy_env() {
             .or_else(|_| std::env::var("no_proxy"))
             .ok();
         if https.is_some() || http.is_some() || all.is_some() {
+            // A proxy env value may embed `user:pass@` userinfo, which this
+            // line previously printed verbatim at INFO. Redact it — the same
+            // rule the per-repository egress proxy applies to its stored URL
+            // (#2469). Host and port survive, which is all an operator needs
+            // to confirm the value reached the process.
+            let redact = |v: &Option<String>| {
+                v.as_deref()
+                    .map(crate::services::egress_proxy::redact_proxy_url)
+            };
             tracing::info!(
-                https_proxy = ?https,
-                http_proxy = ?http,
-                all_proxy = ?all,
+                https_proxy = ?redact(&https),
+                http_proxy = ?redact(&http),
+                all_proxy = ?redact(&all),
                 no_proxy = ?no,
                 "HTTP proxy configuration detected"
             );

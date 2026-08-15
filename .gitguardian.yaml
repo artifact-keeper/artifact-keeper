@@ -1,5 +1,23 @@
 version: 2
 
+# SCOPE OF THIS FILE — read before adding entries below.
+#
+# This is the `ggshield` CLI's configuration. It is honored by local runs and
+# by the pre-commit hook. It is NOT read by the **GitGuardian GitHub App**,
+# which is what posts the "GitGuardian Security Checks" run on every pull
+# request — that scan is configured entirely in the GitGuardian dashboard
+# (Settings -> Exclusions, or by resolving/ignoring an individual incident).
+#
+# Demonstrated on PR #3417: `backend/src/services/egress_proxy.rs` matches the
+# `backend/src/services/*.rs` entry under `ignored_paths` below, and the App
+# raised a "Basic Auth String" incident on it anyway. There is no reason to
+# expect `ignored_matches` to behave differently, since the App does not read
+# this file at all.
+#
+# So: adding an entry here will NOT turn a red GitGuardian check green. To fix
+# a false positive on a PR, either resolve the incident in the dashboard or
+# change the fixture so the detector does not fire. Tracked in #3418.
+
 secret:
   # Paths to ignore (test files with intentional test credentials)
   ignored_paths:

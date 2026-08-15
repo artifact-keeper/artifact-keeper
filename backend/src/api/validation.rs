@@ -218,6 +218,26 @@ pub fn validate_outbound_sso_url(url_str: &str, label: &str) -> Result<()> {
     }
 }
 
+/// Validate an **operator-configured, trusted internal endpoint** URL
+/// (anti-SSRF) in the [`OutboundUrlContext::TrustedInternal`] trust class:
+/// RFC1918 / CGNAT / IPv6 unique-local addresses are permitted
+/// unconditionally, while cloud-metadata, loopback, link-local and
+/// unspecified addresses stay hard-blocked.
+///
+/// Added for the per-repository egress proxy (#2469 / #2811). A corporate
+/// egress proxy legitimately lives on the internal network — requiring an
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS` entry just to name it would make the feature
+/// unusable in exactly the segmented-network deployments it exists for — but
+/// the hard-blocks are what stop the proxy field from becoming an SSRF
+/// primitive (a metadata reader or a loopback port-scan oracle).
+///
+/// This must ONLY be used for values that come from operator configuration
+/// (the writer is gated on repository `admin`), never for
+/// attacker-influenceable targets, which keep using [`validate_outbound_url`].
+pub fn validate_outbound_internal_url(url_str: &str, label: &str) -> Result<()> {
+    validate_outbound_url_with(url_str, label, OutboundUrlContext::TrustedInternal)
+}
+
 /// Validate an LDAP server URL (`ldap://` or `ldaps://`) against the SSRF
 /// allowlist, reusing the same blocked-host / private-IP rules as
 /// [`validate_outbound_url`]. Split out because the shared validator
@@ -562,10 +582,35 @@ fn is_cgnat_ipv4(v4: std::net::Ipv4Addr) -> bool {
     octets[0] == 100 && (octets[1] & CGNAT_SECOND_OCTET_MASK) == CGNAT_SECOND_OCTET_PREFIX
 }
 
+/// IPv6 cloud-metadata endpoints that must be unreachable in EVERY context,
+/// including [`OutboundUrlContext::TrustedInternal`].
+///
+/// The IPv4 equivalents live in [`CLOUD_METADATA_IPS`] / [`is_hard_blocked_ipv4`].
+/// The IPv6 case needs its own hard block because AWS's IMDS IPv6 address sits
+/// inside the unique-local range `fc00::/7`, which `TrustedInternal` permits
+/// unconditionally (it is the IPv6 equivalent of RFC1918, and internal services
+/// legitimately live there). Without this, an operator-configured endpoint —
+/// the scanner adapter (#2389) or a per-repository egress proxy (#2469) —
+/// could be pointed at the metadata service over IPv6 even though the IPv4
+/// form is refused.
+const CLOUD_METADATA_IPS_V6: &[[u16; 8]] = &[
+    // AWS EC2 IMDS over IPv6: fd00:ec2::254
+    [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254],
+];
+
+/// True for an IPv6 address that is hard-blocked regardless of context or
+/// operator allowlist (cloud metadata). Mirrors [`is_hard_blocked_ipv4`].
+fn is_hard_blocked_ipv6(v6: std::net::Ipv6Addr) -> bool {
+    CLOUD_METADATA_IPS_V6.contains(&v6.segments())
+}
+
 fn is_blocked_ipv6(v6: std::net::Ipv6Addr, ctx: OutboundUrlContext) -> bool {
     // Evaluate IPv6 own properties first so `::1` is caught as IPv6
     // loopback before the IPv4-alias fallthrough re-interprets it.
     if v6.is_loopback() || v6.is_unspecified() {
+        return true;
+    }
+    if is_hard_blocked_ipv6(v6) {
         return true;
     }
     let segs = v6.segments();
