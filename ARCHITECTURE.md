@@ -202,7 +202,13 @@ is almost always a stale cache.
 Migrations live in `backend/migrations/` as numbered SQL files
 (`001_users.sql`, `002_roles.sql`, and so on) and are embedded with
 `sqlx::migrate!`. They run automatically at startup on a dedicated connection
-with raised statement and lock timeouts, unless `SKIP_MIGRATIONS=true`. The
+with raised statement and lock timeouts, unless `SKIP_MIGRATIONS=true`. That
+flag is also the supported **rollback** mechanism: an older binary refuses to
+start against a newer database because `sqlx` validates the applied ledger
+against the versions it embeds, and `SKIP_MIGRATIONS=true` takes a branch that
+never builds the `Migrator` at all. See
+[docs/operations/rollback.md](docs/operations/rollback.md) for the procedure,
+why it is safe, and the boundary condition where it stops holding. The
 discipline is strict:
 
 - **Append only.** Never edit or renumber a migration that has shipped. SQLx
