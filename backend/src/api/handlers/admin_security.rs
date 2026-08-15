@@ -254,11 +254,79 @@ pub struct BlastDownloader {
     pub ip_addresses: Vec<String>,
 }
 
+/// Coverage token: proxy-cached content WAS searched for this target.
+const PROXY_COVERAGE_INCLUDED: &str = "included";
+/// Coverage token: the target is an artifact id, which proxy-cached content
+/// structurally cannot have (#1278/#1280), so there is nothing to search.
+const PROXY_COVERAGE_NOT_APPLICABLE: &str = "not_applicable";
+
+/// Exposure through proxy-cached content, reported alongside the hosted
+/// numbers (#3397).
+///
+/// `summary` above is computed over `scan_findings` joined to `artifacts` and
+/// `download_statistics` — all three artifact-keyed. Proxy-cached bytes have no
+/// `artifacts` row by design, and their downloads land in
+/// `proxy_download_statistics` keyed by `proxy_cache_id`, so the hosted numbers
+/// were not merely incomplete for proxy content: they were structurally
+/// incapable of being non-zero for it. A confident zero to a security question
+/// is worse than an error, so this block exists even when it is all zeros — an
+/// operator can then see that proxy content WAS searched.
+///
+/// Attribution runs through `proxy_scan_findings` (#3395). Before that table
+/// existed there was no per-CVE detail for proxy content to attribute a
+/// download to, which is why #3397 depended on #3395.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyBlastRadius {
+    /// `included` | `not_applicable` — see the constants. Never omit this:
+    /// it is what tells a reader whether a zero below means "searched, nothing
+    /// found" or "not searched".
+    pub coverage: String,
+    /// Distinct proxy-cached digests carrying this CVE.
+    pub affected_digest_count: i64,
+    /// Repositories whose proxy cache holds one of those digests.
+    pub affected_repo_count: i64,
+    /// Proxy download events of affected digests in the window.
+    pub download_count: i64,
+    /// Distinct authenticated users who pulled one.
+    pub downloader_user_count: i64,
+    /// Whether any such pull was anonymous.
+    pub anonymous_download_present: bool,
+}
+
+impl ProxyBlastRadius {
+    /// The all-zero report for a target proxy content cannot have.
+    fn not_applicable() -> Self {
+        Self {
+            coverage: PROXY_COVERAGE_NOT_APPLICABLE.to_string(),
+            affected_digest_count: 0,
+            affected_repo_count: 0,
+            download_count: 0,
+            downloader_user_count: 0,
+            anonymous_download_present: false,
+        }
+    }
+}
+
+/// Internal row shape for the proxy aggregate; `bool_or` is NULL over an empty
+/// set, exactly as in [`SummaryRow`].
+#[derive(sqlx::FromRow)]
+struct ProxySummaryRow {
+    affected_digest_count: i64,
+    affected_repo_count: i64,
+    download_count: i64,
+    downloader_user_count: i64,
+    anonymous_download_present: Option<bool>,
+}
+
 /// Full blast-radius report for a CVE or artifact.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BlastRadiusResponse {
     pub target: BlastRadiusTargetInfo,
+    /// **Hosted content only.** Every field here is artifact-keyed; see
+    /// [`ProxyBlastRadius`] for proxy-cached exposure.
     pub summary: BlastRadiusSummary,
+    /// Exposure through proxy-cached content (#3397).
+    pub proxy_exposure: ProxyBlastRadius,
     /// Every repository containing an affected artifact (downloaded or not),
     /// bounded to [`MAX_AFFECTED_REPOS`] entries.
     pub affected_repos: Vec<AffectedRepo>,
@@ -285,6 +353,80 @@ fn require_admin(auth: &AuthExtension) -> Result<()> {
 
 fn db_err(e: sqlx::Error) -> AppError {
     AppError::Database(e.to_string())
+}
+
+/// Exposure through proxy-cached content for one target (#3397).
+///
+/// The chain is `proxy_scan_findings` (digest -> CVE, #3395) ->
+/// `proxy_cache_artifacts` (digest -> which repository cached it at which path)
+/// -> `proxy_download_statistics` (who pulled that catalog row). Deliberately
+/// NOT folded into the hosted aggregate: the two have no join key in common
+/// (`artifacts.id` vs `checksum_sha256`), and merging their counts would make
+/// `affected_artifact_count` mean two different things at once.
+///
+/// `affected_digest_count` and `affected_repo_count` are computed WITHOUT the
+/// download window: a digest sitting in a cache is exposure whether or not
+/// anyone pulled it inside the window, matching how `affected_repos` is
+/// reported for hosted content.
+async fn proxy_blast_radius(
+    db: &sqlx::PgPool,
+    target: &BlastRadiusTarget,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<ProxyBlastRadius> {
+    // An artifact id can never name proxy-cached content, so there is nothing
+    // to search — reported as `not_applicable` rather than as a zero that
+    // would read as "searched, nothing found".
+    let BlastRadiusTarget::Cve(cve_id) = target else {
+        return Ok(ProxyBlastRadius::not_applicable());
+    };
+
+    let mut builder = sqlx::QueryBuilder::new(
+        "SELECT COUNT(DISTINCT pca.checksum_sha256) AS affected_digest_count, \
+         COUNT(DISTINCT pca.repository_id) AS affected_repo_count, \
+         COUNT(pd.id) AS download_count, \
+         COUNT(DISTINCT pd.user_id) AS downloader_user_count, \
+         bool_or(pd.id IS NOT NULL AND pd.user_id IS NULL) \
+             AS anonymous_download_present \
+         FROM (SELECT DISTINCT checksum_sha256 FROM proxy_scan_findings WHERE cve_id = ",
+    );
+    builder.push_bind(cve_id.as_str());
+    builder.push(
+        ") pf \
+         JOIN proxy_cache_artifacts pca ON pca.checksum_sha256 = pf.checksum_sha256 \
+         LEFT JOIN proxy_download_statistics pd ON pd.proxy_cache_id = pca.id",
+    );
+    // The window bounds the DOWNLOAD side only, so it must live on the LEFT
+    // JOIN rather than in a WHERE clause — a WHERE on the nullable side of an
+    // outer join would silently drop every cached-but-never-pulled digest and
+    // undercount exposure.
+    //
+    // The `pd.id IS NOT NULL` guard on the anonymous flag above is the price of
+    // that choice: on an unmatched outer-join row every `pd` column is NULL, so
+    // a bare `bool_or(pd.user_id IS NULL)` reports "an anonymous user pulled
+    // this" for a digest nobody pulled at all. The counts are immune (`COUNT`
+    // skips NULLs); only the boolean needed pinning down.
+    if let Some(from) = from {
+        builder.push(" AND pd.downloaded_at >= ").push_bind(from);
+    }
+    if let Some(to) = to {
+        builder.push(" AND pd.downloaded_at <= ").push_bind(to);
+    }
+
+    let row: ProxySummaryRow = builder
+        .build_query_as()
+        .fetch_one(db)
+        .await
+        .map_err(db_err)?;
+
+    Ok(ProxyBlastRadius {
+        coverage: PROXY_COVERAGE_INCLUDED.to_string(),
+        affected_digest_count: row.affected_digest_count,
+        affected_repo_count: row.affected_repo_count,
+        download_count: row.download_count,
+        downloader_user_count: row.downloader_user_count,
+        anonymous_download_present: row.anonymous_download_present.unwrap_or(false),
+    })
 }
 
 /// Shared blast-radius core for the CVE and artifact endpoints.
@@ -391,6 +533,8 @@ async fn blast_radius_core(
         })
         .collect();
 
+    let proxy_exposure = proxy_blast_radius(db, &target, from, to).await?;
+
     Ok(BlastRadiusResponse {
         target: BlastRadiusTargetInfo {
             kind: target.kind().to_string(),
@@ -404,6 +548,7 @@ async fn blast_radius_core(
             distinct_ip_count: summary.distinct_ip_count,
             total_download_count: summary.total_download_count,
         },
+        proxy_exposure,
         affected_repos,
         downloaders,
         total_downloaders,
@@ -907,6 +1052,7 @@ pub async fn artifact_accessible_users(
         BlastRadiusResponse,
         BlastRadiusTargetInfo,
         BlastRadiusSummary,
+        ProxyBlastRadius,
         AffectedRepo,
         BlastDownloader,
         AccessibleUsersResponse,
@@ -1111,6 +1257,162 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed download");
+    }
+
+    // -----------------------------------------------------------------------
+    // Proxy blast radius (#3397)
+    // -----------------------------------------------------------------------
+
+    /// Cache one proxy path at `digest` in `repo_id`, returning the catalog id.
+    async fn seed_proxy_cache_row(pool: &sqlx::PgPool, repo_id: Uuid, digest: &str) -> Uuid {
+        let path = format!("simple/blast/{}.whl", Uuid::new_v4());
+        sqlx::query_scalar(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, \
+             metadata_key, size_bytes, checksum_sha256) \
+             VALUES ($1, $2, $3, $4, 16, $5) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .bind(format!("proxy-cache/{repo_id}/{path}/__content__"))
+        .bind(format!("proxy-cache/{repo_id}/{path}/__cache_meta__.json"))
+        .bind(digest)
+        .fetch_one(pool)
+        .await
+        .expect("seed proxy_cache_artifacts")
+    }
+
+    /// The bug #3397 names, reproduced and then fixed.
+    ///
+    /// A CVE that exists ONLY in proxy-cached content produces an all-zero
+    /// HOSTED summary — correctly, because no `artifacts` row carries it and
+    /// none ever can (#1278/#1280). Before this change that zero was the whole
+    /// answer, and it reads as "nobody is affected". The proxy block must be
+    /// non-zero for the same target, which is what makes the hosted zero safe
+    /// to display.
+    #[tokio::test]
+    async fn test_blast_radius_reports_proxy_exposure_when_hosted_is_zero_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let cve = format!("CVE-3397-{}", &Uuid::new_v4().to_string()[..8]);
+        let digest = format!("{:0>64}", Uuid::new_v4().simple());
+        let (user1, _n1) = tdh::create_user(&pool).await;
+        let (repo_a, _ka, dir_a) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (repo_b, _kb, dir_b) = tdh::create_repo(&pool, "remote", "pypi").await;
+
+        // The same bytes cached by two tenants; the CVE is recorded once,
+        // against the digest.
+        let cache_a = seed_proxy_cache_row(&pool, repo_a, &digest).await;
+        let _cache_b = seed_proxy_cache_row(&pool, repo_b, &digest).await;
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_findings(
+                &digest,
+                "grype",
+                &[crate::models::security::ProxyFinding {
+                    cve_id: cve.clone(),
+                    severity: "critical".to_string(),
+                    package_name: Some("werkzeug".to_string()),
+                    package_version: Some("0.15.0".to_string()),
+                    fixed_version: Some("0.15.3".to_string()),
+                    title: None,
+                }],
+            )
+            .await
+            .expect("record proxy finding");
+        for user in [Some(user1), None] {
+            sqlx::query(
+                "INSERT INTO proxy_download_statistics (proxy_cache_id, user_id, \
+                 ip_address, user_agent) VALUES ($1, $2, '203.0.113.9', 'blast/1.0')",
+            )
+            .bind(cache_a)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .expect("seed proxy download");
+        }
+
+        let resp = blast_radius_core(
+            &pool,
+            BlastRadiusTarget::Cve(cve.clone()),
+            &BlastRadiusQuery::default(),
+        )
+        .await
+        .expect("cve blast radius");
+
+        // The hosted half is structurally zero — that is correct, and is
+        // exactly why it must not be the whole answer.
+        assert_eq!(resp.summary.affected_artifact_count, 0);
+        assert_eq!(resp.summary.total_download_count, 0);
+
+        assert_eq!(resp.proxy_exposure.coverage, PROXY_COVERAGE_INCLUDED);
+        assert_eq!(resp.proxy_exposure.affected_digest_count, 1);
+        assert_eq!(
+            resp.proxy_exposure.affected_repo_count, 2,
+            "both tenants caching the digest are exposed"
+        );
+        assert_eq!(resp.proxy_exposure.download_count, 2);
+        assert_eq!(resp.proxy_exposure.downloader_user_count, 1);
+        assert!(resp.proxy_exposure.anonymous_download_present);
+
+        // A future-only window zeroes the DOWNLOAD side but must not drop the
+        // cached-but-unpulled digests: the window lives on the LEFT JOIN, and
+        // moving it into a WHERE would silently undercount exposure to zero.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let windowed = blast_radius_core(
+            &pool,
+            BlastRadiusTarget::Cve(cve.clone()),
+            &BlastRadiusQuery {
+                from: Some(future),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("windowed");
+        assert_eq!(windowed.proxy_exposure.download_count, 0);
+        // Zero downloads must not report an anonymous one. On an unmatched
+        // LEFT JOIN row every `pd` column is NULL, so a bare
+        // `bool_or(pd.user_id IS NULL)` claims an anonymous pull of a digest
+        // nobody pulled — a fabricated exposure event in a security report.
+        assert!(!windowed.proxy_exposure.anonymous_download_present);
+        assert_eq!(
+            windowed.proxy_exposure.affected_digest_count, 1,
+            "a cached digest is exposure whether or not it was pulled in the window"
+        );
+
+        // An artifact target names hosted content by construction, so the
+        // proxy block reports `not_applicable` rather than a zero that would
+        // read as "searched, nothing found".
+        let hosted_only = blast_radius_core(
+            &pool,
+            BlastRadiusTarget::Artifact(Uuid::new_v4()),
+            &BlastRadiusQuery::default(),
+        )
+        .await
+        .expect("artifact blast radius");
+        assert_eq!(
+            hosted_only.proxy_exposure.coverage,
+            PROXY_COVERAGE_NOT_APPLICABLE
+        );
+        assert_eq!(hosted_only.proxy_exposure.affected_digest_count, 0);
+
+        // An unknown CVE is `included` with zeros: searched, nothing found.
+        let unknown = blast_radius_core(
+            &pool,
+            BlastRadiusTarget::Cve("CVE-0000-00000".to_string()),
+            &BlastRadiusQuery::default(),
+        )
+        .await
+        .expect("unknown cve");
+        assert_eq!(unknown.proxy_exposure.coverage, PROXY_COVERAGE_INCLUDED);
+        assert_eq!(unknown.proxy_exposure.affected_digest_count, 0);
+
+        let _ = sqlx::query("DELETE FROM proxy_scan_findings WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, repo_a, &dir_a).await;
+        tdh::cleanup_member_repo(&pool, repo_b, &dir_b).await;
+        tdh::cleanup(&pool, repo_a, user1).await;
     }
 
     #[tokio::test]
