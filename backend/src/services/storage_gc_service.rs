@@ -179,6 +179,11 @@ pub(crate) const MAVEN_SIDECAR_SUFFIXES: [&str; 4] = [".md5", ".sha1", ".sha256"
 /// Upper bound on flat-object attribution rows examined per GC pass.
 const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 
+/// TTL for the [`StorageGcService::run_scheduled_tick`] singleton lease.
+/// Matches the GC's own default hourly cadence so a crashed holder's lease
+/// lapses in time for the next natural tick rather than blocking it.
+const STORAGE_GC_LEASE_TTL_SECS: f64 = 3600.0;
+
 /// SQL fragment expressing the orphaned row-less Maven flat-object predicate
 /// over an outer `maven_flat_object_owner` row aliased `o` (#2668).
 ///
@@ -543,6 +548,71 @@ impl StorageGcService {
     /// resurrecting the rows before they are hard-deleted.
     pub async fn run_gc(&self, dry_run: bool) -> Result<StorageGcResult> {
         self.run_gc_inner(None, dry_run).await
+    }
+
+    /// One scheduled storage-GC tick, gated by the cluster-wide `job_name`
+    /// singleton lease (`cluster_work::SchedulerLease`). Every replica's
+    /// scheduler independently computes the same cron occurrence, so without
+    /// this gate every replica ran `run_gc` at the same instant — confirmed
+    /// in production via `pg_stat_activity`: multiple identical copies of the
+    /// Maven flat-object orphan scan running concurrently for 20+ minutes,
+    /// sharing one `xact_start` (artifact-keeper#3384).
+    ///
+    /// Returns `true` if this replica won the lease and ran GC, `false` if
+    /// another replica currently holds it (a no-op tick).
+    ///
+    /// Only the scheduler's automatic tick should call this — the on-demand
+    /// admin/per-repo GC endpoints (`storage_gc.rs`) call
+    /// `run_gc`/`run_gc_for_repository` directly and must keep working even
+    /// while a scheduled tick holds this lease.
+    pub(crate) async fn run_scheduled_tick(&self, job_name: &str) -> bool {
+        let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+            &self.db,
+            job_name,
+            STORAGE_GC_LEASE_TTL_SECS,
+        )
+        .await
+        else {
+            tracing::debug!("Another replica owns the storage GC lease; skipping tick");
+            return false;
+        };
+        // A pass can outlive the fixed TTL on a large registry; keep the
+        // lease alive for as long as this one runs.
+        let lease_renewal = lease.spawn_renewal(self.db.clone(), STORAGE_GC_LEASE_TTL_SECS);
+
+        tracing::info!("Running scheduled storage garbage collection");
+
+        match self.run_gc(false).await {
+            Ok(result) => {
+                if result.storage_keys_deleted > 0 {
+                    tracing::info!(
+                        "Storage GC: deleted {} keys, removed {} artifacts, freed {} bytes",
+                        result.storage_keys_deleted,
+                        result.artifacts_removed,
+                        result.bytes_freed
+                    );
+                    crate::services::metrics_service::record_cleanup(
+                        "storage_gc",
+                        result.artifacts_removed as u64,
+                    );
+                }
+                if !result.errors.is_empty() {
+                    tracing::warn!("Storage GC completed with {} errors", result.errors.len());
+                    // Surface the actual messages, not just the count, so the
+                    // orchestration-layer log is actionable.
+                    for err in &result.errors {
+                        tracing::warn!(gc_error = %err, "Storage GC error");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Storage garbage collection failed: {}", e);
+            }
+        }
+
+        drop(lease_renewal);
+        lease.release(&self.db).await;
+        true
     }
 
     /// Repository-scoped variant of [`Self::run_gc`] (web #708).
@@ -3925,6 +3995,62 @@ mod tests {
             !key_present(&other_repo),
             "scan scoped to a different repository must not include the key"
         );
+    }
+
+    /// [`StorageGcService::run_scheduled_tick`] must skip (return `false`)
+    /// while another replica holds the named lease, and must acquire, run,
+    /// and release it (returning `true`) once that lease is free — the
+    /// concurrency guard added for artifact-keeper#3384.
+    #[tokio::test]
+    async fn run_scheduled_tick_respects_the_singleton_lease() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::cluster_work;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let job = format!("test-storage-gc-{}", Uuid::new_v4());
+
+        // Simulate another replica already holding the lease for this tick.
+        let other_replica_lease =
+            cluster_work::try_acquire_scheduler_lease(&fixture.pool, &job, "other-replica", 60.0)
+                .await
+                .expect("query ok")
+                .expect("first claim wins");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        assert!(
+            !service.run_scheduled_tick(&job).await,
+            "tick must skip while another replica holds the lease"
+        );
+
+        // Free the lease; the next tick must win it, run, and release it.
+        other_replica_lease.release(&fixture.pool).await;
+        assert!(
+            service.run_scheduled_tick(&job).await,
+            "tick must run once the lease is free"
+        );
+
+        let held_after = cluster_work::try_acquire_scheduler_lease(
+            &fixture.pool,
+            &job,
+            "post-tick-checker",
+            60.0,
+        )
+        .await
+        .expect("query ok");
+        assert!(
+            held_after.is_some(),
+            "a completed tick must release the lease, not hold it forever"
+        );
+
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(&job)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
     }
 
     /// Reference kind for [`insert_referenced_soft_deleted_artifact`].
