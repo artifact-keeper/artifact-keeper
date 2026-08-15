@@ -116,8 +116,21 @@ pub(crate) async fn require_repo_write_access(
     if repo.is_public || auth.is_admin {
         return Ok(());
     }
+    // TENANT-GATE-ONLY (#3331). Deliberately action-blind: this is the tenant
+    // half of the write/delete decision, and the ACTION half is layered
+    // separately and canonically by `require_repo_action(.., "write"/"delete",
+    // ..)` at the artifact upload and delete handlers below (the #2603 G1
+    // idiom — "the tenant gate above admits any grantee (incl. a write-only or
+    // read-only one), collapsing write/delete"). Naming `read` here would be
+    // actively wrong: it would refuse a legitimate publish-only identity, and
+    // naming `write` would silently duplicate — and eventually drift from —
+    // the real per-action gate.
     if repo_service
-        .user_can_access_repo(repo.id, auth.user_id)
+        .user_can_access_repo(
+            repo.id,
+            auth.user_id,
+            crate::services::repository_service::RepoAccess::TenantOnly,
+        )
         .await?
     {
         Ok(())
@@ -366,15 +379,45 @@ pub(crate) fn member_passes_token_scope(
     }
 }
 
-/// Ensure a repository is visible to the current user.
+/// Ensure a repository is READABLE by the current user.
 ///
 /// Public repos are visible to everyone. Private repos require authentication
-/// AND per-repo authorization: the caller must be an admin or hold a role
-/// assignment scoped to the repository (direct or global). The token-scope
-/// check (`can_access_repo`) is also enforced for repository-scoped API tokens.
+/// AND per-repo authorization: the caller must be an admin, or hold a grant on
+/// the repository (direct or global) that carries the `read` action. The
+/// token-scope check (`can_access_repo`) is also enforced for
+/// repository-scoped API tokens.
 ///
 /// Denials on private repos return `NotFound` (not `Forbidden`) to avoid
 /// leaking the existence of repositories the caller may not see.
+///
+/// # Why the action is `read` and is fixed here (#3331)
+///
+/// This helper used to stop at the tenant gate — any grant passed — which made
+/// it strictly looser than the OCI `/v2` and native-format read gates on the
+/// same repositories. Every production call site was classified before the
+/// action was chosen, and all of them read:
+///
+/// * `repositories.rs` — `get_repository`, `get_repository_storage`,
+///   `get_repository_storage_tree`, `list_artifacts`, `get_artifact_metadata`,
+///   `list_artifact_versions`, `download_artifact`, `list_virtual_members`,
+///   `test_upstream`, and `require_repo_id_visible` (the by-id wrapper, itself
+///   used by curation, promotion-rule, approval, signing and quarantine reads);
+/// * `approval.rs`, `curation.rs`, `promotion_rules.rs`, `security.rs`,
+///   `signing.rs`, `quality_gates.rs`, `repository_labels.rs`, `wasm_proxy.rs`
+///   — all `GET`s, plus three `POST`s that are read-only in effect
+///   (`request_approval` probes the SOURCE repo, `evaluate_rule` enumerates the
+///   source repo, `check_license_compliance` reads the repo's policy);
+/// * `require_member_attachable` — attaching a member to a virtual is a
+///   mutation, but the capability it confers (and the #3177 escalation it
+///   closes) is READING the member back out through the virtual, so `read` is
+///   the right bar. Whether re-export should additionally require write or
+///   ownership on the member remains the open product question in #3177; this
+///   does not answer it.
+///
+/// Mutating handlers do NOT come through here — they use
+/// `require_repo_write_access` (tenant) plus `require_repo_action` (action).
+/// That split is what lets this gate hold one constant action instead of
+/// threading an argument through 23 call sites that would all pass `read`.
 ///
 /// Exposed as `pub(crate)` so leaky-read sub-resource handlers in sibling
 /// modules (labels list, security read) can reuse the canonical visibility gate.
@@ -394,10 +437,23 @@ pub(crate) async fn require_visible(
                 return Err(not_found());
             }
             // Per-repo authorization: admins bypass; everyone else needs a
-            // role assignment scoped to this repo (or a global assignment).
+            // grant on this repo (or a global assignment) that carries `read`.
             if a.is_admin
                 || repo_service
-                    .user_can_access_repo(repo.id, a.user_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        a.user_id,
+                        // CONTENT (#3331). Every production caller of
+                        // `require_visible` is a read of the repository's
+                        // contents, metadata or configuration — see the
+                        // classification in this function's doc comment — so
+                        // the action is fixed here rather than threaded through
+                        // 23 call sites that would all pass the same value. A
+                        // caller that wants to MUTATE uses
+                        // `require_repo_write_access` + `require_repo_action`
+                        // instead; that split is what keeps this one constant.
+                        crate::services::repository_service::RepoAccess::READ,
+                    )
                     .await?
             {
                 Ok(())
@@ -5436,6 +5492,13 @@ fn build_catalog_artifact_response(
 /// every sidecar before slicing. `per_page` is treated as at least 1 so a
 /// `per_page == 0` query cannot wedge pagination. Pure / unit-testable
 /// without a storage backend.
+///
+/// Cached upstream index responses are dropped first, through the same
+/// [`proxy_catalog::is_cached_index_path`] predicate the catalog-backed
+/// listing pushes into SQL. This legacy path only runs for a cold pre-catalog
+/// cache, but it renders the same listing, so filtering only the catalog path
+/// would leave the empty-name rows visible on exactly the repositories nobody
+/// has touched since migration 159.
 fn filter_and_paginate_paths(
     paths: Vec<String>,
     path_prefix: Option<&str>,
@@ -5450,6 +5513,7 @@ fn filter_and_paginate_paths(
 
     let mut matched: Vec<String> = paths
         .into_iter()
+        .filter(|p| !crate::services::proxy_catalog::is_cached_index_path(p))
         .filter(|p| match path_prefix {
             Some(prefix) if !prefix.is_empty() => p.starts_with(prefix),
             _ => true,
@@ -11666,6 +11730,31 @@ mod tests {
         // Sorted by path.
         assert_eq!(page[0], "is-odd/-/is-odd-3.0.1.tgz");
         assert_eq!(page[1], "lodash/-/lodash-4.17.21.tgz");
+    }
+
+    /// The legacy pre-catalog listing path must drop cached index responses
+    /// on the same terms as the catalog-backed one, or a cold cache still
+    /// renders the empty-name rows. `total` must drop with them, since it
+    /// drives the pager.
+    #[test]
+    fn test_filter_and_paginate_paths_drops_cached_index_responses() {
+        let input = paths(&[
+            "simple/idna/",
+            "simple/idna/idna-3.18-py3-none-any.whl",
+            "simple/pyyaml/",
+            "simple/pyyaml/index.v1+json",
+            // Near-miss: a real package named `index`, which must survive.
+            "simple/index/index-1.0.tar.gz",
+        ]);
+        let (page, total) = filter_and_paginate_paths(input, None, None, 1, 20);
+        assert_eq!(total, 2, "index responses are not artifacts");
+        assert_eq!(
+            page,
+            vec![
+                "simple/idna/idna-3.18-py3-none-any.whl",
+                "simple/index/index-1.0.tar.gz",
+            ]
+        );
     }
 
     #[test]

@@ -492,7 +492,20 @@ pub(crate) async fn require_promotion_tenant_access(
     target: &crate::models::repository::Repository,
 ) -> Result<()> {
     for repo in [source, target] {
-        let has_grant = repo_service.user_can_access_repo(repo.id, user_id).await?;
+        // TENANT-GATE-ONLY (#3331). The question here is literally tenant
+        // OWNERSHIP — "is this repository in a tenant this principal holds" —
+        // asked of the source and target of a promotion, and deliberately
+        // enforced independently of the `is_admin` capability flag (see this
+        // function's doc comment). It is not a capability check, so it carries
+        // no action: the promote capability itself is gated separately by the
+        // admin / `promote:artifacts` scope check above.
+        let has_grant = repo_service
+            .user_can_access_repo(
+                repo.id,
+                user_id,
+                crate::services::repository_service::RepoAccess::TenantOnly,
+            )
+            .await?;
         if !promotion_tenant_access_allowed(repo.is_public, has_grant) {
             return Err(AppError::Authorization(format!(
                 "You are not authorized to promote into the '{}' repository's tenant",
