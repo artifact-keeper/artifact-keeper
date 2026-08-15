@@ -331,18 +331,25 @@ fn build_index_response(
 
 async fn index_yaml(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
 
     // Virtual repository: merge index.yaml from all member repositories
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): index.yaml is the discovery
+        // half of the chart download — names, versions, digests and the URLs
+        // the client then fetches — so a member this caller may not read
+        // directly must not contribute entries to it.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut all_charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
 
         // Collect index.yaml from remote members and parse chart entries
         let remote_indexes = proxy_helpers::collect_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             "index.yaml",

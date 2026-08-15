@@ -2726,8 +2726,16 @@ where
 /// Virtual verbatim forward could disagree with the Remote arm of the same
 /// endpoint (a `mix` client got hex's signed protobuf labelled
 /// `application/json`).
+///
+/// `auth` is the CALLER (#3323), and is REQUIRED rather than optional-by-
+/// omission on purpose: this primitive resolves content, the route middleware
+/// authorizes only the URL repository (a public Virtual parent admits an
+/// anonymous caller), and every member is a separate repository with its own
+/// ACL. Adding the parameter is what forces each of the callers to make the
+/// decision explicitly instead of silently inheriting an unfiltered walk.
 pub async fn resolve_virtual_metadata<F, Fut>(
     db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     proxy_service: Option<&ProxyService>,
     virtual_repo_id: Uuid,
     path: &str,
@@ -2737,7 +2745,7 @@ where
     F: Fn(Bytes, Option<String>, Option<String>, String) -> Fut,
     Fut: std::future::Future<Output = Result<Response, Response>>,
 {
-    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let members = authorized_virtual_members(db, auth, virtual_repo_id).await?;
 
     if members.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
@@ -2874,8 +2882,13 @@ where
 /// this process. A caller that wants to forward one member's bytes verbatim
 /// belongs on [`resolve_virtual_metadata`], whose transform receives the
 /// coding.
+///
+/// `auth` is the CALLER (#3323) and is required for the same reason it is on
+/// [`resolve_virtual_metadata`]: the merged document this returns is content,
+/// so a member the caller may not read directly must not contribute to it.
 pub async fn collect_virtual_metadata<T, F, Fut>(
     db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
     proxy_service: Option<&ProxyService>,
     virtual_repo_id: Uuid,
     path: &str,
@@ -2885,7 +2898,7 @@ where
     F: Fn(Bytes, String) -> Fut,
     Fut: std::future::Future<Output = Result<T, Response>>,
 {
-    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let members = authorized_virtual_members(db, auth, virtual_repo_id).await?;
 
     // Remote members are queried CONCURRENTLY (#2069) in priority-order batches
     // of at most [`MAX_VIRTUAL_FANOUT`], so a cold merge fan-out costs roughly
@@ -3338,6 +3351,93 @@ pub async fn try_authorize_virtual_members(
         .zip(decisions)
         .filter_map(|(member, ok)| ok.then_some(member))
         .collect())
+}
+
+/// Fetch a virtual repository's members already narrowed to the ones the
+/// CALLER may read directly — [`fetch_virtual_members`] composed with
+/// [`try_authorize_virtual_members`] (#3323).
+///
+/// This is the form every CONTENT-SERVING virtual path should use. The
+/// unfiltered [`fetch_virtual_members`] is reserved for ENFORCEMENT walks —
+/// deny-sets, shadowing/priority decisions, cache invalidation, cycle
+/// detection — where narrowing by caller visibility would let a caller who
+/// cannot see a member escape that member's gate (see `oci_v2`'s scan-verdict
+/// fan-out and the `virtual_non_remote_owns_*` shadowing guards).
+///
+/// Why a single helper rather than the two-line pair at each call site: the
+/// gap this closes was never one missed walker, it was ~40 call sites that
+/// each independently had to remember to filter. One function, called by every
+/// content path, makes "did this path authorize?" a grep for the callee rather
+/// than a review of forty bodies — and keeps the pair from drifting apart
+/// (e.g. someone reaching for the infallible `authorize_virtual_members` on an
+/// AGGREGATING path, where an empty set from a transient DB error reads as
+/// "nothing exists").
+///
+/// Fails CLOSED, and fallibly: a failed visibility query surfaces as the
+/// [`map_db_err`] response (retryable) rather than being flattened into the
+/// empty member set, which an aggregating caller would serve as a definitive
+/// empty index and a walking caller as a definitive not-found (#3321).
+pub async fn authorized_virtual_members(
+    db: &PgPool,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    virtual_repo_id: Uuid,
+) -> Result<Vec<Repository>, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    try_authorize_virtual_members(db, auth, virtual_repo_id, members).await
+}
+
+/// True when any member of a virtual repository is NOT public (#3323).
+///
+/// Errs on the side of `true` if the lookup fails, because the only caller
+/// shape is "may this caller-independent cache be used?", where `true` means
+/// "recompute per request" — merely slower — and `false` would mean serving one
+/// caller's view to another.
+pub async fn virtual_has_private_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+            SELECT 1 FROM repositories r \
+            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
+            WHERE vrm.virtual_repo_id = $1 AND r.is_public = false)",
+    )
+    .bind(virtual_repo_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(true)
+}
+
+/// Whether a document aggregated from a virtual repository's members may be
+/// stored in a CALLER-INDEPENDENT cache (#3323).
+///
+/// Several formats front their aggregated virtual document with a shared cache
+/// keyed by repository/document and NOT by caller — npm's computed packument
+/// cache, cargo's in-process sparse-index cache. Once the aggregation is
+/// narrowed to the members the caller may read, that document becomes
+/// caller-dependent, and a caller-independent cache in front of it re-opens the
+/// leak from the other side: the first authorized request stores a document
+/// containing a private member's contribution and every later anonymous request
+/// is served it from cache.
+///
+/// The document is caller-INdependent exactly when every member is public.
+/// [`try_authorize_virtual_members`] admits a public member for every caller
+/// unconditionally — the grant half and `member_passes_token_scope` both
+/// short-circuit on `is_public`, and the read-action gate skips public members —
+/// so with an all-public member set the authorized member list is identical for
+/// anonymous and authenticated callers alike.
+///
+/// Pure so the decision is unit-testable without a database; the `is_private`
+/// input comes from [`virtual_has_private_member`].
+pub fn virtual_aggregate_is_cacheable(is_virtual: bool, has_private_member: bool) -> bool {
+    !is_virtual || !has_private_member
+}
+
+/// [`virtual_aggregate_is_cacheable`] with the member lookup performed, skipping
+/// the query entirely for a non-virtual repository (which resolves no members,
+/// so member visibility cannot vary its document).
+pub async fn virtual_aggregate_cacheable(db: &PgPool, repo_id: Uuid, is_virtual: bool) -> bool {
+    if !is_virtual {
+        return true;
+    }
+    virtual_aggregate_is_cacheable(true, virtual_has_private_member(db, repo_id).await)
 }
 
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
@@ -14815,5 +14915,282 @@ mod tests {
         // bounding anything.
         assert!(on_demand_row_admitted(true, cap, cap));
         assert!(on_demand_row_admitted(true, cap * 10, cap));
+    }
+}
+
+/// #3323: virtual-repo member authorization on the READ paths.
+///
+/// `fetch_virtual_members` returns every member of a virtual repository with no
+/// access control; the route middleware authorizes only the URL repo (the
+/// virtual PARENT), so for a public virtual an anonymous caller reaches every
+/// member — each a separate repository with its own ACL. The filter existed and
+/// was applied on a minority of call sites.
+///
+/// The fix is one helper — [`authorized_virtual_members`] — used by every
+/// CONTENT-serving path, plus a required `auth` parameter on the two shared
+/// metadata primitives so their callers cannot inherit an unfiltered walk
+/// silently.
+#[cfg(test)]
+mod virtual_read_authz_tests {
+    use super::*;
+
+    /// Every format handler that can resolve a virtual repository. The
+    /// structural gate below reads these at COMPILE time (`include_str!`), so
+    /// it is database-free and runs in the offline lib suite.
+    const HANDLER_SOURCES: &[(&str, &str)] = &[
+        ("alpine.rs", include_str!("alpine.rs")),
+        ("cargo.rs", include_str!("cargo.rs")),
+        ("composer.rs", include_str!("composer.rs")),
+        ("conan.rs", include_str!("conan.rs")),
+        ("conda.rs", include_str!("conda.rs")),
+        ("cran.rs", include_str!("cran.rs")),
+        ("debian.rs", include_str!("debian.rs")),
+        ("goproxy.rs", include_str!("goproxy.rs")),
+        ("helm.rs", include_str!("helm.rs")),
+        ("hex.rs", include_str!("hex.rs")),
+        ("huggingface.rs", include_str!("huggingface.rs")),
+        ("maven.rs", include_str!("maven.rs")),
+        ("npm.rs", include_str!("npm.rs")),
+        ("nuget.rs", include_str!("nuget.rs")),
+        ("oci_v2.rs", include_str!("oci_v2.rs")),
+        ("pub_registry.rs", include_str!("pub_registry.rs")),
+        ("pypi.rs", include_str!("pypi.rs")),
+        ("repositories.rs", include_str!("repositories.rs")),
+        ("rpm.rs", include_str!("rpm.rs")),
+        ("rubygems.rs", include_str!("rubygems.rs")),
+        ("swift.rs", include_str!("swift.rs")),
+    ];
+
+    /// Byte window after a `fetch_virtual_members(` call in which the paired
+    /// authorization call must appear. Generous enough to span the explanatory
+    /// comment every such site carries, tight enough that an authorization call
+    /// belonging to a LATER, unrelated branch cannot vouch for this one.
+    const AUTHZ_WINDOW: usize = 1500;
+
+    /// The calls that count as authorizing a member set.
+    ///
+    /// `filter_visible_repo_ids` is the second form: the REST listing paths
+    /// (`repositories.rs`) compose the visibility predicate inline because
+    /// listing deliberately stops at the tenant gate — "any grant means you may
+    /// see this repository exists" — where content resolution additionally
+    /// requires the `read` ACTION (#3326). Both are caller-narrowing; only the
+    /// second half differs.
+    const AUTHZ_CALLS: &[&str] = &["authorize_virtual_members(", "filter_visible_repo_ids("];
+
+    /// Byte window BEFORE the call in which an explicit opt-out marker must
+    /// appear for a site that is deliberately unfiltered.
+    const MARKER_WINDOW: usize = 1200;
+
+    /// The structural gate for the whole class (#3323).
+    ///
+    /// The bug was never one missed walker: `fetch_virtual_members` was called
+    /// from ~50 places and only 13 of them filtered. A test pinned to the
+    /// handful of sites fixed in one PR would go green while the next new
+    /// format re-opened the hole, so this scans EVERY format handler and
+    /// requires each raw member walk to be one of exactly two things:
+    ///
+    /// * paired with `authorize_virtual_members` / `try_authorize_virtual_members`
+    ///   within [`AUTHZ_WINDOW`] bytes (the content-serving shape — most sites
+    ///   now call [`authorized_virtual_members`], which is the pair fused into
+    ///   one call and matches this substring too); or
+    /// * preceded by an explicit `UNFILTERED-ENFORCEMENT` or
+    ///   `UNFILTERED-DEFERRED` marker, which forces the author to state in the
+    ///   source WHY this walk must not be narrowed.
+    ///
+    /// The marker exists because filtering is not universally correct: a walk
+    /// that computes a DENY-set (OCI's scan-verdict blocklist) or a shadowing
+    /// decision must see every member, or a caller who cannot see a member
+    /// would escape that member's gate. Making the exemption a greppable token
+    /// keeps that judgement in review rather than in a test allowlist that
+    /// drifts.
+    /// Largest index `<= at` that is a UTF-8 char boundary of `src`.
+    fn floor_boundary(src: &str, at: usize) -> usize {
+        let mut at = at.min(src.len());
+        while at > 0 && !src.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    #[test]
+    fn every_raw_virtual_member_walk_is_authorized_or_explicitly_exempt() {
+        const NEEDLE: &str = "fetch_virtual_members(";
+        let mut unguarded: Vec<String> = Vec::new();
+
+        for (name, src) in HANDLER_SOURCES {
+            let mut from = 0usize;
+            while let Some(rel) = src[from..].find(NEEDLE) {
+                let at = from + rel;
+                from = at + NEEDLE.len();
+
+                // Skip doc-comment and string mentions of the name: only real
+                // call sites matter, and they are always `..fetch_virtual_members(`
+                // preceded by `::` or whitespace, never by `"` or by a `///` line.
+                let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                let line_prefix = &src[line_start..at];
+                if line_prefix.trim_start().starts_with("//") || line_prefix.contains('"') {
+                    continue;
+                }
+
+                // Windows are clamped to char boundaries: the source carries
+                // multi-byte characters (em dashes in the comments), and slicing
+                // mid-codepoint would panic.
+                let before = &src[floor_boundary(src, at.saturating_sub(MARKER_WINDOW))..at];
+                if before.contains("UNFILTERED-ENFORCEMENT")
+                    || before.contains("UNFILTERED-DEFERRED")
+                {
+                    continue;
+                }
+
+                let after_end = floor_boundary(src, (at + AUTHZ_WINDOW).min(src.len()));
+                let after = &src[at..after_end];
+                if AUTHZ_CALLS.iter().any(|call| after.contains(call)) {
+                    continue;
+                }
+
+                let line_no = src[..at].bytes().filter(|b| *b == b'\n').count() + 1;
+                unguarded.push(format!("{name}:{line_no}"));
+            }
+        }
+
+        assert!(
+            unguarded.is_empty(),
+            "#3323: these virtual-repo member walks neither authorize the member set \
+             against the caller nor carry an UNFILTERED-ENFORCEMENT / \
+             UNFILTERED-DEFERRED marker explaining why they must not: {unguarded:?}. \
+             A content-serving path must use `proxy_helpers::authorized_virtual_members`; \
+             an enforcement path (deny-set, shadowing guard, cache invalidation) must \
+             say so in a comment immediately above the call."
+        );
+    }
+
+    /// The two shared metadata primitives must TAKE a caller. Their ~15 callers
+    /// each render a member's content, and before #3323 neither primitive had an
+    /// `auth` parameter at all — so every caller inherited an unfiltered walk
+    /// without ever making a decision. Requiring the parameter is what turns
+    /// "did you remember?" into a compile error.
+    #[test]
+    fn the_shared_metadata_primitives_require_a_caller() {
+        let src = include_str!("proxy_helpers.rs");
+        for primitive in [
+            "pub async fn resolve_virtual_metadata",
+            "pub async fn collect_virtual_metadata",
+        ] {
+            let at = src
+                .find(primitive)
+                .unwrap_or_else(|| panic!("{primitive} must exist"));
+            let sig_end = src[at..]
+                .find(") -> ")
+                .unwrap_or_else(|| panic!("{primitive} signature must terminate"));
+            let signature = &src[at..at + sig_end];
+            assert!(
+                signature.contains("auth: Option<&crate::api::middleware::auth::AuthExtension>"),
+                "#3323: `{primitive}` must take the CALLER so each of its callers is \
+                 forced to make an authorization decision instead of inheriting an \
+                 unfiltered member walk"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_virtual_aggregate_is_always_cacheable() {
+        // A Remote or Local repository resolves no members, so member
+        // visibility cannot vary the document it produces — the private-member
+        // input is irrelevant and must not cost it its cache.
+        assert!(virtual_aggregate_is_cacheable(false, false));
+        assert!(virtual_aggregate_is_cacheable(false, true));
+    }
+
+    #[test]
+    fn an_all_public_virtual_aggregate_is_cacheable() {
+        // Every caller — anonymous included — authorizes to the same member
+        // set, so one stored document is correct for all of them.
+        assert!(virtual_aggregate_is_cacheable(true, false));
+    }
+
+    #[test]
+    fn a_virtual_with_a_private_member_is_not_cacheable() {
+        // This is the direction that matters: the merged document now depends
+        // on WHO asked, and the caches in front of it (npm packument, cargo
+        // sparse index, maven GA metadata) are keyed without the caller. Storing
+        // one caller's view would serve it to the next.
+        assert!(!virtual_aggregate_is_cacheable(true, true));
+    }
+
+    /// DB-backed: the composed helper must equal fetch-then-authorize, and must
+    /// drop a private member for an anonymous caller while keeping the public
+    /// one. This is the single predicate ~40 read paths now share, so it is
+    /// asserted directly rather than only through one format's handler.
+    #[tokio::test]
+    async fn authorized_virtual_members_drops_a_private_member_for_an_anonymous_caller() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (virtual_id, _vkey, virtual_dir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        let (public_id, _pk, public_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (private_id, _prk, private_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(public_id)
+            .execute(&pool)
+            .await
+            .expect("publish the public member");
+        tdh::link_virtual_member(&pool, virtual_id, private_id, 1).await;
+        tdh::link_virtual_member(&pool, virtual_id, public_id, 2).await;
+
+        // Both members are present in the RAW walk: the leak was that this set,
+        // not the authorized one, reached the response.
+        let raw = fetch_virtual_members(&pool, virtual_id)
+            .await
+            .expect("raw member walk");
+        assert_eq!(raw.len(), 2, "positive control: both members are linked");
+
+        let anon = authorized_virtual_members(&pool, None, virtual_id)
+            .await
+            .expect("authorized member walk");
+        assert_eq!(
+            anon.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![public_id],
+            "#3323: an anonymous caller through a public virtual parent must see \
+             ONLY the public member"
+        );
+
+        // The shared-cache predicate must notice the private member.
+        assert!(
+            virtual_has_private_member(&pool, virtual_id).await,
+            "a virtual with a private member must report one"
+        );
+        assert!(
+            !virtual_aggregate_cacheable(&pool, virtual_id, true).await,
+            "#3323: with a private member the aggregated document is caller-dependent \
+             and must not be stored in a caller-independent cache"
+        );
+
+        // Publish the private member and the aggregate becomes shareable again —
+        // the positive control that this is not a blanket cache disable.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(private_id)
+            .execute(&pool)
+            .await
+            .expect("publish the second member");
+        assert!(!virtual_has_private_member(&pool, virtual_id).await);
+        assert!(virtual_aggregate_cacheable(&pool, virtual_id, true).await);
+        let anon_all_public = authorized_virtual_members(&pool, None, virtual_id)
+            .await
+            .expect("authorized member walk");
+        assert_eq!(
+            anon_all_public.len(),
+            2,
+            "an all-public member set must authorize identically for an anonymous caller"
+        );
+
+        for (id, dir) in [
+            (private_id, &private_dir),
+            (public_id, &public_dir),
+            (virtual_id, &virtual_dir),
+        ] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
     }
 }

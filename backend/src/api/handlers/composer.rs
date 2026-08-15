@@ -376,6 +376,7 @@ fn build_metadata_v1_response(
 /// threaded through so locally-rendered `dist.url`s route back through us.
 async fn resolve_virtual_composer_metadata<R>(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
     full_name: &str,
@@ -385,7 +386,11 @@ async fn resolve_virtual_composer_metadata<R>(
 where
     R: Fn(&str, &str, &[ComposerArtifactRow]) -> Response,
 {
-    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+    // Caller-authorized member walk (#3323): package metadata is content, so a
+    // member this caller may not read directly is neither rendered from nor
+    // proxied through.
+    let members =
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
 
     if members.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
@@ -1040,6 +1045,7 @@ async fn fetch_remote_composer_metadata(
 
 async fn packages_json(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -1052,7 +1058,10 @@ async fn packages_json(
     // (#1781). Remote members are not aggregated into the root index (Composer
     // resolves those per-package via the metadata-url).
     let rows = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the root index enumerates
+        // every package name a member holds.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut aggregated: Vec<PackageIndexRow> = Vec::new();
         for member in &members {
             if member.repo_type == RepositoryType::Local
@@ -1089,6 +1098,7 @@ async fn packages_json(
 
 async fn metadata_v2(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, vendor, package_file)): Path<(String, String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -1105,6 +1115,7 @@ async fn metadata_v2(
         let upstream_path = composer_v2_upstream_path(&full_name);
         return resolve_virtual_composer_metadata(
             &state,
+            auth.as_ref(),
             repo.id,
             &repo_key,
             &full_name,
@@ -1172,6 +1183,7 @@ async fn metadata_v2(
 
 async fn metadata_v1(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, vendor, package_hash)): Path<(String, String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -1187,6 +1199,7 @@ async fn metadata_v1(
         let upstream_path = composer_v1_upstream_path(&full_name);
         return resolve_virtual_composer_metadata(
             &state,
+            auth.as_ref(),
             repo.id,
             &repo_key,
             &full_name,

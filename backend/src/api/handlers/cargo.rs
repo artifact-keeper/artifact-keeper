@@ -1179,33 +1179,37 @@ async fn download(
 /// Index for 1-character crate names: /index/1/{name}
 async fn sparse_index_1(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    serve_index(&state, &repo_key, &name).await
+    serve_index(&state, auth.as_ref(), &repo_key, &name).await
 }
 
 /// Index for 2-character crate names: /index/2/{name}
 async fn sparse_index_2(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    serve_index(&state, &repo_key, &name).await
+    serve_index(&state, auth.as_ref(), &repo_key, &name).await
 }
 
 /// Index for 3-character crate names: /index/3/{first_char}/{name}
 async fn sparse_index_3(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, _prefix, name)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
-    serve_index(&state, &repo_key, &name).await
+    serve_index(&state, auth.as_ref(), &repo_key, &name).await
 }
 
 /// Index for 4+ character crate names: /index/{first2}/{next2}/{name}
 async fn sparse_index_4plus(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, _prefix1, _prefix2, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    serve_index(&state, &repo_key, &name).await
+    serve_index(&state, auth.as_ref(), &repo_key, &name).await
 }
 
 /// Build a single sparse-index JSON entry from crate metadata.
@@ -1415,10 +1419,12 @@ async fn try_remote_index(
 #[allow(clippy::result_large_err)]
 async fn try_virtual_index(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     name_lower: &str,
     index_cache: &IndexCache,
     cache_key: &str,
+    cache_shareable: bool,
 ) -> Option<Result<Response, Response>> {
     use sqlx::Row;
 
@@ -1426,7 +1432,11 @@ async fn try_virtual_index(
         return None;
     }
 
-    let members = match proxy_helpers::fetch_virtual_members(&state.db, repo.id).await {
+    // Caller-authorized member walk (#3323): the aggregated sparse index is
+    // content — crate names, versions, checksums, dependency lists and yank
+    // state — so a member this caller may not read directly must not
+    // contribute entries to it.
+    let members = match proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await {
         Ok(m) => m,
         Err(e) => return Some(Err(e)),
     };
@@ -1558,7 +1568,13 @@ async fn try_virtual_index(
 
     match finalize_virtual_index_aggregation(aggregated) {
         Some(Ok(body)) => {
-            index_cache_set(index_cache, cache_key.to_string(), body.clone()).await;
+            // Only memoize a document that is the SAME for every caller
+            // (#3323). The index cache is keyed by `repo_key:crate`, not by
+            // caller, so storing a caller-narrowed aggregation would serve one
+            // caller's view to the next — including an anonymous one.
+            if cache_shareable {
+                index_cache_set(index_cache, cache_key.to_string(), body.clone()).await;
+            }
             Some(Ok(index_response(
                 body,
                 Some("application/json".to_string()),
@@ -1673,6 +1689,7 @@ fn merge_index_lines(
 /// Serve the sparse index file for a crate (one JSON object per version, per line).
 async fn serve_index(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo_key: &str,
     crate_name: &str,
 ) -> Result<Response, Response> {
@@ -1681,9 +1698,23 @@ async fn serve_index(
 
     let cache_key = format!("{}:{}", repo_key, name_lower);
 
+    // Whether the in-process index cache — keyed by `repo_key:crate`, not by
+    // caller — may be read or written for this repository (#3323). A virtual
+    // repo aggregates its members' entries, and that aggregation is now
+    // narrowed to the members THIS caller may read, so it is only shareable
+    // when every member is public.
+    let cache_shareable = proxy_helpers::virtual_aggregate_cacheable(
+        &state.db,
+        repo.id,
+        repo.repo_type == RepositoryType::Virtual,
+    )
+    .await;
+
     // Fast path: serve from in-process index cache (no storage I/O, no SHA-256).
-    if let Some(cached) = index_cache_get(&state.index_cache, &cache_key).await {
-        return Ok(index_response(cached, Some("application/json".to_string())));
+    if cache_shareable {
+        if let Some(cached) = index_cache_get(&state.index_cache, &cache_key).await {
+            return Ok(index_response(cached, Some("application/json".to_string())));
+        }
     }
 
     // Remote and virtual repos never have directly-published artifacts — publishes
@@ -1705,8 +1736,16 @@ async fn serve_index(
         };
     }
     if repo.repo_type == "virtual" {
-        return match try_virtual_index(state, &repo, &name_lower, &state.index_cache, &cache_key)
-            .await
+        return match try_virtual_index(
+            state,
+            auth,
+            &repo,
+            &name_lower,
+            &state.index_cache,
+            &cache_key,
+            cache_shareable,
+        )
+        .await
         {
             Some(result) => result,
             None => Err(AppError::NotFound("Crate not found in index".to_string()).into_response()),
@@ -1745,8 +1784,16 @@ async fn serve_index(
         {
             return result;
         }
-        if let Some(result) =
-            try_virtual_index(state, &repo, &name_lower, &state.index_cache, &cache_key).await
+        if let Some(result) = try_virtual_index(
+            state,
+            auth,
+            &repo,
+            &name_lower,
+            &state.index_cache,
+            &cache_key,
+            cache_shareable,
+        )
+        .await
         {
             return result;
         }

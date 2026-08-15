@@ -1244,8 +1244,13 @@ async fn channeldata_json(
 
     // Virtual repos: merge channeldata from all members
     if repo.repo_type == RepositoryType::Virtual {
-        let channeldata =
-            build_virtual_channeldata(&state.db, state.proxy_service.as_deref(), repo.id).await?;
+        let channeldata = build_virtual_channeldata(
+            &state.db,
+            auth.as_ref(),
+            state.proxy_service.as_deref(),
+            repo.id,
+        )
+        .await?;
         let body = serde_json::to_string_pretty(&channeldata)
             .unwrap()
             .into_bytes();
@@ -1627,7 +1632,7 @@ async fn serve_repodata(
     encoding: RepodataEncoding,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, repo_key).await?;
-    check_read_access(&state.db, auth, &repo).await?;
+    check_read_access(&state.db, auth.clone(), &repo).await?;
 
     let ct = encoding.content_type();
 
@@ -1635,6 +1640,7 @@ async fn serve_repodata(
     if repo.repo_type == RepositoryType::Virtual {
         let repodata = build_virtual_repodata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             repo_key,
@@ -2452,6 +2458,7 @@ fn build_channeldata_entry(
 /// (lower priority number) wins.
 async fn build_virtual_repodata(
     db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
     proxy_service: Option<&crate::services::proxy_service::ProxyService>,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
@@ -2460,7 +2467,10 @@ async fn build_virtual_repodata(
     validate_cep26_subdir(subdir)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
 
-    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+    // Caller-authorized member walk (#3323): repodata is content, so a member
+    // this caller may not read directly contributes neither its packages nor
+    // its upstream's.
+    let members = proxy_helpers::authorized_virtual_members(db, auth, virtual_repo_id).await?;
 
     let mut merged_packages = serde_json::Map::new();
     let mut merged_packages_conda = serde_json::Map::new();
@@ -2469,6 +2479,7 @@ async fn build_virtual_repodata(
     let upstream_path = format!("{}/repodata.json", subdir);
     let remote_data = proxy_helpers::collect_virtual_metadata(
         db,
+        auth,
         proxy_service,
         virtual_repo_id,
         &upstream_path,
@@ -2522,16 +2533,19 @@ async fn build_virtual_repodata(
 /// Build merged channeldata.json for a virtual repository.
 async fn build_virtual_channeldata(
     db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
     proxy_service: Option<&crate::services::proxy_service::ProxyService>,
     virtual_repo_id: uuid::Uuid,
 ) -> Result<serde_json::Value, Response> {
-    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+    // Caller-authorized member walk (#3323).
+    let members = proxy_helpers::authorized_virtual_members(db, auth, virtual_repo_id).await?;
 
     let mut merged_packages = serde_json::Map::new();
 
     // Collect from remote members using shared helper
     let remote_data = proxy_helpers::collect_virtual_metadata(
         db,
+        auth,
         proxy_service,
         virtual_repo_id,
         "channeldata.json",

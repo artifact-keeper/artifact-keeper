@@ -4873,6 +4873,11 @@ async fn enforce_blob_scan_reblock(
     // freshness rule -- see `stale_blob_verdicts_still_withhold`.
     let mut ref_owners: Vec<(&str, Uuid)> = Vec::new();
     let status = if repo.repo_type == RepositoryType::Virtual {
+        // UNFILTERED-ENFORCEMENT (#3323): this walk computes a DENY-set (the
+        // scan-verdict blocklist), not a response body. Narrowing it by caller
+        // visibility would let a caller who cannot see a member escape that
+        // member's quarantine gate, so every member is enumerated and an
+        // enumeration failure fails CLOSED below.
         let members = match proxy_helpers::fetch_virtual_members(&state.db, repo.id).await {
             Ok(members) => members,
             Err(_) => {

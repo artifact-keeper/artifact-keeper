@@ -33,6 +33,11 @@ async fn pool() -> PgPool {
     .expect("connect")
 }
 
+/// Members are created PUBLIC. The virtual member walk is caller-authorized
+/// since #3323 and these fixtures probe with no caller, so a private member
+/// would be (correctly) filtered out — the subject here is the #1554 fan-out,
+/// and the anonymous-vs-private direction is pinned by the unit tests in
+/// `swift.rs`.
 async fn insert_repo(pool: &PgPool, key: &str, repo_type: &str) -> Uuid {
     let id = Uuid::new_v4();
     let storage_path = format!("/tmp/test-artifacts/{}", id);
@@ -43,8 +48,10 @@ async fn insert_repo(pool: &PgPool, key: &str, repo_type: &str) -> Uuid {
     };
     sqlx::query(
         r#"
-        INSERT INTO repositories (id, key, name, format, repo_type, storage_path, upstream_url)
-        VALUES ($1, $2, $2, 'swift'::repository_format, $3::repository_type, $4, $5)
+        INSERT INTO repositories (
+            id, key, name, format, repo_type, storage_path, upstream_url, is_public
+        )
+        VALUES ($1, $2, $2, 'swift'::repository_format, $3::repository_type, $4, $5, true)
         "#,
     )
     .bind(id)
@@ -155,7 +162,7 @@ async fn swift_virtual_resolves_release_from_local_member() {
     insert_swift_artifact(&pool, local_id, package_id, "12.5.2", Some("// manifest")).await;
 
     // list_releases fan-out
-    let versions = query_release_versions_virtual(&pool, virtual_id, package_id)
+    let versions = query_release_versions_virtual(&pool, None, virtual_id, package_id)
         .await
         .expect("virtual list lookup must succeed");
     assert_eq!(
@@ -165,7 +172,7 @@ async fn swift_virtual_resolves_release_from_local_member() {
     );
 
     // get_release_metadata fan-out
-    let row = query_release_metadata_virtual(&pool, virtual_id, package_id, "12.5.2")
+    let row = query_release_metadata_virtual(&pool, None, virtual_id, package_id, "12.5.2")
         .await
         .expect("virtual metadata lookup must succeed")
         .expect("release must be found via the member");
@@ -196,7 +203,7 @@ async fn swift_virtual_aggregates_versions_across_members() {
     insert_swift_artifact(&pool, local_a, package_id, "1.0.0", None).await;
     insert_swift_artifact(&pool, local_b, package_id, "2.0.0", None).await;
 
-    let versions = query_release_versions_virtual(&pool, virtual_id, package_id)
+    let versions = query_release_versions_virtual(&pool, None, virtual_id, package_id)
         .await
         .expect("lookup must succeed");
     assert!(
@@ -237,7 +244,7 @@ async fn swift_virtual_dedupes_versions_across_members() {
     insert_swift_artifact(&pool, local_b, package_id, "3.1.0", None).await;
     insert_swift_artifact(&pool, local_b, package_id, "3.2.0", None).await;
 
-    let versions = query_release_versions_virtual(&pool, virtual_id, package_id)
+    let versions = query_release_versions_virtual(&pool, None, virtual_id, package_id)
         .await
         .expect("lookup must succeed");
     assert_eq!(
@@ -272,7 +279,7 @@ async fn swift_virtual_missing_package_returns_empty() {
     let local_id = insert_repo(&pool, &format!("sw-local-miss-{}", suffix), "local").await;
     add_virtual_member(&pool, virtual_id, local_id, 1).await;
 
-    let versions = query_release_versions_virtual(&pool, virtual_id, "nope.absent")
+    let versions = query_release_versions_virtual(&pool, None, virtual_id, "nope.absent")
         .await
         .expect("lookup must succeed");
     assert!(
@@ -280,7 +287,7 @@ async fn swift_virtual_missing_package_returns_empty() {
         "unknown package must yield no versions"
     );
 
-    let row = query_release_metadata_virtual(&pool, virtual_id, "nope.absent", "1.0.0")
+    let row = query_release_metadata_virtual(&pool, None, virtual_id, "nope.absent", "1.0.0")
         .await
         .expect("lookup must succeed");
     assert!(row.is_none(), "unknown release must yield None");

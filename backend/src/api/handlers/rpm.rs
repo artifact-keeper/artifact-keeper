@@ -702,6 +702,15 @@ async fn repodata_repo_ids(
     if repo.repo_type != RepositoryType::Virtual {
         return Ok(vec![repo.id]);
     }
+    // UNFILTERED-DEFERRED (#3323): this walk IS content-serving and must
+    // eventually be caller-authorized like every other format's. It is not,
+    // yet, because the repodata document it feeds is rendered once and cached
+    // per VIRTUAL repo id (`state.rpm_repodata_cache.get_or_render(repo.id,
+    // ..)`) and `repomd.xml.asc` is a detached signature OVER THE RENDERED
+    // BYTES (#2636). Making the document caller-dependent without first
+    // re-keying that cache by the authorized member-id set would break both the
+    // shared cache and the reproducible-signature invariant — a design decision
+    // deliberately kept out of the mechanical filter pass. Tracked on #3323.
     let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
     let mut ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
     ids.sort_unstable();

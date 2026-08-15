@@ -970,6 +970,7 @@ async fn resolve_maven_sha1_sidecar(
 /// correctly for Maven proxy and group repos.  Fixes #1880.
 async fn download_root(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
@@ -997,7 +998,11 @@ async fn download_root(
     }
 
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the root listing reveals which
+        // upstream a virtual fronts, and that upstream may be reached with a
+        // private member's stored credentials.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         for member in &members {
             if member.repo_type == RepositoryType::Remote {
                 if let (Some(ref upstream_url), Some(ref proxy)) =
@@ -1412,9 +1417,16 @@ async fn fetch_maven_metadata_bytes(
 
     // Virtual repos: merge metadata from all members.
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-        let members =
-            proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+
+        // Whether the GA-level merge may be shared through the process-wide
+        // cache (#3323). The merge is built from the members THIS caller may
+        // read, while `VIRTUAL_MAVEN_METADATA_CACHE` is keyed by
+        // `(repo, groupId, artifactId)` only — so with a private member in the
+        // set, one caller's merged `<versions>` would otherwise be served to
+        // the next caller, anonymous included.
+        let merge_cacheable =
+            proxy_helpers::virtual_aggregate_cacheable(&state.db, repo.id, true).await;
 
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
             let cache_key: VirtualMetadataCacheKey =
@@ -1423,7 +1435,12 @@ async fn fetch_maven_metadata_bytes(
             // Consult the GA-level merge cache before iterating members (#2302).
             // A hit — including a definitive `Some(None)` empty-merge — skips the
             // fan-out entirely; a miss runs the merge below and stores its result.
-            let ga_merge: Option<Bytes> = match VIRTUAL_MAVEN_METADATA_CACHE.get(&cache_key).await {
+            let cached_merge = if merge_cacheable {
+                VIRTUAL_MAVEN_METADATA_CACHE.get(&cache_key).await
+            } else {
+                None
+            };
+            let ga_merge: Option<Bytes> = match cached_merge {
                 Some(cached) => cached,
                 None => {
                     let mut all_versions: Vec<String> = Vec::new();
@@ -1499,9 +1516,11 @@ async fn fetch_maven_metadata_bytes(
                         Some(Bytes::from(xml))
                     };
 
-                    VIRTUAL_MAVEN_METADATA_CACHE
-                        .insert(cache_key, merged.clone())
-                        .await;
+                    if merge_cacheable {
+                        VIRTUAL_MAVEN_METADATA_CACHE
+                            .insert(cache_key, merged.clone())
+                            .await;
+                    }
                     merged
                 }
             };
@@ -4973,9 +4992,13 @@ mod tests {
         }
 
         // REMOTE: GET /maven/<remote>/ → 200 from the upstream root.
-        let remote_resp = download_root(State(state.clone()), Path(remote_key.clone()))
-            .await
-            .expect("remote root must proxy 200");
+        let remote_resp = download_root(
+            State(state.clone()),
+            Extension(None),
+            Path(remote_key.clone()),
+        )
+        .await
+        .expect("remote root must proxy 200");
         assert_eq!(remote_resp.status(), axum::http::StatusCode::OK);
         assert_eq!(&root_body(remote_resp).await[..], b"maven-root-index");
 
@@ -4990,15 +5013,24 @@ mod tests {
         .execute(&pool)
         .await
         .expect("link remote as virtual member");
-        let virtual_resp = download_root(State(state.clone()), Path(virtual_key.clone()))
-            .await
-            .expect("virtual root must proxy 200 from its remote member");
+        let virtual_resp = download_root(
+            State(state.clone()),
+            Extension(None),
+            Path(virtual_key.clone()),
+        )
+        .await
+        .expect("virtual root must proxy 200 from its remote member");
         assert_eq!(virtual_resp.status(), axum::http::StatusCode::OK);
         assert_eq!(&root_body(virtual_resp).await[..], b"maven-root-index");
 
         // LOCAL: a hosted repo does not forward an empty path → NotFound.
         let (local_id, local_key, _ldir) = tdh::create_repo(&pool, "local", "maven").await;
-        let denied = download_root(State(state.clone()), Path(local_key.clone())).await;
+        let denied = download_root(
+            State(state.clone()),
+            Extension(None),
+            Path(local_key.clone()),
+        )
+        .await;
         assert!(
             denied.is_err(),
             "local repo root must be NotFound, not forwarded upstream"
@@ -5093,7 +5125,7 @@ mod tests {
             state: crate::api::SharedState,
             key: &str,
         ) -> (Option<String>, Option<String>, bytes::Bytes) {
-            let resp = download_root(State(state), Path(key.to_string()))
+            let resp = download_root(State(state), Extension(None), Path(key.to_string()))
                 .await
                 .expect("root probe must proxy 200");
             assert_eq!(resp.status(), axum::http::StatusCode::OK);

@@ -1310,6 +1310,10 @@ fn push_release_hash_section<F>(
 /// handler only needs to call `proxy.dists("suffix", "ct").await?`.
 struct DebianProxy<'a> {
     state: &'a SharedState,
+    /// The CALLER (#3323). A Virtual repo's dists metadata is served from its
+    /// members, each a separate repository with its own ACL, so the member walk
+    /// must be narrowed to the ones this caller may read directly.
+    auth: Option<&'a AuthExtension>,
     repo_key: &'a str,
     distribution: &'a str,
 }
@@ -1317,6 +1321,7 @@ struct DebianProxy<'a> {
 impl<'a> DebianProxy<'a> {
     async fn resolve(
         state: &'a SharedState,
+        auth: Option<&'a AuthExtension>,
         repo_key: &'a str,
         distribution: &'a str,
     ) -> Result<(Self, RepoInfo), Response> {
@@ -1324,6 +1329,7 @@ impl<'a> DebianProxy<'a> {
         Ok((
             Self {
                 state,
+                auth,
                 repo_key,
                 distribution,
             },
@@ -1346,6 +1352,7 @@ impl<'a> DebianProxy<'a> {
             let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
             if let Some(resp) = try_virtual_dists(
                 self.state,
+                self.auth,
                 repo.id,
                 self.repo_key,
                 self.distribution,
@@ -1436,6 +1443,7 @@ impl<'a> DebianProxy<'a> {
         if repo.repo_type == RepositoryType::Virtual {
             if let Some(resp) = try_virtual_dists_detecting_change(
                 self.state,
+                self.auth,
                 repo.id,
                 self.repo_key,
                 self.distribution,
@@ -1962,6 +1970,7 @@ async fn virtual_member_dists_allowed(
 ///     to the local-DB path (hosted repos).
 async fn try_virtual_dists(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
     distribution: &str,
@@ -1969,7 +1978,13 @@ async fn try_virtual_dists(
     default_content_type: &'static str,
 ) -> Result<Option<Response>, Response> {
     let _ = virtual_repo_key;
-    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+    // Caller-authorized member walk (#3323). The per-member
+    // `virtual_member_dists_allowed` gate below is the MEMBER's own dist/
+    // component/arch allowlist, not a caller check — a private member's
+    // Release, InRelease and Packages indexes were served to anyone who could
+    // reach the public virtual parent.
+    let members =
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
     };
@@ -2090,6 +2105,7 @@ async fn maybe_invalidate_by_epoch(
 ///     silently falling through to an empty local DB.
 async fn try_virtual_dists_detecting_change(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
     distribution: &str,
@@ -2097,7 +2113,13 @@ async fn try_virtual_dists_detecting_change(
     default_content_type: &'static str,
 ) -> Result<Option<Response>, Response> {
     let _ = virtual_repo_key;
-    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+    // Caller-authorized member walk (#3323). The per-member
+    // `virtual_member_dists_allowed` gate below is the MEMBER's own dist/
+    // component/arch allowlist, not a caller check — a private member's
+    // Release, InRelease and Packages indexes were served to anyone who could
+    // reach the public virtual parent.
+    let members =
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
     };
@@ -2195,9 +2217,11 @@ async fn local_release_content(
 
 async fn release_file(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    let (proxy, repo) =
+        DebianProxy::resolve(&state, auth.as_ref(), &repo_key, &distribution).await?;
     // #2460 P2: deny a distribution outside the operator allowlist before any
     // upstream fetch, gating on the reqwest-normalised path. An allowed
     // distribution passes through unchanged so the P1 signed-Release integrity
@@ -2225,9 +2249,11 @@ async fn release_file(
 
 async fn in_release_file(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    let (proxy, repo) =
+        DebianProxy::resolve(&state, auth.as_ref(), &repo_key, &distribution).await?;
     // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch),
     // gating on the reqwest-normalised path.
     if let Some(base) = repo_remote_upstream(&repo) {
@@ -2285,9 +2311,11 @@ async fn in_release_file(
 
 async fn release_gpg(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    let (proxy, repo) =
+        DebianProxy::resolve(&state, auth.as_ref(), &repo_key, &distribution).await?;
     // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch),
     // gating on the reqwest-normalised path.
     if let Some(base) = repo_remote_upstream(&repo) {
@@ -2416,9 +2444,11 @@ fn build_packages_xz(entries: &[PackageEntry]) -> Result<Vec<u8>, io::Error> {
 
 async fn packages_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    let (proxy, repo) =
+        DebianProxy::resolve(&state, auth.as_ref(), &repo_key, &distribution).await?;
     let packages_suffix = packages_index_suffix(&component, &binary_arch, "");
     proxy
         .dists(&packages_suffix, "text/plain; charset=utf-8", &repo)
@@ -2443,9 +2473,11 @@ async fn packages_index(
 
 async fn packages_index_gz(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    let (proxy, repo) =
+        DebianProxy::resolve(&state, auth.as_ref(), &repo_key, &distribution).await?;
     let packages_gz_suffix = packages_index_suffix(&component, &binary_arch, "gz");
     proxy
         .dists(&packages_gz_suffix, "application/gzip", &repo)
@@ -2478,9 +2510,11 @@ async fn packages_index_gz(
 
 async fn packages_index_xz(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    let (proxy, repo) =
+        DebianProxy::resolve(&state, auth.as_ref(), &repo_key, &distribution).await?;
     let packages_xz_suffix = packages_index_suffix(&component, &binary_arch, "xz");
     proxy
         .dists(&packages_xz_suffix, "application/x-xz", &repo)
@@ -2551,6 +2585,7 @@ fn parse_packages_request(dists_path: &str) -> Option<PackagesRequest> {
 /// handler and forwards everything else to the upstream proxy catch-all.
 async fn dists_dispatch(
     state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     if let Some(req) = parse_packages_request(&dists_path) {
@@ -2566,12 +2601,12 @@ async fn dists_dispatch(
 
         let path = Path((repo_key, distribution, req.component, req.binary_arch));
         return match req.ext {
-            PackagesExt::Plain => packages_index(state, path).await,
-            PackagesExt::Gz => packages_index_gz(state, path).await,
-            PackagesExt::Xz => packages_index_xz(state, path).await,
+            PackagesExt::Plain => packages_index(state, auth, path).await,
+            PackagesExt::Gz => packages_index_gz(state, auth, path).await,
+            PackagesExt::Xz => packages_index_xz(state, auth, path).await,
         };
     }
-    dists_proxy_catchall(state, Path((repo_key, distribution, dists_path))).await
+    dists_proxy_catchall(state, auth, Path((repo_key, distribution, dists_path))).await
 }
 
 /// Catch-all handler for dists metadata that does not have a dedicated route.
@@ -2584,6 +2619,7 @@ async fn dists_dispatch(
 /// metadata files are generated on-the-fly only through the dedicated routes.
 async fn dists_proxy_catchall(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
@@ -2621,6 +2657,7 @@ async fn dists_proxy_catchall(
     if repo.repo_type == RepositoryType::Virtual {
         let resp = try_virtual_dists(
             &state,
+            auth.as_ref(),
             repo.id,
             &repo_key,
             &distribution,
@@ -5085,6 +5122,7 @@ mod virtual_dists_cap_tests {
 
         let first = try_virtual_dists(
             &state,
+            None,
             virtual_id,
             &virtual_key,
             DIST,
@@ -5094,6 +5132,7 @@ mod virtual_dists_cap_tests {
         .await;
         let second = try_virtual_dists(
             &state,
+            None,
             virtual_id,
             &virtual_key,
             DIST,
@@ -5146,6 +5185,7 @@ mod virtual_dists_cap_tests {
 
         let out = try_virtual_dists(
             &state,
+            None,
             virtual_id,
             &virtual_key,
             DIST,
@@ -5193,6 +5233,7 @@ mod virtual_dists_cap_tests {
 
         let out = try_virtual_dists(
             &state,
+            None,
             virtual_id,
             &virtual_key,
             DIST,
@@ -5239,6 +5280,7 @@ mod virtual_dists_cap_tests {
 
         let out = try_virtual_dists_detecting_change(
             &state,
+            None,
             virtual_id,
             &virtual_key,
             DIST,
@@ -5280,6 +5322,7 @@ mod virtual_dists_cap_tests {
 
         let out = try_virtual_dists_detecting_change(
             &state,
+            None,
             virtual_id,
             &virtual_key,
             DIST,
@@ -5355,6 +5398,7 @@ mod virtual_dists_cap_tests {
 
         let out = try_virtual_dists(
             &state,
+            None,
             virtual_id,
             &virtual_key,
             DIST,

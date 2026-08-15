@@ -100,13 +100,19 @@ async fn resolve_nuget_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 /// non-virtual repos) so callers can additionally proxy remote members.
 async fn effective_local_repo_ids(
     db: &PgPool,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
 ) -> Result<(Vec<uuid::Uuid>, Vec<crate::models::repository::Repository>), Response> {
     if repo.repo_type != RepositoryType::Virtual {
         return Ok((vec![repo.id], Vec::new()));
     }
 
-    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+    // Caller-authorized member walk (#3323). Every consumer of this function
+    // renders CONTENT from the ids it returns — the V3 search results, the
+    // registration and flat-container version indexes, the V2 OData feed — and
+    // it also returns the member list the remote half of those handlers proxies
+    // through, so both halves must be the set this caller may read directly.
+    let members = proxy_helpers::authorized_virtual_members(db, auth, repo.id).await?;
     let local_ids: Vec<uuid::Uuid> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
@@ -887,6 +893,7 @@ struct SearchPackageRow {
 
 async fn search_packages(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     Query(params): Query<SearchQuery>,
     base_url: RequestBaseUrl,
@@ -906,7 +913,7 @@ async fn search_packages(
 
     // Federate over virtual members (local/staging) when the repo is virtual;
     // otherwise query the repo itself.
-    let (repo_ids, members) = effective_local_repo_ids(&state.db, &repo).await?;
+    let (repo_ids, members) = effective_local_repo_ids(&state.db, auth.as_ref(), &repo).await?;
 
     // Pull the latest-by-created_at description per package via a LATERAL
     // join so the search payload carries the package summary instead of a
@@ -1097,6 +1104,7 @@ async fn search_packages(
 
 async fn registration_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package_id)): Path<(String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -1107,7 +1115,7 @@ async fn registration_index(
 
     // Resolve the set of local repo IDs to query: the repo itself, or all
     // local/staging members for a virtual repo.
-    let (repo_ids, members) = effective_local_repo_ids(&state.db, &repo).await?;
+    let (repo_ids, members) = effective_local_repo_ids(&state.db, auth.as_ref(), &repo).await?;
 
     // Fetch all versions of this package across the effective repo IDs.
     let artifacts = sqlx::query!(
@@ -1265,6 +1273,7 @@ async fn registration_index(
 
 async fn flatcontainer_versions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package_id)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
@@ -1272,7 +1281,7 @@ async fn flatcontainer_versions(
 
     // Resolve the set of local repo IDs to query: the repo itself, or all
     // local/staging members for a virtual repo.
-    let (repo_ids, members) = effective_local_repo_ids(&state.db, &repo).await?;
+    let (repo_ids, members) = effective_local_repo_ids(&state.db, auth.as_ref(), &repo).await?;
 
     let mut versions: Vec<String> = sqlx::query_scalar(
         r#"
@@ -1421,7 +1430,17 @@ async fn flatcontainer_download(
                 // Remote members need V3 service-index discovery to resolve the
                 // real `PackageBaseAddress`, so try them explicitly first (#2775).
                 if let Some(proxy) = state.proxy_service.as_deref() {
-                    let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                    // Caller-authorized member walk (#3323): `auth` was already
+                    // threaded to `resolve_virtual_download` below but not to
+                    // this Remote-member loop, so a private Remote member's
+                    // upstream — potentially reached with that member's stored
+                    // credentials — was proxied for any caller.
+                    let members = proxy_helpers::authorized_virtual_members(
+                        &state.db,
+                        auth.as_ref(),
+                        repo.id,
+                    )
+                    .await?;
                     let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
                     for member in &members {
                         if member.repo_type != RepositoryType::Remote {
@@ -2027,6 +2046,7 @@ async fn v2_odata(
 
     let entries = load_hosted_v2_entries(
         &state,
+        auth.as_ref(),
         &repo,
         id_filter.as_deref(),
         version_filter.as_deref(),
@@ -2097,11 +2117,12 @@ fn bounded_cache_segment(raw: &str) -> String {
 /// id/version. Federates over virtual local members like the V3 handlers.
 async fn load_hosted_v2_entries(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     id_filter: Option<&str>,
     version_filter: Option<&str>,
 ) -> Result<Vec<V2Entry>, Response> {
-    let (repo_ids, _members) = effective_local_repo_ids(&state.db, repo).await?;
+    let (repo_ids, _members) = effective_local_repo_ids(&state.db, auth, repo).await?;
     let id_lower = id_filter.map(|s| s.to_lowercase());
     let rows = sqlx::query!(
         r#"
@@ -4455,6 +4476,7 @@ mod read_db_tests {
 
         let resp = super::search_packages(
             axum::extract::State(state),
+            axum::Extension(None),
             axum::extract::Path(fx.repo_key.clone()),
             axum::extract::Query(SearchQuery {
                 q: Some("newtonsoft".to_string()),
@@ -4619,6 +4641,7 @@ mod read_db_tests {
 
         let resp = super::registration_index(
             axum::extract::State(state.clone()),
+            axum::Extension(None),
             axum::extract::Path((fx.repo_key.clone(), "Newtonsoft.Json".to_string())),
             crate::api::extractors::RequestBaseUrl("https://ak.example".to_string()),
         )
@@ -4685,6 +4708,7 @@ mod read_db_tests {
 
         let resp = super::flatcontainer_versions(
             axum::extract::State(state.clone()),
+            axum::Extension(None),
             axum::extract::Path((fx.repo_key.clone(), "Newtonsoft.Json".to_string())),
         )
         .await;

@@ -71,9 +71,13 @@ async fn resolve_cran_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Resp
 /// member indexes via proxy, concatenating them with newline separators.
 async fn build_virtual_combined_index(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
 ) -> Result<String, Response> {
-    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+    // Caller-authorized member walk (#3323): the PACKAGES index is content, so
+    // a member this caller may not read directly must not contribute entries.
+    let members =
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
     let mut combined = String::new();
 
     for member in &members {
@@ -90,6 +94,7 @@ async fn build_virtual_combined_index(
 
     let remote_indexes = proxy_helpers::collect_virtual_metadata(
         &state.db,
+        auth,
         state.proxy_service.as_deref(),
         virtual_repo_id,
         "src/contrib/PACKAGES",
@@ -119,12 +124,13 @@ async fn build_virtual_combined_index(
 
 async fn package_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Virtual {
-        let combined = build_virtual_combined_index(&state, repo.id).await?;
+        let combined = build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -149,12 +155,13 @@ async fn package_index(
 
 async fn package_index_gz(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Virtual {
-        let combined = build_virtual_combined_index(&state, repo.id).await?;
+        let combined = build_virtual_combined_index(&state, auth.as_ref(), repo.id).await?;
         let compressed = gzip_compress(combined.as_bytes()).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

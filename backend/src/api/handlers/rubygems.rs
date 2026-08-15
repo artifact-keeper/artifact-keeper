@@ -77,6 +77,7 @@ async fn resolve_rubygems_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
 
 async fn gem_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
@@ -131,6 +132,7 @@ async fn gem_info(
     if repo.repo_type == RepositoryType::Virtual {
         return proxy_helpers::resolve_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             &format!("api/v1/gems/{}.json", gem_name),
@@ -512,11 +514,13 @@ fn parse_upstream_specs(bytes: &[u8]) -> Result<Vec<serde_json::Value>, Response
 /// Collect remote specs from virtual members, decompress and parse each one.
 async fn collect_remote_specs(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     upstream_path: &str,
 ) -> Result<Vec<serde_json::Value>, Response> {
     let remote_specs = proxy_helpers::collect_virtual_metadata(
         &state.db,
+        auth,
         state.proxy_service.as_deref(),
         virtual_repo_id,
         upstream_path,
@@ -588,16 +592,19 @@ fn specs_to_gzip_response(specs: &[serde_json::Value]) -> Result<Response, Respo
 
 async fn specs_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
 
     // Virtual repo: merge specs from all local and remote members
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the spec index is content.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut all_specs = query_local_member_specs(&state.db, &members, SPECS_QUERY).await?;
 
-        let remote = collect_remote_specs(&state, repo.id, "specs.4.8.gz").await?;
+        let remote = collect_remote_specs(&state, auth.as_ref(), repo.id, "specs.4.8.gz").await?;
         all_specs.extend(remote);
 
         return specs_to_gzip_response(&all_specs);
@@ -613,6 +620,7 @@ async fn specs_index(
 
 async fn latest_specs_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
@@ -620,11 +628,14 @@ async fn latest_specs_index(
     // Virtual repo: merge latest specs from all local and remote members,
     // then deduplicate by gem name (keep the first occurrence per name).
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the spec index is content.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut all_specs =
             query_local_member_specs(&state.db, &members, LATEST_SPECS_QUERY).await?;
 
-        let remote = collect_remote_specs(&state, repo.id, "latest_specs.4.8.gz").await?;
+        let remote =
+            collect_remote_specs(&state, auth.as_ref(), repo.id, "latest_specs.4.8.gz").await?;
         all_specs.extend(remote);
 
         // Deduplicate by gem name, keeping the first occurrence (higher-priority member wins)
@@ -652,17 +663,21 @@ async fn latest_specs_index(
 
 async fn prerelease_specs_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
 
     // Virtual repo: merge prerelease specs from all local and remote members.
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the spec index is content.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut all_specs =
             query_local_member_specs(&state.db, &members, PRERELEASE_SPECS_QUERY).await?;
 
-        let remote = collect_remote_specs(&state, repo.id, "prerelease_specs.4.8.gz").await?;
+        let remote =
+            collect_remote_specs(&state, auth.as_ref(), repo.id, "prerelease_specs.4.8.gz").await?;
         all_specs.extend(remote);
 
         return specs_to_gzip_response(&all_specs);
@@ -782,6 +797,7 @@ fn quick_spec_response(spec: &crate::formats::rubygems::GemSpec) -> Result<Respo
 
 async fn quick_spec(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, spec_file)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
@@ -794,7 +810,9 @@ async fn quick_spec(
 
     if repo.repo_type == RepositoryType::Virtual {
         // Prefer a locally published member (mirrors the download shadowing rule).
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the spec index is content.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 if let Some(spec) = find_local_quick_spec(&state.db, member.id, full_name).await? {
@@ -809,6 +827,7 @@ async fn quick_spec(
         // member that declared none.
         return proxy_helpers::resolve_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             &format!("quick/Marshal.4.8/{}", spec_file),

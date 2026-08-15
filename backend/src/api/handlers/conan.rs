@@ -944,6 +944,7 @@ async fn package_latest_from_remote(
 
 async fn search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Response, Response> {
@@ -965,7 +966,11 @@ async fn search(
         // Walk virtual members in priority order. Hosted members are queried
         // directly; remote members are forwarded to their upstream. Each
         // member's results are merged and deduped.
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         for member in &members {
             if member.repo_type.is_hosted() {
                 let local = search_recipes_for_repo(&state.db, member.id, &like_pattern)
@@ -1066,6 +1071,7 @@ async fn latest_recipe_revision_for_repo(
 
 async fn recipe_latest(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
@@ -1080,7 +1086,11 @@ async fn recipe_latest(
     // used by `recipe_file_download`. Remote member aggregation is deferred to
     // a follow-up; only hosted (Local/Staging) members are consulted here.
     let revision = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut found: Option<String> = None;
         for member in &members {
             if !member.repo_type.is_hosted() {
@@ -1207,6 +1217,7 @@ async fn recipe_revisions_for_repo(
 
 async fn recipe_revisions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
@@ -1219,7 +1230,11 @@ async fn recipe_revisions(
     // union of revisions, deduped by revision id, ordered by newest first.
     // Remote-member aggregation is deferred (matches recipe_latest semantics).
     let rows = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut seen = std::collections::HashSet::<String>::new();
         let mut merged: Vec<RecipeRevisionRow> = Vec::new();
         for member in &members {
@@ -1339,6 +1354,7 @@ async fn package_ids_for_recipe_revision(
 
 async fn recipe_package_search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision)): Path<(
         String,
         String,
@@ -1364,7 +1380,11 @@ async fn recipe_package_search(
     };
 
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         for member in &members {
             if member.repo_type.is_hosted() {
                 let ids = package_ids_for_recipe_revision(
@@ -1478,6 +1498,7 @@ async fn recipe_files_list_for_repo(
 
 async fn recipe_files_list(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision)): Path<(
         String,
         String,
@@ -1492,7 +1513,11 @@ async fn recipe_files_list(
     // For virtual repos, walk hosted members in priority order and merge the
     // union of file names, deduped. Order matches recipe_revisions semantics.
     let filenames: Vec<String> = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut seen = std::collections::HashSet::<String>::new();
         let mut merged: Vec<String> = Vec::new();
         for member in &members {
@@ -1925,6 +1950,7 @@ async fn latest_package_revision_for_repo(
 
 async fn package_latest(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision, package_id)): Path<(
         String,
         String,
@@ -1941,7 +1967,11 @@ async fn package_latest(
     // return the first member that has a matching package revision. Matches
     // recipe_latest semantics. Remote-member aggregation is deferred.
     let pkg_revision = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut found: Option<String> = None;
         for member in &members {
             if !member.repo_type.is_hosted() {
@@ -2090,6 +2120,7 @@ async fn package_revisions_for_repo(
 
 async fn package_revisions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision, package_id)): Path<(
         String,
         String,
@@ -2105,7 +2136,11 @@ async fn package_revisions(
     // Virtual fan-out: union of package revisions across hosted members,
     // deduped by revision id and re-sorted by newest first.
     let rows = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut seen = std::collections::HashSet::<String>::new();
         let mut merged: Vec<PackageRevisionRow> = Vec::new();
         for member in &members {
@@ -2234,6 +2269,7 @@ async fn package_files_list_for_repo(
 #[allow(clippy::type_complexity)]
 async fn package_files_list(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision)): Path<(
         String,
         String,
@@ -2250,7 +2286,11 @@ async fn package_files_list(
     // Virtual fan-out: union of package file names across hosted members,
     // deduped by file name.
     let filenames: Vec<String> = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut seen = std::collections::HashSet::<String>::new();
         let mut merged: Vec<String> = Vec::new();
         for member in &members {

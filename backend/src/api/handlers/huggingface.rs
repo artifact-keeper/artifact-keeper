@@ -759,6 +759,7 @@ async fn fetch_upstream_commit_sha(
 ///     artifact row), not through this function.
 async fn ensure_resolve_metadata_headers(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     model_id: &str,
     revision: &str,
@@ -785,7 +786,8 @@ async fn ensure_resolve_metadata_headers(
     // Virtual: only a local member's bytes get local metadata. If no local
     // member owns this path the serve came from a Remote member, and whatever
     // that member's upstream said (possibly nothing) is the honest answer.
-    let Some(checksum) = virtual_member_checksum(&state.db, repo.id, artifact_path).await else {
+    let Some(checksum) = virtual_member_checksum(&state.db, auth, repo.id, artifact_path).await
+    else {
         return;
     };
     apply_local_metadata_headers(resp, Some(&checksum), model_id, revision);
@@ -856,14 +858,28 @@ fn insert_header_if_valid(resp: &mut Response, name: &str, value: &str) {
 /// download proceeds without the header.
 async fn virtual_member_checksum(
     db: &PgPool,
+    auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     artifact_path: &str,
 ) -> Option<String> {
+    // Caller-authorized member set (#3323). The bytes are resolved through the
+    // authorized `resolve_virtual_download`, but this header query re-derived
+    // the winner from an UNFILTERED member walk — so a caller served from
+    // public member B could receive private member A's `checksum_sha256`. That
+    // is both a metadata oracle and a plain correctness bug: the ETag then
+    // describes bytes that were not sent. Constraining the query to the same
+    // member set the download used makes the two agree by construction.
+    let member_ids: Vec<uuid::Uuid> =
+        match proxy_helpers::authorized_virtual_members(db, auth, virtual_repo_id).await {
+            Ok(members) => members.into_iter().map(|m| m.id).collect(),
+            Err(_) => return None,
+        };
     match sqlx::query_scalar::<_, Option<String>>(
         "SELECT a.checksum_sha256 FROM artifacts a \
          JOIN virtual_repo_members vrm ON vrm.member_repo_id = a.repository_id \
          JOIN repositories r ON r.id = a.repository_id \
          WHERE vrm.virtual_repo_id = $1 \
+           AND a.repository_id = ANY($3) \
            AND r.repo_type != 'remote' \
            AND a.path = $2 \
            AND a.is_deleted = false \
@@ -872,6 +888,7 @@ async fn virtual_member_checksum(
     )
     .bind(virtual_repo_id)
     .bind(artifact_path)
+    .bind(&member_ids)
     .fetch_optional(db)
     .await
     {
@@ -992,6 +1009,7 @@ async fn download_file_impl(
             // entirely whenever the header came through.
             ensure_resolve_metadata_headers(
                 &state,
+                auth.as_ref(),
                 &repo,
                 &model_id,
                 &revision,
@@ -2939,9 +2957,10 @@ mod tests {
         .await
         .expect("insert member artifact");
 
-        let found = virtual_member_checksum(&f.pool, f.repo_id, artifact_path).await;
+        let found = virtual_member_checksum(&f.pool, None, f.repo_id, artifact_path).await;
         let missing = virtual_member_checksum(
             &f.pool,
+            None,
             f.repo_id,
             "sentence-transformers/all-MiniLM-L6-v2/main/absent.json",
         )

@@ -701,6 +701,7 @@ fn resolve_apkindex_signature(
 
 async fn apk_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, branch, repository, arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
@@ -739,7 +740,11 @@ async fn apk_index(
     // upstream-signed indexes are returned when available.
     if repo.repo_type == RepositoryType::Virtual {
         let upstream_path = build_apk_index_upstream_path(&branch, &repository, &arch);
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): a private Remote member's
+        // upstream index — potentially fetched with that member's credentials —
+        // must not be proxied to a caller who cannot read the member.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
 
         for member in &members {
             if member.repo_type != RepositoryType::Remote {

@@ -341,6 +341,7 @@ async fn enforce_pypi_curation(
 
 async fn simple_root(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
@@ -397,7 +398,11 @@ async fn simple_root(
     // from all member repos so that the root index lists every package
     // available through the virtual endpoint.
     if merged.is_empty() && repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the root index is content, so
+        // a member this caller may not read directly must not contribute its
+        // project names to it.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
 
         for member in &members {
             if member.repo_type == RepositoryType::Local
@@ -739,6 +744,7 @@ async fn pypi_project_tracks_for(
 
 async fn simple_project(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, project)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
@@ -933,7 +939,16 @@ async fn simple_project(
         // package that exists partially in a local member doesn't shadow
         // the rest of upstream. See #1230.
         if repo.repo_type == RepositoryType::Virtual {
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            // Caller-authorized member walk (#3323). Only the CONTENT walk is
+            // narrowed: the PEP 708 isolation decision below
+            // (`pypi_virtual_isolates_name`) and the priority map that feeds it
+            // deliberately keep looking at every member, because narrowing an
+            // isolation/shadowing decision by caller visibility would drop the
+            // isolation a member the caller cannot see asserts and re-expose
+            // the upstream name — dependency confusion.
+            let members =
+                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await?;
 
             if members.is_empty() {
                 return Err(
@@ -9496,6 +9511,7 @@ mod tests {
         headers.insert("accept", PEP691_JSON_CONTENT_TYPE.parse().unwrap());
         let result = super::simple_project(
             axum::extract::State(state.clone()),
+            axum::Extension(None),
             axum::extract::Path((fx.repo_key.clone(), project.to_string())),
             headers,
         )
@@ -11221,6 +11237,7 @@ mod tests {
         // their hrefs to the local repo (not the upstream URL).
         let result = super::simple_root(
             axum::extract::State(state.clone()),
+            axum::Extension(None),
             axum::extract::Path(fx.repo_key.clone()),
             HeaderMap::new(),
         )
@@ -11260,6 +11277,7 @@ mod tests {
         // upstream HEAD/GET. Package list must still be the same.
         let result2 = super::simple_root(
             axum::extract::State(state.clone()),
+            axum::Extension(None),
             axum::extract::Path(fx.repo_key.clone()),
             HeaderMap::new(),
         )
@@ -15349,5 +15367,142 @@ mod content_encoding_forwarding_tests {
         let (status, body, _headers) = tdh::collect_response(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], payload);
+    }
+}
+
+/// #3323 regression: the PyPI simple index must not disclose a PRIVATE virtual
+/// member's projects, versions or filenames to a caller who could not read that
+/// member directly.
+///
+/// `serve_file` (the BYTES) was gated by #2073; the INDEX was not. `simple_root`
+/// and `simple_project` walked `fetch_virtual_members` unfiltered and neither
+/// handler bound an auth extractor at all, so a public virtual parent published
+/// a private member's full project list and per-project file list — names,
+/// versions and SHA-256 hashes — to anonymous callers. Both handlers now bind
+/// the caller and resolve members through
+/// `proxy_helpers::authorized_virtual_members`.
+#[cfg(test)]
+mod virtual_index_member_authz_tests {
+    use axum::http::HeaderMap;
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Seed one sdist row on a member so it can appear in the index.
+    async fn seed_member_project(
+        pool: &sqlx::PgPool,
+        member_id: uuid::Uuid,
+        project: &str,
+        version: &str,
+        uploaded_by: uuid::Uuid,
+    ) {
+        let filename = format!("{project}-{version}.tar.gz");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 42, $5, 'application/gzip', $2, $6)",
+        )
+        .bind(member_id)
+        .bind(&filename)
+        .bind(project)
+        .bind(version)
+        .bind(format!("{:0>64}", project))
+        .bind(uploaded_by)
+        .execute(pool)
+        .await
+        .expect("seed member project");
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: test-only read of a bounded simple-index document.
+    async fn body_of(result: Result<axum::response::Response, axum::response::Response>) -> String {
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => r,
+        };
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn simple_index_hides_a_private_members_projects_from_an_anonymous_caller() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (private_id, _pk, private_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        let (public_id, _puk, public_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(public_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish the public member");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, private_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, public_id, 2).await;
+        seed_member_project(&fx.pool, private_id, "secretpkg", "1.0.0", fx.user_id).await;
+        seed_member_project(&fx.pool, public_id, "openpkg", "2.0.0", fx.user_id).await;
+
+        // Root index, anonymous: only the public member's project.
+        let root = body_of(
+            super::simple_root(
+                axum::extract::State(fx.state.clone()),
+                axum::Extension(None),
+                axum::extract::Path(fx.repo_key.clone()),
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            root.contains("openpkg"),
+            "positive control: the PUBLIC member's project must still be listed, got {root}"
+        );
+        assert!(
+            !root.contains("secretpkg"),
+            "#3323: the root index must not disclose a PRIVATE member's project names \
+             to an anonymous caller, got {root}"
+        );
+
+        // Per-project index, anonymous: the private member's files must not
+        // surface, and the project must read as absent.
+        let project = body_of(
+            super::simple_project(
+                axum::extract::State(fx.state.clone()),
+                axum::Extension(None),
+                axum::extract::Path((fx.repo_key.clone(), "secretpkg".to_string())),
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            !project.contains("secretpkg-1.0.0.tar.gz"),
+            "#3323: the per-project index must not disclose a PRIVATE member's \
+             filenames to an anonymous caller, got {project}"
+        );
+
+        // Positive control: an admin sees it, so this is authorization and not
+        // a blanket break of virtual index aggregation.
+        let admin = tdh::admin_auth(fx.user_id, &fx.username);
+        let admin_project = body_of(
+            super::simple_project(
+                axum::extract::State(fx.state.clone()),
+                axum::Extension(Some(admin)),
+                axum::extract::Path((fx.repo_key.clone(), "secretpkg".to_string())),
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            admin_project.contains("secretpkg-1.0.0.tar.gz"),
+            "an admin must still resolve the private member's project through the \
+             virtual repo, got {admin_project}"
+        );
+
+        tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
+        fx.teardown().await;
     }
 }

@@ -211,9 +211,11 @@ async fn handle_get(
     let request = parse_path(&path)?;
 
     match request {
-        GoProxyRequest::List { module } => list_versions(&state, &repo, &module).await,
+        GoProxyRequest::List { module } => {
+            list_versions(&state, auth.as_ref(), &repo, &module).await
+        }
         GoProxyRequest::Info { module, version } => {
-            version_info(&state, &repo, &module, &version).await
+            version_info(&state, auth.as_ref(), &repo, &module, &version).await
         }
         GoProxyRequest::Mod { module, version } => {
             get_mod_file(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
@@ -221,7 +223,9 @@ async fn handle_get(
         GoProxyRequest::Zip { module, version } => {
             download_zip(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
         }
-        GoProxyRequest::Latest { module } => latest_version(&state, &repo, &module).await,
+        GoProxyRequest::Latest { module } => {
+            latest_version(&state, auth.as_ref(), &repo, &module).await
+        }
         GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
     }
 }
@@ -364,6 +368,7 @@ async fn handle_put(
 /// back to the local/not-found response.
 async fn try_proxy_go_metadata(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     upstream_path: &str,
     default_content_type: &str,
@@ -405,6 +410,7 @@ async fn try_proxy_go_metadata(
         let ct = default_content_type.to_string();
         if let Ok(resp) = proxy_helpers::resolve_virtual_metadata(
             &state.db,
+            auth,
             state.proxy_service.as_deref(),
             repo.id,
             upstream_path,
@@ -470,6 +476,7 @@ fn filter_version_list(body: &str, blocked: &std::collections::HashSet<String>) 
 ///   e.g. via [`proxy_helpers::forward_verbatim_metadata`].
 async fn fetch_go_metadata_with_source(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     upstream_path: &str,
 ) -> Option<(uuid::Uuid, Bytes, Option<String>)> {
@@ -489,7 +496,11 @@ async fn fetch_go_metadata_with_source(
         return Some((repo.id, content, content_encoding));
     }
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
+        // Caller-authorized member walk (#3323): a Remote member may hold
+        // credentials for a private upstream feed, so proxying one for a caller
+        // who cannot read that member would launder a credentialed private
+        // index to them. The sibling `download_zip` was already gated this way.
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
             .await
             .ok()?;
         for member in members {
@@ -707,6 +718,7 @@ async fn go_version_exists_upstream(
 
 async fn list_versions(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     module: &str,
 ) -> Result<Response, Response> {
@@ -739,21 +751,29 @@ async fn list_versions(
         // not consult. Aggregate distinct versions across those members so
         // a module stored only in a Local member is listed (#1782).
         if repo.repo_type == RepositoryType::Virtual {
+            // Caller-authorized member set (#3323). This walk used to join
+            // `virtual_repo_members` directly, which no visibility predicate
+            // reaches; the member ids are now resolved through the shared
+            // authorization helper and the query constrained to them.
+            let member_ids: Vec<uuid::Uuid> =
+                proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
+                    .await?
+                    .into_iter()
+                    .filter(|m| m.repo_type != crate::models::repository::RepositoryType::Remote)
+                    .map(|m| m.id)
+                    .collect();
             let member_versions: Vec<Option<String>> = sqlx::query_scalar(
                 r#"
                 SELECT DISTINCT a.version
                 FROM artifacts a
-                INNER JOIN virtual_repo_members vrm ON a.repository_id = vrm.member_repo_id
-                INNER JOIN repositories member ON member.id = vrm.member_repo_id
-                WHERE vrm.virtual_repo_id = $1
-                  AND member.repo_type != 'remote'::repository_type
+                WHERE a.repository_id = ANY($1)
                   AND a.name = $2
                   AND a.is_deleted = false
                   AND a.version IS NOT NULL
                 ORDER BY a.version
                 "#,
             )
-            .bind(repo.id)
+            .bind(&member_ids)
             .bind(module)
             .fetch_all(&state.db)
             .await
@@ -772,7 +792,7 @@ async fn list_versions(
 
         let upstream_path = build_go_upstream_list_path(module);
         if let Some((source_repo_id, content, content_encoding)) =
-            fetch_go_metadata_with_source(state, repo, &upstream_path).await
+            fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await
         {
             // This arm REBUILDS the document (parse + age-gate filter), so a
             // declared coding must be stripped before parsing and dropped from
@@ -805,6 +825,7 @@ async fn list_versions(
 
 async fn version_info(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     module: &str,
     version: &str,
@@ -843,27 +864,40 @@ async fn version_info(
             // queries. Look across member repos for the earliest matching
             // artifact before falling through to the upstream proxy (#1782).
             if repo.repo_type == RepositoryType::Virtual {
-                if let Some(member_row) = sqlx::query!(
+                // Caller-authorized member set (#3323). Unlike the `list`
+                // sibling this walk carries no `repo_type` predicate — that
+                // asymmetry is preserved here deliberately, since narrowing it
+                // would change which versions the endpoint reports; only the
+                // caller-visibility filter is added.
+                let member_ids: Vec<uuid::Uuid> =
+                    proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
+                        .await?
+                        .into_iter()
+                        .map(|m| m.id)
+                        .collect();
+                // Runtime-checked (`query_scalar`, not `query!`) because the
+                // member-id array is bound rather than joined; the returned
+                // column is a single `timestamptz`.
+                if let Some(created_at) = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
                     r#"
                     SELECT a.created_at
                     FROM artifacts a
-                    INNER JOIN virtual_repo_members vrm ON a.repository_id = vrm.member_repo_id
-                    WHERE vrm.virtual_repo_id = $1
+                    WHERE a.repository_id = ANY($1)
                       AND a.name = $2
                       AND a.version = $3
                       AND a.is_deleted = false
                     ORDER BY a.created_at ASC
                     LIMIT 1
                     "#,
-                    repo.id,
-                    module,
-                    version
                 )
+                .bind(&member_ids)
+                .bind(module)
+                .bind(version)
                 .fetch_optional(&state.db)
                 .await
                 .map_err(crate::api::handlers::db_err)?
                 {
-                    let time_str = format_go_timestamp(&member_row.created_at);
+                    let time_str = format_go_timestamp(&created_at);
                     let info = build_version_info_json(version, &time_str);
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
@@ -875,7 +909,7 @@ async fn version_info(
 
             let upstream_path = build_go_upstream_path(module, version, "info");
             if let Ok(resp) =
-                try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
+                try_proxy_go_metadata(state, auth, repo, &upstream_path, "application/json").await
             {
                 return Ok(resp);
             }
@@ -1204,6 +1238,7 @@ async fn download_zip(
 
 async fn latest_version(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     module: &str,
 ) -> Result<Response, Response> {
@@ -1237,7 +1272,7 @@ async fn latest_version(
         Err(not_found) => {
             let upstream_path = build_go_upstream_latest_path(module);
             if let Some((source_repo_id, content, content_encoding)) =
-                fetch_go_metadata_with_source(state, repo, &upstream_path).await
+                fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await
             {
                 // Parse a DECODED copy for the age gate (#3280): a coded
                 // upstream body used to fail `from_slice` here and 404 the
@@ -1735,7 +1770,7 @@ mod tests {
 
         // First sight: the upstream-served list is the existence evidence,
         // both versions are observed and withheld.
-        let listed = list_versions(&state, &repo, module)
+        let listed = list_versions(&state, None, &repo, module)
             .await
             .expect("list must succeed");
         assert_eq!(body_string(listed).await, "", "young versions are withheld");
@@ -1749,7 +1784,7 @@ mod tests {
         assert_eq!(observations, 2, "listing observes every advertised version");
 
         // Young @latest is withheld as 404 (client falls back to the list).
-        let err = latest_version(&state, &repo, module)
+        let err = latest_version(&state, None, &repo, module)
             .await
             .expect_err("young latest must be withheld");
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
@@ -1798,7 +1833,7 @@ mod tests {
             .expect("remove temporary LKG fixture");
 
         // Version-addressed metadata stays readable while the zip is gated.
-        let info = version_info(&state, &repo, module, "v1.1.0")
+        let info = version_info(&state, None, &repo, module, "v1.1.0")
             .await
             .expect(".info is metadata and passes");
         assert_eq!(info.status(), StatusCode::OK);
@@ -1813,11 +1848,11 @@ mod tests {
         .await
         .expect("backdate observations");
 
-        let listed = list_versions(&state, &repo, module)
+        let listed = list_versions(&state, None, &repo, module)
             .await
             .expect("aged list must succeed");
         assert_eq!(body_string(listed).await, "v1.0.0\nv1.1.0");
-        let latest = latest_version(&state, &repo, module)
+        let latest = latest_version(&state, None, &repo, module)
             .await
             .expect("aged latest must serve");
         let latest_body = body_string(latest).await;

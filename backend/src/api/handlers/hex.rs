@@ -320,6 +320,7 @@ async fn public_key(
 
 async fn package_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
@@ -394,7 +395,12 @@ async fn package_info(
         // published name. Local-first lookup also avoids an unnecessary
         // network round-trip when the package is already known to a member.
         if repo.repo_type == RepositoryType::Virtual {
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            // Caller-authorized member walk (#3323): the registry document is
+            // content, so a member this caller may not read directly is neither
+            // consulted locally nor proxied.
+            let members =
+                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await?;
 
             // Pass 1+2: any member that already has artifact rows for this name.
             // Non-Remote members run first so they shadow Remote upstreams; this
@@ -420,6 +426,7 @@ async fn package_info(
             let upstream_path = format!("packages/{}", name);
             return proxy_helpers::resolve_virtual_metadata(
                 &state.db,
+                auth.as_ref(),
                 state.proxy_service.as_deref(),
                 repo.id,
                 &upstream_path,
@@ -1065,6 +1072,7 @@ fn canonical_hex_names(rows: &[(String, DateTime<Utc>)]) -> Vec<hex_registry::He
 
 async fn list_names(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
@@ -1134,11 +1142,16 @@ async fn list_names(
     }
     // Virtual: merge package names from all member repositories (local DB + remote proxy).
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323). This site additionally had no
+        // `repo_type` filter at all, so a Remote member's cached rows were
+        // exposed alongside the local ones.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut merged = query_local_member_names(&state.db, &members).await?;
 
         let remote_results = proxy_helpers::collect_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             "names",
@@ -1213,6 +1226,7 @@ fn canonical_hex_versions(rows: &[(String, String, DateTime<Utc>)]) -> Vec<(Stri
 
 async fn list_versions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
@@ -1290,11 +1304,14 @@ async fn list_versions(
     }
     // Virtual: merge versions from all member repositories (local DB + remote proxy).
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323).
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut merged = query_local_member_versions(&state.db, &members).await?;
 
         let remote_results = proxy_helpers::collect_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             "versions",
