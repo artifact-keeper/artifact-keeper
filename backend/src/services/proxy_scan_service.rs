@@ -19,6 +19,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::models::security::Severity;
 
 /// A persisted proxy scan verdict row.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -46,6 +47,75 @@ pub const VERDICT_ERROR: &str = "error";
 /// `error` is inconclusive (handled by the fail-open/closed decision, not here).
 pub fn verdict_blocks(verdict: &str) -> bool {
     verdict == VERDICT_VULNERABLE
+}
+
+/// The severity policy a repo applies to a BLOCKING (`vulnerable`) verdict on
+/// the inline proxy/OCI scan gate (#3243 stage 3 / #3246).
+///
+/// `scan_configs.block_on_policy_violation` (DEFAULT `false`, migration 022) is
+/// the explicit per-repo opt-in that makes `scan_configs.severity_threshold`
+/// enforced: when it is on, a finding at or above the threshold counts as a
+/// policy violation and blocks the pull — exactly the behavior both fields have
+/// always documented. When it is off (every repo that never touched it), the
+/// gate keeps its historical block-on-any-finding posture, so wiring the column
+/// changes nothing for a repository on defaults.
+///
+/// Fail-closed requirements (#3243):
+/// * a `vulnerable` verdict whose stored `max_severity` is NULL or unparseable
+///   (legacy rows) must still block even when a threshold is configured —
+///   serve only when the severity is KNOWN and strictly below the threshold;
+/// * an unparseable *configured* threshold falls back to block-on-any rather
+///   than guessing a level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxySeverityGate {
+    /// Historical posture (and the posture of every repo that has not opted
+    /// in): ANY finding blocks, severity not consulted.
+    BlockOnAny,
+    /// Opted-in posture: findings at or above this severity block; a verdict
+    /// whose highest severity is known and strictly below it serves.
+    Threshold(Severity),
+}
+
+impl ProxySeverityGate {
+    /// Derive the gate from a repo's `scan_configs` row. Absent row, opt-out,
+    /// or an unparseable stored threshold all mean [`Self::BlockOnAny`].
+    pub fn from_config(block_on_policy_violation: bool, severity_threshold: &str) -> Self {
+        if !block_on_policy_violation {
+            return Self::BlockOnAny;
+        }
+        match Severity::from_str_loose(severity_threshold) {
+            Some(t) => Self::Threshold(t),
+            // A configured-but-unparseable threshold must not weaken the gate.
+            None => Self::BlockOnAny,
+        }
+    }
+
+    /// Does a `vulnerable` verdict with this highest observed severity block?
+    ///
+    /// `None` (missing / unparseable stored `max_severity`) blocks under every
+    /// gate: an ungraded vulnerable verdict is fail-closed, never fail-open.
+    pub fn blocks(self, max_severity: Option<Severity>) -> bool {
+        match self {
+            Self::BlockOnAny => true,
+            Self::Threshold(t) => match max_severity {
+                None => true,
+                Some(s) => s.meets_threshold(t),
+            },
+        }
+    }
+
+    /// The stricter of two gates, for Virtual repos (stricter-of-two over the
+    /// virtual's own config and the member's, matching `stricter_scan_policy`).
+    /// `BlockOnAny` dominates; between two thresholds the one that blocks MORE
+    /// severities wins (`Severity` is ordered Critical=0 .. Info=4, and a
+    /// threshold blocks everything at-or-above it, so the numerically larger
+    /// variant is the stricter gate).
+    pub fn stricter(a: Self, b: Self) -> Self {
+        match (a, b) {
+            (Self::BlockOnAny, _) | (_, Self::BlockOnAny) => Self::BlockOnAny,
+            (Self::Threshold(x), Self::Threshold(y)) => Self::Threshold(x.max(y)),
+        }
+    }
 }
 
 /// Whether a cached verdict may be reused for a fresh pull.
@@ -335,11 +405,146 @@ impl ProxyScanService {
 
         Ok(())
     }
+
+    /// All stored verdict rows for one content digest, across scan types
+    /// (#3244 admin inspect). Runtime query (no macro) so the admin surface
+    /// adds no offline sqlx data.
+    pub async fn list_verdicts_for_digest(
+        &self,
+        checksum_sha256: &str,
+    ) -> Result<Vec<ProxyScanRow>> {
+        sqlx::query_as::<_, ProxyScanRow>(
+            r#"
+            SELECT checksum_sha256, scan_type, verdict,
+                   findings_count, critical_count, high_count, medium_count, low_count,
+                   max_severity, scanner_version, scanned_at
+            FROM proxy_scan_results
+            WHERE checksum_sha256 = $1
+            ORDER BY scan_type
+            "#,
+        )
+        .bind(checksum_sha256)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Delete every stored verdict row for one content digest, returning the
+    /// deleted rows (#3244 admin invalidate).
+    ///
+    /// Semantics are "force re-assessment on the next pull", NOT a waiver:
+    /// the next pull of the digest re-scans (inline under `fail_closed`,
+    /// async under `fail_open`) and re-records whatever the engine finds — a
+    /// still-flagged image immediately re-records `vulnerable`. Only the
+    /// stale/false-positive-since-fixed case is durably resolved by this.
+    pub async fn delete_verdicts_for_digest(
+        &self,
+        checksum_sha256: &str,
+    ) -> Result<Vec<ProxyScanRow>> {
+        sqlx::query_as::<_, ProxyScanRow>(
+            r#"
+            DELETE FROM proxy_scan_results
+            WHERE checksum_sha256 = $1
+            RETURNING checksum_sha256, scan_type, verdict,
+                      findings_count, critical_count, high_count, medium_count, low_count,
+                      max_severity, scanner_version, scanned_at
+            "#,
+        )
+        .bind(checksum_sha256)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // ProxySeverityGate (#3243 stage 3 / #3246)
+    // -----------------------------------------------------------------------
+
+    /// The opt-in boolean is load-bearing: with `block_on_policy_violation`
+    /// off (the column default), the stored threshold is inert and the gate is
+    /// the historical block-on-any — no repository changes behavior on
+    /// upgrade without an operator having flipped the toggle.
+    #[test]
+    fn severity_gate_requires_explicit_opt_in() {
+        assert_eq!(
+            ProxySeverityGate::from_config(false, "high"),
+            ProxySeverityGate::BlockOnAny,
+            "the default 'high' threshold must NOT weaken the gate while the \
+             opt-in is off"
+        );
+        assert_eq!(
+            ProxySeverityGate::from_config(true, "high"),
+            ProxySeverityGate::Threshold(Severity::High)
+        );
+        // Normalized vocabulary parses; junk fails closed to block-on-any.
+        assert_eq!(
+            ProxySeverityGate::from_config(true, "CRITICAL"),
+            ProxySeverityGate::Threshold(Severity::Critical)
+        );
+        assert_eq!(
+            ProxySeverityGate::from_config(true, "garbage"),
+            ProxySeverityGate::BlockOnAny,
+            "an unparseable configured threshold must fail closed"
+        );
+    }
+
+    /// The blocking decision itself: serve ONLY when the verdict's highest
+    /// severity is known and strictly below the threshold; everything else —
+    /// at/above threshold, unknown severity, no opt-in — blocks.
+    #[test]
+    fn severity_gate_blocks_fail_closed() {
+        let high = ProxySeverityGate::Threshold(Severity::High);
+        // At or above the threshold blocks.
+        assert!(high.blocks(Some(Severity::Critical)));
+        assert!(high.blocks(Some(Severity::High)));
+        // Strictly below serves.
+        assert!(!high.blocks(Some(Severity::Medium)));
+        assert!(!high.blocks(Some(Severity::Low)));
+        assert!(!high.blocks(Some(Severity::Info)));
+        // Fail closed: a legacy row with no stored max_severity blocks even
+        // with a threshold configured (#3243's hard requirement).
+        assert!(high.blocks(None));
+        // Block-on-any ignores severity entirely, including unknown.
+        assert!(ProxySeverityGate::BlockOnAny.blocks(Some(Severity::Info)));
+        assert!(ProxySeverityGate::BlockOnAny.blocks(None));
+        // Threshold(Info) blocks every KNOWN severity — "block on anything"
+        // stays expressible after opting in.
+        let info = ProxySeverityGate::Threshold(Severity::Info);
+        assert!(info.blocks(Some(Severity::Info)));
+        assert!(info.blocks(Some(Severity::Critical)));
+    }
+
+    /// Stricter-of-two for Virtual repos: `BlockOnAny` dominates, and between
+    /// two thresholds the one that blocks MORE severities wins — a virtual
+    /// repo can never become the lax route around a member's posture (#3025
+    /// direction).
+    #[test]
+    fn severity_gate_stricter_of_two() {
+        use ProxySeverityGate::*;
+        assert_eq!(
+            ProxySeverityGate::stricter(BlockOnAny, Threshold(Severity::Critical)),
+            BlockOnAny
+        );
+        assert_eq!(
+            ProxySeverityGate::stricter(Threshold(Severity::Critical), BlockOnAny),
+            BlockOnAny
+        );
+        // Threshold(Low) blocks {critical,high,medium,low}; Threshold(Critical)
+        // blocks only {critical} — Low is the stricter of the pair.
+        assert_eq!(
+            ProxySeverityGate::stricter(Threshold(Severity::Critical), Threshold(Severity::Low)),
+            Threshold(Severity::Low)
+        );
+        assert_eq!(
+            ProxySeverityGate::stricter(BlockOnAny, BlockOnAny),
+            BlockOnAny
+        );
+    }
 
     #[test]
     fn verdict_blocks_only_vulnerable() {

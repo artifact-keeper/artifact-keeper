@@ -100,4 +100,25 @@ pub struct CurationPackage {
     /// must be re-synced before a publish can include them — the publish path
     /// fails closed on missing metadata) and for non-RPM formats.
     pub primary_metadata: Option<serde_json::Value>,
+    /// Attestation verification state (#2955, migration 195):
+    /// `unverified` | `verified` | `failed`.
+    ///
+    /// These six columns were write-only until #3230: nothing carried them onto
+    /// this struct, so the `SELECT *` behind every catalog read decoded and
+    /// dropped them and each re-evaluation fell back to the fail-safe Flag. They
+    /// are read back through
+    /// [`crate::services::curation::attestation_verify::AttestationRecord`],
+    /// which is the only thing allowed to turn them into trust.
+    pub attestation_state: String,
+    /// Cert-bound workflow identity (SAN URI). Populated on success only.
+    pub attestation_identity: Option<String>,
+    /// Cert-bound OIDC issuer. Populated on success only.
+    pub attestation_issuer: Option<String>,
+    /// Cert-bound repository owner (org/user). Populated on success only.
+    pub attestation_owner: Option<String>,
+    /// When verification last ran (success or failure).
+    pub attestation_verified_at: Option<DateTime<Utc>>,
+    /// The specific failing-check reason (or unsupported reason); NULL on
+    /// success.
+    pub attestation_error: Option<String>,
 }

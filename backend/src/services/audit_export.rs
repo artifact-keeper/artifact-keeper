@@ -124,7 +124,8 @@ impl AuditAction {
             | AuditAction::AgeGateReopened
             | AuditAction::CurationSyncTriggered
             | AuditAction::CurationVersionCreated
-            | AuditAction::CurationVersionPublished => Outcome::Success,
+            | AuditAction::CurationVersionPublished
+            | AuditAction::ProxyScanVerdictDeleted => Outcome::Success,
         }
     }
 }

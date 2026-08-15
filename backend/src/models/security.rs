@@ -233,13 +233,18 @@ pub struct ScanConfig {
     pub scan_enabled: bool,
     pub scan_on_upload: bool,
     pub scan_on_proxy: bool,
-    /// Persisted and round-tripped through the API, but consulted by NO gate:
-    /// enforcement is driven by the separate `scan_policies` table
-    /// (`PolicyService::evaluate_artifact`). Wiring this up either direction is
-    /// a policy change (see #3144); disposition tracked in #3246.
+    /// The explicit per-repo opt-in that makes `severity_threshold` enforced
+    /// on the proxy/OCI inline scan gate (#3243 stage 3 / #3246, resolving the
+    /// #3144 disposition question by WIRING it). Default `false`: the gate
+    /// keeps its historical block-on-any-finding posture. When `true`, a
+    /// `vulnerable` verdict blocks only at-or-above `severity_threshold` —
+    /// see `ProxySeverityGate`. Hosted-artifact enforcement remains the
+    /// separate `scan_policies` table (`PolicyService::evaluate_artifact`).
     pub block_on_policy_violation: bool,
-    /// Persisted but consulted by no production gate (the inline proxy scan
-    /// gate deliberately blocks on ANY finding) — see #3243 before wiring up.
+    /// The severity floor the inline proxy scan gate blocks at, LIVE only when
+    /// `block_on_policy_violation` is set (#3243 stage 3 / #3246); inert on
+    /// the default-`false` opt-out, so the column default (`'high'`) cannot
+    /// silently weaken a gate nobody configured.
     pub severity_threshold: String,
     /// #2954: fail-open (default) vs fail-closed action for the inline proxy
     /// scan-on-fetch. `'fail_open'` | `'fail_closed'`.

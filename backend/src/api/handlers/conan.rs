@@ -1837,6 +1837,33 @@ async fn recipe_file_upload(
     .execute(&state.db)
     .await;
 
+    // Populate the packages catalog (the WebUI Packages tab reads the
+    // `packages` table, not `artifacts`) the same way the other hosted
+    // formats do (issue #2910). Keyed on the recipe reference —
+    // `name@user/channel`, collapsing to bare `name` for the default
+    // `_/_` — so recipe revisions and the multiple physical recipe files
+    // upsert into one catalog row per reference. Fire-and-forget so a
+    // packages-table failure never blocks the upload.
+    {
+        let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
+        pkg_svc
+            .try_create_or_update_from_artifact(
+                repo.id,
+                &conan_catalog_name(&name, &user, &channel),
+                &version,
+                size_bytes,
+                &checksum_sha256,
+                None,
+                Some(serde_json::json!({
+                    "format": "conan",
+                    "user": normalize_user(&user),
+                    "channel": normalize_channel(&channel),
+                    "reference": build_conan_reference(&name, &version, &user, &channel),
+                })),
+            )
+            .await;
+    }
+
     info!(
         "Conan recipe upload: {}/{} rev={} file={} to repo {}",
         name,
@@ -2695,6 +2722,23 @@ fn conan_glob_to_like(pattern: &str) -> String {
 /// Build a Conan reference string: `name/version@user/channel`.
 fn build_conan_reference(name: &str, version: &str, user: &str, channel: &str) -> String {
     format!("{}/{}@{}/{}", name, version, user, channel)
+}
+
+/// Catalog identity for a Conan recipe reference (issue #2910): bare `name`
+/// when user/channel are the Conan defaults (`_/_`), otherwise
+/// `name@user/channel`. Keeping user/channel in the key means distinct
+/// channels stay distinct rows under `UNIQUE(repository_id, name)` instead of
+/// overwriting each other; `'@'` cannot appear inside a Conan path segment
+/// (rejected by `validate_conan_segments`), so this never collides with a
+/// literal package name.
+fn conan_catalog_name(name: &str, user: &str, channel: &str) -> String {
+    let user = normalize_user(user);
+    let channel = normalize_channel(channel);
+    if user == "_" && channel == "_" {
+        name.to_string()
+    } else {
+        format!("{}@{}/{}", name, user, channel)
+    }
 }
 
 /// Build recipe metadata JSON.
@@ -5385,6 +5429,174 @@ mod tests {
 
             cleanup(&pool, repo_id, user_id).await;
             let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        /// Catalog-name identity rule (#2910): default `_/_` collapses to the
+        /// bare name; any explicit user/channel is kept in the key.
+        #[test]
+        fn conan_catalog_name_pins_reference_identity() {
+            use crate::api::handlers::conan::conan_catalog_name;
+
+            assert_eq!(conan_catalog_name("zlib", "_", "_"), "zlib");
+            assert_eq!(
+                conan_catalog_name("zlib", "myuser", "stable"),
+                "zlib@myuser/stable"
+            );
+            assert_eq!(
+                conan_catalog_name("zlib", "myuser", "testing"),
+                "zlib@myuser/testing"
+            );
+        }
+
+        /// Core red→green for #2910: a Conan recipe upload must land one row
+        /// in the `packages` catalog (what the WebUI Packages tab reads).
+        /// Fails on the pre-fix code, which never called `PackageService`.
+        #[tokio::test]
+        async fn recipe_upload_populates_packages_catalog() {
+            let Some(f) = TestFixture::setup("local").await else {
+                return;
+            };
+
+            let status = upload_recipe_file(
+                &f.state,
+                &f.auth,
+                &f.repo_key,
+                "zlib",
+                "1.3.1",
+                "_",
+                "_",
+                "rev1",
+                "conanmanifest.txt",
+                b"1 0\nconanfile.py: abc\n",
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+
+            let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+                "SELECT version, metadata FROM packages \
+                 WHERE repository_id = $1 AND name = 'zlib'",
+            )
+            .bind(f.repo_id)
+            .fetch_all(&f.pool)
+            .await
+            .expect("query packages catalog");
+            assert_eq!(
+                rows.len(),
+                1,
+                "recipe upload must create exactly one packages row"
+            );
+            let (version, metadata) = &rows[0];
+            assert_eq!(version, "1.3.1");
+            assert_eq!(metadata["format"], "conan");
+            assert_eq!(metadata["reference"], "zlib/1.3.1@_/_");
+
+            // The per-version row must land too.
+            let version_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM package_versions pv \
+                 JOIN packages p ON p.id = pv.package_id \
+                 WHERE p.repository_id = $1 AND p.name = 'zlib' \
+                   AND pv.version = '1.3.1'",
+            )
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("query package_versions");
+            assert_eq!(version_count, 1);
+
+            f.teardown().await;
+        }
+
+        /// Re-uploading the same file and uploading a second recipe revision
+        /// (plus a second physical recipe file) must all UPSERT into the same
+        /// catalog row — no duplicates (#2910).
+        #[tokio::test]
+        async fn recipe_reupload_and_new_revision_no_duplicate_catalog_rows() {
+            let Some(f) = TestFixture::setup("local").await else {
+                return;
+            };
+
+            for (revision, file_name, body) in [
+                ("rev1", "conanmanifest.txt", &b"1 0\nfirst\n"[..]),
+                ("rev1", "conanmanifest.txt", &b"1 0\nsecond bytes\n"[..]),
+                ("rev1", "conanfile.py", &b"class ZlibConan: pass\n"[..]),
+                ("rev2", "conanmanifest.txt", &b"1 0\nthird\n"[..]),
+            ] {
+                let status = upload_recipe_file(
+                    &f.state,
+                    &f.auth,
+                    &f.repo_key,
+                    "zlib",
+                    "1.3.1",
+                    "_",
+                    "_",
+                    revision,
+                    file_name,
+                    body,
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED);
+            }
+
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM packages \
+                 WHERE repository_id = $1 AND name = 'zlib'",
+            )
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("count packages rows");
+            assert_eq!(
+                count, 1,
+                "re-uploads and new revisions must not duplicate catalog rows"
+            );
+
+            f.teardown().await;
+        }
+
+        /// Distinct user/channel combinations are distinct catalog entries
+        /// under `UNIQUE(repository_id, name)` — they must not overwrite each
+        /// other (#2910).
+        #[tokio::test]
+        async fn distinct_channels_are_distinct_catalog_rows() {
+            let Some(f) = TestFixture::setup("local").await else {
+                return;
+            };
+
+            for (user, channel) in [("_", "_"), ("myuser", "stable"), ("myuser", "testing")] {
+                let status = upload_recipe_file(
+                    &f.state,
+                    &f.auth,
+                    &f.repo_key,
+                    "zlib",
+                    "1.3.1",
+                    user,
+                    channel,
+                    "rev1",
+                    "conanmanifest.txt",
+                    b"1 0\nmanifest\n",
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "upload {user}/{channel}");
+            }
+
+            let mut names: Vec<String> =
+                sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1")
+                    .bind(f.repo_id)
+                    .fetch_all(&f.pool)
+                    .await
+                    .expect("list catalog names");
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    "zlib".to_string(),
+                    "zlib@myuser/stable".to_string(),
+                    "zlib@myuser/testing".to_string(),
+                ],
+                "each user/channel must be its own catalog entry"
+            );
+
+            f.teardown().await;
         }
 
         // ================================================================

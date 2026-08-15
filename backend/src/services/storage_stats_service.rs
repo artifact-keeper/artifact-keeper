@@ -52,18 +52,44 @@ pub const OCI_BLOB_DEDUP_PREFIX: &str = "oci-blobs/";
 /// definition of "what bytes a repository references" (avoids CTE copy-paste
 /// and drift with the GC reference model).
 ///
-/// * `artifacts` (live, non-proxy) — `storage_key` is the physical identity
-///   (CAS `cas/…`, coordinate formats, `oci-manifests/…`). Proxy-cache leftover
+/// * `artifacts` (live, non-proxy, non-OCI-manifest) — `storage_key` is the
+///   physical identity (CAS `cas/…`, coordinate formats). Proxy-cache leftover
 ///   rows are excluded to mirror the #2218 / #2531 accounting exclusion.
 /// * `oci_blobs` — keyed by `'oci-blobs/' || digest`; `size_bytes` is the true
 ///   layer size. **This is the OCI accounting gap #2056 closes.**
 /// * `proxy_cache_artifacts` — path-keyed per repo, never cross-repo shared and
 ///   effectively never duplicated (logical == physical == unique).
+///
+/// # Why `oci-manifests/%` rows are excluded (#3286)
+///
+/// `artifacts.size_bytes` for an OCI **image manifest** does not hold the size
+/// of the stored manifest object: the push path writes
+/// `oci_v2::manifest_total_size(body)` — `config.size` plus the sum of
+/// `layers[].size`, i.e. the *aggregate image size* — because GC, quota and
+/// scanning enumerate `artifacts` and need the image to weigh what it actually
+/// occupies. That column is therefore already the layer bytes, and #3134 added
+/// `oci_blobs` (the same layer bytes, at their true physical size) as a second
+/// source. Unioning both double-counts every OCI layer: a reporter measured
+/// 3097 GB of `unique_bytes` against 1.14 TiB of real bucket usage (~2.7x).
+///
+/// The manifest JSON documents themselves are consequently not counted here.
+/// That is a deliberate, bounded undercount: real manifests are a few KB each
+/// (56k live manifests ≈ 164 MB on the reporting instance, ~0.01% of the
+/// footprint), and there is no column holding their true object size to
+/// substitute. Correcting `artifacts.size_bytes` instead was rejected on
+/// purpose — it is the column `RepositoryService::check_quota` sums, so
+/// rewriting it would silently loosen every OCI repository's quota.
+///
+/// [`PATH_REF_UNION_SQL`] deliberately keeps its `oci-manifests/%` rows: that
+/// relation drives the *logical* per-path tree, where an image node is expected
+/// to weigh the image, and layer blobs are excluded from it entirely (they
+/// carry no path), so no double count arises there.
 const REPO_OBJECT_UNION_SQL: &str = r#"
     SELECT repository_id, storage_key AS dedup_key, size_bytes
       FROM artifacts
      WHERE is_deleted = false
        AND storage_key NOT LIKE 'proxy-cache/%'
+       AND storage_key NOT LIKE 'oci-manifests/%'
     UNION ALL
     SELECT repository_id, 'oci-blobs/' || digest AS dedup_key, size_bytes
       FROM oci_blobs
@@ -71,6 +97,32 @@ const REPO_OBJECT_UNION_SQL: &str = r#"
     SELECT repository_id, storage_key AS dedup_key, size_bytes
       FROM proxy_cache_artifacts
 "#;
+
+/// Whether a `dedup_key` counts toward the *physical* footprint computed from
+/// [`REPO_OBJECT_UNION_SQL`].
+///
+/// Pure mirror of that relation's `artifacts` filter, so the exclusion rule is
+/// unit-testable without a database and the SQL literal cannot drift from the
+/// documented intent. Keys under
+/// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX)
+/// carry the aggregate image size rather than the stored object size and are
+/// counted through `oci_blobs` instead (#3286); `proxy-cache/%` leftovers are
+/// counted through `proxy_cache_artifacts` (#2218 / #2531).
+pub fn artifact_key_counts_toward_physical_footprint(dedup_key: &str) -> bool {
+    !dedup_key.starts_with(crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX)
+        && !dedup_key.starts_with(PROXY_CACHE_STORAGE_PREFIX)
+}
+
+/// Storage-key prefix of proxy-cached objects, excluded from the `artifacts`
+/// arm of the union because those bytes are accounted through
+/// `proxy_cache_artifacts` (#2218 / #2531).
+const PROXY_CACHE_STORAGE_PREFIX: &str = "proxy-cache/";
+
+// Pin the `oci-manifests/%` literal embedded in REPO_OBJECT_UNION_SQL to the
+// Rust constant, the same guard `storage_gc_service` uses: Postgres cannot read
+// Rust constants, so changing the prefix must fail the build here rather than
+// silently un-fix #3286.
+const _: () = assert!(crate::storage::keys::prefix_matches("oci-manifests/"));
 
 /// The *path-bearing* subset of the repo-object union (#2601): one row per
 /// reference that has a logical `path`, projected to
@@ -536,6 +588,66 @@ mod tests {
             ref_count: refs,
             repo_count: repos,
         }
+    }
+
+    // --- #3286: OCI manifest rows must not re-count layer bytes -------------
+
+    #[test]
+    fn oci_manifest_keys_are_excluded_from_the_physical_footprint() {
+        // `artifacts.size_bytes` for an image manifest holds the aggregate
+        // image size (config + layers), not the ~3 KB manifest object, so
+        // counting it alongside `oci_blobs` double-counts every layer.
+        assert!(!artifact_key_counts_toward_physical_footprint(
+            "oci-manifests/sha256:deadbeef"
+        ));
+    }
+
+    #[test]
+    fn proxy_cache_keys_are_excluded_from_the_physical_footprint() {
+        // Accounted through `proxy_cache_artifacts` instead (#2218 / #2531).
+        assert!(!artifact_key_counts_toward_physical_footprint(
+            "proxy-cache/repo/path/__content__"
+        ));
+    }
+
+    #[test]
+    fn real_artifact_keys_still_count_toward_the_physical_footprint() {
+        for key in [
+            "cas/aa/bb/sha256:beef",
+            "maven/com/example/app/1.0/app-1.0.jar",
+            "oci-blobs/sha256:beef",
+            // Near-misses: only the exact prefixes are excluded.
+            "oci-manifest/sha256:beef",
+            "not-proxy-cache/x",
+        ] {
+            assert!(
+                artifact_key_counts_toward_physical_footprint(key),
+                "{key} must still be counted"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_object_union_excludes_both_non_physical_artifact_prefixes() {
+        // The pure predicate above documents the rule; this pins the SQL that
+        // actually implements it, so the two cannot drift (the compile-time
+        // `prefix_matches` guard pins the literal to the Rust constant).
+        assert!(
+            REPO_OBJECT_UNION_SQL.contains("storage_key NOT LIKE 'oci-manifests/%'"),
+            "REPO_OBJECT_UNION_SQL must exclude OCI manifest rows (#3286); their \
+             size_bytes is the image size, already counted via oci_blobs"
+        );
+        assert!(
+            REPO_OBJECT_UNION_SQL.contains("storage_key NOT LIKE 'proxy-cache/%'"),
+            "REPO_OBJECT_UNION_SQL must keep excluding proxy-cache leftovers (#2218)"
+        );
+        // The path tree is a LOGICAL view and intentionally keeps manifests:
+        // layer blobs carry no path, so it has no double count to fix.
+        assert!(
+            !PATH_REF_UNION_SQL.contains("oci-manifests"),
+            "PATH_REF_UNION_SQL must keep OCI manifest rows so the per-image tree \
+             node still weighs the image"
+        );
     }
 
     #[test]

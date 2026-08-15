@@ -70,11 +70,25 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/nuget", handlers::nuget::router())
         .nest("/rpm", handlers::rpm::router())
         .nest("/cargo", handlers::cargo::router())
+        // `/api/cargo` alias (#3000): the documented / generated cargo client
+        // config points the sparse registry index at
+        // `sparse+{base}/api/cargo/{repo}/`, so cargo fetches
+        // `/api/cargo/{repo}/config.json` (and the sparse index files) under
+        // the `/api` prefix. Without this alias every such request 404s and
+        // `cargo publish` fails with "config.json not found".
+        .nest("/api/cargo", handlers::cargo::router())
         .nest("/gems", handlers::rubygems::router())
         .nest("/lfs", handlers::gitlfs::router())
         .nest("/pub", handlers::pub_registry::router())
         .nest("/go", handlers::goproxy::router())
         .nest("/helm", handlers::helm::router())
+        // `/api/helm` alias (#2941): the ChartMuseum `cm-push` plugin builds
+        // its push URL as `{host}/api{repo_path}/charts`, so for a repo URL of
+        // `{host}/helm/{repo}` it POSTs to `/api/helm/{repo}/charts` rather
+        // than this registry's native `/helm/{repo}/api/charts`. Mounting the
+        // upload/delete handlers under the plugin's shape makes a plain
+        // `helm cm-push chart.tgz <repo-url>` work without `--context-path`.
+        .nest("/api/helm", handlers::helm::cm_push_router())
         .nest("/composer", handlers::composer::router())
         .nest("/conan", handlers::conan::router())
         .nest("/alpine", handlers::alpine::router())

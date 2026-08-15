@@ -42,6 +42,11 @@ fn is_allowed_auth_write(path: &str) -> bool {
     path.starts_with("/api/v1/auth/totp/") || path.starts_with("/api/v1/auth/sso/")
 }
 
+/// The one demo-mode refusal message, shared by the REST body and the OCI
+/// error envelope so the two surfaces cannot drift.
+const DEMO_BLOCK_MESSAGE: &str =
+    "Write operations are disabled in the demo. Deploy your own instance to get full access.";
+
 /// Returns true when a request must be blocked by the demo guard.
 ///
 /// Reads (GET/HEAD/OPTIONS) are always allowed. Writes are blocked unless they
@@ -68,11 +73,18 @@ pub async fn demo_guard(
     }
 
     if should_block(request.method(), request.uri().path()) {
+        // #3284: on the OCI surface the refusal must be the distribution-spec
+        // error envelope — docker/oras cannot render the REST shape below.
+        if super::oci_errors::is_oci_v2_path(request.uri().path()) {
+            return super::oci_errors::oci_denied_response(
+                StatusCode::FORBIDDEN,
+                "DENIED",
+                DEMO_BLOCK_MESSAGE,
+            );
+        }
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "Write operations are disabled in the demo. Deploy your own instance to get full access."
-            })),
+            Json(json!({ "error": DEMO_BLOCK_MESSAGE })),
         )
             .into_response();
     }
@@ -132,5 +144,59 @@ mod tests {
         // allowlisted login endpoint must still be blocked for writes.
         assert!(should_block(&Method::POST, "/api/v1/auth/tokens/extra"));
         assert!(should_block(&Method::POST, "/api/v1/authzzz"));
+    }
+
+    /// #3284: a demo-mode refusal on `/v2` must be the distribution-spec
+    /// error envelope (`{"errors":[{"code","message"}]}`), while REST routes
+    /// keep the legacy `{"error": ...}` shape.
+    #[tokio::test]
+    async fn demo_guard_emits_oci_envelope_on_v2_and_rest_shape_elsewhere() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ak-demo-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = crate::api::handlers::test_db_helpers::build_state_with(
+            pool,
+            dir.to_str().unwrap(),
+            |c| c.demo_mode = true,
+        );
+        let app = axum::Router::new()
+            .fallback(|| async { StatusCode::OK })
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                demo_guard,
+            ));
+
+        let send = |app: axum::Router, uri: &'static str| async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let (status, bytes) = crate::api::handlers::test_db_helpers::send(app, req).await;
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        };
+
+        let (status, body) = send(app.clone(), "/v2/demo/app/blobs/uploads/").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["errors"][0]["code"], "DENIED",
+            "OCI surface must get the spec envelope, got: {body}"
+        );
+        assert_eq!(body["errors"][0]["message"], DEMO_BLOCK_MESSAGE);
+        assert!(body.get("error").is_none());
+
+        let (status, body) = send(app.clone(), "/api/v1/repositories").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["error"], DEMO_BLOCK_MESSAGE,
+            "REST surface keeps the legacy shape"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

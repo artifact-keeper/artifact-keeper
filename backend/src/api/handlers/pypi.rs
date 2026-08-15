@@ -818,7 +818,7 @@ async fn simple_project(
                         &repo_key,
                         &effective_upstream,
                         &upstream_path,
-                        &format!("{}index.v1+json", upstream_path),
+                        &format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
                         Some(PEP691_JSON_CONTENT_TYPE),
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
@@ -1107,7 +1107,7 @@ async fn simple_project(
                         &member.key,
                         &effective_upstream,
                         &upstream_path,
-                        &format!("{}index.v1+json", upstream_path),
+                        &format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
                         Some(PEP691_JSON_CONTENT_TYPE),
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
@@ -1803,12 +1803,11 @@ async fn download_or_metadata(
     // way: it enqueues only after a version document resolves out of a real
     // packument.
     //
-    // 3xx counts because #1555 answers a fresh proxy-cache hit on a remote member
-    // with a 307 to a presigned URL (`presigned_downloads_enabled`); gating on
-    // `is_success()` alone would silently switch ingestion off for every operator
-    // running object-storage downloads. Both shapes mean the same thing here: the
-    // access check inside `serve_file` passed and the artifact resolved.
-    let served = response.status().is_success() || response.status().is_redirection();
+    // The predicate itself lives in `proxy_helpers` so the relocation is covered
+    // by a test (#3233): `response_admits_ondemand_ingest` documents why 3xx
+    // counts (#1555 presigned redirects) and pins that 401/403/404 do not.
+    let served =
+        crate::api::handlers::proxy_helpers::response_admits_ondemand_ingest(response.status());
     if served && repo.repo_type == RepositoryType::Remote && !filename.ends_with(".metadata") {
         if let Some(version) = requested_version.clone() {
             // `normalized.as_str()` (#3186): the catalog row must key on the same
@@ -1937,6 +1936,10 @@ async fn serve_virtual_metadata(
         // PEP 658 metadata is not hash-tied to the distribution, so pip would
         // resolve against one package's dependencies and install another's,
         // with nothing anywhere to detect it.
+
+        // Set when this member owns the name but its bytes are temporarily
+        // unavailable; confines the fallback to this member (#3372).
+        let mut owns_unavailable_bytes = false;
         match serve_metadata(
             state,
             &state.db,
@@ -1948,6 +1951,20 @@ async fn serve_virtual_metadata(
         {
             Ok(response) => return Ok(response),
             Err(response) if response.status() == StatusCode::NOT_FOUND => {}
+            // 507: this member HAS an `artifacts` row for the file, but
+            // storage could not produce the bytes even after the coordinated
+            // re-read. That is NOT "this member does not have it" -- the
+            // member owns the name, so falling through to a lower-priority
+            // member would serve THAT member's upstream METADATA for a
+            // distribution this one owns. We still try this member's OWN
+            // upstream (same provenance the wheel would resolve to), but the
+            // flag below stops resolution at this member either way (#3372).
+            Err(response) if response.status() == StatusCode::INSUFFICIENT_STORAGE => {
+                owns_unavailable_bytes = true;
+                if first_member_error.is_none() {
+                    first_member_error = Some(response);
+                }
+            }
             // A non-404 here is a storage or DB fault, or a 503 from the
             // decode-permit fast-fail -- not "this member does not have it".
             // Swallowing it would fall through to a lower-priority REMOTE
@@ -2010,6 +2027,21 @@ async fn serve_virtual_metadata(
             }
         } else {
             // Local storage was already tried for this member above.
+            //
+            // A Local/Staging member that owns the name but could not produce
+            // its bytes must not fall through either. `pypi_virtual_isolates_name`
+            // does suppress lower-priority Remotes for a Local-owned name, so
+            // this is belt-and-braces — but the substitution guard should not
+            // depend on a second mechanism agreeing with it (#3372).
+            if owns_unavailable_bytes {
+                return Err(first_member_error.take().unwrap_or_else(|| {
+                    (
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        "artifact metadata unavailable; retry later",
+                    )
+                        .into_response()
+                }));
+            }
             continue;
         };
 
@@ -2028,10 +2060,24 @@ async fn serve_virtual_metadata(
         // 404.
         match result {
             Ok(response) => return Ok(response),
-            Err(response) if response.status() == StatusCode::NOT_FOUND => continue,
             Err(response) => {
-                if first_member_error.is_none() {
+                if response.status() != StatusCode::NOT_FOUND && first_member_error.is_none() {
                     first_member_error = Some(response);
+                }
+                // This member owns the name (it holds an `artifacts` row for
+                // the file) and neither its storage nor its own upstream could
+                // serve it. Stop here rather than letting a lower-priority
+                // member answer for a name it does not own -- that is the
+                // metadata/wheel mismatch the local-first ordering exists to
+                // prevent (#3372).
+                if owns_unavailable_bytes {
+                    return Err(first_member_error.take().unwrap_or_else(|| {
+                        (
+                            StatusCode::INSUFFICIENT_STORAGE,
+                            "artifact metadata unavailable; retry later",
+                        )
+                            .into_response()
+                    }));
                 }
                 continue;
             }
@@ -2061,8 +2107,35 @@ async fn serve_remote_metadata(
     project: &NormalizedProjectName,
     filename: &str,
 ) -> Result<Response, Response> {
-    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let metadata_filename = format!("{}.metadata", filename);
+    let cache_path = build_pypi_proxy_cache_path(project, &metadata_filename);
+
+    // The probe must stay ahead of target resolution (#3300): resolving reads
+    // the upstream simple index through `proxy_fetch_uncached`, so a probe
+    // behind it pays an upstream round-trip even on a hit. Keyed on the
+    // sidecar's own cache path — the key the fetch below writes.
+    //
+    // A probe error counts as a miss, so a cache fault degrades to a refetch
+    // rather than failing the request.
+    if let Ok(Some((content, _content_type, content_encoding))) = proxy
+        .cached_metadata_if_servable(
+            &proxy_helpers::build_remote_repo_with_format(
+                repo_id,
+                repo_key,
+                upstream_url,
+                RepositoryFormat::Pypi,
+            ),
+            &cache_path,
+        )
+        .await
+    {
+        return Ok(pep658_metadata_response(
+            content,
+            content_encoding.as_deref(),
+        ));
+    }
+
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let target = resolve_pypi_remote_fetch_target(
         proxy,
         repo_id,
@@ -2081,35 +2154,24 @@ async fn serve_remote_metadata(
         RepositoryFormat::Pypi,
     );
 
+    // Fetching through the cache is what lets the probe above ever hit: the
+    // `fetch_upstream_direct_*` family bypasses the cache in both directions.
+    // This stores the body and its upstream `Content-Encoding` under
+    // `target.cache_path` (`simple/{project}/{dist}.metadata`), which is
+    // distinct from the distribution's own key.
     match proxy
-        .fetch_upstream_direct_with_link(&remote_repo, &target.fetch_path)
+        .fetch_artifact_with_cache_path_capped(
+            &remote_repo,
+            &target.fetch_path,
+            &target.cache_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
         .await
     {
-        Ok(upstream) => {
-            // The content-type is fixed, never relayed from upstream: a PEP 658
-            // metadata resource is always the plain-text METADATA file, so a
-            // hostile or misconfigured upstream labelling it `text/html` must
-            // not get that type echoed back under this origin. Matches the
-            // wheel-extraction arm below.
-            //
-            // The content *coding* is the opposite case (#3193). These bytes are
-            // forwarded VERBATIM, and the shared HTTP client no longer lets
-            // reqwest decode upstream bodies, so a `.metadata` from a gzipping
-            // CDN or an object-store upstream arrives here still coded. Pinning
-            // the type while dropping the coding is the worst of both: pip gets
-            // compressed bytes labelled `text/plain; charset=utf-8` with no
-            // coding declared, and PEP 658 metadata parsing fails. Declare what
-            // the bytes actually are. `None` upstream means the header stays
-            // ABSENT — manufacturing a coding would mislabel every ordinary
-            // uncoded serve, which is the common case.
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/plain; charset=utf-8");
-            if let Some(enc) = upstream.content_encoding.as_deref() {
-                builder = builder.header(CONTENT_ENCODING, enc);
-            }
-            Ok(builder.body(Body::from(upstream.content)).unwrap())
-        }
+        Ok((content, _content_type, content_encoding)) => Ok(pep658_metadata_response(
+            content,
+            content_encoding.as_deref(),
+        )),
         Err(AppError::NotFound(_)) => {
             let wheel_target = resolve_pypi_remote_fetch_target(
                 proxy,
@@ -2176,14 +2238,35 @@ async fn serve_remote_metadata(
             .ok_or_else(|| {
                 AppError::NotFound("Metadata not available".to_string()).into_response()
             })?;
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from(metadata))
-                .unwrap())
+            // Extracted here, so the bytes are plain: no coding to declare.
+            Ok(pep658_metadata_response(Bytes::from(metadata), None))
         }
         Err(error) => Err(error.into_response()),
     }
+}
+
+/// Build the response for a PEP 658 `.metadata` resource.
+///
+/// The content-type is pinned rather than relayed: a PEP 658 resource is always
+/// the plain-text METADATA file, so an upstream labelling it `text/html` must
+/// not get that type echoed back under this origin.
+///
+/// The coding is the opposite case (#3193). The shared HTTP client hands over
+/// undecoded upstream bodies, so bytes forwarded verbatim may still be coded
+/// and must say so, or pip parses a compressed body as METADATA. `None` leaves
+/// the header absent — the common, uncoded case.
+///
+/// Shared by every arm that produces a sidecar (cache hit, upstream fetch,
+/// wheel extraction) so one resource carries identical headers whichever
+/// served it.
+fn pep658_metadata_response(content: Bytes, content_encoding: Option<&str>) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8");
+    if let Some(enc) = content_encoding {
+        builder = builder.header(CONTENT_ENCODING, enc);
+    }
+    builder.body(Body::from(content)).unwrap()
 }
 
 fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
@@ -2520,12 +2603,8 @@ async fn serve_file(
                     .await
                     .unwrap_or(false)
                     {
-                        let action = crate::services::scan_config_service::ScanConfigService::new(
-                            state.db.clone(),
-                        )
-                        .proxy_scan_action(repo.id)
-                        .await
-                        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+                        let (action, severity_gate) =
+                            proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                         return serve_scanned_pypi_file(
                             state,
                             proxy,
@@ -2535,6 +2614,7 @@ async fn serve_file(
                             project,
                             filename,
                             action,
+                            severity_gate,
                             ctx,
                         )
                         .await;
@@ -2809,7 +2889,7 @@ async fn serve_file(
                             // a not-found or other error falls through to the next
                             // member. A member with scanning disabled keeps the
                             // untouched streaming cache path below (no regression).
-                            let (scan_enabled, action) =
+                            let (scan_enabled, action, severity_gate) =
                                 proxy_helpers::effective_virtual_scan_policy(
                                     &state.db, repo.id, member.id,
                                 )
@@ -2824,6 +2904,7 @@ async fn serve_file(
                                     project,
                                     filename,
                                     action,
+                                    severity_gate,
                                     ctx,
                                 )
                                 .await
@@ -3614,6 +3695,7 @@ async fn serve_scanned_pypi_file(
     project: &NormalizedProjectName,
     filename: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
@@ -3743,6 +3825,7 @@ async fn serve_scanned_pypi_file(
         synthetic,
         &bytes,
         action,
+        severity_gate,
         identity,
         proxy_helpers::ProxyScanMode::File,
     )
@@ -3791,10 +3874,40 @@ async fn serve_metadata(
 
     // Try to extract METADATA from the package file
     let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(map_storage_err)?;
+    let content = match storage.get(&artifact.storage_key).await {
+        Ok(bytes) => bytes,
+        // A storage NotFound on a row we just read is the "row present,
+        // object absent" state — and in this codebase that state is TRANSIENT
+        // until proven otherwise. `coordinated_retry_get` is the download
+        // path's handling of exactly it (#1609/#3147): take the cluster-wide
+        // hydration lease, re-read, and only if the object is *still* absent
+        // answer 507 "retry later".
+        //
+        // Do NOT map this to 404. #3366 did, and 404 is the virtual member
+        // loop's "this member does not have it" signal — the one status that
+        // lets resolution fall through to a LOWER-PRIORITY member. A Remote
+        // member carrying `artifacts` rows (direct upload, replication,
+        // promotion — see the local-first comment in `serve_virtual_metadata`)
+        // owns the name, but `pypi_virtual_isolates_name` counts only
+        // Local/Staging members, so nothing suppresses the lower-priority
+        // Remote. The result was pip resolving `Requires-Dist` from a public
+        // package while the wheel path — which DOES coordinate and retry —
+        // served the private bytes, with nothing anywhere to detect it.
+        //
+        // 507 keeps metadata and the wheel failing together, which is the
+        // invariant that matters. The caller's loop treats it as "owns the
+        // name, bytes unavailable" and confines the fallback to this member.
+        Err(AppError::NotFound(_)) => {
+            crate::api::handlers::proxy_helpers::coordinated_retry_get(
+                db,
+                artifact.id,
+                &artifact.storage_key,
+                storage.as_ref(),
+            )
+            .await?
+        }
+        Err(other) => return Err(map_storage_err(other)),
+    };
 
     // #2561: permit-scoped decode on the serve path, fast-fail 503 on
     // saturation. Only taken for the branches that actually decode an archive.
@@ -4603,6 +4716,34 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 /// PEP 691 JSON simple-index media type.
 const PEP691_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 
+/// Cache-path suffix under which the PEP 691 JSON representation of a Simple
+/// project index is stored, appended to the HTML representation's cache path
+/// (see `simple_project`'s `{upstream_path}index.v1+json` cache key).
+const PEP691_JSON_CACHE_SUFFIX: &str = "index.v1+json";
+
+/// The sibling content-negotiated cache path of a PyPI Simple project index
+/// (#3290), or `None` when `path` is not a Simple-index cache path.
+///
+/// A Remote PyPI project index is cached once per negotiated representation:
+/// the PEP 503 HTML under the index path itself (`.../<project>/`) and the
+/// PEP 691 JSON under `.../<project>/index.v1+json`. The two entries expire
+/// independently, so evicting one representation without the other leaves
+/// them describing different upstream snapshots — `uv` (which prefers JSON)
+/// then reports versions missing that the HTML index already lists. Callers
+/// that explicitly invalidate either representation use this to evict the
+/// sibling in the same operation.
+pub(crate) fn pep691_sibling_cache_path(path: &str) -> Option<String> {
+    if let Some(base) = path.strip_suffix(PEP691_JSON_CACHE_SUFFIX) {
+        // JSON variant -> its HTML sibling, which is always a directory-shaped
+        // index path. A non-directory base means `path` merely *ends* in the
+        // suffix (e.g. an artifact literally named `index.v1+json`).
+        return base.ends_with('/').then(|| base.to_string());
+    }
+    // Directory-shaped index path (HTML variant) -> its JSON sibling.
+    path.ends_with('/')
+        .then(|| format!("{path}{PEP691_JSON_CACHE_SUFFIX}"))
+}
+
 /// Rewrite the `files[].url` of a parsed PEP 691 JSON simple index to route
 /// downloads through Artifact Keeper's proxy, mirroring `rewrite_upstream_urls`
 /// for the HTML form. PEP 658/714 metadata signals (`core-metadata`,
@@ -5083,6 +5224,40 @@ mod tests {
     use super::*;
     use crate::api::handlers::proxy_helpers::scan_blocked_response;
     use sha2::{Digest, Sha256};
+
+    /// #3290: the sibling mapping between the two content-negotiated cache
+    /// paths of a Simple project index, in both directions — and `None` for
+    /// paths that are not Simple-index cache paths (a package file, or an
+    /// artifact whose name merely ends in the JSON suffix).
+    #[test]
+    fn test_pep691_sibling_cache_path_maps_both_directions_3290() {
+        assert_eq!(
+            pep691_sibling_cache_path("simple/requests/").as_deref(),
+            Some("simple/requests/index.v1+json"),
+            "HTML index path must map to its PEP 691 sibling"
+        );
+        assert_eq!(
+            pep691_sibling_cache_path("simple/requests/index.v1+json").as_deref(),
+            Some("simple/requests/"),
+            "PEP 691 path must map back to its HTML sibling"
+        );
+        // Flat (no `simple/` prefix) upstream layouts keep the same shape.
+        assert_eq!(
+            pep691_sibling_cache_path("requests/").as_deref(),
+            Some("requests/index.v1+json")
+        );
+        // Not Simple-index cache paths: no sibling.
+        assert_eq!(
+            pep691_sibling_cache_path("simple/requests/requests-2.0.0-py3-none-any.whl"),
+            None,
+            "a package file has no negotiated sibling"
+        );
+        assert_eq!(
+            pep691_sibling_cache_path("simple/proj/weird-index.v1+json"),
+            None,
+            "a non-directory base merely ends in the JSON suffix"
+        );
+    }
 
     /// Build a [`NormalizedProjectName`] for a test fixture (#3186).
     ///
@@ -11848,6 +12023,94 @@ mod tests {
         );
     }
 
+    /// A Remote member carrying an `artifacts` row whose `storage_key` object
+    /// no longer exists must not turn the virtual `.metadata` route into a
+    /// permanent 500 (#3366). The member loop's local-first check hits the row,
+    /// storage answers NotFound, and pre-fix `map_storage_err` promoted that to
+    /// a 500 — which the loop deliberately propagates (the #3179 transient-
+    /// fault guard) instead of trying the SAME member's upstream fallback. With
+    /// the NotFound carve-out, the local-first check 404s and the loop falls
+    /// through to `serve_remote_metadata`, which serves the upstream's PEP 658
+    /// metadata. There are no local bytes for that fallback to mismatch
+    /// against, so this does not weaken the #3179 guard for real storage/DB
+    /// faults.
+    #[tokio::test]
+    async fn test_virtual_pypi_metadata_missing_storage_object_falls_back_to_remote() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(metadata))
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+
+        // The poisoned state: an artifacts row on the REMOTE member whose
+        // storage_key names an object that was never written (deleted cache
+        // entry, lost object, stale backfill). Nothing is written to the
+        // member's storage on purpose.
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8)",
+        )
+        .bind(member_id)
+        .bind(format!("simple/{project}/{wheel}"))
+        .bind(project)
+        .bind("1.0")
+        .bind("test-orphaned-row")
+        .bind("application/zip")
+        .bind(format!("missing/{wheel}"))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed orphaned artifacts row");
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an orphaned artifacts row must fall through to the member's \
+             upstream metadata, not pin the route to a 500: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "the upstream's PEP 658 metadata must be served"
+        );
+    }
+
     /// A higher-priority local owner without a `tracks` declaration isolates
     /// its project from lower-priority remote-only versions. PEP 658 metadata
     /// must enforce the same Case-B suppression as the simple index and wheel
@@ -12425,6 +12688,96 @@ mod tests {
             content_type, "text/plain; charset=utf-8",
             "the served content-type must be pinned to text/plain, not relayed \
              from the upstream (which answered text/html here)"
+        );
+    }
+
+    /// A repeated `.whl.metadata` request is served from the proxy cache
+    /// (#3300), reaching upstream zero times.
+    ///
+    /// Asserted on the upstream request COUNT, not the body: the sidecar's
+    /// bytes are correct whether or not the cache is consulted, so only the
+    /// count separates a cache hit from a silent refetch of the simple index
+    /// and the sidecar.
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_is_served_from_cache_on_repeat() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(metadata))
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let uri = format!("/{}/simple/{project}/{wheel}.metadata", fx.repo_key);
+
+        let (cold_status, cold_body, cold_headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        let after_cold = upstream.received_requests().await.unwrap_or_default().len();
+
+        let (warm_status, warm_body, warm_headers) =
+            tdh::send_with_headers(tdh::router_anon(super::router(), state), tdh::get(uri)).await;
+        let after_warm = upstream.received_requests().await.unwrap_or_default().len();
+
+        fx.teardown().await;
+
+        assert_eq!(
+            cold_status,
+            StatusCode::OK,
+            "cold .metadata request must be served; body: {}",
+            String::from_utf8_lossy(&cold_body)
+        );
+        assert_eq!(&cold_body[..], metadata);
+        assert_eq!(
+            after_cold, 2,
+            "a cold sidecar costs one simple-index read plus one sidecar fetch"
+        );
+
+        assert_eq!(
+            warm_status,
+            StatusCode::OK,
+            "warm .metadata request must be served; body: {}",
+            String::from_utf8_lossy(&warm_body)
+        );
+        assert_eq!(
+            after_warm, after_cold,
+            "a repeated .metadata request must hit the proxy cache and reach \
+             upstream zero times — neither the sidecar nor the simple index"
+        );
+
+        // What the cache replays must be indistinguishable from what filled it.
+        assert_eq!(
+            warm_body, cold_body,
+            "cached sidecar bytes must be identical"
+        );
+        assert_eq!(
+            warm_headers.get(CONTENT_TYPE),
+            cold_headers.get(CONTENT_TYPE),
+            "cached sidecar must carry the same Content-Type"
+        );
+        assert_eq!(
+            warm_headers.get(CONTENT_ENCODING),
+            cold_headers.get(CONTENT_ENCODING),
+            "cached sidecar must carry the same Content-Encoding"
         );
     }
 

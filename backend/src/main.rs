@@ -1423,6 +1423,12 @@ async fn initialize_wasm_plugins(
 }
 
 /// Initialize or retrieve the persistent peer identity for this instance.
+///
+/// The `is_local` row in `peer_instances` is reconciled from
+/// `PEER_INSTANCE_NAME` / `PEER_PUBLIC_ENDPOINT` on EVERY boot, exactly like
+/// `peer_instance_identity` — not only seeded at first boot — so env changes
+/// after the initial deployment reach the Peers UI instead of it showing the
+/// stale first-boot name/endpoint forever (#2832).
 async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::Uuid> {
     // Check if identity already exists
     let existing: Option<uuid::Uuid> =
@@ -1431,50 +1437,47 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
             .await
             .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
-    if let Some(id) = existing {
-        // Update name/endpoint in case config changed
-        sqlx::query(
-            "UPDATE peer_instance_identity SET name = $1, endpoint_url = $2, updated_at = NOW()",
+    let peer_instances =
+        artifact_keeper_backend::services::peer_instance_service::PeerInstanceService::new(
+            db.clone(),
+        );
+
+    let id = match existing {
+        Some(id) => {
+            // Update name/endpoint in case config changed
+            sqlx::query(
+                "UPDATE peer_instance_identity SET name = $1, endpoint_url = $2, updated_at = NOW()",
+            )
+            .bind(&config.peer_instance_name)
+            .bind(&config.peer_public_endpoint)
+            .execute(db)
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            id
+        }
+        None => {
+            // Generate new identity
+            let id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO peer_instance_identity (peer_instance_id, name, endpoint_url) VALUES ($1, $2, $3)",
+            )
+            .bind(id)
+            .bind(&config.peer_instance_name)
+            .bind(&config.peer_public_endpoint)
+            .execute(db)
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            id
+        }
+    };
+
+    peer_instances
+        .reconcile_local_instance(
+            &config.peer_instance_name,
+            &config.peer_public_endpoint,
+            &config.peer_api_key,
         )
-        .bind(&config.peer_instance_name)
-        .bind(&config.peer_public_endpoint)
-        .execute(db)
-        .await
-        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-        return Ok(id);
-    }
-
-    // Generate new identity
-    let id = uuid::Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO peer_instance_identity (peer_instance_id, name, endpoint_url) VALUES ($1, $2, $3)",
-    )
-    .bind(id)
-    .bind(&config.peer_instance_name)
-    .bind(&config.peer_public_endpoint)
-    .execute(db)
-    .await
-    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
-
-    // Also register this instance in the peer_instances table as is_local=true
-    sqlx::query(
-        r#"
-        INSERT INTO peer_instances (name, endpoint_url, status, api_key, is_local)
-        VALUES ($1, $2, 'online', $3, true)
-        ON CONFLICT (name) DO UPDATE SET
-            endpoint_url = EXCLUDED.endpoint_url,
-            api_key = EXCLUDED.api_key,
-            status = 'online',
-            is_local = true,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(&config.peer_instance_name)
-    .bind(&config.peer_public_endpoint)
-    .bind(&config.peer_api_key)
-    .execute(db)
-    .await
-    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+        .await?;
 
     Ok(id)
 }
@@ -1493,7 +1496,25 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
 
     let req = match build_oidc_bootstrap_request() {
         Some(r) => r,
-        None => return Ok(()),
+        None => {
+            // #2819: the OIDC_* env vars are absent (removed or never set).
+            // Any provider a previous boot seeded from the environment must
+            // not outlive its configuration: disable (never delete) rows the
+            // bootstrap owns, so the login page stops advertising a flow
+            // that can no longer complete and local login recovers once no
+            // enabled provider remains. Admin-created providers — and
+            // env-seeded rows an admin later edited or toggled (which clears
+            // the `env_seeded` marker) — are untouched.
+            for name in AuthConfigService::disable_env_seeded_oidc(db).await? {
+                tracing::warn!(
+                    "Disabled OIDC provider '{}': it was seeded from OIDC_* environment \
+                     variables that are no longer set. Re-set the env vars to re-enable it, \
+                     or re-enable it via the admin API to take manual ownership.",
+                    name
+                );
+            }
+            return Ok(());
+        }
     };
 
     // Reconcile the env-managed provider (matched by name) on every boot so
@@ -1506,6 +1527,9 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
     match plan_provider_reconcile(&req.name, &pairs) {
         ReconcileAction::Create => {
             let config = AuthConfigService::create_oidc(db, req).await?;
+            // Record env ownership so removing the env vars later disables
+            // this row rather than leaving it advertised forever (#2819).
+            AuthConfigService::mark_oidc_env_seeded(db, config.id).await?;
             tracing::info!(
                 "Bootstrapped OIDC provider '{}' (id={}) from environment variables",
                 config.name,
@@ -1515,6 +1539,9 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
         ReconcileAction::Update(id) => {
             let name = req.name.clone();
             let cfg = AuthConfigService::update_oidc(db, id, req.into()).await?;
+            // `update_oidc` clears the env-ownership marker (admin updates
+            // take ownership); the bootstrap is the env, so re-assert it.
+            AuthConfigService::mark_oidc_env_seeded(db, cfg.id).await?;
             tracing::info!(
                 "Reconciled env-managed OIDC provider '{}' (id={}) from environment variables",
                 name,

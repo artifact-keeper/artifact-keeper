@@ -1519,13 +1519,31 @@ impl Scanner for GrypeScanner {
         self.is_applicable(artifact)
     }
 
-    /// Probe `grype --version` once and cache the parsed version string.
-    /// Returns `None` if the binary is missing or its output cannot be
-    /// parsed.
+    /// Probe `grype --version` once and cache the parsed version string,
+    /// composed with the CVE-DB build date from `grype db status` (#3287),
+    /// e.g. `grype-0.83.0+db-2026-08-10`. Grype ships vulnerability-database
+    /// updates daily while the CLI version changes rarely; folding the DB
+    /// build into the token makes `verdict_is_fresh` invalidate a cached proxy
+    /// verdict when the DATABASE moves — as its own doc comment has always
+    /// claimed — instead of only when the binary is upgraded. A failed DB
+    /// probe degrades to the bare CLI token (freshness falls back to the TTL),
+    /// and a missing/unparseable CLI probe still returns `None`.
     async fn version(&self) -> Option<String> {
         cached_cli_version(&self.cached_version, || async {
             let raw = capture_cli_version("grype", &["--version"]).await?;
-            format_grype_version(&raw)
+            let cli = format_grype_version(&raw)?;
+            let db_build = match crate::services::scanner_service::capture_cli_output(
+                "grype",
+                &["db", "status"],
+            )
+            .await
+            {
+                Some(status) => crate::services::scanner_service::format_grype_db_build(&status),
+                None => None,
+            };
+            Some(crate::services::scanner_service::compose_scanner_version(
+                cli, db_build,
+            ))
         })
         .await
     }

@@ -1943,6 +1943,16 @@ fn preserve_engine_unavailable(error: &AppError, msg: String) -> AppError {
 /// but consumers (SBOM, CVE-mapping lookup, UI) need the raw name to do
 /// cross-source joins — see #903. Callers that still need the target string
 /// can read it from the parallel `RawPackage` row's `source_target` field.
+/// Convert a Trivy-shaped report's vulnerabilities into [`RawFinding`]s.
+///
+/// Reachability note for the `UNKNOWN` arm of the classifier (#3296): all four
+/// Trivy producers now deliver ungraded findings here. The adapter image path
+/// always did (`SCANNER_TRIVY_SEVERITY` defaults to the full list and Harbor
+/// maps `UNKNOWN -> "Unknown"`); the local filesystem and incus invocations —
+/// and the adapter's fs mode — historically pinned a
+/// `CRITICAL,HIGH,MEDIUM,LOW` allowlist that filtered `UNKNOWN` out at the
+/// CLI, so the finding never reached this converter at all. They now share
+/// [`TRIVY_FS_SEVERITY_LIST`], which admits `UNKNOWN`.
 pub(crate) fn convert_trivy_findings(
     report: &crate::services::image_scanner::TrivyReport,
     source_label: &str,
@@ -2495,16 +2505,29 @@ pub struct ProxyScanVerdict {
     pub low_count: i32,
     /// Highest severity observed across all findings, for policy comparison.
     pub max_severity: Option<Severity>,
-    /// Scanner binary/DB version string (e.g. `grype-0.83.0`), for CVE-DB
-    /// freshness gating of a reused verdict.
+    /// Scanner binary + CVE-DB version string (e.g.
+    /// `grype-0.83.0+db-2026-08-10`, #3287), for CVE-DB freshness gating of a
+    /// reused verdict.
     pub scanner_version: Option<String>,
 }
 
 impl ProxyScanVerdict {
-    /// A vulnerable verdict is any non-zero finding count. Whether that BLOCKS a
-    /// pull is a policy decision made by the caller against the repo's action.
+    /// A vulnerable verdict is any finding ABOVE `Info` (#3243 stage 2).
+    /// Whether that BLOCKS a pull is a policy decision made by the caller
+    /// against the repo's action.
+    ///
+    /// `Info` findings are deliberately excluded: that bucket holds Grype's
+    /// `Negligible` (a CVE the distro has triaged as not worth fixing) and
+    /// explicit `info`/`informational` grades. Counting them made fail-closed
+    /// OCI proxying unusable against ordinary Debian/Ubuntu base images —
+    /// every image carries a long tail of `Negligible` CVEs, each of which
+    /// produced a `vulnerable` verdict and a 403. This matches Harbor, which
+    /// documents `negligible` as never blocking a pull at any threshold. The
+    /// findings are still recorded (`findings_count`, the row, the report);
+    /// they just do not 403 the pull. Before #3243 this was
+    /// `findings_count > 0`, i.e. severity-blind.
     pub fn is_vulnerable(&self) -> bool {
-        self.findings_count > 0
+        self.critical_count + self.high_count + self.medium_count + self.low_count > 0
     }
 
     /// The stored `proxy_scan_results.verdict` token for this result.
@@ -2576,8 +2599,8 @@ pub fn aggregate_proxy_verdict(
 ///    scanner failing (an optional Trivy adapter that is down) still must NOT
 ///    abort the scan — only the CVE engine is load-bearing.
 /// 2. **The CVE engine cataloged something** (#3003), when the caller supplied
-///    an `expected_component`. `is_vulnerable()` is `findings_count > 0`, so an
-///    engine that ran but had nothing to grade reports "clean".
+///    an `expected_component`. `is_vulnerable()` counts findings above `Info`,
+///    so an engine that ran but had nothing to grade reports "clean".
 /// 3. **What it cataloged is what we are serving** (#3003). A clean grade of
 ///    some other identity says nothing about these bytes.
 ///
@@ -2660,10 +2683,10 @@ async fn run_inline_proxy_scanners_target(
         ));
     }
 
-    // #3003: "the CVE engine ran Ok" is still not enough. `is_vulnerable()` is
-    // `findings_count > 0`, so an engine that RUNS but catalogs nothing to
-    // grade reports zero findings — indistinguishable from a genuinely clean
-    // artifact. That is not a hypothetical: syft/grype do not catalog a bare
+    // #3003: "the CVE engine ran Ok" is still not enough. `is_vulnerable()`
+    // counts findings above `Info`, so an engine that RUNS but catalogs
+    // nothing to grade reports zero findings — indistinguishable from a
+    // genuinely clean artifact. That is not a hypothetical: syft/grype do not catalog a bare
     // npm `package/package.json` or an sdist's root `PKG-INFO`, so a real
     // vulnerable npm tarball (identity stripped/rewritten, or a lockfile-shaped
     // decoy added) and an ordinary vulnerable PyPI sdist both scanned "clean"
@@ -2915,8 +2938,34 @@ const CAPTURE_CLI_VERSION_STDOUT_CAP_BYTES: u64 = 64 * 1024;
 
 /// Inner implementation of [`capture_cli_version`] parameterized on the
 /// timeout so tests can exercise the elapsed-timeout branch in milliseconds
-/// rather than the full production five-second wait.
+/// rather than the full production five-second wait. Returns the FIRST stdout
+/// line; probes that need multi-line output (e.g. `grype db status`, #3287)
+/// use [`capture_cli_output`] instead.
 pub(crate) async fn capture_cli_version_with_timeout(
+    binary: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let full = capture_cli_output_with_timeout(binary, args, timeout).await?;
+    let line = full.lines().next()?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
+/// Capture the FULL (capped, bounded) stdout of a short metadata CLI
+/// invocation, e.g. `grype db status` or `trivy --version` (#3287). Same
+/// safety properties as [`capture_cli_version`]: 64 KiB stdout cap, wall-clock
+/// timeout, kill+reap on every failure path, `None` on a non-zero exit.
+pub(crate) async fn capture_cli_output(binary: &str, args: &[&str]) -> Option<String> {
+    capture_cli_output_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT).await
+}
+
+/// Shared child-process capture behind [`capture_cli_version_with_timeout`]
+/// (first line) and [`capture_cli_output`] (full text).
+pub(crate) async fn capture_cli_output_with_timeout(
     binary: &str,
     args: &[&str],
     timeout: Duration,
@@ -3017,11 +3066,11 @@ pub(crate) async fn capture_cli_version_with_timeout(
     }
 
     let stdout_str = String::from_utf8_lossy(&buf);
-    let line = stdout_str.lines().next()?.trim();
-    if line.is_empty() {
+    let text = stdout_str.trim();
+    if text.is_empty() {
         None
     } else {
-        Some(line.to_string())
+        Some(text.to_string())
     }
 }
 
@@ -3133,15 +3182,34 @@ where
 }
 
 /// Convenience wrapper around [`cached_cli_version`] for scanners that probe
-/// the Trivy CLI. Returns `Some("trivy-<ver>")` once the CLI has been
+/// the Trivy CLI. Returns `Some("trivy-<ver>")` — composed with the
+/// vulnerability-DB build date (`trivy-<ver>+db-<date>`, #3287) when the
+/// probe's `Vulnerability DB:` block reports one — once the CLI has been
 /// probed, or `None` when the binary is missing or its output is unparseable.
+/// Probes the FULL `--version` output ([`capture_cli_output`]) because the DB
+/// block lives below the first line.
 pub(crate) async fn cached_trivy_cli_version(cell: &VersionCache) -> Option<String> {
     cached_cli_version(cell, || async {
-        let raw = capture_cli_version("trivy", &["--version"]).await?;
+        let raw = capture_cli_output("trivy", &["--version"]).await?;
         format_trivy_version(&raw)
     })
     .await
 }
+
+/// The `--severity` allowlist for every local `trivy filesystem` invocation
+/// (the hosted-artifact filesystem scanner and the incus rootfs scanner).
+///
+/// `UNKNOWN` is included deliberately (#3296): an ungraded CVE is an
+/// un-triaged one, not a harmless one. Before this constant existed, both call
+/// sites carried their own `"CRITICAL,HIGH,MEDIUM,LOW"` literal, so a Trivy
+/// `UNKNOWN` finding was filtered out by the CLI before the report was ever
+/// written — no `scan_findings` row, no count contribution, invisible to every
+/// gate and score, and unrecoverable by any operator-side policy because the
+/// data was discarded at the scanner invocation. One shared constant means the
+/// next divergence is a compile error rather than a silent drift; the adapter
+/// image path (`docker/scanner-adapter`) already defaults to the full list via
+/// `SCANNER_TRIVY_SEVERITY`.
+pub(crate) const TRIVY_FS_SEVERITY_LIST: &str = "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL";
 
 /// Classify a spawn failure from the `trivy` CLI into an [`AppError`].
 ///
@@ -3182,9 +3250,16 @@ pub(crate) fn classify_trivy_spawn_error(err: &std::io::Error) -> AppError {
     }
 }
 
-/// Parse a Trivy `--version` first stdout line into a `trivy-X.Y.Z` token.
-/// Trivy emits `Version: 0.62.1` (or `Version: 0.62.1\n...`). We normalize
-/// to `trivy-<version>` to make the field self-describing in the DB.
+/// Parse a Trivy `--version` first stdout line into a `trivy-X.Y.Z` token,
+/// composed with the vulnerability-DB build date when the output carries one
+/// (#3287). Trivy emits `Version: 0.62.1` followed, once a DB has been
+/// downloaded, by a `Vulnerability DB:` block whose `UpdatedAt:` line is the
+/// DB build timestamp. Folding that date into the token
+/// (`trivy-0.62.1+db-2026-08-10`) makes the stored `scanner_version` change
+/// when the CVE database moves, so `verdict_is_fresh` invalidates a cached
+/// verdict on a DB update — not only on a CLI upgrade. Output with no DB block
+/// keeps the bare `trivy-<version>` token (freshness falls back to the TTL,
+/// exactly as an unknown version always has).
 pub(crate) fn format_trivy_version(raw: &str) -> Option<String> {
     let v = raw
         .strip_prefix("Version:")
@@ -3194,10 +3269,62 @@ pub(crate) fn format_trivy_version(raw: &str) -> Option<String> {
         .trim();
     let token = v.split_whitespace().next()?;
     if token.is_empty() {
-        None
-    } else {
-        Some(format!("trivy-{}", token))
+        return None;
     }
+    let cli = format!("trivy-{}", token);
+    // The `Vulnerability DB:` block also carries `NextUpdate:`/`DownloadedAt:`
+    // lines; `UpdatedAt:` is the build timestamp of the DB content itself.
+    let db = raw
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("UpdatedAt:"))
+        .and_then(db_build_date_token);
+    Some(compose_scanner_version(cli, db))
+}
+
+/// Extract a compact `YYYY-MM-DD` build-date token from a scanner's DB
+/// metadata timestamp (#3287). Accepts both the space-separated shape
+/// (`2026-08-10 01:31:31 +0000 UTC`) and the ISO shape
+/// (`2026-08-10T01:31:31Z`), reducing either to the date. Day resolution
+/// matches the daily CVE-DB release cadence of both Grype and Trivy, and keeps
+/// the composed token within `scan_results.scanner_version`'s `VARCHAR(50)`.
+pub(crate) fn db_build_date_token(value: &str) -> Option<String> {
+    let first = value.split_whitespace().next()?;
+    let date = first.split('T').next().unwrap_or(first);
+    // A plausible build date starts with a digit; anything else (an error
+    // string, a "unknown" placeholder) is treated as no DB information.
+    if date.is_empty() || !date.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(date.to_string())
+}
+
+/// Compose the stored scanner-version token from the CLI version and the
+/// optional CVE-DB build token: `grype-0.83.0+db-2026-08-10` (#3287). The DB
+/// half is what makes daily vulnerability-database updates invalidate cached
+/// proxy verdicts via `verdict_is_fresh`'s exact-match comparison; without it
+/// the token changes only when the scanner BINARY is upgraded, and a withdrawn
+/// advisory keeps blocking (or a new one keeps serving) for the full TTL.
+pub(crate) fn compose_scanner_version(cli: String, db_build: Option<String>) -> String {
+    match db_build {
+        Some(db) => format!("{}+db-{}", cli, db),
+        None => cli,
+    }
+}
+
+/// Parse `grype db status` output into the DB build-date token (#3287).
+/// Grype prints a `Built:` line for the installed vulnerability DB, e.g.
+/// `Built:    2026-08-10 01:31:31 +0000 UTC` (schema v6 emits ISO:
+/// `Built: 2026-08-10T01:31:31Z`). Returns `None` when the output carries no
+/// parseable build date (no DB downloaded, unexpected format), in which case
+/// the caller stores the bare CLI token and freshness falls back to the TTL.
+pub(crate) fn format_grype_db_build(raw: &str) -> Option<String> {
+    raw.lines()
+        .find_map(|l| {
+            let t = l.trim();
+            t.strip_prefix("Built:")
+                .or_else(|| t.strip_prefix("built:"))
+        })
+        .and_then(db_build_date_token)
 }
 
 /// Parse a `grype --version` first stdout line into a `grype-X.Y.Z` token.
@@ -6893,6 +7020,88 @@ mod tests {
             format_trivy_version("Version: 0.62.1"),
             Some("trivy-0.62.1".to_string())
         );
+    }
+
+    /// #3287: the stored token must change when the CVE DATABASE moves, not
+    /// only when the CLI is upgraded. Two probes with the same CLI version but
+    /// different DB builds must produce different tokens — asserting the token
+    /// merely "contains the version" would pass with the bug present.
+    #[test]
+    fn test_scanner_version_token_composes_db_build() {
+        // Trivy: full --version output carries the DB block below line 1.
+        let day1 = "Version: 0.62.1\nVulnerability DB:\n  Version: 2\n  UpdatedAt: 2026-08-10 12:07:04.16797355 +0000 UTC\n  NextUpdate: 2026-08-11 12:07:04 +0000 UTC";
+        let day2 = "Version: 0.62.1\nVulnerability DB:\n  Version: 2\n  UpdatedAt: 2026-08-11 12:07:04.16797355 +0000 UTC";
+        let t1 = format_trivy_version(day1).expect("day1 parses");
+        let t2 = format_trivy_version(day2).expect("day2 parses");
+        assert_eq!(t1, "trivy-0.62.1+db-2026-08-10");
+        assert_eq!(t2, "trivy-0.62.1+db-2026-08-11");
+        assert_ne!(
+            t1, t2,
+            "same CLI, different DB build => different token, so the second \
+             scan must NOT reuse the first verdict via verdict_is_fresh"
+        );
+        // ...and verdict_is_fresh actually treats them as a version mismatch.
+        assert!(
+            !crate::services::proxy_scan_service::verdict_is_fresh(
+                chrono::Utc::now(),
+                Some(&t1),
+                Some(&t2),
+                DEDUP_TTL_DAYS as i64,
+                chrono::Utc::now(),
+            ),
+            "a DB-build change must invalidate a stored verdict inside the TTL"
+        );
+
+        // Grype: db status Built line, both output shapes.
+        assert_eq!(
+            format_grype_db_build(
+                "Path:     /db/vulnerability.db\nSchema:   v5\nBuilt:    2026-08-10 01:31:31 +0000 UTC\nStatus: valid"
+            ),
+            Some("2026-08-10".to_string())
+        );
+        assert_eq!(
+            format_grype_db_build("Path: /db\nSchema: v6.0.2\nBuilt: 2026-08-10T01:31:31Z"),
+            Some("2026-08-10".to_string())
+        );
+        assert_eq!(
+            compose_scanner_version("grype-0.83.0".to_string(), Some("2026-08-10".to_string())),
+            "grype-0.83.0+db-2026-08-10"
+        );
+        // Failed DB probe degrades to the bare CLI token (TTL-only freshness),
+        // never to a probe failure.
+        assert_eq!(
+            compose_scanner_version("grype-0.83.0".to_string(), None),
+            "grype-0.83.0"
+        );
+        assert_eq!(format_grype_db_build("no such database"), None);
+        assert_eq!(db_build_date_token("  "), None);
+        assert_eq!(db_build_date_token("unknown"), None);
+        // The composed grype token stays within scan_results.scanner_version's
+        // VARCHAR(50).
+        assert!("grype-0.83.0+db-2026-08-10".len() <= 50);
+    }
+
+    /// #3296: the shared `trivy filesystem` severity allowlist must admit
+    /// UNKNOWN. A finding dropped at the CLI never becomes a RawFinding, a
+    /// scan_findings row, or a gate input — removing UNKNOWN from the list
+    /// reds this test (revert-proof for the fix).
+    #[test]
+    fn test_trivy_fs_severity_list_admits_unknown() {
+        let severities: Vec<&str> = TRIVY_FS_SEVERITY_LIST.split(',').collect();
+        assert!(
+            severities.contains(&"UNKNOWN"),
+            "ungraded CVEs must reach the report instead of being filtered \
+             out at the scanner invocation (#3296)"
+        );
+        for graded in ["LOW", "MEDIUM", "HIGH", "CRITICAL"] {
+            assert!(
+                severities.contains(&graded),
+                "positive control: the graded severities must all stay listed"
+            );
+        }
+        // Matches the adapter image path's default (SCANNER_TRIVY_SEVERITY in
+        // docker/scanner-adapter/config.go), so the four Trivy producers agree.
+        assert_eq!(TRIVY_FS_SEVERITY_LIST, "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL");
     }
 
     #[test]
@@ -10649,65 +10858,68 @@ mod tests {
         assert_eq!(verdict.max_severity_token(), Some("high"));
     }
 
-    /// #3294: re-bucketing a finding's severity must NOT change what the
-    /// proxy/OCI inline gate blocks. The gate is `findings_count > 0`
-    /// (`ProxyScanVerdict::is_vulnerable`) -> `verdict_token()` ->
-    /// `proxy_scan_service::verdict_blocks`, and consults no severity at any
-    /// step, so moving findings between buckets is enforcement-neutral here.
-    ///
-    /// This is a standing invariant, not just a claim about this change: it is
-    /// what made #3306 (repointing `UNRECOGNIZED_SCANNER_SEVERITY` to `High`)
-    /// provably unable to change what the inline download gate blocks, and
-    /// #3243 stage 2 proposes making `Info` non-blocking, which would break it
-    /// deliberately. Anyone doing that should have to delete this test on
-    /// purpose.
+    /// #3243 stage 2: `Info` findings are recorded but NOT blocking. This
+    /// deliberately replaces the former standing invariant
+    /// `test_proxy_verdict_blocking_is_independent_of_severity` (#3294), which
+    /// pinned the severity-blind `findings_count > 0` gate; stage 2 makes the
+    /// `Info` bucket non-blocking on purpose (Harbor's `negligible` rule), so
+    /// the gate is now severity-aware at exactly one boundary: Info vs
+    /// everything above it.
     #[test]
-    fn test_proxy_verdict_blocking_is_independent_of_severity() {
-        // Same population, every finding re-bucketed off the lowest severity.
-        // Stated with literal severities rather than through
-        // `UNRECOGNIZED_SCANNER_SEVERITY`, so the fixture genuinely moves
-        // regardless of where that constant points.
-        let as_info = vec![
+    fn test_proxy_verdict_info_findings_do_not_block() {
+        // Info-only population: recorded, counted, NOT vulnerable.
+        let info_only = vec![
             make_finding(Severity::Info),
             make_finding(Severity::Info),
             make_finding(Severity::Info),
         ];
-        let as_rebucketed: Vec<_> = (0..3).map(|_| make_finding(Severity::Medium)).collect();
-
-        let before = aggregate_proxy_verdict(&as_info, None);
-        let after = aggregate_proxy_verdict(&as_rebucketed, None);
-
-        // The severity really did move — without this the equalities below are
-        // vacuous and would hold for two identical inputs.
-        assert_ne!(
-            before.max_severity, after.max_severity,
-            "fixture must actually re-bucket the findings"
+        let verdict = aggregate_proxy_verdict(&info_only, None);
+        assert_eq!(
+            verdict.findings_count, 3,
+            "info findings stay recorded in the verdict"
         );
-        // `Severity` is ordered Critical=0 .. Info=4, so "more severe" is "<".
-        // `Info` is a fixed endpoint of that order, so pinning it literally is
-        // safe; the re-bucketed side is stated against the ordering so the
-        // test survives a change to which bucket the fixture uses.
-        assert_eq!(before.max_severity, Some(Severity::Info));
+        assert_eq!(verdict.max_severity, Some(Severity::Info));
         assert!(
-            after.max_severity < Some(Severity::Info),
-            "fixture must re-bucket strictly above the floor"
+            !verdict.is_vulnerable(),
+            "#3243 stage 2: an info-only population must not produce a \
+             blocking verdict"
         );
-
-        // ...and the gate's inputs and output did not.
-        assert_eq!(before.findings_count, after.findings_count);
-        assert_eq!(before.is_vulnerable(), after.is_vulnerable());
-        assert_eq!(before.verdict_token(), after.verdict_token());
-        assert!(
-            crate::services::proxy_scan_service::verdict_blocks(before.verdict_token()),
-            "positive control: this population must actually BLOCK, otherwise \
-             the equality above is satisfied by two non-blocking verdicts"
-        );
-        assert!(crate::services::proxy_scan_service::verdict_blocks(
-            after.verdict_token()
+        assert_eq!(verdict.verdict_token(), "clean");
+        assert!(!crate::services::proxy_scan_service::verdict_blocks(
+            verdict.verdict_token()
         ));
 
-        // Negative control at the same call: no findings never blocks, at any
-        // severity, so the assertions above are not simply "everything blocks".
+        // Positive control: ONE finding above the floor flips the verdict,
+        // even buried in an info tail — so the exclusion is exactly Info, not
+        // "low severities" generally.
+        let mut with_low = info_only.clone();
+        with_low.push(make_finding(Severity::Low));
+        let verdict = aggregate_proxy_verdict(&with_low, None);
+        assert_eq!(verdict.findings_count, 4);
+        assert_eq!(verdict.low_count, 1);
+        assert_eq!(
+            verdict.max_severity,
+            Some(Severity::Low),
+            "max_severity still reads the highest across ALL findings"
+        );
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "vulnerable");
+        assert!(crate::services::proxy_scan_service::verdict_blocks(
+            verdict.verdict_token()
+        ));
+
+        // Above the floor, blocking is still independent of WHICH bucket a
+        // finding lands in (the #3294 half of the old invariant that #3306's
+        // re-bucketing relies on): low vs medium changes nothing.
+        let as_low: Vec<_> = (0..3).map(|_| make_finding(Severity::Low)).collect();
+        let as_medium: Vec<_> = (0..3).map(|_| make_finding(Severity::Medium)).collect();
+        let low_v = aggregate_proxy_verdict(&as_low, None);
+        let med_v = aggregate_proxy_verdict(&as_medium, None);
+        assert_ne!(low_v.max_severity, med_v.max_severity);
+        assert_eq!(low_v.is_vulnerable(), med_v.is_vulnerable());
+        assert_eq!(low_v.verdict_token(), med_v.verdict_token());
+
+        // Negative control: no findings never blocks.
         let empty = aggregate_proxy_verdict(&[], None);
         assert!(!crate::services::proxy_scan_service::verdict_blocks(
             empty.verdict_token()
@@ -11819,6 +12031,37 @@ mod tests {
         // Positive control in the same fixture: a graded row below High is
         // untouched, so a converter that raised everything cannot pass.
         assert_eq!(findings[3].severity, Severity::Low);
+    }
+
+    /// #3296: an ungraded (`UNKNOWN`) finding must be PRESENT in the converted
+    /// set — the historical bug was that the fs/incus CLI invocations filtered
+    /// it out before the report was written, so no conversion, row, count, or
+    /// gate ever saw it. This pins the converter half (presence, identity
+    /// intact); [`test_trivy_fs_severity_list_admits_unknown`] pins the CLI
+    /// half. The BUCKET is deliberately asserted through
+    /// `UNRECOGNIZED_SCANNER_SEVERITY` so this test tracks #3306's repointing
+    /// rather than fighting it.
+    #[test]
+    fn test_convert_trivy_findings_unknown_finding_is_present() {
+        let report = trivy_report_with_severities(&["UNKNOWN", "HIGH"]);
+        let findings = convert_trivy_findings(&report, "trivy");
+        assert_eq!(
+            findings.len(),
+            2,
+            "the ungraded finding must be present, not dropped"
+        );
+        assert_eq!(
+            findings[0].cve_id.as_deref(),
+            Some("CVE-2026-0000"),
+            "identity of the ungraded finding survives conversion"
+        );
+        assert_eq!(
+            findings[0].severity,
+            Severity::UNRECOGNIZED_SCANNER_SEVERITY
+        );
+        // Positive control in the same fixture: a graded finding also
+        // converts, so an empty-converter regression cannot pass this test.
+        assert_eq!(findings[1].severity, Severity::High);
     }
 
     // -----------------------------------------------------------------------

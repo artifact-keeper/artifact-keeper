@@ -758,10 +758,28 @@ async fn require_oci_repo_read_access(
     claims: &crate::services::auth_service::Claims,
     repo: &OciRepoInfo,
 ) -> Result<(), Response> {
+    oci_read_permitted(state, claims, repo.id, &repo.key, repo.is_public).await
+}
+
+/// Decision core of [`require_oci_repo_read_access`], extracted so the
+/// `_catalog` listing (#3269) can ask THE SAME "may this caller read this
+/// repository" question per candidate row without constructing a throwaway
+/// [`OciRepoInfo`]. The gate only ever consults `repo.{id,key,is_public}`, so
+/// taking those three fields is behavior-preserving. Callers that only need
+/// the boolean (the catalog filter) treat any `Err` — including the fail-closed
+/// 503 on a lookup error — as deny/omit; the per-repository handlers return the
+/// shaped denial (403 `DENIED` vs existence-hiding 404 `NAME_UNKNOWN`) as-is.
+async fn oci_read_permitted(
+    state: &SharedState,
+    claims: &crate::services::auth_service::Claims,
+    repo_id: Uuid,
+    repo_key: &str,
+    is_public: bool,
+) -> Result<(), Response> {
     // Scope ceilings first — before the admin and scanner bypasses, matching
     // the write gate, where `enforce_token_repo_scope` applies even to admins.
-    enforce_scan_pull_scope(claims, &repo.key)?;
-    enforce_token_repo_scope(claims, repo.id)?;
+    enforce_scan_pull_scope(claims, repo_key)?;
+    enforce_token_repo_scope(claims, repo_id)?;
 
     if claims.is_admin || claims.scan_pull_repo.is_some() {
         return Ok(());
@@ -769,7 +787,7 @@ async fn require_oci_repo_read_access(
 
     // #2329: never leave an authenticated caller below the anonymous read
     // baseline a public repository already grants.
-    if crate::api::middleware::auth::public_read_satisfies_acl(repo.is_public, OCI_READ_ACTION) {
+    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, OCI_READ_ACTION) {
         return Ok(());
     }
 
@@ -781,7 +799,7 @@ async fn require_oci_repo_read_access(
     // `repository-owner` row repository creation seeds) always wins.
     match state
         .permission_service
-        .check_repository_action(claims.sub, repo.id, OCI_READ_ACTION, claims.is_admin)
+        .check_repository_action(claims.sub, repo_id, OCI_READ_ACTION, claims.is_admin)
         .await
     {
         Ok(true) => return Ok(()),
@@ -801,7 +819,7 @@ async fn require_oci_repo_read_access(
     // access or turn a firm refusal into a retryable 503.
     let has_rules = state
         .permission_service
-        .has_any_rules_for_target("repository", repo.id)
+        .has_any_rules_for_target("repository", repo_id)
         .await
         .unwrap_or_else(|e| {
             tracing::error!("OCI read denial: rules lookup failed: {}", e);
@@ -813,7 +831,7 @@ async fn require_oci_repo_read_access(
         Err(oci_error(
             StatusCode::NOT_FOUND,
             "NAME_UNKNOWN",
-            &format!("repository not found: {}", repo.key),
+            &format!("repository not found: {}", repo_key),
         ))
     }
 }
@@ -2153,6 +2171,59 @@ pub(crate) fn extract_child_digests(body: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The `subject` edge of a pushed manifest, extracted once at PUT time and
+/// persisted to `oci_manifest_subjects` so the OCI 1.1 Referrers API (#3108)
+/// can answer `GET /v2/<name>/referrers/<digest>` without re-parsing stored
+/// manifests.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ManifestSubject {
+    /// Digest of the manifest this one refers to (`subject.digest`).
+    pub subject_digest: String,
+    /// The referrer manifest's own media type (body `mediaType`, falling back
+    /// to the stored content type when the field is absent).
+    pub media_type: String,
+    /// Descriptor `artifactType` per distribution-spec 1.1: the manifest's
+    /// `artifactType` field, else `config.mediaType` for image manifests.
+    pub artifact_type: Option<String>,
+    /// The referrer manifest's `annotations`, copied into the descriptor.
+    pub annotations: Option<serde_json::Value>,
+}
+
+/// Extract the `subject` edge from a manifest body, if any.
+///
+/// Returns `None` for bodies without a `subject.digest` string (the common
+/// case) and for unparseable JSON — a manifest without a subject is simply
+/// not a referrer, never an error.
+pub(crate) fn extract_manifest_subject(
+    body: &[u8],
+    stored_media_type: &str,
+) -> Option<ManifestSubject> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let subject_digest = json.get("subject")?.get("digest")?.as_str()?.to_string();
+    let media_type = json
+        .get("mediaType")
+        .and_then(|m| m.as_str())
+        .unwrap_or(stored_media_type)
+        .to_string();
+    let artifact_type = json
+        .get("artifactType")
+        .and_then(|a| a.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            json.get("config")
+                .and_then(|c| c.get("mediaType"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        });
+    let annotations = json.get("annotations").filter(|a| a.is_object()).cloned();
+    Some(ManifestSubject {
+        subject_digest,
+        media_type,
+        artifact_type,
+        annotations,
+    })
+}
+
 /// Insert (parent_digest, child_digest, repository_id) rows into
 /// `oci_manifest_refs` for every child of an image index. Idempotent: on
 /// conflict the existing row is kept.
@@ -2520,6 +2591,31 @@ pub(crate) async fn persist_tag_and_refs_in_tx(
             }
         }
         ManifestClass::Malformed => {}
+    }
+
+    // 3. Referrers subject edge (#3108), in the SAME transaction. Both image
+    //    and index manifests may carry a `subject`, so this runs for either
+    //    class. Content-addressing makes the upsert idempotent: the same
+    //    digest is the same bytes, hence the same subject.
+    if let Some(subject) = extract_manifest_subject(manifest_body, manifest_content_type) {
+        sqlx::query(
+            r#"
+            INSERT INTO oci_manifest_subjects
+                (repository_id, manifest_digest, subject_digest, media_type,
+                 artifact_type, size_bytes, annotations)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (repository_id, manifest_digest) DO NOTHING
+            "#,
+        )
+        .bind(repo_id)
+        .bind(manifest_digest)
+        .bind(&subject.subject_digest)
+        .bind(&subject.media_type)
+        .bind(&subject.artifact_type)
+        .bind(manifest_body.len() as i64)
+        .bind(&subject.annotations)
+        .execute(&mut **tx)
+        .await?;
     }
 
     Ok(())
@@ -4682,6 +4778,20 @@ fn parse_oci_path(path: &str) -> Option<(String, String, Option<String>)> {
 
     let parts: Vec<&str> = path.split('/').collect();
 
+    // OCI 1.1 Referrers API (#3108): `<name>/referrers/<digest>`. Recognized
+    // by position (second-to-last segment) like the `/tags/list` suffix above,
+    // so repository names containing "referrers" as a non-terminal component
+    // still route to the manifests/blobs branches below.
+    if parts.len() >= 3
+        && parts[parts.len() - 2] == "referrers"
+        && !parts.contains(&"manifests")
+        && !parts.contains(&"blobs")
+    {
+        let name = parts[..parts.len() - 2].join("/");
+        let digest = parts[parts.len() - 1].to_string();
+        return Some((name, "referrers".to_string(), Some(digest)));
+    }
+
     // Find terminal content operations in the remaining path.
     let op_idx = parts
         .iter()
@@ -4715,6 +4825,155 @@ fn canonical_blob_lookup_digest(digest: &str) -> String {
     Sha256Digest::parse_digest_param(digest)
         .map(|d| d.as_prefixed())
         .unwrap_or_else(|_| digest.to_string())
+}
+
+/// #3003 round 2 (HIGH-3) / #3258: refuse to serve — or, for HEAD, to
+/// acknowledge — a blob belonging to an image with a live `vulnerable`
+/// scan verdict.
+///
+/// Shared by `handle_get_blob` and `handle_head_blob` so the existence
+/// check and the byte serve can never disagree: RFC 9110 §9.3.2 defines
+/// HEAD as identical to GET except for the content transfer, and the
+/// pre-#3258 split let HEAD answer `200` with an exact `Content-Length`
+/// for content whose GET was `403` — leaking existence and size of
+/// blocked content. Scanner-scoped pulls are exempt for the same reason
+/// the manifest gate exempts them.
+async fn enforce_blob_scan_reblock(
+    state: &SharedState,
+    claims: &Option<crate::services::auth_service::Claims>,
+    repo: &OciRepoInfo,
+    lookup_digest: &str,
+) -> Result<(), Response> {
+    if oci_pull_is_scan_scoped(claims) {
+        return Ok(());
+    }
+    let scan_cfg = crate::services::scan_config_service::ScanConfigService::new(state.db.clone());
+    // #3105 (Bug 2): the blob re-block must honor `scan_on_proxy` for
+    // PROXY-served content. Before this, the EXISTS check ran
+    // unconditionally, so a blob belonging to an image flagged vulnerable
+    // ONCE stayed 403 forever even after an operator set
+    // `scan_on_proxy: false` -- while the manifest for the same image served
+    // again (`maybe_gate_remote_manifest_scan` short-circuits on the same
+    // flag), leaving the image un-pullable but not "blocked", with no
+    // non-DB recourse.
+    //
+    // The knob is applied per REPOSITORY THAT OWNS THE REFS, not as one
+    // whole-request boolean -- see `blob_reblock_applies` for why hosted
+    // refs must NOT be gated on it.
+    //
+    // #3023: for a Virtual repo the `manifest_blob_refs` are recorded under
+    // the resolving MEMBER (the virtual owns no refs), so the blocklist
+    // spans the virtual's member set. A direct repo keeps the single-id
+    // check. If the members cannot be enumerated we cannot prove the blob
+    // is safe -> fail closed (same posture as an unreadable verdict store
+    // below).
+    // #3259: the repositories whose refs are in scope for this decision,
+    // as `(repo_type, repo_id)`. Only consulted when EVERY referencing
+    // vulnerable verdict turns out to be stale by the manifest gate's own
+    // freshness rule -- see `stale_blob_verdicts_still_withhold`.
+    let mut ref_owners: Vec<(&str, Uuid)> = Vec::new();
+    let status = if repo.repo_type == RepositoryType::Virtual {
+        let members = match proxy_helpers::fetch_virtual_members(&state.db, repo.id).await {
+            Ok(members) => members,
+            Err(_) => {
+                tracing::warn!(
+                    repo = %repo.key, digest = %lookup_digest,
+                    "virtual member enumeration failed during blob scan-verdict check; withholding"
+                );
+                return Err(oci_error(
+                    StatusCode::LOCKED,
+                    "DENIED",
+                    "blob scan status is unavailable; retry shortly",
+                ));
+            }
+        };
+        // #3025 OR-of-both-sides: `scan_on_proxy` on the VIRTUAL itself
+        // keeps the gate on across the whole member set (the stricter
+        // direction, matching `stricter_scan_policy`). Otherwise each
+        // member's own refs are gated by that member's own policy, so a
+        // virtual with proxy scanning off cannot become a bypass route
+        // around a hosted member's enforcement.
+        let virtual_enabled = scan_cfg
+            .is_proxy_scan_enabled(repo.id)
+            .await
+            .unwrap_or(true);
+        let mut gated_ids: Vec<Uuid> = Vec::with_capacity(members.len());
+        for m in &members {
+            if virtual_enabled || blob_reblock_applies(&scan_cfg, m.repo_type.as_str(), m.id).await
+            {
+                gated_ids.push(m.id);
+                ref_owners.push((m.repo_type.as_str(), m.id));
+            }
+        }
+        // #3025 OR-of-both-sides, applied to the #3259 staleness release
+        // too: a fail-closed VIRTUAL keeps stale blocks on across its whole
+        // member set, so the virtual cannot become the lax route around a
+        // stricter member.
+        ref_owners.push((repo.repo_type.as_str(), repo.id));
+        let severity_gate = blob_severity_gate(&scan_cfg, &ref_owners).await;
+        blob_vulnerable_verdict_status_any(state, &gated_ids, lookup_digest, severity_gate).await
+    } else if blob_reblock_applies(&scan_cfg, &repo.repo_type, repo.id).await {
+        ref_owners.push((repo.repo_type.as_str(), repo.id));
+        let severity_gate = blob_severity_gate(&scan_cfg, &ref_owners).await;
+        blob_vulnerable_verdict_status(state, repo.id, lookup_digest, severity_gate).await
+    } else {
+        Ok(BlobVerdictStatus::NoVerdict)
+    };
+    // #3259: a still-reusable verdict blocks exactly as before. Only a
+    // wholly-stale one reaches the policy decision, which fail-closes.
+    let blocklist = match status {
+        Ok(BlobVerdictStatus::Blocking) => Ok(true),
+        Ok(BlobVerdictStatus::NoVerdict) => Ok(false),
+        Ok(BlobVerdictStatus::StaleOnly) => {
+            let withhold = stale_blob_verdicts_still_withhold(&scan_cfg, &ref_owners).await;
+            if withhold {
+                tracing::warn!(
+                    repo = %repo.key, digest = %lookup_digest,
+                    "blob re-block held on a STALE vulnerable verdict: this repository's \
+                     scan policy cannot serve un-reassessed bytes and the blob seam has no \
+                     image to re-scan"
+                );
+            } else {
+                tracing::info!(
+                    repo = %repo.key, digest = %lookup_digest,
+                    "releasing blob re-block: every referencing vulnerable verdict is stale \
+                     by the manifest gate's freshness rule, and this repository's manifest \
+                     gate would serve and re-scan asynchronously (#3259)"
+                );
+            }
+            Ok(withhold)
+        }
+        Err(e) => Err(e),
+    };
+    match blocklist {
+        Ok(true) => {
+            tracing::warn!(
+                repo = %repo.key, digest = %lookup_digest,
+                "blocking blob pull: blob belongs to an image with a vulnerable scan verdict"
+            );
+            return Err(oci_error(
+                StatusCode::FORBIDDEN,
+                "DENIED",
+                "blob belongs to an image blocked by scan policy: vulnerabilities found",
+            ));
+        }
+        Ok(false) => {}
+        // Fail CLOSED on a control-plane error: we cannot show this blob
+        // is safe to serve, and this is the same posture the manifest gate
+        // takes for an unreadable verdict store.
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo.key, digest = %lookup_digest, error = %e,
+                "blob scan-verdict lookup failed; withholding rather than serving"
+            );
+            return Err(oci_error(
+                StatusCode::LOCKED,
+                "DENIED",
+                "blob scan status is unavailable; retry shortly",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn handle_head_blob(
@@ -4771,6 +5030,13 @@ async fn handle_head_blob(
     // Check oci_blobs table. Look up by the canonical digest so an upper-case
     // pull still resolves a blob stored under its canonical lowercase digest.
     let lookup_digest = canonical_blob_lookup_digest(digest);
+
+    // #3258: HEAD must apply the same scan re-block as GET (including the
+    // #3245 `scan_on_proxy` scoping) and answer 403 where GET would; before
+    // this, HEAD leaked the existence and exact size of blocked content.
+    if let Err(resp) = enforce_blob_scan_reblock(state, &claims, &repo, &lookup_digest).await {
+        return resp;
+    }
     let blob = sqlx::query!(
         "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
         repo.id,
@@ -4964,139 +5230,12 @@ async fn handle_get_blob(
     let lookup_digest = canonical_blob_lookup_digest(digest);
 
     // #3003 round 2 (HIGH-3): a blob belonging to an image we already scanned
-    // and found VULNERABLE must not serve. Blocking the manifest alone left
-    // the image reconstructable: the client is refused the manifest, but every
-    // config/layer blob it names is content-addressed and was still served
-    // 200 by digest. Checked before the storage read and before any upstream
-    // fetch. Scanner-scoped pulls are exempt for the same reason the manifest
-    // gate exempts them.
-    if !oci_pull_is_scan_scoped(&claims) {
-        let scan_cfg =
-            crate::services::scan_config_service::ScanConfigService::new(state.db.clone());
-        // #3105 (Bug 2): the blob re-block must honor `scan_on_proxy` for
-        // PROXY-served content. Before this, the EXISTS check ran
-        // unconditionally, so a blob belonging to an image flagged vulnerable
-        // ONCE stayed 403 forever even after an operator set
-        // `scan_on_proxy: false` -- while the manifest for the same image served
-        // again (`maybe_gate_remote_manifest_scan` short-circuits on the same
-        // flag), leaving the image un-pullable but not "blocked", with no
-        // non-DB recourse.
-        //
-        // The knob is applied per REPOSITORY THAT OWNS THE REFS, not as one
-        // whole-request boolean -- see `blob_reblock_applies` for why hosted
-        // refs must NOT be gated on it.
-        //
-        // #3023: for a Virtual repo the `manifest_blob_refs` are recorded under
-        // the resolving MEMBER (the virtual owns no refs), so the blocklist
-        // spans the virtual's member set. A direct repo keeps the single-id
-        // check. If the members cannot be enumerated we cannot prove the blob
-        // is safe -> fail closed (same posture as an unreadable verdict store
-        // below).
-        // #3259: the repositories whose refs are in scope for this decision,
-        // as `(repo_type, repo_id)`. Only consulted when EVERY referencing
-        // vulnerable verdict turns out to be stale by the manifest gate's own
-        // freshness rule -- see `stale_blob_verdicts_still_withhold`.
-        let mut ref_owners: Vec<(&str, Uuid)> = Vec::new();
-        let status = if repo.repo_type == RepositoryType::Virtual {
-            let members = match proxy_helpers::fetch_virtual_members(&state.db, repo.id).await {
-                Ok(members) => members,
-                Err(_) => {
-                    tracing::warn!(
-                        repo = %repo.key, digest = %lookup_digest,
-                        "virtual member enumeration failed during blob scan-verdict check; withholding"
-                    );
-                    return oci_error(
-                        StatusCode::LOCKED,
-                        "DENIED",
-                        "blob scan status is unavailable; retry shortly",
-                    );
-                }
-            };
-            // #3025 OR-of-both-sides: `scan_on_proxy` on the VIRTUAL itself
-            // keeps the gate on across the whole member set (the stricter
-            // direction, matching `stricter_scan_policy`). Otherwise each
-            // member's own refs are gated by that member's own policy, so a
-            // virtual with proxy scanning off cannot become a bypass route
-            // around a hosted member's enforcement.
-            let virtual_enabled = scan_cfg
-                .is_proxy_scan_enabled(repo.id)
-                .await
-                .unwrap_or(true);
-            let mut gated_ids: Vec<Uuid> = Vec::with_capacity(members.len());
-            for m in &members {
-                if virtual_enabled
-                    || blob_reblock_applies(&scan_cfg, m.repo_type.as_str(), m.id).await
-                {
-                    gated_ids.push(m.id);
-                    ref_owners.push((m.repo_type.as_str(), m.id));
-                }
-            }
-            // #3025 OR-of-both-sides, applied to the #3259 staleness release
-            // too: a fail-closed VIRTUAL keeps stale blocks on across its whole
-            // member set, so the virtual cannot become the lax route around a
-            // stricter member.
-            ref_owners.push((repo.repo_type.as_str(), repo.id));
-            blob_vulnerable_verdict_status_any(state, &gated_ids, &lookup_digest).await
-        } else if blob_reblock_applies(&scan_cfg, &repo.repo_type, repo.id).await {
-            ref_owners.push((repo.repo_type.as_str(), repo.id));
-            blob_vulnerable_verdict_status(state, repo.id, &lookup_digest).await
-        } else {
-            Ok(BlobVerdictStatus::NoVerdict)
-        };
-        // #3259: a still-reusable verdict blocks exactly as before. Only a
-        // wholly-stale one reaches the policy decision, which fail-closes.
-        let blocklist = match status {
-            Ok(BlobVerdictStatus::Blocking) => Ok(true),
-            Ok(BlobVerdictStatus::NoVerdict) => Ok(false),
-            Ok(BlobVerdictStatus::StaleOnly) => {
-                let withhold = stale_blob_verdicts_still_withhold(&scan_cfg, &ref_owners).await;
-                if withhold {
-                    tracing::warn!(
-                        repo = %repo.key, digest = %lookup_digest,
-                        "blob re-block held on a STALE vulnerable verdict: this repository's \
-                         scan policy cannot serve un-reassessed bytes and the blob seam has no \
-                         image to re-scan"
-                    );
-                } else {
-                    tracing::info!(
-                        repo = %repo.key, digest = %lookup_digest,
-                        "releasing blob re-block: every referencing vulnerable verdict is stale \
-                         by the manifest gate's freshness rule, and this repository's manifest \
-                         gate would serve and re-scan asynchronously (#3259)"
-                    );
-                }
-                Ok(withhold)
-            }
-            Err(e) => Err(e),
-        };
-        match blocklist {
-            Ok(true) => {
-                tracing::warn!(
-                    repo = %repo.key, digest = %lookup_digest,
-                    "blocking blob pull: blob belongs to an image with a vulnerable scan verdict"
-                );
-                return oci_error(
-                    StatusCode::FORBIDDEN,
-                    "DENIED",
-                    "blob belongs to an image blocked by scan policy: vulnerabilities found",
-                );
-            }
-            Ok(false) => {}
-            // Fail CLOSED on a control-plane error: we cannot show this blob
-            // is safe to serve, and this is the same posture the manifest gate
-            // takes for an unreadable verdict store.
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo.key, digest = %lookup_digest, error = %e,
-                    "blob scan-verdict lookup failed; withholding rather than serving"
-                );
-                return oci_error(
-                    StatusCode::LOCKED,
-                    "DENIED",
-                    "blob scan status is unavailable; retry shortly",
-                );
-            }
-        }
+    // and found VULNERABLE must not serve. Checked before the storage read and
+    // before any upstream fetch. Shared with HEAD (#3258) via
+    // `enforce_blob_scan_reblock` so the two verbs cannot disagree about the
+    // same resource.
+    if let Err(resp) = enforce_blob_scan_reblock(state, &claims, &repo, &lookup_digest).await {
+        return resp;
     }
 
     let blob = sqlx::query!(
@@ -6218,6 +6357,89 @@ async fn handle_cancel_upload(
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
+}
+
+/// The 204 upload-status response required by the distribution spec (#3275):
+/// *"The response to an active upload `<location>` MUST be a `204 No Content`
+/// response code, and MUST have the following headers: `Location`,
+/// `Range: 0-<end-of-range>`"*. `Docker-Upload-UUID` is included for parity
+/// with the POST/PATCH responses so clients can keep correlating the session.
+fn upload_status_response(image_name: &str, session_id: Uuid, bytes_received: i64) -> Response {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(
+            LOCATION,
+            format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
+        )
+        .header("Docker-Upload-UUID", session_id.to_string())
+        .header("Range", upload_progress_range(bytes_received))
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// `GET /v2/<name>/blobs/uploads/<uuid>` — upload-status probe (#3275).
+///
+/// Lets a client that lost track of a chunked upload (dropped connection, or a
+/// 416 on an out-of-order chunk) recover the current valid offset instead of
+/// restarting the whole blob. Auth mirrors the other upload-session verbs:
+/// the session is part of the push flow, so it requires push scope and repo
+/// write access, and the #1317 repo binding keeps a session created against
+/// repo A invisible through repo B's URL.
+async fn handle_get_upload_status(
+    state: &SharedState,
+    headers: &HeaderMap,
+    base_url: &str,
+    image_name: &str,
+    uuid_str: &str,
+) -> Response {
+    let scope = push_scope(image_name);
+    let (claims, token_scopes) =
+        match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
+            Ok(c) => c,
+            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+        };
+    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
+        return oci_forbidden_scope("write:artifacts");
+    }
+
+    let session_id: Uuid = match uuid_str.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                "invalid upload UUID",
+            )
+        }
+    };
+
+    let repo = match resolve_repo_for_write(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, "write").await {
+        return resp;
+    }
+
+    let session = match fetch_oci_upload_session(&state.db, session_id, repo.id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                "upload session not found",
+            )
+        }
+        Err(resp) => return resp,
+    };
+    if session.state != UploadSessionState::Open {
+        // A committing/cancelling session is not an "active upload" — the
+        // client cannot resume it, so surface the same conflict PATCH would.
+        return upload_session_conflict("upload session is not open");
+    }
+
+    upload_status_response(image_name, session_id, session.bytes_received)
 }
 
 async fn handle_complete_upload(
@@ -7857,6 +8079,31 @@ pub(crate) fn oci_manifest_requires_proxy_scan(body: &[u8]) -> bool {
     crate::services::scanner_service::oci_manifest_is_runnable_image(body)
 }
 
+/// Is this a Docker **schema1 (v2s1)** manifest (`schemaVersion: 1` /
+/// `fsLayers`)? (#3024.)
+///
+/// v2s1 predates the config-descriptor layout, so
+/// [`oci_manifest_requires_proxy_scan`] (which keys on an image config +
+/// rootfs layers) can never gate one — a v2s1 manifest proxied through a
+/// scan-on-proxy repository was served `200` unscanned while every schema2 /
+/// OCI runnable variant was gated. The scanner cannot reassemble a v2s1
+/// image either (no config blob), so under a scan-on-proxy policy the only
+/// fail-closed answer is to refuse the deprecated schema outright. Modern
+/// docker/containerd cannot run v2s1 anyway; only a legacy client loses
+/// anything.
+///
+/// Detection is deliberately OR-of-both-signals: a well-formed v2s1 body has
+/// `schemaVersion: 1` AND `fsLayers`, but either alone is enough for a
+/// crafted body to select the v2s1 code path in a legacy consumer, so either
+/// alone is enough to refuse.
+pub(crate) fn oci_manifest_is_docker_schema1(body: &[u8]) -> bool {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    json.get("schemaVersion").and_then(|v| v.as_i64()) == Some(1)
+        || json.get("fsLayers").map(|f| f.is_array()).unwrap_or(false)
+}
+
 /// Is this blob a config/layer of an image THIS repository already scanned and
 /// found vulnerable? (#3003 round 2, HIGH-3.)
 ///
@@ -7896,10 +8143,11 @@ async fn blob_vulnerable_verdict_status(
     state: &SharedState,
     repo_id: Uuid,
     blob_digest: &str,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
 ) -> Result<BlobVerdictStatus, sqlx::Error> {
     let refs = sqlx::query_as::<_, BlobVerdictRef>(
         r#"
-        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version
+        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity
         FROM manifest_blob_refs mbr
         JOIN proxy_scan_results psr
           ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
@@ -7919,6 +8167,7 @@ async fn blob_vulnerable_verdict_status(
     Ok(classify_blob_verdicts(
         &refs,
         current_version.as_deref(),
+        severity_gate,
         chrono::Utc::now(),
     ))
 }
@@ -7940,13 +8189,14 @@ async fn blob_vulnerable_verdict_status_any(
     state: &SharedState,
     member_ids: &[Uuid],
     blob_digest: &str,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
 ) -> Result<BlobVerdictStatus, sqlx::Error> {
     if member_ids.is_empty() {
         return Ok(BlobVerdictStatus::NoVerdict);
     }
     let refs = sqlx::query_as::<_, BlobVerdictRef>(
         r#"
-        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version
+        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity
         FROM manifest_blob_refs mbr
         JOIN proxy_scan_results psr
           ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
@@ -7966,6 +8216,7 @@ async fn blob_vulnerable_verdict_status_any(
     Ok(classify_blob_verdicts(
         &refs,
         current_version.as_deref(),
+        severity_gate,
         chrono::Utc::now(),
     ))
 }
@@ -7977,6 +8228,9 @@ pub(crate) struct BlobVerdictRef {
     pub verdict: String,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
     pub scanner_version: Option<String>,
+    /// Highest observed severity of the referencing manifest's verdict, for
+    /// the #3243 severity-threshold gate. `None` (legacy rows) fails closed.
+    pub max_severity: Option<String>,
 }
 
 /// What the referencing manifests' verdicts say about serving one blob (#3259).
@@ -8044,12 +8298,29 @@ async fn live_cve_scanner_version_for(
 pub(crate) fn classify_blob_verdicts(
     refs: &[BlobVerdictRef],
     current_version: Option<&str>,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     now: chrono::DateTime<chrono::Utc>,
 ) -> BlobVerdictStatus {
-    if refs.is_empty() {
+    // #3243 stage 3: the blob seam applies the SAME severity threshold the
+    // manifest gate applies, so the two halves cannot disagree (a manifest
+    // that serves under the repo's threshold must not have its layers 403).
+    // A ref whose verdict would not block under the gate is out of scope
+    // entirely — it neither blocks nor holds the blob as StaleOnly. A ref
+    // with an absent/unparseable `max_severity` stays in scope (fail closed).
+    let in_scope: Vec<&BlobVerdictRef> = refs
+        .iter()
+        .filter(|r| {
+            severity_gate.blocks(
+                r.max_severity
+                    .as_deref()
+                    .and_then(crate::models::security::Severity::from_str_loose),
+            )
+        })
+        .collect();
+    if in_scope.is_empty() {
         return BlobVerdictStatus::NoVerdict;
     }
-    let any_reusable = refs.iter().any(|r| {
+    let any_reusable = in_scope.iter().any(|r| {
         crate::services::proxy_scan_service::verdict_is_reusable(
             &r.verdict,
             r.scanned_at,
@@ -8154,6 +8425,40 @@ async fn blob_reblock_applies(
         .is_proxy_scan_enabled(repo_id)
         .await
         .unwrap_or(true)
+}
+
+/// The severity gate the blob re-block applies to referencing `vulnerable`
+/// verdicts (#3243 stage 3), derived from the repositories whose refs are in
+/// scope (`ref_owners`, same population `stale_blob_verdicts_still_withhold`
+/// consults).
+///
+/// Hosted (`Local`/`Staging`) owners pin the gate to block-on-any: the
+/// severity threshold is a proxy-gate knob (`scan_configs` is proxy-shaped and
+/// hosted repos normally have no row), and the hosted carve-out in
+/// [`blob_reblock_applies`] must not be weakened through a side door. For
+/// proxy owners the STRICTEST configured gate across the set wins (the same
+/// OR-of-both-sides direction as #3025), and a config read fault fails closed
+/// to block-on-any.
+async fn blob_severity_gate(
+    scan_cfg: &crate::services::scan_config_service::ScanConfigService,
+    ref_owners: &[(&str, Uuid)],
+) -> crate::services::proxy_scan_service::ProxySeverityGate {
+    use crate::services::proxy_scan_service::ProxySeverityGate;
+    let mut gate: Option<ProxySeverityGate> = None;
+    for (repo_type, repo_id) in ref_owners {
+        if *repo_type == RepositoryType::Local || *repo_type == RepositoryType::Staging {
+            return ProxySeverityGate::BlockOnAny;
+        }
+        let g = scan_cfg
+            .proxy_severity_gate(*repo_id)
+            .await
+            .unwrap_or(ProxySeverityGate::BlockOnAny);
+        gate = Some(match gate {
+            Some(acc) => ProxySeverityGate::stricter(acc, g),
+            None => g,
+        });
+    }
+    gate.unwrap_or(ProxySeverityGate::BlockOnAny)
 }
 
 /// True when the authenticated claims are a scanner-scoped pull token
@@ -8455,6 +8760,7 @@ async fn gate_oci_proxy_manifest_scan(
     manifest_body: &Bytes,
     manifest_content_type: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
 ) -> Result<bool, Response> {
     // The verdict key is the CONTENT digest computed over the bytes being
     // served — the same digest `docker pull` pins — never anything the
@@ -8485,6 +8791,7 @@ async fn gate_oci_proxy_manifest_scan(
         synthetic,
         manifest_body,
         action,
+        severity_gate,
         // Content-addressing IS the identity for an image manifest; the
         // "engine actually graded this image" requirement is carried by
         // `require_nonempty_catalog` on the ScanTarget instead.
@@ -8527,13 +8834,27 @@ async fn maybe_gate_remote_manifest_scan(
     {
         return Ok(false);
     }
+    // #3024: a Docker schema1 (v2s1) manifest has no config descriptor, so
+    // the runnable-image predicate below can never gate it AND the scanner
+    // cannot reassemble it — a v2s1 manifest was the one runnable-on-legacy
+    // shape that evaded scan-on-proxy entirely. Fail closed: refuse to
+    // proxy-serve the deprecated schema while this repository's policy says
+    // proxied images must be scanned.
+    if oci_manifest_is_docker_schema1(manifest_body) {
+        tracing::warn!(
+            repo = %repo.key, reference = %reference,
+            "refusing to proxy-serve a Docker schema1 (v2s1) manifest under a scan-on-proxy policy (#3024)"
+        );
+        return Err(oci_error(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "Docker schema1 manifests cannot be scanned and are refused under this repository's scan-on-proxy policy",
+        ));
+    }
     if !oci_manifest_requires_proxy_scan(manifest_body) {
         return Ok(false);
     }
-    let action = crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-        .proxy_scan_action(repo.id)
-        .await
-        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+    let (action, severity_gate) = proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
     gate_oci_proxy_manifest_scan(
         state,
         repo,
@@ -8541,6 +8862,7 @@ async fn maybe_gate_remote_manifest_scan(
         manifest_body,
         manifest_content_type,
         action,
+        severity_gate,
     )
     .await
 }
@@ -8766,7 +9088,7 @@ async fn handle_get_manifest(
             // Scanner-scoped pull tokens stay exempt, exactly as the Remote gate.
             let mut scan_pending = false;
             if member.repo_type == RepositoryType::Remote && !oci_pull_is_scan_scoped(&claims) {
-                let (enabled, action) =
+                let (enabled, action, severity_gate) =
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
                         .await;
                 if enabled && oci_manifest_requires_proxy_scan(&data) {
@@ -8781,6 +9103,7 @@ async fn handle_get_manifest(
                         &data,
                         &member_ct,
                         action,
+                        severity_gate,
                     )
                     .await
                     {
@@ -9219,18 +9542,64 @@ async fn handle_put_manifest(
 
     info!("Manifest pushed: {}:{} ({})", image_name, reference, digest);
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::CREATED)
         .header(LOCATION, format!("/v2/{}/manifests/{}", image_name, digest))
         .header("Docker-Content-Digest", &digest)
-        .header(CONTENT_LENGTH, "0")
-        .body(Body::empty())
-        .unwrap()
+        .header(CONTENT_LENGTH, "0");
+    // #3108: distribution-spec 1.1 — when the pushed manifest carries a
+    // `subject`, the registry MUST answer with `OCI-Subject`. This is how
+    // clients discover Referrers API support (its absence makes them fall
+    // back to the referrers tag scheme).
+    if let Some(subject) = extract_manifest_subject(&body, &content_type) {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&subject.subject_digest) {
+            builder = builder.header("OCI-Subject", value);
+        }
+    }
+    builder.body(Body::empty()).unwrap()
 }
 
 // ---------------------------------------------------------------------------
 // Tags list handler
 // ---------------------------------------------------------------------------
+
+/// Shared pull-side authentication + read authorization for repo-scoped OCI
+/// read endpoints with no blob/manifest-specific gates (tags list, referrers).
+///
+/// * #1776: anonymous tokens are allowed past the auth gate, but only for a
+///   PUBLIC repository — a logged-out client can list a public repo without
+///   credentials.
+/// * #3261: authentication is not authorization — an authenticated principal
+///   with no grant on a private repository is refused by the read gate, the
+///   same gate the manifest/blob handlers apply.
+async fn authorize_oci_repo_read(
+    state: &SharedState,
+    headers: &HeaderMap,
+    base_url: &str,
+    image_name: &str,
+) -> Result<(OciRepoInfo, Option<crate::services::auth_service::Claims>), Response> {
+    let scope = pull_scope(image_name);
+    let is_anon = is_anonymous_token(headers);
+    let claims = if is_anon {
+        None
+    } else {
+        match authenticate_oci(&state.db, &state.config, headers).await {
+            Ok(c) => Some(c),
+            Err(()) => return Err(unauthorized_challenge_with_scope(base_url, Some(&scope))),
+        }
+    };
+
+    let repo = resolve_repo(&state.db, image_name).await?;
+
+    if is_anon && !repo.is_public {
+        return Err(unauthorized_challenge_with_scope(base_url, Some(&scope)));
+    }
+
+    if let Some(claims) = &claims {
+        require_oci_repo_read_access(state, claims, &repo).await?;
+    }
+    Ok((repo, claims))
+}
 
 async fn handle_tags_list(
     state: &SharedState,
@@ -9239,40 +9608,10 @@ async fn handle_tags_list(
     image_name: &str,
     query: &std::collections::HashMap<String, String>,
 ) -> Response {
-    let scope = pull_scope(image_name);
-    // #1776: mirror handle_head_manifest — anonymous tokens are allowed past the
-    // auth gate so a public repository's tags can be listed without credentials.
-    // #3261: bind the claims instead of discarding them — the tag list of a
-    // private repository is readable content and needs the same read gate the
-    // manifest/blob handlers apply.
-    let is_anon = is_anonymous_token(headers);
-    let claims = if is_anon {
-        None
-    } else {
-        match authenticate_oci(&state.db, &state.config, headers).await {
-            Ok(c) => Some(c),
-            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
-        }
+    let (repo, claims) = match authorize_oci_repo_read(state, headers, base_url, image_name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-
-    let repo = match resolve_repo(&state.db, image_name).await {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    // Anonymous tokens may only list tags on public repositories.
-    if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
-
-    // #3261: authentication is not authorization — an authenticated principal
-    // with no grant on a private repository must not be able to enumerate its
-    // tags either.
-    if let Some(claims) = &claims {
-        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
-            return resp;
-        }
-    }
 
     let (n, last) = match parse_pagination_params(query) {
         Ok(v) => v,
@@ -9926,17 +10265,178 @@ async fn fetch_tags_from_remote_member(
 }
 
 // ---------------------------------------------------------------------------
+// Referrers API (OCI distribution-spec 1.1, #3108)
+// ---------------------------------------------------------------------------
+
+/// Validate the `<digest>` path component of a referrers request per the
+/// distribution-spec digest grammar (`algorithm ":" encoded`). sha256/sha512
+/// additionally pin the exact lowercase-hex length, matching how the rest of
+/// this registry canonicalizes digests. The spec requires `400` for an
+/// invalid digest, so this runs before any lookup.
+pub(crate) fn is_valid_referrers_digest(digest: &str) -> bool {
+    let Some((alg, enc)) = digest.split_once(':') else {
+        return false;
+    };
+    if alg.is_empty() || enc.is_empty() {
+        return false;
+    }
+    let alg_ok = alg.chars().all(|c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-' | '+')
+    });
+    if !alg_ok {
+        return false;
+    }
+    let hex_of_len = |len: usize| {
+        enc.len() == len
+            && enc
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    };
+    match alg {
+        "sha256" => hex_of_len(64),
+        "sha512" => hex_of_len(128),
+        _ => enc
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '=' | '_' | '-')),
+    }
+}
+
+/// One referrer of a subject digest, as loaded from `oci_manifest_subjects`.
+#[derive(sqlx::FromRow)]
+pub(crate) struct ReferrerRow {
+    pub manifest_digest: String,
+    pub media_type: String,
+    pub artifact_type: Option<String>,
+    pub size_bytes: i64,
+    pub annotations: Option<serde_json::Value>,
+}
+
+/// Build the image-index response body for the referrers endpoint, applying
+/// the OPTIONAL `artifactType` filter. Returns the body plus whether the
+/// filter was applied (which drives the `OCI-Filters-Applied` header — the
+/// spec forbids emitting the header when no filtering happened).
+pub(crate) fn build_referrers_index(
+    rows: &[ReferrerRow],
+    artifact_type_filter: Option<&str>,
+) -> (serde_json::Value, bool) {
+    let manifests: Vec<serde_json::Value> = rows
+        .iter()
+        .filter(|r| match artifact_type_filter {
+            Some(want) => r.artifact_type.as_deref() == Some(want),
+            None => true,
+        })
+        .map(|r| {
+            let mut desc = serde_json::json!({
+                "mediaType": r.media_type,
+                "digest": r.manifest_digest,
+                "size": r.size_bytes,
+            });
+            if let Some(at) = &r.artifact_type {
+                desc["artifactType"] = serde_json::Value::String(at.clone());
+            }
+            if let Some(ann) = &r.annotations {
+                desc["annotations"] = ann.clone();
+            }
+            desc
+        })
+        .collect();
+    let body = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_MEDIA_TYPE,
+        "manifests": manifests,
+    });
+    (body, artifact_type_filter.is_some())
+}
+
+/// `GET /v2/<name>/referrers/<digest>` (distribution-spec 1.1, #3108).
+///
+/// Returns an image index whose `manifests` are descriptors of every manifest
+/// in this repository whose `subject` points at `<digest>` — an empty index
+/// (200, not 404) when there are none or when the subject itself was never
+/// pushed, per spec. Auth mirrors `handle_tags_list`: pull scope, anonymous
+/// only on public repositories, and the #3261 read gate for authenticated
+/// principals.
+///
+/// Subject edges are recorded at manifest-PUT time (hosted repos, the only
+/// ones that accept pushes), so Remote/Virtual repositories answer from the
+/// same local table — typically the empty index.
+async fn handle_referrers(
+    state: &SharedState,
+    headers: &HeaderMap,
+    base_url: &str,
+    image_name: &str,
+    digest: &str,
+    query: &std::collections::HashMap<String, String>,
+) -> Response {
+    let (repo, _claims) = match authorize_oci_repo_read(state, headers, base_url, image_name).await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    if !is_valid_referrers_digest(digest) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "invalid digest in referrers request",
+        );
+    }
+
+    let rows = match sqlx::query_as::<_, ReferrerRow>(
+        r#"
+        SELECT manifest_digest, media_type, artifact_type, size_bytes, annotations
+        FROM oci_manifest_subjects
+        WHERE repository_id = $1 AND subject_digest = $2
+        ORDER BY created_at, manifest_digest
+        "#,
+    )
+    .bind(repo.id)
+    .bind(digest)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+
+    let filter = query.get("artifactType").map(|s| s.as_str());
+    let (body, filtered) = build_referrers_index(&rows, filter);
+    let json = serde_json::to_string(&body).unwrap_or_default();
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, OCI_INDEX_MEDIA_TYPE);
+    if filtered {
+        builder = builder.header("OCI-Filters-Applied", "artifactType");
+    }
+    builder.body(Body::from(json)).unwrap()
+}
+
+// ---------------------------------------------------------------------------
 // Catalog handler
 // ---------------------------------------------------------------------------
 
-/// List all repositories visible to the authenticated user.
+/// List the repositories visible to the authenticated user.
 ///
 /// Note: `_catalog` is defined by the Docker Registry HTTP API V2
 /// (distribution/distribution), **not** the OCI Distribution Spec.
 /// Per the Docker spec, the catalog contents are implementation-specific:
 /// registries MAY limit results based on access level. This implementation
-/// returns all repositories to any authenticated user without per-repository
-/// ACL filtering, consistent with Docker Hub and most registry implementations.
+/// scopes the listing to repositories the caller may READ (#3269): each
+/// candidate repository is run through [`oci_read_permitted`] — the same
+/// decision the manifest/blob/tags read handlers enforce — so the catalog
+/// lists exactly the set the caller could pull, no more. A global admin with
+/// no token repo-scope ceiling and no scanner pin skips the filter entirely
+/// (the pre-existing unfiltered query, byte-for-byte).
+///
+/// Anonymous callers keep the pre-existing 401 + `WWW-Authenticate: Bearer`
+/// challenge — the handshake Docker/Podman use to reach `/v2/token` —
+/// deliberately NOT broadened to a public-only listing.
 async fn handle_catalog(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -9944,12 +10444,9 @@ async fn handle_catalog(
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let base_url = base_url.as_str();
-    if authenticate_oci(&state.db, &state.config, &headers)
-        .await
-        .is_err()
-    {
+    let Ok(claims) = authenticate_oci(&state.db, &state.config, &headers).await else {
         return unauthorized_challenge(base_url);
-    }
+    };
 
     let (n, last) = match parse_pagination_params(&query) {
         Ok(v) => v,
@@ -9974,10 +10471,26 @@ async fn handle_catalog(
     // advertise what may exist only upstream.
     // Spec reference:
     // https://github.com/distribution/distribution/blob/v3.0.0/docs/content/spec/api.md#catalog
-    let (page, has_more) = match catalog_local_entries(&state.db, last.as_deref(), n).await {
-        Ok(v) => v,
-        Err(e) => return e,
+    //
+    // Per-repository read filter (#3269): unless the caller's view is
+    // unrestricted, resolve the set of OCI-content repositories the caller may
+    // read and filter INSIDE the paginated query, so `n`/`last`/`Link`
+    // semantics operate on the authorized set only.
+    let authorized_ids = if catalog_view_unrestricted(&claims) {
+        None
+    } else {
+        match authorized_catalog_repo_ids(&state, &claims).await {
+            Ok(ids) => Some(ids),
+            Err(e) => return e,
+        }
     };
+
+    let (page, has_more) =
+        match catalog_local_entries(&state.db, authorized_ids.as_deref(), last.as_deref(), n).await
+        {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -9998,57 +10511,118 @@ async fn handle_catalog(
         .unwrap()
 }
 
+/// True when the caller's catalog view needs no per-repository filtering: a
+/// global admin whose bearer carries no token repo-scope ceiling (#2290) and
+/// no scanner pin (#2093) reads every repository, so the pre-existing
+/// unfiltered catalog query is exact for them. Everyone else — including an
+/// admin holding a scoped or pinned token, whose ceilings apply even to
+/// admins — goes through the per-repository read decision. Pure decision fn
+/// (no I/O) so it is unit-testable.
+fn catalog_view_unrestricted(claims: &crate::services::auth_service::Claims) -> bool {
+    claims.is_admin && claims.allowed_repo_ids.is_none() && claims.scan_pull_repo.is_none()
+}
+
+/// Phase 1 of the catalog read filter (#3269): enumerate the distinct
+/// repositories that currently have OCI content and keep the ids the caller
+/// may READ per [`oci_read_permitted`] — the same choke-point the
+/// manifest/blob/tags handlers enforce, so the catalog and a pull cannot
+/// answer from different predicates. A repository whose decision errors is
+/// OMITTED (reads fail closed). Bounded by the number of OCI repositories,
+/// not tags, and the permission service caches, so this stays cheap on a
+/// cold endpoint.
+async fn authorized_catalog_repo_ids(
+    state: &SharedState,
+    claims: &crate::services::auth_service::Claims,
+) -> Result<Vec<Uuid>, Response> {
+    let candidates: Vec<(Uuid, String, bool)> = sqlx::query_as(
+        "SELECT DISTINCT r.id, r.key, r.is_public \
+         FROM oci_tags t \
+         JOIN repositories r ON r.id = t.repository_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        warn!("Failed to enumerate catalog candidate repositories: {}", e);
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "failed to list catalog",
+        )
+    })?;
+
+    let mut ids = Vec::with_capacity(candidates.len());
+    for (repo_id, repo_key, is_public) in candidates {
+        if oci_read_permitted(state, claims, repo_id, &repo_key, is_public)
+            .await
+            .is_ok()
+        {
+            ids.push(repo_id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Build the catalog page SQL. The repository filter (#3269) is injected
+/// INSIDE the subquery — before `DISTINCT`/`ORDER BY`/`LIMIT` — so cursor
+/// pagination and the `Link` header operate on the authorized set only (a
+/// trailing unauthorized row must never signal `has_more`). Bind order is
+/// cursor (if any), then limit, then the id array (if any).
+fn catalog_page_sql(with_cursor: bool, with_filter: bool) -> String {
+    let filter = match (with_filter, with_cursor) {
+        (false, _) => "",
+        (true, true) => " WHERE r.id = ANY($3)",
+        (true, false) => " WHERE r.id = ANY($2)",
+    };
+    let cursor = if with_cursor {
+        " WHERE (LOWER(name), name) > (LOWER($1), $1)"
+    } else {
+        ""
+    };
+    let limit = if with_cursor { "$2" } else { "$1" };
+    format!(
+        "SELECT name FROM ( \
+             SELECT DISTINCT \
+                 CASE WHEN t.name = r.key OR t.name = '' \
+                      THEN r.key \
+                      ELSE r.key || '/' || t.name \
+                 END AS name \
+             FROM oci_tags t \
+             JOIN repositories r ON r.id = t.repository_id{filter} \
+         ) catalog{cursor} \
+         ORDER BY LOWER(name), name \
+         LIMIT {limit}"
+    )
+}
+
 /// Fetch a single page of catalog entries from oci_tags using SQL-side
 /// cursor pagination. Returns `(page, has_more)`.
+///
+/// `authorized`: `None` = unrestricted view (no filter — the admin fast
+/// path); `Some(ids)` = only entries belonging to those repositories
+/// (`Some(&[])` yields an empty catalog — deny-by-default).
 ///
 /// Sorting uses `LOWER()` for case-insensitive primary order (matching
 /// `oci_lexical_cmp`) with a case-sensitive tiebreaker. The cursor
 /// comparison mirrors this ordering so pagination is consistent.
 async fn catalog_local_entries(
     db: &PgPool,
+    authorized: Option<&[Uuid]>,
     last: Option<&str>,
     n: usize,
 ) -> Result<(Vec<String>, bool), Response> {
     let limit = (n as i64).saturating_add(1);
 
-    let rows: Vec<(String,)> = if let Some(cursor) = last {
-        sqlx::query_as(
-            "SELECT name FROM ( \
-                 SELECT DISTINCT \
-                     CASE WHEN t.name = r.key OR t.name = '' \
-                          THEN r.key \
-                          ELSE r.key || '/' || t.name \
-                     END AS name \
-                 FROM oci_tags t \
-                 JOIN repositories r ON r.id = t.repository_id \
-             ) catalog \
-             WHERE (LOWER(name), name) > (LOWER($1), $1) \
-             ORDER BY LOWER(name), name \
-             LIMIT $2",
-        )
-        .bind(cursor)
-        .bind(limit)
-        .fetch_all(db)
-        .await
-    } else {
-        sqlx::query_as(
-            "SELECT name FROM ( \
-                 SELECT DISTINCT \
-                     CASE WHEN t.name = r.key OR t.name = '' \
-                          THEN r.key \
-                          ELSE r.key || '/' || t.name \
-                     END AS name \
-                 FROM oci_tags t \
-                 JOIN repositories r ON r.id = t.repository_id \
-             ) catalog \
-             ORDER BY LOWER(name), name \
-             LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(db)
-        .await
+    let sql = catalog_page_sql(last.is_some(), authorized.is_some());
+    let mut query = sqlx::query_as::<_, (String,)>(&sql);
+    if let Some(cursor) = last {
+        query = query.bind(cursor);
     }
-    .map_err(|e| {
+    query = query.bind(limit);
+    if let Some(ids) = authorized {
+        query = query.bind(ids.to_vec());
+    }
+
+    let rows: Vec<(String,)> = query.fetch_all(db).await.map_err(|e| {
         warn!("Failed to query local catalog entries: {}", e);
         oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10310,6 +10884,23 @@ async fn handle_delete_manifest(
                 &e.to_string(),
             );
         }
+
+        // #3108: drop this manifest's referrers subject edge so a deleted
+        // referrer stops appearing in `GET /v2/<name>/referrers/<digest>`.
+        if let Err(e) = sqlx::query(
+            "DELETE FROM oci_manifest_subjects WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(repo.id)
+        .bind(&digest)
+        .execute(&mut *tx)
+        .await
+        {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            );
+        }
     }
 
     if let Err(e) = tx.commit().await {
@@ -10430,6 +11021,20 @@ async fn catch_all(
                 return missing_upload_uuid_response();
             };
             handle_cancel_upload(&state, &headers, base_url, &image_name, &u).await
+        }
+        // #3275: upload-status probe. distribution-spec: "A GET request may be
+        // used to retrieve the current valid offset and upload location", and
+        // the response MUST be 204 with `Location` and `Range` headers.
+        ("GET", "uploads") => {
+            let Some(u) = reference else {
+                return missing_upload_uuid_response();
+            };
+            handle_get_upload_status(&state, &headers, base_url, &image_name, &u).await
+        }
+        // #3108: OCI 1.1 Referrers API.
+        ("GET", "referrers") => {
+            let d = require_ref!(reference, "DIGEST_INVALID", "digest required");
+            handle_referrers(&state, &headers, base_url, &image_name, &d, &query).await
         }
         ("HEAD", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
@@ -10653,6 +11258,57 @@ mod tests {
         let admin_scope = crate::models::access_scope::AccessScope::Admin;
         let admin_ids: Option<Vec<Uuid>> = admin_scope.into();
         assert_eq!(admin_ids, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // catalog_view_unrestricted / catalog_page_sql (#3269)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_catalog_view_unrestricted_only_for_unscoped_admin() {
+        // Only a global admin with no repo-scope ceiling and no scanner pin
+        // keeps the unfiltered catalog fast path.
+        assert!(catalog_view_unrestricted(&claims_with_repo_scope(
+            None, true
+        )));
+        // A non-admin never bypasses the filter, scoped or not.
+        assert!(!catalog_view_unrestricted(&claims_with_repo_scope(
+            None, false
+        )));
+        // A repo-scope ceiling binds even an admin bearer (#2290 parity).
+        assert!(!catalog_view_unrestricted(&claims_with_repo_scope(
+            Some(vec![Uuid::new_v4()]),
+            true
+        )));
+        // A scanner pin confines the catalog to the pinned repository.
+        assert!(!catalog_view_unrestricted(&claims_with_scan_scope(Some(
+            "repo-a"
+        ))));
+    }
+
+    #[test]
+    fn test_catalog_page_sql_filter_inside_subquery_before_limit() {
+        // Unfiltered branches carry no repository predicate at all.
+        assert!(!catalog_page_sql(false, false).contains("ANY"));
+        assert!(!catalog_page_sql(true, false).contains("ANY"));
+
+        // Filtered branches inject the predicate INSIDE the subquery (before
+        // DISTINCT/ORDER BY/LIMIT), so pagination operates on the authorized
+        // set only, and bind numbering follows cursor -> limit -> ids.
+        let filtered = catalog_page_sql(false, true);
+        let filter_pos = filtered
+            .find("r.id = ANY($2)")
+            .expect("no-cursor filtered SQL must bind ids at $2");
+        assert!(filter_pos < filtered.find(") catalog").unwrap());
+        assert!(filter_pos < filtered.find("LIMIT $1").unwrap());
+
+        let cursor_filtered = catalog_page_sql(true, true);
+        let filter_pos = cursor_filtered
+            .find("r.id = ANY($3)")
+            .expect("cursor filtered SQL must bind ids at $3");
+        assert!(filter_pos < cursor_filtered.find(") catalog").unwrap());
+        assert!(cursor_filtered.contains("(LOWER(name), name) > (LOWER($1), $1)"));
+        assert!(cursor_filtered.contains("LIMIT $2"));
     }
 
     // -----------------------------------------------------------------------
@@ -12098,6 +12754,282 @@ mod tests {
         assert_eq!(name, "test/image");
         assert_eq!(op, "manifests");
         assert_eq!(reference, Some("sha256:abc123".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Referrers API path parsing + response building (#3108)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_oci_path_referrers() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let result = parse_oci_path(&format!("/test/image/referrers/{digest}"));
+        let (name, op, reference) = result.unwrap();
+        assert_eq!(name, "test/image");
+        assert_eq!(op, "referrers");
+        assert_eq!(reference, Some(digest));
+    }
+
+    #[test]
+    fn test_parse_oci_path_referrers_invalid_digest_still_routes() {
+        // The spec requires a 400 for an invalid digest, so the path must
+        // still parse as a referrers request — the handler owns the 400.
+        let result = parse_oci_path("test/image/referrers/not-a-digest");
+        let (name, op, reference) = result.unwrap();
+        assert_eq!(name, "test/image");
+        assert_eq!(op, "referrers");
+        assert_eq!(reference, Some("not-a-digest".to_string()));
+    }
+
+    #[test]
+    fn test_parse_oci_path_allows_referrers_in_repository_name() {
+        // "referrers" as a non-terminal path component is a repo name part,
+        // not the endpoint.
+        let result = parse_oci_path("acme/referrers/api/manifests/latest");
+        let (name, op, reference) = result.unwrap();
+        assert_eq!(name, "acme/referrers/api");
+        assert_eq!(op, "manifests");
+        assert_eq!(reference, Some("latest".to_string()));
+    }
+
+    #[test]
+    fn test_is_valid_referrers_digest() {
+        assert!(is_valid_referrers_digest(&format!(
+            "sha256:{}",
+            "a1".repeat(32)
+        )));
+        assert!(is_valid_referrers_digest(&format!(
+            "sha512:{}",
+            "b2".repeat(64)
+        )));
+        // Unknown algorithm with a spec-grammar encoded part.
+        assert!(is_valid_referrers_digest(
+            "multihash+base58:QmRZxt2b1FVZPNqd8hsiykDL3TdBDeTSPX9Kv46HmX4Kgd"
+        ));
+        // Invalid shapes.
+        assert!(!is_valid_referrers_digest("no-colon"));
+        assert!(!is_valid_referrers_digest("sha256:"));
+        assert!(!is_valid_referrers_digest(":abc"));
+        assert!(!is_valid_referrers_digest("sha256:tooshort"));
+        // Uppercase hex is not canonical for sha256.
+        assert!(!is_valid_referrers_digest(&format!(
+            "sha256:{}",
+            "A1".repeat(32)
+        )));
+        // Algorithm part must be lowercase alnum + separators.
+        assert!(!is_valid_referrers_digest(&format!(
+            "SHA256:{}",
+            "a1".repeat(32)
+        )));
+    }
+
+    #[test]
+    fn test_extract_manifest_subject_full() {
+        let subject_digest = format!("sha256:{}", "c".repeat(64));
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/vnd.example.sbom",
+            "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+                        "digest": format!("sha256:{}", "d".repeat(64)), "size": 2},
+            "layers": [],
+            "subject": {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                         "digest": subject_digest, "size": 100},
+            "annotations": {"org.example.key": "value"},
+        });
+        let subject = extract_manifest_subject(
+            &serde_json::to_vec(&body).unwrap(),
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .expect("subject present");
+        assert_eq!(subject.subject_digest, subject_digest);
+        assert_eq!(
+            subject.media_type,
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(
+            subject.artifact_type.as_deref(),
+            Some("application/vnd.example.sbom")
+        );
+        assert_eq!(
+            subject.annotations,
+            Some(serde_json::json!({"org.example.key": "value"}))
+        );
+    }
+
+    #[test]
+    fn test_extract_manifest_subject_falls_back_to_config_media_type() {
+        // Spec: descriptor artifactType falls back to config.mediaType when
+        // the manifest has no artifactType of its own.
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "application/vnd.cncf.helm.config.v1+json",
+                        "digest": format!("sha256:{}", "d".repeat(64)), "size": 2},
+            "subject": {"digest": format!("sha256:{}", "c".repeat(64)), "size": 5},
+        });
+        let subject = extract_manifest_subject(
+            &serde_json::to_vec(&body).unwrap(),
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .expect("subject present");
+        assert_eq!(
+            subject.artifact_type.as_deref(),
+            Some("application/vnd.cncf.helm.config.v1+json")
+        );
+        // No body mediaType → stored content type is used for the descriptor.
+        assert_eq!(
+            subject.media_type,
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(subject.annotations, None);
+    }
+
+    #[test]
+    fn test_extract_manifest_subject_absent_or_malformed() {
+        assert_eq!(
+            extract_manifest_subject(br#"{"schemaVersion":2,"config":{}}"#, "ct"),
+            None
+        );
+        assert_eq!(extract_manifest_subject(b"not json", "ct"), None);
+        // subject without a digest string is not a usable edge
+        assert_eq!(
+            extract_manifest_subject(br#"{"subject":{"size":5}}"#, "ct"),
+            None
+        );
+    }
+
+    fn sample_referrer_rows() -> Vec<ReferrerRow> {
+        vec![
+            ReferrerRow {
+                manifest_digest: format!("sha256:{}", "1".repeat(64)),
+                media_type: OCI_IMAGE_MEDIA_TYPE.to_string(),
+                artifact_type: Some("application/vnd.example.sbom".to_string()),
+                size_bytes: 123,
+                annotations: Some(serde_json::json!({"k": "v"})),
+            },
+            ReferrerRow {
+                manifest_digest: format!("sha256:{}", "2".repeat(64)),
+                media_type: OCI_IMAGE_MEDIA_TYPE.to_string(),
+                artifact_type: None,
+                size_bytes: 456,
+                annotations: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_build_referrers_index_unfiltered() {
+        let (body, filtered) = build_referrers_index(&sample_referrer_rows(), None);
+        assert!(!filtered, "no filter param means no OCI-Filters-Applied");
+        assert_eq!(body["schemaVersion"], 2);
+        assert_eq!(body["mediaType"], OCI_INDEX_MEDIA_TYPE);
+        let manifests = body["manifests"].as_array().unwrap();
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0]["artifactType"], "application/vnd.example.sbom");
+        assert_eq!(manifests[0]["annotations"]["k"], "v");
+        assert_eq!(manifests[0]["size"], 123);
+        // Optional fields are OMITTED, not null, when absent.
+        assert!(manifests[1].get("artifactType").is_none());
+        assert!(manifests[1].get("annotations").is_none());
+    }
+
+    #[test]
+    fn test_build_referrers_index_filtered() {
+        let rows = sample_referrer_rows();
+        let (body, filtered) = build_referrers_index(&rows, Some("application/vnd.example.sbom"));
+        assert!(filtered);
+        assert_eq!(body["manifests"].as_array().unwrap().len(), 1);
+
+        let (body, filtered) = build_referrers_index(&rows, Some("application/no.match"));
+        assert!(
+            filtered,
+            "an applied filter with zero matches is still applied"
+        );
+        assert_eq!(body["manifests"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_build_referrers_index_empty() {
+        let (body, filtered) = build_referrers_index(&[], None);
+        assert!(!filtered);
+        assert_eq!(body["schemaVersion"], 2);
+        assert_eq!(body["mediaType"], OCI_INDEX_MEDIA_TYPE);
+        assert_eq!(body["manifests"].as_array().unwrap().len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Upload-status probe response (#3275)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upload_status_response_shape() {
+        let id = Uuid::new_v4();
+        let resp = upload_status_response("test/image", id, 100);
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers().get(LOCATION).unwrap(),
+            &format!("/v2/test/image/blobs/uploads/{id}")
+        );
+        assert_eq!(resp.headers().get("Range").unwrap(), "0-99");
+        assert_eq!(
+            resp.headers().get("Docker-Upload-UUID").unwrap(),
+            &id.to_string()
+        );
+    }
+
+    #[test]
+    fn test_upload_status_response_zero_bytes_range() {
+        let resp = upload_status_response("i", Uuid::new_v4(), 0);
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        // The spec requires a Range header even before any bytes arrive;
+        // "0-0" matches the POST-start response's convention.
+        assert_eq!(resp.headers().get("Range").unwrap(), "0-0");
+    }
+
+    // -----------------------------------------------------------------------
+    // Docker schema1 (v2s1) detection (#3024)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schema1_detected_by_version_and_fslayers() {
+        let v2s1 = serde_json::json!({
+            "schemaVersion": 1,
+            "name": "app", "tag": "latest",
+            "fsLayers": [{"blobSum": format!("sha256:{}", "e".repeat(64))}],
+            "history": [{"v1Compatibility": "{}"}],
+        });
+        assert!(oci_manifest_is_docker_schema1(
+            &serde_json::to_vec(&v2s1).unwrap()
+        ));
+        // Either signal alone is enough (crafted bodies).
+        assert!(oci_manifest_is_docker_schema1(br#"{"schemaVersion":1}"#));
+        assert!(oci_manifest_is_docker_schema1(
+            br#"{"schemaVersion":2,"fsLayers":[]}"#
+        ));
+    }
+
+    #[test]
+    fn test_schema1_not_detected_for_schema2_or_garbage() {
+        let schema2 = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"mediaType": "application/vnd.docker.container.image.v1+json",
+                        "digest": format!("sha256:{}", "f".repeat(64)), "size": 2},
+            "layers": [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                         "digest": format!("sha256:{}", "0".repeat(64)), "size": 2}],
+        });
+        assert!(!oci_manifest_is_docker_schema1(
+            &serde_json::to_vec(&schema2).unwrap()
+        ));
+        let index = serde_json::json!({"schemaVersion": 2, "manifests": []});
+        assert!(!oci_manifest_is_docker_schema1(
+            &serde_json::to_vec(&index).unwrap()
+        ));
+        assert!(!oci_manifest_is_docker_schema1(b"not json"));
+        // A non-array `fsLayers` is not the v2s1 shape.
+        assert!(!oci_manifest_is_docker_schema1(
+            br#"{"schemaVersion":2,"fsLayers":"x"}"#
+        ));
     }
 
     #[test]
@@ -24534,6 +25466,234 @@ mod cross_repo_session_regression_tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    /// #3275: `GET /v2/<name>/blobs/uploads/<uuid>` is the upload-status
+    /// probe. The distribution spec requires `204 No Content` with `Location`
+    /// and `Range` headers so a client can resume a chunked upload after a
+    /// dropped connection or a 416. Before this fix the catch-all had no
+    /// `("GET","uploads")` arm and answered 405.
+    #[tokio::test]
+    async fn get_upload_status_returns_204_with_range_and_location() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "upstat").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // Seed an OPEN session with a real offset, as two prior PATCHes
+        // totalling 12 bytes would have left it.
+        let session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO oci_upload_sessions (id, repository_id, user_id, bytes_received, storage_temp_key) \
+             VALUES ($1, $2, $3, 12, $4)",
+        )
+        .bind(session_id)
+        .bind(repo_id)
+        .bind(user_id)
+        .bind(upload_storage_key(&session_id))
+        .execute(&pool)
+        .await
+        .expect("seed session");
+
+        let status_probe = |uuid: String| {
+            let auth = auth.clone();
+            let key = repo_key.clone();
+            let app = make_app();
+            async move {
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{}/myimage/blobs/uploads/{}", key, uuid))
+                    .header("Authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap();
+                let (status, _body, headers) = tdh::send_with_headers(app, req).await;
+                (status, headers)
+            }
+        };
+
+        let (status, headers) = status_probe(session_id.to_string()).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "spec: upload-status GET on an active upload MUST be 204"
+        );
+        assert_eq!(
+            headers.get("Range").unwrap(),
+            "0-11",
+            "Range must report the current valid offset"
+        );
+        assert_eq!(
+            headers.get(LOCATION).unwrap(),
+            &format!("/v2/{}/myimage/blobs/uploads/{}", repo_key, session_id),
+        );
+        assert_eq!(
+            headers.get("Docker-Upload-UUID").unwrap(),
+            &session_id.to_string()
+        );
+
+        // Unknown session → 404 BLOB_UPLOAD_UNKNOWN, not 405.
+        let (status, _) = status_probe(Uuid::new_v4().to_string()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A non-open (committing) session is not an active upload → 409.
+        sqlx::query("UPDATE oci_upload_sessions SET state = 'committing' WHERE id = $1")
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .expect("mark committing");
+        let (status, _) = status_probe(session_id.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let _ = sqlx::query("DELETE FROM oci_upload_sessions WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #3108 end-to-end over the router: pushing a manifest with a `subject`
+    /// must answer `OCI-Subject`, and `GET /v2/<name>/referrers/<digest>`
+    /// must return the spec's image index — the referrer's descriptor with
+    /// `artifactType`/`annotations`, the `artifactType` filter with
+    /// `OCI-Filters-Applied`, an empty index for a digest with no referrers,
+    /// and 400 for an invalid digest.
+    #[tokio::test]
+    async fn referrers_api_lists_filters_and_validates() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (_user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "refapi").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        let subject_digest = format!("sha256:{}", "5".repeat(64));
+        let referrer = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/vnd.example.sbom",
+            "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+                        "digest": format!("sha256:{}", "6".repeat(64)), "size": 2},
+            "layers": [{"mediaType": "application/vnd.example.sbom.layer",
+                         "digest": format!("sha256:{}", "7".repeat(64)), "size": 2}],
+            "subject": {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                         "digest": subject_digest, "size": 100},
+            "annotations": {"org.example.role": "sbom"},
+        });
+        let referrer_bytes = serde_json::to_vec(&referrer).unwrap();
+        let referrer_digest = compute_sha256(&referrer_bytes);
+
+        // Push the referrer by digest, as oras/cosign do.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/manifests/{}",
+                repo_key, referrer_digest
+            ))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(referrer_bytes.clone()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            resp.headers().get("OCI-Subject").unwrap(),
+            &subject_digest,
+            "spec: a subject-carrying push MUST answer OCI-Subject"
+        );
+
+        let referrers_get = |uri_suffix: String| {
+            let auth = auth.clone();
+            let key = repo_key.clone();
+            let app = make_app();
+            async move {
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/{}/myimage/referrers/{}", key, uri_suffix))
+                    .header("Authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap();
+                tdh::send_with_headers(app, req).await
+            }
+        };
+
+        // Unfiltered listing.
+        let (status, body, headers) = referrers_get(subject_digest.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("Content-Type").unwrap(), OCI_INDEX_MEDIA_TYPE);
+        assert!(
+            headers.get("OCI-Filters-Applied").is_none(),
+            "no filter param → no OCI-Filters-Applied header"
+        );
+        let index: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(index["schemaVersion"], 2);
+        assert_eq!(index["mediaType"], OCI_INDEX_MEDIA_TYPE);
+        let manifests = index["manifests"].as_array().unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0]["digest"], referrer_digest);
+        assert_eq!(manifests[0]["size"], referrer_bytes.len() as i64);
+        assert_eq!(manifests[0]["artifactType"], "application/vnd.example.sbom");
+        assert_eq!(manifests[0]["annotations"]["org.example.role"], "sbom");
+
+        // artifactType filter: match and no-match, both flagged as applied.
+        let (status, body, headers) = referrers_get(format!(
+            "{}?artifactType=application%2Fvnd.example.sbom",
+            subject_digest
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("OCI-Filters-Applied").unwrap(), "artifactType");
+        let index: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(index["manifests"].as_array().unwrap().len(), 1);
+
+        let (_, body, _) = referrers_get(format!(
+            "{}?artifactType=application%2Fno.match",
+            subject_digest
+        ))
+        .await;
+        let index: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(index["manifests"].as_array().unwrap().len(), 0);
+
+        // A digest with no referrers: empty index, still 200.
+        let (status, body, _) = referrers_get(format!("sha256:{}", "9".repeat(64))).await;
+        assert_eq!(status, StatusCode::OK);
+        let index: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(index["manifests"].as_array().unwrap().len(), 0);
+
+        // Invalid digest → 400 per spec.
+        let (status, _, _) = referrers_get("not-a-digest".to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let _ = sqlx::query("DELETE FROM oci_manifest_subjects WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM manifest_blob_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
     /// #1776: deleting one tag by NAME when a sibling tag shares the same
     /// manifest digest must leave the sibling tag intact and must NOT reclaim
     /// the manifest's blob refs (still live via the sibling).
@@ -25856,6 +27016,74 @@ mod proxy_scan_block_tests {
         app.oneshot(req).await.expect("oneshot")
     }
 
+    /// Serve a v2s1 (Docker schema1) manifest through a Remote repo and
+    /// return the resulting status. `scan_on_proxy` toggles the #3024 gate.
+    async fn serve_v2s1_through_proxy(fx: &tdh::Fixture, scan_on_proxy: bool) -> StatusCode {
+        let v2s1 = serde_json::json!({
+            "schemaVersion": 1,
+            "name": "app", "tag": "v1",
+            "fsLayers": [{"blobSum": format!("sha256:{}", "a".repeat(64))}],
+            "history": [{"v1Compatibility": "{}"}],
+        });
+        let body = Bytes::from(serde_json::to_vec(&v2s1).unwrap());
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "v1",
+            &body,
+            "application/vnd.docker.distribution.manifest.v1+json",
+            None,
+        )
+        .await;
+        wire_public_remote(fx, &upstream).await;
+        if scan_on_proxy {
+            enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        pull_manifest(&state, &fx.repo_key, "v1").await.status()
+    }
+
+    /// #3024: a Docker schema1 (v2s1) manifest has no `config` descriptor, so
+    /// the runnable-image predicate never gates it — it was the one
+    /// legacy-runnable shape that proxied through a scan-on-proxy repository
+    /// `200` unscanned. Under scan-on-proxy it must now be refused outright
+    /// (403), since the scanner cannot reassemble a v2s1 image either.
+    #[tokio::test]
+    async fn test_schema1_manifest_refused_under_scan_on_proxy() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let status = serve_v2s1_through_proxy(&fx, true).await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a v2s1 manifest must be refused under scan-on-proxy, not served unscanned"
+        );
+    }
+
+    /// Control for the refusal above: with proxy scanning DISABLED the same
+    /// v2s1 manifest still proxies through — the refusal is scoped to the
+    /// scan-on-proxy policy, not a blanket schema ban.
+    #[tokio::test]
+    async fn test_schema1_manifest_still_proxies_without_scan_on_proxy() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let status = serve_v2s1_through_proxy(&fx, false).await;
+        fx.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "without scan-on-proxy the deprecated schema still proxies (no blanket ban)"
+        );
+    }
+
     // ── Pure decision helpers ──────────────────────────────────────────────
 
     /// Only a runnable single-image manifest enters the gate: an index and
@@ -27044,6 +28272,118 @@ mod proxy_scan_block_tests {
         );
     }
 
+    /// #3258: HEAD must agree with GET on a scan-blocked blob. Before this
+    /// fix `handle_head_blob` never consulted the verdict join, so a blob
+    /// whose GET was `403 DENIED` still answered HEAD `200` with an exact
+    /// `Content-Length` — leaking existence and size of blocked content and
+    /// making the two verbs disagree on the same resource. Positive control:
+    /// a blob with no vulnerable verdict answers HEAD 200, so a fix that
+    /// blanket-403'd HEAD cannot pass.
+    #[tokio::test]
+    async fn test_head_blob_blocked_like_get_for_vulnerable_image() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let cfg_bytes = unique_fixture_bytes("head-vuln-cfg");
+        let layer_bytes = unique_fixture_bytes("head-vuln-layer");
+        let (manifest, config_digest, _layer_digest) = image_manifest(&cfg_bytes, &layer_bytes);
+        let manifest_digest = compute_sha256(&manifest);
+        record_manifest_blob_refs(&fx.pool, fx.repo_id, &manifest_digest, &manifest)
+            .await
+            .expect("record blob refs");
+
+        // Stage the config blob locally so an unblocked serve would be 200,
+        // plus an unrelated clean blob as the positive control.
+        let clean_bytes = unique_fixture_bytes("head-clean-blob");
+        let clean_digest = compute_sha256(&clean_bytes);
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for (d, bytes) in [(&config_digest, &cfg_bytes), (&clean_digest, &clean_bytes)] {
+            storage
+                .put(&blob_storage_key(d), Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(d)
+            .bind(bytes.len() as i64)
+            .bind(blob_storage_key(d))
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                manifest_digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "vulnerable",
+                4,
+                1,
+                3,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let probe = |method: &'static str, d: String| {
+            let state = fx.state.clone();
+            let key = fx.repo_key.clone();
+            async move {
+                let app = tdh::router_anon(router(), state);
+                let req = Request::builder()
+                    .method(method)
+                    .uri(format!("/{key}/app/blobs/{d}"))
+                    .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.expect("oneshot").status()
+            }
+        };
+
+        let head_vuln = probe("HEAD", config_digest.clone()).await;
+        let get_vuln = probe("GET", config_digest.clone()).await;
+        let head_clean = probe("HEAD", clean_digest.clone()).await;
+
+        cleanup_proxy_scan_row(&fx.pool, manifest_digest.strip_prefix("sha256:").unwrap()).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            get_vuln,
+            StatusCode::FORBIDDEN,
+            "control: GET on the vulnerable image's blob is blocked"
+        );
+        assert_eq!(
+            head_vuln,
+            StatusCode::FORBIDDEN,
+            "#3258: HEAD must apply the same scan re-block as GET"
+        );
+        assert_eq!(
+            head_clean,
+            StatusCode::OK,
+            "control: HEAD on an unrelated clean blob still serves"
+        );
+    }
+
     /// #3105 (Bug 2): on a PROXY (Remote) repository the blob-level re-block
     /// MUST honor `scan_on_proxy`, the same way the manifest gate does. A blob
     /// belonging to an image with a stored `vulnerable` verdict is re-blocked
@@ -27412,17 +28752,26 @@ mod proxy_scan_block_tests {
         .await
         .expect("seed clean verdict");
 
-        let blocked_in_a = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &shared_layer)
-            .await
-            .expect("lookup a")
+        let blocked_in_a = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &shared_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup a")
             == BlobVerdictStatus::Blocking;
         // Repo B references the SAME vulnerable manifest, so the shared layer
         // is blocked there too — same bytes, same image, same verdict.
-        let blocked_in_b_with_same_image =
-            blob_vulnerable_verdict_status(&other.state, other.repo_id, &shared_layer)
-                .await
-                .expect("lookup b")
-                == BlobVerdictStatus::Blocking;
+        let blocked_in_b_with_same_image = blob_vulnerable_verdict_status(
+            &other.state,
+            other.repo_id,
+            &shared_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup b")
+            == BlobVerdictStatus::Blocking;
 
         // Now drop repo B's reference to the vulnerable image. Its only
         // remaining reference to the shared layer is via the CLEAN image, so
@@ -27435,16 +28784,24 @@ mod proxy_scan_block_tests {
         .execute(&other.pool)
         .await
         .expect("drop repo b reference");
-        let blocked_in_b_clean_only =
-            blob_vulnerable_verdict_status(&other.state, other.repo_id, &shared_layer)
-                .await
-                .expect("lookup b again")
-                == BlobVerdictStatus::Blocking;
-        let still_blocked_in_a =
-            blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &shared_layer)
-                .await
-                .expect("lookup a again")
-                == BlobVerdictStatus::Blocking;
+        let blocked_in_b_clean_only = blob_vulnerable_verdict_status(
+            &other.state,
+            other.repo_id,
+            &shared_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup b again")
+            == BlobVerdictStatus::Blocking;
+        let still_blocked_in_a = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &shared_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup a again")
+            == BlobVerdictStatus::Blocking;
 
         for d in [&vuln_digest, &clean_digest] {
             cleanup_proxy_scan_row(&fx.pool, d.strip_prefix("sha256:").unwrap()).await;
@@ -27480,9 +28837,14 @@ mod proxy_scan_block_tests {
             return;
         };
         let unknown = format!("sha256:{}", "9".repeat(64));
-        let status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &unknown)
-            .await
-            .expect("lookup");
+        let status = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &unknown,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("lookup");
         fx.teardown().await;
         assert_eq!(
             status,
@@ -27585,15 +28947,30 @@ mod proxy_scan_block_tests {
         )
         .await;
 
-        let stale_status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &stale_layer)
-            .await
-            .expect("stale lookup");
-        let fresh_status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &fresh_layer)
-            .await
-            .expect("fresh lookup");
-        let clean_status = blob_vulnerable_verdict_status(&fx.state, fx.repo_id, &clean_layer)
-            .await
-            .expect("clean lookup");
+        let stale_status = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &stale_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("stale lookup");
+        let fresh_status = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &fresh_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("fresh lookup");
+        let clean_status = blob_vulnerable_verdict_status(
+            &fx.state,
+            fx.repo_id,
+            &clean_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("clean lookup");
 
         for digest in [&stale_digest, &fresh_digest, &clean_digest] {
             cleanup_proxy_scan_row(&fx.pool, digest.strip_prefix("sha256:").unwrap()).await;
@@ -27702,14 +29079,21 @@ mod proxy_scan_block_tests {
             verdict: "vulnerable".to_string(),
             scanned_at: now - chrono::Duration::days(age_days),
             scanner_version: version.map(|v| v.to_string()),
+            max_severity: Some("critical".to_string()),
         };
+        let gate = crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny;
 
         assert_eq!(
-            classify_blob_verdicts(&[], Some("grype-1.0.0"), now),
+            classify_blob_verdicts(&[], Some("grype-1.0.0"), gate, now),
             BlobVerdictStatus::NoVerdict
         );
         assert_eq!(
-            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], Some("grype-1.0.0"), now),
+            classify_blob_verdicts(
+                &[mk(1, Some("grype-1.0.0"))],
+                Some("grype-1.0.0"),
+                gate,
+                now
+            ),
             BlobVerdictStatus::Blocking,
             "a current verdict blocks"
         );
@@ -27717,6 +29101,7 @@ mod proxy_scan_block_tests {
             classify_blob_verdicts(
                 &[mk(DEDUP_TTL_DAYS as i64 + 1, Some("grype-1.0.0"))],
                 Some("grype-1.0.0"),
+                gate,
                 now
             ),
             BlobVerdictStatus::StaleOnly,
@@ -27724,18 +29109,23 @@ mod proxy_scan_block_tests {
              hold a standing block"
         );
         assert_eq!(
-            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], Some("grype-2.0.0"), now),
+            classify_blob_verdicts(
+                &[mk(1, Some("grype-1.0.0"))],
+                Some("grype-2.0.0"),
+                gate,
+                now
+            ),
             BlobVerdictStatus::StaleOnly,
             "#2976: a scanner-version change invalidates the verdict on this seam too"
         );
         assert_eq!(
-            classify_blob_verdicts(&[mk(1, None)], Some("grype-1.0.0"), now),
+            classify_blob_verdicts(&[mk(1, None)], Some("grype-1.0.0"), gate, now),
             BlobVerdictStatus::Blocking,
             "an unknown stored version cannot PROVE staleness; TTL alone decides, and the \
              block stays on"
         );
         assert_eq!(
-            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], None, now),
+            classify_blob_verdicts(&[mk(1, Some("grype-1.0.0"))], None, gate, now),
             BlobVerdictStatus::Blocking,
             "an unreadable live version cannot prove staleness either — fail closed"
         );
@@ -27746,11 +29136,81 @@ mod proxy_scan_block_tests {
                     mk(1, Some("grype-1.0.0")),
                 ],
                 Some("grype-1.0.0"),
+                gate,
                 now
             ),
             BlobVerdictStatus::Blocking,
             "ANY-not-ALL is preserved: one still-reusable verdict blocks, and a stale \
              sibling must not unlock it"
+        );
+    }
+
+    /// #3243 stage 3: the blob seam applies the repo's severity threshold with
+    /// the same fail-closed edges as the manifest gate — a KNOWN severity
+    /// strictly below the threshold releases the ref, an absent/unparseable
+    /// stored severity keeps blocking, and `BlockOnAny` (the non-opted-in
+    /// posture) ignores severity entirely.
+    #[test]
+    fn classify_blob_verdicts_severity_threshold() {
+        use crate::models::security::Severity;
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        let now = chrono::Utc::now();
+        let mk = |max_severity: Option<&str>| BlobVerdictRef {
+            verdict: "vulnerable".to_string(),
+            scanned_at: now - chrono::Duration::days(1),
+            scanner_version: Some("grype-1.0.0".to_string()),
+            max_severity: max_severity.map(|v| v.to_string()),
+        };
+        let high = ProxySeverityGate::Threshold(Severity::High);
+
+        assert_eq!(
+            classify_blob_verdicts(&[mk(Some("low"))], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::NoVerdict,
+            "a verdict below the opted-in threshold must not block the blob \
+             (the manifest for the same image serves)"
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(Some("critical"))], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::Blocking,
+            "at-or-above the threshold still blocks"
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(None)], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::Blocking,
+            "fail closed: a legacy row with no stored max_severity blocks even \
+             under a configured threshold"
+        );
+        assert_eq!(
+            classify_blob_verdicts(&[mk(Some("bogus"))], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::Blocking,
+            "fail closed: an unparseable stored max_severity blocks"
+        );
+        assert_eq!(
+            classify_blob_verdicts(
+                &[mk(Some("low"))],
+                Some("grype-1.0.0"),
+                ProxySeverityGate::BlockOnAny,
+                now
+            ),
+            BlobVerdictStatus::Blocking,
+            "a repo that has not opted in keeps block-on-any"
+        );
+        assert_eq!(
+            classify_blob_verdicts(
+                &[mk(Some("low")), mk(Some("critical"))],
+                Some("grype-1.0.0"),
+                high,
+                now
+            ),
+            BlobVerdictStatus::Blocking,
+            "ANY-not-ALL survives the threshold: one blocking ref blocks the blob"
+        );
+        // A below-threshold ref is OUT OF SCOPE, not merely stale: it must not
+        // hold the blob in StaleOnly (which would withhold under fail_closed).
+        assert_eq!(
+            classify_blob_verdicts(&[mk(Some("info"))], Some("grype-1.0.0"), high, now),
+            BlobVerdictStatus::NoVerdict,
+            "a below-threshold ref neither blocks nor withholds"
         );
     }
 
@@ -28256,9 +29716,14 @@ mod virtual_scan_gate_tests {
             .expect("seed vulnerable verdict");
 
         // Empty member set -> never blocks.
-        let empty = blob_vulnerable_verdict_status_any(&fx.state, &[], &config_digest)
-            .await
-            .expect("empty ids lookup");
+        let empty = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &[],
+            &config_digest,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("empty ids lookup");
         assert_eq!(
             empty,
             BlobVerdictStatus::NoVerdict,
@@ -28266,10 +29731,14 @@ mod virtual_scan_gate_tests {
         );
 
         // A member set NOT containing the recording member -> no refs -> false.
-        let other =
-            blob_vulnerable_verdict_status_any(&fx.state, &[Uuid::new_v4()], &config_digest)
-                .await
-                .expect("other ids lookup");
+        let other = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &[Uuid::new_v4()],
+            &config_digest,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("other ids lookup");
         assert_eq!(
             other,
             BlobVerdictStatus::NoVerdict,
@@ -28281,6 +29750,7 @@ mod virtual_scan_gate_tests {
             &fx.state,
             &[Uuid::new_v4(), member_id],
             &config_digest,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
         )
         .await
         .expect("spanning lookup");
@@ -28362,15 +29832,30 @@ mod virtual_scan_gate_tests {
         );
 
         let span = [Uuid::new_v4(), member_id];
-        let stale_status = blob_vulnerable_verdict_status_any(&fx.state, &span, &stale_layer)
-            .await
-            .expect("stale span lookup");
-        let fresh_status = blob_vulnerable_verdict_status_any(&fx.state, &span, &fresh_layer)
-            .await
-            .expect("fresh span lookup");
-        let clean_status = blob_vulnerable_verdict_status_any(&fx.state, &span, &clean_layer)
-            .await
-            .expect("clean span lookup");
+        let stale_status = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &span,
+            &stale_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("stale span lookup");
+        let fresh_status = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &span,
+            &fresh_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("fresh span lookup");
+        let clean_status = blob_vulnerable_verdict_status_any(
+            &fx.state,
+            &span,
+            &clean_layer,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        )
+        .await
+        .expect("clean span lookup");
 
         for digest in [&stale_digest, &fresh_digest, &clean_digest] {
             cleanup_refs(&fx.pool, member_id, digest).await;
@@ -31487,5 +32972,351 @@ mod direct_credential_repo_scope_regression_3316 {
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
 
         let _ = std::fs::remove_dir_all(&storage);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OCI `/v2/_catalog` READ scoping (#3269).
+//
+// Before this fix `handle_catalog` authenticated the caller and then listed
+// EVERY repository key with OCI content — any authenticated principal could
+// enumerate the full repository namespace, including private repositories it
+// could not pull. These tests drive the real router and assert both
+// directions in one fixture: a non-admin sees only the repositories the read
+// gate permits (its granted repo + public repos), while the admin still sees
+// everything and the anonymous 401 challenge is unchanged. DB-backed: the
+// decision reads `permissions` / `role_assignments` / `oci_tags`; the tests
+// no-op without a database and PANIC under `AK_TESTS_REQUIRE_DB=1` if the
+// pool is missing (revert-proof: a sub-second "pass" means nothing ran).
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod oci_catalog_read_scope_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+
+    /// Insert a user and backdate the credential/privilege watermarks by 60s,
+    /// so a bearer minted immediately after the INSERT cannot lose the race
+    /// against `privileges_changed_at` (migration 131).
+    async fn backdated_user(pool: &PgPool, is_admin: bool) -> Uuid {
+        let (id, _) = tdh::create_user(pool).await;
+        sqlx::query(
+            "UPDATE users SET is_admin = $2, \
+                              password_changed_at = NOW() - INTERVAL '60 seconds', \
+                              privileges_changed_at = NOW() - INTERVAL '60 seconds' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(is_admin)
+        .execute(pool)
+        .await
+        .expect("backdate user watermarks");
+        id
+    }
+
+    /// Seed one `oci_tags` row whose `name` is empty, so the repository's
+    /// catalog entry is exactly `r.key` (the `CASE` branch in the catalog SQL).
+    async fn seed_catalog_tag(pool: &PgPool, repo_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO oci_tags \
+                 (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, '', 'latest', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo_id)
+        .bind(format!("sha256:{:064x}", 0x3269))
+        .execute(pool)
+        .await
+        .expect("seed catalog tag");
+    }
+
+    /// Two PRIVATE hosted docker repositories (A granted to the member, B
+    /// ungranted) plus a PUBLIC one (P), each carrying one OCI tag so all
+    /// three are catalog candidates.
+    struct CatalogFixture {
+        pool: PgPool,
+        state: SharedState,
+        repo_a: Uuid,
+        key_a: String,
+        repo_b: Uuid,
+        key_b: String,
+        repo_p: Uuid,
+        key_p: String,
+        member_id: Uuid,
+        extra_users: Vec<Uuid>,
+        dirs: Vec<std::path::PathBuf>,
+    }
+
+    impl CatalogFixture {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+            let (repo_b, key_b, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+            let (repo_p, key_p, dir_p) = tdh::create_repo(&pool, "local", "docker").await;
+            sqlx::query("UPDATE repositories SET is_public = TRUE WHERE id = $1")
+                .bind(repo_p)
+                .execute(&pool)
+                .await
+                .expect("mark repo public");
+            for repo in [repo_a, repo_b, repo_p] {
+                seed_catalog_tag(&pool, repo).await;
+            }
+            let state = tdh::build_state(pool.clone(), dir_a.to_str().unwrap());
+            let member_id = backdated_user(&pool, false).await;
+            tdh::grant_repo_access(&pool, repo_a, member_id).await;
+            Some(Self {
+                pool,
+                state,
+                repo_a,
+                key_a,
+                repo_b,
+                key_b,
+                repo_p,
+                key_p,
+                member_id,
+                extra_users: Vec::new(),
+                dirs: vec![dir_a, dir_b, dir_p],
+            })
+        }
+
+        async fn add_user(&mut self, is_admin: bool) -> Uuid {
+            let id = backdated_user(&self.pool, is_admin).await;
+            self.extra_users.push(id);
+            id
+        }
+
+        async fn bearer(&self, user_id: Uuid) -> String {
+            tdh::bearer_for(&self.state, user_id).await
+        }
+
+        /// `GET /v2/_catalog{query}` through the real router; `None` = no
+        /// Authorization header (anonymous).
+        async fn catalog(
+            &self,
+            query: &str,
+            authorization: Option<&str>,
+        ) -> (StatusCode, Bytes, HeaderMap) {
+            let mut builder = Request::builder()
+                .method("GET")
+                .uri(format!("/_catalog{query}"));
+            if let Some(auth) = authorization {
+                builder = builder.header(AUTHORIZATION, auth);
+            }
+            let req = builder.body(Body::empty()).expect("build request");
+            tdh::send_with_headers(router().with_state(self.state.clone()), req).await
+        }
+
+        async fn teardown(&self) {
+            for repo in [self.repo_a, self.repo_b, self.repo_p] {
+                let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                    .bind(repo)
+                    .execute(&self.pool)
+                    .await;
+            }
+            for user_id in &self.extra_users {
+                tdh::cleanup_user(&self.pool, *user_id).await;
+            }
+            tdh::cleanup(&self.pool, self.repo_b, self.member_id).await;
+            tdh::cleanup(&self.pool, self.repo_p, self.member_id).await;
+            tdh::cleanup(&self.pool, self.repo_a, self.member_id).await;
+            for dir in &self.dirs {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// Parse the `repositories` array out of a catalog response body.
+    fn repo_list(body: &Bytes) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_slice(body).expect("catalog body is JSON");
+        v["repositories"]
+            .as_array()
+            .expect("repositories array")
+            .iter()
+            .map(|s| s.as_str().expect("string entry").to_string())
+            .collect()
+    }
+
+    /// THE BUG (#3269): a non-admin member with a read grant on A alone saw
+    /// EVERY repository key in `_catalog`, including private B. Now the
+    /// listing is scoped to what the read gate permits — A (granted) and P
+    /// (public) — while the admin, in the same fixture, still sees all three
+    /// (a filter that hid everything from everyone could not pass this).
+    #[tokio::test]
+    async fn catalog_lists_only_readable_repos_for_non_admin() {
+        let Some(mut f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let admin = f.add_user(true).await;
+        let member_bearer = f.bearer(f.member_id).await;
+        let admin_bearer = f.bearer(admin).await;
+
+        let (member_status, member_body, _) = f.catalog("?n=10000", Some(&member_bearer)).await;
+        let (admin_status, admin_body, _) = f.catalog("?n=10000", Some(&admin_bearer)).await;
+        f.teardown().await;
+
+        assert_eq!(member_status, StatusCode::OK);
+        let member_repos = repo_list(&member_body);
+        assert!(
+            member_repos.contains(&f.key_a),
+            "the granted repository must be listed for its member"
+        );
+        assert!(
+            member_repos.contains(&f.key_p),
+            "a public repository must be listed for any authenticated caller"
+        );
+        assert!(
+            !member_repos.contains(&f.key_b),
+            "a private repository the caller cannot read must NOT appear in _catalog"
+        );
+
+        assert_eq!(admin_status, StatusCode::OK);
+        let admin_repos = repo_list(&admin_body);
+        for key in [&f.key_a, &f.key_b, &f.key_p] {
+            assert!(
+                admin_repos.contains(key),
+                "a global admin must still see every repository ({key})"
+            );
+        }
+    }
+
+    /// Parity with the pull gate on the fine-grained store: an applicable
+    /// `permissions` rule naming the caller WITHOUT `read` is authoritative,
+    /// so the repository disappears from the catalog exactly as its manifests
+    /// became unpullable — this is why the role-only visibility helper was
+    /// not reused (it would still leak the name).
+    #[tokio::test]
+    async fn fine_grained_deny_removes_repo_from_catalog() {
+        let Some(mut f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let denied = f.add_user(false).await;
+        tdh::grant_repo_access(&f.pool, f.repo_a, denied).await;
+        tdh::grant_permission(&f.pool, "user", denied, "repository", f.repo_a, &["write"]).await;
+        let bearer = f.bearer(denied).await;
+
+        let (status, body, _) = f.catalog("?n=10000", Some(&bearer)).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let repos = repo_list(&body);
+        assert!(
+            !repos.contains(&f.key_a),
+            "an applicable fine-grained rule without `read` must remove the name"
+        );
+        assert!(
+            repos.contains(&f.key_p),
+            "the public read baseline must survive an unrelated deny"
+        );
+    }
+
+    /// The token repo-scope ceiling (#2290/#3316) confines the catalog set:
+    /// a bearer restricted to P sees only P even though its identity holds a
+    /// role grant on A. Also pins the unscoped Phase-1 set for the member.
+    #[tokio::test]
+    async fn repo_scope_ceiling_confines_catalog_set() {
+        let Some(f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let bearer = f.bearer(f.member_id).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, bearer.parse().expect("bearer header"));
+        let mut claims = authenticate_oci(&f.state.db, &f.state.config, &headers)
+            .await
+            .expect("authenticate member bearer");
+
+        let unscoped = authorized_catalog_repo_ids(&f.state, &claims)
+            .await
+            .expect("resolve unscoped set");
+
+        claims.allowed_repo_ids = Some(vec![f.repo_p]);
+        let scoped = authorized_catalog_repo_ids(&f.state, &claims)
+            .await
+            .expect("resolve scoped set");
+        f.teardown().await;
+
+        assert!(unscoped.contains(&f.repo_a), "granted repo in Phase-1 set");
+        assert!(unscoped.contains(&f.repo_p), "public repo in Phase-1 set");
+        assert!(
+            !unscoped.contains(&f.repo_b),
+            "ungranted private repo must be omitted from the Phase-1 set"
+        );
+        assert_eq!(
+            scoped,
+            vec![f.repo_p],
+            "a repo-scope ceiling must confine the catalog to its allow-list"
+        );
+    }
+
+    /// Anonymous behavior is deliberately UNCHANGED: no credentials still gets
+    /// the 401 + `WWW-Authenticate: Bearer` challenge Docker/Podman use to
+    /// reach `/v2/token` — the fix must not broaden anonymous access to a
+    /// public-only listing.
+    #[tokio::test]
+    async fn anonymous_catalog_keeps_401_challenge() {
+        let Some(f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let (status, _, headers) = f.catalog("", None).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let challenge = headers
+            .get("WWW-Authenticate")
+            .expect("401 must carry the WWW-Authenticate challenge")
+            .to_str()
+            .expect("header is ASCII");
+        assert!(
+            challenge.starts_with("Bearer"),
+            "the Bearer challenge handshake must be preserved, got: {challenge}"
+        );
+    }
+
+    /// `n`/`last` pagination operates on the AUTHORIZED set only: the filter
+    /// is applied inside the query before `LIMIT`, so a trailing unauthorized
+    /// row never signals `has_more`, and the cursor walks the filtered order.
+    #[tokio::test]
+    async fn pagination_operates_on_authorized_set_only() {
+        let Some(f) = CatalogFixture::setup().await else {
+            return;
+        };
+        let both = [f.repo_a, f.repo_p];
+        let (page1, more1) = catalog_local_entries(&f.pool, Some(&both), None, 1)
+            .await
+            .expect("first page");
+        let cursor = page1.first().cloned().expect("first page has one entry");
+        let (page2, more2) = catalog_local_entries(&f.pool, Some(&both), Some(&cursor), 1)
+            .await
+            .expect("second page");
+
+        let only_a = [f.repo_a];
+        let (solo, more_solo) = catalog_local_entries(&f.pool, Some(&only_a), None, 1)
+            .await
+            .expect("single-repo page");
+
+        let (empty, more_empty) = catalog_local_entries(&f.pool, Some(&[]), None, 1)
+            .await
+            .expect("empty allow-list page");
+        f.teardown().await;
+
+        // Keys are lowercase, so plain lexical order matches LOWER()-first SQL order.
+        let mut expected = [f.key_a.clone(), f.key_p.clone()];
+        expected.sort();
+        assert_eq!(page1, vec![expected[0].clone()]);
+        assert!(more1, "one authorized entry remains past the first page");
+        assert_eq!(page2, vec![expected[1].clone()]);
+        assert!(
+            !more2,
+            "unauthorized rows beyond the set must not signal has_more"
+        );
+        assert_eq!(solo, vec![f.key_a.clone()]);
+        assert!(
+            !more_solo,
+            "B and P exist but are outside the allow-list — no has_more"
+        );
+        assert!(empty.is_empty(), "an empty allow-list yields an empty page");
+        assert!(!more_empty);
     }
 }

@@ -294,10 +294,16 @@ fn classify_maven(lower: &str) -> Mutability {
     if leaf.starts_with("maven-metadata.xml") {
         return Mutability::mutable_default();
     }
-    // A SNAPSHOT path that is NOT a concrete timestamped artifact is mutable
-    // (the directory listing / metadata is republished). Concrete timestamped
-    // SNAPSHOT artifacts (e.g. `app-1.0-20240101.120000-3.jar`) are immutable.
-    if lower.contains("-snapshot/") && !has_artifact_extension(leaf) {
+    // Files inside a `-SNAPSHOT/` version directory. A NON-UNIQUE SNAPSHOT
+    // artifact keeps the literal `-SNAPSHOT` token in its filename
+    // (e.g. `app-1.0-SNAPSHOT.jar`) and Maven redeploys it in place — mutable,
+    // as are its checksum/signature sidecars and the directory
+    // metadata/listing. A UNIQUE (timestamped) SNAPSHOT artifact
+    // (`app-1.0-20240101.120000-3.jar`) has a one-shot filename — the token is
+    // replaced by the timestamp — and stays immutable, like a released
+    // coordinate.
+    if lower.contains("-snapshot/") && (leaf.contains("-snapshot") || !has_artifact_extension(leaf))
+    {
         return Mutability::mutable_default();
     }
     if has_artifact_extension(leaf) {
@@ -498,11 +504,18 @@ fn has_artifact_extension(leaf: &str) -> bool {
 }
 
 /// PyPI distribution files: wheels, sdists, eggs (immutable once published).
+///
+/// A PEP 658 `.metadata` sidecar (`<dist>.whl.metadata`) holds the `METADATA`
+/// entry of that distribution, so it is immutable on the same grounds: PyPI
+/// forbids republishing a version. The suffix is stripped before the extension
+/// test, as [`is_maven_artifact_file`] does for its checksum/signature
+/// sidecars (#3300).
 fn is_pypi_package_file(leaf: &str) -> bool {
     const EXTS: &[&str] = &[
         ".whl", ".tar.gz", ".tar.bz2", ".zip", ".egg", ".tgz", ".conda", ".tar.zst",
     ];
-    EXTS.iter().any(|e| leaf.ends_with(e))
+    let base = leaf.strip_suffix(".metadata").unwrap_or(leaf);
+    EXTS.iter().any(|e| base.ends_with(e))
 }
 
 #[cfg(test)]
@@ -525,6 +538,11 @@ mod tests {
         ));
         assert!(is_explicitly_mutable_index(&Pypi, "simple/requests/"));
         assert!(is_explicitly_mutable_index(&Npm, "left-pad"));
+        // A NON-UNIQUE SNAPSHOT artifact is redeployed in place -> true.
+        assert!(is_explicitly_mutable_index(
+            &Maven,
+            "com/x/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar"
+        ));
         // Versioned / content-addressed artifacts -> false (protected).
         assert!(!is_explicitly_mutable_index(
             &Maven,
@@ -584,6 +602,29 @@ mod tests {
                 "com/example/app/1.0-SNAPSHOT/app-1.0-20240101.120000-3.jar",
                 true,
             ),
+            // Non-unique SNAPSHOT artifacts keep the literal `-SNAPSHOT` token
+            // in the filename and are redeployed in place -> mutable, along
+            // with their checksum sidecars and secondary artifacts.
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar",
+                false,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.pom",
+                false,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT-sources.jar",
+                false,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar.sha1",
+                false,
+            ),
             (Gradle, "org/foo/bar/2.1/bar-2.1.jar", true),
             (Sbt, "org/foo/bar/maven-metadata.xml", false),
             // PyPI: index mutable, package files immutable.
@@ -600,6 +641,21 @@ mod tests {
                 "simple/requests/requests-2.31.0-py3-none-any.whl",
                 true,
             ),
+            // PEP 658 sidecar: immutable with the distribution it describes.
+            (
+                Pypi,
+                "simple/requests/requests-2.31.0-py3-none-any.whl.metadata",
+                true,
+            ),
+            (
+                Pypi,
+                "simple/requests/requests-2.31.0.tar.gz.metadata",
+                true,
+            ),
+            // `.metadata` on a non-distribution leaf stays mutable: the strip
+            // must not promote an arbitrary path to cache-forever.
+            (Pypi, "simple/requests/index.html.metadata", false),
+            (Pypi, "simple/requests/.metadata", false),
             (Poetry, "simple/black/", false),
             // npm: packument mutable, tarball immutable.
             (Npm, "lodash", false),

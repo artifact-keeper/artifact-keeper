@@ -20,7 +20,7 @@ use reqwest::header::{
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -79,6 +79,118 @@ async fn proxy_metadata_lru() -> &'static Cache<String, Option<CacheMetadata>> {
 
 async fn invalidate_proxy_metadata_lru(metadata_key: &str) {
     proxy_metadata_lru().await.invalidate(metadata_key).await;
+}
+
+/// Upper bound on how long a cache read will wait for an in-flight streaming
+/// publish tail (#3335). The tail — staging `copy`, staging delete, ETag pin,
+/// sidecar write — is normally a few milliseconds on filesystem backends and
+/// well under a second on object stores; a publish that takes longer than this
+/// degrades to the pre-#3335 behaviour (the read classifies as a miss and
+/// refetches upstream), never to an unbounded stall.
+const TEE_PUBLISH_WAIT_MAX: Duration = Duration::from_secs(5);
+
+/// One in-flight streaming cache publish (#3335), keyed by metadata sidecar
+/// key in [`tee_publish_registry`].
+struct TeePublishEntry {
+    /// `false` while the body is still streaming from upstream (requests in
+    /// that phase are coalesced by the single-flight coordinator, so a reader
+    /// must NOT wait here); flipped to `true` at upstream EOF — the moment the
+    /// client response completes but the cache writer still has its publish
+    /// tail to run. Only tail-phase publishes are worth waiting for.
+    tail: std::sync::atomic::AtomicBool,
+    /// Completion signal: becomes `true` when the writer task finishes
+    /// (commit, reject, or error alike).
+    done_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Process-global registry of in-flight streaming cache publishes (#3335).
+///
+/// [`CachePersister::tee_stream`] registers its metadata key here for the
+/// lifetime of the cache write, so a request that arrives in the window
+/// between "client response complete" and "sidecar readable" can wait for the
+/// writer instead of classifying the just-cached entry as a miss and opening
+/// a second upstream fetch.
+fn tee_publish_registry() -> &'static std::sync::Mutex<HashMap<String, Arc<TeePublishEntry>>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<TeePublishEntry>>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Lock the registry, recovering from a poisoned mutex (no invariant spans the
+/// critical section: the map is only inserted into / removed from).
+fn lock_tee_publish_registry(
+) -> std::sync::MutexGuard<'static, HashMap<String, Arc<TeePublishEntry>>> {
+    match tee_publish_registry().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Registration handle for one streaming cache publish (#3335). Held by the
+/// tee's writer task; dropping it (on ANY writer exit path — commit, reject,
+/// upstream error, panic unwind) deregisters the key and wakes every waiter.
+struct TeePublishGuard {
+    metadata_key: String,
+    entry: Arc<TeePublishEntry>,
+    done_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl TeePublishGuard {
+    fn register(metadata_key: &str) -> Self {
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        let entry = Arc::new(TeePublishEntry {
+            tail: std::sync::atomic::AtomicBool::new(false),
+            done_rx,
+        });
+        lock_tee_publish_registry().insert(metadata_key.to_string(), Arc::clone(&entry));
+        Self {
+            metadata_key: metadata_key.to_string(),
+            entry,
+            done_tx,
+        }
+    }
+
+    /// The shared entry, cloned into the client-facing tee stream so it can
+    /// flip [`TeePublishEntry::tail`] at upstream EOF.
+    fn entry_handle(&self) -> Arc<TeePublishEntry> {
+        Arc::clone(&self.entry)
+    }
+}
+
+impl Drop for TeePublishGuard {
+    fn drop(&mut self) {
+        let mut map = lock_tee_publish_registry();
+        // Remove only our own registration: a concurrent writer for the same
+        // hot key (the coordinator normally prevents one, but nothing here
+        // relies on that) must not have its entry torn down by our drop.
+        if let Some(current) = map.get(&self.metadata_key) {
+            if Arc::ptr_eq(current, &self.entry) {
+                map.remove(&self.metadata_key);
+            }
+        }
+        drop(map);
+        let _ = self.done_tx.send(true);
+    }
+}
+
+/// Wait (bounded by [`TEE_PUBLISH_WAIT_MAX`]) for an in-flight tail-phase
+/// streaming publish of `metadata_key` to complete (#3335). Returns `true`
+/// when such a publish was in flight and was waited for — the caller should
+/// re-read the sidecar — and `false` when there was nothing to wait for
+/// (no publish in flight, or the body is still streaming, in which case the
+/// single-flight coordinator owns coalescing and waiting here would only
+/// delay follower fan-out).
+async fn await_tee_publish(metadata_key: &str) -> bool {
+    let entry = lock_tee_publish_registry().get(metadata_key).cloned();
+    let Some(entry) = entry else {
+        return false;
+    };
+    if !entry.tail.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let mut done_rx = entry.done_rx.clone();
+    let _ = tokio::time::timeout(TEE_PUBLISH_WAIT_MAX, done_rx.wait_for(|done| *done)).await;
+    true
 }
 
 /// Response from an upstream registry fetch.
@@ -935,8 +1047,11 @@ enum CacheReadOutcome {
 /// three actions are otherwise identical to the buffered path: serve a body,
 /// return a cached 404, or fetch upstream.
 enum StreamingCacheReadOutcome {
-    /// Serve this cached (or freshly revalidated) streamed body.
-    Hit(StreamingFetchResult),
+    /// Serve this cached (or freshly revalidated) streamed body. Carries the
+    /// sidecar [`CacheMetadata`] that was already loaded to reach this hit, so
+    /// the caller's lazy catalog backfill (#2218/#2270) can reuse it instead
+    /// of re-reading the same sidecar object from storage a second time.
+    Hit(StreamingFetchResult, Box<CacheMetadata>),
     /// A negative-cached upstream 404 is still within its TTL: respond 404.
     NegativeHit,
     /// No usable entry; the caller must elect a streaming leader / fetch
@@ -1725,7 +1840,18 @@ impl CachePersister {
         // hot key never share one, and no content-path length ever factors
         // into this key's own length.
         let staging_key = format!("{TEE_STAGING_KEY_PREFIX}{}", Uuid::new_v4());
+        // #3335: register this publish so a cache read that lands in the
+        // window between "client response complete" and "sidecar readable"
+        // can wait for the writer instead of refetching upstream. The guard
+        // is moved into the writer task and dropped on every exit path; the
+        // client-facing stream keeps a handle only to flip the tail flag at
+        // upstream EOF.
+        let publish_guard = TeePublishGuard::register(&metadata_key);
+        let publish_entry = publish_guard.entry_handle();
         tokio::spawn(async move {
+            // Deregisters the publish + wakes waiters when this task ends,
+            // whichever arm it exits through.
+            let _publish_guard = publish_guard;
             // Adapter: receiver -> futures::Stream<Result<Bytes>>.
             let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
@@ -2023,6 +2149,14 @@ impl CachePersister {
                     }
                 }
             }
+            // upstream EOF: the client response is about to complete, but the
+            // cache writer still has its publish tail (staging copy, ETag
+            // pin, sidecar write) to run. Flip the tail flag so a cache read
+            // arriving in that window waits for the writer (#3335) instead of
+            // classifying the entry as a miss and refetching upstream.
+            publish_entry
+                .tail
+                .store(true, std::sync::atomic::Ordering::Release);
             // upstream EOF: publish the tee-computed digest (when a
             // non-SHA-256 commit gate is in play) BEFORE dropping tx, so the
             // writer's `put_stream` can only complete after the digest it is
@@ -2710,11 +2844,21 @@ impl UpstreamClient {
 
     /// Check if upstream ETag has changed (returns true if changed/newer).
     /// Relocated verbatim from `ProxyService::check_etag_changed`.
+    ///
+    /// `accept` is the `Accept` header the cached representation was fetched
+    /// under, when there was one (#3290). RFC 9110 §12.5.1 / §13.1.2: a
+    /// conditional probe of a content-negotiated resource must replay the
+    /// selecting header fields, or the validator is compared against a
+    /// *different* representation than the one cached. The PyPI Simple API is
+    /// the live case — `simple/<project>/` serves HTML or PEP 691 JSON off
+    /// `Accept` with per-representation ETags, so probing the JSON variant's
+    /// ETag without the JSON `Accept` validates it against the HTML variant.
     async fn check_etag_changed(
         &self,
         url: &str,
         cached_etag: &str,
         repo_id: Uuid,
+        accept: Option<&str>,
     ) -> Result<bool> {
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
@@ -2723,6 +2867,9 @@ impl UpstreamClient {
             .http_client
             .head(url)
             .header(IF_NONE_MATCH, cached_etag);
+        if let Some(accept) = accept {
+            request = request.header(ACCEPT, accept);
+        }
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
@@ -2805,6 +2952,14 @@ pub struct ProxyService {
     /// //               replaces this field with a wrapping `Coordinator` impl,
     /// //               selected by config via the [`HydrationCoordinator`] enum.
     coordinator: HydrationCoordinator,
+    /// Bounds how many [`Self::spawn_lazy_catalog_backfill`] tasks may be
+    /// in flight at once. Those tasks are opportunistic (#2218/#2270
+    /// self-healing) but draw a connection from the same shared `db` pool
+    /// as real request handlers; left unbounded, a burst of concurrent
+    /// cache hits could spawn enough of them to starve that pool under
+    /// load. Saturating this limiter simply skips the backfill for that
+    /// hit rather than queuing — never blocks the serve.
+    backfill_limiter: Arc<Semaphore>,
 }
 
 impl ProxyService {
@@ -2818,6 +2973,12 @@ impl ProxyService {
     /// denominator so a switch from filesystem to S3 cannot turn an
     /// existing repo into a broken one (#1044).
     const MAX_STORAGE_KEY_BYTES: usize = 1024;
+
+    /// Max concurrent lazy catalog-backfill tasks (see `backfill_limiter`).
+    /// Small relative to `DATABASE_MAX_CONNECTIONS` (default 50) so this
+    /// best-effort background work can never claim more than a slice of the
+    /// pool away from real request handlers, even at full saturation.
+    const MAX_CONCURRENT_CATALOG_BACKFILLS: usize = 8;
 
     /// Create a new proxy service
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
@@ -2837,6 +2998,7 @@ impl ProxyService {
         // with `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`. Call sites are
         // unchanged — both variants implement the same `Coordinator` seam.
         let coordinator = HydrationCoordinator::from_env(db.clone());
+        let backfill_limiter = Arc::new(Semaphore::new(Self::MAX_CONCURRENT_CATALOG_BACKFILLS));
 
         Self {
             db,
@@ -2845,6 +3007,7 @@ impl ProxyService {
             cache_persister,
             upstream_client,
             coordinator,
+            backfill_limiter,
         }
     }
 
@@ -3185,7 +3348,14 @@ impl ProxyService {
         //   * Stale (mutable, past TTL) -> conditional revalidation below.
         //   * Miss                  -> single-flight upstream fetch below.
         match self
-            .read_cached_with_revalidation(repo, fetch_path, cache_path, &cache_key, &metadata_key)
+            .read_cached_with_revalidation(
+                repo,
+                fetch_path,
+                cache_path,
+                &cache_key,
+                &metadata_key,
+                accept,
+            )
             .await?
         {
             CacheReadOutcome::Hit(content, content_type, content_encoding) => {
@@ -3670,15 +3840,24 @@ impl ProxyService {
             )
             .await?
         {
-            StreamingCacheReadOutcome::Hit(result) => {
+            StreamingCacheReadOutcome::Hit(result, metadata) => {
                 // #2218/#2270 back-compat: a cache hit on an object cached
                 // BEFORE this catalog existed has no `proxy_cache_artifacts`
                 // row. Fire-and-forget a best-effort backfill from the sidecar
                 // so pre-upgrade objects self-heal into the catalog on first
                 // access (also bumps `last_accessed_at`). Never blocks the
                 // serve; `ON CONFLICT DO NOTHING` leaves authoritative rows
-                // untouched.
-                self.spawn_lazy_catalog_backfill(repo.id, cache_path, cache_key, metadata_key);
+                // untouched. Bounded by `backfill_limiter` (#3xxx overload
+                // fix): under a cache-hit burst this is skipped rather than
+                // spawning unbounded tasks that starve the shared DB pool —
+                // it is strictly best-effort self-healing, safe to drop.
+                self.spawn_lazy_catalog_backfill(
+                    repo.id,
+                    cache_path,
+                    cache_key,
+                    metadata_key,
+                    *metadata,
+                );
                 Ok(Some(result))
             }
             StreamingCacheReadOutcome::NegativeHit => Err(AppError::NotFound(format!(
@@ -3691,31 +3870,44 @@ impl ProxyService {
 
     /// Fire-and-forget lazy backfill of the persisted proxy-cache catalog from a
     /// cache-hit's sidecar (#2218/#2270 back-compat). Spawned so it never blocks
-    /// the serve; reads the metadata sidecar for the true size/checksum and
-    /// upserts `ON CONFLICT DO NOTHING` (existing authoritative rows only get
-    /// their `last_accessed_at` bumped). Any failure is logged at `debug` and
-    /// swallowed — a warm-hit backfill is strictly best-effort.
+    /// the serve; upserts `ON CONFLICT DO NOTHING` (existing authoritative rows
+    /// only get their `last_accessed_at` bumped). Any failure is logged at
+    /// `debug` and swallowed — a warm-hit backfill is strictly best-effort.
+    ///
+    /// Takes the [`CacheMetadata`] the caller already loaded to determine the
+    /// hit, instead of re-reading the same sidecar object from storage a
+    /// second time — every cache hit was paying for two storage reads before
+    /// this (one to evaluate freshness, one here).
+    ///
+    /// Bounded by `backfill_limiter`: a burst of concurrent cache hits used to
+    /// spawn an unbounded number of these tasks, each contending with normal
+    /// request handlers for a connection out of the *same* shared DB pool —
+    /// under sustained load this starved the pool for real traffic and fed
+    /// into the global concurrency backstop tripping "Server overloaded". This
+    /// is opportunistic self-healing, not correctness-critical, so it is
+    /// simply skipped (not queued) once the limiter is saturated; the next
+    /// cache hit on the same object will retry.
     fn spawn_lazy_catalog_backfill(
         &self,
         repository_id: Uuid,
         path: &str,
         cache_key: &str,
         metadata_key: &str,
+        metadata: CacheMetadata,
     ) {
+        let Ok(permit) = Arc::clone(&self.backfill_limiter).try_acquire_owned() else {
+            tracing::debug!(
+                cache_key = %cache_key,
+                "skipping proxy-cache catalog backfill: limiter saturated under load"
+            );
+            return;
+        };
         let db = self.db.clone();
-        let storage = Arc::clone(&self.storage);
         let path = path.to_string();
         let cache_key = cache_key.to_string();
         let metadata_key = metadata_key.to_string();
         tokio::spawn(async move {
-            let data = match storage.get(&metadata_key).await {
-                Ok(data) => data,
-                Err(_) => return, // sidecar gone -> nothing to backfill from
-            };
-            let metadata: CacheMetadata = match serde_json::from_slice(&data) {
-                Ok(m) => m,
-                Err(_) => return,
-            };
+            let _permit = permit; // held for the task's lifetime, released on drop
             if let Err(e) = proxy_catalog::backfill_from_sidecar(
                 &db,
                 repository_id,
@@ -3765,8 +3957,11 @@ impl ProxyService {
         let mutability = cache_classifier::classify(&repo.format, cache_path);
 
         // A sidecar read/parse error is treated as "no entry" (Miss) — the same
-        // B6-safe stance as the buffered path.
-        let metadata = self.load_cache_metadata(metadata_key).await.unwrap_or(None);
+        // B6-safe stance as the buffered path. Waits (bounded) for an in-flight
+        // tail-phase streaming publish of the same key first (#3335).
+        let metadata = self
+            .load_cache_metadata_awaiting_publish(metadata_key)
+            .await;
         let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
 
         match cache_classifier::evaluate(entry.as_ref(), Utc::now()) {
@@ -3780,14 +3975,17 @@ impl ProxyService {
                 // never degraded to a Miss (which would refetch upstream).
                 check_quarantine_until(metadata.quarantine_until)?;
                 match self.open_cached_stream(cache_key, &metadata).await? {
-                    Some(result) => Ok(StreamingCacheReadOutcome::Hit(result)),
+                    Some(result) => Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata))),
                     None => Ok(StreamingCacheReadOutcome::Miss),
                 }
             }
             cache_classifier::Freshness::Stale => {
                 let metadata = metadata.expect("stale implies metadata present");
                 match self
-                    .revalidate_verdict(repo, fetch_path, metadata_key, &metadata)
+                    // The streaming path performs no content negotiation
+                    // (no `Accept` is threaded to it), so there is no
+                    // selecting header to replay on the probe (#3290).
+                    .revalidate_verdict(repo, fetch_path, metadata_key, &metadata, None)
                     .await
                 {
                     // 304 extended the TTL; stream the cached body.
@@ -3797,7 +3995,9 @@ impl ProxyService {
                         // stale-if-error body the same way as a fresh hit.
                         check_quarantine_until(metadata.quarantine_until)?;
                         match self.open_cached_stream(cache_key, &metadata).await? {
-                            Some(result) => Ok(StreamingCacheReadOutcome::Hit(result)),
+                            Some(result) => {
+                                Ok(StreamingCacheReadOutcome::Hit(result, Box::new(metadata)))
+                            }
                             None => Ok(StreamingCacheReadOutcome::Miss),
                         }
                     }
@@ -4140,7 +4340,11 @@ impl ProxyService {
         // If we have an ETag, do a conditional request
         if let Some(ref etag) = metadata.upstream_etag {
             let full_url = Self::build_upstream_url(upstream_url, path);
-            return self.check_etag_changed(&full_url, etag, repo.id).await;
+            // No content negotiation on this probe path (#3290): callers pass
+            // a plain artifact path fetched without an `Accept`.
+            return self
+                .check_etag_changed(&full_url, etag, repo.id, None)
+                .await;
         }
 
         // No ETag, rely on TTL - cache is still valid
@@ -4735,6 +4939,42 @@ impl ProxyService {
         self.load_cache_metadata(metadata_key).await.ok().flatten()
     }
 
+    /// Open the committed proxy-cache body for `(repo_key, cache_path)` as a
+    /// raw storage stream, with the sidecar's recorded size (#2921).
+    ///
+    /// Used by the NuGet flat-container repair to re-materialize an artifact
+    /// row's own storage object from an already-warm proxy-cache entry without
+    /// a second upstream pull. The cache commit writes the body before the
+    /// `__cache_meta__.json` sidecar, so a present sidecar implies a complete
+    /// body. Returns `Ok(None)` — caller falls back to its normal repair path,
+    /// which surfaces these states with the proper client-facing semantics —
+    /// when the entry is absent or uncommitted, is a negative (404) cache,
+    /// carries an active Package Age Policy hold, or holds a content-coded
+    /// body (raw storage objects are stored uncoded; copying coded bytes would
+    /// corrupt what `storage_key` is defined to hold).
+    pub async fn open_committed_cache_body(
+        &self,
+        repo_key: &str,
+        cache_path: &str,
+    ) -> Result<Option<(BoxStream<'static, Result<Bytes>>, i64)>> {
+        let keys = CacheKeys::derive(repo_key, cache_path)?;
+        let Some(meta) = self.load_cache_metadata(&keys.metadata).await? else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        if meta.negative_cached_until.is_some_and(|t| t > now)
+            || meta.quarantine_until.is_some_and(|t| t > now)
+            || meta.content_encoding.is_some()
+        {
+            return Ok(None);
+        }
+        match self.storage.get_stream(&keys.content).await {
+            Ok(stream) => Ok(Some((stream, meta.size_bytes))),
+            Err(AppError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// List the PyPI project names that already have a cached `simple/<name>/`
     /// index in this repository's proxy cache.
     ///
@@ -5322,12 +5562,17 @@ impl ProxyService {
         cache_path: &str,
         cache_key: &str,
         metadata_key: &str,
+        accept: Option<&str>,
     ) -> Result<CacheReadOutcome> {
         let mutability = cache_classifier::classify(&repo.format, cache_path);
 
         // Load the sidecar to evaluate freshness. A read/parse error is treated
         // as "no entry" (Miss) — same B6-safe stance as the fresh read path.
-        let metadata = self.load_cache_metadata(metadata_key).await.unwrap_or(None);
+        // Waits (bounded) for an in-flight tail-phase streaming publish of the
+        // same key so a just-cached entry is not misread as a miss (#3335).
+        let metadata = self
+            .load_cache_metadata_awaiting_publish(metadata_key)
+            .await;
         let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
 
         match cache_classifier::evaluate(entry.as_ref(), Utc::now()) {
@@ -5359,7 +5604,14 @@ impl ProxyService {
                 // Safe: Stale only arises when metadata is present.
                 let stale_metadata = metadata.as_ref().expect("stale implies metadata present");
                 let outcome = self
-                    .revalidate_stale(repo, fetch_path, cache_key, metadata_key, stale_metadata)
+                    .revalidate_stale(
+                        repo,
+                        fetch_path,
+                        cache_key,
+                        metadata_key,
+                        stale_metadata,
+                        accept,
+                    )
                     .await?;
                 // Package Age Policy (#1770): gate a revalidated /
                 // stale-if-error body the same way as a fresh hit. A Refill
@@ -5437,9 +5689,10 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
         metadata: &CacheMetadata,
+        accept: Option<&str>,
     ) -> Result<CacheReadOutcome> {
         match self
-            .revalidate_verdict(repo, fetch_path, metadata_key, metadata)
+            .revalidate_verdict(repo, fetch_path, metadata_key, metadata, accept)
             .await
         {
             RevalidationVerdict::Refill => Ok(CacheReadOutcome::Miss),
@@ -5493,12 +5746,19 @@ impl ProxyService {
     /// * **changed (200 / different ETag)** -> [`RevalidationVerdict::Refill`].
     /// * **upstream error within grace** -> [`RevalidationVerdict::ServeStaleIfError`].
     /// * **upstream error past grace** -> [`RevalidationVerdict::Refill`].
+    ///
+    /// `accept` is the selecting `Accept` header of the cached representation,
+    /// replayed on the conditional probe (#3290): validating a negotiated
+    /// variant (e.g. the PyPI PEP 691 JSON index) without it compares the
+    /// cached ETag against a different representation, which can spuriously
+    /// extend a stale variant or force needless refills.
     async fn revalidate_verdict(
         &self,
         repo: &Repository,
         fetch_path: &str,
         metadata_key: &str,
         metadata: &CacheMetadata,
+        accept: Option<&str>,
     ) -> RevalidationVerdict {
         let Some(etag) = metadata.upstream_etag.clone() else {
             // No ETag validator: a cheap conditional request is impossible.
@@ -5511,7 +5771,10 @@ impl ProxyService {
         };
         let full_url = Self::build_upstream_url(upstream_url, fetch_path);
 
-        match self.check_etag_changed(&full_url, &etag, repo.id).await {
+        match self
+            .check_etag_changed(&full_url, &etag, repo.id, accept)
+            .await
+        {
             Ok(false) => {
                 // 304 Not Modified: extend the TTL and serve the cached body.
                 let new_ttl = self.cache_ttl_for_path(repo, fetch_path).await;
@@ -5646,6 +5909,36 @@ impl ProxyService {
         self.cache_store
             .get(cache_key, metadata_key, allow_stale)
             .await
+    }
+
+    /// Load cache metadata for a freshness decision, waiting (bounded) for an
+    /// in-flight tail-phase streaming publish of the same key first (#3335).
+    ///
+    /// Without the wait, a request that arrives just after the client response
+    /// that populated the cache completes — but before the tee writer has
+    /// finished the staging copy / ETag pin / sidecar write — observes "no
+    /// sidecar", classifies the entry as a Miss, and opens a second upstream
+    /// fetch. That both amplifies upstream traffic and, for mutable paths,
+    /// re-serves whatever the upstream returns *now* instead of the bytes just
+    /// cached (the `test-cache-poisoning.sh` window).
+    ///
+    /// The wait only engages for a publish in its tail phase; while the body
+    /// is still streaming, the single-flight coordinator owns coalescing. The
+    /// re-read after the wait drops any memoised `None` from the metadata LRU
+    /// first, so the sidecar the writer just published is actually observed.
+    async fn load_cache_metadata_awaiting_publish(
+        &self,
+        metadata_key: &str,
+    ) -> Option<CacheMetadata> {
+        let metadata = self.load_cache_metadata(metadata_key).await.unwrap_or(None);
+        if metadata.is_some() {
+            return metadata;
+        }
+        if !await_tee_publish(metadata_key).await {
+            return None;
+        }
+        invalidate_proxy_metadata_lru(metadata_key).await;
+        self.load_cache_metadata(metadata_key).await.unwrap_or(None)
     }
 
     /// Load cache metadata from storage via the in-process LRU (#2301).
@@ -5975,14 +6268,17 @@ impl ProxyService {
     /// Check if upstream ETag has changed (returns true if changed/newer).
     ///
     /// Thin delegation to [`UpstreamClient::check_etag_changed`] (#1618 S8).
+    /// `accept` replays the selecting header of the cached representation on
+    /// the conditional probe (#3290) — see the delegate's doc.
     async fn check_etag_changed(
         &self,
         url: &str,
         cached_etag: &str,
         repo_id: Uuid,
+        accept: Option<&str>,
     ) -> Result<bool> {
         self.upstream_client
-            .check_etag_changed(url, cached_etag, repo_id)
+            .check_etag_changed(url, cached_etag, repo_id, accept)
             .await
     }
 }
@@ -8187,6 +8483,116 @@ mod tests {
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy should not fail");
         ProxyService::new(pool, Arc::new(StorageService::new(storage)))
+    }
+
+    /// Minimal [`CacheMetadata`] for tests that only need `spawn_lazy_catalog_backfill`
+    /// to have something to pass along; the values are not asserted on.
+    fn backfill_test_metadata() -> CacheMetadata {
+        CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at: Utc::now(),
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: Utc::now() + chrono::Duration::hours(24),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: 42,
+            checksum_sha256: "a".repeat(64),
+        }
+    }
+
+    /// Regression test for the overload fix: a burst of concurrent cache hits
+    /// used to call `spawn_lazy_catalog_backfill` with no bound at all, each
+    /// spawning a `tokio::spawn`ed task that grabbed a connection from the
+    /// *same* pool serving real request traffic. `backfill_limiter` caps how
+    /// many of these can be in flight; this asserts a permit is claimed
+    /// synchronously (before the task itself even runs) and released once the
+    /// task completes, so the limiter's count is a true reflection of
+    /// in-flight backfills rather than drifting.
+    #[tokio::test]
+    async fn test_lazy_catalog_backfill_permit_is_acquired_then_released() {
+        let service = ProxyService::new(
+            test_catalog_pool(),
+            Arc::new(StorageService::new(Arc::new(CacheFreshMock::new(
+                None, false,
+            )))),
+        );
+        let before = service.backfill_limiter.available_permits();
+        assert_eq!(before, ProxyService::MAX_CONCURRENT_CATALOG_BACKFILLS);
+
+        service.spawn_lazy_catalog_backfill(
+            Uuid::nil(),
+            "test/path",
+            "cache-key",
+            "cache-key/__cache_meta__.json",
+            backfill_test_metadata(),
+        );
+
+        // `try_acquire_owned` runs synchronously inside `spawn_lazy_catalog_backfill`
+        // itself, so the permit is claimed immediately — before the spawned
+        // task has had any chance to be polled.
+        assert_eq!(
+            service.backfill_limiter.available_permits(),
+            before - 1,
+            "spawning a backfill must claim a limiter permit up front"
+        );
+
+        // Let the spawned task run to completion against the never-connecting
+        // pool (fails fast, logs at debug, drops its permit on the way out).
+        for _ in 0..50 {
+            if service.backfill_limiter.available_permits() == before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            service.backfill_limiter.available_permits(),
+            before,
+            "the permit must be released once the backfill task finishes"
+        );
+    }
+
+    /// Regression test for the overload fix: once `backfill_limiter` is
+    /// saturated (modeling a cache-hit burst where every permit is already
+    /// claimed by in-flight backfills), a further call must be skipped —
+    /// no panic, no additional task spawned, no extra pool contention — rather
+    /// than piling up unboundedly.
+    #[tokio::test]
+    async fn test_lazy_catalog_backfill_is_skipped_when_limiter_saturated() {
+        let service = ProxyService::new(
+            test_catalog_pool(),
+            Arc::new(StorageService::new(Arc::new(CacheFreshMock::new(
+                None, false,
+            )))),
+        );
+
+        // Simulate a burst that has already claimed every permit.
+        let _permits = Arc::clone(&service.backfill_limiter)
+            .acquire_many_owned(ProxyService::MAX_CONCURRENT_CATALOG_BACKFILLS as u32)
+            .await
+            .expect("semaphore is not closed");
+        assert_eq!(service.backfill_limiter.available_permits(), 0);
+
+        service.spawn_lazy_catalog_backfill(
+            Uuid::nil(),
+            "test/path",
+            "cache-key",
+            "cache-key/__cache_meta__.json",
+            backfill_test_metadata(),
+        );
+
+        // Give an (incorrectly) spawned task a chance to run; a correct
+        // implementation never touched the semaphore beyond our own explicit
+        // acquisition above, so the count must not move.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            service.backfill_limiter.available_permits(),
+            0,
+            "a saturated limiter must skip the backfill instead of spawning anyway"
+        );
     }
 
     fn fresh_metadata_bytes() -> Bytes {
@@ -16980,5 +17386,261 @@ mod tests {
             .await
             .ok();
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3335: the tee-publish window — a just-cached streaming entry must be
+    // readable to a closely-following request instead of refetching upstream.
+    // -----------------------------------------------------------------------
+
+    /// Registry mechanics: a reader must NOT wait while the body is still
+    /// streaming (the single-flight coordinator owns that phase), MUST wait
+    /// for a tail-phase publish, and must observe the guard's drop from every
+    /// writer exit path.
+    #[tokio::test]
+    async fn test_await_tee_publish_waits_only_for_tail_phase_3335() {
+        let key = format!(
+            "proxy-cache/tee-3335-{}/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+
+        // No publish registered: nothing to wait for.
+        assert!(!await_tee_publish(&key).await);
+
+        // Registered but still in the body phase: the reader must not stall.
+        let guard = TeePublishGuard::register(&key);
+        assert!(!await_tee_publish(&key).await);
+
+        // Tail phase: the reader waits until the guard drops (writer done).
+        let entry = guard.entry_handle();
+        entry.tail.store(true, std::sync::atomic::Ordering::Release);
+        let waiter = tokio::spawn({
+            let key = key.clone();
+            async move { await_tee_publish(&key).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter must block on a tail-phase publish"
+        );
+        drop(guard);
+        let waited = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("guard drop must wake the waiter")
+            .expect("waiter task must not panic");
+        assert!(
+            waited,
+            "a tail-phase publish must be reported as waited-for"
+        );
+
+        // Deregistered after drop: later readers see nothing in flight.
+        assert!(!await_tee_publish(&key).await);
+        assert!(
+            !lock_tee_publish_registry().contains_key(&key),
+            "guard drop must deregister the key"
+        );
+    }
+
+    /// Map-backed storage whose contents can be mutated after construction,
+    /// so a test can emulate the tee writer publishing the sidecar while a
+    /// reader is waiting on the #3335 registry.
+    struct MutableMapStorage {
+        entries: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for MutableMapStorage {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.entries
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            Ok(self.entries.lock().unwrap().contains_key(key))
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.entries.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, key: &str) -> Result<u64> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|b| b.len() as u64)
+                .unwrap_or(0))
+        }
+    }
+
+    /// End-to-end reader half of #3335: a metadata load that initially misses
+    /// (and memoises `None` in the process-global LRU) must, when a tail-phase
+    /// publish is in flight for the key, wait for the writer and then observe
+    /// the sidecar the writer just published — not the memoised miss.
+    #[tokio::test]
+    async fn test_load_cache_metadata_awaiting_publish_sees_fresh_sidecar_3335() {
+        let repo_key = format!("tee-3335-{}", Uuid::new_v4());
+        let keys = CacheKeys::derive(&repo_key, "some/artifact.bin").unwrap();
+        let storage = Arc::new(MutableMapStorage {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let svc = build_proxy_service_with_storage(storage.clone());
+
+        // Prime the memoised miss exactly like the request that opened the
+        // fetch does.
+        assert!(svc
+            .load_cache_metadata(&keys.metadata)
+            .await
+            .unwrap()
+            .is_none());
+
+        // A tail-phase publish is in flight for the key.
+        let guard = TeePublishGuard::register(&keys.metadata);
+        guard
+            .entry_handle()
+            .tail
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Writer: publish the sidecar, then finish (drop the guard).
+        let writer_storage = storage.clone();
+        let metadata_key = keys.metadata.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            crate::services::storage_service::StorageBackend::put(
+                writer_storage.as_ref(),
+                &metadata_key,
+                fresh_metadata_bytes(),
+            )
+            .await
+            .unwrap();
+            drop(guard);
+        });
+
+        let metadata = svc
+            .load_cache_metadata_awaiting_publish(&keys.metadata)
+            .await;
+        assert!(
+            metadata.is_some(),
+            "the reader must observe the sidecar published while it waited (#3335), \
+             not the memoised miss"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3290: conditional revalidation of a content-negotiated cached variant
+    // must replay the selecting `Accept` header on the probe.
+    // -----------------------------------------------------------------------
+
+    /// Build an expired (stale) sidecar carrying `etag`, as
+    /// `revalidate_verdict` receives it for a mutable entry past its TTL.
+    fn stale_metadata_with_etag(etag: &str) -> CacheMetadata {
+        CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at: Utc::now() - chrono::Duration::seconds(900),
+            upstream_etag: Some(etag.to_string()),
+            storage_etag: None,
+            last_modified: None,
+            quarantine_until: None,
+            negative_cached_until: None,
+            expires_at: Utc::now() - chrono::Duration::seconds(600),
+            content_type: Some("application/vnd.pypi.simple.v1+json".to_string()),
+            size_bytes: 2,
+            checksum_sha256: String::new(),
+        }
+    }
+
+    /// #3290: the PyPI PEP 691 JSON index is cached under an Accept-selected
+    /// representation whose ETag differs from the HTML one. The conditional
+    /// probe must replay that `Accept`: with it, the upstream (here: matching
+    /// on both `If-None-Match` and `Accept`) answers 304 and the verdict is
+    /// `ServeRevalidated`; without it the same upstream serves the *other*
+    /// representation's validator and the entry is needlessly refilled — or,
+    /// upstream-dependent, a stale variant is spuriously extended.
+    #[tokio::test]
+    async fn test_revalidate_verdict_replays_accept_of_cached_variant_3290() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let json_accept = "application/vnd.pypi.simple.v1+json";
+        let json_etag = "\"etag-json-3290\"";
+        let upstream = MockServer::start().await;
+        // The JSON representation: 304 only for a probe that both presents
+        // the JSON validator AND selects the JSON representation.
+        Mock::given(method("HEAD"))
+            .and(path("/simple/proj3290/"))
+            .and(header("if-none-match", json_etag))
+            .and(header("accept", json_accept))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        // Any other probe of the URL selects the HTML representation, whose
+        // validator does not match: 200 with a different ETag.
+        Mock::given(method("HEAD"))
+            .and(path("/simple/proj3290/"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"etag-html-3290\""))
+            .mount(&upstream)
+            .await;
+
+        let storage = Arc::new(MutableMapStorage {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let svc = ProxyService::new(pool, Arc::new(StorageService::new(storage)));
+        let mut repo = remote_repo_for(
+            &format!("pypi-3290-{}", Uuid::new_v4()),
+            &upstream.uri(),
+            "/tmp/x",
+        );
+        repo.format = RepositoryFormat::Pypi;
+        let metadata = stale_metadata_with_etag(json_etag);
+        let metadata_key = format!(
+            "proxy-cache/{}/simple/proj3290/index.v1+json/__cache_meta__.json",
+            repo.key
+        );
+
+        // With the selecting Accept replayed, the JSON variant revalidates.
+        let verdict = svc
+            .revalidate_verdict(
+                &repo,
+                "simple/proj3290/",
+                &metadata_key,
+                &metadata,
+                Some(json_accept),
+            )
+            .await;
+        assert!(
+            matches!(verdict, RevalidationVerdict::ServeRevalidated),
+            "the probe must replay the cached variant's Accept and see the 304"
+        );
+
+        // Without it, the probe validates against the WRONG representation
+        // (the pre-#3290 behaviour): the ETags disagree and the entry refills.
+        let verdict = svc
+            .revalidate_verdict(&repo, "simple/proj3290/", &metadata_key, &metadata, None)
+            .await;
+        assert!(
+            matches!(verdict, RevalidationVerdict::Refill),
+            "a probe without the selecting header is answered for a different \
+             representation and must not 304-extend the JSON variant"
+        );
     }
 }

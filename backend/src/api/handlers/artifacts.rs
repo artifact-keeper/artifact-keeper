@@ -103,6 +103,12 @@ struct ArtifactByIdRow {
     created_at: chrono::DateTime<chrono::Utc>,
     quarantine_status: Option<String>,
     quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Uploader id from the `artifacts` row, plus the display name resolved
+    /// by the same query's `LEFT JOIN users` (#3271) — so the detail view
+    /// gets the uploader without a second, admin-only user lookup. The join
+    /// is a LEFT one: a deleted uploader leaves the id with a `NULL` name.
+    uploaded_by: Option<Uuid>,
+    uploaded_by_username: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -143,9 +149,11 @@ pub async fn get_artifact(
     let artifact: ArtifactByIdRow = sqlx::query_as(
         "SELECT a.id, r.key AS repository_key, a.path, a.name, a.version, \
                 a.size_bytes, a.checksum_sha256, a.content_type, a.created_at, \
-                a.quarantine_status, a.quarantine_until \
+                a.quarantine_status, a.quarantine_until, \
+                a.uploaded_by, u.username AS uploaded_by_username \
          FROM artifacts a \
          JOIN repositories r ON r.id = a.repository_id \
+         LEFT JOIN users u ON u.id = a.uploaded_by \
          WHERE a.id = $1 AND a.is_deleted = false",
     )
     .bind(id)
@@ -181,6 +189,8 @@ pub async fn get_artifact(
         content_type: artifact.content_type,
         download_count,
         created_at: artifact.created_at,
+        uploaded_by: artifact.uploaded_by,
+        uploaded_by_username: artifact.uploaded_by_username,
         metadata,
         // This handler resolves a real `artifacts` row by id, so it is
         // always a hosted artifact (analyzable), matching the by-path
@@ -203,6 +213,36 @@ pub async fn get_artifact(
     }))
 }
 
+/// Precondition shared by the by-id sub-resource endpoints (`/metadata`,
+/// `/stats`): the artifact must exist and not be soft-deleted, and the caller
+/// must be allowed to see the repository that owns it.
+///
+/// `get_artifact_metadata` and `get_artifact_stats` carried byte-identical
+/// copies of this guard. The ORDER is load-bearing and is preserved exactly:
+/// the existence check runs first and returns the same generic "Artifact not
+/// found" for a soft-deleted or non-existent id, and only then is
+/// [`check_artifact_visibility`] consulted — so the pair of checks cannot be
+/// used to distinguish "exists but you may not see it" from "does not exist".
+async fn require_existing_visible_artifact(
+    state: &SharedState,
+    auth: &Option<AuthExtension>,
+    id: Uuid,
+) -> Result<()> {
+    let exists = sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1 AND is_deleted = false)",
+        id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if exists != Some(true) {
+        return Err(AppError::NotFound("Artifact not found".to_string()));
+    }
+
+    check_artifact_visibility(auth, id, &state.db).await
+}
+
 /// Get artifact metadata by artifact ID
 #[utoipa::path(
     get,
@@ -222,19 +262,7 @@ pub async fn get_artifact_metadata(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ArtifactMetadataResponse>> {
-    let exists = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1 AND is_deleted = false)",
-        id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    if exists != Some(true) {
-        return Err(AppError::NotFound("Artifact not found".to_string()));
-    }
-
-    check_artifact_visibility(&auth, id, &state.db).await?;
+    require_existing_visible_artifact(&state, &auth, id).await?;
 
     let metadata = sqlx::query!(
         r#"
@@ -276,19 +304,7 @@ pub async fn get_artifact_stats(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ArtifactStatsResponse>> {
-    let exists = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1 AND is_deleted = false)",
-        id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    if exists != Some(true) {
-        return Err(AppError::NotFound("Artifact not found".to_string()));
-    }
-
-    check_artifact_visibility(&auth, id, &state.db).await?;
+    require_existing_visible_artifact(&state, &auth, id).await?;
 
     let stats = sqlx::query!(
         r#"
@@ -331,6 +347,37 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    /// Baseline `ArtifactResponse` for the serialization tests below.
+    ///
+    /// The tests differ in only a handful of fields each, so they share one
+    /// constructor and override just what they exercise. Previously every test
+    /// spelled out the whole literal, which meant each field added to the
+    /// struct was duplicated four more times.
+    fn sample_response() -> ArtifactResponse {
+        ArtifactResponse {
+            revision: None,
+            version_label: None,
+            id: Uuid::new_v4(),
+            repository_key: "generic-local".to_string(),
+            path: "file.tar.gz".to_string(),
+            name: "file".to_string(),
+            version: None,
+            size_bytes: 0,
+            checksum_sha256: "sha".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            download_count: 0,
+            created_at: Utc::now(),
+            uploaded_by: None,
+            uploaded_by_username: None,
+            metadata: None,
+            analyzable: true,
+            cache_cached_at: None,
+            cache_expires_at: None,
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
+        }
+    }
+
     // ── ArtifactResponse serialization tests ────────────────────────
     //
     // The by-id endpoint now serves the canonical repositories.rs
@@ -340,11 +387,8 @@ mod tests {
 
     #[test]
     fn test_artifact_response_serialization_all_fields() {
-        let now = Utc::now();
         let id = Uuid::new_v4();
         let resp = ArtifactResponse {
-            revision: None,
-            version_label: None,
             id,
             repository_key: "maven-releases".to_string(),
             path: "com/example/lib/1.0/lib-1.0.jar".to_string(),
@@ -354,13 +398,8 @@ mod tests {
             checksum_sha256: "abc123".to_string(),
             content_type: "application/java-archive".to_string(),
             download_count: 42,
-            created_at: now,
             metadata: Some(serde_json::json!({"groupId": "com.example"})),
-            analyzable: true,
-            cache_cached_at: None,
-            cache_expires_at: None,
-            quarantine_status: "not_quarantined".to_string(),
-            quarantine_until: None,
+            ..sample_response()
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], id.to_string());
@@ -381,26 +420,7 @@ mod tests {
     fn test_artifact_response_no_undeclared_fields() {
         // The previous local ArtifactResponse leaked DB columns the spec
         // never declared. Pin their absence on the serialized output.
-        let resp = ArtifactResponse {
-            revision: None,
-            version_label: None,
-            id: Uuid::new_v4(),
-            repository_key: "generic-local".to_string(),
-            path: "file.tar.gz".to_string(),
-            name: "file".to_string(),
-            version: None,
-            size_bytes: 0,
-            checksum_sha256: "sha".to_string(),
-            content_type: "application/octet-stream".to_string(),
-            download_count: 0,
-            created_at: Utc::now(),
-            metadata: None,
-            analyzable: true,
-            cache_cached_at: None,
-            cache_expires_at: None,
-            quarantine_status: "not_quarantined".to_string(),
-            quarantine_until: None,
-        };
+        let resp = sample_response();
         let json = serde_json::to_value(&resp).unwrap();
         let obj = json.as_object().unwrap();
         for undeclared in [
@@ -424,25 +444,13 @@ mod tests {
     #[test]
     fn test_artifact_response_zero_size() {
         let resp = ArtifactResponse {
-            revision: None,
-            version_label: None,
-            id: Uuid::new_v4(),
-            repository_key: "generic-local".to_string(),
             path: "empty".to_string(),
             name: "empty".to_string(),
-            version: None,
             size_bytes: 0,
             checksum_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                 .to_string(),
-            content_type: "application/octet-stream".to_string(),
-            download_count: 0,
-            created_at: Utc::now(),
-            metadata: None,
             analyzable: false,
-            cache_cached_at: None,
-            cache_expires_at: None,
-            quarantine_status: "not_quarantined".to_string(),
-            quarantine_until: None,
+            ..sample_response()
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["size_bytes"], 0);
@@ -543,26 +551,7 @@ mod tests {
 
     #[test]
     fn test_artifact_response_debug_impl() {
-        let resp = ArtifactResponse {
-            revision: None,
-            version_label: None,
-            id: Uuid::nil(),
-            repository_key: "k".to_string(),
-            path: "p".to_string(),
-            name: "n".to_string(),
-            version: None,
-            size_bytes: 0,
-            checksum_sha256: "s".to_string(),
-            content_type: "t".to_string(),
-            download_count: 0,
-            created_at: Utc::now(),
-            metadata: None,
-            analyzable: true,
-            cache_cached_at: None,
-            cache_expires_at: None,
-            quarantine_status: "not_quarantined".to_string(),
-            quarantine_until: None,
-        };
+        let resp = sample_response();
         let debug_str = format!("{:?}", resp);
         assert!(debug_str.contains("ArtifactResponse"));
     }

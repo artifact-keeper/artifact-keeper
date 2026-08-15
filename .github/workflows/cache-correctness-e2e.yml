@@ -1,12 +1,15 @@
 name: Cache-Correctness E2E
 
-# Cache-correctness + virtual-resolution E2E suite (issue #1625, acceptance gate
-# for #1611). These tests are RED on `main` BY DESIGN — they reproduce the open
-# wrong-result bugs #1600 / #1595 / #1562 and the immutable-vs-mutable
-# mis-caching. They must therefore NEVER run on `pull_request` (they would block
-# every PR). Run manually via workflow_dispatch, plus a weekly schedule so the
-# reproduction does not silently rot. When #1611 lands, flip this green and turn
-# it into the regression gate (and only then consider gating PRs on it).
+# Cache-correctness + virtual-resolution E2E suite (issue #1625, originally the
+# acceptance gate for #1611). #1611 closed 2026-06-06, so the original "red by
+# design until #1611 lands" justification has EXPIRED — but the suite cannot be
+# flipped to blocking yet, because it is still red for an unrelated reason: the
+# harness aborts in Phase 1 when the SSRF guard on remote-repo upstream URLs
+# (added after this harness was written) rejects the docker-internal
+# cache-mock-upstream hostname with HTTP 400, before any assertion runs. That
+# harness defect is tracked in #3363; once it is fixed and a dispatch run passes,
+# remove the waiver below so regressions hard-fail (the #3310 flip).
+# Still NEVER run on `pull_request` (docker-compose e2e, too heavy to block PRs).
 
 on:
   workflow_dispatch:
@@ -35,10 +38,18 @@ jobs:
     name: 🧊 Cache-correctness + virtual-resolution
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    # Do NOT fail the workflow run if the suite is red on `main`: a red result is
-    # the EXPECTED outcome until #1611 lands (it proves the bugs reproduce). The
-    # per-step logs carry the PASS/FAIL detail. Once #1611 lands, remove this
-    # `continue-on-error` so regressions hard-fail.
+    # WAIVER (#3310): soft-fail retained past #1611's close (2026-06-06)
+    # because the suite is still red on `main` for a harness reason, not a
+    # product reason — repo creation against the mock upstream fails the SSRF
+    # guard (HTTP 400) before any assertion runs. Verified in scheduled run
+    # 31358654047 (2026-08-10): both test containers exit 1 in Phase 1.
+    #   owner:    brandonrc
+    #   reason:   harness aborts at setup (#3363); a hard-fail would page on a
+    #             harness defect, not a regression
+    #   tracking: #3363 (fix), #3310 (the flip this waiver defers)
+    #   expires:  when #3363 closes — remove this continue-on-error (and the
+    #             `|| echo ::warning` escapes on the suite steps below) in the
+    #             same PR that fixes it
     continue-on-error: true
     steps:
       - name: Checkout
@@ -53,7 +64,7 @@ jobs:
           docker compose -f docker-compose.test.yml --profile cache-correctness up \
             --build --exit-code-from virtual-resolution-test \
             backend postgres trivy setup cache-mock-upstream virtual-resolution-test \
-            || echo "::warning::virtual-resolution suite reported failures (EXPECTED on main — reproduces #1600/#1595/#1562)"
+            || echo "::warning::virtual-resolution suite reported failures (known harness defect #3363: repo create vs SSRF guard; #1600/#1595/#1562 themselves are fixed)"
 
       - name: Tear down between suites
         if: always()
@@ -65,7 +76,7 @@ jobs:
           docker compose -f docker-compose.test.yml --profile cache-correctness up \
             --build --exit-code-from cache-correctness-test \
             backend postgres trivy setup cache-mock-upstream cache-correctness-test \
-            || echo "::warning::cache-correctness suite reported failures (EXPECTED on main — reproduces immutable-vs-mutable mis-caching)"
+            || echo "::warning::cache-correctness suite reported failures (known harness defect #3363: repo create vs SSRF guard; the mis-caching bugs themselves are fixed)"
 
       - name: Dump failure diagnostics
         if: always()

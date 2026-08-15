@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "artifact-keeper-backend"
-version = "1.7.4"
+version = "1.7.5"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -264,6 +264,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "serde_urlencoded",
  "serde_yaml",
  "sha1",

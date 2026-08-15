@@ -38,6 +38,10 @@ pub fn router() -> Router<SharedState> {
         .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
         .route("/audit", get(list_audit_logs))
+        .route(
+            "/proxy-scan-verdicts/:digest",
+            get(get_proxy_scan_verdicts).delete(delete_proxy_scan_verdicts),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +560,7 @@ pub struct RestoreResponse {
 )]
 pub async fn restore_backup(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>> {
@@ -576,6 +581,7 @@ pub async fn restore_backup(
         restore_database: payload.restore_database.unwrap_or(true),
         restore_artifacts: payload.restore_artifacts.unwrap_or(true),
         target_repository_id: payload.target_repository_id,
+        actor: Some(auth.user_id),
     };
 
     let result = service.restore(id, options).await?;
@@ -1454,6 +1460,208 @@ pub async fn rescan_for_inventory(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Proxy scan verdict inspect / invalidate (#3244)
+// ---------------------------------------------------------------------------
+
+/// Normalize an operator-supplied content digest for the `proxy_scan_results`
+/// key: accepts either `sha256:<64 hex>` or the bare 64-hex form (the stored
+/// shape), lowercases it, and rejects anything else. Pure so the validation is
+/// unit-testable without a DB.
+pub(crate) fn normalize_verdict_digest(raw: &str) -> Option<String> {
+    let hex = raw.trim().strip_prefix("sha256:").unwrap_or(raw.trim());
+    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hex.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// One stored `proxy_scan_results` row, as returned by the admin
+/// inspect/invalidate endpoints (#3244).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyScanVerdictItem {
+    pub checksum_sha256: String,
+    pub scan_type: String,
+    pub verdict: String,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub max_severity: Option<String>,
+    pub scanner_version: Option<String>,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::services::proxy_scan_service::ProxyScanRow> for ProxyScanVerdictItem {
+    fn from(r: crate::services::proxy_scan_service::ProxyScanRow) -> Self {
+        Self {
+            checksum_sha256: r.checksum_sha256,
+            scan_type: r.scan_type,
+            verdict: r.verdict,
+            findings_count: r.findings_count,
+            critical_count: r.critical_count,
+            high_count: r.high_count,
+            medium_count: r.medium_count,
+            low_count: r.low_count,
+            max_severity: r.max_severity,
+            scanner_version: r.scanner_version,
+            scanned_at: r.scanned_at,
+        }
+    }
+}
+
+/// Response for the admin proxy-scan-verdict endpoints (#3244).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyScanVerdictListResponse {
+    /// The normalized (bare-hex) digest the verdicts are keyed on.
+    pub digest: String,
+    pub verdicts: Vec<ProxyScanVerdictItem>,
+}
+
+/// Inspect the stored proxy scan verdict(s) for a content digest (#3244).
+///
+/// The verdict store is content-addressed and GLOBAL across repositories and
+/// tenants (the same bytes are the same CVEs), which is why this surface is
+/// instance-admin only: no repo-scoped principal should read — let alone
+/// clear — a lever that spans every repo.
+#[utoipa::path(
+    get,
+    path = "/proxy-scan-verdicts/{digest}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(("digest" = String, Path, description = "Content digest: `sha256:<64 hex>` or bare 64-hex")),
+    responses(
+        (status = 200, description = "Stored verdict rows for the digest", body = ProxyScanVerdictListResponse),
+        (status = 400, description = "Malformed digest"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "No stored verdict for this digest"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_proxy_scan_verdicts(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(digest): Path<String>,
+) -> Result<Json<ProxyScanVerdictListResponse>> {
+    // Defense-in-depth behind the /admin nest's admin_middleware, with the
+    // RBAC-deny recorded (#2321 G-AUDIT convention).
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::ScanResult,
+        "/api/v1/admin/proxy-scan-verdicts",
+        "GET",
+    )
+    .await?;
+    let normalized = normalize_verdict_digest(&digest).ok_or_else(|| {
+        AppError::Validation("digest must be sha256:<64 hex> or bare 64-hex".to_string())
+    })?;
+    let rows = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone())
+        .list_verdicts_for_digest(&normalized)
+        .await?;
+    if rows.is_empty() {
+        return Err(AppError::NotFound(
+            "no stored proxy scan verdict for this digest".to_string(),
+        ));
+    }
+    Ok(Json(ProxyScanVerdictListResponse {
+        digest: normalized,
+        verdicts: rows.into_iter().map(Into::into).collect(),
+    }))
+}
+
+/// Invalidate (delete) the stored proxy scan verdict(s) for a content digest
+/// (#3244).
+///
+/// This forces RE-ASSESSMENT on the next pull — it is NOT a waiver. The next
+/// pull of the digest re-scans (inline under `fail_closed`, asynchronously
+/// under `fail_open`) and records a fresh verdict; a still-flagged image is
+/// immediately re-blocked. Only a stale verdict (advisory withdrawn, CVE-DB
+/// corrected) is durably cleared. Deleting by digest un-blocks that content
+/// EVERYWHERE (the store is global by design), hence instance-admin only.
+/// The deletion is audited with the removed rows' verdict summary.
+#[utoipa::path(
+    delete,
+    path = "/proxy-scan-verdicts/{digest}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(("digest" = String, Path, description = "Content digest: `sha256:<64 hex>` or bare 64-hex")),
+    responses(
+        (status = 200, description = "Deleted verdict rows (re-assessment forced on next pull)", body = ProxyScanVerdictListResponse),
+        (status = 400, description = "Malformed digest"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "No stored verdict for this digest"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_proxy_scan_verdicts(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(digest): Path<String>,
+) -> Result<Json<ProxyScanVerdictListResponse>> {
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::ScanResult,
+        "/api/v1/admin/proxy-scan-verdicts",
+        "DELETE",
+    )
+    .await?;
+    let normalized = normalize_verdict_digest(&digest).ok_or_else(|| {
+        AppError::Validation("digest must be sha256:<64 hex> or bare 64-hex".to_string())
+    })?;
+    let rows = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone())
+        .delete_verdicts_for_digest(&normalized)
+        .await?;
+    if rows.is_empty() {
+        return Err(AppError::NotFound(
+            "no stored proxy scan verdict for this digest".to_string(),
+        ));
+    }
+    // Audit the clear: who removed which verdicts for which digest. Details
+    // carry the verdict summary so the trail shows what protection state was
+    // discarded, never any credential material.
+    let audit = crate::services::audit_service::AuditService::new(state.db.clone());
+    let entry = crate::services::audit_service::AuditEntry::new(
+        crate::services::audit_service::AuditAction::ProxyScanVerdictDeleted,
+        crate::services::audit_service::ResourceType::ScanResult,
+    )
+    .user(auth.user_id)
+    .details(serde_json::json!({
+        "digest": normalized,
+        "deleted": rows
+            .iter()
+            .map(|r| serde_json::json!({
+                "scan_type": r.scan_type,
+                "verdict": r.verdict,
+                "findings_count": r.findings_count,
+                "max_severity": r.max_severity,
+                "scanner_version": r.scanner_version,
+                "scanned_at": r.scanned_at,
+            }))
+            .collect::<Vec<_>>(),
+    }));
+    if let Err(e) = audit.log(entry).await {
+        // Fire-and-forget posture: an audit-table outage must not turn a
+        // completed delete into a 500, but it must be loud.
+        tracing::error!(digest = %normalized, error = %e, "failed to audit proxy scan verdict deletion");
+    }
+    tracing::warn!(
+        actor_user_id = %auth.user_id,
+        digest = %normalized,
+        deleted = rows.len(),
+        "admin cleared proxy scan verdict(s); next pull re-assesses"
+    );
+    Ok(Json(ProxyScanVerdictListResponse {
+        digest: normalized,
+        verdicts: rows.into_iter().map(Into::into).collect(),
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -1475,6 +1683,8 @@ pub async fn rescan_for_inventory(
         rescan_for_inventory,
         list_storage_backends,
         list_audit_logs,
+        get_proxy_scan_verdicts,
+        delete_proxy_scan_verdicts,
     ),
     components(schemas(
         ListBackupsQuery,
@@ -1495,6 +1705,8 @@ pub async fn rescan_for_inventory(
         RescanForInventoryResponse,
         AuditLogItem,
         AuditLogListResponse,
+        ProxyScanVerdictItem,
+        ProxyScanVerdictListResponse,
     ))
 )]
 pub struct AdminApiDoc;
@@ -1507,6 +1719,58 @@ mod tests {
     // audit_page_bounds (#2366) — pure pagination arithmetic, no DB required so
     // the coverage gate exercises it even without Postgres.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // normalize_verdict_digest (#3244) — pure digest validation, no DB.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_verdict_digest_accepts_both_forms() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            normalize_verdict_digest(&format!("sha256:{hex}")).as_deref(),
+            Some(hex.as_str()),
+            "prefixed digest normalizes to the stored bare-hex shape"
+        );
+        assert_eq!(
+            normalize_verdict_digest(&hex).as_deref(),
+            Some(hex.as_str())
+        );
+        // Uppercase hex lowercases (the store is lowercase hex).
+        let upper = "A".repeat(64);
+        assert_eq!(
+            normalize_verdict_digest(&upper).as_deref(),
+            Some(hex.as_str())
+        );
+        // Surrounding whitespace is tolerated.
+        assert_eq!(
+            normalize_verdict_digest(&format!("  sha256:{hex}  ")).as_deref(),
+            Some(hex.as_str())
+        );
+    }
+
+    #[test]
+    fn test_normalize_verdict_digest_rejects_malformed() {
+        assert_eq!(normalize_verdict_digest(""), None);
+        assert_eq!(normalize_verdict_digest("sha256:"), None);
+        assert_eq!(normalize_verdict_digest(&"a".repeat(63)), None, "too short");
+        assert_eq!(normalize_verdict_digest(&"a".repeat(65)), None, "too long");
+        assert_eq!(
+            normalize_verdict_digest(&format!("{}g", "a".repeat(63))),
+            None,
+            "non-hex"
+        );
+        assert_eq!(
+            normalize_verdict_digest(&format!("md5:{}", "a".repeat(64))),
+            None,
+            "unknown algorithm prefix must not silently pass through"
+        );
+        // SQL-shaped garbage can never reach the query.
+        assert_eq!(
+            normalize_verdict_digest("'; DROP TABLE proxy_scan_results;--"),
+            None
+        );
+    }
 
     #[test]
     fn test_audit_page_bounds_defaults() {
