@@ -1692,7 +1692,17 @@ async fn require_repo_visibility(
     if !is_public && !auth.is_admin {
         let repo_service = crate::services::repository_service::RepositoryService::new(db.clone());
         if !repo_service
-            .user_can_access_repo(repo_id, auth.user_id)
+            .user_can_access_repo(
+                repo_id,
+                auth.user_id,
+                // CONTENT (#3331): a private repository's dependency inventory
+                // and CVE history. Every non-admin-reachable caller of this
+                // helper is a GET; the one POST
+                // (`update_cve_status_by_artifact_cve`) is gated on global admin
+                // by `enforce_admin_audited` before it gets here, and admins
+                // short-circuit above, so `read` narrows no mutation.
+                crate::services::repository_service::RepoAccess::READ,
+            )
             .await?
         {
             return Err(AppError::NotFound(missing_msg.into()));

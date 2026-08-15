@@ -1465,7 +1465,13 @@ mod tests {
             }
             assert!(
                 repo_svc
-                    .user_can_access_repo(repo_id, a.user_id)
+                    .user_can_access_repo(
+                        repo_id,
+                        a.user_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("parity check"),
                 "enumerated user {} must pass user_can_access_repo",

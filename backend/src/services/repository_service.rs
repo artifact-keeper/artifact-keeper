@@ -15,6 +15,59 @@ use crate::models::repository::{
 };
 use crate::services::opensearch_service::{OpenSearchService, RepositoryDocument};
 
+/// What a [`RepositoryService::user_can_access_repo`] call is actually asking
+/// (#3331).
+///
+/// Before this existed the function took no action at all, so it could only
+/// answer *"does this principal hold ANY grant on this repository"* — and every
+/// caller, including the ones serving artifact BYTES, got that answer. A
+/// principal whose only entitlement was `{write}` (or a role carrying no
+/// `read`, or a fine-grained rule with an unrecognised action string, since the
+/// grant fragment tests only `actions <> '{}'`) therefore passed the gate on a
+/// private repository's content reads, while the equivalent OCI `/v2` and
+/// native-format reads correctly refused.
+///
+/// Making the action a REQUIRED parameter is the point. An added variant or a
+/// new call site cannot silently inherit the action-blind behaviour: the author
+/// has to name which question they mean, and [`TenantOnly`](Self::TenantOnly)
+/// — the one that keeps the old semantics — is greppable and is required by
+/// `every_user_can_access_repo_call_names_its_action` to carry a written
+/// justification.
+///
+/// This is the #3326 shape (`try_authorize_virtual_members`) applied to the
+/// REST content paths: the tenant gate is kept and the canonical ACTION
+/// choke-point, [`PermissionService::check_repository_action`], is layered on
+/// top of it — the SAME function, with the same arguments, that the direct
+/// `/v2` read gate (`oci_v2::require_oci_repo_read_access`) and
+/// `repo_visibility_middleware` call. The two cannot drift, because they are
+/// one function.
+///
+/// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoAccess {
+    /// The TENANT gate only: "does this principal hold any grant on this
+    /// repository", with no action term.
+    ///
+    /// Correct exactly where an action gate is enforced separately (the REST
+    /// write/delete handlers layer `require_repo_action` on top of it) or where
+    /// the question genuinely is tenant membership rather than a capability
+    /// (cross-tenant promotion, webhook ownership). It is NOT correct in front
+    /// of anything that returns a private repository's contents — that is the
+    /// defect this enum exists to make un-writable by accident.
+    TenantOnly,
+    /// The tenant gate AND the named action, resolved through
+    /// [`PermissionService::check_repository_action`].
+    ///
+    /// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
+    Action(&'static str),
+}
+
+impl RepoAccess {
+    /// The `read` action — the gate for every path that returns a private
+    /// repository's bytes, metadata, or configuration.
+    pub const READ: Self = Self::Action("read");
+}
+
 /// Outcome of an atomic, in-transaction quota admission check
 /// ([`RepositoryService::check_quota_locked`]).
 #[derive(Debug, Clone, Copy)]
@@ -996,16 +1049,41 @@ impl RepositoryService {
         Ok(repo)
     }
 
-    /// Check whether a single user may access a private repository.
+    /// Check whether a single user may perform `access` on a private repository.
     ///
-    /// Mirrors the `RepoVisibility::User` branch of [`build_visibility_clause`]
-    /// for one repository: the user has access if they hold any role assignment
-    /// scoped to that repository OR a global (NULL-scoped) role assignment.
+    /// The TENANT half mirrors the `RepoVisibility::User` branch of
+    /// [`build_visibility_clause`] for one repository: the user holds any role
+    /// assignment scoped to that repository OR a global (NULL-scoped) one, or a
+    /// fine-grained `permissions` rule (direct or via a group).
+    ///
+    /// The ACTION half (#3331) is `access`. [`RepoAccess::TenantOnly`] stops at
+    /// the tenant gate — the historical behaviour, correct only where an action
+    /// gate is layered separately or where the question really is tenant
+    /// membership. [`RepoAccess::Action`] additionally requires that action
+    /// through [`PermissionService::check_repository_action`], the canonical
+    /// choke-point the OCI `/v2` and native-format read gates already use, so a
+    /// `{write}`-only principal can no longer read a private repository's bytes
+    /// through a REST content path while a direct `/v2` read of the same
+    /// repository refuses.
+    ///
+    /// The two halves are ANDed, and the tenant half is evaluated FIRST: a
+    /// principal with no grant at all still costs exactly one round trip, and
+    /// the action lookup is only reached by principals who already hold
+    /// something.
     ///
     /// This is the per-repo authorization predicate. Callers are responsible for
     /// short-circuiting the cases this method does NOT cover: admins bypass it
-    /// entirely and public repositories are accessible to everyone.
-    pub async fn user_can_access_repo(&self, repo_id: Uuid, user_id: Uuid) -> Result<bool> {
+    /// entirely (so the action check is asked with `is_admin = false`, matching
+    /// `try_authorize_virtual_members`) and public repositories are accessible
+    /// to everyone.
+    ///
+    /// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
+    pub async fn user_can_access_repo(
+        &self,
+        repo_id: Uuid,
+        user_id: Uuid,
+        access: RepoAccess,
+    ) -> Result<bool> {
         // Access is granted via EITHER authz store, in a single round trip:
         // the legacy `role_assignments` predicate OR a fine-grained
         // `permissions` grant (direct or via group), mirroring the
@@ -1023,7 +1101,23 @@ impl RepositoryService {
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(granted)
+        if !granted {
+            return Ok(false);
+        }
+        match access {
+            RepoAccess::TenantOnly => Ok(granted),
+            // Action gate (#3331), the #2603 G1 / #3326 idiom: the predicate
+            // above admits ANY grantee, so without this a `{write}` grant on a
+            // private repository bought that repository's bytes through every
+            // REST content path. `is_admin` is passed as `false` because every
+            // caller short-circuits admins before reaching here; passing the
+            // caller's flag would be a second, redundant bypass.
+            RepoAccess::Action(action) => {
+                crate::services::permission_service::PermissionService::new(self.db.clone())
+                    .check_repository_action(user_id, repo_id, action, false)
+                    .await
+            }
+        }
     }
 
     /// Narrow `candidate_ids` to the repositories this caller is allowed to
@@ -2473,6 +2567,206 @@ fn map_virtual_member_insert_error(
         }
     }
     AppError::Database(err.to_string())
+}
+
+/// #3331: the CLASS-level gate on action-blind repository access checks.
+///
+/// The defect was never one careless handler. `user_can_access_repo` took no
+/// action at all, so all ~11 of its call sites — the ones serving artifact
+/// bytes and the ones asking a genuine tenant question alike — got the same
+/// any-grant answer, and nothing in the code said which was which. A test
+/// pinned to the sites fixed in one PR would go green while the next new
+/// content path re-opened the hole, exactly as #3399 found for the virtual
+/// member walks.
+///
+/// Two mechanisms, deliberately layered:
+///
+/// 1. **The compiler.** [`RepoAccess`] is a REQUIRED parameter, so a new call
+///    site cannot inherit the action-blind behaviour by omission. It has to
+///    name a variant.
+/// 2. **This module.** Naming [`RepoAccess::TenantOnly`] is still allowed —
+///    four call sites legitimately want it — but it must be justified in the
+///    source with a `TENANT-GATE-ONLY` marker, the same greppable-exemption
+///    shape #3399 used for `UNFILTERED-ENFORCEMENT`. That keeps the judgement
+///    in review rather than in a test allowlist that drifts.
+///
+/// The scan walks the source tree at test time rather than taking a fixed list
+/// of files, so a call site added in a NEW module is covered without anyone
+/// remembering to extend a constant. It needs no database and runs in the
+/// offline lib suite.
+#[cfg(test)]
+mod action_gate_structural_tests {
+    /// Bytes after a `.user_can_access_repo(` call in which its arguments — and
+    /// so its `RepoAccess` variant — must appear. Comfortably spans the
+    /// explanatory comment these call sites carry, while staying far short of
+    /// the next unrelated call.
+    const ARG_WINDOW: usize = 1400;
+
+    /// Bytes BEFORE the call in which a `TENANT-GATE-ONLY` justification may
+    /// appear. A marker inside the argument list itself also counts, since
+    /// rustfmt puts the explanatory comment next to the variant it explains.
+    const MARKER_WINDOW: usize = 1200;
+
+    const CALL: &str = ".user_can_access_repo(";
+    const MARKER: &str = "TENANT-GATE-ONLY";
+
+    /// Largest index `<= at` that is a UTF-8 char boundary of `src` — the
+    /// sources carry em dashes, and slicing mid-codepoint would panic.
+    fn floor_boundary(src: &str, at: usize) -> usize {
+        let mut at = at.min(src.len());
+        while at > 0 && !src.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    /// Every `.rs` file under `backend/src`, read at test time.
+    fn rust_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    if let Ok(src) = std::fs::read_to_string(&path) {
+                        out.push((path.display().to_string(), src));
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut out,
+        );
+        assert!(
+            !out.is_empty(),
+            "#3331: the source scan found no files; the structural gate would \
+             pass vacuously"
+        );
+        out
+    }
+
+    /// A real call site, as opposed to a doc-comment or string mention of the
+    /// name (this module's own text included).
+    fn is_call_site(src: &str, at: usize) -> bool {
+        let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_prefix = &src[line_start..at];
+        !line_prefix.trim_start().starts_with("//") && !line_prefix.contains('"')
+    }
+
+    /// The gate. Every call must name its action, and every `TenantOnly` must
+    /// say why it is not asking for one.
+    #[test]
+    fn every_user_can_access_repo_call_names_its_action() {
+        let mut unnamed: Vec<String> = Vec::new();
+        let mut unjustified: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+
+        for (name, src) in rust_sources() {
+            let mut from = 0usize;
+            while let Some(rel) = src[from..].find(CALL) {
+                let at = from + rel;
+                from = at + CALL.len();
+                if !is_call_site(&src, at) {
+                    continue;
+                }
+                seen += 1;
+
+                let args_end = floor_boundary(&src, (at + ARG_WINDOW).min(src.len()));
+                let args = &src[at..args_end];
+                let line_no = src[..at].bytes().filter(|b| *b == b'\n').count() + 1;
+                let site = format!("{name}:{line_no}");
+
+                if !args.contains("RepoAccess::") {
+                    unnamed.push(site);
+                    continue;
+                }
+                if args.contains("RepoAccess::TenantOnly") {
+                    let before = &src[floor_boundary(&src, at.saturating_sub(MARKER_WINDOW))..at];
+                    if !before.contains(MARKER) && !args.contains(MARKER) {
+                        unjustified.push(site);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            seen > 0,
+            "#3331: no `{CALL}` call sites found at all — the scan is broken, \
+             not the code"
+        );
+        assert!(
+            unnamed.is_empty(),
+            "#3331: these repository access checks do not name a `RepoAccess` \
+             variant: {unnamed:?}. Every call must state whether it is asking a \
+             tenant question or a capability one."
+        );
+        assert!(
+            unjustified.is_empty(),
+            "#3331: these call sites take the ACTION-BLIND `RepoAccess::TenantOnly` \
+             without saying why: {unjustified:?}. `TenantOnly` answers only \
+             \"does this principal hold any grant\", so it must never front a path \
+             that returns a private repository's contents — that is the bug this \
+             gate exists to stop from coming back. If the tenant gate really is \
+             what you want (a separate `require_repo_action` layers the capability \
+             on top, or the question is genuinely tenant ownership), write a \
+             `TENANT-GATE-ONLY` comment at the call saying so."
+        );
+    }
+
+    /// The signature must keep the action parameter. Deleting it would restore
+    /// the action-blind function and silently re-open every content path,
+    /// while the gate above kept passing (it would find no `RepoAccess::` to
+    /// demand, because there would be nothing to name).
+    #[test]
+    fn user_can_access_repo_still_requires_an_action_parameter() {
+        let src = include_str!("repository_service.rs");
+        let at = src
+            .find("pub async fn user_can_access_repo")
+            .expect("user_can_access_repo must exist");
+        let sig_end = at + src[at..].find(") -> ").expect("signature must terminate");
+        assert!(
+            src[at..sig_end].contains("access: RepoAccess"),
+            "#3331: `user_can_access_repo` must TAKE the intended action, so that a \
+             caller who has not decided cannot compile. Making it optional (a \
+             default, an `Option`, a second action-blind overload) is the exact \
+             shape of the original defect."
+        );
+    }
+
+    /// `require_visible` is the single widest blast radius in this fix: ~23
+    /// production read surfaces fan out through it, and it holds the `read`
+    /// action as a constant rather than threading an argument each of them
+    /// would pass identically. That constant is therefore load-bearing, and is
+    /// pinned here rather than left to review.
+    #[test]
+    fn the_rest_visibility_gate_asks_for_the_read_action() {
+        let src = include_str!("../api/handlers/repositories.rs");
+        let at = src
+            .find("pub(crate) async fn require_visible")
+            .expect("require_visible must exist");
+        let body_end = at
+            + src[at..]
+                .find("\n}\n")
+                .expect("require_visible must terminate");
+        let body = &src[at..body_end];
+        assert!(
+            body.contains("RepoAccess::READ"),
+            "#3331: `require_visible` fronts the REST read surfaces (repository \
+             metadata, artifact listings and downloads, storage trees, security \
+             and SBOM and curation reads). It must require the `read` ACTION, not \
+             merely any grant, or a write-only principal reads private \
+             repositories it is refused by the OCI /v2 and native-format gates."
+        );
+        assert!(
+            !body.contains("RepoAccess::TenantOnly"),
+            "#3331: `require_visible` must not fall back to the tenant gate"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4296,7 +4590,13 @@ mod tests {
             // Owner (auto-granted repository-owner role) -> allowed.
             assert!(
                 service
-                    .user_can_access_repo(repo.id, owner_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        owner_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("owner access check"),
                 "owner should retain access via auto-grant"
@@ -4305,7 +4605,13 @@ mod tests {
             // Different user with no grant -> denied (this is the bug being fixed).
             assert!(
                 !service
-                    .user_can_access_repo(repo.id, other_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        other_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("other access check"),
                 "ungranted user must NOT access a private repo"
@@ -4324,7 +4630,13 @@ mod tests {
             .expect("grant developer role");
             assert!(
                 service
-                    .user_can_access_repo(repo.id, other_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        other_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("granted access check"),
                 "explicitly granted user should now have access"
@@ -4361,7 +4673,13 @@ mod tests {
             // No grant of any kind -> denied.
             assert!(
                 !service
-                    .user_can_access_repo(repo.id, grantee_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        grantee_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("no-grant access check"),
                 "ungranted user must NOT access a private repo"
@@ -4380,7 +4698,13 @@ mod tests {
             .expect("insert empty-actions permission");
             assert!(
                 !service
-                    .user_can_access_repo(repo.id, grantee_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        grantee_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("empty-actions access check"),
                 "empty-actions permission must not grant access"
@@ -4399,7 +4723,13 @@ mod tests {
             .expect("populate permission actions");
             assert!(
                 service
-                    .user_can_access_repo(repo.id, grantee_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        grantee_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("permissions-grant access check"),
                 "user with a non-empty permissions grant must have access"
@@ -4454,7 +4784,13 @@ mod tests {
             // Case: SA WITHOUT a grant -> denied.
             assert!(
                 !service
-                    .user_can_access_repo(repo_a.id, sa_id)
+                    .user_can_access_repo(
+                        repo_a.id,
+                        sa_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("no-grant SA access check"),
                 "service account without a grant must NOT access a private repo"
@@ -4473,7 +4809,13 @@ mod tests {
             .expect("insert empty-actions SA permission");
             assert!(
                 !service
-                    .user_can_access_repo(repo_a.id, sa_id)
+                    .user_can_access_repo(
+                        repo_a.id,
+                        sa_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("empty-actions SA access check"),
                 "empty-actions service-account grant must fail closed"
@@ -4492,7 +4834,13 @@ mod tests {
             .expect("populate SA permission actions");
             assert!(
                 service
-                    .user_can_access_repo(repo_a.id, sa_id)
+                    .user_can_access_repo(
+                        repo_a.id,
+                        sa_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("granted SA access check"),
                 "service account WITH an explicit grant must access the repo"
@@ -4501,7 +4849,13 @@ mod tests {
             // Case: per-repo scoping — SA granted on A is still denied on B.
             assert!(
                 !service
-                    .user_can_access_repo(repo_b.id, sa_id)
+                    .user_can_access_repo(
+                        repo_b.id,
+                        sa_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("other-repo SA access check"),
                 "SA granted on repo A must NOT reach a different private repo B"
@@ -4578,7 +4932,13 @@ mod tests {
             .expect("insert group permission");
             assert!(
                 !service
-                    .user_can_access_repo(repo.id, member_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        member_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("non-member access check"),
                 "non-member must NOT inherit a group grant"
@@ -4593,7 +4953,13 @@ mod tests {
                 .expect("add group member");
             assert!(
                 service
-                    .user_can_access_repo(repo.id, member_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        member_id,
+                        // TENANT-GATE-ONLY (#3331): pins the tenant predicate itself, which is what
+                        // this test was written to assert; the read-action narrowing has its own tests.
+                        crate::services::repository_service::RepoAccess::TenantOnly
+                    )
                     .await
                     .expect("group-member access check"),
                 "group member must inherit the group's repository grant"
@@ -4610,6 +4976,136 @@ mod tests {
                     .execute(&pool)
                     .await;
             }
+        }
+
+        /// #3331: the defect itself. A principal whose ONLY entitlement on a
+        /// private repository is `{write}` holds a grant, so the tenant
+        /// predicate admits them — and before this fix that was the entire
+        /// gate in front of the REST content paths, so they were served the
+        /// repository's artifact bytes while the equivalent OCI `/v2` read of
+        /// the same repository correctly refused.
+        ///
+        /// Asserted as a matrix on ONE grant so the two halves cannot be
+        /// confused: the same `{write}` rule must be admitted by `TenantOnly`
+        /// and refused by `READ`. A regression that reverts the action gate
+        /// fails the second assertion; a regression that over-narrows the
+        /// tenant gate (and would collaterally break the write/delete
+        /// handlers, which layer their own action check on top of it) fails
+        /// the first.
+        #[tokio::test]
+        async fn user_can_access_repo_read_refuses_a_write_only_grant() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+            let (writer_id, _) = tdh::create_user(&pool).await;
+
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut req = make_create_req(&suffix, RepositoryFormat::Generic);
+            req.created_by = Some(owner_id);
+            let repo = service.create(req).await.expect("create private repo");
+            assert!(!repo.is_public, "the gate under test is the PRIVATE one");
+
+            // A fine-grained rule carrying `write` and nothing else.
+            tdh::grant_repo_actions(&pool, repo.id, writer_id, &["write"]).await;
+
+            assert!(
+                service
+                    .user_can_access_repo(
+                        repo.id,
+                        writer_id,
+                        // TENANT-GATE-ONLY (#3331): asserting the tenant half is
+                        // UNCHANGED is half the point of this test.
+                        RepoAccess::TenantOnly
+                    )
+                    .await
+                    .expect("tenant gate query"),
+                "the tenant gate must still admit a write-only grantee: the REST \
+                 write/delete handlers depend on it and layer their own action check"
+            );
+            assert!(
+                !service
+                    .user_can_access_repo(repo.id, writer_id, RepoAccess::READ)
+                    .await
+                    .expect("read gate query"),
+                "#3331: a {{write}}-only grant must NOT satisfy the read action, or \
+                 the REST content paths hand this principal a private repository's \
+                 bytes that a direct /v2 read of the same repository refuses"
+            );
+
+            // A second principal on the SAME repository, granted `read`, IS
+            // admitted — so the gate narrows by ACTION and not by accident.
+            // (A distinct principal rather than a re-grant: `permissions` is
+            // unique per (principal, target), so the write-only rule above
+            // cannot be added to without replacing it.)
+            let (reader_id, _) = tdh::create_user(&pool).await;
+            tdh::grant_repo_actions(&pool, repo.id, reader_id, &["read"]).await;
+            assert!(
+                service
+                    .user_can_access_repo(repo.id, reader_id, RepoAccess::READ)
+                    .await
+                    .expect("read gate query for read grant"),
+                "a grant carrying `read` must pass the read gate"
+            );
+
+            tdh::cleanup(&pool, repo.id, owner_id).await;
+            for uid in [writer_id, reader_id] {
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(uid)
+                    .execute(&pool)
+                    .await;
+            }
+        }
+
+        /// #3331: a principal holding NO grant at all is refused by both forms,
+        /// and the read form costs no extra round trip to say so (the tenant
+        /// half short-circuits). The negative case matters because the action
+        /// gate is ANDed on top: an implementation that consulted only
+        /// `check_repository_action` would WIDEN access for a principal whose
+        /// role carries `read` globally but who holds nothing on this
+        /// repository.
+        #[tokio::test]
+        async fn user_can_access_repo_read_still_refuses_a_principal_with_no_grant() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+            let (stranger_id, _) = tdh::create_user(&pool).await;
+
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut req = make_create_req(&suffix, RepositoryFormat::Generic);
+            req.created_by = Some(owner_id);
+            let repo = service.create(req).await.expect("create private repo");
+
+            for access in [RepoAccess::TenantOnly, RepoAccess::READ] {
+                assert!(
+                    !service
+                        .user_can_access_repo(repo.id, stranger_id, access)
+                        .await
+                        .expect("gate query"),
+                    "a principal with no grant must be refused under {access:?}"
+                );
+            }
+
+            // The repository owner, whose `repository-owner` role carries
+            // `read`, still passes — the fix must not lock owners out.
+            assert!(
+                service
+                    .user_can_access_repo(repo.id, owner_id, RepoAccess::READ)
+                    .await
+                    .expect("owner read gate query"),
+                "the auto-granted repository owner must keep read access"
+            );
+
+            tdh::cleanup(&pool, repo.id, owner_id).await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(stranger_id)
+                .execute(&pool)
+                .await;
         }
 
         /// #1996: `list(RepoVisibility::User(..))` must return a private repo the

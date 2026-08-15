@@ -231,10 +231,21 @@ async fn authorize_repo_for_tokens(
     // given capability by minting a token is enforced per-scope in
     // `create_repo_token` (#2603 G3 delegation ceiling), so a read-only member
     // can still self-manage read-scoped tokens on a repo it can see.
+    // TENANT-GATE-ONLY (#3331). This stays action-blind on purpose: it is a
+    // VISIBILITY bar for the token-management surface, and the capability
+    // question — may this caller DELEGATE a given scope by minting a token —
+    // is enforced per-scope in `create_repo_token` (#2603 G3 delegation
+    // ceiling). Asking for `read` here would refuse a write-only member the
+    // ability to self-manage the write-scoped tokens they are entitled to mint,
+    // which is a capability removal this issue does not call for.
     if !repo.is_public
         && !auth.is_admin
         && !repo_service
-            .user_can_access_repo(repo.id, auth.user_id)
+            .user_can_access_repo(
+                repo.id,
+                auth.user_id,
+                crate::services::repository_service::RepoAccess::TenantOnly,
+            )
             .await?
     {
         return Err(AppError::NotFound(format!(
