@@ -7126,6 +7126,10 @@ mod agent2_recipe_reads {
         .execute(&pool)
         .await
         .expect("link virtual member");
+        // Entitle the caller on the PRIVATE member (#3323) — the subject here
+        // is revision aggregation, not authorization.
+        crate::api::handlers::test_db_helpers::grant_repo_access(&pool, local_repo_id, user_id)
+            .await;
 
         // Seed two revisions in the local member; the newer one should win.
         let _ = seed_recipe_row(
@@ -7879,6 +7883,13 @@ mod agent2_recipe_reads {
         .execute(pool)
         .await
         .expect("link virtual member");
+        // The member is PRIVATE (`create_conan_repo` leaves `is_public` false)
+        // and since #3323 a virtual repo resolves only the members the CALLER
+        // may read directly. These fixtures probe with `auth`, so entitle that
+        // user on the member: the subject of every test below is the virtual
+        // AGGREGATION, and without the grant they would be asserting the
+        // unauthorized walk instead.
+        crate::api::handlers::test_db_helpers::grant_repo_access(pool, member_id, user_id).await;
         (
             virtual_id,
             virtual_key,

@@ -4056,6 +4056,10 @@ mod read_db_tests {
         .execute(pool)
         .await
         .expect("link virtual member");
+        // The federation fixtures probe anonymously and the member walk is
+        // caller-authorized since #3323; publish the member so the subject
+        // stays the V2/V3 federation itself.
+        tdh::publish_repo(pool, member_id).await;
         (vid, vkey)
     }
 

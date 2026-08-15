@@ -6118,6 +6118,9 @@ mod tests {
             .execute(&fx.pool)
             .await
             .expect("attach member");
+            // Anonymous probe below; publish so the subject stays the #2844
+            // priority MERGE rather than the #3323 authorization filter.
+            tdh::publish_repo(&fx.pool, member_id).await;
         }
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
@@ -9154,6 +9157,10 @@ mod tests {
         .execute(&fx.pool)
         .await
         .expect("insert virtual member");
+        // Publish the member (#3323): the reads below are anonymous, and only
+        // an all-public virtual uses the packument cache whose cross-replica
+        // invalidation this test is about.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
 
         // "Replica B": its own in-process packument cache over the same
         // database, with its cross-replica invalidation listener running.
@@ -10918,6 +10925,12 @@ mod db_cov_tests {
         .await
         .expect("attach virtual member");
         tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        // Publish the member (#3323). Two reasons, both load-bearing for the
+        // cache fixtures below: the packument probes here are ANONYMOUS, and a
+        // virtual repo with a PRIVATE member is no longer packument-cache
+        // eligible at all (the merged document would be caller-dependent).
+        // Without this the cache tests would warm nothing and assert nothing.
+        tdh::publish_repo(&fx.pool, member_id).await;
         (member_id, member_key, member_dir)
     }
 

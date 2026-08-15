@@ -719,6 +719,26 @@ pub async fn create_repo(pool: &PgPool, repo_type: &str, format: &str) -> (Uuid,
     (id, key, storage_dir)
 }
 
+/// Mark a repository public.
+///
+/// `create_repo` leaves `is_public` at its `false` default, so a repository it
+/// creates is PRIVATE. Since #3323 a virtual repo resolves only the members the
+/// CALLER may read directly, which means a fixture that links a `create_repo`
+/// member and then probes ANONYMOUSLY resolves nothing — correctly.
+///
+/// Use this in fixtures whose subject is the virtual AGGREGATION rather than
+/// the authorization, so the anonymous probe stays valid. When the fixture
+/// probes with a caller, prefer [`grant_repo_access`] instead: it keeps the
+/// member private and exercises the full read predicate rather than the
+/// public-repository short-circuit.
+pub async fn publish_repo(pool: &PgPool, repo_id: Uuid) {
+    sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("publish repo");
+}
+
 pub fn make_auth(user_id: Uuid, username: &str) -> AuthExtension {
     AuthExtension {
         user_id,
@@ -1909,6 +1929,12 @@ pub async fn create_remote_and_virtual(
     .execute(pool)
     .await
     .expect("link remote as virtual member");
+    // Every rig built on this pair probes ANONYMOUSLY, and since #3323 a
+    // virtual repo resolves only the members the caller may read directly.
+    // Publish the member so those fixtures keep testing what they are about —
+    // verbatim Content-Type / Content-Encoding forwarding (#3281 / #3260) —
+    // rather than the authorization filter.
+    publish_repo(pool, remote_id).await;
     (remote_id, remote_key, virtual_id, virtual_key)
 }
 

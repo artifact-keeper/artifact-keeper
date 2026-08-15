@@ -5038,6 +5038,11 @@ mod virtual_dists_cap_tests {
             .execute(pool)
             .await
             .expect("insert virtual member");
+            // These fixtures probe ANONYMOUSLY and the dists walk is
+            // caller-authorized since #3323, so publish the member: the subject
+            // of the suite is the metadata cap / member dist-filter behaviour,
+            // not authorization.
+            crate::api::handlers::test_db_helpers::publish_repo(pool, *member_id).await;
         }
         (virtual_id, virtual_key)
     }

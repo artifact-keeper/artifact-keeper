@@ -3875,8 +3875,16 @@ mod metadata_db_tests {
         )
         .await;
         add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+        // The member is PRIVATE (`create_repo` leaves `is_public` at its false
+        // default), and since #3323 a virtual repo resolves only the members
+        // the CALLER may read directly. Entitle the fixture user on the member
+        // so this test asserts what #1715 is actually about — that a virtual
+        // repo resolves p2 from its local member — rather than incidentally
+        // depending on the unauthorized walk. The anonymous direction is
+        // asserted below.
+        tdh::grant_repo_access(&vf.pool, member_id, vf.user_id).await;
 
-        let app = vf.router_anon(super::router());
+        let app = vf.router_with_auth(super::router());
         let req = tdh::get(format!("/{}/p2/symfony/serializer-pack.json", vf.repo_key));
         let (status, body) = tdh::send(app, req).await;
         assert_eq!(
@@ -3900,6 +3908,18 @@ mod metadata_db_tests {
                 && url.contains(&format!("/composer/{}/dist/", vf.repo_key)),
             "dist url must be absolute and point at virtual repo, got {}",
             url
+        );
+
+        // #3323, the other direction: the same request with NO caller must not
+        // resolve the private member's package through the virtual parent.
+        let anon_app = vf.router_anon(super::router());
+        let anon_req = tdh::get(format!("/{}/p2/symfony/serializer-pack.json", vf.repo_key));
+        let (anon_status, _anon_body) = tdh::send(anon_app, anon_req).await;
+        assert_ne!(
+            anon_status,
+            axum::http::StatusCode::OK,
+            "#3323: an anonymous caller must not resolve a PRIVATE member's package \
+             metadata through the virtual parent, got {anon_status}"
         );
 
         // cleanup member rows + repo
@@ -3927,8 +3947,11 @@ mod metadata_db_tests {
         )
         .await;
         add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+        // Entitle the caller on the PRIVATE member — see the #3323 note on
+        // `virtual_p2_resolves_from_local_member`.
+        tdh::grant_repo_access(&vf.pool, member_id, vf.user_id).await;
 
-        let app = vf.router_anon(super::router());
+        let app = vf.router_with_auth(super::router());
         let req = tdh::get(format!("/{}/p/vendor/legacy.json", vf.repo_key));
         let (status, body) = tdh::send(app, req).await;
         assert_eq!(status, axum::http::StatusCode::OK);
@@ -4010,8 +4033,11 @@ mod metadata_db_tests {
         )
         .await;
         add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+        // Entitle the caller on the PRIVATE member — see the #3323 note on
+        // `virtual_p2_resolves_from_local_member`.
+        tdh::grant_repo_access(&vf.pool, member_id, vf.user_id).await;
 
-        let app = vf.router_anon(super::router());
+        let app = vf.router_with_auth(super::router());
         let req = tdh::get(format!("/{}/packages.json", vf.repo_key));
         let (status, body) = tdh::send(app, req).await;
         assert_eq!(status, axum::http::StatusCode::OK);
@@ -4140,8 +4166,15 @@ mod metadata_db_tests {
         // m2 has higher priority (lower number) so it should win.
         add_member(&vf.pool, vf.repo_id, m1, 10).await;
         add_member(&vf.pool, vf.repo_id, m2, 0).await;
+        // Entitle the caller on BOTH private members — see the #3323 note on
+        // `virtual_p2_resolves_from_local_member`. Granting both keeps the
+        // subject of this test the PRIORITY order, not the authorization: if
+        // the filter silently dropped one member the winner would change and
+        // this assertion would catch it.
+        tdh::grant_repo_access(&vf.pool, m1, vf.user_id).await;
+        tdh::grant_repo_access(&vf.pool, m2, vf.user_id).await;
 
-        let app = vf.router_anon(super::router());
+        let app = vf.router_with_auth(super::router());
         let req = tdh::get(format!("/{}/p2/dup/pkg.json", vf.repo_key));
         let (status, body) = tdh::send(app, req).await;
         assert_eq!(status, axum::http::StatusCode::OK);

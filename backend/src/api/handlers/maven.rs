@@ -5013,6 +5013,9 @@ mod tests {
         .execute(&pool)
         .await
         .expect("link remote as virtual member");
+        // Private member + anonymous probe: publish it (#3323). The subject
+        // here is the virtual forward, not authorization.
+        tdh::publish_repo(&pool, remote_id).await;
         let virtual_resp = download_root(
             State(state.clone()),
             Extension(None),
@@ -5117,6 +5120,9 @@ mod tests {
         .execute(&pool)
         .await
         .expect("link coded remote as virtual member");
+        // Private member + anonymous probe: publish it (#3323). The subject
+        // here is the virtual forward, not authorization.
+        tdh::publish_repo(&pool, coded_id).await;
 
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);

@@ -2937,6 +2937,10 @@ mod tests {
         .execute(&f.pool)
         .await
         .expect("link virtual member");
+        // The header query is caller-authorized since #3323 and this fixture
+        // resolves with no caller, so publish the member: the subject here is
+        // which member wins the PRIORITY race, not authorization.
+        tdh::publish_repo(&f.pool, member_id).await;
 
         let artifact_path = "sentence-transformers/all-MiniLM-L6-v2/main/config.json";
         // A full 64-hex digest, so the assertion also shows that a real checksum

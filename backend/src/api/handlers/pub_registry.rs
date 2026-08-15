@@ -1858,6 +1858,11 @@ dev_dependencies:
         .execute(&fx.pool)
         .await
         .expect("add member");
+        // The member is PRIVATE and this fixture probes ANONYMOUSLY, so publish
+        // it (#3323): a virtual repo now resolves only the members the caller
+        // may read directly, and the subject here is member resolution, not
+        // authorization.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
 
         // Also grant access to virtual repo for the fixture user
         tdh::grant_repo_access(&fx.pool, virtual_id, fx.user_id).await;
@@ -1957,6 +1962,11 @@ dev_dependencies:
         .execute(&fx.pool)
         .await
         .expect("add member");
+        // The member is PRIVATE and this fixture probes ANONYMOUSLY, so publish
+        // it (#3323): a virtual repo now resolves only the members the caller
+        // may read directly, and the subject here is member resolution, not
+        // authorization.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
 
         tdh::grant_repo_access(&fx.pool, virtual_id, fx.user_id).await;
 
