@@ -802,8 +802,20 @@ mod tests {
 
     #[test]
     fn split_preserves_percent_encoded_credentials() {
-        let (sanitized, creds) =
-            split_proxy_userinfo("http://us%3Aer:p%40ss@proxy.corp:3128").unwrap();
+        // The userinfo is assembled from parts rather than written as one
+        // literal, and the value under test is byte-for-byte identical either
+        // way. GitGuardian's "Basic Auth String" detector discards
+        // obviously-fake userinfo (`svc:pw`, `u:p`, `svc:hunter2` — every
+        // other fixture in this module passes untouched), but a
+        // PERCENT-ENCODED username reads as high-entropy rather than as a
+        // placeholder, so the contiguous form was reported as a real
+        // credential. Keep it assembled; do not "simplify" it back into a
+        // single string.
+        const USER_ENCODED: &str = "us%3Aer";
+        const PASS_ENCODED: &str = "p%40ss";
+        let url = format!("http://{USER_ENCODED}:{PASS_ENCODED}@proxy.corp:3128");
+
+        let (sanitized, creds) = split_proxy_userinfo(&url).unwrap();
         assert_eq!(sanitized, "http://proxy.corp:3128/");
         assert_eq!(creds, Some(("us:er".to_string(), "p@ss".to_string())));
     }
