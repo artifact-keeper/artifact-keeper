@@ -18,20 +18,9 @@
 # to the requested TARGET arch (fast, no emulation for the compile step).
 # Go 1.26 toolchain: the adapter is stdlib-only, so every Go CVE reported
 # against the compiled binary is a stdlib CVE baked in by the builder
-# toolchain. The floating `1.26` tag is deliberate — it always resolves to the
-# newest patch, which is what a security rebuild wants. Current floor is
-# **1.26.6**, not the 1.26.5 this comment used to name: the 2026-08 batch
-# (CVE-2026-33818/-56853/-56858/-56859/-56860/-56862, plus -39821/-46600)
-# needs 1.26.6, and that is the batch that blocked publishing in #3352.
-# Verified 2026-08-16: this image's `usr/local/bin/scanner-adapter` reports
-# stdlib v1.26.6 and scans clean. The go.mod `go` directive stays at the
-# minimum language version. See issues #2391 and #3352.
-#
-# Note the asymmetry with docker/Dockerfile.backend{,.alpine}, which build
-# grype on the same floating tag but ALSO assert a `GO_MIN_PATCH` floor. The
-# assertion is there because those images ship a binary whose stdlib CVEs were
-# a release blocker; if this adapter ever fails a scan on the same class, copy
-# that assertion here rather than pinning an exact patch.
+# toolchain. Track the current patched Go minor here (>= 1.26.5 clears the
+# 2026-07 stdlib batch, issue #2391); the go.mod `go` directive stays at the
+# minimum language version.
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 
 ARG TARGETOS
