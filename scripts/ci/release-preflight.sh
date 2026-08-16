@@ -14,20 +14,41 @@
 # nothing checked it before tagging. This gate is that check.
 #
 # What it verifies:
-#   1. TRIVYIGNORE DRIFT (hard): main's CVE/GHSA suppression set must be a
-#      SUPERSET of every active `release/*` branch's. A CVE suppressed on a
-#      hotfix branch but not forward-ported to main means main's images fail
-#      Security Scan -> no release can be cut from main. This is the exact
-#      #3039 gap. Enumeration mirrors check-migration-ledger.sh.
+#   1. TRIVYIGNORE DRIFT (hard): every suppression on every active `release/*`
+#      branch must be ACCOUNTED FOR on main -- either as a live suppression
+#      token, or as an explicit `# RETIRED: <token>` tombstone line. A CVE
+#      suppressed on a hotfix branch and neither carried nor tombstoned on
+#      main means main's images fail Security Scan -> no release can be cut
+#      from main. This is the exact #3039 gap. Enumeration mirrors
+#      check-migration-ledger.sh.
+#
+#      The tombstone form exists because a plain superset rule makes the set
+#      monotonic (#3309): a suppression provably dead for main's images could
+#      never be DELETED while any release branch still listed it, so the file
+#      drifted from "the residual set" toward "everything ever worked
+#      around". A `# RETIRED: <token>` line is the machine-read record that
+#      main removed the token DELIBERATELY (the finding is absent from main's
+#      images), as opposed to never having received it (the #3039 forward-port
+#      miss, which still hard-fails). Retiring is a reviewable diff, and a
+#      token listed BOTH live and retired is a contradiction and fails.
 #   2. VERSION-SET CONSISTENCY (hard): the workspace version in Cargo.toml,
 #      the OpenAPI info version in backend/src/api/openapi.rs, and the
 #      artifact-keeper-backend entry in Cargo.lock must all agree. A partial
 #      bump ships a stale version string (see RELEASING.md step 2).
-#   3. MAIN DOCKER-PUBLISH HEALTH (hard, when it can be measured): whether the
-#      most recent `Docker Publish` run on main published its multi-arch
-#      manifest (i.e. Security Scan passed). A red/skipped manifest here does
-#      not merely "predict" the same stall on the tag -- it is the same job,
-#      on the same images, with the same gate. If it is red, the cut stalls.
+#   3. DOCKER-PUBLISH HEALTH FOR THIS COMMIT (hard, when it can be measured):
+#      whether the `Docker Publish` run for the EXACT commit being tagged
+#      (HEAD) published its multi-arch manifest (i.e. Security Scan passed).
+#      A red/skipped manifest here does not merely "predict" the same stall
+#      on the tag -- it is the same job, on the same images, with the same
+#      gate. If it is red, the cut stalls.
+#
+#      Selection is by `head_sha`, NOT by recency (#3338). "Latest run on
+#      main" is a proxy that diverges from the question that matters whenever
+#      main has moved since the last publish, a publish is still in flight,
+#      or the list API answers stalely -- the v1.7.2 cut lost time to a
+#      blocking false red when the "latest run" query returned a ten-day-old
+#      run while the actual latest (and green) run existed. A tag is cut on a
+#      commit; the commit's own run is the measurement.
 #
 #      This check used to `warn` and let the script exit 0, so the tool printed
 #      "a tag cut will likely stall" and "READY: ... Safe to cut the tag." in
@@ -45,11 +66,23 @@
 #      because the CVE affected main and the release branches equally so there
 #      was no drift to find.
 #
-#      Three outcomes, deliberately kept distinct -- "I did not look",
-#      "I could not look" and "I looked and it is red" are different claims:
+#      Outcomes, deliberately kept distinct -- "I did not look", "I could not
+#      look", "there is nothing to look at yet" and "I looked and it is red"
+#      are different claims:
 #        * not measured (skipped, or `gh` absent)      -> note, not blocking
 #        * could not measure (the gh query failed)     -> INFRA, exit 2
+#        * no run for this commit (not built yet)      -> blocking, exit 1
+#          NOT a pass and NOT "ran and failed": the images for this commit do
+#          not exist, so a tag cut has nothing to resolve a digest from.
+#        * run still queued/in progress                -> blocking, exit 1
+#          (wait for it to finish and re-run; treating in-flight as absent
+#          or as green would launder an unfinished measurement)
 #        * measured red                                -> blocking, exit 1
+#      PREFLIGHT_ALLOW_RED_PUBLISH only overrides the MEASURED-RED outcome:
+#      "I looked, it is red, proceeding anyway" is a coherent human call.
+#      There is no override for not-built/in-flight, because there is no
+#      result to accept the risk of -- the digest resolution would simply
+#      fail.
 #
 #   4. VERSION-PINNED IMAGE COLLISION (hard, when it can be measured): for each
 #      component whose image tag comes from a checked-in VERSION file, whether
@@ -139,9 +172,18 @@ if [[ -z "$REPO" ]]; then
   [[ -z "$REPO" ]] && REPO="artifact-keeper/artifact-keeper"
 fi
 
-# extract sorted, unique CVE-/GHSA- tokens from stdin
+# extract sorted, unique CVE-/GHSA- tokens from stdin. `|| true` because a
+# file with zero tokens is an answer, not an error (grep exits 1 on no match,
+# which would abort the script under `set -euo pipefail`).
 suppression_tokens() {
-  grep -oE '^(CVE-[0-9]{4}-[0-9]+|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})' | sort -u
+  { grep -oE '^(CVE-[0-9]{4}-[0-9]+|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})' || true; } | sort -u
+}
+
+# extract sorted, unique tombstoned tokens (`# RETIRED: <token>` lines, #3309)
+# from stdin. Anything after the token (a date, an issue ref) is free text.
+retired_tokens() {
+  { grep -oE '^# RETIRED: (CVE-[0-9]{4}-[0-9]+|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})' || true; } \
+    | sed 's/^# RETIRED: //' | sort -u
 }
 
 echo "== release preflight =="
@@ -149,11 +191,23 @@ echo "repo: $REPO   ref: $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
 echo
 
 # --- check 1: .trivyignore forward-port drift -------------------------------
-echo "1) .trivyignore forward-port drift (main must be a superset of release/*)"
+echo "1) .trivyignore forward-port drift (main must account for release/* suppressions)"
 if [[ ! -f .trivyignore ]]; then
   warn "no .trivyignore at repo root -- skipping drift check"
 else
   main_tokens="$(suppression_tokens < .trivyignore)"
+  main_retired="$(retired_tokens < .trivyignore)"
+  # A token both live and tombstoned is a contradiction: the file claims
+  # "this is an active exception" and "this was deliberately removed" at
+  # once. Fail rather than pick a winner (#3309).
+  contradiction="$(comm -12 <(printf '%s\n' "$main_tokens") <(printf '%s\n' "$main_retired") | grep -v '^$' || true)"
+  if [[ -n "$contradiction" ]]; then
+    bad ".trivyignore lists token(s) BOTH as live suppressions and as '# RETIRED:' tombstones:"
+    while IFS= read -r c; do [[ -n "$c" ]] && note "  - $c"; done <<< "$contradiction"
+    note "  -> delete one of the two lines per token; a token is live or retired, never both."
+  fi
+  # What main accounts for: live suppressions plus deliberate retirements.
+  covered="$(printf '%s\n%s\n' "$main_tokens" "$main_retired" | grep -v '^$' | sort -u)"
   # enumerate active release branches (works on a shallow checkout)
   if ! remote_refs="$(git ls-remote --heads origin 'release/*' 2>/dev/null)"; then
     echo "INFRA: git ls-remote for release/* failed" >&2
@@ -173,18 +227,27 @@ else
         continue
       fi
       rel_tokens="$(printf '%s\n' "$rel_content" | suppression_tokens)"
-      # tokens present on the release branch but MISSING from main
-      missing="$(comm -23 <(printf '%s\n' "$rel_tokens") <(printf '%s\n' "$main_tokens") | grep -v '^$' || true)"
+      # tokens present on the release branch but neither live nor tombstoned
+      # on main: the #3039 forward-port miss, still a hard failure.
+      missing="$(comm -23 <(printf '%s\n' "$rel_tokens") <(printf '%s\n' "$covered") | grep -v '^$' || true)"
+      # tokens the release branch still suppresses that main has RETIRED:
+      # accounted for, but say so -- a retirement is a claim about main's
+      # images, and it should be visible in the transcript, not silent.
+      retired_hits="$(comm -12 <(printf '%s\n' "$rel_tokens") <(printf '%s\n' "$main_retired") | grep -v '^$' || true)"
       if [[ -n "$missing" ]]; then
         bad "main is MISSING suppressions that $br has:"
         while IFS= read -r m; do [[ -n "$m" ]] && note "  - $m"; done <<< "$missing"
-        note "  -> forward-port these to main's .trivyignore before tagging (see #3039)"
+        note "  -> forward-port these to main's .trivyignore before tagging (see #3039),"
+        note "     or -- ONLY if the finding is measured absent from main's images --"
+        note "     record the removal as a '# RETIRED: <token>' tombstone (see #3309)."
         drift=$((drift + 1))
+      elif [[ -n "$retired_hits" ]]; then
+        note "$br: main covers all of its suppressions ($(printf '%s' "$retired_hits" | grep -c . ) via RETIRED tombstones)"
       else
         note "$br: main covers all of its suppressions"
       fi
     done <<< "$rel_branches"
-    [[ "$drift" -eq 0 ]] && ok "trivyignore drift: main is a superset of every release/*"
+    [[ "$drift" -eq 0 ]] && ok "trivyignore drift: main accounts for every release/* suppression"
   fi
 fi
 echo
@@ -206,8 +269,8 @@ else
 fi
 echo
 
-# --- check 3: main docker-publish health (hard when measurable) -------------
-echo "3) latest main Docker Publish health"
+# --- check 3: docker-publish health for HEAD (hard when measurable) ---------
+echo "3) Docker Publish health for the commit being tagged (HEAD)"
 if [[ "${PREFLIGHT_SKIP_DOCKER_HEALTH:-0}" == "1" ]]; then
   note "NOT MEASURED (PREFLIGHT_SKIP_DOCKER_HEALTH=1) -- this check did not run,"
   note "which is not the same as it passing."
@@ -215,36 +278,68 @@ elif ! command -v gh >/dev/null 2>&1; then
   note "NOT MEASURED (gh not on PATH) -- this check did not run, which is not"
   note "the same as it passing."
 else
-  run_id="$(gh run list --repo "$REPO" --workflow "Docker Publish" --branch main --limit 1 \
-              --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
-  if [[ -z "$run_id" ]]; then
-    # gh is present but the query failed (auth, network, API). We could not
-    # measure, so we must not render a readiness verdict either way.
-    echo "INFRA: could not query the latest main Docker Publish run" >&2
+  head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+  if [[ -z "$head_sha" ]]; then
+    echo "INFRA: could not resolve HEAD" >&2
     exit 2
   fi
-  sec="$(gh run view "$run_id" --repo "$REPO" --json jobs \
-          --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?')"
-  man="$(gh run view "$run_id" --repo "$REPO" --json jobs \
-          --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?')"
-  note "run $run_id: Security Scan=$sec, Backend Multi-Arch Manifest=$man"
-  if [[ "$sec" == "?" || "$man" == "?" ]]; then
-    echo "INFRA: could not read job conclusions from run $run_id" >&2
+  # Select the run for THIS commit, never "the latest run" (#3338): recency
+  # is a proxy that diverges when main has moved, a publish is in flight, or
+  # the list API answers stalely -- and the divergence produced a blocking
+  # false red on the v1.7.2 cut. head_sha resolves to at most one run and
+  # needs no new machinery.
+  if ! run_info="$(gh api "repos/$REPO/actions/workflows/docker-publish.yml/runs?head_sha=$head_sha&per_page=1" \
+                    --jq '.workflow_runs[0] // empty | "\(.id) \(.status)"' 2>/dev/null)"; then
+    # gh is present but the query failed (auth, network, API). We could not
+    # measure, so we must not render a readiness verdict either way.
+    echo "INFRA: could not query Docker Publish runs for $head_sha" >&2
     exit 2
-  elif [[ "$sec" == "success" && "$man" == "success" ]]; then
-    ok "main images are publishing cleanly"
-  elif [[ "${PREFLIGHT_ALLOW_RED_PUBLISH:-0}" == "1" ]]; then
-    warn "main's last Docker Publish did NOT cleanly publish the manifest, but"
-    warn "PREFLIGHT_ALLOW_RED_PUBLISH=1 was set, so this is not blocking."
-    note "  -> whoever set that owns the stall if the cut hits the same gate."
-    note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
+  fi
+  if [[ -z "$run_info" ]]; then
+    # A fourth outcome, distinct from "ran and failed" (#3338): the query
+    # succeeded and there is NO run for this commit. The images a tag cut
+    # would pin do not exist, so resolve-candidate-digest has nothing to
+    # resolve. Not a pass; also not an infra retry.
+    bad "no Docker Publish run exists for HEAD ($(git rev-parse --short HEAD)) -- the images for this commit have NOT been built."
+    note "  -> a tag cut from this commit has no manifest to resolve a digest from."
+    note "  -> wait for (or trigger) Docker Publish on this exact commit, then re-run preflight."
   else
-    bad "main's last Docker Publish did NOT cleanly publish the manifest -- a tag cut WILL stall on the same gate."
-    note "  -> Security Scan hard-gates every multi-arch manifest, which gates"
-    note "     resolve-candidate-digest, which gates the whole release chain."
-    note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
-    note "  -> fix it on main and let Docker Publish go green before tagging (#3039, #3307)."
-    note "  -> PREFLIGHT_ALLOW_RED_PUBLISH=1 overrides this deliberately; do not use it to retry a red away."
+    read -r run_id run_status <<< "$run_info"
+    if [[ -z "$run_id" || -z "$run_status" ]]; then
+      echo "INFRA: unparseable Docker Publish run answer for $head_sha ('$run_info')" >&2
+      exit 2
+    fi
+    if [[ "$run_status" != "completed" ]]; then
+      # In flight is not absent and not green: block and say to wait rather
+      # than silently mis-classifying an unfinished measurement (#3338).
+      bad "Docker Publish for HEAD is still '$run_status' (run $run_id) -- its verdict does not exist yet."
+      note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
+      note "  -> wait for it to complete, then re-run preflight. Do not tag ahead of the gate."
+    else
+      sec="$(gh run view "$run_id" --repo "$REPO" --json jobs \
+              --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?')"
+      man="$(gh run view "$run_id" --repo "$REPO" --json jobs \
+              --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?')"
+      note "run $run_id: Security Scan=$sec, Backend Multi-Arch Manifest=$man"
+      if [[ "$sec" == "?" || "$man" == "?" ]]; then
+        echo "INFRA: could not read job conclusions from run $run_id" >&2
+        exit 2
+      elif [[ "$sec" == "success" && "$man" == "success" ]]; then
+        ok "this commit's images published cleanly"
+      elif [[ "${PREFLIGHT_ALLOW_RED_PUBLISH:-0}" == "1" ]]; then
+        warn "Docker Publish for HEAD did NOT cleanly publish the manifest, but"
+        warn "PREFLIGHT_ALLOW_RED_PUBLISH=1 was set, so this is not blocking."
+        note "  -> whoever set that owns the stall if the cut hits the same gate."
+        note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
+      else
+        bad "Docker Publish for HEAD did NOT cleanly publish the manifest -- a tag cut WILL stall on the same gate."
+        note "  -> Security Scan hard-gates every multi-arch manifest, which gates"
+        note "     resolve-candidate-digest, which gates the whole release chain."
+        note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
+        note "  -> fix it on main and let Docker Publish go green before tagging (#3039, #3307)."
+        note "  -> PREFLIGHT_ALLOW_RED_PUBLISH=1 overrides this deliberately; do not use it to retry a red away."
+      fi
+    fi
   fi
 fi
 echo
