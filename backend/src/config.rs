@@ -4497,9 +4497,12 @@ mod tests {
         files
     }
 
-    /// Extract every `ghcr.io/anchore/grype:<tag>` reference in `content`.
+    /// Extract every `ghcr.io/anchore/grype:<tag>` reference in `content` —
+    /// i.e. every place a PREBUILT upstream grype binary would be pulled in.
+    /// Since #3352 the expected answer is "none anywhere"; the extractor is
+    /// kept so the failure message can name the tag that came back.
     /// Test-only.
-    fn grype_pins(content: &str) -> Vec<String> {
+    fn prebuilt_grype_pins(content: &str) -> Vec<String> {
         const PREFIX: &str = "ghcr.io/anchore/grype:";
         let mut pins = Vec::new();
         for (idx, _) in content.match_indices(PREFIX) {
@@ -4514,29 +4517,125 @@ mod tests {
         pins
     }
 
+    /// Value of a Dockerfile `ARG <name>=<value>` declaration, if present.
+    /// Only the defaulted form is recognised, which is the form that actually
+    /// pins something: a bare `ARG NAME` carries no value to compare.
+    /// Test-only.
+    fn dockerfile_arg(content: &str, name: &str) -> Option<String> {
+        content.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix("ARG ")?;
+            let (key, value) = rest.split_once('=')?;
+            (key.trim() == name).then(|| value.trim().trim_matches('"').to_string())
+        })
+    }
+
+    /// True if `content` builds grype from upstream source rather than copying
+    /// a released binary. Keyed on the clone URL because that is the line that
+    /// makes it a source build; the stage name is incidental. Test-only.
+    fn builds_grype_from_source(content: &str) -> bool {
+        content.contains("github.com/anchore/grype.git")
+    }
+
+    /// Suppression tokens that are LIVE in a `.trivyignore` — a bare
+    /// `CVE-…`/`GHSA-…` at the start of a line. Mirrors `suppression_tokens`
+    /// in `scripts/ci/release-preflight.sh`, so a `# RETIRED:` tombstone is
+    /// deliberately NOT a live token. Test-only.
+    fn live_suppression_tokens(content: &str) -> Vec<String> {
+        content
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| line.starts_with("CVE-") || line.starts_with("GHSA-"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The Go stdlib CVEs that failing `Security Scan` runs reported against
+    /// `usr/local/bin/grype`, all fixed in go1.26.6 (#3352). Kept as data so
+    /// the guard below can state exactly what must never come back as a
+    /// suppression. Test-only.
+    const GRYPE_STDLIB_CVES_FIXED_BY_TOOLCHAIN: &[&str] = &[
+        // The six that were unsuppressed and actually blocking publication.
+        "CVE-2026-33818", // encoding/asn1  DoS via recursion in Unmarshal
+        "CVE-2026-56853", // net/http       DoS on unencrypted connections
+        "CVE-2026-56858", // html/template  XSS via pathological input
+        "CVE-2026-56859", // encoding/xml   DoS via recursion depth
+        "CVE-2026-56860", // net/url        DoS via quadratic path complexity
+        "CVE-2026-56862", // crypto/tls     indefinite KeyUpdate
+        // The seven older stdlib tokens #3352 retired from .trivyignore.
+        "CVE-2026-27145",
+        "CVE-2026-39821",
+        "CVE-2026-39822",
+        "CVE-2026-42504",
+        "CVE-2026-42505",
+        "CVE-2026-42507",
+        "CVE-2026-46600",
+    ];
+
+    #[test]
+    fn prebuilt_grype_pins_extracts_tag_and_ignores_source_builds() {
+        assert_eq!(
+            prebuilt_grype_pins("FROM ghcr.io/anchore/grype:v0.117.0 AS grype-bin\n"),
+            vec!["v0.117.0".to_string()]
+        );
+        // The source-build form must not read as a prebuilt pin, otherwise the
+        // guard below would fire on the very thing it is asking for.
+        assert!(prebuilt_grype_pins(
+            "RUN git clone --branch v0.117.0 https://github.com/anchore/grype.git .\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn dockerfile_arg_reads_defaulted_args_only() {
+        let content = "FROM golang:1.26-alpine\nARG GRYPE_VERSION=0.117.0\nARG TARGETARCH\n";
+        assert_eq!(
+            dockerfile_arg(content, "GRYPE_VERSION"),
+            Some("0.117.0".to_string())
+        );
+        // Declared-but-unset: nothing is pinned, so there is nothing to report.
+        assert_eq!(dockerfile_arg(content, "TARGETARCH"), None);
+        assert_eq!(dockerfile_arg(content, "NOT_PRESENT"), None);
+    }
+
+    #[test]
+    fn live_suppression_tokens_ignores_retired_tombstones() {
+        let content =
+            "# RETIRED: CVE-2026-46600 (2026-08-16, #3352)\nCVE-2026-34040\n# CVE-2026-1\n";
+        assert_eq!(
+            live_suppression_tokens(content),
+            vec!["CVE-2026-34040".to_string()]
+        );
+    }
+
+    #[test]
+    fn builds_grype_from_source_detects_the_clone() {
+        assert!(builds_grype_from_source(
+            "RUN git clone --depth 1 https://github.com/anchore/grype.git .\n"
+        ));
+        assert!(!builds_grype_from_source(
+            "FROM ghcr.io/anchore/grype:v0.117.0 AS grype-bin\n"
+        ));
+    }
+
     /// Regression guard for the bundled-grype drift class (#2881 / #3262 /
     /// #3352).
     ///
     /// The backend images vendor the `grype` CLI, and that single Go binary is
-    /// the sole source of the repo's residual CRITICAL/HIGH container findings
-    /// — the 2026-08-10 weekly scan (#3262) reported two, both located at
-    /// `usr/local/bin/grype`. Clearing them means bumping the pin and updating
-    /// `.trivyignore` together.
+    /// the sole source of the repo's residual CRITICAL/HIGH container
+    /// findings. Until #3352 it was copied out of `ghcr.io/anchore/grype`,
+    /// which made every Go STDLIB advisory unfixable here — a stdlib CVE is a
+    /// property of the toolchain Anchore compiled with, so bumping the grype
+    /// tag does nothing, and the only lever left was a `.trivyignore` entry.
+    /// Six such CVEs failed `Security Scan` on five consecutive runs on `main`
+    /// and on `release/1.7.x`, publishing no images and blocking both a
+    /// `v1.7.5` security tag and `v1.8.0`.
     ///
-    /// Two images pin grype independently (`Dockerfile.backend` and
-    /// `Dockerfile.backend.alpine`), which is exactly the shape of drift
-    /// CLAUDE.md calls out from #2126/#2059: bump one, forget the other, and
-    /// the suppressions in `.trivyignore` then describe a version that only
-    /// half the images actually ship. So rather than hardcoding the two files
-    /// known today, every `docker/Dockerfile*` is scanned, and the pin is
-    /// required to agree with the version `.trivyignore` documents its
-    /// suppressions against.
-    ///
-    /// This guard is deliberately version-agnostic: it asserts agreement, not
-    /// a specific tag, so a legitimate grype bump stays a one-line change in
-    /// each Dockerfile plus the `.trivyignore` header.
+    /// So the prebuilt binary must not come back. Every `docker/Dockerfile*`
+    /// is scanned rather than the two known today, for the reason CLAUDE.md
+    /// gives from #2126/#2059: fix one, forget the other, and the images
+    /// disagree about what they ship.
     #[test]
-    fn bundled_grype_pin_is_consistent_across_images_and_trivyignore() {
+    fn no_dockerfile_pulls_a_prebuilt_grype_binary() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("backend crate has a parent directory (repo root)");
@@ -4549,33 +4648,83 @@ mod tests {
              Dockerfile.backend.alpine, found: {dockerfiles:?}"
         );
 
-        // (file name, pinned tag) for every Dockerfile that vendors grype.
-        let mut pinned: Vec<(String, String)> = Vec::new();
+        let mut offenders: Vec<(String, String)> = Vec::new();
         for file_name in &dockerfiles {
             let path = repo_root.join("docker").join(file_name);
             let content = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            for tag in grype_pins(&content) {
-                pinned.push((file_name.clone(), tag));
+            for tag in prebuilt_grype_pins(&content) {
+                offenders.push((file_name.clone(), tag));
             }
         }
 
         assert!(
-            !pinned.is_empty(),
-            "no Dockerfile pins ghcr.io/anchore/grype. If the bundled grype \
-             binary was removed (#2881) or repointed at a self-built image \
-             (#3352), delete this guard together with the grype blocks in \
-             .trivyignore — do not leave stale suppressions behind."
+            offenders.is_empty(),
+            "these Dockerfiles pull a PREBUILT grype binary from \
+             ghcr.io/anchore/grype: {offenders:?}. Since #3352 grype is built \
+             from source with a patched Go toolchain, because a Go stdlib CVE \
+             in the upstream binary cannot be fixed by bumping the grype tag — \
+             it is the compiler, not the tool. Reverting to the prebuilt image \
+             re-opens the exact failure that blocked v1.7.5 and v1.8.0."
+        );
+    }
+
+    /// The source build has to be pinned the SAME WAY in every image, and the
+    /// `.trivyignore` rationale has to describe the version actually shipped.
+    ///
+    /// Version-agnostic on purpose: it asserts agreement, not a specific tag,
+    /// so a legitimate grype bump stays a small edit in each Dockerfile plus
+    /// the `.trivyignore` header. The commit is checked alongside the version
+    /// because a tag is mutable and the commit is what makes the pin mean
+    /// something; the Dockerfiles assert the two agree at build time.
+    #[test]
+    fn grype_source_build_is_pinned_consistently_across_images() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        // (file, version, commit, go floor) per Dockerfile that builds grype.
+        let mut builds: Vec<(String, String, String, String)> = Vec::new();
+        for file_name in discover_dockerfiles(repo_root) {
+            let path = repo_root.join("docker").join(&file_name);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            if !builds_grype_from_source(&content) {
+                continue;
+            }
+            let arg = |name: &str| {
+                dockerfile_arg(&content, name).unwrap_or_else(|| {
+                    panic!(
+                        "{file_name} builds grype from source but declares no \
+                         `ARG {name}=<value>`. The pin is what makes the build \
+                         reproducible and auditable (#3352)."
+                    )
+                })
+            };
+            builds.push((
+                file_name.clone(),
+                arg("GRYPE_VERSION"),
+                arg("GRYPE_COMMIT"),
+                arg("GO_MIN_PATCH"),
+            ));
+        }
+
+        assert!(
+            builds.len() >= 2,
+            "expected at least Dockerfile.backend and Dockerfile.backend.alpine \
+             to build grype from source, found: {builds:?}"
         );
 
-        let (_, first_tag) = &pinned[0];
-        for (file_name, tag) in &pinned {
+        let (_, version, commit, go_min) = builds[0].clone();
+        for (file_name, v, c, g) in &builds {
             assert_eq!(
-                tag, first_tag,
-                "grype pin drift: {file_name} pins {tag} but another Dockerfile \
-                 pins {first_tag}. Every image must vendor the same grype build, \
-                 otherwise the .trivyignore suppressions describe a version only \
-                 some images ship. All pins found: {pinned:?}"
+                (v, c, g),
+                (&version, &commit, &go_min),
+                "grype source-build pin drift in {file_name}: it builds \
+                 v{v} @ {c} on go>={g} while another Dockerfile builds \
+                 v{version} @ {commit} on go>={go_min}. Every image must ship \
+                 the same grype build, otherwise .trivyignore's rationale \
+                 describes a binary only some images carry. All: {builds:?}"
             );
         }
 
@@ -4583,10 +4732,46 @@ mod tests {
         let trivyignore = std::fs::read_to_string(&trivyignore_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", trivyignore_path.display()));
         assert!(
-            trivyignore.contains(first_tag.as_str()),
-            ".trivyignore does not mention the pinned grype version {first_tag}. \
-             Its grype suppressions are justified per-version, so a bump must \
-             update the rationale in that file too (#3262)."
+            trivyignore.contains(version.as_str()),
+            ".trivyignore does not mention the grype version {version} the \
+             images build. Its remaining grype suppressions are justified \
+             per-version, so a bump must update the rationale there too \
+             (#3262/#3352)."
+        );
+    }
+
+    /// The six CVEs that blocked publication — and the seven older stdlib
+    /// tokens #3352 retired — must never be suppressed again.
+    ///
+    /// This is the guard that keeps #3352 from being undone the cheap way.
+    /// Every one of these is fixed by the Go toolchain the Dockerfiles build
+    /// on, so the correct response to a recurrence is to raise `GO_MIN_PATCH`,
+    /// not to add a line to `.trivyignore`. A tombstone (`# RETIRED: <token>`)
+    /// is fine and expected — the release-preflight gate reads those — but a
+    /// live token is a regression to the treadmill this issue removed.
+    #[test]
+    fn toolchain_fixed_grype_stdlib_cves_are_not_suppressed() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+        let trivyignore_path = repo_root.join(".trivyignore");
+        let trivyignore = std::fs::read_to_string(&trivyignore_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", trivyignore_path.display()));
+
+        let live = live_suppression_tokens(&trivyignore);
+        let resurrected: Vec<&&str> = GRYPE_STDLIB_CVES_FIXED_BY_TOOLCHAIN
+            .iter()
+            .filter(|cve| live.iter().any(|token| token == *cve))
+            .collect();
+
+        assert!(
+            resurrected.is_empty(),
+            ".trivyignore suppresses Go stdlib CVEs that the grype source \
+             build already fixes: {resurrected:?}. These are compiled-with \
+             CVEs — raise GO_MIN_PATCH in docker/Dockerfile.backend and \
+             docker/Dockerfile.backend.alpine so the binary stops carrying the \
+             vulnerable stdlib, rather than suppressing the finding (#3352). \
+             A `# RETIRED:` tombstone for these is fine; a live token is not."
         );
     }
 }
