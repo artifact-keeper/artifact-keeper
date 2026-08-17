@@ -281,6 +281,10 @@ pub struct CreateOidcConfigRequest {
     /// group memberships (auto-creating groups on first sight). Defaults to
     /// `false` to preserve legacy role-mapping behavior.
     pub map_groups_to_groups: Option<bool>,
+    /// IdP group whose members are granted the admin role on login.
+    /// Persisted as `attribute_mapping.admin_group`, the key the OIDC
+    /// callback reads for admin elevation (#3420).
+    pub admin_group: Option<String>,
     /// Opt-in compatibility flag (migration 144): when `true` the provider
     /// accepts ID tokens signed with RSA keys shorter than 2048 bits via a
     /// restricted RS256/384/512 PKCS#1 v1.5 fallback path. Defaults to
@@ -310,6 +314,13 @@ pub struct UpdateOidcConfigRequest {
     pub auto_create_users: Option<bool>,
     pub pkce_enabled: Option<bool>,
     pub map_groups_to_groups: Option<bool>,
+    /// IdP group whose members are granted the admin role on login. `Some`
+    /// sets `attribute_mapping.admin_group` after the mapping merge/replace
+    /// above is applied; `None` leaves the mapping-derived value alone — so
+    /// `None` together with `attribute_mapping_replace` clears it, which is
+    /// how the env bootstrap revokes group-based admin when
+    /// `OIDC_ADMIN_GROUP` is unset (#3420).
+    pub admin_group: Option<String>,
     pub allow_legacy_rsa_keys: Option<bool>,
 }
 
@@ -624,7 +635,12 @@ impl AuthConfigService {
                 "email".to_string(),
             ]
         });
-        let attribute_mapping = req.attribute_mapping.unwrap_or(serde_json::json!({}));
+        let mut attribute_mapping = req.attribute_mapping.unwrap_or(serde_json::json!({}));
+        if let Some(group) = req.admin_group {
+            if let Some(map) = attribute_mapping.as_object_mut() {
+                map.insert("admin_group".to_string(), serde_json::Value::String(group));
+            }
+        }
         let is_enabled = req.is_enabled.unwrap_or(true);
         let auto_create_users = req.auto_create_users.unwrap_or(true);
         let pkce_enabled = req.pkce_enabled.unwrap_or(true);
@@ -690,11 +706,16 @@ impl AuthConfigService {
         let scopes = req.scopes.unwrap_or(existing.scopes);
         // Issue #1191: deep-merge attribute_mapping by default. Callers that
         // want the legacy wholesale-replace behavior must opt in.
-        let attribute_mapping = match req.attribute_mapping {
+        let mut attribute_mapping = match req.attribute_mapping {
             Some(patch) if req.attribute_mapping_replace.unwrap_or(false) => patch,
             Some(patch) => merge_attribute_mapping(&existing.attribute_mapping, &patch),
             None => existing.attribute_mapping,
         };
+        if let Some(group) = req.admin_group {
+            if let Some(map) = attribute_mapping.as_object_mut() {
+                map.insert("admin_group".to_string(), serde_json::Value::String(group));
+            }
+        }
         let is_enabled = req.is_enabled.unwrap_or(existing.is_enabled);
         let auto_create_users = req.auto_create_users.unwrap_or(existing.auto_create_users);
         let pkce_enabled = req.pkce_enabled.unwrap_or(existing.pkce_enabled);
@@ -1958,12 +1979,16 @@ impl From<CreateOidcConfigRequest> for UpdateOidcConfigRequest {
             scopes: c.scopes,
             attribute_mapping: c.attribute_mapping,
             // Env is definitive: replace the whole mapping so a key removed
-            // from the environment is cleared from the stored config.
+            // from the environment is cleared from the stored config. That
+            // holds for `admin_group` too — it rides through as `None` when
+            // OIDC_ADMIN_GROUP is unset, so the replace clears the persisted
+            // value rather than carrying it over (#3420).
             attribute_mapping_replace: Some(true),
             is_enabled: c.is_enabled,
             auto_create_users: c.auto_create_users,
             pkce_enabled: c.pkce_enabled,
             map_groups_to_groups: c.map_groups_to_groups,
+            admin_group: c.admin_group,
             allow_legacy_rsa_keys: c.allow_legacy_rsa_keys,
         }
     }
@@ -2875,6 +2900,7 @@ mod tests {
             auto_create_users: None,
             pkce_enabled: None,
             map_groups_to_groups: None,
+            admin_group: Some("ArtifactKeeperAdmins".into()),
             allow_legacy_rsa_keys: None,
         };
         let u: UpdateOidcConfigRequest = c.into();
@@ -2882,6 +2908,34 @@ mod tests {
         assert_eq!(u.client_id, Some("c".to_string()));
         assert_eq!(u.client_secret, Some("s".to_string()));
         assert_eq!(u.attribute_mapping_replace, Some(true));
+        assert_eq!(u.admin_group, Some("ArtifactKeeperAdmins".to_string()));
+    }
+
+    /// #3420: the env bootstrap's `Create -> Update` conversion must not
+    /// invent an admin group. An absent `OIDC_ADMIN_GROUP` arrives here as
+    /// `None`, and `None` alongside `attribute_mapping_replace: Some(true)`
+    /// is what makes the reconcile clear a persisted group instead of
+    /// carrying the last known value forward forever.
+    #[test]
+    fn test_oidc_create_to_update_absent_admin_group_stays_none() {
+        let c = CreateOidcConfigRequest {
+            name: "default".into(),
+            issuer_url: "https://idp".into(),
+            client_id: "c".into(),
+            client_secret: "s".into(),
+            scopes: None,
+            attribute_mapping: Some(serde_json::json!({"groups_claim": "roles"})),
+            is_enabled: None,
+            auto_create_users: None,
+            pkce_enabled: None,
+            map_groups_to_groups: None,
+            admin_group: None,
+            allow_legacy_rsa_keys: None,
+        };
+        let u: UpdateOidcConfigRequest = c.into();
+        assert_eq!(u.admin_group, None);
+        assert_eq!(u.attribute_mapping_replace, Some(true));
+        assert!(!u.attribute_mapping.unwrap()["groups_claim"].is_null());
     }
 
     #[test]
@@ -2935,9 +2989,16 @@ mod tests {
         use super::*;
         use crate::api::handlers::test_db_helpers as db_helpers;
 
-        /// Build a CreateOidcConfigRequest with a unique name suffix so
-        /// parallel tests do not collide on the UNIQUE constraint.
+        /// Build a CreateOidcConfigRequest with a unique name so parallel
+        /// tests do not collide on `oidc_configs.name`'s UNIQUE constraint.
+        ///
+        /// The per-call random component matters beyond parallelism: a test
+        /// that fails before its `cleanup_oidc` leaves the row behind, and a
+        /// fixed name then makes *every subsequent run* fail on the unique
+        /// violation instead of on the original assertion. `suffix` stays as a
+        /// human-readable tag for whoever is reading the table.
         fn make_create_req(suffix: &str) -> CreateOidcConfigRequest {
+            let suffix = format!("{suffix}-{}", Uuid::new_v4());
             CreateOidcConfigRequest {
                 name: format!("acs-test-{suffix}"),
                 issuer_url: "https://issuer.test.local".to_string(),
@@ -2949,6 +3010,7 @@ mod tests {
                 auto_create_users: Some(true),
                 pkce_enabled: None,
                 map_groups_to_groups: None,
+                admin_group: None,
                 allow_legacy_rsa_keys: None,
             }
         }
@@ -3107,6 +3169,7 @@ mod tests {
                 auto_create_users: None,
                 pkce_enabled: None,
                 map_groups_to_groups: None,
+                admin_group: None,
                 allow_legacy_rsa_keys: None,
             };
             let updated = AuthConfigService::update_oidc(&pool, created.id, update)
@@ -3151,6 +3214,7 @@ mod tests {
                 auto_create_users: None,
                 pkce_enabled: None,
                 map_groups_to_groups: None,
+                admin_group: None,
                 allow_legacy_rsa_keys: None,
             };
             let updated = AuthConfigService::update_oidc(&pool, created.id, update)
@@ -3159,6 +3223,130 @@ mod tests {
             assert_eq!(updated.attribute_mapping["username_claim"], "email");
             // redirect_uri must be GONE because we asked for replace semantics.
             assert!(updated.attribute_mapping.get("redirect_uri").is_none());
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_create_oidc_persists_admin_group_in_mapping() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let mut req = make_create_req("admin-group-create");
+            req.admin_group = Some("ArtifactKeeperAdmins".to_string());
+            let resp = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            assert_eq!(
+                resp.attribute_mapping["admin_group"],
+                "ArtifactKeeperAdmins"
+            );
+            cleanup_oidc(&pool, resp.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_oidc_admin_group_wins_over_replaced_mapping() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let mut req = make_create_req("admin-group-update");
+            req.admin_group = Some("artifact-keeper-admins".to_string());
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            assert_eq!(
+                created.attribute_mapping["admin_group"],
+                "artifact-keeper-admins"
+            );
+
+            // The env reconcile shape (#3420): admin_group must land in the
+            // wholesale-replaced mapping.
+            let update = UpdateOidcConfigRequest {
+                name: None,
+                issuer_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                attribute_mapping: Some(json!({})),
+                attribute_mapping_replace: Some(true),
+                is_enabled: None,
+                auto_create_users: None,
+                pkce_enabled: None,
+                map_groups_to_groups: None,
+                admin_group: Some("ArtifactKeeperAdmins".to_string()),
+                allow_legacy_rsa_keys: None,
+            };
+            let updated = AuthConfigService::update_oidc(&pool, created.id, update)
+                .await
+                .expect("update_oidc");
+            assert_eq!(
+                updated.attribute_mapping["admin_group"],
+                "ArtifactKeeperAdmins"
+            );
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        /// #3420 revocation semantic: `OIDC_ADMIN_GROUP` is env-definitive.
+        /// The per-boot reconcile sends exactly this shape when the variable
+        /// is unset — a wholesale mapping replace carrying no `admin_group`
+        /// and `admin_group: None` — and it must CLEAR the persisted group,
+        /// because unsetting the variable and redeploying is how an operator
+        /// revokes group-based admin. A carry-over here would leave the last
+        /// known group elevating members forever.
+        #[tokio::test]
+        async fn test_update_oidc_env_reconcile_shape_clears_admin_group() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let mut req = make_create_req("admin-group-clear");
+            req.admin_group = Some("artifact-keeper-admins".to_string());
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            assert_eq!(
+                created.attribute_mapping["admin_group"],
+                "artifact-keeper-admins"
+            );
+
+            let update = UpdateOidcConfigRequest {
+                name: None,
+                issuer_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                attribute_mapping: Some(json!({})),
+                attribute_mapping_replace: Some(true),
+                is_enabled: None,
+                auto_create_users: None,
+                pkce_enabled: None,
+                map_groups_to_groups: None,
+                admin_group: None,
+                allow_legacy_rsa_keys: None,
+            };
+            let updated = AuthConfigService::update_oidc(&pool, created.id, update)
+                .await
+                .expect("update_oidc");
+            assert_eq!(
+                updated.attribute_mapping.get("admin_group"),
+                None,
+                "an env reconcile with OIDC_ADMIN_GROUP unset must clear the persisted \
+                 admin group, not carry it over"
+            );
+
+            // And the row on disk agrees, not just the response DTO.
+            let reread = AuthConfigService::get_oidc(&pool, created.id)
+                .await
+                .expect("get_oidc");
+            assert_eq!(reread.attribute_mapping.get("admin_group"), None);
+
             cleanup_oidc(&pool, created.id).await;
         }
 
@@ -3189,6 +3377,7 @@ mod tests {
                 auto_create_users: None,
                 pkce_enabled: Some(false),
                 map_groups_to_groups: Some(true),
+                admin_group: None,
                 allow_legacy_rsa_keys: None,
             };
             let updated = AuthConfigService::update_oidc(&pool, created.id, update)
@@ -3224,6 +3413,7 @@ mod tests {
                 auto_create_users: None,
                 pkce_enabled: None,
                 map_groups_to_groups: None,
+                admin_group: None,
                 allow_legacy_rsa_keys: None,
             };
             let updated = AuthConfigService::update_oidc(&pool, created.id, update)
@@ -3370,6 +3560,7 @@ mod tests {
                 auto_create_users: None,
                 pkce_enabled: None,
                 map_groups_to_groups: None,
+                admin_group: None,
                 allow_legacy_rsa_keys: None,
             };
             AuthConfigService::update_oidc(&pool, created.id, update)
