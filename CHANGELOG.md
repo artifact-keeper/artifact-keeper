@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.7.5] - 2026-08-14
+## [1.7.6] - 2026-08-17
+
+> **`v1.7.5` is a dead tag — do not use it.** It was tagged, its Docker Publish
+> failed on a scanner-adapter version-collision gate, and no images or release
+> object were ever produced. Repository rulesets forbid deleting or moving a
+> tag, so the version number was burned rather than reused. Everything intended
+> for 1.7.5 ships in 1.7.6 unchanged. See #3429.
 
 ### Security
 
