@@ -580,6 +580,31 @@ jobs:
       - name: Check duplicate-migration gate catches what it must
         run: bash scripts/ci/test-check-duplicate-migrations.sh
 
+      # A release prep that renames `## [Unreleased]` to `## [X.Y.Z]` without
+      # opening a fresh empty one strands every entry that lands after it:
+      # PR branches cut before the rename anchor into the renamed, ALREADY
+      # RELEASED section and merge with no conflict and no warning. That is
+      # how 30 entries of 1.8.0 work ended up filed under `[1.7.5]`, a version
+      # that produced no images and no release object (#3433, #3429). The
+      # assertion is one grep — the first `## [` heading must be
+      # `## [Unreleased]` — and it is a repo-state invariant, so it fires on
+      # whichever PR reaches CI first rather than depending on who did it.
+      - name: Check CHANGELOG has an open [Unreleased] section
+        run: ./scripts/ci/check-changelog-unreleased.sh
+
+      - name: Check the CHANGELOG gate catches what it must
+        run: bash scripts/ci/test-check-changelog-unreleased.sh
+
+      # The release-branch gate only runs on PRs against `release/*` — a
+      # handful of runs per release, far too rare to notice a regression in.
+      # It matters most for the two exemptions #3422 added (release prep,
+      # narrowed backport), which must keep FAILING for everything they are
+      # not: a `chore(release):` commit that also touches source, a
+      # version-file-only commit under another subject, a cherry-pick trailer
+      # naming a sha main does not have. Builds throwaway git repos; ~2s.
+      - name: Check release-branch gate exemptions stay narrow
+        run: bash scripts/ci/test-check-release-branch-commits.sh
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners

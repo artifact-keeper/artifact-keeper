@@ -47,9 +47,17 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
 
 3. **REQUIRED: promote the CHANGELOG.** Before tagging `vX.Y.Z`, promote
    the `## [Unreleased]` section in `CHANGELOG.md` to
-   `## [X.Y.Z] - <date>` (and open a fresh empty `## [Unreleased]` above
-   it). Include the Sponsors and Thank You recognition sections per the
+   `## [X.Y.Z] - <date>` **and open a fresh empty `## [Unreleased]` above
+   it**. Include the Sponsors and Thank You recognition sections per the
    "Changelog and Release Notes" policy in [CLAUDE.md](CLAUDE.md).
+
+   The fresh `## [Unreleased]` is not cosmetic. Without it, every PR branch
+   cut before the promotion still anchors its CHANGELOG hunk on the old
+   heading and merges into the *renamed, already-released* section — no
+   conflict, no warning. That is how 30 entries of 1.8.0 work ended up filed
+   under `[1.7.5]` (#3433). `scripts/ci/check-changelog-unreleased.sh` runs
+   in CI's shell-tests job and fails if the first `## [` heading is anything
+   other than `## [Unreleased]`.
 
    This step is enforced, not advisory: the release gate's
    `version-set-integrity` check (artifact-keeper-test) and the
@@ -65,7 +73,33 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    as `backend_tag`, `version-set-integrity` also verifies the published
    image set and the CHANGELOG entry before you commit to the tag.
 
-5. **Cut a release candidate first, then tag the release.** Tag
+5. **REQUIRED for backports: check the versioned component source sets.**
+   Before tagging, confirm no change since the previous tag touches a
+   versioned component's source set unless that component's `VERSION` is
+   bumped in the same change. Today that is `docker/scanner-adapter/**` and
+   `docker/Dockerfile.scanner-adapter`; the general rule is "any directory
+   under `docker/` with a `VERSION` file, plus its sibling Dockerfile".
+
+   ```bash
+   git ls-files 'docker/*/VERSION'                      # the component list
+   git diff --stat vX.Y.Z-1..HEAD -- \
+     docker/scanner-adapter docker/Dockerfile.scanner-adapter
+   ```
+
+   Any output means either bump `docker/scanner-adapter/VERSION` or drop the
+   change. The publish gate treats **any** edit under the source set as a
+   source change and refuses to republish an existing exact version tag — a
+   comment-only line counts. `v1.7.5` died on exactly that: a comment carried
+   along "for tidiness" in the #3424 backport made the tag's Docker Publish
+   fail, and the ruleset forbids deleting or moving the tag, so the version
+   was burned (#3429). `v1.7.2` died the same way (#3340). When backporting,
+   restrict the cherry-pick to files that are functionally required.
+
+   Preflight check 4 (step 1) asserts this against the registry, so a `READY`
+   already covers it — this step is the one to run when you are assembling a
+   backport, before you get as far as preflight.
+
+6. **Cut a release candidate first, then tag the release.** Tag
    `vX.Y.Z-rc.N` and let the full chain complete before tagging `vX.Y.Z`.
 
    ```bash
@@ -94,7 +128,7 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    `docker-publish.yml` (backend, web, openscap images on ghcr.io and
    docker.io).
 
-6. **Watch the gates.** `release.yml` runs the E2E gate, the
+7. **Watch the gates.** `release.yml` runs the E2E gate, the
    artifact-keeper-test release gate, and `verify-images-published`
    (image presence on both registries plus the CHANGELOG entry check).
    If any required gate fails, the GitHub Release is created as a
@@ -102,7 +136,7 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    (for a missing CHANGELOG entry: land the promotion on `main`, delete
    and re-cut the tag) rather than publishing the draft by hand.
 
-7. **Post-release checks.** Confirm the GitHub Release is published (not
+8. **Post-release checks.** Confirm the GitHub Release is published (not
    draft), release notes are the curated per-version body (see "Release-notes
    style" below), not the raw auto-generated PR list, `:latest` moved only if this is a stable release, and the demo
    or any pinned environments are updated intentionally (see
@@ -120,6 +154,24 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
   Thank You) follow the CLAUDE.md policy.
 - Prerelease tags (`-rc.N`, `-beta.N`) are exempt from the CHANGELOG
   entry requirement; final releases are not.
+- `CHANGELOG.md` always has an open `## [Unreleased]` as its first `## [`
+  heading. Enforced by `scripts/ci/check-changelog-unreleased.sh` in CI's
+  shell-tests job (#3433).
+- No change reaches a tag that touches a versioned component's source set
+  (`docker/*/VERSION` and its sibling Dockerfile) without bumping that
+  component's `VERSION` — step 5. Exact version tags are never republished,
+  and a tag that fails to publish is burned (#3429, #3340).
+- Every `release/**` branch publishes images on push, same as `main`
+  (#3422). A maintenance-branch commit therefore has a Docker Publish run of
+  its own, which is what preflight check 3 resolves by `head_sha` (#3338);
+  no manual `workflow_dispatch` is needed before a cut.
+- The release-branch gate accepts two shapes that cannot trace to `main` by
+  patch-id without the `release-process: approved` label (#3422): a release
+  prep (`chore(release): ...` touching only the version/changelog/
+  release-notes file set) and a narrowed backport (a
+  `(cherry picked from commit <sha>)` trailer naming a commit on `main`).
+  Use `git cherry-pick -x` so the trailer is written for you, and keep it
+  when you resolve hunks away. Everything else still needs the label.
 - Cut a release candidate and let the chain finish before tagging the real
   release. Tag immutability covers `refs/tags/v*` and excludes `v*-rc*` /
   `v*-beta*` / `v*-alpha*`, so a failed candidate is re-cuttable while a

@@ -2,7 +2,13 @@ name: Docker Publish
 
 on:
   push:
-    branches: [main, master, 'release/1.1.x']
+    # `release/**`, not a hardcoded series (#3422): a commit landing on
+    # release/1.7.x used to publish NOTHING, so release-preflight check 3
+    # correctly reported "no Docker Publish run exists for HEAD" (#3338) and
+    # every 1.7.x cut needed an undocumented manual workflow_dispatch first.
+    # Every maintenance branch now publishes on push exactly as release/1.1.x
+    # already did.
+    branches: [main, master, 'release/**']
     tags: ['v*']
     paths-ignore:
       - '**/*.md'
@@ -102,6 +108,12 @@ jobs:
       # dispatch). Non-empty flips the build jobs off and the merge jobs into
       # re-apply-existing-digest mode.
       promote_version: ${{ steps.promote.outputs.version }}
+      # The `X.Y-dev` floating alias for a maintenance branch push -- `1.1-dev`
+      # for release/1.1.x, `1.7-dev` for release/1.7.x -- and empty for every
+      # other ref. Computed once here rather than hardcoded per image, which
+      # is what left the `release/**` glob (#3422) publishing a series-dev tag
+      # for exactly one series.
+      series_dev_tag: ${{ steps.series.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -177,6 +189,26 @@ jobs:
           TAG=$(.github/scripts/validate-dispatch-tag.sh "$REQUESTED_TAG")
           echo "Manual tag accepted: ${TAG}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      # Derive the `X.Y-dev` alias from the branch name so a new maintenance
+      # line gets one the moment it is created, with no workflow edit. Only a
+      # `release/<major>.<minor>.x` branch qualifies; anything else (main, a
+      # tag, a dispatch, a stray `release/hotfix`) yields the empty string and
+      # the metadata line disables itself -- the same shape `dispatch_tag`
+      # already uses, so an empty raw value here is a pattern the workflow
+      # already relies on rather than a new risk.
+      - name: Derive the series-dev tag for maintenance branch pushes
+        id: series
+        env:
+          GH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          tag=""
+          if [[ "$GH_REF" =~ ^refs/heads/release/([0-9]+\.[0-9]+)\.x$ ]]; then
+            tag="${BASH_REMATCH[1]}-dev"
+          fi
+          echo "series-dev tag: '${tag}'"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
   build-backend:
     name: Backend (${{ matrix.platform }})
@@ -1074,7 +1106,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
@@ -1091,7 +1123,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
@@ -1332,7 +1364,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
@@ -1349,7 +1381,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
@@ -1679,7 +1711,7 @@ jobs:
             type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
@@ -1697,7 +1729,7 @@ jobs:
             type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Create manifest list and push (ghcr.io)
@@ -1895,7 +1927,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
@@ -1913,7 +1945,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 

@@ -6,6 +6,16 @@ name: Release Branch Gate
 # either already on `main` or are cherry-picks of commits already on `main`.
 # This enforces the "land on main first, then cherry-pick" workflow.
 #
+# Two shapes that legitimately CANNOT trace to main by patch-id are accepted
+# without the label (#3422): a release prep (`chore(release): ...` touching
+# only the version/changelog/release-notes file set — the version being
+# prepared exists only on the maintenance branch) and a narrowed backport (a
+# `(cherry picked from commit <sha>)` trailer naming a commit that is on main,
+# where hunks that could not apply were resolved away). Both are logged
+# explicitly so the narrowing stays visible. The logic and its self-test live
+# in scripts/ci/check-release-branch-commits.sh and its sibling test-*.sh, so
+# the gate can be exercised without opening a release PR.
+#
 # Why: PR #1068 was authored directly against `release/1.1.x` without
 # going through main. It bundled +1489 lines, broke remote-proxy fetches
 # across every package format, and forced a revert mid-release-candidate
@@ -67,83 +77,14 @@ jobs:
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
-
-          # Commits introduced by this PR, excluding merge commits.
-          # Rev-list base..head gives commits reachable from head but not
-          # base, which is exactly the PR's contribution.
-          mapfile -t pr_commits < <(git rev-list --no-merges "${PR_BASE_SHA}..${PR_HEAD_SHA}")
-
-          if [ "${#pr_commits[@]}" -eq 0 ]; then
-            echo "::notice::PR contains no non-merge commits; nothing to verify."
-            exit 0
-          fi
-
-          # Build a set of patch-ids from a recent slice of main history so
-          # we can cheaply detect cherry-picks (which change SHAs but
-          # preserve patch content). 1500 commits covers ~3 months of main
-          # at typical velocity; tune up if main moves faster.
-          echo "Indexing patch-ids from origin/main (last 1500 commits)..."
-          declare -A main_patch_ids
-          while read -r main_sha; do
-            pid=$(git show "$main_sha" 2>/dev/null | git patch-id --stable 2>/dev/null | awk '{print $1}' || true)
-            if [ -n "$pid" ]; then
-              main_patch_ids["$pid"]="$main_sha"
-            fi
-          done < <(git rev-list --no-merges -n 1500 origin/main)
-
-          echo "Indexed ${#main_patch_ids[@]} patch-ids from main."
-          echo
-
-          fail=0
-          fail_lines=()
-          for sha in "${pr_commits[@]}"; do
-            subject=$(git log -1 --format='%s' "$sha" 2>/dev/null || echo '<no subject>')
-            short=$(git rev-parse --short "$sha")
-
-            # Path A: commit is literally an ancestor of origin/main (this
-            # happens when the PR brings forward already-merged main
-            # commits, e.g. a merge of main into release/1.1.x).
-            if git merge-base --is-ancestor "$sha" origin/main; then
-              echo "  ✓ ${short} on main: ${subject}"
-              continue
-            fi
-
-            # Path B: a commit with matching patch-id exists on main
-            # (cherry-pick or rebase).
-            pid=$(git show "$sha" 2>/dev/null | git patch-id --stable 2>/dev/null | awk '{print $1}' || true)
-            if [ -n "$pid" ] && [ -n "${main_patch_ids[$pid]:-}" ]; then
-              main_short=$(git rev-parse --short "${main_patch_ids[$pid]}")
-              echo "  ✓ ${short} cherry-pick of ${main_short} on main: ${subject}"
-              continue
-            fi
-
-            # Neither: this commit was authored directly against the
-            # release branch and never went through main. Fail the gate.
-            fail=$((fail + 1))
-            fail_lines+=("  ✗ ${short}: ${subject}")
-          done
-
-          if [ "$fail" -gt 0 ]; then
-            echo
-            echo "::error title=Release branch gate failed::${fail} commit(s) on this PR are not on main and are not cherry-picks of main commits."
-            printf '%s\n' "${fail_lines[@]}"
-            echo
-            echo "This branch (${PR_BASE_REF}) is a maintenance line. The expected workflow is:"
-            echo "  1. Land the change on main first."
-            echo "  2. Soak through main's CI (the CI workflow gates main)."
-            echo "  3. Cherry-pick (\`git cherry-pick <sha>\`) the main commit(s) to ${PR_BASE_REF}."
-            echo
-            echo "If this PR genuinely cannot go through main first (e.g., a fix"
-            echo "that ONLY applies to the maintenance branch), apply the label"
-            echo "  release-process: approved"
-            echo "and re-run this check. Document the rationale in the PR body."
-            echo
-            echo "Reference: artifact-keeper#1090 / artifact-keeper#1068 (the bypass that motivated this gate)"
+          # The checkout is the PR HEAD, so the script has to exist on the
+          # maintenance branch too. It arrives with this workflow when the
+          # gate is forward-ported; say so plainly rather than dying on
+          # "No such file or directory".
+          if [ ! -f scripts/ci/check-release-branch-commits.sh ]; then
+            echo "::error title=Release branch gate is incomplete::scripts/ci/check-release-branch-commits.sh is missing on this branch. Cherry-pick it alongside .github/workflows/release-branch-gate.yml (artifact-keeper#3422)."
             exit 1
           fi
-
-          echo
-          echo "::notice::All ${#pr_commits[@]} PR commit(s) trace back to main. Gate passed."
+          bash scripts/ci/check-release-branch-commits.sh "$PR_BASE_SHA" "$PR_HEAD_SHA"
