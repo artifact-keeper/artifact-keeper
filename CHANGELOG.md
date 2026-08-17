@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-08-17
+
 ### Security
 
 - **The bundled `grype` CLI is built from source with a patched Go toolchain, clearing every Go-stdlib CVE in the backend images** (#3352). `docker/Dockerfile.backend` and `docker/Dockerfile.backend.alpine` copied the `grype` binary out of `ghcr.io/anchore/grype:v0.117.0`. That binary is compiled with go1.26.3, and six HIGH Go **stdlib** advisories were live against it — `CVE-2026-33818` (`encoding/asn1`, DoS via recursion in `Unmarshal`), `CVE-2026-56853` (`net/http`, DoS on unencrypted connections), `CVE-2026-56858` (`html/template`, XSS via pathological input), `CVE-2026-56859` (`encoding/xml`, DoS via recursion depth), `CVE-2026-56860` (`net/url`, DoS via quadratic path complexity) and `CVE-2026-56862` (`crypto/tls`, indefinite `KeyUpdate`). `Security Scan` in `docker-publish.yml` failed on five consecutive runs on `main` and on `release/1.7.x` (run 31919400928), so **no images published from either branch** and both a `v1.7.5` security tag and `v1.8.0` were blocked.
