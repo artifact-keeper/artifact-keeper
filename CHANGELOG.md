@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pausing or cancelling a migration job during its final repository no longer flips it to a terminal status** (#3380). A pause or cancel observed between artifacts returned the same result as a fully drained repository, so when the interruption landed during the final (or only) repository the worker stamped a terminal status and `finished_at` over `paused`/`cancelled`; resume then rejected the job, leaving delete as the only option — for single-repository jobs pause always ended the job. The interruption now propagates distinctly from repository processing, and the terminal write is guarded at the database level (`UPDATE … WHERE status NOT IN ('paused','cancelled')`), so a pause racing the final write cannot be clobbered either. Uninterrupted jobs keep the exact prior behavior.
+
 ## [1.8.1] - 2026-08-21
 
 ### Fixed

@@ -702,6 +702,32 @@ impl MigrationService {
         Ok(())
     }
 
+    /// Finalize a job with a terminal status and stamp `finished_at`, unless
+    /// the operator has already paused or cancelled it — the guard keeps a
+    /// pause that races the worker's final write from being overwritten
+    /// (issue #3380). Returns whether the job was finalized.
+    #[instrument(skip(self), fields(job_id = %job_id, status = ?status))]
+    pub async fn finalize_job_status(
+        &self,
+        job_id: Uuid,
+        status: MigrationJobStatus,
+    ) -> Result<bool, MigrationError> {
+        info!(job_id = %job_id, status = ?status, "Finalizing job status");
+        let result = sqlx::query(
+            r#"
+            UPDATE migration_jobs
+            SET status = $1, finished_at = NOW()
+            WHERE id = $2 AND status NOT IN ('paused', 'cancelled')
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(job_id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Update job progress
     pub async fn update_job_progress(
         &self,
@@ -1616,6 +1642,99 @@ mod tests {
                 .await
                 .ok();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Guarded finalize: paused/cancelled must never be overwritten by a
+    // terminal status (issue #3380)
+    // -----------------------------------------------------------------------
+
+    /// DB-backed proof for the #3380 finalize guard: `finalize_job_status`
+    /// must skip a job the operator paused or cancelled (the pause raced the
+    /// worker's final write), while a running job still finalizes with its
+    /// terminal status and a `finished_at`.
+    ///
+    /// No-ops when `DATABASE_URL` is unset so it skips cleanly off-CI.
+    #[tokio::test]
+    async fn test_finalize_job_status_skips_paused_and_cancelled_3380() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        async fn seed_job(pool: &PgPool, conn_id: Uuid, status: &str) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO migration_jobs (source_connection_id, job_type, config, status) \
+                 VALUES ($1, 'full', $2, $3) RETURNING id",
+            )
+            .bind(conn_id)
+            .bind(serde_json::json!({}))
+            .bind(status)
+            .fetch_one(pool)
+            .await
+            .expect("seed migration job")
+        }
+
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("finalize-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed source connection");
+
+        let svc = MigrationService::new(pool.clone());
+        let paused = seed_job(&pool, conn_id, "paused").await;
+        let cancelled = seed_job(&pool, conn_id, "cancelled").await;
+        let running = seed_job(&pool, conn_id, "running").await;
+
+        for (job_id, expected) in [(paused, "paused"), (cancelled, "cancelled")] {
+            let finalized = svc
+                .finalize_job_status(job_id, MigrationJobStatus::Completed)
+                .await
+                .expect("finalize");
+            assert!(!finalized, "{expected} job must not be finalized");
+            let (status, finished): (String, bool) = sqlx::query_as(
+                "SELECT status, finished_at IS NOT NULL FROM migration_jobs WHERE id = $1",
+            )
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read job row");
+            assert_eq!(status, expected, "operator-set status must survive");
+            assert!(!finished, "a skipped finalize must not stamp finished_at");
+        }
+
+        let finalized = svc
+            .finalize_job_status(running, MigrationJobStatus::Completed)
+            .await
+            .expect("finalize running job");
+        assert!(finalized, "a running job still finalizes");
+        let (status, finished): (String, bool) = sqlx::query_as(
+            "SELECT status, finished_at IS NOT NULL FROM migration_jobs WHERE id = $1",
+        )
+        .bind(running)
+        .fetch_one(&pool)
+        .await
+        .expect("read finalized job row");
+        assert_eq!(status, "completed");
+        assert!(finished, "finalize must stamp finished_at");
+
+        for job_id in [paused, cancelled, running] {
+            sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     // -----------------------------------------------------------------------

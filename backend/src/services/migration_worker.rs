@@ -145,6 +145,21 @@ struct RepoKeys {
     target: String,
 }
 
+/// Outcome of processing one repository's artifacts.
+///
+/// `Interrupted` propagates a pause/cancel observed between artifacts up to
+/// the job loop, which must stop without writing a terminal status. Before
+/// the two cases were distinguished, a mid-repository pause returned the same
+/// `Ok` as a fully drained listing and the job walked on to stamp the paused
+/// job Completed (issue #3380).
+#[derive(Debug)]
+enum RepoProcessOutcome {
+    /// The repository's artifact listing was drained to the end.
+    Completed,
+    /// A pause/cancel request stopped processing mid-listing.
+    Interrupted,
+}
+
 /// Conflict resolution strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictResolution {
@@ -700,8 +715,19 @@ impl MigrationWorker {
                     )
                     .await
                 {
-                    Ok(_) => {
+                    Ok(RepoProcessOutcome::Completed) => {
                         tracing::info!(repo = %keys.target, "Repository artifacts processed");
+                    }
+                    Ok(RepoProcessOutcome::Interrupted) => {
+                        if self.cancel_token.is_cancelled() {
+                            tracing::info!(job_id = %job_id, "Migration cancelled by user");
+                            self.migration_service
+                                .update_job_status(job_id, MigrationJobStatus::Cancelled)
+                                .await?;
+                        } else {
+                            tracing::info!(job_id = %job_id, "Migration paused by user");
+                        }
+                        return Ok(());
                     }
                     Err(e) => {
                         tracing::error!(repo = %keys.target, error = %e, "Failed to process repository");
@@ -711,18 +737,19 @@ impl MigrationWorker {
             }
         }
 
-        // Update final status
+        // Update final status and stamp `finished_at`. The guarded write
+        // skips paused/cancelled jobs, so a pause landing after the last
+        // per-artifact check is not clobbered either (issue #3380).
         let final_status = determine_final_status(total_failed, total_completed);
 
-        self.migration_service
-            .update_job_status(job_id, final_status)
-            .await?;
-
-        // Mark job as finished
-        sqlx::query("UPDATE migration_jobs SET finished_at = NOW() WHERE id = $1")
-            .bind(job_id)
-            .execute(&self.db)
-            .await?;
+        if !self
+            .migration_service
+            .finalize_job_status(job_id, final_status)
+            .await?
+        {
+            tracing::info!(job_id = %job_id, "Migration paused or cancelled before finalization");
+            return Ok(());
+        }
 
         // Send final progress update
         if let Some(tx) = progress_tx {
@@ -771,7 +798,7 @@ impl MigrationWorker {
         skipped: &mut i32,
         transferred: &mut i64,
         progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
-    ) -> Result<(), MigrationError> {
+    ) -> Result<RepoProcessOutcome, MigrationError> {
         // Read the source registry by source key (== target for unrenamed repos).
         let repo_key = keys.source.as_str();
         let mut offset = 0i64;
@@ -807,7 +834,7 @@ impl MigrationWorker {
             for artifact in &artifacts.results {
                 // Check for pause/cancel between artifacts
                 if self.cancel_token.is_cancelled() || self.is_paused(job_id).await? {
-                    return Ok(());
+                    return Ok(RepoProcessOutcome::Interrupted);
                 }
 
                 let artifact_path = build_artifact_path(&artifact.path, &artifact.name);
@@ -954,7 +981,7 @@ impl MigrationWorker {
             offset = new_offset;
         }
 
-        Ok(())
+        Ok(RepoProcessOutcome::Completed)
     }
 
     /// Check if a migration item was already completed (for resume support)
@@ -5258,6 +5285,339 @@ mod tests {
             .bind(conn_id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3380: pause/cancel mid-repository must not be overwritten by a
+    // terminal status (DB-gated via try_pool)
+    // -----------------------------------------------------------------------
+
+    /// How the mock source interrupts the worker while it is mid-repository.
+    #[derive(Clone, Copy)]
+    enum MockInterrupt {
+        /// Nothing interrupts: the listing drains empty (uninterrupted control).
+        None,
+        /// The operator paused/cancelled through the API — the mock flips the
+        /// `migration_jobs` row to this status, which is what both
+        /// `is_paused` and `finalize_job_status`'s guard read.
+        JobStatus(&'static str),
+        /// The worker's own cancellation token fires while the job row stays
+        /// `running`. Nothing in the database records the interruption, so
+        /// `finalize_job_status`'s `WHERE status NOT IN ('paused','cancelled')`
+        /// guard matches and only the `RepoProcessOutcome::Interrupted`
+        /// propagation can stop the terminal write.
+        CancelToken,
+    }
+
+    /// Mock source registry whose artifact listing interrupts the job as a
+    /// side effect, simulating an operator pressing pause/cancel while the
+    /// worker is mid-repository. The per-artifact check must interrupt the
+    /// job before the first transfer, so downloading panics.
+    struct InterruptingSource {
+        pool: sqlx::PgPool,
+        job_id: Uuid,
+        repo_key: String,
+        interrupt: MockInterrupt,
+        /// The same token the worker under test holds, so
+        /// [`MockInterrupt::CancelToken`] can fire it mid-listing.
+        cancel_token: CancellationToken,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::source_registry::SourceRegistry for InterruptingSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!("not called by process_job")
+        }
+        async fn list_repositories(
+            &self,
+        ) -> Result<
+            Vec<crate::services::artifactory_client::RepositoryListItem>,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(vec![mk_source_repo(&self.repo_key, "LOCAL", "Generic")])
+        }
+        async fn list_artifacts(
+            &self,
+            repo_key: &str,
+            offset: i64,
+            limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            use crate::services::artifactory_client::{AqlRange, AqlResponse, AqlResult};
+            match self.interrupt {
+                MockInterrupt::None => {
+                    return Ok(AqlResponse {
+                        results: vec![],
+                        range: AqlRange {
+                            start_pos: offset,
+                            end_pos: offset,
+                            total: 0,
+                        },
+                    });
+                }
+                MockInterrupt::JobStatus(status) => {
+                    sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
+                        .bind(status)
+                        .bind(self.job_id)
+                        .execute(&self.pool)
+                        .await
+                        .expect("flip job status mid-listing");
+                }
+                MockInterrupt::CancelToken => self.cancel_token.cancel(),
+            }
+            Ok(AqlResponse {
+                results: vec![AqlResult {
+                    repo: repo_key.to_string(),
+                    path: "pkg/1.0".into(),
+                    name: "thing.tar.gz".into(),
+                    size: Some(1234),
+                    created: None,
+                    modified: None,
+                    sha256: None,
+                    actual_sha1: None,
+                }],
+                range: AqlRange {
+                    start_pos: offset,
+                    end_pos: offset + limit,
+                    total: 1,
+                },
+            })
+        }
+        async fn download_artifact(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            panic!("an interrupted job must not transfer artifacts");
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            panic!("an interrupted job must not read artifact properties");
+        }
+        fn source_type(&self) -> &'static str {
+            "interrupting-mock"
+        }
+    }
+
+    /// Seed a source connection + single-repo job, run it through
+    /// `process_job` against an [`InterruptingSource`], and return the job's
+    /// `(status, finished_at IS NOT NULL)` after the worker returns. Cleans
+    /// up the provisioned repository row; the job and connection are the
+    /// caller's to delete once done asserting.
+    async fn run_single_repo_job(
+        pool: &sqlx::PgPool,
+        prefix: &str,
+        interrupt: MockInterrupt,
+    ) -> (Uuid, Uuid, String, bool) {
+        let repo_key = format!("{prefix}-{}", Uuid::new_v4().simple());
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("interrupt-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(pool)
+        .await
+        .expect("seed source connection");
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
+             VALUES ($1, 'full', $2) RETURNING id",
+        )
+        .bind(conn_id)
+        .bind(serde_json::json!({ "include_repos": [repo_key.as_str()] }))
+        .fetch_one(pool)
+        .await
+        .expect("seed migration job");
+
+        let staging = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let cancel_token = CancellationToken::new();
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig {
+                staging_path: staging.path().to_str().unwrap().to_string(),
+                ..WorkerConfig::default()
+            },
+            cancel_token.clone(),
+        );
+
+        worker
+            .process_job(
+                job_id,
+                Arc::new(InterruptingSource {
+                    pool: pool.clone(),
+                    job_id,
+                    repo_key: repo_key.clone(),
+                    interrupt,
+                    cancel_token,
+                }),
+                ConflictResolution::Skip,
+                None,
+            )
+            .await
+            .expect("process_job must not error");
+
+        let (status, finished): (String, bool) = sqlx::query_as(
+            "SELECT status, finished_at IS NOT NULL FROM migration_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("read job row");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(pool)
+            .await;
+
+        (job_id, conn_id, status, finished)
+    }
+
+    /// Delete a test job and then its source connection (FK order).
+    async fn cleanup_single_repo_job(pool: &sqlx::PgPool, job_id: Uuid, conn_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Pausing a single-repo job mid-listing must leave it paused and
+    /// resumable. Pre-fix, the per-artifact pause check returned the same
+    /// `Ok` as a fully drained repository, so `process_job` walked on and
+    /// stamped the paused job Completed with a `finished_at` — after which
+    /// resume rejected the job and the UI offered only delete (issue #3380).
+    #[tokio::test]
+    async fn test_process_job_pause_during_final_repo_stays_paused_3380() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (job_id, conn_id, status, finished) =
+            run_single_repo_job(&pool, "pause-src", MockInterrupt::JobStatus("paused")).await;
+
+        assert_eq!(status, "paused", "pause must survive the final repository");
+        assert!(!finished, "a paused job must not be stamped finished");
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// Cancelling mid-listing takes the same interruption path (`is_paused`
+    /// matches both 'paused' and 'cancelled'): the job must stay cancelled
+    /// instead of being overwritten by Completed (issue #3380).
+    #[tokio::test]
+    async fn test_process_job_cancel_during_final_repo_stays_cancelled_3380() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (job_id, conn_id, status, finished) =
+            run_single_repo_job(&pool, "cancel-src", MockInterrupt::JobStatus("cancelled")).await;
+
+        assert_eq!(
+            status, "cancelled",
+            "cancel must survive the final repository"
+        );
+        assert!(
+            !finished,
+            "the worker must not stamp a cancelled job finished"
+        );
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// Control for #3380: a job that runs to the end still lands Completed
+    /// with `finished_at` stamped — the guarded finalize skips only
+    /// paused/cancelled jobs, never a running one.
+    #[tokio::test]
+    async fn test_process_job_uninterrupted_still_completes_with_finished_at() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (job_id, conn_id, status, finished) =
+            run_single_repo_job(&pool, "complete-src", MockInterrupt::None).await;
+
+        assert_eq!(status, "completed", "an uninterrupted job still completes");
+        assert!(finished, "an uninterrupted job still gets finished_at");
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// Isolation proof for this fix's *headline* mechanism (#3380): the
+    /// `RepoProcessOutcome::Interrupted` propagation must stop the terminal
+    /// write **on its own**, with no help from `finalize_job_status`'s
+    /// paused/cancelled guard.
+    ///
+    /// The two mechanisms are deliberately redundant for an operator-driven
+    /// pause: the job row already reads `paused`, so the guard alone keeps
+    /// that row correct and the pause/cancel tests above stay green even if
+    /// the interruption is swallowed and `process_job` walks on. Without a
+    /// case that separates them, deleting the `Interrupted` return would be
+    /// invisible to CI (the compiler would only note the variant is never
+    /// constructed).
+    ///
+    /// Here the interruption arrives on the worker's own cancellation token
+    /// while the job row is still `running`. Nothing in the database records
+    /// it, so the guard's `WHERE status NOT IN ('paused','cancelled')`
+    /// matches: if the repository loop reports `Completed`, the job is
+    /// finalized `completed` with `finished_at` and a cancelled migration is
+    /// reported as a clean success. Only the distinct `Interrupted` outcome
+    /// prevents that.
+    #[tokio::test]
+    async fn test_process_job_token_cancel_during_final_repo_is_not_finalized_3380() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (job_id, conn_id, status, finished) =
+            run_single_repo_job(&pool, "token-cancel-src", MockInterrupt::CancelToken).await;
+
+        assert_ne!(
+            status, "completed",
+            "a token cancel mid-repository must not be finalized as a success; \
+             the job row never leaves 'running', so only the Interrupted \
+             outcome can stop the terminal write"
+        );
+        assert_eq!(
+            status, "cancelled",
+            "the interruption must be recorded as a cancel"
+        );
+        assert!(
+            !finished,
+            "an interrupted job must not be stamped finished_at"
+        );
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
     }
 
     #[test]
