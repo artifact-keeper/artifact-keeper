@@ -4774,4 +4774,117 @@ mod tests {
              A `# RETIRED:` tombstone for these is fine; a live token is not."
         );
     }
+
+    /// The last `USER` directive in a Dockerfile, i.e. the identity the runtime
+    /// image actually runs as. Test-only.
+    fn dockerfile_final_user(content: &str) -> Option<String> {
+        content
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("USER "))
+            .map(|u| u.trim().to_string())
+            .next_back()
+    }
+
+    /// OpenShift's default `restricted-v2` SCC ignores the image's `USER` and
+    /// runs the process as a RANDOM high UID that is a member of GID 0. So a
+    /// cluster-deployable image must (a) declare a numeric non-root `USER` (the
+    /// platform confirms it is not UID 0), (b) give its runtime user GID 0 as
+    /// the primary group, and (c) make every writable path group-writable
+    /// (`chmod g=rwX`) — owning it `1001:0` is not enough because the default
+    /// 0755 denies group write, so the arbitrary UID gets EACCES.
+    ///
+    /// Every `docker/Dockerfile*` is classified into exactly one bucket. A new
+    /// Dockerfile added later fails this test until it is placed in one, which
+    /// is the point: it forces a decision rather than silently escaping the
+    /// guard (the #2126/#2059 drift CLAUDE.md warns about).
+    #[test]
+    fn openshift_runtime_images_are_arbitrary_uid_compatible() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        // Images that must run under restricted-v2 as an arbitrary UID.
+        const OPENSHIFT_RUNTIME: &[&str] = &["Dockerfile.backend", "Dockerfile.openscap"];
+        // Images deliberately outside the OpenShift contract, each with a
+        // reason. The Alpine/scanner images move into OPENSHIFT_RUNTIME once
+        // Phase 2 rebases them on UBI with a GID-0 user.
+        const EXCLUDED: &[(&str, &str)] = &[
+            (
+                "Dockerfile.backend.alpine",
+                "non-UBI Alpine variant; Phase 2 UBI + GID 0 conversion pending",
+            ),
+            (
+                "Dockerfile.scanner-adapter",
+                "non-UBI Alpine variant; Phase 2 UBI + GID 0 conversion pending",
+            ),
+            (
+                "Dockerfile.backend.dev",
+                "hot-reload development image, not a cluster workload",
+            ),
+            (
+                "Dockerfile.redteam",
+                "security-testing image, intentionally runs as root; never deployed",
+            ),
+        ];
+
+        let discovered = discover_dockerfiles(repo_root);
+        let classified: std::collections::HashSet<&str> = OPENSHIFT_RUNTIME
+            .iter()
+            .copied()
+            .chain(EXCLUDED.iter().map(|(f, _)| *f))
+            .collect();
+        let unclassified: Vec<&String> = discovered
+            .iter()
+            .filter(|f| !classified.contains(f.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "these Dockerfiles are neither in OPENSHIFT_RUNTIME nor EXCLUDED: \
+             {unclassified:?}. Classify each: if it is a cluster workload it \
+             must be arbitrary-UID compatible and go in OPENSHIFT_RUNTIME; \
+             otherwise add it to EXCLUDED with a reason."
+        );
+
+        for file_name in OPENSHIFT_RUNTIME {
+            let path = repo_root.join("docker").join(file_name);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            let user = dockerfile_final_user(&content).unwrap_or_else(|| {
+                panic!("{file_name} declares no USER; restricted-v2 needs a numeric non-root user")
+            });
+            assert!(
+                user.chars().all(|c| c.is_ascii_digit()) && user != "0",
+                "{file_name} runs as USER `{user}`; restricted-v2 needs a \
+                 numeric non-root UID (a named user resolves to an unknown UID)"
+            );
+            assert!(
+                content.contains(":1001:0:"),
+                "{file_name} does not give its runtime user GID 0 as primary \
+                 group (expected a passwd entry like `name:x:1001:0:`); an \
+                 arbitrary OpenShift UID is a member of GID 0, so writable \
+                 paths owned `1001:0` are what it can reach"
+            );
+            assert!(
+                content.contains("g=rwX"),
+                "{file_name} never makes its writable directories \
+                 group-writable (`chmod g=rwX`). Owning them `1001:0` leaves \
+                 mode 0755, which denies group write, so an arbitrary UID in \
+                 GID 0 cannot write to /data, caches, or scan workspaces"
+            );
+            assert!(
+                content.contains("registry.access.redhat.com/ubi9"),
+                "{file_name} is not built on a Red Hat UBI9 base, which \
+                 container certification requires"
+            );
+        }
+    }
+
+    #[test]
+    fn dockerfile_final_user_takes_the_last_directive() {
+        // Multi-stage: only the final stage's USER is the runtime identity.
+        let content = "FROM ubi9 AS build\nUSER root\nFROM ubi9\nUSER 1001\n";
+        assert_eq!(dockerfile_final_user(content), Some("1001".to_string()));
+        assert_eq!(dockerfile_final_user("FROM scratch\n"), None);
+    }
 }

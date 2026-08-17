@@ -115,6 +115,9 @@ RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mn
              /mnt/rootfs/usr/local/bin && \
     chown -R 1001:0 /mnt/rootfs/data /mnt/rootfs/scan-workspace \
                      /mnt/rootfs/home/artifact /mnt/rootfs/app \
+                     /mnt/rootfs/shared && \
+    chmod -R g=rwX /mnt/rootfs/data /mnt/rootfs/scan-workspace \
+                     /mnt/rootfs/home/artifact /mnt/rootfs/app \
                      /mnt/rootfs/shared
 
 # ---------- STIG hardening (applicable subset for ubi-micro) ----------
@@ -309,8 +312,10 @@ COPY --from=grype-bin /grype /usr/local/bin/
 # its self-built trivy (/licenses/trivy).
 COPY --from=grype-bin /licenses/grype /licenses/grype
 
-# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch)
-COPY --from=grype-db-seed --chown=1001:0 /grype-db /home/artifact/.cache/grype
+# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch).
+# --chmod=0770 keeps the seed group-writable so an arbitrary OpenShift UID
+# (always a member of GID 0 under restricted-v2) can refresh the DB at runtime.
+COPY --from=grype-db-seed --chown=1001:0 --chmod=0770 /grype-db /home/artifact/.cache/grype
 
 # Copy application binary
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
