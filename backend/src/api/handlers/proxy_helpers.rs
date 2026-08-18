@@ -15577,6 +15577,13 @@ mod proxy_download_recording_tests {
     #[test]
     fn every_proxy_serve_path_records_a_download_or_is_explicitly_exempt() {
         let mut unrecorded: Vec<String> = Vec::new();
+        // How many real serve sites the scan reached. A structural gate whose
+        // matcher silently stops matching is indistinguishable from a green
+        // one, and [`test_spans`] is a heuristic — an item shape that made it
+        // over-cover would swallow production code and pass trivially. This
+        // counter turns that into a failure. See
+        // `the_recording_gate_reaches_every_serve_site_it_should` below.
+        let mut scanned = 0usize;
 
         for (file, src) in SERVE_SOURCES {
             let spans = test_spans(src);
@@ -15630,6 +15637,7 @@ mod proxy_download_recording_tests {
                     {
                         continue;
                     }
+                    scanned += 1;
 
                     let body = &bodies[name];
                     if RECORDERS.iter().any(|r| body.contains(r)) || body.contains(MARKER) {
@@ -15664,6 +15672,21 @@ mod proxy_download_recording_tests {
              serve genuinely must not count (a HEAD, or an OCI blob — a Docker pull is \
              counted once at the manifest, never per layer), say so in a comment \
              carrying the marker."
+        );
+
+        // Coverage floor. The scan currently reaches 33 serve sites across 30
+        // handlers; 25 leaves room for a format to consolidate its arms without
+        // churn while still failing loudly if the matcher, the `#[cfg(test)]`
+        // span heuristic, or the top-level-`fn` parser stops seeing the code it
+        // is supposed to police. Without this a gate that matched NOTHING would
+        // report the same green as a gate that matched everything.
+        assert!(
+            scanned >= 25,
+            "#3446: the recording gate only reached {scanned} proxy serve sites, which \
+             is too few to be policing the class. Either the streaming helpers were \
+             renamed (update SERVE_PRIMITIVES), or `test_spans` / `top_level_fns` \
+             stopped parsing the handlers correctly and the gate is now green by \
+             accident rather than by correctness."
         );
     }
 
