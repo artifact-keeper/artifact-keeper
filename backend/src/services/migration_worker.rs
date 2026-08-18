@@ -383,10 +383,22 @@ impl MigrationWorker {
             .update_job_status(job_id, MigrationJobStatus::Running)
             .await?;
 
+        // The run owns the discovered totals from here on. They are rebuilt
+        // page by page below, so clearing them keeps the denominator on the
+        // same footing as the counters, which also restart at zero every run:
+        // an assessment's pre-run estimate, or the totals a previous run left
+        // behind, would otherwise be divided into counts that no longer belong
+        // to it.
+        self.migration_service
+            .update_job_totals(job_id, 0, 0)
+            .await?;
+
         let mut total_completed = 0i32;
         let mut total_failed = 0i32;
         let mut total_skipped = 0i32;
         let mut total_transferred = 0i64;
+        let mut total_discovered = 0i32;
+        let mut total_discovered_bytes = 0i64;
 
         // Provision destination repositories before transferring artifacts.
         //
@@ -711,6 +723,8 @@ impl MigrationWorker {
                         &mut total_failed,
                         &mut total_skipped,
                         &mut total_transferred,
+                        &mut total_discovered,
+                        &mut total_discovered_bytes,
                         progress_tx.clone(),
                     )
                     .await
@@ -797,6 +811,8 @@ impl MigrationWorker {
         failed: &mut i32,
         skipped: &mut i32,
         transferred: &mut i64,
+        discovered: &mut i32,
+        discovered_bytes: &mut i64,
         progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
     ) -> Result<RepoProcessOutcome, MigrationError> {
         // Read the source registry by source key (== target for unrenamed repos).
@@ -830,6 +846,25 @@ impl MigrationWorker {
             if page_len == 0 {
                 break;
             }
+
+            // Publish what the source has yielded so far as the job's totals.
+            // Neither AQL nor the Nexus component API reports a result-set
+            // count, so a denominator is only knowable by enumeration, and the
+            // job row's zero was being divided into forever (#3378). The price
+            // of a running total is that the percentage can fall back when the
+            // next page arrives; it is exact once enumeration ends. Items the
+            // loop below skips without ever writing a `migration_items` row --
+            // duplicates, dry runs -- still count here, because they are
+            // counted in `skipped`/`completed` and the two sides must agree.
+            *discovered += page_len as i32;
+            *discovered_bytes += artifacts
+                .results
+                .iter()
+                .map(|a| a.size.unwrap_or(0))
+                .sum::<i64>();
+            self.migration_service
+                .update_job_totals(job_id, *discovered, *discovered_bytes)
+                .await?;
 
             for artifact in &artifacts.results {
                 // Check for pause/cancel between artifacts
@@ -5618,6 +5653,247 @@ mod tests {
         );
 
         cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A migration job is measured against the totals the worker enumerates,
+    /// not against the zero its row was created with (issue #3378). The source
+    /// pages, and the mock reads the job row on its way in to the second page,
+    /// so this also pins that the denominator is republished per page rather
+    /// than written once the run is over.
+    ///
+    /// Fails-before: `total_items` was only ever written by
+    /// `add_migration_items` and `save_assessment`, and the worker calls
+    /// neither — it inserts every row through its own `add_migration_item` —
+    /// so the mid-run read, the finished row, and the reported percentage were
+    /// all 0 for the whole life of the job.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_process_job_publishes_discovered_totals_3378() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::artifactory_client::{
+            AqlRange, AqlResponse, AqlResult, ArtifactoryError, PropertiesResponse,
+        };
+        use crate::services::source_registry::SourceRegistry;
+        use async_trait::async_trait;
+        use std::sync::{Arc, Mutex};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // Three artifacts over two pages at a batch size of 2: a full page
+        // that keeps pagination going, then a short one that ends it.
+        const PAGE_ONE_BYTES: i64 = 4 + 8;
+        const ALL_BYTES: i64 = PAGE_ONE_BYTES + 15;
+
+        fn mk_result(repo: &str, name: &str, size: i64) -> AqlResult {
+            AqlResult {
+                repo: repo.to_string(),
+                path: "pkg/1.0".into(),
+                name: name.into(),
+                size: Some(size),
+                created: None,
+                modified: None,
+                sha256: None,
+                actual_sha1: None,
+            }
+        }
+
+        struct PagedSource {
+            db: PgPool,
+            job_id: Uuid,
+            repo_key: String,
+            totals_before_second_page: Arc<Mutex<Option<(i32, i64)>>>,
+        }
+
+        #[async_trait]
+        impl SourceRegistry for PagedSource {
+            async fn ping(&self) -> Result<bool, ArtifactoryError> {
+                Ok(true)
+            }
+            async fn get_version(
+                &self,
+            ) -> Result<crate::services::artifactory_client::SystemVersionResponse, ArtifactoryError>
+            {
+                unimplemented!("not called by process_job")
+            }
+            async fn list_repositories(
+                &self,
+            ) -> Result<
+                Vec<crate::services::artifactory_client::RepositoryListItem>,
+                ArtifactoryError,
+            > {
+                Ok(vec![mk_source_repo(&self.repo_key, "LOCAL", "Generic")])
+            }
+            async fn list_artifacts(
+                &self,
+                repo_key: &str,
+                offset: i64,
+                limit: i64,
+            ) -> Result<AqlResponse, ArtifactoryError> {
+                if offset > 0 {
+                    // The first page is fully accounted for by now, so this is
+                    // the denominator the UI would be showing mid-run.
+                    let totals: (i32, i64) = sqlx::query_as(
+                        "SELECT total_items, total_bytes FROM migration_jobs WHERE id = $1",
+                    )
+                    .bind(self.job_id)
+                    .fetch_one(&self.db)
+                    .await
+                    .expect("read job totals between pages");
+                    *self.totals_before_second_page.lock().unwrap() = Some(totals);
+                }
+
+                let results = if offset == 0 {
+                    vec![
+                        mk_result(repo_key, "one.tar.gz", 4),
+                        mk_result(repo_key, "two.tar.gz", 8),
+                    ]
+                } else {
+                    vec![mk_result(repo_key, "three.tar.gz", 15)]
+                };
+                Ok(AqlResponse {
+                    range: AqlRange {
+                        start_pos: offset,
+                        end_pos: offset + limit,
+                        total: results.len() as i64,
+                    },
+                    results,
+                })
+            }
+            async fn download_artifact(
+                &self,
+                _repo_key: &str,
+                path: &str,
+            ) -> Result<bytes::Bytes, ArtifactoryError> {
+                // Bodies match the sizes advertised by the listing.
+                let size = match path {
+                    "pkg/1.0/one.tar.gz" => 4,
+                    "pkg/1.0/two.tar.gz" => 8,
+                    _ => 15,
+                };
+                Ok(bytes::Bytes::from(vec![b'x'; size]))
+            }
+            async fn get_properties(
+                &self,
+                _repo_key: &str,
+                _path: &str,
+            ) -> Result<PropertiesResponse, ArtifactoryError> {
+                Ok(PropertiesResponse {
+                    properties: None,
+                    uri: None,
+                })
+            }
+            fn source_type(&self) -> &'static str {
+                "paged-mock"
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_key = format!("totals-3378-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO repositories (key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $1, $2, 'local', 'generic'::repository_format, true)",
+        )
+        .bind(&repo_key)
+        .bind(tmp.path().to_str().unwrap())
+        .execute(&pool)
+        .await
+        .expect("seed destination repository");
+
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("totals-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed source connection");
+
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
+             VALUES ($1, 'full', $2) RETURNING id",
+        )
+        .bind(conn_id)
+        .bind(serde_json::json!({ "include_repos": [&repo_key] }))
+        .fetch_one(&pool)
+        .await
+        .expect("seed migration job");
+
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig {
+                batch_size: 2,
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+            CancellationToken::new(),
+        );
+
+        let totals_before_second_page = Arc::new(Mutex::new(None));
+        worker
+            .process_job(
+                job_id,
+                Arc::new(PagedSource {
+                    db: pool.clone(),
+                    job_id,
+                    repo_key: repo_key.clone(),
+                    totals_before_second_page: totals_before_second_page.clone(),
+                }),
+                ConflictResolution::Skip,
+                None,
+            )
+            .await
+            .expect("migration job must not fail");
+
+        let mid_run = totals_before_second_page
+            .lock()
+            .unwrap()
+            .expect("the second page must have been requested");
+        assert_eq!(
+            mid_run,
+            (2, PAGE_ONE_BYTES),
+            "the first page's totals must be published before the next page is fetched"
+        );
+
+        let (total_items, total_bytes, completed, failed, skipped): (i32, i64, i32, i32, i32) =
+            sqlx::query_as(
+                "SELECT total_items, total_bytes, completed_items, failed_items, skipped_items \
+                 FROM migration_jobs WHERE id = $1",
+            )
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read finished job counters");
+        assert_eq!(
+            (total_items, total_bytes),
+            (3, ALL_BYTES),
+            "every enumerated artifact must be counted toward the job's totals"
+        );
+        assert_eq!((completed, failed, skipped), (3, 0, 0));
+        assert!(
+            (crate::models::migration::progress_percent(total_items, completed, failed, skipped)
+                - 100.0)
+                .abs()
+                < f64::EPSILON,
+            "a finished job must report 100%, not 0% against a zero total"
+        );
+
+        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await;
     }
 
     #[test]

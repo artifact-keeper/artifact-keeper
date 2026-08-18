@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::models::migration::MigrationConfig;
+use crate::models::migration::{progress_percent, MigrationConfig};
 use crate::services::artifactory_client::{
     ArtifactoryAuth, ArtifactoryClient, ArtifactoryClientConfig,
 };
@@ -337,13 +337,12 @@ pub struct MigrationJobResponse {
 
 impl From<MigrationJobRow> for MigrationJobResponse {
     fn from(row: MigrationJobRow) -> Self {
-        let total = row.total_items;
-        let done = row.completed_items + row.failed_items + row.skipped_items;
-        let progress = if total > 0 {
-            done as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        };
+        let progress = progress_percent(
+            row.total_items,
+            row.completed_items,
+            row.failed_items,
+            row.skipped_items,
+        );
 
         Self {
             id: row.id,
@@ -1492,12 +1491,7 @@ async fn stream_migration_progress(
             match result {
                 Some((status, total, completed, failed, skipped, total_bytes, transferred)) => {
                     // Calculate progress
-                    let done = completed + failed + skipped;
-                    let progress = if total > 0 {
-                        done as f64 / total as f64 * 100.0
-                    } else {
-                        0.0
-                    };
+                    let progress = progress_percent(total, completed, failed, skipped);
 
                     // Create progress event
                     let event_data = serde_json::json!({

@@ -188,16 +188,33 @@ pub struct MigrationJob {
     pub error_summary: Option<String>,
 }
 
+/// Share of a job's items that have reached a terminal per-item outcome.
+///
+/// `total` is what the worker has enumerated so far, not a count obtained up
+/// front: a paged source like Nexus never reports how many artifacts a
+/// repository holds, so the denominator grows page by page and the percentage
+/// can fall back when the next page lands (#3378). A job that has not
+/// enumerated anything yet reports 0 rather than dividing by zero. The result
+/// is clamped to 100 because repository-level failures — a source repo missing
+/// from the listing, a destination conflict — land in `failed` without ever
+/// having been enumerated as items.
+pub fn progress_percent(total: i32, completed: i32, failed: i32, skipped: i32) -> f64 {
+    if total <= 0 {
+        return 0.0;
+    }
+    let done = completed + failed + skipped;
+    (done as f64 / total as f64 * 100.0).min(100.0)
+}
+
 impl MigrationJob {
     /// Calculate progress percentage
     pub fn progress_percent(&self) -> f64 {
-        if self.total_items == 0 {
-            0.0
-        } else {
-            (self.completed_items + self.failed_items + self.skipped_items) as f64
-                / self.total_items as f64
-                * 100.0
-        }
+        progress_percent(
+            self.total_items,
+            self.completed_items,
+            self.failed_items,
+            self.skipped_items,
+        )
     }
 
     /// Estimate remaining time in seconds
@@ -481,6 +498,32 @@ mod tests {
         let job = make_test_job(10, 5, 3, 2);
         // (5 + 3 + 2) / 10 * 100 = 100.0
         assert!((job.progress_percent() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_progress_percent_follows_the_running_total() {
+        // Issue #3378: the worker publishes what it has enumerated so far, so
+        // the denominator grows page by page. Finishing a page of 1000 reads
+        // as done until the next page lands and the same work reads as half.
+        assert!((progress_percent(1000, 1000, 0, 0) - 100.0).abs() < f64::EPSILON);
+        assert!((progress_percent(2000, 1000, 0, 0) - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_progress_percent_nothing_enumerated_yet() {
+        // A job row starts at total_items = 0 and the worker clears it again
+        // at the top of every run, so the divide-by-zero window is real and
+        // reports 0 rather than a NaN the UI would render as "NaN%".
+        assert_eq!(progress_percent(0, 0, 0, 0), 0.0);
+        assert_eq!(progress_percent(0, 7, 1, 2), 0.0);
+    }
+
+    #[test]
+    fn test_progress_percent_does_not_exceed_full() {
+        // Repository-level failures (a source repo missing from the listing, a
+        // destination conflict) land in failed_items without ever having been
+        // enumerated as items, so the processed count can outrun the total.
+        assert!((progress_percent(100, 99, 3, 0) - 100.0).abs() < f64::EPSILON);
     }
 
     // -----------------------------------------------------------------------

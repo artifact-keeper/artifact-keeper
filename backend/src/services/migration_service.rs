@@ -758,6 +758,37 @@ impl MigrationService {
         Ok(())
     }
 
+    /// Update the totals a job is measured against
+    ///
+    /// The worker calls this as it enumerates the source, so `total_items`
+    /// tracks what has actually been discovered instead of staying at the zero
+    /// the row was created with, which left every job reporting `N/0` and 0%
+    /// (#3378). The values are written absolutely rather than accumulated:
+    /// a resumed or re-run job enumerates from the first page again, so
+    /// rebuilding the totals is correct and adding to them would double count.
+    pub async fn update_job_totals(
+        &self,
+        job_id: Uuid,
+        total_items: i32,
+        total_bytes: i64,
+    ) -> Result<(), MigrationError> {
+        sqlx::query(
+            r#"
+            UPDATE migration_jobs
+            SET total_items = $1,
+                total_bytes = $2
+            WHERE id = $3
+            "#,
+        )
+        .bind(total_items)
+        .bind(total_bytes)
+        .bind(job_id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
     /// Add migration items for a job
     pub async fn add_migration_items(
         &self,
@@ -1350,6 +1381,13 @@ impl MigrationService {
     }
 
     /// Save assessment result to database
+    ///
+    /// The totals written here are the assessment's pre-run estimate and hold
+    /// only until the job runs: the worker resets them and republishes what it
+    /// enumerates (see `update_job_totals`), so a repository whose real content
+    /// differs from the assessment does not leave a stale denominator behind.
+    /// The estimate itself survives in `config.assessment`, which is what
+    /// `GET /assessment` reads.
     pub async fn save_assessment(
         &self,
         job_id: Uuid,
