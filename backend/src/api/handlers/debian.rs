@@ -4983,6 +4983,77 @@ mod upload_db_tests {
         ));
     }
 
+    /// #3446: a PROXIED `.deb` must increment the Downloads counter.
+    ///
+    /// The Remote pool arm streamed the upstream body straight back and never
+    /// recorded, so an apt-facing Debian proxy reported 0 downloads forever no
+    /// matter how much traffic it carried. Asserted through
+    /// `download_counts_by_paths`, the same lookup the artifact listing uses
+    /// (#3388), across a cold miss and a warm cache hit.
+    #[tokio::test]
+    async fn proxied_deb_download_is_counted_3446() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "debian").await else {
+            return;
+        };
+
+        let deb_path = "main/c/counted/counted_1.0-1_amd64.deb";
+        let body = b"not a real .deb, but real bytes".repeat(6);
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/pool/{deb_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+
+        // The proxy-cache key the pool arm commits under, which is also the
+        // `proxy_cache_artifacts.path` the listing renders.
+        let cache_path = format!("pool/{deb_path}");
+        let counted = |path: String| {
+            let pool = fx.pool.clone();
+            let repo_id = fx.repo_id;
+            async move {
+                crate::services::proxy_catalog::download_counts_by_paths(
+                    &pool,
+                    repo_id,
+                    std::slice::from_ref(&path),
+                )
+                .await
+                .expect("count proxy downloads")
+                .get(&path)
+                .copied()
+                .unwrap_or(0)
+            }
+        };
+
+        assert_eq!(
+            counted(cache_path.clone()).await,
+            0,
+            "negative control: nothing counted before the first download"
+        );
+
+        for expected in 1..=2i64 {
+            let (status, served) = tdh::send(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/pool/{}", fx.repo_key, deb_path)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "proxied .deb must be served");
+            assert_eq!(&served[..], &body[..], "the full .deb body is served");
+            assert_eq!(
+                counted(cache_path.clone()).await,
+                expected,
+                "#3446: proxied .deb download {expected} must be counted (cold miss \
+                 then warm cache hit); a 0 here is the original bug"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn pool_upload_populates_debian_metadata_packages_and_indexes() {
         let Some(f) = tdh::Fixture::setup("local", "debian").await else {
