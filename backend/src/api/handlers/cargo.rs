@@ -1048,6 +1048,24 @@ async fn download(
                     if let Some(ref encoding) = result.content_encoding {
                         builder = builder.header(CONTENT_ENCODING, encoding);
                     }
+                    // #3446: count the proxied crate. This arm returns the
+                    // upstream stream directly, so it never reached the
+                    // `record_download` call ~15 lines below on the hosted
+                    // path — and `record_download` would not have helped
+                    // anyway: it is keyed on an `artifacts.id`, and a
+                    // proxy-cached crate has no `artifacts` row. The proxy
+                    // recorder is keyed on (repo, path) instead, and the path
+                    // is `cache_path` — the same canonical key the streaming
+                    // tee commits the catalog row under, so the count and the
+                    // listing row line up.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &cache_path,
+                        &ctx,
+                    )
+                    .await;
                     return Ok(builder.body(Body::from_stream(result.body)).unwrap());
                 }
             }
@@ -2084,6 +2102,89 @@ mod tests {
             ),
             "a body failing the index cksum must NOT be committed to the proxy cache (#2929)"
         );
+    }
+
+    /// #3446: a PROXIED crate download must increment the Downloads counter.
+    ///
+    /// The Remote arm returns the upstream stream directly, so it never reached
+    /// the hosted `record_download` further down the function — and that call
+    /// could not have helped anyway, because it resolves an `artifacts.id` and
+    /// a proxy-cached crate has no `artifacts` row. The failure was silent: the
+    /// crate was served correctly and the counter simply never moved.
+    ///
+    /// Asserted through `download_counts_by_paths`, the same lookup the
+    /// artifact listing uses (#3388), so this pins the number an operator
+    /// actually sees rather than just the fact that a row was written. Two
+    /// requests are made — a cold miss and a warm cache hit — because the two
+    /// take different paths through the handler and BOTH must count.
+    #[tokio::test]
+    async fn test_proxied_crate_download_is_counted_3446() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+
+        let name = "counted-crate";
+        let version = "0.4.2";
+        let body = b"a small but real crate body".repeat(8);
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/api/v1/crates/{name}/{version}/download")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let request_path = format!(
+            "/cargo/{}/api/v1/crates/{}/{}/download",
+            fx.repo_key, name, version
+        );
+
+        // The canonical proxy-cache key the handler records under, which is
+        // also the `proxy_cache_artifacts.path` the listing renders.
+        let cache_path = format!("api/v1/crates/{name}/{version}/download");
+        let counted = |pool: sqlx::PgPool, repo_id: uuid::Uuid, path: String| async move {
+            crate::services::proxy_catalog::download_counts_by_paths(
+                &pool,
+                repo_id,
+                std::slice::from_ref(&path),
+            )
+            .await
+            .expect("count proxy downloads")
+            .get(&path)
+            .copied()
+            .unwrap_or(0)
+        };
+
+        assert_eq!(
+            counted(fx.pool.clone(), fx.repo_id, cache_path.clone()).await,
+            0,
+            "negative control: nothing is counted before the first download"
+        );
+
+        for expected in 1..=2i64 {
+            let (status, served) = tdh::send(
+                tdh::router_anon(mounted_router(), state.clone()),
+                tdh::get(request_path.clone()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "proxied crate download must succeed"
+            );
+            assert_eq!(&served[..], &body[..], "the full crate body is served");
+            assert_eq!(
+                counted(fx.pool.clone(), fx.repo_id, cache_path.clone()).await,
+                expected,
+                "#3446: proxied crate download {expected} must be counted (cold miss \
+                 then warm cache hit); a 0 here is the original bug"
+            );
+        }
     }
 
     /// Regression test for the cargo instance of the buffered-download class

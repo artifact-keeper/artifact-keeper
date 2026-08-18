@@ -1122,7 +1122,7 @@ async fn download_zip(
                     // matches the buffered handler's prior fallback so the
                     // Go toolchain still sees `application/zip` when
                     // upstream omits the header (review N2).
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo.key,
@@ -1130,7 +1130,22 @@ async fn download_zip(
                         &upstream_path,
                         "application/zip",
                     )
+                    .await?;
+                    // #3446: count the proxied module zip. The `.mod` and
+                    // `.info` siblings are metadata the toolchain fetches on
+                    // every resolve; the `.zip` is the artifact, so it is the
+                    // one seam that counts — the same "one download per
+                    // fetched artifact, not per protocol round-trip" rule
+                    // OCI applies at the manifest.
+                    proxy_helpers::record_proxy_download(
+                        state,
+                        repo.id,
+                        &repo.key,
+                        &upstream_path,
+                        ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
 
@@ -2710,6 +2725,101 @@ mod tests {
     /// fan-out) and warm (Pass 1, `cached_metadata_if_servable`). Pass 1 is a
     /// line this fix changed — it used to discard the member's coding — and
     /// only the second probe reaches it.
+    /// #3446: a PROXIED Go module `.zip` must increment the Downloads counter.
+    ///
+    /// The `.zip` is the artifact; `.mod` / `.info` are metadata the toolchain
+    /// re-fetches on every resolve and must NOT count, or a single `go build`
+    /// would report several downloads per module. Both halves are asserted so a
+    /// future "record everything the proxy serves" change cannot pass.
+    #[tokio::test]
+    async fn test_proxied_go_module_zip_is_counted_but_metadata_is_not_3446() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+
+        let module = "example.com/counted";
+        let version = "v1.4.0";
+        let zip_body = b"PK\x03\x04 pretend module zip".repeat(4);
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/{module}/@v/{version}.zip")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_body.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/{module}/@v/{version}.mod")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("module example.com/counted\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+
+        let counted = |path: String| {
+            let pool = fx.pool.clone();
+            let repo_id = fx.repo_id;
+            async move {
+                crate::services::proxy_catalog::download_counts_by_paths(
+                    &pool,
+                    repo_id,
+                    std::slice::from_ref(&path),
+                )
+                .await
+                .expect("count proxy downloads")
+                .get(&path)
+                .copied()
+                .unwrap_or(0)
+            }
+        };
+        let zip_path = format!("{module}/@v/{version}.zip");
+        let mod_path = format!("{module}/@v/{version}.mod");
+
+        assert_eq!(
+            counted(zip_path.clone()).await,
+            0,
+            "negative control: nothing counted before the first download"
+        );
+
+        // The `.mod` metadata fetch must leave the counter alone.
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{}/{}/@v/{}.mod", fx.repo_key, module, version)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the .mod metadata fetch must succeed"
+        );
+        assert_eq!(
+            counted(mod_path).await,
+            0,
+            "#3446: `.mod` is metadata, not a download - counting it would report \
+             several downloads for one `go build`"
+        );
+
+        // The `.zip` artifact must count, cold and warm alike.
+        for expected in 1..=2i64 {
+            let (status, served) = tdh::send(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/{}/@v/{}.zip", fx.repo_key, module, version)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "proxied module zip must be served");
+            assert_eq!(&served[..], &zip_body[..], "the full zip body is served");
+            assert_eq!(
+                counted(zip_path.clone()).await,
+                expected,
+                "#3446: proxied module zip download {expected} must be counted"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_go_metadata_forwards_upstream_content_encoding_verbatim_db() {
         let Some(fx) = tdh::Fixture::setup("remote", "go").await else {

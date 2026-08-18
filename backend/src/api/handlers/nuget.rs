@@ -753,19 +753,22 @@ const VERIFIED_NUPKG_REPAIR_MAX_BYTES: usize = 128 * 1024 * 1024;
 /// `{id}/index.json` or `{id}/{version}/{file}`. Version lists carry no URLs so
 /// no rewriting is needed. Downloads stream (never buffered) under a stable
 /// cache key.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_v3_flatcontainer(
+    state: &SharedState,
     proxy: &crate::services::proxy_service::ProxyService,
     fetch_repo_id: uuid::Uuid,
     fetch_repo_key: &str,
     upstream_url: &str,
     sub_path: &str,
     streaming: bool,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Response, Response> {
     let (fetch_url, cache_path) =
         flatcontainer_fetch_target(proxy, fetch_repo_id, fetch_repo_key, upstream_url, sub_path)
             .await?;
     if streaming {
-        proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+        let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
             proxy,
             fetch_repo_id,
             fetch_repo_key,
@@ -775,7 +778,27 @@ async fn proxy_v3_flatcontainer(
             "application/octet-stream",
             RepositoryFormat::Nuget,
         )
-        .await
+        .await?;
+        // #3446: `streaming` is exactly the `.nupkg` arm — the non-streaming
+        // sibling below serves a version LIST, which is metadata and must not
+        // count. `ctx` is therefore `Some` only where a real download context
+        // exists; the repair path (#2929) re-fetches a package on the server's
+        // behalf rather than serving a client, and passes `None`.
+        //
+        // Recorded against `fetch_repo_id`/`fetch_repo_key`, which for a
+        // virtual parent is the resolving MEMBER — the repository that owns
+        // the proxy cache entry and the catalog row the count is read from.
+        if let Some(ctx) = ctx {
+            proxy_helpers::record_proxy_download(
+                state,
+                fetch_repo_id,
+                fetch_repo_key,
+                &cache_path,
+                ctx,
+            )
+            .await;
+        }
+        Ok(response)
     } else {
         // Unlike the registration / search / OData arms, this one serves the
         // upstream body VERBATIM (a version list carries no URLs, so nothing is
@@ -1316,13 +1339,16 @@ async fn flatcontainer_versions(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
+                // Version LIST: metadata, never a download (#3446).
                 return proxy_v3_flatcontainer(
+                    &state,
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &sub_path,
                     false,
+                    None,
                 )
                 .await;
             }
@@ -1338,13 +1364,16 @@ async fn flatcontainer_versions(
                     let Some(upstream_url) = member.upstream_url.as_deref() else {
                         continue;
                     };
+                    // Version LIST: metadata, never a download (#3446).
                     if let Ok(resp) = proxy_v3_flatcontainer(
+                        &state,
                         proxy,
                         member.id,
                         &member.key,
                         upstream_url,
                         &sub_path,
                         false,
+                        None,
                     )
                     .await
                     {
@@ -1415,12 +1444,14 @@ async fn flatcontainer_download(
                     // index and stream the .nupkg from there (#2775).
                     let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
                     return proxy_v3_flatcontainer(
+                        &state,
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &sub_path,
                         true,
+                        Some(&ctx),
                     )
                     .await;
                 }
@@ -1450,12 +1481,14 @@ async fn flatcontainer_download(
                             continue;
                         };
                         if let Ok(resp) = proxy_v3_flatcontainer(
+                            &state,
                             proxy,
                             member.id,
                             &member.key,
                             upstream_url,
                             &sub_path,
                             true,
+                            Some(&ctx),
                         )
                         .await
                         {
@@ -1739,13 +1772,21 @@ async fn flatcontainer_download(
                                  the discovered PackageBaseAddress (streaming, no enforceable \
                                  digest recorded)"
                             );
+                            // `None` context: this arm has a REAL `artifacts`
+                            // row (it is repairing that row's missing blob), so
+                            // it is counted by the hosted `record_download`
+                            // just below. Passing a context here would
+                            // double-count the same download in both the
+                            // hosted and the proxy statistics table (#3446).
                             let response = proxy_v3_flatcontainer(
+                                &state,
                                 proxy,
                                 repo.id,
                                 &repo_key,
                                 upstream_url,
                                 &sub_path,
                                 true,
+                                None,
                             )
                             .await?;
                             // Recorded after the upstream body is open so a
@@ -2209,7 +2250,7 @@ async fn v2_download(
             let up = upstream_url.trim_end_matches('/');
             let fetch_url = format!("{}/package/{}/{}", up, id, version);
             let cache_path = format!("v2/package/{}/{}/package.nupkg", id.to_lowercase(), version);
-            return proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+            let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
                 proxy,
                 repo.id,
                 repo_key,
@@ -2219,7 +2260,13 @@ async fn v2_download(
                 "application/octet-stream",
                 RepositoryFormat::Nuget,
             )
-            .await;
+            .await?;
+            // #3446: the legacy V2 / Chocolatey download seam counts too. It
+            // caches under its own `v2/package/...` key rather than the V3
+            // flat-container key, so it records against that key — the row a
+            // V2-only client's downloads actually accumulate on.
+            proxy_helpers::record_proxy_download(state, repo.id, repo_key, &cache_path, ctx).await;
+            return Ok(response);
         }
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }

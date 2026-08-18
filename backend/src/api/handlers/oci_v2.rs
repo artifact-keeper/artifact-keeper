@@ -3438,6 +3438,10 @@ pub async fn resolve_virtual_blob(
                     // A member without the blob (404) or any upstream error
                     // maps to `Err`; skip it and try the next candidate /
                     // member, preserving the existing member-selection walk.
+                    // UNRECORDED-PROXY-SERVE: blob, not a pull — the same
+                    // #2260 rule the direct-Remote blob path documents. A
+                    // Docker pull through a virtual parent is counted once at
+                    // the manifest, never per layer.
                     match proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         member.id,
@@ -3896,6 +3900,10 @@ async fn try_upstream_fetch(
     state: &SharedState,
     path_suffix: &str,
 ) -> Option<(Bytes, Option<String>)> {
+    // UNRECORDED-PROXY-SERVE: a pure delegating wrapper that neither knows the
+    // request context nor decides what the bytes are for — its callers (tags
+    // list, referrers, the manifest handlers) each carry the counting decision
+    // at their own seam, where the unit of a pull is known.
     try_upstream_fetch_with_accept(repo, state, path_suffix, None).await
 }
 
@@ -4097,6 +4105,12 @@ async fn try_upstream_fetch_streaming_blob(
     let proxy = state.proxy_service.as_ref()?;
     let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/blobs/{}", image, digest);
+    // UNRECORDED-PROXY-SERVE: a blob is deliberately never counted. #2260 fixed
+    // the unit of a Docker "download" as the PULL, counted once at the manifest
+    // (`record_oci_manifest_pull`); one pull fetches N blobs, many of them
+    // shared between images and skipped entirely when the client already has
+    // them, so counting blob GETs would both over-report a cold pull and
+    // under-report a warm one. Recording here would double-count every pull.
     let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
         proxy,
         repo.id,
@@ -7924,6 +7938,11 @@ async fn handle_head_manifest(
         }
     }
 
+    // UNRECORDED-PROXY-SERVE: this is the HEAD handler. A HEAD serves no body,
+    // so it is not a download — the same rule `artifact_service::record_download`
+    // and `proxy_helpers::record_proxy_download` both enforce with their own
+    // `is_head` short circuits. Counting it would inflate every repository that
+    // a `docker pull` merely probes for existence.
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
@@ -8039,6 +8058,46 @@ async fn oci_manifest_quarantine_block(
             Some(oci_error(status, code, &message))
         }
     }
+}
+
+/// Count one `docker pull` against a repository, choosing the recorder that
+/// matches where the bytes actually live (#3446).
+///
+/// [`record_oci_manifest_download`] resolves the manifest through
+/// `artifacts.storage_key`. That is correct for a HOSTED repo, and silently
+/// correct-looking but inert for a REMOTE one: proxy-cached content is
+/// deliberately not registered in `artifacts` (#1278), so the lookup returns
+/// `Ok(None)` and the pull is dropped on the floor. Every proxied Docker pull
+/// therefore counted zero, which is what made the Downloads column read 0
+/// forever on the highest-traffic proxy format we have.
+///
+/// A Remote repo is counted through the proxy recorder instead, keyed on
+/// (repo, path) with the same `v2/{image}/manifests/{reference}` path the
+/// manifest fetch caches under — so the count lands on the catalog row the
+/// artifact listing renders.
+///
+/// The MANIFEST is the unit either way: #2260 established that a pull is
+/// counted once, here, and never per blob (one pull fetches one manifest plus
+/// N frequently-deduplicated blobs, so counting blobs would wildly
+/// over-report). `reference` is the client's own reference — a tag pulled
+/// twice counts twice, and a by-digest pull accumulates on the digest row.
+async fn record_oci_manifest_pull(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    reference: &str,
+    manifest_digest: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
+    if repo.repo_type == RepositoryType::Remote {
+        let Some(upstream_url) = repo.upstream_url.as_deref() else {
+            return;
+        };
+        let image = normalize_docker_image(&repo.image, upstream_url);
+        let path = upstream_manifest_path(&image, reference);
+        proxy_helpers::record_proxy_download(state, repo.id, &repo.key, &path, ctx).await;
+        return;
+    }
+    record_oci_manifest_download(state, repo.id, manifest_digest, ctx).await;
 }
 
 async fn record_oci_manifest_download(
@@ -9082,9 +9141,14 @@ async fn handle_get_manifest(
             // wildly over-report. Recording against the manifest's `artifacts`
             // row (resolved by its content-addressed storage key) attributes one
             // download per pull. Best-effort + inline-awaited; a HEAD manifest
-            // is a separate handler and is never counted. Remote/virtual
-            // pass-through manifests resolve no local row and stay unrecorded.
-            record_oci_manifest_download(state, repo.id, &manifest_digest, ctx).await;
+            // is a separate handler and is never counted.
+            //
+            // #3446: this arm is reached by a REMOTE repo too — a proxy caches
+            // the manifest on the first pull, so every warm pull lands here —
+            // and a proxy-cached manifest has no `artifacts` row to resolve.
+            // `record_oci_manifest_pull` picks the proxy recorder for those, so
+            // warm proxy pulls count instead of silently resolving `None`.
+            record_oci_manifest_pull(state, &repo, reference, &manifest_digest, ctx).await;
             return with_scan_pending_header(
                 build_local_manifest_response(&manifest_digest, &content_type, data, true),
                 scan_pending,
@@ -9203,6 +9267,11 @@ async fn handle_get_manifest(
             Ok(pending) => pending,
             Err(resp) => return resp,
         };
+        // #3446: the COLD proxy pull. Counted after the scan gate, so an image
+        // the gate refuses to serve is not counted as a download, and using the
+        // same manifest path the fetch above cached under so the cold pull and
+        // every subsequent warm pull accumulate on one catalog row.
+        record_oci_manifest_pull(state, &repo, reference, &digest, ctx).await;
         return with_scan_pending_header(
             build_oci_proxy_response(
                 &content,

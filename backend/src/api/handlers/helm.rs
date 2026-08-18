@@ -423,7 +423,9 @@ fn resolve_chart_url(upstream_url: &str, chart_url: &str) -> String {
 /// is typically free after the first virtual-index request. The chart content is
 /// cached under the stable key `charts/{filename}` regardless of where the actual
 /// bytes come from, so subsequent downloads are served from cache.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_chart_via_index(
+    state: &SharedState,
     proxy: &ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
@@ -431,6 +433,7 @@ async fn fetch_chart_via_index(
     name: &str,
     version: &str,
     filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     // The `index.yaml` lookup stays buffered/capped by design: it is a small
     // metadata document that must be parsed in-process.
@@ -504,6 +507,12 @@ async fn fetch_chart_via_index(
         RepositoryFormat::Helm,
     )
     .await?;
+    // #3446: count the proxied chart (or its `.prov`). `cache_path` is the
+    // stable `charts/{filename}` key this fetch is teed into, so the recorded
+    // (repo, path) is exactly the catalog row the artifact listing renders.
+    // Recorded after the fetch resolves, so a 404/502 from upstream does not
+    // count as a download.
+    proxy_helpers::record_proxy_download(state, repo_id, repo_key, &cache_path, ctx).await;
     proxy_helpers::stream_fetch_result(result, content_type, Some(filename))
 }
 
@@ -520,6 +529,7 @@ async fn fetch_chart_via_index(
 /// directly, the same `authorize_virtual_members` filter the OCI virtual
 /// walkers and `resolve_virtual_download` apply. Without it a public virtual
 /// parent laundered a PRIVATE member's chart bytes to anonymous callers.
+#[allow(clippy::too_many_arguments)]
 async fn download_chart_via_index(
     state: &SharedState,
     repo: &RepoInfo,
@@ -527,6 +537,7 @@ async fn download_chart_via_index(
     name: &str,
     version: &str,
     filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Option<Response>, Response> {
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
@@ -546,6 +557,7 @@ async fn download_chart_via_index(
             return Ok(None);
         };
         let response = fetch_chart_via_index(
+            state,
             proxy,
             repo.id,
             &repo.key,
@@ -553,6 +565,7 @@ async fn download_chart_via_index(
             name,
             version,
             filename,
+            ctx,
         )
         .await?;
         return Ok(Some(response));
@@ -605,7 +618,11 @@ async fn download_chart_via_index(
             let Some(upstream_url) = member.upstream_url.as_deref() else {
                 continue;
             };
+            // #3446: a Remote MEMBER's serve is recorded against the member,
+            // not the virtual parent — the member owns the proxy cache the
+            // bytes came from and the catalog row that carries the count.
             match fetch_chart_via_index(
+                state,
                 proxy,
                 member.id,
                 &member.key,
@@ -613,6 +630,7 @@ async fn download_chart_via_index(
                 name,
                 version,
                 filename,
+                ctx,
             )
             .await
             {
@@ -678,6 +696,7 @@ async fn download_chart(
                         &name,
                         &version,
                         &filename,
+                        &ctx,
                     )
                     .await?
                     {
@@ -2488,17 +2507,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy",
             &upstream_url,
             "mychart",
             "1.0.0",
             "mychart-1.0.0.tgz",
+            &ctx,
         )
         .await;
 
@@ -2551,17 +2578,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy-abs",
             &upstream_url,
             "abs-chart",
             "1.0.0",
             "abs-chart-1.0.0.tgz",
+            &ctx,
         )
         .await;
 
@@ -2615,7 +2650,13 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         for i in 0..2 {
@@ -2625,13 +2666,15 @@ entries:
                 tdh::wait_for_cache_commit(&tmp, chart_bytes.len() as u64).await;
             }
             let result = fetch_chart_via_index(
-                &proxy,
+                &state,
+                proxy,
                 repo_id,
                 "helm-proxy-big",
                 &upstream_url,
                 "big",
                 "3.0.0",
                 "big-3.0.0.tgz",
+                &ctx,
             )
             .await;
             match result {
@@ -2710,17 +2753,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy-prov",
             &upstream_url,
             "mychart",
             "1.0.0",
             "mychart-1.0.0.tgz.prov",
+            &ctx,
         )
         .await;
 
@@ -2828,17 +2879,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy",
             &upstream_url,
             "nonexistent",
             "9.9.9",
             "nonexistent-9.9.9.tgz",
+            &ctx,
         )
         .await;
 
@@ -2871,17 +2930,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy",
             &upstream_url,
             "mychart",
             "1.0.0",
             "mychart-1.0.0.tgz",
+            &ctx,
         )
         .await;
 
@@ -2924,6 +2991,7 @@ entries:
         let tmp = proxy_tmp_dir();
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
@@ -2942,7 +3010,8 @@ entries:
         };
 
         let result =
-            download_chart_via_index(&state, &repo, None, "tc", "2.0.0", "tc-2.0.0.tgz").await;
+            download_chart_via_index(&state, &repo, None, "tc", "2.0.0", "tc-2.0.0.tgz", &ctx)
+                .await;
 
         let _ = std::fs::remove_dir_all(&tmp);
 
@@ -2963,6 +3032,7 @@ entries:
             .expect("connect_lazy");
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
@@ -2981,7 +3051,8 @@ entries:
         };
 
         let result =
-            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz", &ctx)
+                .await;
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(matches!(result, Ok(None)));
@@ -2994,6 +3065,7 @@ entries:
             .expect("connect_lazy");
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
@@ -3012,7 +3084,8 @@ entries:
         };
 
         let result =
-            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz", &ctx)
+                .await;
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(matches!(result, Ok(None)));
