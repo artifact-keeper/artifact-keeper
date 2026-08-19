@@ -220,6 +220,18 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 /// unreferenced and was purged by the sweep while its parent artifact was
 /// still serving it (#3156).
 ///
+/// The FIRST arm is the source allowlist
+/// ([`crate::services::maven_flat_attribution::SYSTEM_WRITTEN_ATTRIBUTION_SOURCES`]).
+/// Everything below it tests catalog *anchors*, which is only a proof of
+/// garbage for rows the system wrote and can re-derive. An owner row is also
+/// what makes a row-less legacy object READABLE (#2574/#2585), and for an
+/// object whose only catalog record is its owner row every anchor arm is true
+/// by construction and permanently — so before this arm existed, an
+/// operator-inserted row (the documented repair for keys the catalog-only
+/// backfill cannot see) nominated its own object for deletion within the hour
+/// (#3431). Unknown/novel sources are protected by default: the arm is an
+/// allowlist, so the failure direction is leaked storage, never lost bytes.
+///
 /// Guards 3, 4 and 5 likewise take their sidecar-suffix regex from
 /// [`crate::services::maven_flat_attribution::GUARDED_SIDECAR_SUFFIXES`] rather
 /// than an inline `(md5|sha1|sha256|sha512)` alternation. The inline copies
@@ -238,7 +250,8 @@ static ORPHAN_MAVEN_FLAT_PREDICATE_SQL: Lazy<String> = Lazy::new(|| {
     let sidecar_base = mfa::sidecar_base_key_sql("o.storage_key");
     format!(
         r#"
-o.storage_key LIKE 'maven/%'
+{system_source}
+AND o.storage_key LIKE 'maven/%'
 AND o.created_at < NOW() - INTERVAL '1 hour'
 AND NOT EXISTS (
     SELECT 1 FROM artifacts a
@@ -277,6 +290,7 @@ AND NOT EXISTS (
       AND {sidecar_base_files_match}
 )
 "#,
+        system_source = mfa::system_written_source_sql("o.source"),
         files_match = mfa::metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key"),
         is_rollup = mfa::is_metadata_rollup_key_sql("o.storage_key"),
         rollup_dir = mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
@@ -294,6 +308,14 @@ pub struct StorageGcResult {
     pub artifacts_removed: i64,
     pub bytes_freed: i64,
     pub errors: Vec<String>,
+    /// Orphaned row-less Maven flat objects this pass identified but left in
+    /// place because the sweep is not opted in (`MAVEN_FLAT_GC_ENABLED`
+    /// unset, #3431). Report-only: these objects and their attribution rows
+    /// were NOT deleted and are not counted in `storage_keys_deleted`. Always
+    /// `0` on a dry run (a dry run deletes nothing anyway) and when the sweep
+    /// is enabled.
+    #[serde(default)]
+    pub maven_flat_objects_gated: i64,
 }
 
 /// Default grace window (hours) used to classify "recent" OCI blobs in the
@@ -382,6 +404,13 @@ pub struct OciBlobFootprintReport {
 pub struct StorageGcService {
     db: PgPool,
     storage_registry: Arc<StorageRegistry>,
+    /// Opt-in gate for [`StorageGcService::cleanup_orphan_maven_flat_objects`]
+    /// (#3431). `false` — the default from [`StorageGcService::new`] — makes
+    /// that sweep report-only. Set from `Config::maven_flat_gc_enabled` via
+    /// [`StorageGcService::with_maven_flat_gc_enabled`] at every production
+    /// entry point (scheduler + admin handlers), so an entry point that
+    /// forgets to wire the flag fails SAFE.
+    maven_flat_gc_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -469,7 +498,19 @@ impl StorageGcService {
         Self {
             db,
             storage_registry,
+            // Fail safe: the orphan Maven flat-object sweep never deletes
+            // until a caller explicitly opts in (#3431).
+            maven_flat_gc_enabled: false,
         }
+    }
+
+    /// Opt the orphaned row-less Maven flat-object sweep into live deletion
+    /// (#3431). Mirrors `BLOB_GC_ENABLED`: without this the sweep still runs
+    /// and reports what it would reclaim, but deletes nothing.
+    #[must_use]
+    pub fn with_maven_flat_gc_enabled(mut self, enabled: bool) -> Self {
+        self.maven_flat_gc_enabled = enabled;
+        self
     }
 
     /// Get the storage backend for a given storage location.
@@ -2316,6 +2357,27 @@ impl StorageGcService {
         let candidates = self.select_orphan_maven_flat_objects(repo_scope).await?;
         let mut objects_removed = 0_i64;
 
+        // Opt-in gate (#3431), mirroring BLOB_GC_ENABLED's "bias to leaking
+        // storage over losing data". This sweep's entire subject matter is
+        // objects the catalog cannot see; on an instance migrated from another
+        // registry that absence is the EXPECTED state of legitimate legacy
+        // data — it is why the attribution table exists — so catalog absence
+        // alone is not proof of garbage. Unset, the pass still reports what it
+        // would reclaim and deletes nothing.
+        if !dry_run && !self.maven_flat_gc_enabled {
+            let gated = candidates.len() as i64;
+            result.maven_flat_objects_gated += gated;
+            if gated > 0 {
+                tracing::info!(
+                    maven_flat_objects_gated = gated,
+                    "Maven flat GC (disabled): would reclaim {} orphaned row-less Maven flat \
+                     objects; deleting nothing (set MAVEN_FLAT_GC_ENABLED=true to delete)",
+                    gated,
+                );
+            }
+            return Ok(());
+        }
+
         for row in candidates {
             let storage_key: String = row
                 .try_get("storage_key")
@@ -3187,6 +3249,7 @@ pub(crate) fn empty_gc_result(dry_run: bool) -> StorageGcResult {
         artifacts_removed: 0,
         bytes_freed: 0,
         errors: Vec::new(),
+        maven_flat_objects_gated: 0,
     }
 }
 
@@ -3283,6 +3346,7 @@ mod tests {
             artifacts_removed: 12,
             bytes_freed: 1024 * 1024,
             errors: vec![],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"storage_keys_deleted\":5"));
@@ -3297,6 +3361,7 @@ mod tests {
             artifacts_removed: 0,
             bytes_freed: 0,
             errors: vec![],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"dry_run\":true"));
@@ -3310,6 +3375,7 @@ mod tests {
             artifacts_removed: 3,
             bytes_freed: 512,
             errors: vec!["Failed to delete key abc".to_string()],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -3333,6 +3399,7 @@ mod tests {
                 "error two".to_string(),
                 "error three".to_string(),
             ],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -3369,6 +3436,7 @@ mod tests {
             artifacts_removed: i64::MAX,
             bytes_freed: i64::MAX,
             errors: vec![],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         let restored: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -3385,6 +3453,7 @@ mod tests {
             artifacts_removed: 0,
             bytes_freed: 0,
             errors: vec![],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"errors\":[]"));
@@ -3398,6 +3467,7 @@ mod tests {
             artifacts_removed: 2,
             bytes_freed: 3,
             errors: vec!["err".to_string()],
+            maven_flat_objects_gated: 0,
         };
         let debug = format!("{:?}", result);
         assert!(debug.contains("StorageGcResult"));
@@ -3417,6 +3487,7 @@ mod tests {
             artifacts_removed: 50,
             bytes_freed: 50 * 1024,
             errors: errors.clone(),
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         let restored: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -4359,15 +4430,36 @@ mod tests {
         storage_key: &str,
         age_hours: i32,
     ) {
+        insert_flat_attribution_row_with_source(
+            pool,
+            repo_id,
+            storage_key,
+            age_hours,
+            "write_claim",
+        )
+        .await;
+    }
+
+    /// [`insert_flat_attribution_row`] with an explicit `source`, for the
+    /// #3431 tests that turn on which writer produced the row. `source` is a
+    /// test literal, never external input.
+    async fn insert_flat_attribution_row_with_source(
+        pool: &PgPool,
+        repo_id: Uuid,
+        storage_key: &str,
+        age_hours: i32,
+        source: &str,
+    ) {
         sqlx::query(
             "INSERT INTO maven_flat_object_owner \
                  (storage_backend, storage_key, repository_id, source, created_at) \
-             VALUES ('filesystem', $1, $2, 'write_claim', \
+             VALUES ('filesystem', $1, $2, $4, \
                      NOW() - make_interval(hours => $3))",
         )
         .bind(storage_key)
         .bind(repo_id)
         .bind(age_hours)
+        .bind(source)
         .execute(pool)
         .await
         .expect("insert flat attribution row");
@@ -4397,8 +4489,13 @@ mod tests {
         let fixture =
             crate::api::handlers::test_db_helpers::Fixture::setup("local", "maven").await?;
         let storage = fixture_storage(&fixture);
+        // These are the #2668 RECLAIM tests, so they opt the flat-object
+        // sweep in explicitly (#3431). The default is report-only; the gate
+        // itself is covered by
+        // `test_run_gc_gated_flat_sweep_reports_but_deletes_nothing_3431`.
         let service =
-            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_maven_flat_gc_enabled(true);
         let uid = Uuid::new_v4().simple().to_string();
         Some((fixture, storage, service, uid))
     }
@@ -4593,6 +4690,284 @@ mod tests {
              (#2668 safety)"
         );
         assert_eq!(rows_left, 2, "both attribution rows must be intact");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3431: the attribution table must not nominate its own keys for deletion
+    // -----------------------------------------------------------------------
+
+    /// Revert-proof, DB-free: the source allowlist must be IN the predicate,
+    /// and every value in it must be one the system actually writes.
+    ///
+    /// `ORPHAN_MAVEN_FLAT_PREDICATE_SQL` enumerates its candidates FROM
+    /// `maven_flat_object_owner` and tests catalog anchors only. Since
+    /// #2574/#2585 an owner row is also what makes a row-less legacy object
+    /// READABLE, so for an object whose only catalog record is its owner row
+    /// every anchor arm is true by construction and permanently: without this
+    /// arm the row that makes the object servable is the row that queues it
+    /// for deletion (#3431).
+    #[test]
+    fn test_flat_predicate_restricts_reclaim_to_system_written_sources_3431() {
+        use crate::services::maven_flat_attribution as mfa;
+
+        let arm = mfa::system_written_source_sql("o.source");
+        assert!(
+            ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(&arm),
+            "ORPHAN_MAVEN_FLAT_PREDICATE_SQL must restrict reclaim to \
+             system-written attribution sources (#3431); expected the arm \
+             {arm} to appear in:\n{}",
+            ORPHAN_MAVEN_FLAT_PREDICATE_SQL.as_str()
+        );
+        for source in mfa::SYSTEM_WRITTEN_ATTRIBUTION_SOURCES {
+            assert!(
+                arm.contains(&format!("'{source}'")),
+                "{source} must be quoted into the SQL allowlist"
+            );
+        }
+        // An ALLOWLIST, not a denylist: the arm must name the sources it
+        // permits, never the ones it excludes, so an unknown/future value is
+        // protected by default rather than reclaimed by default.
+        assert!(
+            arm.contains(" IN (") && !arm.contains("NOT IN"),
+            "the source arm must be an allowlist (`IN`), so unknown sources \
+             fail SAFE (#3431); got: {arm}"
+        );
+    }
+
+    /// #3431 repro, fixed: an operator repairs a fail-closed 404 by inserting
+    /// an attribution row by hand (`source='manual'`, the documented
+    /// remediation for keys the catalog-only backfill of migrations 163/170
+    /// cannot see). Before the fix the next hourly pass deleted the S3 object
+    /// AND the row, so the key went 404 -> 200 -> permanently gone.
+    ///
+    /// The sweep is opted IN here, so this test isolates the source allowlist
+    /// from the opt-in gate: reverting the allowlist alone must fail it.
+    ///
+    /// The `write_claim` positive control is load-bearing — the fix must not
+    /// disable the sweep's legitimate purpose. An orphaned claim left by a
+    /// crashed first publish is exactly the leftover it exists to collect,
+    /// and without this assertion "spare everything" would pass.
+    #[tokio::test]
+    async fn test_run_gc_spares_operator_attributed_flat_object_3431() {
+        let Some((fixture, storage, service, uid)) = maven_gc_2668_setup().await else {
+            return;
+        };
+
+        // Hand-repaired legacy companion: no artifacts row, no files[]
+        // reference, nothing under its directory. Its owner row is the ONLY
+        // record of it, and the only reason a GET serves it.
+        let manual = format!("maven/gc3431/{uid}/com/example/lib/1.0.0/lib-1.0.0.pom");
+        // Orphaned write claim from a crashed publish: system-written, and
+        // re-derivable (the next publish re-claims the key).
+        let claim = format!("maven/gc3431/{uid}/com/example/crashed/1.0.0/crashed-1.0.0.jar");
+        seed_objects(&storage, &[&manual, &claim]).await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &manual,
+            2,
+            "manual",
+        )
+        .await;
+        insert_flat_attribution_row(&fixture.pool, fixture.repo_id, &claim, 2).await;
+
+        let gc = service.run_gc_for_repository(fixture.repo_id, false).await;
+
+        let left = objects_left(&storage, &[&manual, &claim]).await;
+        let manual_rows = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &manual).await;
+        let claim_rows = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &claim).await;
+        fixture.teardown().await;
+
+        gc.expect("run_gc_for_repository succeeds");
+        assert!(
+            left[0],
+            "an object whose owner row an OPERATOR wrote (source='manual') \
+             must survive the sweep — that row is a primary record, not a \
+             re-derivable cache, and deleting the object destroys the only \
+             physical copy (#3431)"
+        );
+        assert_eq!(
+            manual_rows, 1,
+            "the operator's attribution row must survive too — it is the only \
+             record that the key was hand-attributed, and losing it makes the \
+             object unreadable even if the bytes were restored (#3431)"
+        );
+        assert!(
+            !left[1],
+            "positive control: an orphaned `write_claim` is system-written and \
+             re-derivable, so it must STILL be reclaimed — the fix must not \
+             disable the sweep's legitimate purpose (#3431)"
+        );
+        assert_eq!(
+            claim_rows, 0,
+            "the reclaimed claim's attribution row is dropped with its object"
+        );
+    }
+
+    /// Per-source candidacy, at the scan: every system-written source stays
+    /// reclaimable once its anchors are gone, and every non-system source —
+    /// including a value no code in this tree has ever written — is spared.
+    ///
+    /// The unknown-source case (`external_repair_tool`) is the FAIL-SAFE
+    /// property: the arm is an allowlist, so a value stamped by a future code
+    /// path or an external repair tool is protected until someone
+    /// deliberately adds it. Getting this backwards leaks storage; getting it
+    /// right the other way destroys the only copy of an object.
+    ///
+    /// Repository-scoped, so no GC lock is needed (#1493 pattern).
+    #[tokio::test]
+    async fn test_orphan_maven_flat_scan_spares_non_system_sources_3431() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::maven_flat_attribution::SYSTEM_WRITTEN_ATTRIBUTION_SOURCES;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let uid = Uuid::new_v4().simple().to_string();
+
+        // Non-system sources: the operator repair from the report, plus a
+        // value nothing in this tree writes.
+        let protected_sources = ["manual", "external_repair_tool"];
+
+        let mut expect_collected = Vec::new();
+        for source in SYSTEM_WRITTEN_ATTRIBUTION_SOURCES {
+            let key = format!("maven/scan3431/{uid}/{source}/1.0/gone-1.0.pom");
+            insert_flat_attribution_row_with_source(
+                &fixture.pool,
+                fixture.repo_id,
+                &key,
+                2,
+                source,
+            )
+            .await;
+            expect_collected.push((source, key));
+        }
+        let mut expect_spared = Vec::new();
+        for source in protected_sources {
+            let key = format!("maven/scan3431/{uid}/{source}/1.0/kept-1.0.pom");
+            insert_flat_attribution_row_with_source(
+                &fixture.pool,
+                fixture.repo_id,
+                &key,
+                2,
+                source,
+            )
+            .await;
+            expect_spared.push((source, key));
+        }
+
+        let rows = service
+            .select_orphan_maven_flat_objects(Some(fixture.repo_id))
+            .await;
+        let collected: Vec<String> = rows
+            .expect("scan succeeds")
+            .iter()
+            .map(|r| r.get::<String, _>("storage_key"))
+            .collect();
+        fixture.teardown().await;
+
+        for (source, key) in &expect_collected {
+            assert!(
+                collected.contains(key),
+                "source='{source}' is written by the system and is a cache \
+                 over other catalog state, so it must STAY reclaimable once \
+                 its anchors are gone — sparing it leaks storage forever \
+                 (#3431); collected: {collected:?}"
+            );
+        }
+        for (source, key) in &expect_spared {
+            assert!(
+                !collected.contains(key),
+                "source='{source}' is not one the system writes, so its row is \
+                 a primary record nothing can re-derive and its object must NOT \
+                 be collected; unknown sources are protected by DEFAULT because \
+                 the arm is an allowlist (#3431); collected: {collected:?}"
+            );
+        }
+    }
+
+    /// The opt-in gate (#3431), mirroring `BLOB_GC_ENABLED`: with
+    /// `MAVEN_FLAT_GC_ENABLED` unset the sweep still reports what it would
+    /// reclaim but deletes nothing — neither the object nor its attribution
+    /// row. Flipping the flag on the same fixture data reclaims it, which
+    /// keeps the gate from passing by simply never finding candidates.
+    ///
+    /// This runs through `run_gc_for_repository`, the per-repository admin
+    /// endpoint's entry point, which shares both the predicate constant and
+    /// the gate with the scheduled pass.
+    #[tokio::test]
+    async fn test_run_gc_gated_flat_sweep_reports_but_deletes_nothing_3431() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let storage = fixture_storage(&fixture);
+        let uid = Uuid::new_v4().simple().to_string();
+
+        // Genuinely orphaned, system-written, past the age floor: the source
+        // allowlist alone would reclaim this one.
+        let key = format!("maven/gate3431/{uid}/lib/maven-metadata.xml");
+        seed_objects(&storage, &[&key]).await;
+        insert_flat_attribution_row(&fixture.pool, fixture.repo_id, &key, 2).await;
+
+        // Default construction == MAVEN_FLAT_GC_ENABLED unset.
+        let gated =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let gated_result = gated
+            .run_gc_for_repository(fixture.repo_id, false)
+            .await
+            .expect("gated run_gc_for_repository succeeds");
+        let survived = storage.exists(&key).await.expect("exists check");
+        let rows_after_gated = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &key).await;
+
+        // Same data, same code path, flag on.
+        let enabled =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_maven_flat_gc_enabled(true);
+        let enabled_result = enabled
+            .run_gc_for_repository(fixture.repo_id, false)
+            .await
+            .expect("enabled run_gc_for_repository succeeds");
+        let left_after_enabled = storage.exists(&key).await.expect("exists check");
+        let rows_after_enabled = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &key).await;
+        fixture.teardown().await;
+
+        assert!(
+            survived,
+            "with MAVEN_FLAT_GC_ENABLED unset the flat-object sweep must \
+             delete nothing (#3431)"
+        );
+        assert_eq!(
+            rows_after_gated, 1,
+            "the attribution row must survive the gated pass too"
+        );
+        assert_eq!(
+            gated_result.maven_flat_objects_gated, 1,
+            "the gated pass must still REPORT what it would reclaim, so an \
+             operator can size the sweep before opting in (#3431)"
+        );
+        assert_eq!(
+            gated_result.storage_keys_deleted, 0,
+            "a gated pass must not count un-deleted objects as deleted"
+        );
+
+        assert!(
+            !left_after_enabled,
+            "positive control: with the flag on, the very same key IS \
+             reclaimed — otherwise the gate test would pass on a sweep that \
+             simply never finds candidates (#3431)"
+        );
+        assert_eq!(
+            rows_after_enabled, 0,
+            "the enabled pass drops the attribution row with the object"
+        );
+        assert_eq!(
+            enabled_result.maven_flat_objects_gated, 0,
+            "nothing is gated once the sweep is opted in"
+        );
     }
 
     /// End-to-end variant of the manifest-survival test: run GC with

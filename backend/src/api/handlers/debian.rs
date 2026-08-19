@@ -2796,6 +2796,18 @@ async fn pool_download(
                         RepositoryFormat::Debian,
                     )
                     .await?;
+                    // #3446: count the proxied `.deb`. `upstream_path` is also
+                    // the proxy-cache key this fetch commits under, so the
+                    // recorded (repo, path) matches the catalog row the
+                    // artifact listing reads its `download_count` from.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
+                    .await;
                     return proxy_helpers::stream_fetch_result(
                         result,
                         DEBIAN_BINARY_CONTENT_TYPE,

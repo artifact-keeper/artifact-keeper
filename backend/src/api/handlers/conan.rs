@@ -1607,6 +1607,15 @@ async fn recipe_file_download(
                     // merged coordinator so concurrent cold-misses collapse to
                     // a single upstream fetch (#1609). octet-stream default
                     // matches the buffered handler's prior fallback.
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -2403,6 +2412,15 @@ async fn package_file_download(
                     // buffering it in memory. Single-flight via the merged
                     // coordinator (#1609). octet-stream default matches the
                     // buffered handler's prior fallback.
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -3630,6 +3648,7 @@ mod tests {
                 gc_schedule: "0 0 * * * *".into(),
                 storage_stats_schedule: "0 0 */4 * * *".into(),
                 blob_gc_enabled: false,
+                maven_flat_gc_enabled: false,
                 blob_gc_sweep_grace_secs: 3600,
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,

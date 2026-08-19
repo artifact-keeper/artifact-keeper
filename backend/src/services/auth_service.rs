@@ -3632,6 +3632,7 @@ mod tests {
             gc_schedule: "0 0 * * * *".to_string(),
             storage_stats_schedule: "0 0 */4 * * *".to_string(),
             blob_gc_enabled: false,
+            maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,

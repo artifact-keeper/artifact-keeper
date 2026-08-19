@@ -1054,7 +1054,7 @@ async fn download_zip(
                     // matches the buffered handler's prior fallback so the
                     // Go toolchain still sees `application/zip` when
                     // upstream omits the header (review N2).
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo.key,
@@ -1062,7 +1062,22 @@ async fn download_zip(
                         &upstream_path,
                         "application/zip",
                     )
+                    .await?;
+                    // #3446: count the proxied module zip. The `.mod` and
+                    // `.info` siblings are metadata the toolchain fetches on
+                    // every resolve; the `.zip` is the artifact, so it is the
+                    // one seam that counts — the same "one download per
+                    // fetched artifact, not per protocol round-trip" rule
+                    // OCI applies at the manifest.
+                    proxy_helpers::record_proxy_download(
+                        state,
+                        repo.id,
+                        &repo.key,
+                        &upstream_path,
+                        ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
 

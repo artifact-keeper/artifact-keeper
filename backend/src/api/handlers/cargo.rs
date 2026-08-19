@@ -1048,6 +1048,24 @@ async fn download(
                     if let Some(ref encoding) = result.content_encoding {
                         builder = builder.header(CONTENT_ENCODING, encoding);
                     }
+                    // #3446: count the proxied crate. This arm returns the
+                    // upstream stream directly, so it never reached the
+                    // `record_download` call ~15 lines below on the hosted
+                    // path — and `record_download` would not have helped
+                    // anyway: it is keyed on an `artifacts.id`, and a
+                    // proxy-cached crate has no `artifacts` row. The proxy
+                    // recorder is keyed on (repo, path) instead, and the path
+                    // is `cache_path` — the same canonical key the streaming
+                    // tee commits the catalog row under, so the count and the
+                    // listing row line up.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &cache_path,
+                        &ctx,
+                    )
+                    .await;
                     return Ok(builder.body(Body::from_stream(result.body)).unwrap());
                 }
             }
