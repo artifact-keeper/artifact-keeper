@@ -474,6 +474,19 @@ pub struct Config {
     /// check, so it never deletes while ref coverage is incomplete.
     pub blob_gc_enabled: bool,
 
+    /// Whether the orphaned row-less Maven flat-object sweep is allowed to
+    /// actually delete objects (#3431). Defaults to `false`, mirroring
+    /// [`Self::blob_gc_enabled`]: the sweep's whole subject matter is objects
+    /// the *catalog cannot see*, and on an instance migrated from another
+    /// registry that absence is the EXPECTED state of legitimate legacy data —
+    /// it is why the attribution table exists at all. Catalog absence alone is
+    /// therefore not proof of garbage, so the sweep must not delete until an
+    /// operator opts in with `MAVEN_FLAT_GC_ENABLED=true`. Unset, the sweep
+    /// still runs and REPORTS what it would reclaim
+    /// (`StorageGcResult::maven_flat_objects_gated`) but deletes nothing.
+    /// Bias to leaking storage over losing data.
+    pub maven_flat_gc_enabled: bool,
+
     /// Sweep-grace window (seconds) for the two-phase mark-and-sweep blob GC
     /// (#1660). A blob is first *marked* (`pending_delete_at`) in one pass and
     /// only physically *swept* (storage + row delete) in a later pass once it
@@ -907,6 +920,7 @@ redacted_debug!(Config {
     show gc_schedule,
     show storage_stats_schedule,
     show blob_gc_enabled,
+    show maven_flat_gc_enabled,
     show blob_gc_sweep_grace_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
@@ -1023,6 +1037,7 @@ impl Default for Config {
             gc_schedule: "0 0 * * * *".into(),
             storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
+            maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
@@ -1235,6 +1250,13 @@ impl Config {
             // Accepts "true" / "1" (case-insensitive); anything else
             // (empty, garbage, unset) keeps live blob deletion disabled.
             blob_gc_enabled: parse_opt_in_flag(env::var("BLOB_GC_ENABLED").ok().as_deref()),
+            // The Maven flat-object sweep deletes objects whose only catalog
+            // record is their attribution row — including rows an operator
+            // inserted by hand to repair a fail-closed 404. Same opt-in
+            // discipline as blob GC: unset means report-only (#3431).
+            maven_flat_gc_enabled: parse_opt_in_flag(
+                env::var("MAVEN_FLAT_GC_ENABLED").ok().as_deref(),
+            ),
             // Two-phase blob-GC sweep grace (#1660). Clamped to at most 7 days
             // so a fat-fingered enormous value can't silently disable the
             // sweep forever; `0` is allowed (sweep on the next pass).
@@ -1905,6 +1927,63 @@ mod tests {
             env::set_var("BLOB_GC_ENABLED", v);
         } else {
             env::remove_var("BLOB_GC_ENABLED");
+        }
+    }
+
+    /// #3431: the orphaned Maven flat-object sweep must be opt-in, exactly as
+    /// blob deletion is. Its candidates are keys the catalog cannot see, which
+    /// on a migrated instance is the expected state of legitimate legacy data,
+    /// so "no anchors" is not proof of garbage without an operator saying so.
+    #[test]
+    fn test_config_maven_flat_gc_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("MAVEN_FLAT_GC_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("MAVEN_FLAT_GC_ENABLED");
+
+        let config = Config::from_env().unwrap();
+        assert!(
+            !config.maven_flat_gc_enabled,
+            "Maven flat-object GC must default to report-only when \
+             MAVEN_FLAT_GC_ENABLED is unset (#3431)"
+        );
+
+        // Only the recognized affirmatives opt in; garbage must not enable a
+        // destructive sweep by accident.
+        for value in ["false", "no", "", "yes-please"] {
+            env::set_var("MAVEN_FLAT_GC_ENABLED", value);
+            assert!(
+                !Config::from_env().unwrap().maven_flat_gc_enabled,
+                "MAVEN_FLAT_GC_ENABLED={value:?} must not enable deletion"
+            );
+        }
+
+        env::set_var("MAVEN_FLAT_GC_ENABLED", "true");
+        let config = Config::from_env().unwrap();
+        assert!(
+            config.maven_flat_gc_enabled,
+            "MAVEN_FLAT_GC_ENABLED=true must opt into live flat-object deletion"
+        );
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_flag {
+            env::set_var("MAVEN_FLAT_GC_ENABLED", v);
+        } else {
+            env::remove_var("MAVEN_FLAT_GC_ENABLED");
         }
     }
 
