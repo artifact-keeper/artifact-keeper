@@ -129,6 +129,77 @@ pub(crate) fn metadata_files_name_key_sql(files_expr: &str, key_expr: &str) -> S
 pub(crate) const GUARDED_SIDECAR_SUFFIXES: [&str; 5] =
     [".md5", ".sha1", ".sha256", ".sha512", ".asc"];
 
+/// Every `maven_flat_object_owner.source` value the SYSTEM writes, and
+/// therefore the only rows storage GC may treat as reclaimable (#3431).
+///
+/// An owner row plays two roles, and they pull in opposite directions. Since
+/// #2574/#2585 the row is what makes a *row-less* legacy object READABLE
+/// (owner-table resolution, the last layer of [`attributed_owner`]) — for an
+/// object whose only catalog record is its owner row, that row is the primary
+/// record and nothing else can reconstruct it. But the orphan flat-object
+/// sweep enumerates its delete candidates from the same table, so without a
+/// source filter the row that makes an object servable is also the row that
+/// queues it for deletion: every catalog-anchor arm of the sweep's predicate
+/// is true by construction, and permanently, for exactly that class. An
+/// operator who repaired a fail-closed 404 by inserting an attribution row —
+/// the documented remediation for keys the migration-163/170 catalog-only
+/// backfill cannot see — got a 200 for one hour and then lost the bytes
+/// (#3431).
+///
+/// The invariant that separates safe from unsafe reclaim: GC may only delete
+/// keys whose attribution row the system itself WROTE and can RE-DERIVE.
+/// Those rows are caches over other catalog state, so once the anchors are
+/// gone the row is stale by definition. This list is that set, and it is
+/// exhaustive against the writers:
+///
+/// * `primary_row`, `metadata_files`, `metadata_rollup`, `derived_checksum` —
+///   migration 163 steps (1), (2), (4a/4b/4c) and (3)/(4d); migration 170
+///   re-runs (2') and (3') for the camelCase `files[]` spelling.
+/// * `write_claim` — [`insert_claim`] and [`claim_flat_key_for_write`], the
+///   only runtime writers.
+///
+/// `write_claim` stays reclaimable **deliberately**: an orphaned claim left by
+/// a crashed first publish is precisely the leftover the sweep exists to
+/// collect, and its row is re-derivable (the next publish re-claims the key).
+///
+/// This is an ALLOWLIST, not a denylist, so the failure direction is safe: any
+/// value written by a future code path, an external repair tool, or an
+/// operator's `INSERT ... 'manual'` is unknown here and therefore PROTECTED
+/// until someone deliberately adds it. A new system-written source that is
+/// forgotten here leaks storage; a hand-written source treated as system-owned
+/// destroys the only copy of an object.
+///
+/// Scope: this is a **sweep**-level invariant, not a table-level one. The
+/// other place that enumerates delete candidates from this table —
+/// `collect_repo_maven_flat_keys` in the repository-delete purge — is
+/// deliberately NOT filtered by source: there the trigger is an operator
+/// explicitly deleting the very repository the row names as owner, so an
+/// operator-written row saying "repo X owns this key" plus "delete repo X" is
+/// a coherent instruction, and the rows CASCADE away with the repository in
+/// any case (sparing the objects would leak them permanently, since nothing
+/// would be left to track them). What made GC different is that the row's
+/// mere existence past the one-hour age floor was the entire trigger.
+pub(crate) const SYSTEM_WRITTEN_ATTRIBUTION_SOURCES: [&str; 5] = [
+    "primary_row",
+    "metadata_files",
+    "derived_checksum",
+    "metadata_rollup",
+    "write_claim",
+];
+
+/// SQL predicate: was `source_expr` written by the system, i.e. is the row a
+/// re-derivable cache that GC may reclaim? Built from
+/// [`SYSTEM_WRITTEN_ATTRIBUTION_SOURCES`] so the list and the SQL cannot
+/// drift.
+pub(crate) fn system_written_source_sql(source_expr: &str) -> String {
+    let list = SYSTEM_WRITTEN_ATTRIBUTION_SOURCES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{source_expr} IN ({list})")
+}
+
 /// The `(md5|sha1|...)` regex alternation built from
 /// [`GUARDED_SIDECAR_SUFFIXES`], so the SQL and the list cannot drift.
 fn guarded_sidecar_alternation() -> String {

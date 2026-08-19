@@ -351,8 +351,14 @@ pub fn spawn_all(
             // the scheduled pass runs DRY-RUN: it logs what it would reclaim
             // but deletes nothing. Bias to leaking storage over losing data.
             let blob_gc_dry_run = !config_clone.blob_gc_enabled;
+            // The orphaned row-less Maven flat-object sweep is opt-in for the
+            // same reason blob deletion is (#3431): its candidates are keys
+            // the catalog cannot see, which on a migrated instance is the
+            // expected state of legitimate legacy data. Unset, that sweep
+            // reports what it would reclaim and deletes nothing.
             let service =
-                crate::services::storage_gc_service::StorageGcService::new(db, gc_registry);
+                crate::services::storage_gc_service::StorageGcService::new(db, gc_registry)
+                    .with_maven_flat_gc_enabled(config_clone.maven_flat_gc_enabled);
 
             let normalized = normalize_cron_expression(&config_clone.gc_schedule);
             let gc_schedule = match parse_cron_schedule(&normalized) {
