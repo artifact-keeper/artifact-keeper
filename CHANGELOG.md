@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-08-19
+
 ### Fixed
 
 - **Storage GC no longer deletes Maven objects whose attribution row an operator wrote, and the flat-object sweep is now opt-in** (#3431, reported by [@ThaSami](https://github.com/ThaSami)). `cleanup_orphan_maven_flat_objects` enumerated its delete candidates **from `maven_flat_object_owner`** and reclaimed every row whose catalog anchors were gone — live, on the hourly scheduled pass. But since #2574/#2585 that same row is what makes a *row-less* legacy object **readable**: it is the last layer of read-time owner resolution, and inserting one is the documented remediation for keys the catalog-only backfill of migrations 163/170 cannot see. For exactly that class — an object whose only catalog record is its owner row — every anchor arm of the sweep's predicate is true by construction and permanently. The row that made the object servable was the row that queued it for deletion: an operator who repaired a fail-closed 404 by attributing the key got a 200 for one hour, and then lost the bytes. The flat key is the only physical copy, and the sweep deleted the attribution row with it, so nothing recorded that the key had ever been hand-attributed.
