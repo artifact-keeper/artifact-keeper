@@ -14417,3 +14417,336 @@ mod tests {
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
 }
+
+/// #3446: proxy/remote download RECORDING across every format handler.
+///
+/// Two functions count a download and they are not interchangeable.
+/// [`crate::services::artifact_service::record_download`] is keyed on an
+/// `artifacts.id` and writes `download_statistics`; [`record_proxy_download`]
+/// is keyed on `(repository, path)` and writes `proxy_download_statistics`.
+/// Proxy-cached content is deliberately not registered in `artifacts` (#1278),
+/// so a format that calls only the first *looks* instrumented on inspection and
+/// records nothing at runtime — the id lookup returns `None`, nothing errors,
+/// and the counter simply never moves. That is exactly how ~19 formats stayed
+/// broken behind #3388, which fixed Maven and concluded Maven was the only one.
+///
+/// So the gate below is structural rather than per-format. It scans EVERY
+/// format handler for the primitives that serve upstream bytes to a client and
+/// requires each site to be one of exactly two things:
+///
+/// * within a function that records the serve — directly via
+///   [`record_proxy_download`], or through
+///   [`try_remote_or_virtual_download`], which records internally — or one
+///   call hop from such a function (pypi records in the CALLER of its
+///   streaming helper, npm in the CALLEE; both are correct and neither should
+///   need a marker); or
+/// * carrying an explicit `UNRECORDED-PROXY-SERVE:` marker, which forces the
+///   author to write down in the source WHY this serve is not counted.
+///
+/// The marker exists because not counting is sometimes right: a HEAD serves no
+/// body, and an OCI blob must not be counted because #2260 fixed the unit of a
+/// Docker download as the PULL, counted once at the manifest. It is also how
+/// the formats this pass did not reach stay VISIBLE — each one names #3446 —
+/// instead of silently blending back into the correct sites.
+#[cfg(test)]
+mod proxy_download_recording_tests {
+    /// Every format handler that can serve bytes from an upstream. Read at
+    /// COMPILE time (`include_str!`), so this gate is database-free and runs in
+    /// the offline lib suite.
+    const SERVE_SOURCES: &[(&str, &str)] = &[
+        ("alpine.rs", include_str!("alpine.rs")),
+        ("ansible.rs", include_str!("ansible.rs")),
+        ("cargo.rs", include_str!("cargo.rs")),
+        ("chef.rs", include_str!("chef.rs")),
+        ("cocoapods.rs", include_str!("cocoapods.rs")),
+        ("composer.rs", include_str!("composer.rs")),
+        ("conan.rs", include_str!("conan.rs")),
+        ("conda.rs", include_str!("conda.rs")),
+        ("cran.rs", include_str!("cran.rs")),
+        ("debian.rs", include_str!("debian.rs")),
+        ("gitlfs.rs", include_str!("gitlfs.rs")),
+        ("goproxy.rs", include_str!("goproxy.rs")),
+        ("helm.rs", include_str!("helm.rs")),
+        ("hex.rs", include_str!("hex.rs")),
+        ("huggingface.rs", include_str!("huggingface.rs")),
+        ("incus.rs", include_str!("incus.rs")),
+        ("jetbrains.rs", include_str!("jetbrains.rs")),
+        ("maven.rs", include_str!("maven.rs")),
+        ("npm.rs", include_str!("npm.rs")),
+        ("nuget.rs", include_str!("nuget.rs")),
+        ("oci_v2.rs", include_str!("oci_v2.rs")),
+        ("pub_registry.rs", include_str!("pub_registry.rs")),
+        ("puppet.rs", include_str!("puppet.rs")),
+        ("pypi.rs", include_str!("pypi.rs")),
+        ("rpm.rs", include_str!("rpm.rs")),
+        ("rubygems.rs", include_str!("rubygems.rs")),
+        ("sbt.rs", include_str!("sbt.rs")),
+        ("swift.rs", include_str!("swift.rs")),
+        ("terraform.rs", include_str!("terraform.rs")),
+        ("vscode.rs", include_str!("vscode.rs")),
+    ];
+
+    /// The primitives that put UPSTREAM bytes in front of a client.
+    ///
+    /// The streaming family is the artifact-serving family by construction: a
+    /// package body is streamed precisely because it is a package body, while
+    /// the buffered/capped siblings carry metadata documents (indexes,
+    /// packuments, `config.json`, service indexes) that must be parsed
+    /// in-process and are not downloads. `try_upstream_fetch_with_accept` is
+    /// the one deliberate addition — OCI manifests stay BUFFERED by design
+    /// (they are parsed for blob-ref resolution) yet a manifest GET *is* the
+    /// download seam for the whole Docker format, so leaving it out would
+    /// exempt the single highest-traffic proxy type from its own guard.
+    const SERVE_PRIMITIVES: &[&str] = &[
+        "proxy_fetch_streaming(",
+        "proxy_fetch_streaming_with_disposition(",
+        "proxy_fetch_streaming_with_cache_key(",
+        "proxy_fetch_streaming_with_cache_key_verified(",
+        "proxy_fetch_streaming_response_with_cache_key(",
+        "try_upstream_fetch_with_accept(",
+    ];
+
+    /// Calls that count as recording the serve. `try_remote_or_virtual_download`
+    /// records internally, so routing through it is the preferred fix and needs
+    /// no separate call.
+    const RECORDERS: &[&str] = &["record_proxy_download(", "try_remote_or_virtual_download("];
+
+    const MARKER: &str = "UNRECORDED-PROXY-SERVE:";
+
+    /// Byte spans covered by `#[cfg(test)]` items, which must not be scanned:
+    /// test fixtures mention these primitives constantly and a test asserting
+    /// on a handler's behaviour is not itself a serve path.
+    ///
+    /// A top-level `#[cfg(test)]` item ends at the next line that is exactly
+    /// `}` in column 0 — rustfmt guarantees that for a top-level item, and the
+    /// handlers are all rustfmt-clean (CI enforces `cargo fmt --check`).
+    fn test_spans(src: &str) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find("\n#[cfg(test)]") {
+            let start = from + rel + 1;
+            let end = match src[start..].find("\n}\n") {
+                Some(r) => start + r + 3,
+                None => src.len(),
+            };
+            spans.push((start, end));
+            from = end;
+        }
+        spans
+    }
+
+    /// Byte offsets and names of the top-level `fn` items outside test spans.
+    /// A top-level item starts in column 0, so a line beginning with an
+    /// optional `pub`/`pub(..)`, an optional `async`, then `fn ` is one.
+    fn top_level_fns(src: &str, spans: &[(usize, usize)]) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        for line in src.split_inclusive('\n') {
+            let start = at;
+            at += line.len();
+            if spans.iter().any(|(a, b)| *a <= start && start < *b) {
+                continue;
+            }
+            let mut rest = line;
+            if let Some(r) = rest.strip_prefix("pub") {
+                // `pub`, `pub ` or `pub(crate) ` / `pub(super) ` etc.
+                rest = match r.strip_prefix('(') {
+                    Some(paren) => match paren.find(')') {
+                        Some(p) => &paren[p + 1..],
+                        None => continue,
+                    },
+                    None => r,
+                }
+                .trim_start();
+            }
+            let rest = rest.strip_prefix("async ").unwrap_or(rest).trim_start();
+            if let Some(name) = rest.strip_prefix("fn ") {
+                let name: String = name
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    out.push((start, name));
+                }
+            }
+        }
+        out
+    }
+
+    /// The structural gate for the whole class (#3446).
+    #[test]
+    fn every_proxy_serve_path_records_a_download_or_is_explicitly_exempt() {
+        let mut unrecorded: Vec<String> = Vec::new();
+        // How many real serve sites the scan reached. A structural gate whose
+        // matcher silently stops matching is indistinguishable from a green
+        // one, and [`test_spans`] is a heuristic — an item shape that made it
+        // over-cover would swallow production code and pass trivially. This
+        // counter turns that into a failure. See
+        // `the_recording_gate_reaches_every_serve_site_it_should` below.
+        let mut scanned = 0usize;
+
+        for (file, src) in SERVE_SOURCES {
+            let spans = test_spans(src);
+            let fns = top_level_fns(src, &spans);
+
+            // Body text per function NAME (a name can repeat across `impl`-free
+            // free functions only by shadowing, which rustc forbids, so this is
+            // 1:1 in practice; concatenating is the safe degenerate case).
+            let mut bodies: std::collections::HashMap<&str, String> =
+                std::collections::HashMap::new();
+            for (i, (off, name)) in fns.iter().enumerate() {
+                let end = fns.get(i + 1).map(|(o, _)| *o).unwrap_or(src.len());
+                bodies.entry(name).or_default().push_str(&src[*off..end]);
+            }
+            let recorders: Vec<&str> = bodies
+                .iter()
+                .filter(|(_, body)| RECORDERS.iter().any(|r| body.contains(r)))
+                .map(|(name, _)| *name)
+                .collect();
+
+            for needle in SERVE_PRIMITIVES {
+                let mut from = 0usize;
+                while let Some(rel) = src[from..].find(needle) {
+                    let at = from + rel;
+                    from = at + needle.len();
+
+                    if spans.iter().any(|(a, b)| *a <= at && at < *b) {
+                        continue;
+                    }
+                    // Doc-comment and string mentions are not call sites.
+                    let line_start = src[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    let prefix = &src[line_start..at];
+                    if prefix.trim_start().starts_with("//") || prefix.contains('"') {
+                        continue;
+                    }
+
+                    let Some((idx, name)) = fns
+                        .iter()
+                        .enumerate()
+                        .take_while(|(_, (off, _))| *off <= at)
+                        .map(|(i, (_, name))| (i, name.as_str()))
+                        .last()
+                    else {
+                        continue;
+                    };
+                    // A primitive's own definition (or a same-named
+                    // re-export) is not a serve site.
+                    if SERVE_PRIMITIVES
+                        .iter()
+                        .any(|p| p.strip_suffix('(') == Some(name))
+                    {
+                        continue;
+                    }
+                    scanned += 1;
+
+                    let body = &bodies[name];
+                    if RECORDERS.iter().any(|r| body.contains(r)) || body.contains(MARKER) {
+                        continue;
+                    }
+                    // One call hop in either direction: the recording may live
+                    // in a helper this function calls (npm) or in the function
+                    // that calls this one (pypi).
+                    let call = format!("{name}(");
+                    if recorders
+                        .iter()
+                        .any(|g| body.contains(&format!("{g}(")) || bodies[*g].contains(&call))
+                    {
+                        continue;
+                    }
+
+                    let line = src[..at].bytes().filter(|b| *b == b'\n').count() + 1;
+                    let _ = idx;
+                    unrecorded.push(format!("{file}:{line} (fn {name}, {needle})"));
+                }
+            }
+        }
+
+        assert!(
+            unrecorded.is_empty(),
+            "#3446: these proxy/remote serve paths hand upstream bytes to a client \
+             without recording a download, and carry no `UNRECORDED-PROXY-SERVE:` \
+             marker explaining why: {unrecorded:?}. Route the serve through \
+             `proxy_helpers::try_remote_or_virtual_download` (which records), or call \
+             `proxy_helpers::record_proxy_download` on that arm AFTER the fetch \
+             resolves, keyed on the proxy-cache path the fetch commits under. If the \
+             serve genuinely must not count (a HEAD, or an OCI blob — a Docker pull is \
+             counted once at the manifest, never per layer), say so in a comment \
+             carrying the marker."
+        );
+
+        // Coverage floor. The scan currently reaches 33 serve sites across 30
+        // handlers; 25 leaves room for a format to consolidate its arms without
+        // churn while still failing loudly if the matcher, the `#[cfg(test)]`
+        // span heuristic, or the top-level-`fn` parser stops seeing the code it
+        // is supposed to police. Without this a gate that matched NOTHING would
+        // report the same green as a gate that matched everything.
+        assert!(
+            scanned >= 25,
+            "#3446: the recording gate only reached {scanned} proxy serve sites, which \
+             is too few to be policing the class. Either the streaming helpers were \
+             renamed (update SERVE_PRIMITIVES), or `test_spans` / `top_level_fns` \
+             stopped parsing the handlers correctly and the gate is now green by \
+             accident rather than by correctness."
+        );
+    }
+
+    /// The gate is worthless if it matches nothing, and a rename of the
+    /// streaming helpers would silently empty it. Pin that it still sees the
+    /// real serve sites and the real recorders.
+    #[test]
+    fn the_recording_gate_actually_scans_live_serve_sites() {
+        let cargo = SERVE_SOURCES
+            .iter()
+            .find(|(n, _)| *n == "cargo.rs")
+            .expect("cargo.rs is scanned");
+        assert!(
+            cargo
+                .1
+                .contains("proxy_fetch_streaming_with_cache_key_verified("),
+            "#3446: cargo's Remote download arm must still be a streaming serve the \
+             gate can see; if it was renamed, SERVE_PRIMITIVES must be updated too"
+        );
+        assert!(
+            cargo.1.contains("record_proxy_download("),
+            "#3446: cargo's proxied crate download must record"
+        );
+        for format in [
+            "debian.rs",
+            "goproxy.rs",
+            "helm.rs",
+            "nuget.rs",
+            "oci_v2.rs",
+        ] {
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(n, _)| *n == format)
+                .unwrap_or_else(|| panic!("{format} is scanned"));
+            assert!(
+                src.contains("record_proxy_download("),
+                "#3446: {format} proxied downloads must record"
+            );
+        }
+    }
+
+    /// Count the formats still carrying a DEFERRAL marker (as opposed to a
+    /// policy exemption like a HEAD or an OCI blob). This is the remaining
+    /// #3446 surface, asserted so it can only ever shrink: a new format that
+    /// ships an unrecorded proxy serve has to move this number, which is a
+    /// review conversation rather than a silent regression.
+    #[test]
+    fn the_deferred_format_count_only_shrinks() {
+        let deferred: Vec<&str> = SERVE_SOURCES
+            .iter()
+            .filter(|(_, src)| src.contains("UNRECORDED-PROXY-SERVE: #3446 - deferred"))
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            deferred.len(),
+            15,
+            "#3446: expected 15 formats still deferring proxy-download recording, \
+             found {deferred:?}. Fixing one? Lower this number. Raising it means a \
+             new format shipped without counting its proxied downloads — record it \
+             instead."
+        );
+    }
+}
