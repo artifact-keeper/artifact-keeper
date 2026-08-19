@@ -1,0 +1,60 @@
+-- Trigram index for the Maven flat-object GC rollup guard (#3384 follow-up).
+--
+-- `ORPHAN_MAVEN_FLAT_PREDICATE_SQL` guard 3 (storage_gc_service.rs) protects a
+-- `maven-metadata.xml` rollup document (or a checksum sidecar of one) while
+-- any live artifact remains under its directory prefix:
+--
+--   a2.storage_key LIKE {rollup_dir} || '%'
+--
+-- {rollup_dir} (`maven_flat_attribution::metadata_rollup_dir_prefix_sql`) is
+-- computed per candidate row from `o.storage_key`, not a literal known at
+-- plan time. Postgres only rewrites `LIKE 'literal%'` into an indexable
+-- range scan for a constant pattern; a per-row computed pattern is always
+-- evaluated as a plain filter, regardless of what index exists on
+-- `artifacts.storage_key` (migration 157, a plain b-tree). Confirmed via
+-- `EXPLAIN (ANALYZE, BUFFERS)`: this guard alone accounted for ~76s of an
+-- 80s run against a 136-row `maven_flat_object_owner` table -- a Hash Join
+-- against the *entire* `artifacts` table (394,937 rows) re-evaluated once
+-- per rollup candidate, filtered row-by-row afterwards. See the discussion
+-- on #3384.
+--
+-- A GIN `gin_trgm_ops` index (`pg_trgm`, enabled since migration 004) is used
+-- instead of hand-deriving `>=`/`<` range bounds from the computed prefix:
+-- unlike a b-tree range rewrite, it does not require the prefix bound math to
+-- be exactly right to stay correct. GIN trigram scans are lossy by
+-- construction -- Postgres always rechecks the actual `LIKE` condition
+-- against the heap row after the index lookup -- so a case this index
+-- under-prunes just costs a wasted recheck, never a wrong answer. That
+-- matters here specifically because this guard's failure direction is
+-- security-sensitive: under-matching (missing a live artifact that should
+-- have anchored the rollup) would let the sweep delete a `maven-metadata.xml`
+-- that is still being served (see the "can only ever over-PROTECT" invariant
+-- documented on `metadata_rollup_dir_prefix_sql`). This index changes the
+-- query plan, not the query's semantics.
+--
+-- Reused for guard 3's leading arm too (`{base} LIKE '%/maven-metadata.xml'`,
+-- a suffix match) -- the same trigram index serves both prefix and suffix
+-- `LIKE` shapes, unlike a b-tree.
+--
+-- `WHERE is_deleted = false` matches guard 3's own filter (`a2.is_deleted =
+-- false`), keeping soft-deleted rows out of the index the same way migration
+-- 173 scopes its trigram indexes.
+--
+-- CREATE INDEX CONCURRENTLY is intentionally not used: sqlx::migrate runs
+-- each migration in a transaction, and CONCURRENTLY is rejected inside one.
+-- The non-concurrent build takes ACCESS EXCLUSIVE on `artifacts` for the
+-- duration of the build (GIN trigram builds are the heaviest index type this
+-- table carries -- see migration 173's note). Operators who cannot accept
+-- that lock window on a large `artifacts` table can build it out of band
+-- beforehand; `IF NOT EXISTS` makes the in-migration statement a no-op then:
+--
+--   CREATE INDEX CONCURRENTLY idx_artifacts_storage_key_trgm
+--     ON artifacts USING gin (storage_key gin_trgm_ops)
+--     WHERE is_deleted = false;
+--
+-- Functionality is unaffected without this index; it is purely a query-plan
+-- accelerator for guard 3. Idempotent via IF NOT EXISTS.
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_storage_key_trgm
+  ON artifacts USING gin (storage_key gin_trgm_ops)
+  WHERE is_deleted = false;
