@@ -940,6 +940,22 @@ async fn upload_chart(
     )
     .await;
 
+    // Populate the package catalog so the chart appears on the Packages page.
+    // The catalog is a derived index over artifacts; Helm previously never wrote
+    // it, so charts were visible on Artifacts but absent from Packages. Matches
+    // the other format handlers' fire-and-forget catalog write.
+    crate::services::package_service::PackageService::new(state.db.clone())
+        .try_create_or_update_from_artifact(
+            repo.id,
+            chart_name,
+            chart_version,
+            size_bytes,
+            &computed_sha256,
+            None,
+            Some(serde_json::json!({ "format": "helm" })),
+        )
+        .await;
+
     if let Some(prov_artifact_id) = prov_artifact_id {
         quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, prov_artifact_id).await;
 
@@ -2126,6 +2142,39 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         .await;
         assert_eq!(status, StatusCode::OK, "the .prov must not 404 (#2635)");
         assert_eq!(&got[..], REAL_PROV);
+
+        f.teardown().await;
+    }
+
+    /// Regression: an uploaded chart must be indexed into the package catalog
+    /// (`packages`/`package_versions`), not just the `artifacts` table. Before
+    /// the fix, `upload_chart` never wrote the catalog, so charts appeared on
+    /// the Artifacts page but were absent from the Packages page.
+    #[tokio::test]
+    async fn test_helm_upload_indexes_chart_into_package_catalog() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = build_tgz(
+            "catalogchart/Chart.yaml",
+            b"apiVersion: v2\nname: catalogchart\nversion: 0.1.0\n",
+        );
+
+        let (status, _body) = upload_parts(&f, &[("chart", "catalogchart-0.1.0.tgz", &tgz)]).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The chart must be indexed into the catalog under its Chart.yaml
+        // name + version.
+        let (name, version): (String, String) = sqlx::query_as(
+            "SELECT name, version FROM packages WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(f.repo_id)
+        .bind("catalogchart")
+        .fetch_one(&f.pool)
+        .await
+        .expect("uploaded chart must be indexed into the package catalog");
+        assert_eq!(name, "catalogchart");
+        assert_eq!(version, "0.1.0");
 
         f.teardown().await;
     }
