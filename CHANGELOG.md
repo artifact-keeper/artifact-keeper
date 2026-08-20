@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Release engineering on the 1.7.x maintenance line: pushes publish images again, backports can pass the gate, and a preflight verdict names the branch it is about** (#3422, #3338). GitHub runs a workflow file *at the ref that triggered it*, so the release-engineering fixes that landed on `main` were inert here and the two lines had silently diverged. Three consequences, each fixed:
+
+  **Docker Publish never ran.** The push trigger listed `release/1.1.x`, a branch that no longer exists, so a commit landing on `release/1.7.x` published nothing at all. Release preflight check 3 was right every time it said "no Docker Publish run exists for HEAD", and every 1.7.x cut worked around it with an undocumented manual `workflow_dispatch`. The trigger is now `release/**`, and the `X.Y-dev` floating alias is derived from the branch name (`1.7-dev` for `release/1.7.x`) instead of being hardcoded to one series, so a new maintenance line gets one the moment it is created.
+
+  **No compliant backport could pass the release-branch gate.** The gate's logic was inlined in `release-branch-gate.yml` and only accepted commits that are on `main` or match one by patch-id. A release prep (`chore(release): ...`) prepares a version that exists *only* on the maintenance branch, and a narrowed backport (hunks resolved away because the branch lacks the scaffolding the main change assumed) cannot match by patch-id by construction — so both shapes had to be waved through with the `release-process: approved` label, six times in five days. The gate is now `scripts/ci/check-release-branch-commits.sh`, which additionally accepts a release prep (subject prefix **and** an allowlisted version/changelog path set — both, so neither alone is a hole) and a narrowed backport carrying a `(cherry picked from commit <sha>)` trailer naming a commit that *is* on main, logged as "narrowed backport of \<sha\>" rather than passed silently. Its self-test runs in CI's Shell Tests job and asserts the exemptions from the failing side too.
+
+  **The preflight could not audit this branch.** `release-preflight.yml` hardcoded `ref: main` in its checkout, so dispatching it from `release/1.7.x` ran this branch's workflow against main's tree: the `READY` verdicts behind v1.7.5, v1.7.6 and v1.7.7 were statements about a different branch. The checkout now follows the ref the workflow was dispatched on (overridable with a `ref` input), the verdict names what it evaluated — `READY to cut from <ref>@<sha>` — and check 1 (`.trivyignore` forward-port drift, a main-centric invariant) reports NOT APPLICABLE rather than manufacturing findings when the audited ref is itself a `release/*` branch.
+
 ## [1.7.7] - 2026-08-19
 
 ### Fixed

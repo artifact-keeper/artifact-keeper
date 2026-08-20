@@ -3,8 +3,8 @@
 # Pre-tag release readiness check (issue #3042).
 #
 # Run this BEFORE cutting a release/RC tag (see RELEASING.md). It asserts that
-# `main` is actually releasable, so a stale main does not cost a full re-cut
-# cycle. The motivating incident (#3039): v1.7.0-rc.1 stalled ~90 minutes at
+# THE REF BEING CUT is actually releasable, so a stale tree does not cost a
+# full re-cut cycle. The motivating incident (#3039): v1.7.0-rc.1 stalled ~90 minutes at
 # docker-publish's Security Scan because `main` was missing two trivy-CLI CVE
 # suppressions that lived only on `release/1.6.x` (#2997/#3040). Security Scan
 # HARD-gates the multi-arch manifest, which gates resolve-candidate-digest,
@@ -21,6 +21,14 @@
 #      main means main's images fail Security Scan -> no release can be cut
 #      from main. This is the exact #3039 gap. Enumeration mirrors
 #      check-migration-ledger.sh.
+#
+#      This one check is MAIN-CENTRIC and is skipped (loudly) when the audited
+#      ref is a `release/*` branch. Its subject is "can a cut from main clear
+#      Security Scan given what the maintenance branches suppress"; a
+#      maintenance branch's own images are scanned against its OWN
+#      .trivyignore, so another branch's suppressions say nothing about it and
+#      the branch comparing against itself is vacuous. Running it anyway would
+#      manufacture drift findings that no cut from that branch can act on.
 #
 #      The tombstone form exists because a plain superset rule makes the set
 #      monotonic (#3309): a suppression provably dead for main's images could
@@ -122,12 +130,18 @@
 # Exit-code contract (mirrors scripts/ci/check-migration-ledger.sh):
 #   0  ready       -- no blocking problem found.
 #   1  NOT READY   -- a real, blocking problem (drift, version mismatch, or a
-#                     measured-red Docker Publish on main).
-#                     Fix it on main before tagging; NEVER retry it away.
+#                     measured-red Docker Publish for the audited commit).
+#                     Fix it on the ref being cut before tagging; NEVER retry
+#                     it away.
 #   2  INFRA       -- tooling/network failure (git ls-remote / gh / file reads
 #                     failed); retryable, NOT a readiness verdict.
 #
 # Env overrides:
+#   PREFLIGHT_REF    the ref this run is a statement about. Names the verdict
+#                    line and decides whether check 1 applies. Defaults to the
+#                    checked-out branch name; a detached HEAD reports as
+#                    `HEAD`, which is not a `release/*` ref, so check 1 keeps
+#                    its historical behaviour when nothing says otherwise.
 #   PREFLIGHT_REPO   owner/name for the `gh api` calls (default: derived from
 #                    the origin remote, else artifact-keeper/artifact-keeper).
 #   PREFLIGHT_SKIP_DOCKER_HEALTH=1  do not run check 3 at all.
@@ -186,13 +200,39 @@ retired_tokens() {
     | sed 's/^# RETIRED: //' | sort -u
 }
 
+# --- which ref is this run a statement about? -------------------------------
+#
+# The workflow used to hardcode `ref: main` in its checkout, so a preflight
+# dispatched from release/1.7.x audited main and said READY about it. Naming
+# the ref in the verdict is what makes that mistake unrepeatable: a transcript
+# that says which ref it evaluated cannot be read as one about another.
+#
+# refs/heads/ is stripped so `refs/heads/release/1.7.x` and `release/1.7.x`
+# print (and match) identically no matter which of the two the caller passes.
+AUDIT_REF="${PREFLIGHT_REF:-}"
+if [[ -z "$AUDIT_REF" ]]; then
+  AUDIT_REF="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+fi
+AUDIT_REF="${AUDIT_REF#refs/heads/}"
+AUDIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+
+# True for a maintenance branch, false for main / a tag / a detached HEAD.
+is_release_branch_ref() { [[ "$AUDIT_REF" == release/* ]]; }
+
 echo "== release preflight =="
-echo "repo: $REPO   ref: $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+echo "repo: $REPO   ref: ${AUDIT_REF}@${AUDIT_SHA}"
 echo
 
 # --- check 1: .trivyignore forward-port drift -------------------------------
 echo "1) .trivyignore forward-port drift (main must account for release/* suppressions)"
-if [[ ! -f .trivyignore ]]; then
+if is_release_branch_ref; then
+  note "NOT APPLICABLE: this check asks whether MAIN accounts for the"
+  note "suppressions on every release/* branch, and the audited ref is"
+  note "${AUDIT_REF}. A maintenance branch's images are scanned against its own"
+  note ".trivyignore, so another branch's suppressions are not a claim about"
+  note "this cut -- and comparing the branch against itself is vacuous."
+  note "Run this check against main (its forward-port drift is main's problem)."
+elif [[ ! -f .trivyignore ]]; then
   warn "no .trivyignore at repo root -- skipping drift check"
 else
   main_tokens="$(suppression_tokens < .trivyignore)"
@@ -444,9 +484,14 @@ fi
 echo
 
 # --- verdict ----------------------------------------------------------------
+#
+# The ref and sha are part of the verdict, not decoration. A bare "READY" is
+# ambiguous about WHAT is ready, and that ambiguity is exactly how v1.7.5,
+# v1.7.6 and v1.7.7 were each cut from release/1.7.x on the strength of a
+# preflight transcript that had, in fact, audited main.
 if [[ "$problems" -gt 0 ]]; then
-  echo "${RED}NOT READY${RST}: $problems blocking problem(s). Fix on main before tagging."
+  echo "${RED}NOT READY${RST} to cut from ${AUDIT_REF}@${AUDIT_SHA}: $problems blocking problem(s). Fix them on ${AUDIT_REF} before tagging."
   exit 1
 fi
-echo "${GRN}READY${RST}: no blocking problems. Safe to cut the tag."
+echo "${GRN}READY${RST} to cut from ${AUDIT_REF}@${AUDIT_SHA}: no blocking problems."
 exit 0

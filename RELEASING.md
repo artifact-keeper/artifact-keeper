@@ -19,18 +19,29 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
 
    ```bash
    scripts/ci/release-preflight.sh          # local (needs an authenticated gh)
-   # or, from the Actions UI: run the "Release Preflight" workflow
+   # or, from the Actions UI: run the "Release Preflight" workflow, selecting
+   # the branch you are cutting from in the workflow's branch picker
    ```
 
-   It asserts main is actually releasable — `.trivyignore` covers every
-   active `release/*` branch's suppressions (the drift that stalled
-   v1.7.0-rc.1 at Security Scan, #3039), the version set is consistent,
-   main's last Docker Publish cleanly published its manifest, and no
-   component pinned by a checked-in `VERSION` file would try to republish an
-   exact tag that already exists with different content (the collision that
-   killed the v1.7.2 tag). A `NOT READY` (exit 1) means fix main first;
-   tagging over it costs a full re-cut cycle. An exit 2 is `INFRA` — a check
-   that could not be measured, which is neither a pass nor a failure.
+   **It audits the ref you point it at, and the verdict says which one** —
+   `READY to cut from release/1.7.x@<sha>`. The workflow used to hardcode
+   `ref: main` in its checkout, so dispatching it from a maintenance branch
+   produced a verdict about `main`; v1.7.5, v1.7.6 and v1.7.7 were each cut on
+   one. If the verdict does not name the branch you are about to tag, it is
+   not about your cut.
+
+   It asserts the audited ref is actually releasable — the version set is
+   consistent, that commit's own Docker Publish cleanly published its manifest
+   (selected by `head_sha`, not recency, #3338), and no component pinned by a
+   checked-in `VERSION` file would try to republish an exact tag that already
+   exists with different content (the collision that killed the v1.7.2 tag).
+   On `main` it additionally checks that `.trivyignore` covers every active
+   `release/*` branch's suppressions (the drift that stalled v1.7.0-rc.1 at
+   Security Scan, #3039); that check is skipped on a `release/*` ref, where
+   another branch's suppressions say nothing about the cut. A `NOT READY`
+   (exit 1) means fix the ref you are cutting from first; tagging over it
+   costs a full re-cut cycle. An exit 2 is `INFRA` — a check that could not be
+   measured, which is neither a pass nor a failure.
 
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
