@@ -8965,19 +8965,40 @@ pub async fn delete_artifact(
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = state.create_artifact_service(storage);
 
-    // Find the artifact
-    let artifact = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        repo.id,
-        path
+    // Find the artifact. Runtime query (not the compile-time `query!` macro) so
+    // the offline build doesn't require a `.sqlx` cache entry for this shape.
+    let (artifact_id, artifact_checksum): (Uuid, String) = sqlx::query_as(
+        "SELECT id, checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
     )
+    .bind(repo.id)
+    .bind(&path)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
+    // Docker/OCI manifests are indexed in `oci_tags`/`oci_manifest_refs`/
+    // `manifest_blob_refs` in addition to the `artifacts` row. Soft-deleting the
+    // artifacts row alone leaves those rows orphaned, so a re-push's HEAD
+    // manifest resolves the surviving tag and Docker skips the PUT — the
+    // artifacts row is never resurrected. Unwind the OCI index here, mirroring
+    // `handle_delete_manifest`, so a later re-push cleanly re-creates it.
+    if crate::services::repository_service::format_handler_key(&repo.format) == "oci" {
+        if let Some((image, reference)) = path
+            .strip_prefix("v2/")
+            .and_then(|rest| rest.split_once("/manifests/"))
+        {
+            let digest = format!("sha256:{}", artifact_checksum);
+            crate::api::handlers::oci_v2::delete_oci_manifest_content(
+                &state.db, repo.id, image, reference, &digest,
+            )
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+    }
+
     artifact_service
-        .delete_with_sync_options(artifact, !is_replication)
+        .delete_with_sync_options(artifact_id, !is_replication)
         .await?;
 
     // Deleting a Maven artifact changes the version set for its GAV. Drop both
@@ -16100,6 +16121,94 @@ mod tests {
             allowed.is_ok(),
             "delete grant must delete, got: {allowed:?}"
         );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Docker/OCI manifest delete via the REST `delete_artifact` handler must
+    /// also unwind the `oci_tags` index (not just soft-delete `artifacts`), so a
+    /// subsequent re-push's HEAD returns 404 and the artifacts row is resurrected.
+    #[tokio::test]
+    async fn delete_artifact_docker_removes_oci_tags_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "docker").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        let auth = Some(tdh::make_auth(user_id, &username));
+
+        let checksum = "a".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine".to_string();
+
+        // Seed the artifacts row + its oci_tags index row as a push would.
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key
+            )
+            VALUES ($1, $2, 'redis:7-alpine', '7-alpine', 100,
+                    $3, 'application/vnd.oci.image.manifest.v1+json', $4)
+            "#,
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .bind(&checksum)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("seed artifacts row");
+
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'redis', '7-alpine', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("seed oci_tags row");
+
+        let result = delete_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            )),
+            Extension(auth),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "docker delete must succeed, got: {result:?}"
+        );
+
+        // The oci_tags index row must be gone.
+        let tags: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_tags WHERE repository_id = $1 AND name = 'redis' AND tag = '7-alpine'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tags, 0, "oci_tags row must be removed by the REST delete");
+
+        // The artifacts row must be soft-deleted.
+        let deleted: bool = sqlx::query_scalar(
+            "SELECT is_deleted FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(deleted, "artifacts row must be soft-deleted");
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);

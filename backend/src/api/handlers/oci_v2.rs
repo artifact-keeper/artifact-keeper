@@ -10913,115 +10913,9 @@ async fn handle_delete_manifest(
         }
     };
 
-    let mut tx = match state.db.begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
-
-    // Remove tag rows for this delete. A digest reference is a content-address
-    // delete, so every tag pointing at that digest in this repo is removed. A
-    // tag-name reference removes ONLY the named tag row, leaving sibling tags
-    // that happen to share the same manifest digest intact (#1776).
-    let tag_delete = if is_digest_reference(reference) {
-        sqlx::query!(
-            "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
-            repo.id,
-            digest
-        )
-        .execute(&mut *tx)
-        .await
-    } else {
-        sqlx::query!(
-            "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
-            repo.id,
-            repo.image,
-            reference
-        )
-        .execute(&mut *tx)
-        .await
-    };
-    if let Err(e) = tag_delete {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
-    }
-
-    // A tag-name delete only removes the named tag (#1776). If a sibling tag in
-    // this repo still points at the same manifest digest, the manifest is still
-    // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
-    // intact. The cleanup only runs once the last tag for the digest is gone (or
-    // for a content-addressed digest delete, which removes every such tag).
-    let digest_still_tagged = match sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
-        repo.id,
-        digest
-    )
-    .fetch_one(&mut *tx)
-    .await
+    if let Err(e) =
+        delete_oci_manifest_content(&state.db, repo.id, &repo.image, reference, &digest).await
     {
-        Ok(exists) => exists.unwrap_or(false),
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
-
-    if !digest_still_tagged {
-        // Drop stale index relationships for this digest. Live child edges are
-        // preserved so a still-tagged parent index keeps the child relationship
-        // live and the child's blobs protected.
-        if let Err(e) = clear_repo_manifest_refs(&mut *tx, repo.id, &digest).await {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
-        }
-
-        // #1409: drop the manifest's blob refs so its config + layer blobs
-        // become reclaimable once nothing else references them. Scoped to skip a
-        // digest still referenced as a live per-architecture child of a tagged
-        // index (its blobs are protected ONLY by these rows). After #1681 these
-        // rows also gate digest fallback, so a cleanup error must abort the
-        // delete.
-        if let Err(e) = delete_manifest_blob_refs(&mut *tx, repo.id, &digest).await {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
-        }
-
-        // #3108: drop this manifest's referrers subject edge so a deleted
-        // referrer stops appearing in `GET /v2/<name>/referrers/<digest>`.
-        if let Err(e) = sqlx::query(
-            "DELETE FROM oci_manifest_subjects WHERE repository_id = $1 AND manifest_digest = $2",
-        )
-        .bind(repo.id)
-        .bind(&digest)
-        .execute(&mut *tx)
-        .await
-        {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
-        }
-    }
-
-    if let Err(e) = tx.commit().await {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -11049,6 +10943,88 @@ async fn handle_delete_manifest(
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
+}
+
+/// Transactionally remove a Docker/OCI manifest from the OCI index: delete its
+/// `oci_tags` row(s) and, when the digest is no longer tagged by any sibling
+/// tag, its `oci_manifest_refs`/`manifest_blob_refs` edges so storage GC can
+/// reclaim the blobs. Shared by the OCI `handle_delete_manifest` path and the
+/// REST `delete_artifact` path so a UI delete leaves the index consistent.
+///
+/// The caller is responsible for soft-deleting the corresponding `artifacts`
+/// row (and for resolving `digest` from the reference); this function only
+/// unwinds the OCI index, matching the transaction previously inlined in
+/// `handle_delete_manifest`.
+pub(crate) async fn delete_oci_manifest_content(
+    pool: &PgPool,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // Remove tag rows for this delete. A digest reference is a content-address
+    // delete, so every tag pointing at that digest in this repo is removed. A
+    // tag-name reference removes ONLY the named tag row, leaving sibling tags
+    // that happen to share the same manifest digest intact (#1776).
+    if is_digest_reference(reference) {
+        sqlx::query!(
+            "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+            repo_id,
+            digest
+        )
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query!(
+            "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+            repo_id,
+            image,
+            reference
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // A tag-name delete only removes the named tag (#1776). If a sibling tag in
+    // this repo still points at the same manifest digest, the manifest is still
+    // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
+    // intact. The cleanup only runs once the last tag for the digest is gone.
+    let digest_still_tagged = match sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
+        repo_id,
+        digest
+    )
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(exists) => exists.unwrap_or(false),
+        Err(e) => return Err(e),
+    };
+
+    if !digest_still_tagged {
+        // Drop stale index relationships for this digest. Live child edges are
+        // preserved so a still-tagged parent index keeps the child relationship
+        // live and the child's blobs protected.
+        clear_repo_manifest_refs(&mut *tx, repo_id, digest).await?;
+
+        // #1409: drop the manifest's blob refs so its config + layer blobs
+        // become reclaimable once nothing else references them.
+        delete_manifest_blob_refs(&mut *tx, repo_id, digest).await?;
+
+        // #3108: drop this manifest's referrers subject edge so a deleted
+        // referrer stops appearing in `GET /v2/<name>/referrers/<digest>`.
+        sqlx::query(
+            "DELETE FROM oci_manifest_subjects WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await
 }
 
 // ---------------------------------------------------------------------------
