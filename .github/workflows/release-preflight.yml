@@ -10,14 +10,32 @@ name: Release Preflight
 # from release/1.6.x to main).
 #
 # This publishes NOTHING. It only reads: the repo tree, the .trivyignore of
-# active release/* branches, the latest main Docker Publish run status, and
+# active release/* branches, the status of the Docker Publish run for the
+# exact commit being checked (selected by head_sha, not recency -- #3338), and
 # the manifests of already-published component images (check 4, #3339).
-# A red run means "do not tag yet"; a green run means main is safe to cut.
+# A red run means "do not tag yet"; a green run means the audited ref is safe
+# to cut.
+#
+# IT AUDITS THE REF IT WAS DISPATCHED ON. The checkout used to hardcode
+# `ref: main`, so dispatching this workflow from `release/1.7.x` ran the
+# maintenance branch's copy of the workflow against MAIN's tree: v1.7.5,
+# v1.7.6 and v1.7.7 each got a READY verdict that was a statement about a
+# different branch, and there was no way to preflight the branch actually
+# being cut. The `ref` input defaults to whatever ref the dispatch was made
+# on, and the verdict line now names the ref and sha it evaluated so a
+# transcript can never again be mistaken for one about another branch.
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ref to audit (branch, tag or sha). Defaults to the ref this workflow was dispatched on.'
+        required: false
+        type: string
+        default: ''
   # Also surface drift proactively on a schedule so a stale main is caught
   # before anyone even tries to cut. Advisory only -- never blocks a merge.
+  # A schedule always fires on the default branch, so this leg audits main.
   schedule:
     - cron: '17 13 * * 1-5'  # weekday mid-morning US, after the overnight merges
 
@@ -36,10 +54,16 @@ jobs:
     name: Pre-tag readiness
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout main
+      # `inputs.ref || github.ref` rather than an input default: a
+      # workflow_dispatch `default:` is a literal string, so `${{ github.ref }}`
+      # written there would be checked out verbatim. The fallback expression is
+      # evaluated, so an unset input means "the ref I dispatched on" -- main
+      # from the Actions UI's default selection, release/1.7.x when the branch
+      # picker says release/1.7.x, and refs/heads/<default> on the schedule.
+      - name: Checkout the ref being audited
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: main
+          ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 1
 
       # Runs first, and offline. If check 3 has regressed into a soft warn
@@ -54,6 +78,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PREFLIGHT_REPO: ${{ github.repository }}
+          # The ref this run is a statement about. It names the verdict line
+          # and it decides whether check 1 (a main-centric invariant) applies.
+          PREFLIGHT_REF: ${{ inputs.ref || github.ref }}
           # Used by check 4's registry probes. The checkout is depth-1, so the
           # commit a published tag was built from is not local; the check
           # fetches just that commit when it needs it, and reports INFRA if it

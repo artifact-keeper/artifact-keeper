@@ -254,6 +254,79 @@ expect1 "token both live and tombstoned -> NOT READY" 1 "BOTH as live suppressio
   "CVE-2099-0001"
 
 echo
+echo "release-preflight ref-awareness"
+
+# --- ref-awareness fixtures -------------------------------------------------
+#   release-preflight.yml hardcoded `ref: main` in its checkout, so a preflight
+#   DISPATCHED on release/1.7.x ran that branch's workflow against MAIN's tree.
+#   v1.7.5, v1.7.6 and v1.7.7 were each cut on a READY verdict that was a
+#   statement about a different branch. Two properties fix that and both are
+#   asserted here, because both are invisible from the happy path:
+#
+#     * the verdict NAMES the ref and sha it evaluated, so a transcript cannot
+#       be mistaken for one about another branch;
+#     * check 1 -- "does MAIN account for every release/* suppression?" -- is
+#       skipped when the audited ref is itself a release branch, because
+#       another branch's suppressions are not a claim about this cut and the
+#       branch comparing against itself is vacuous.
+#
+#   The second must stay NARROW in both directions: skipping it for main (or
+#   for a detached HEAD, which is what a sha checkout gives) would silently
+#   delete the #3039 gate, so case 3 below re-runs the exact forward-port miss
+#   from check-1 case 1 with PREFLIGHT_REF=main and demands it still fails.
+expectref() { # <label> <expected-exit> <expected-substring> <preflight-ref> [main-trivyignore] [rel-trivyignore]
+  local label="$1" want="$2" needle="$3" pref="$4" main_ti="${5:-}" rel_ti="${6:-}" got
+  [ -n "$main_ti" ] && printf '%s\n' "$main_ti" > "$REPO_DIR/.trivyignore"
+  ( cd "$REPO_DIR" && PATH="$STUB:$PATH" \
+      PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
+      PREFLIGHT_REF="$pref" \
+      FAKE_RELEASE_REFS="$REL_REFS" \
+      FAKE_REL_TRIVYIGNORE="$rel_ti" \
+      PREFLIGHT_SKIP_VERSION_PIN=1 \
+      bash scripts/ci/release-preflight.sh > "$WORK/out.txt" 2>&1 )
+  got=$?
+  rm -f "$REPO_DIR/.trivyignore"
+  if [ "$got" != "$want" ]; then
+    fail "$label: expected exit $want, got $got"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  elif ! grep -qF "$needle" "$WORK/out.txt"; then
+    fail "$label: exit $got correct but output lacks '$needle'"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  else
+    pass "$label (exit $got)"
+  fi
+}
+
+# 1. The verdict names the ref it evaluated, and strips refs/heads/ so the
+#    caller can pass either spelling.
+expectref "verdict names the audited ref" 0 "READY to cut from release/1.7.x@" \
+  refs/heads/release/1.7.x
+
+# 2. On a release branch, the main-centric drift check does not manufacture a
+#    finding no cut from that branch could act on.
+expectref "release ref -> check 1 is NOT APPLICABLE, not a failure" 0 "NOT APPLICABLE" \
+  release/1.7.x \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+# 3. ...and the exemption stays narrow: the same fixture on main is still the
+#    #3039 hard failure it has always been.
+expectref "main ref -> forward-port miss still blocks" 1 "main is MISSING suppressions" \
+  refs/heads/main \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+# 4. A NOT READY verdict names the ref too -- an unnamed failure is as
+#    ambiguous as an unnamed pass.
+expectref "NOT READY names the audited ref" 1 "NOT READY to cut from main@" \
+  main \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+echo
 echo "release-preflight check 4 (#3339)"
 
 # --- check 4 fixture --------------------------------------------------------
