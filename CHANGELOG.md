@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The bundled `grype` CLI is built against `golang.org/x/mod` v0.40.0, clearing CVE-2026-56864 and CVE-2026-56865** (#3465). Both are HIGH and both are fixed in x/mod v0.40.0; grype v0.117.0 pins v0.38.0, so `Security Scan` reports `usr/local/bin/grype  Total: 2 (HIGH: 2)` against the backend image and fails. Docker Publish on `main` has failed on this for two consecutive runs (32337069636, 32419016885) with every manifest-merge job skipped, so **no images have published from `main` since 2026-08-19** and the `v1.8.1` tag cannot be cut. The same finding burned `v1.7.7` on `release/1.7.x`, where rulesets forbid deleting or moving a tag and the version number was lost.
+
+  Neither lever the `grype-bin` stage already had could reach it. This is a **module**, not the standard library, so the `GO_MIN_PATCH` toolchain floor (#3352) does nothing; and there is no release to bump to — v0.117.0 is the latest anchore/grype release and `main` (`ffbca56`) still pins v0.38.0, with no open or merged PR to move it. Upstream has not made this bump anywhere, which is what makes this an **override** rather than the version bump that clears the same CVE pair in the scanner-adapter's Trivy (upstream v0.74.0 carries x/mod v0.40.0 itself). `docker/Dockerfile.backend` and `docker/Dockerfile.backend.alpine` therefore apply `go get golang.org/x/mod@v0.40.0` after the commit-pin verification and before `go build`, with three build-time guards: the pinned source must still require v0.38.0 (so the tag bump that makes the override redundant is also what stops the build until it is deleted), `go get` must move only the five declared `golang.org/x/*` modules MVS pulls with it, and the compiled binary's Go build info must record v0.40.0 — because that build info is exactly what Trivy reads. `grype --version` still prints `grype 0.117.0` and `Supported DB Schema` is still 6, so `scanner_version` and the DB seeded at build time are unaffected.
+
+  **The vulnerable code was never linked in**, and that is worth recording rather than implying urgency the finding did not have. Both advisories are scoped to `golang.org/x/mod/sumdb` (`Client.Lookup`, GO-2026-6180) and `golang.org/x/mod/sumdb/tlog` (`tileHashReader.ReadHashes`, GO-2026-6179) — the GOSUMDB transparency-log client — and neither package is in grype's build graph: `go mod why golang.org/x/mod/sumdb` answers "main module does not need package", and `go list -deps ./cmd/grype` links only `semver`, `module`, `modfile` and `internal/lazyregexp`, reached via `cmd/grype/cli/commands/internal/jsonschema` → `x/tools/go/packages`. Trivy flags Go binaries at module granularity from the embedded build info and cannot see that, while `govulncheck` would call the binary unaffected. It is fixed at source anyway rather than suppressed in `.trivyignore`, which is reserved for findings with no fix available in a tool we can build.
+
+  This clears the backend image only. The same CVE pair is also reported against `usr/local/bin/trivy` in the scanner-adapter image and is cleared separately by repointing at a Trivy build carrying x/mod v0.40.0; **both are required before `main` publishes again**.
+
 ## [1.8.1] - 2026-08-19
 
 ### Fixed
