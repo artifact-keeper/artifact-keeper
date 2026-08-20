@@ -578,6 +578,21 @@ jobs:
       - name: Check release-preflight gates block on what they measure
         run: bash scripts/ci/test-release-preflight.sh
 
+      # The release-branch gate only runs on PRs against `release/*` — a
+      # handful of runs per release, far too rare to notice a regression in.
+      # It matters most for the two exemptions #3422 added (release prep,
+      # narrowed backport), which must keep FAILING for everything they are
+      # not: a `chore(release):` commit that also touches source, a
+      # version-file-only commit under another subject, a cherry-pick trailer
+      # naming a sha main does not have. Builds throwaway git repos; ~2s.
+      #
+      # On THIS branch the wiring matters twice over: the gate's logic lived
+      # inline in release-branch-gate.yml, so it had no test at all and no way
+      # to be exercised without opening a release PR — which is how the 1.7.x
+      # line ended up needing `release-process: approved` on every backport.
+      - name: Check release-branch gate exemptions stay narrow
+        run: bash scripts/ci/test-check-release-branch-commits.sh
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
