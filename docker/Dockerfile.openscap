@@ -45,7 +45,8 @@ RUN mkdir -p /mnt/rootfs && \
 RUN echo 'oscap:x:1001:0:OpenSCAP Scanner:/home/oscap:/sbin/nologin' >> /mnt/rootfs/etc/passwd && \
     echo 'oscap:x:1001:' >> /mnt/rootfs/etc/group && \
     mkdir -p /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace /mnt/rootfs/usr/local/bin && \
-    chown -R 1001:0 /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace
+    chown -R 1001:0 /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace && \
+    chmod -R g=rwX /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace
 
 # ---------- STIG hardening (applicable subset for ubi-micro) ----------
 
