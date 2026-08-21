@@ -71,12 +71,23 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 # github.com/docker/docker v28.5.2 (CVE-2026-34040) is a dependency rather than
 # the toolchain and stays suppressed in /.trivyignore — see Dockerfile.backend
 # for why no override version exists to point at.
+#
+# golang.org/x/mod IS overridden here (#3465), because unlike docker/docker it
+# has a version to point at. CVE-2026-56864 / CVE-2026-56865 (HIGH, fixed in
+# x/mod v0.40.0) burned the v1.7.7 tag; no grype release and not even
+# anchore/grype `main` carries the bump, so this is an override rather than a
+# tag bump, with the removal condition enforced by the guard below. The full
+# justification, the reachability finding and the MVS consequences are in
+# Dockerfile.backend — read it there rather than duplicating a second copy that
+# can drift.
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS grype-bin
 ARG TARGETOS
 ARG TARGETARCH
 ARG GRYPE_VERSION=0.117.0
 ARG GRYPE_COMMIT=b5fa92bbcbef655497e3be840a2f718380e2cdd3
 ARG GO_MIN_PATCH=1.26.6
+ARG XMOD_FROM=v0.38.0
+ARG XMOD_TO=v0.40.0
 
 RUN apk add --no-cache git ca-certificates
 
@@ -100,6 +111,36 @@ RUN set -eu; \
       exit 1; \
     fi
 
+# Dependency override — see Dockerfile.backend for the full note (#3465).
+RUN set -eu; \
+    xmod_pin() { sed -n 's|^[[:space:]]*golang\.org/x/mod \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
+    have="$(xmod_pin)"; \
+    if [ "${have}" != "${XMOD_FROM}" ]; then \
+      echo "ERROR: grype v${GRYPE_VERSION} pins golang.org/x/mod ${have}, not ${XMOD_FROM}." >&2; \
+      echo "       This override was written against ${XMOD_FROM}. If upstream now" >&2; \
+      echo "       ships >= ${XMOD_TO}, DELETE the override block in this stage." >&2; \
+      echo "       If it moved to some other version, re-review it. See #3465." >&2; \
+      exit 1; \
+    fi; \
+    go get "golang.org/x/mod@${XMOD_TO}"; \
+    got="$(xmod_pin)"; \
+    if [ "${got}" != "${XMOD_TO}" ]; then \
+      echo "ERROR: override did not take: go.mod pins golang.org/x/mod ${got}." >&2; \
+      exit 1; \
+    fi; \
+    moved="$(git --no-pager diff --unified=0 go.mod \
+             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
+    expected="golang.org/x/crypto golang.org/x/mod golang.org/x/net golang.org/x/text golang.org/x/tools "; \
+    if [ "${moved}" != "${expected}" ]; then \
+      echo "ERROR: go get moved an undeclared set of modules." >&2; \
+      echo "       expected: ${expected}" >&2; \
+      echo "       actual:   ${moved}" >&2; \
+      echo "       Re-review the override and update the declared set (#3465)." >&2; \
+      exit 1; \
+    fi; \
+    go mod verify; \
+    echo "grype build: override applied — golang.org/x/mod ${XMOD_FROM} -> ${XMOD_TO}"
+
 RUN set -eu; \
     build_date="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)"; \
     CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
@@ -111,6 +152,26 @@ RUN set -eu; \
           -X main.buildDate=${build_date}" \
         ./cmd/grype; \
     install -Dm644 LICENSE /licenses/grype/LICENSE
+
+# Prove the override reached the compiled binary's build info, which is what
+# Trivy actually reads — see Dockerfile.backend (#3465).
+RUN set -eu; \
+    info="$(go version -m /grype)"; \
+    deps="$(printf '%s\n' "${info}" | grep -c '^[[:space:]]*dep[[:space:]]')"; \
+    if [ "${deps}" -lt 50 ]; then \
+      echo "ERROR: /grype reports only ${deps} dependency records; build info is" >&2; \
+      echo "       unreadable or implausible, so the override is unverified." >&2; \
+      exit 1; \
+    fi; \
+    recorded="$(printf '%s\n' "${info}" \
+                | sed -n 's|^[[:space:]]*dep[[:space:]]*golang\.org/x/mod[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+                | head -n1)"; \
+    if [ "${recorded}" != "${XMOD_TO}" ]; then \
+      echo "ERROR: compiled grype records golang.org/x/mod '${recorded}', want ${XMOD_TO}." >&2; \
+      echo "       The Trivy gate reads this build info; the override did not ship (#3465)." >&2; \
+      exit 1; \
+    fi; \
+    echo "grype build: build info verified — golang.org/x/mod ${recorded} across ${deps} deps"
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
