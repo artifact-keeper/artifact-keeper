@@ -1975,7 +1975,11 @@ pub(crate) fn apply_pypi_simple_json_blocks(
 /// Map a repository format to the bounded Prometheus label owned by the
 /// age-gate capability registry. Unsupported formats collapse to `"other"`
 /// rather than widening the label set.
-fn format_label(format: &RepositoryFormat) -> &'static str {
+///
+/// `pub(crate)` so handlers that run their own listing filter — the Cargo
+/// sparse index (#3480), which parses NDJSON this service does not model —
+/// emit the same label from the same registry rather than hardcoding one.
+pub(crate) fn format_label(format: &RepositoryFormat) -> &'static str {
     crate::formats::age_gate_spec(format)
         .map(|spec| spec.label)
         .unwrap_or("other")
