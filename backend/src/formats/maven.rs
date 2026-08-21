@@ -214,6 +214,26 @@ impl MavenHandler {
         path.ends_with("maven-metadata.xml")
     }
 
+    /// Check if this is the repository prefix file (`.meta/prefixes.txt`).
+    pub fn is_prefixes_file(path: &str) -> bool {
+        path.trim_start_matches('/') == ".meta/prefixes.txt"
+    }
+
+    /// Render a Maven repository prefix file
+    /// (https://maven.apache.org/resolver/remote-repository-filtering.html#the-prefixes-filter)
+    /// from groupId path prefixes such as `/org/apache/maven`. Sorts and
+    /// dedupes the input.
+    pub fn generate_prefixes_txt(mut group_paths: Vec<String>) -> String {
+        group_paths.sort();
+        group_paths.dedup();
+        let mut out = String::from("## repository-prefixes/1.0\n");
+        for p in group_paths {
+            out.push_str(&p);
+            out.push('\n');
+        }
+        out
+    }
+
     /// Normalize a catalog `packages.name` for a Maven/Gradle artifact to the
     /// grouped `groupId:artifactId` form that hosted/virtual grouped listings
     /// key on (#2723).
@@ -807,6 +827,37 @@ mod tests {
         assert_eq!(coords.artifact_id, "test");
         assert_eq!(coords.version, "1.0.0-SNAPSHOT");
         assert_eq!(coords.extension, "maven-metadata.xml");
+    }
+
+    #[test]
+    fn test_is_prefixes_file() {
+        assert!(MavenHandler::is_prefixes_file(".meta/prefixes.txt"));
+        assert!(MavenHandler::is_prefixes_file("/.meta/prefixes.txt"));
+        assert!(!MavenHandler::is_prefixes_file("prefixes.txt"));
+        assert!(!MavenHandler::is_prefixes_file(
+            "com/example/mylib/1.0.0/mylib-1.0.0.jar"
+        ));
+        assert!(!MavenHandler::is_prefixes_file("maven-metadata.xml"));
+    }
+
+    #[test]
+    fn test_generate_prefixes_txt_sorts_and_dedupes() {
+        let txt = MavenHandler::generate_prefixes_txt(vec![
+            "/org/apache/maven".to_string(),
+            "/com/example".to_string(),
+            "/org/apache/maven".to_string(),
+        ]);
+        let mut lines = txt.lines();
+        assert_eq!(lines.next(), Some("## repository-prefixes/1.0"));
+        assert_eq!(lines.next(), Some("/com/example"));
+        assert_eq!(lines.next(), Some("/org/apache/maven"));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn test_generate_prefixes_txt_empty_is_header_only() {
+        let txt = MavenHandler::generate_prefixes_txt(vec![]);
+        assert_eq!(txt, "## repository-prefixes/1.0\n");
     }
 
     #[test]
