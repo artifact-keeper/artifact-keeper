@@ -1663,6 +1663,20 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
     if format == "ext" {
         segments.next(); // "<format_key>"
     }
+    // Two format routers are ALSO mounted under an `/api` prefix, matching the
+    // URL shape their clients build:
+    //   /api/cargo/<repo_key>/...    sparse index (#3000)
+    //   /api/helm/<repo_key>/charts  ChartMuseum cm-push (#2941)
+    // Those paths are `/api/<format>/<repo_key>/...`, so the generic rule
+    // returned the literal "cargo"/"helm" as the key, nothing resolved, and
+    // the visibility middleware answered from its no-repo branch — 401 for
+    // anonymous callers, existence-hiding 404 for a valid credential. Both
+    // aliases were mounted but dead. Skip the `/api` prefix for exactly those
+    // two format names so the real repository key is evaluated; every other
+    // `/api` path, `/api/v1/...` included, keeps its second segment.
+    if format == "api" && matches!(segments.clone().next(), Some("cargo" | "helm")) {
+        segments.next(); // "<format>"
+    }
     let raw = segments.next().unwrap_or("");
     match percent_decode_path_segment(raw) {
         Some(decoded) => decoded,
@@ -2082,6 +2096,18 @@ pub async fn repo_visibility_middleware(
     let repo_key = extract_repo_key(&path);
 
     if repo_key.is_empty() {
+        // No repository key to authorize, but the handler this falls through
+        // to still binds `Extension<Option<AuthExtension>>`, and axum answers
+        // a missing extension with a 500 that prints the extension's type
+        // path. Every format route reaches this branch when its `:repo_key`
+        // segment is empty (`/npm//pkg`, `/maven//`, `/api/cargo//ve/ri/x`),
+        // so the anonymous, unauthenticated 500 was reachable on all of them.
+        // Insert the anonymous value the middleware would have inserted below
+        // so the handler runs and answers 401/404 on its own terms. This
+        // grants nothing: `None` is exactly what an unauthenticated caller
+        // gets on the normal path, and every handler that reads the extension
+        // re-derives its own decision from it.
+        request.extensions_mut().insert(None::<AuthExtension>);
         return next.run(request).await;
     }
 
@@ -3679,6 +3705,51 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_repo_key_api_alias() {
+        // #2941 / #3000: the cm-push and cargo alias routers are mounted at
+        // `/api/helm` and `/api/cargo`, so their paths are
+        // `/api/<format>/<repo_key>/...` and the repository key is the THIRD
+        // segment. Before the fix the generic rule returned the literal
+        // "helm"/"cargo", no repo matched, and the visibility middleware's
+        // no-repo branch rejected every alias request before the handler ran.
+        assert_eq!(extract_repo_key("/api/helm/my-repo/charts"), "my-repo");
+        assert_eq!(
+            extract_repo_key("/api/helm/my-repo/charts/mychart/1.2.3"),
+            "my-repo"
+        );
+        assert_eq!(
+            extract_repo_key("/api/cargo/my-repo/config.json"),
+            "my-repo"
+        );
+        assert_eq!(
+            extract_repo_key("/api/cargo/my-repo/api/v1/crates/new"),
+            "my-repo"
+        );
+        // Missing repo segment: empty key, as at any other format root.
+        assert_eq!(extract_repo_key("/api/cargo"), "");
+        assert_eq!(extract_repo_key("/api"), "");
+    }
+
+    #[test]
+    fn test_extract_repo_key_api_non_alias_unchanged() {
+        // The skip is limited to the two aliased format names. `/api/v1` is
+        // the REST API, not a format mount, and must never be read as
+        // `/api/<format>/<repo_key>/...` — a broadened "any /api/<x>" rule
+        // would turn "v1" into a format prefix and the resource name into a
+        // repository key.
+        assert_eq!(extract_repo_key("/api/v1/repositories"), "v1");
+        assert_eq!(
+            extract_repo_key("/api/v1/repositories/my-repo/artifacts"),
+            "v1"
+        );
+        assert_eq!(extract_repo_key("/api/packages/flutter_web"), "packages");
+        // The native mounts are untouched, including a repository that
+        // happens to be named after an aliased format.
+        assert_eq!(extract_repo_key("/cargo/helm/config.json"), "helm");
+        assert_eq!(extract_repo_key("/helm/cargo/index.yaml"), "cargo");
+    }
+
+    #[test]
     fn test_extract_repo_key_percent_decoded() {
         // GHSA-fv45-mwhh-q23r: axum's `Path<String>` extraction percent-decodes
         // route params, so the middleware must evaluate the SAME decoded key.
@@ -3696,14 +3767,19 @@ mod tests {
         assert_eq!(extract_repo_key("/npm/my+repo/pkg"), "my+repo");
         // Double-encoding decodes exactly once, like the handler.
         assert_eq!(extract_repo_key("/npm/a%2520b/pkg"), "a%20b");
-        // The conda token-channel and /ext skips happen BEFORE decoding, so
-        // encoded keys under those mounts canonicalize the same way.
+        // The conda token-channel, /ext and /api alias skips all happen
+        // BEFORE decoding, so encoded keys under those mounts canonicalize
+        // the same way.
         assert_eq!(
             extract_repo_key("/conda/t/abc123token/privat%65/noarch/repodata.json"),
             "private"
         );
         assert_eq!(
             extract_repo_key("/ext/pypi-custom/privat%65/simple/"),
+            "private"
+        );
+        assert_eq!(
+            extract_repo_key("/api/cargo/privat%65/config.json"),
             "private"
         );
     }
@@ -6804,6 +6880,327 @@ mod tests {
         let state = make_vis_state(Some((key.to_string(), cached))).await;
         let resp = run_through_visibility(state, empty_get("/pypi/privat%65/simple/")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_api_alias_resolves_repo_key() {
+        // #3000: the cargo alias is mounted at `/api/cargo`, so the key is the
+        // third segment. The repo below is PUBLIC and cached under that key,
+        // so the anonymous sparse-index read passes (200). Before the fix the
+        // middleware looked up the literal "cargo", missed, and answered from
+        // its no-repo branch (401 anonymous / 404 with a credential) — the
+        // alias route was mounted but unreachable. The `/api/helm` cm-push
+        // alias shares the same shape and the same extraction.
+        let key = "myrepo";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let resp = run_through_visibility(state, empty_get("/api/cargo/myrepo/config.json")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3443 — the authorization half of the `/api` alias defect.
+    //
+    // `/api/cargo/{repo}/...` and `/api/helm/{repo}/charts` are mounted
+    // (routes.rs), but `extract_repo_key` returned the SECOND segment, i.e.
+    // the literal string `"cargo"` / `"helm"`. Those are ordinary, accepted
+    // repository keys, and they are the names an operator naturally gives a
+    // cargo or a Helm repository. Whenever such a repository exists, the
+    // middleware evaluated visibility, token scope and permissions against
+    // THAT repository while axum handed the handler the third segment — the
+    // repository actually being served. A checked-vs-served split, exactly
+    // the shape of GHSA-9rqp-mgmw-5879 (`/ext`) and GHSA-fv45-mwhh-q23r.
+    //
+    // The tests below encode the bypass primitives themselves, not just the
+    // extraction: each one passes the request through the real middleware and
+    // asserts a DENIAL that only holds once the key resolves to the third
+    // segment.
+    // -----------------------------------------------------------------------
+
+    /// Build a visibility state whose repo cache is pre-populated with several
+    /// repositories, so a request can be driven against one key while another
+    /// key is also resolvable — the decoy setup the `/api` alias defect needs.
+    async fn make_vis_state_multi(cached: Vec<(String, CachedRepo)>) -> RepoVisibilityState {
+        let state = make_vis_state(None).await;
+        {
+            let mut cache = state.repo_cache.write().await;
+            for (key, entry) in cached {
+                cache.insert(key, (entry, std::time::Instant::now()));
+            }
+        }
+        state
+    }
+
+    /// A PUBLIC repository literally named `cargo` — the ordinary result of
+    /// `POST /api/v1/repositories {"key":"cargo"}` — alongside the PRIVATE
+    /// repository whose crates are being protected.
+    async fn decoy_cargo_vis_state() -> RepoVisibilityState {
+        make_vis_state_multi(vec![
+            ("cargo".to_string(), make_cached_repo(/* is_public */ true)),
+            (
+                "cargo-priv".to_string(),
+                make_cached_repo(/* is_public */ false),
+            ),
+        ])
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_api_alias_decoy_cargo_repo_does_not_authorize_anonymous_private_read() {
+        // A repository literally named `cargo` exists and is public — the
+        // ordinary result of `POST /api/v1/repositories {"key":"cargo"}`.
+        // A second, PRIVATE repository holds the crates being protected.
+        //
+        // Before the fix the middleware resolved the key `"cargo"`, saw a
+        // PUBLIC repository, allowed the anonymous read, and the handler then
+        // served `cargo-priv` — an unauthenticated download of a private
+        // crate. The key must resolve to the repository the handler serves.
+        let state = decoy_cargo_vis_state().await;
+        let resp = run_through_visibility(
+            state,
+            empty_get("/api/cargo/cargo-priv/api/v1/crates/verifycrate/0.1.0/download"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an anonymous read of a PRIVATE repository through /api/cargo must \
+             be refused even when a public repository named `cargo` exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_alias_decoy_cargo_repo_does_not_authorize_anonymous_sparse_index() {
+        // Same primitive on the sparse-index shape cargo actually fetches
+        // first: the index reveals every crate name and version in the
+        // private repository before a single download is attempted.
+        let state = decoy_cargo_vis_state().await;
+        for uri in [
+            "/api/cargo/cargo-priv/config.json",
+            "/api/cargo/cargo-priv/ve/ri/verifycrate",
+        ] {
+            let resp = run_through_visibility(state.clone(), empty_get(uri)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "anonymous {uri} must be refused while `cargo-priv` is private"
+            );
+        }
+    }
+
+    /// Mint an access JWT carrying an `allowed_repo_ids` ceiling, i.e. the
+    /// claim shape a repository-scoped API token is exchanged into.
+    fn mint_scoped_access_jwt(
+        secret: &str,
+        sub: Uuid,
+        username: &str,
+        allowed_repo_ids: Vec<Uuid>,
+    ) -> String {
+        let now = Utc::now();
+        let claims = Claims {
+            sub,
+            username: username.to_string(),
+            email: format!("{}@example.test", username),
+            is_admin: false,
+            allowed_repo_ids: Some(allowed_repo_ids),
+            iat: now.timestamp(),
+            iat_ms: Some(now.timestamp_millis()),
+            exp: now.timestamp() + 300,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+            scopes: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode scoped access jwt")
+    }
+
+    /// Shared fixture for the two scoped-token alias tests.
+    ///
+    /// The caller holds a token scoped to a repository named after the alias
+    /// format (`cargo` / `helm`) and every fine-grained action on it — the
+    /// legitimate owner of that repository. A second, unrelated private
+    /// repository is the victim, and the caller has NO grant and NO scope on
+    /// it. Both repositories live only in the middleware's repo cache; the
+    /// database is needed for the users row the JWT validator re-reads and for
+    /// the `permissions` rows the write gate consults.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset, and `AK_TESTS_REQUIRE_DB=1`
+    /// (set by both the unit-test and coverage CI jobs) turns an unreachable
+    /// database into a hard failure rather than a silent skip.
+    async fn api_alias_scoped_token_fixture(
+        decoy_key: &str,
+        victim_key: &str,
+        actions: &[&str],
+    ) -> Option<(sqlx::PgPool, RepoVisibilityState, String, Uuid, Uuid)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await; // non-admin
+
+        // The repositories live in the cache only, so no `repositories` rows
+        // (and no globally-unique `cargo` / `helm` key) are claimed in a
+        // shared test database. `permissions.target_id` is an unconstrained
+        // uuid, so the grant below still drives the real permission service.
+        let decoy_id = Uuid::new_v4();
+        let victim_id = Uuid::new_v4();
+        tdh::grant_repo_actions(&pool, decoy_id, user_id, actions).await;
+
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let config = std::sync::Arc::new(crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        });
+        let auth_service = Arc::new(AuthService::new(pool.clone(), config));
+        let bearer = format!(
+            "Bearer {}",
+            mint_scoped_access_jwt(secret, user_id, &username, vec![decoy_id])
+        );
+
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let mut guard = cache.write().await;
+            for (key, id) in [(decoy_key, decoy_id), (victim_key, victim_id)] {
+                let entry = CachedRepo {
+                    id,
+                    ..make_cached_repo(/* is_public */ false)
+                };
+                guard.insert(key.to_string(), (entry, std::time::Instant::now()));
+            }
+        }
+        let state = RepoVisibilityState {
+            auth_service,
+            db: pool.clone(),
+            repo_cache: cache,
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        Some((pool, state, bearer, user_id, decoy_id))
+    }
+
+    /// Delete the fixture rows created against ids that have no `repositories`
+    /// row, which `tdh::cleanup` cannot reach.
+    async fn api_alias_scoped_token_cleanup(pool: &sqlx::PgPool, user_id: Uuid, decoy_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(decoy_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_api_alias_scoped_token_cannot_publish_to_another_repository() {
+        // A token scoped to the repository named `cargo` publishing into a
+        // DIFFERENT repository through `/api/cargo/{other}/api/v1/crates/new`.
+        //
+        // Before the fix the middleware resolved `"cargo"` — the very
+        // repository the token IS scoped to — so `can_access_repo` passed and
+        // the write gate checked the caller's grant on `cargo`. Both said yes,
+        // and the handler then published into `othercrates`. The repository
+        // ceiling was lost on the alias path, the #3316 shape.
+        let Some((pool, state, bearer, user_id, decoy_id)) =
+            api_alias_scoped_token_fixture("cargo", "othercrates", &["read", "write", "delete"])
+                .await
+        else {
+            return;
+        };
+
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri("/api/cargo/othercrates/api/v1/crates/new")
+            .header("Authorization", &bearer)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let status = run_through_visibility(state, req).await.status();
+
+        api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a token scoped to the repository `cargo` must not publish into \
+             another repository through /api/cargo"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_alias_scoped_token_cannot_delete_in_another_repository() {
+        // The destructive half, on the cm-push alias: a token scoped to the
+        // repository named `helm` deleting a chart out of a different
+        // repository through `/api/helm/{other}/charts/{name}/{version}`.
+        let Some((pool, state, bearer, user_id, decoy_id)) =
+            api_alias_scoped_token_fixture("helm", "helm-priv", &["read", "write", "delete"]).await
+        else {
+            return;
+        };
+
+        let req = axum::http::Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/helm/helm-priv/charts/testchart/0.1.0")
+            .header("Authorization", &bearer)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let status = run_through_visibility(state, req).await.status();
+
+        api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a token scoped to the repository `helm` must not delete a chart \
+             in another repository through /api/helm"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_empty_key_still_provides_auth_extension() {
+        // An empty `:repo_key` segment (`/npm//pkg`, `/api/cargo//ve/ri/x`)
+        // leaves nothing to authorize, so the middleware falls through — but
+        // the handler behind it still binds `Extension<Option<AuthExtension>>`,
+        // and axum answers a missing extension with a 500 whose body prints
+        // the extension's type path. The fall-through therefore has to insert
+        // the anonymous value it would otherwise have inserted further down.
+        use axum::{middleware, routing::any, Extension, Router};
+        use tower::ServiceExt;
+
+        // A handler with the strict extractor every format handler uses.
+        async fn probe(
+            Extension(auth): Extension<Option<AuthExtension>>,
+        ) -> (StatusCode, &'static str) {
+            assert!(auth.is_none(), "an anonymous request must arrive as None");
+            (StatusCode::OK, "handler-reached")
+        }
+
+        for uri in [
+            "/npm//pkg",
+            "/pypi//simple/",
+            "/maven//",
+            "/api/cargo//ve/ri/verifycrate",
+            "/api/helm//charts",
+        ] {
+            let state = make_vis_state(None).await;
+            let app: Router =
+                Router::new()
+                    .fallback(any(probe))
+                    .layer(middleware::from_fn_with_state(
+                        state,
+                        repo_visibility_middleware,
+                    ));
+            let resp = app.oneshot(empty_get(uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{uri} must reach the handler with an auth extension present, \
+                 not fail with a 500 for a missing extension"
+            );
+        }
     }
 
     #[tokio::test]
