@@ -335,9 +335,9 @@ pub fn spawn_all(
         let config_clone = config.clone();
         let gc_registry = storage_registry.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(120)).await;
+            tokio::time::sleep(jittered_startup_delay(120)).await;
             // Kept for the blob-GC readiness gate below; the pool itself is
-            // moved into the GC service on the next line.
+            // also moved into the GC service below.
             let gate_db = db.clone();
             // Post-GC storage-stats refresher (#2056): recompute the
             // deduplicated `repository_storage_stats` right after each GC pass
@@ -382,38 +382,15 @@ pub fn spawn_all(
                     .unwrap_or(std::time::Duration::from_secs(3600));
                 tokio::time::sleep(delay).await;
 
-                tracing::info!("Running scheduled storage garbage collection");
-
-                match service.run_gc(false).await {
-                    Ok(result) => {
-                        if result.storage_keys_deleted > 0 {
-                            tracing::info!(
-                                "Storage GC: deleted {} keys, removed {} artifacts, freed {} bytes",
-                                result.storage_keys_deleted,
-                                result.artifacts_removed,
-                                result.bytes_freed
-                            );
-                            metrics_service::record_cleanup(
-                                "storage_gc",
-                                result.artifacts_removed as u64,
-                            );
-                        }
-                        if !result.errors.is_empty() {
-                            tracing::warn!(
-                                "Storage GC completed with {} errors",
-                                result.errors.len()
-                            );
-                            // Surface the actual messages, not just the count,
-                            // so the orchestration-layer log is actionable.
-                            for err in &result.errors {
-                                tracing::warn!(gc_error = %err, "Storage GC error");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Storage garbage collection failed: {}", e);
-                    }
-                }
+                // Multi-replica safety: without a lease, every replica computes
+                // the same `next` occurrence and fires this tick at the same
+                // instant, running the Maven flat-object orphan scan (and the
+                // rest of `run_gc`) concurrently on every replica. Only the
+                // scheduled tick is gated — the on-demand admin/per-repo GC
+                // endpoints call `run_gc`/`run_gc_for_repository` directly and
+                // must keep working even while a scheduled tick holds this
+                // lease. See `StorageGcService::run_scheduled_tick`.
+                service.run_scheduled_tick("storage_gc").await;
 
                 // Blob layer GC runs in the same tick: the manifest GC pass
                 // above frees `oci-manifests/...` storage keys, this pass
