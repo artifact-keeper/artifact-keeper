@@ -10,7 +10,7 @@
 //!   GET  /cargo/{repo_key}/api/v1/crates/{name}/{version}/download - Download crate
 //!   GET  /cargo/{repo_key}/index/*path                             - Sparse index lookup
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -248,6 +248,196 @@ fn split_url(url: &str) -> Option<(String, String)> {
     let origin = &url[..scheme_end + 3 + slash];
     let path = &url[scheme_end + 3 + slash + 1..];
     Some((origin.to_string(), path.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Age-gate sparse-index filtering (#3480, Phase 1 — pure, no IO)
+// ---------------------------------------------------------------------------
+//
+// These helpers extract `(version, publish_time)` pairs from a sparse-index
+// NDJSON document for `AgeGateService::evaluate_versions_batch`
+// (`crate::services::age_gate_service`, `pub(crate)`), and rebuild a
+// filtered document once the caller knows which versions are blocked — the
+// same split as the Go `@v/list` filter (`parse_version_list` /
+// `filter_version_list` in `goproxy.rs`). Not yet wired into `serve_index`,
+// `try_remote_index`, or `try_virtual_index`: that DB-backed enforcement,
+// the content-coding-aware `_encoded` fetch variant, and the `resolve_index_
+// cksum` fail-open-to-fail-closed inversion are Phase 2. `#[allow(dead_code)]`
+// mirrors `package_name_from_crate_filename` in `formats::cargo` — a pure
+// primitive kept ready for a call site that lands in a later phase.
+
+/// Minimal fields extracted from one Cargo sparse-index NDJSON line for
+/// age-gate evaluation: the version being described and its optional
+/// registry-published `pubtime`. Deliberately narrower than
+/// [`crate::formats::cargo::IndexEntry`] (which requires `name`/`cksum` and
+/// models the full entry shape): serde ignores JSON keys it doesn't
+/// recognise, so this stays forward-compatible with index fields this
+/// server does not otherwise model, and a line missing `cksum` (which the
+/// full `IndexEntry` requires) still parses far enough to be age-gate
+/// evaluated.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct CargoAgeGateLineFields {
+    vers: String,
+    #[serde(default)]
+    pubtime: Option<String>,
+}
+
+/// Parse a Cargo sparse-index `pubtime` value under the registry-index
+/// spec's **strict** grammar: exactly `yyyy-mm-ddThh:mm:ssZ` — zero-padded,
+/// `Z`-suffixed UTC, no fractional seconds, no numeric offset, no other
+/// RFC 3339 variant.
+///
+/// This is deliberately narrower than Cargo itself. Cargo stabilized
+/// parsing `pubtime` by deserializing it into a `jiff::Timestamp`, which
+/// accepts the full RFC 3339 grammar (fractional seconds, `+00:00`-style
+/// numeric offsets). A conforming third-party sparse registry could
+/// therefore emit a `pubtime` Cargo parses successfully but this function
+/// rejects. That divergence is a conscious, spec-strict, fail-closed choice
+/// for the initial slice — raised as an open question upstream
+/// (artifact-keeper#3480, unanswered as of this writing): a `pubtime` this
+/// function cannot parse becomes `None`, which the `upstream_publish_time`
+/// policy treats as missing evidence and blocks + queues for review, rather
+/// than silently trusting a lenient parse.
+///
+/// Isolated as a single function — with its own tests below, including the
+/// forms it deliberately rejects — so switching to Cargo's own leniency
+/// later, if that is the maintainers' answer, is a one-function change.
+#[allow(dead_code)] // not yet wired into a handler; see the module comment above.
+fn parse_cargo_pubtime(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
+
+    // "yyyy-mm-ddThh:mm:ssZ" is exactly 20 ASCII bytes. Checking length and
+    // ASCII-ness up front means every byte index used below is also a valid
+    // char boundary, so the slices cannot panic.
+    if raw.len() != 20 || !raw.is_ascii() {
+        return None;
+    }
+    let b = raw.as_bytes();
+    let literals_match = b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'Z';
+    let digits_match = [0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+        .iter()
+        .all(|&i| b[i].is_ascii_digit());
+    if !literals_match || !digits_match {
+        return None;
+    }
+
+    let year: i32 = raw[0..4].parse().ok()?;
+    let month: u32 = raw[5..7].parse().ok()?;
+    let day: u32 = raw[8..10].parse().ok()?;
+    let hour: u32 = raw[11..13].parse().ok()?;
+    let minute: u32 = raw[14..16].parse().ok()?;
+    let second: u32 = raw[17..19].parse().ok()?;
+
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
+    Some(Utc.from_utc_datetime(&date.and_time(time)))
+}
+
+/// Extract `(version, publish_time)` pairs from a decoded Cargo sparse-index
+/// NDJSON document, for [`AgeGateService::evaluate_versions_batch`]
+/// (`crate::services::age_gate_service`).
+///
+/// Pure and IO-free: `content` must already be decoded bytes (identity
+/// coding) — stripping an upstream `Content-Encoding` before parsing is the
+/// caller's job, following `decode_go_metadata_body`'s template in
+/// `goproxy.rs` (#3280). Splits on raw bytes (not `str::from_utf8` on the
+/// whole document) so one invalid-UTF-8 line cannot hide every other line's
+/// evaluation. Blank/whitespace-only lines are skipped, matching
+/// [`crate::formats::cargo::CargoHandler::parse_index_file`]'s existing
+/// upstream-document shape.
+///
+/// A line that is not valid UTF-8, not valid JSON, or has no `vers` field is
+/// a malformed upstream entry: it is logged and OMITTED — not surfaced as an
+/// error — so one bad line cannot hide the rest of a crate's otherwise-valid
+/// version history from evaluation. A missing or unparseable `pubtime`
+/// (see [`parse_cargo_pubtime`]) becomes `None` on an otherwise-valid line;
+/// the `upstream_publish_time` policy is what turns that into a block.
+///
+/// Because omission here means a version never reaches
+/// `evaluate_versions_batch`, [`filter_cargo_index_lines`] independently
+/// omits any line this function could not parse too — an enabled gate must
+/// never pass a line whose version/time it never evaluated.
+#[allow(dead_code)] // not yet wired into a handler; see the module comment above.
+fn collect_cargo_index_versions(
+    content: &[u8],
+) -> Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> {
+    let mut out = Vec::new();
+    for raw_line in content.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            tracing::warn!(
+                "cargo sparse-index line is not valid UTF-8; omitting from age-gate evaluation"
+            );
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<CargoAgeGateLineFields>(trimmed) {
+            Ok(fields) => {
+                let pubtime = fields.pubtime.as_deref().and_then(parse_cargo_pubtime);
+                out.push((fields.vers, pubtime));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "cargo sparse-index line failed to parse; omitting from age-gate evaluation"
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Rebuild a Cargo sparse-index NDJSON document with every `blocked` version
+/// removed, preserving each surviving line byte-for-byte (no
+/// re-serialization) and in original order.
+///
+/// This is the enabled-gate contract: it is deliberately more aggressive
+/// than [`collect_cargo_index_versions`] on malformed input. That function
+/// only SKIPS a line it cannot parse, so one bad release does not hide the
+/// rest of the document from evaluation; this function OMITS such a line
+/// too, for a different reason — an enabled gate must never pass a line
+/// whose version/publish-time was never evaluated (fail closed on malformed
+/// NDJSON, per the plan). Blank lines are dropped, matching
+/// [`collect_cargo_index_versions`] and the Go `@v/list` filter's shape.
+///
+/// The caller (Phase 2's handler-level wiring — not yet added) is expected
+/// to invoke this only when the age gate is enabled and enforceable; an
+/// ungated repository keeps today's verbatim proxy fast path untouched.
+/// `content` must already be decoded bytes for the same reason as
+/// [`collect_cargo_index_versions`].
+#[allow(dead_code)] // not yet wired into a handler; see the module comment above.
+fn filter_cargo_index_lines(content: &[u8], blocked: &HashSet<String>) -> Bytes {
+    let mut out: Vec<u8> = Vec::with_capacity(content.len());
+    let mut wrote_any = false;
+    for raw_line in content.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(fields) = serde_json::from_str::<CargoAgeGateLineFields>(trimmed) else {
+            continue;
+        };
+        if blocked.contains(&fields.vers) {
+            continue;
+        }
+        if wrote_any {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(raw_line);
+        wrote_any = true;
+    }
+    Bytes::from(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1929,6 +2119,379 @@ mod tests {
             super::cksum_for_version(ndjson.as_bytes(), "1.0.0").as_deref(),
             Some(CKSUM_A)
         );
+    }
+
+    // ── #3480 Phase 1: age-gate sparse-index filtering (pure helpers) ──
+
+    // ---- parse_cargo_pubtime ----
+
+    #[test]
+    fn test_parse_cargo_pubtime_valid_strict_format() {
+        use chrono::TimeZone;
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00Z"),
+            Some(chrono::Utc.with_ymd_and_hms(2024, 3, 15, 9, 30, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_old_timestamp() {
+        use chrono::TimeZone;
+        // "old" — well outside any plausible min-age window.
+        assert_eq!(
+            super::parse_cargo_pubtime("1970-01-01T00:00:00Z"),
+            Some(chrono::Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_young_timestamp() {
+        use chrono::TimeZone;
+        // "young" — the incident's actual publish instant (arrayref 0.3.10).
+        assert_eq!(
+            super::parse_cargo_pubtime("2026-08-20T07:15:00Z"),
+            Some(chrono::Utc.with_ymd_and_hms(2026, 8, 20, 7, 15, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_boundary_leap_day_valid() {
+        use chrono::TimeZone;
+        // 2024 is a leap year: Feb 29 is a valid calendar date.
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-02-29T23:59:59Z"),
+            Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2024, 2, 29, 23, 59, 59)
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_boundary_non_leap_year_rejected() {
+        // 2023 is not a leap year: Feb 29 does not exist.
+        assert_eq!(super::parse_cargo_pubtime("2023-02-29T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_boundary_out_of_range_components_rejected() {
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-13-01T00:00:00Z"),
+            None,
+            "month 13 is out of range"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-32T00:00:00Z"),
+            None,
+            "day 32 is out of range"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-01T24:00:00Z"),
+            None,
+            "hour 24 is out of range"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-01T00:60:00Z"),
+            None,
+            "minute 60 is out of range"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-01T00:00:60Z"),
+            None,
+            "a leap second is outside the spec-strict grammar"
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_missing_and_malformed() {
+        assert_eq!(super::parse_cargo_pubtime(""), None);
+        assert_eq!(super::parse_cargo_pubtime("not a timestamp"), None);
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-01"),
+            None,
+            "a bare date has no time component"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024/01/01T00:00:00Z"),
+            None,
+            "slashes instead of hyphens"
+        );
+    }
+
+    /// Deliberate spec-strict divergence from Cargo's own (jiff-based) RFC
+    /// 3339 leniency — see the doc comment on `parse_cargo_pubtime`. These
+    /// forms are exactly what upstream `pubtime`-carrying registries could
+    /// legally emit under full RFC 3339 but this parser rejects.
+    #[test]
+    fn test_parse_cargo_pubtime_strict_divergence_from_cargo_leniency() {
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00.123Z"),
+            None,
+            "fractional seconds are accepted by jiff but not the registry-index spec"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00.000000001Z"),
+            None,
+            "nanosecond-precision fractional seconds"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00+00:00"),
+            None,
+            "a numeric UTC offset is accepted by jiff but not the registry-index spec"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00-05:00"),
+            None,
+            "a non-UTC numeric offset"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15t09:30:00z"),
+            None,
+            "lowercase T/Z are outside the spec-strict grammar"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15 09:30:00Z"),
+            None,
+            "a space separator instead of T is valid RFC 3339 but not this grammar"
+        );
+    }
+
+    // ---- collect_cargo_index_versions ----
+
+    #[test]
+    fn test_collect_cargo_index_versions_extracts_vers_and_pubtime_in_order() {
+        let ndjson = concat!(
+            "{\"name\":\"arrayref\",\"vers\":\"0.3.9\",\"cksum\":\"aa\",\"pubtime\":\"2020-01-01T00:00:00Z\"}\n",
+            "{\"name\":\"arrayref\",\"vers\":\"0.3.10\",\"cksum\":\"bb\",\"pubtime\":\"2026-08-20T07:15:00Z\"}\n",
+        );
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].0, "0.3.9");
+        assert_eq!(
+            versions[0].1,
+            super::parse_cargo_pubtime("2020-01-01T00:00:00Z")
+        );
+        assert_eq!(versions[1].0, "0.3.10");
+        assert_eq!(
+            versions[1].1,
+            super::parse_cargo_pubtime("2026-08-20T07:15:00Z")
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_missing_pubtime_is_none() {
+        let ndjson = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(versions, vec![("1.0.0".to_string(), None)]);
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_malformed_pubtime_is_none_not_an_error() {
+        let ndjson =
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"pubtime\":\"not-a-timestamp\"}";
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(versions, vec![("1.0.0".to_string(), None)]);
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_omits_malformed_json_line_but_keeps_others() {
+        let ndjson = concat!(
+            "this-is-not-json\n",
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}\n",
+        );
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(
+            versions,
+            vec![("1.0.0".to_string(), None)],
+            "a malformed line must not hide a later good one, and must not itself surface"
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_line_missing_vers_field_omitted() {
+        let ndjson = concat!(
+            "{\"name\":\"x\",\"cksum\":\"aa\"}\n",
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}\n",
+        );
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(versions, vec![("1.0.0".to_string(), None)]);
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_blank_lines_skipped() {
+        let ndjson = concat!(
+            "\n",
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}\n",
+            "\n\n",
+            "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\"}\n",
+            "\n",
+        );
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(
+            versions,
+            vec![("1.0.0".to_string(), None), ("1.0.1".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_invalid_utf8_line_omitted_others_kept() {
+        let mut ndjson: Vec<u8> = Vec::new();
+        ndjson.extend_from_slice(b"{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}\n");
+        ndjson.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // not valid UTF-8
+        ndjson.push(b'\n');
+        ndjson.extend_from_slice(b"{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\"}");
+        let versions = super::collect_cargo_index_versions(&ndjson);
+        assert_eq!(
+            versions,
+            vec![("1.0.0".to_string(), None), ("1.0.1".to_string(), None)],
+            "the invalid-UTF-8 line must be omitted without corrupting neighboring lines"
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_yanked_entry_still_extracted() {
+        // `yanked` is not part of the age-gate contract; a yanked-but-young
+        // entry is still evaluated (and, once wired, still blockable) like
+        // any other.
+        let ndjson = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"yanked\":true,\"pubtime\":\"2026-08-20T07:15:00Z\"}";
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(
+            versions,
+            vec![(
+                "1.0.0".to_string(),
+                super::parse_cargo_pubtime("2026-08-20T07:15:00Z")
+            )]
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_empty_document() {
+        assert!(super::collect_cargo_index_versions(b"").is_empty());
+    }
+
+    // ---- filter_cargo_index_lines ----
+
+    #[test]
+    fn test_filter_cargo_index_lines_preserves_allowed_lines_byte_for_byte_and_in_order() {
+        let line_a = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"deps\":[]}";
+        let line_b = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\",\"deps\":[]}";
+        let ndjson = format!("{line_a}\n{line_b}");
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(filtered.as_ref(), format!("{line_a}\n{line_b}").as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_drops_blocked_versions_entirely() {
+        let line_a = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let line_b = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\"}";
+        let line_c = "{\"name\":\"x\",\"vers\":\"1.0.2\",\"cksum\":\"cc\"}";
+        let ndjson = format!("{line_a}\n{line_b}\n{line_c}");
+        let mut blocked = HashSet::new();
+        blocked.insert("1.0.1".to_string());
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(
+            filtered.as_ref(),
+            format!("{line_a}\n{line_c}").as_bytes(),
+            "the blocked version's line must be dropped entirely, survivors stay in order"
+        );
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_drops_malformed_line_even_when_gate_enabled() {
+        // Fail-closed contract: an unparseable line is omitted regardless of
+        // the blocked set, because its version/time was never evaluated.
+        let good = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let ndjson = format!("this-is-not-json\n{good}");
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(filtered.as_ref(), good.as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_drops_line_missing_vers_field() {
+        let good = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let ndjson = format!("{{\"name\":\"x\",\"cksum\":\"aa\"}}\n{good}");
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(filtered.as_ref(), good.as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_blank_lines_dropped() {
+        let line_a = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let line_b = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\"}";
+        let ndjson = format!("\n{line_a}\n\n\n{line_b}\n\n");
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(filtered.as_ref(), format!("{line_a}\n{line_b}").as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_invalid_utf8_line_dropped() {
+        let good = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let mut ndjson: Vec<u8> = Vec::new();
+        ndjson.extend_from_slice(&[0xFF, 0xFE]);
+        ndjson.push(b'\n');
+        ndjson.extend_from_slice(good.as_bytes());
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(&ndjson, &blocked);
+        assert_eq!(filtered.as_ref(), good.as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_yanked_entry_follows_the_same_blocked_set() {
+        // yanked:true must not exempt a version from the age gate, and must
+        // not itself trigger the malformed-line fail-closed path.
+        let yanked_allowed = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"yanked\":true}";
+        let yanked_blocked = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\",\"yanked\":true}";
+        let ndjson = format!("{yanked_allowed}\n{yanked_blocked}");
+        let mut blocked = HashSet::new();
+        blocked.insert("1.0.1".to_string());
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(
+            filtered.as_ref(),
+            yanked_allowed.as_bytes(),
+            "yanked is orthogonal to the age-gate block decision"
+        );
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_all_blocked_yields_empty_document() {
+        let ndjson = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let mut blocked = HashSet::new();
+        blocked.insert("1.0.0".to_string());
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_empty_document() {
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(b"", &blocked);
+        assert!(filtered.is_empty());
+    }
+
+    /// Decoded-body (identity content-coding) coverage at this pure layer:
+    /// bytes that already represent the identity-coded document round-trip
+    /// through both helpers with no surprises. Stripping an actual upstream
+    /// content-coding (gzip/deflate/zstd) before calling either helper is
+    /// Phase 2's job (`strip_content_coding`, per the module comment above);
+    /// these helpers only ever see decoded bytes.
+    #[test]
+    fn test_identity_decoded_body_round_trips_through_collect_and_filter() {
+        let line_a = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"pubtime\":\"2020-01-01T00:00:00Z\"}";
+        let line_b = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\",\"pubtime\":\"2026-08-20T07:15:00Z\"}";
+        let ndjson = format!("{line_a}\n{line_b}");
+        let decoded: Bytes = Bytes::from(ndjson.clone().into_bytes());
+
+        let versions = super::collect_cargo_index_versions(&decoded);
+        assert_eq!(versions.len(), 2);
+
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(&decoded, &blocked);
+        assert_eq!(filtered.as_ref(), ndjson.as_bytes());
     }
 
     /// Fixture shared by the two #2929 cache-gate tests below.
