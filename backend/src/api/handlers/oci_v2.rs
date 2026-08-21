@@ -10913,8 +10913,19 @@ async fn handle_delete_manifest(
         }
     };
 
+    // Preserve the OCI contract exactly: a digest reference is a
+    // content-addressed delete (every tag pointing at the digest goes), a tag
+    // reference removes only that tag. The digest here was resolved FROM this
+    // repository's index, which is what makes the content-addressed scope
+    // correct on this route.
+    let scope = if is_digest_reference(reference) {
+        OciIndexDeleteScope::ContentAddressed
+    } else {
+        OciIndexDeleteScope::NamedReference
+    };
     if let Err(e) =
-        delete_oci_manifest_content(&state.db, repo.id, &repo.image, reference, &digest).await
+        delete_oci_manifest_content(&state.db, repo.id, &repo.image, reference, &digest, scope)
+            .await
     {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10945,73 +10956,184 @@ async fn handle_delete_manifest(
         .unwrap()
 }
 
+/// Which OCI index rows a manifest delete is allowed to remove.
+///
+/// The two delete routes reach [`delete_oci_manifest_content_in_tx`] with very
+/// different guarantees about their `digest` argument, so the scope is made
+/// explicit rather than re-derived from the reference's shape:
+///
+/// * [`OciIndexDeleteScope::ContentAddressed`] is the OCI `DELETE
+///   /v2/<name>/manifests/<digest>` contract — the reference *is* the digest and
+///   it was resolved from this repository's own index, so removing every tag row
+///   pointing at that digest is the documented behaviour (#1776).
+/// * [`OciIndexDeleteScope::NamedReference`] removes exactly the
+///   `(name = image, tag = reference)` row. The REST artifact delete always uses
+///   this scope: it deletes ONE `artifacts` row, and that row's index footprint
+///   is exactly the `(image, reference)` key `persist_tag_and_refs` and
+///   `upsert_manifest_artifact` wrote together. Widening it to a content-address
+///   delete would let a caller-supplied path drive removal of index rows that
+///   belong to a different image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OciIndexDeleteScope {
+    /// Remove every tag row in the repository pointing at `digest`.
+    ContentAddressed,
+    /// Remove only the `(name = image, tag = reference)` tag row.
+    NamedReference,
+}
+
+/// Resolve the manifest digest that `(repo_id, image, reference)` names in the
+/// OCI index, or `None` when that reference has no index row.
+///
+/// The OCI index is the only authority on what a reference resolves to. A
+/// digest-reference push writes an `oci_tags` row whose `tag` is the literal
+/// digest string (`handle_put_manifest` passes the same `(image, reference)`
+/// pair to `persist_tag_and_refs` and `upsert_manifest_artifact`), so the
+/// `(name, tag)` lookup is complete for any path-derived reference and needs no
+/// tag-vs-digest branching.
+///
+/// `None` is a normal, non-exceptional outcome: peer-replicated Docker artifacts
+/// and non-manifest files stored under an OCI repository have `artifacts` rows
+/// with no index rows at all.
+pub(crate) async fn resolve_indexed_manifest_digest<'e, E>(
+    executor: E,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_scalar!(
+        "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+        repo_id,
+        image,
+        reference
+    )
+    .fetch_optional(executor)
+    .await
+}
+
+/// The digest a REST artifact delete may unwind from the OCI index, if any.
+///
+/// Returns `Some` only when the index's digest for the reference is the very
+/// manifest the `artifacts` row holds — i.e. when the row being deleted IS that
+/// indexed manifest. `indexed_digest` is what
+/// [`resolve_indexed_manifest_digest`] returned; `artifact_checksum_sha256` is
+/// the `artifacts.checksum_sha256` column of the row being deleted.
+///
+/// The two disagreement cases both yield `None`, which the caller treats as
+/// "skip the unwind, still soft-delete":
+///
+/// * **Not indexed** (`None`): nothing to unwind. This is the replication case
+///   and must stay a successful delete.
+/// * **Indexed, but a different manifest**: the `artifacts` row is not the one
+///   the reference resolves to, so unwinding would destroy index rows the row
+///   does not own. Skipping degrades to the pre-#3476 behaviour (an orphaned
+///   index entry, which is non-destructive and self-heals on re-push) instead of
+///   making a diverged row permanently undeletable.
+///
+/// A non-`sha256:` index digest can never match a `checksum_sha256` column and
+/// so is always `None`.
+pub(crate) fn rest_unwind_digest<'a>(
+    indexed_digest: Option<&'a str>,
+    artifact_checksum_sha256: &str,
+) -> Option<&'a str> {
+    let digest = indexed_digest?;
+    let hex = digest.strip_prefix("sha256:")?;
+    if !hex.is_empty() && hex.eq_ignore_ascii_case(artifact_checksum_sha256) {
+        Some(digest)
+    } else {
+        None
+    }
+}
+
 /// Transactionally remove a Docker/OCI manifest from the OCI index: delete its
 /// `oci_tags` row(s) and, when the digest is no longer tagged by any sibling
-/// tag, its `oci_manifest_refs`/`manifest_blob_refs` edges so storage GC can
-/// reclaim the blobs. Shared by the OCI `handle_delete_manifest` path and the
-/// REST `delete_artifact` path so a UI delete leaves the index consistent.
+/// tag, its `oci_manifest_refs`/`manifest_blob_refs`/`oci_manifest_subjects`
+/// edges so storage GC can reclaim the blobs. Shared by the OCI
+/// `handle_delete_manifest` path and the REST `delete_artifact` path so a UI
+/// delete leaves the index consistent.
+///
+/// Thin begin/commit wrapper around [`delete_oci_manifest_content_in_tx`],
+/// mirroring the `persist_tag_and_refs` / `persist_tag_and_refs_in_tx` pair.
 ///
 /// The caller is responsible for soft-deleting the corresponding `artifacts`
-/// row (and for resolving `digest` from the reference); this function only
-/// unwinds the OCI index, matching the transaction previously inlined in
-/// `handle_delete_manifest`.
+/// row and for resolving `digest`; this function only unwinds the OCI index.
 pub(crate) async fn delete_oci_manifest_content(
     pool: &PgPool,
     repo_id: Uuid,
     image: &str,
     reference: &str,
     digest: &str,
+    scope: OciIndexDeleteScope,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    delete_oci_manifest_content_in_tx(&mut tx, repo_id, image, reference, digest, scope).await?;
+    tx.commit().await
+}
 
-    // Remove tag rows for this delete. A digest reference is a content-address
-    // delete, so every tag pointing at that digest in this repo is removed. A
-    // tag-name reference removes ONLY the named tag row, leaving sibling tags
-    // that happen to share the same manifest digest intact (#1776).
-    if is_digest_reference(reference) {
-        sqlx::query!(
-            "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
-            repo_id,
-            digest
-        )
-        .execute(&mut *tx)
-        .await?;
-    } else {
-        sqlx::query!(
-            "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
-            repo_id,
-            image,
-            reference
-        )
-        .execute(&mut *tx)
-        .await?;
+/// Transaction-participating form of [`delete_oci_manifest_content`]. Runs the
+/// tag removal and index cleanup against a caller-owned transaction WITHOUT
+/// committing, so the caller can bind the unwind to a larger atomic unit — the
+/// REST delete pairs it with the `artifacts` soft-delete UPDATE so a failure of
+/// either can never leave the index and the artifacts row disagreeing.
+pub(crate) async fn delete_oci_manifest_content_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest: &str,
+    scope: OciIndexDeleteScope,
+) -> Result<(), sqlx::Error> {
+    // Remove tag rows for this delete. A content-addressed delete (the OCI
+    // `DELETE .../manifests/<digest>` contract) removes every tag pointing at
+    // that digest in this repo. A named-reference delete removes ONLY the named
+    // tag row, leaving sibling tags that happen to share the same manifest
+    // digest intact (#1776).
+    match scope {
+        OciIndexDeleteScope::ContentAddressed => {
+            sqlx::query!(
+                "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+                repo_id,
+                digest
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+        OciIndexDeleteScope::NamedReference => {
+            sqlx::query!(
+                "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+                repo_id,
+                image,
+                reference
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
     }
 
     // A tag-name delete only removes the named tag (#1776). If a sibling tag in
     // this repo still points at the same manifest digest, the manifest is still
     // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
     // intact. The cleanup only runs once the last tag for the digest is gone.
-    let digest_still_tagged = match sqlx::query_scalar!(
+    let digest_still_tagged = sqlx::query_scalar!(
         "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
         repo_id,
         digest
     )
-    .fetch_one(&mut *tx)
-    .await
-    {
-        Ok(exists) => exists.unwrap_or(false),
-        Err(e) => return Err(e),
-    };
+    .fetch_one(&mut **tx)
+    .await?
+    .unwrap_or(false);
 
     if !digest_still_tagged {
         // Drop stale index relationships for this digest. Live child edges are
         // preserved so a still-tagged parent index keeps the child relationship
         // live and the child's blobs protected.
-        clear_repo_manifest_refs(&mut *tx, repo_id, digest).await?;
+        clear_repo_manifest_refs(&mut **tx, repo_id, digest).await?;
 
         // #1409: drop the manifest's blob refs so its config + layer blobs
         // become reclaimable once nothing else references them.
-        delete_manifest_blob_refs(&mut *tx, repo_id, digest).await?;
+        delete_manifest_blob_refs(&mut **tx, repo_id, digest).await?;
 
         // #3108: drop this manifest's referrers subject edge so a deleted
         // referrer stops appearing in `GET /v2/<name>/referrers/<digest>`.
@@ -11020,11 +11142,11 @@ pub(crate) async fn delete_oci_manifest_content(
         )
         .bind(repo_id)
         .bind(digest)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
-    tx.commit().await
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -13194,6 +13316,115 @@ mod tests {
     #[test]
     fn test_is_digest_reference_rejects_tag_with_dot() {
         assert!(!is_digest_reference("v1.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // REST delete unwind authority (#3476)
+    // -----------------------------------------------------------------------
+
+    /// `rest_unwind_digest` is the choke point that decides whether a REST
+    /// artifact delete may touch the OCI index at all. It must say "yes" only
+    /// when the index's digest for the reference IS the manifest the artifacts
+    /// row holds — the index is the authority, and the row must be that
+    /// manifest.
+    #[test]
+    fn rest_unwind_digest_requires_the_index_to_name_this_artifact() {
+        let victim = "1".repeat(64);
+        let other = "2".repeat(64);
+
+        // Not indexed at all (a replicated artifact, or any non-manifest file
+        // stored under an OCI repo): nothing to unwind.
+        assert_eq!(rest_unwind_digest(None, &victim), None);
+
+        // Indexed as exactly this artifact's manifest: unwind is authorized,
+        // and the digest handed on is the INDEX's, not one rebuilt from the
+        // row's checksum.
+        let indexed = format!("sha256:{victim}");
+        assert_eq!(rest_unwind_digest(Some(&indexed), &victim), Some(&*indexed));
+
+        // Digest hex is case-insensitive, matching the checksum comparison the
+        // upload path uses.
+        let upper = format!("sha256:{}", victim.to_uppercase());
+        assert_eq!(rest_unwind_digest(Some(&upper), &victim), Some(&*upper));
+
+        // Indexed as a DIFFERENT manifest: this row does not own those index
+        // rows, so it may not unwind them.
+        assert_eq!(rest_unwind_digest(Some(&indexed), &other), None);
+
+        // A non-`sha256:` index digest is not comparable to the
+        // `checksum_sha256` column and can never authorize an unwind.
+        assert_eq!(rest_unwind_digest(Some("blake3:00"), "00"), None);
+        assert_eq!(rest_unwind_digest(Some("blake3:00"), &victim), None);
+
+        // Degenerate/empty forms are never a match.
+        assert_eq!(rest_unwind_digest(Some("sha256:"), ""), None);
+        assert_eq!(rest_unwind_digest(Some(&victim), &victim), None);
+    }
+
+    /// The unwind must participate in the caller's transaction, not commit
+    /// itself: that is what lets the REST delete bind it atomically to the
+    /// `artifacts` soft-delete. Rolling the caller's transaction back must
+    /// restore the index.
+    #[tokio::test]
+    async fn oci_index_unwind_participates_in_caller_transaction_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let repo = fixture.repo_id;
+        let digest = format!("sha256:{}", "c".repeat(64));
+
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'app', 'v1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo)
+        .bind(&digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed oci_tags row");
+
+        let mut tx = fixture.pool.begin().await.expect("begin");
+        delete_oci_manifest_content_in_tx(
+            &mut tx,
+            repo,
+            "app",
+            "v1",
+            &digest,
+            OciIndexDeleteScope::NamedReference,
+        )
+        .await
+        .expect("unwind");
+
+        // Gone inside the transaction...
+        let inside: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(inside, 0, "unwind must be visible inside the caller's tx");
+
+        tx.rollback().await.expect("rollback");
+
+        // ...and back after the caller rolls back: the helper did not commit.
+        let after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, 1,
+            "the unwind must roll back with the caller's transaction"
+        );
+
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&fixture.pool)
+            .await
+            .ok();
+        fixture.teardown().await;
     }
 
     #[test]

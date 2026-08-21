@@ -1966,8 +1966,36 @@ impl ArtifactService {
     }
 
     /// Soft-delete an artifact, optionally suppressing peer sync task fan-out.
+    ///
+    /// Thin wrapper preserving the historical single-call shape: pre-flight,
+    /// one transaction for the durable state change, then the best-effort
+    /// side effects. Callers that must bind the soft-delete to additional
+    /// writes (e.g. the REST delete's OCI index unwind) drive
+    /// [`Self::prepare_delete`] / [`Self::commit_delete_in_tx`] /
+    /// [`Self::finish_delete`] directly so the whole delete is atomic.
     pub async fn delete_with_sync_options(&self, id: Uuid, enqueue_sync_tasks: bool) -> Result<()> {
-        // Get artifact info for plugin hooks
+        let artifact = self.prepare_delete(id).await?;
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        self.commit_delete_in_tx(&mut tx, id).await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        self.finish_delete(&artifact, enqueue_sync_tasks).await;
+        Ok(())
+    }
+
+    /// Delete pre-flight: load the row and run the `BeforeDelete` veto.
+    ///
+    /// Performs NO writes, and deliberately runs BEFORE the caller opens its
+    /// transaction. A plugin hook is arbitrary, potentially networked work;
+    /// holding an open Postgres transaction across it is exactly the pool
+    /// pressure that makes a mid-delete failure likely. Running it first also
+    /// means a veto aborts before any index row has been touched.
+    pub async fn prepare_delete(&self, id: Uuid) -> Result<Artifact> {
         let artifact = self.get_by_id(id).await?;
         let artifact_info = ArtifactInfo::from(&artifact);
 
@@ -1975,23 +2003,51 @@ impl ArtifactService {
         self.trigger_hook(PluginEventType::BeforeDelete, &artifact_info)
             .await?;
 
-        // The soft-delete's usage-ledger decrement is applied by migration
-        // 182's row-level trigger in this statement's own transaction
-        // (is_deleted false -> true releases the bytes; re-flipping an
-        // already-deleted row is a zero-delta no-op), so freed space is
-        // admissible by the very next quota-checked upload with no manual
-        // ledger write here.
+        Ok(artifact)
+    }
+
+    /// The delete's single durable state change, inside a caller-owned
+    /// transaction so it can be committed atomically with the caller's own
+    /// writes.
+    ///
+    /// The soft-delete's usage-ledger decrement is applied by migration 182's
+    /// row-level trigger in this statement's transaction (is_deleted false ->
+    /// true releases the bytes), so freed space is admissible by the very next
+    /// quota-checked upload with no manual ledger write here.
+    ///
+    /// The `is_deleted = false` predicate is what makes "re-deleting maps to
+    /// NotFound" hold under concurrency as well as sequentially. The caller's
+    /// pre-checks are non-locking reads, so several concurrent deletes of the
+    /// same artifact can all pass them; the UPDATE serializes on the row, and
+    /// only the one that actually flipped the flag reports success. Without it
+    /// every racer would report a delete it did not perform, and each would run
+    /// the post-commit side effects (including an audit entry) for it.
+    pub async fn commit_delete_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: Uuid,
+    ) -> Result<()> {
         let result = sqlx::query!(
-            "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = $1",
+            "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = $1 AND is_deleted = false",
             id
         )
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound("Artifact not found".to_string()));
         }
+
+        Ok(())
+    }
+
+    /// Post-commit side effects of a delete. Every step is best-effort and
+    /// never fails the delete, so this deliberately runs AFTER the caller's
+    /// COMMIT: none of it may hold the transaction open, and the audit write
+    /// must not be rolled back with it.
+    pub async fn finish_delete(&self, artifact: &Artifact, enqueue_sync_tasks: bool) {
+        let id = artifact.id;
 
         // A delete supersedes any upload retries for the same artifact.
         let _ = sqlx::query(CANCEL_SUPERSEDED_PUSH_TASKS_SQL)
@@ -2048,6 +2104,7 @@ impl ArtifactService {
         }
 
         // Trigger AfterDelete hooks (non-blocking)
+        let artifact_info = ArtifactInfo::from(artifact);
         self.trigger_hook_non_blocking(PluginEventType::AfterDelete, &artifact_info)
             .await;
 
@@ -2065,8 +2122,6 @@ impl ArtifactService {
                 }
             });
         }
-
-        Ok(())
     }
 
     /// Get or create artifact metadata
