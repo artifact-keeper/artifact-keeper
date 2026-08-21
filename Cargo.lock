@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "artifact-keeper-backend"
-version = "1.7.7"
+version = "1.7.8"
 dependencies = [
  "aes-gcm",
  "anyhow",
