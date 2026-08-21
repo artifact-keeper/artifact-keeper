@@ -2081,6 +2081,9 @@ impl CachePersister {
             // point of the guard is to bound bytes-to-disk: a post-hoc check
             // only fires once the unbounded object has already been written.
             let mut cached_bytes: u64 = 0;
+            // Bytes fed to the tee hasher. Tracked separately from
+            // `cached_bytes`, which only advances when a ceiling is configured.
+            let mut hashed_bytes: u64 = 0;
             let mut cache_abandoned = false;
             while let Some(chunk_result) = upstream.next().await {
                 match chunk_result {
@@ -2123,6 +2126,29 @@ impl CachePersister {
                             if !cache_abandoned {
                                 if let Some(hasher) = tee_hasher.as_mut() {
                                     hasher.update(&slice);
+                                }
+                                hashed_bytes += slice.len() as u64;
+                                // Publish the tee digest as soon as the
+                                // advertised length has been hashed. A consumer
+                                // that stops polling once it holds
+                                // `Content-Length` bytes -- which a server
+                                // serving a fixed-length body may legitimately
+                                // do -- drops this stream without a final poll,
+                                // so the end-of-stream block below never runs.
+                                // The writer then compares against an empty
+                                // slot and, since a missing digest fails the
+                                // gate closed, refuses to cache EVERY object.
+                                // Only a known length lets a consumer stop
+                                // early, so this covers exactly that case; the
+                                // chunked path still publishes at EOF below.
+                                if let Some(total) = expected_len {
+                                    if hashed_bytes >= total {
+                                        if let Some(hasher) = tee_hasher.take() {
+                                            if let Ok(mut slot) = tee_digest_slot.lock() {
+                                                *slot = Some(hasher.finalize_hex());
+                                            }
+                                        }
+                                    }
                                 }
                                 let _ = tx.send(Ok(slice.clone())).await;
                             }
@@ -11537,6 +11563,188 @@ mod tests {
             "a matching SHA-512 gate must publish onto the live key"
         );
         assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// GHSA-qxv7-p3mq-88fv: the SHA-1 counterpart of
+    /// [`test_tee_sha512_gate_match_commits`]. Maven `.sha1` sidecars are the
+    /// only SHA-1 expectation that reaches this gate in practice, and the
+    /// mismatch posture was covered without the matching one, so a SHA-1
+    /// specific regression here turns every proxied release `.pom`/`.jar`
+    /// into a permanent cache miss while still serving correct bytes.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_match_commits() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"first-chunk"),
+        )));
+
+        let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(11),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(
+            writes.len(),
+            1,
+            "a matching SHA-1 gate must commit the metadata sidecar"
+        );
+        assert_eq!(writes[0].0, "meta-key");
+        let copies = backend.copies.lock().await;
+        assert_eq!(
+            copies.len(),
+            1,
+            "a matching SHA-1 gate must publish onto the live key"
+        );
+        assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// A real upstream arrives as many chunks, not one. The SHA-1 gate must
+    /// hash the concatenation, so a multi-chunk body whose overall digest
+    /// matches still commits.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_match_commits_multi_chunk() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"hello world, this is a multi chunk body"),
+        )));
+
+        let upstream = upstream_chunks(vec![
+            &b"hello "[..],
+            &b"world, "[..],
+            &b"this is a "[..],
+            &b"multi chunk body"[..],
+        ]);
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(39),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "a matching multi-chunk SHA-1 gate must commit the metadata sidecar"
+        );
+        assert_eq!(
+            backend.copies.lock().await.len(),
+            1,
+            "a matching multi-chunk SHA-1 gate must publish onto the live key"
+        );
+    }
+
+    /// A body over TEE_MAX_CHUNK_BYTES is split before it reaches the cache
+    /// writer. The gate hashes what it forwards, so the split must not change
+    /// the digest -- this is the shape a real `.jar` download takes.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_match_commits_across_chunk_split() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let big = vec![0xABu8; 200 * 1024];
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(&big),
+        )));
+
+        let upstream: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::iter(vec![Ok(Bytes::from(big.clone()))]));
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(big.len() as u64),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "a matching SHA-1 gate must commit even when the body is split into 64 KiB pieces"
+        );
+        assert_eq!(
+            backend.copies.lock().await.len(),
+            1,
+            "a matching split-body SHA-1 gate must publish onto the live key"
+        );
+    }
+
+    /// The gate must still commit when the consumer stops polling as soon as
+    /// it has `Content-Length` bytes, instead of polling on until `None`.
+    ///
+    /// Every other gate test drives the stream to completion, which always runs
+    /// the end-of-stream block that publishes the tee digest. A real response
+    /// with a known length need not: the server can stop once it has the
+    /// advertised bytes and drop the body. If the digest is only published
+    /// after the final poll, the slot is empty when the writer compares and the
+    /// gate fails closed on every artifact.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_commits_when_consumer_stops_at_content_length() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let body = b"first-chunk";
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(body),
+        )));
+
+        let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(body.len() as u64),
+            None,
+        );
+
+        // Read exactly Content-Length bytes, then drop without a final poll.
+        let mut seen = 0usize;
+        while seen < body.len() {
+            let chunk = client.next().await.expect("chunk").expect("ok");
+            seen += chunk.len();
+        }
+        drop(client);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "a consumer that stops at Content-Length must still get a cache commit"
+        );
+        assert_eq!(
+            backend.copies.lock().await.len(),
+            1,
+            "a consumer that stops at Content-Length must still publish onto the live key"
+        );
     }
 
     /// An error mid-upstream-stream must surface to the client AND
