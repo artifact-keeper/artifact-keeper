@@ -4352,8 +4352,27 @@ async fn purge_storage_object_keys(
 ///   the guard *does* test `is_deleted` and reclaims the key once those rows
 ///   are hard-deleted. A leak GC later collects is recoverable; a purge is not.
 async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
+    let sql = repo_maven_flat_keys_sql();
+    sqlx::query_scalar(&sql)
+        .bind(repo_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Failed to list Maven flat-object keys to purge before repository delete"
+            );
+            Vec::new()
+        })
+}
+
+/// The purge-list SQL [`collect_repo_maven_flat_keys`] runs, split out so the
+/// anti-drift test can assert its shape without a database. `$1` is the
+/// repository being deleted.
+fn repo_maven_flat_keys_sql() -> String {
     use crate::services::maven_flat_attribution as mfa;
-    let sql = format!(
+    format!(
         "SELECT o.storage_key \
          FROM maven_flat_object_owner o \
          WHERE o.repository_id = $1 \
@@ -4395,7 +4414,7 @@ async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec
                WHERE {is_rollup} \
                  AND mb.repository_id <> $1 \
                  AND mrb.storage_backend = o.storage_backend \
-                 AND mb.storage_key LIKE {rollup_dir} || '%' \
+                 AND {rollup_anchor} \
            )",
         files_match = mfa::metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key"),
         is_sidecar = mfa::is_sidecar_key_sql("o.storage_key"),
@@ -4405,20 +4424,8 @@ async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec
             &mfa::sidecar_base_key_sql("o.storage_key"),
         ),
         is_rollup = mfa::is_metadata_rollup_key_sql("o.storage_key"),
-        rollup_dir = mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
-    );
-    sqlx::query_scalar(&sql)
-        .bind(repo_id)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                repo_id = %repo_id,
-                error = %e,
-                "Failed to list Maven flat-object keys to purge before repository delete"
-            );
-            Vec::new()
-        })
+        rollup_anchor = mfa::metadata_rollup_dir_anchor_sql("mb.storage_key", "o.storage_key"),
+    )
 }
 
 /// Derived row-less Maven keys for a FILESYSTEM repository being deleted:
@@ -23465,6 +23472,142 @@ mod apt_validation_tests {
             collected.contains(&orphan_key),
             "positive control: a key no repository references must still be \
              collected for purge; collected: {collected:?}"
+        );
+    }
+
+    /// Deleting one repository must not purge the `maven-metadata.xml` of a
+    /// subtree ANOTHER repository is still serving when that subtree's key
+    /// contains a literal backslash.
+    ///
+    /// This collector runs on every repository delete on a cloud backend — it
+    /// carries no opt-in gate — and the guard it depends on builds its `LIKE`
+    /// pattern FROM the stored key. Postgres's default `LIKE` escape character
+    /// is a backslash, so without an `ESCAPE` clause `.../com/ba\ck/lib/`
+    /// becomes the pattern `.../com/back/lib/`, the foreign repository's live
+    /// artifact no longer matches, and the `NOT EXISTS` guard reports
+    /// "unanchored" for a document the other tenant is still serving. The
+    /// rollup is what resolves version ranges and `LATEST`/`RELEASE`, so the
+    /// loss breaks resolution for a repository that was not being deleted.
+    ///
+    /// The fixture deliberately has NO artifact under the collapsed
+    /// `.../com/back/lib/` directory: a fixture whose collapsed sibling exists
+    /// is spared even without the fix and proves nothing.
+    ///
+    /// Three positive controls keep the fix honest — the `<> $1` scoping (the
+    /// doomed repository's own live artifact under a backslash directory must
+    /// not anchor its own rollup, or the object leaks forever), a rollup over
+    /// an empty backslash subtree, and a plain unreferenced backslash key.
+    #[tokio::test]
+    async fn collect_repo_maven_flat_keys_spares_foreign_rollup_whose_directory_contains_a_backslash(
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_repo, _, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (other_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let uid = Uuid::new_v4().simple().to_string();
+        let root = format!("maven/rd3431/{uid}/com");
+
+        // The surviving tenant's live artifact, under a backslash directory.
+        seed_flat_artifact_row(
+            &pool,
+            other_repo,
+            &format!(r"{root}/ba\ck/lib/1.0/lib-1.0.jar"),
+        )
+        .await;
+        let foreign_rollup = format!(r"{root}/ba\ck/lib/maven-metadata.xml");
+        let foreign_rollup_sha1 = format!("{foreign_rollup}.sha1");
+        let foreign_rollup_asc = format!("{foreign_rollup}.asc");
+
+        // Control 1: the doomed repository's OWN live artifact, likewise under
+        // a backslash directory, must not anchor its own rollup.
+        seed_flat_artifact_row(
+            &pool,
+            owner_repo,
+            &format!(r"{root}/sel\f/lib/1.0/own-1.0.jar"),
+        )
+        .await;
+        let own_rollup = format!(r"{root}/sel\f/lib/maven-metadata.xml");
+        // Controls 2 and 3: nothing anchors either of these anywhere.
+        let dead_rollup = format!(r"{root}/de\ad/lib/maven-metadata.xml");
+        let orphan_key = format!(r"{root}/or\ph/lib/9.9.9/gone-9.9.9.pom");
+
+        // Every attribution row belongs to the repository being deleted.
+        for key in [
+            &foreign_rollup,
+            &foreign_rollup_sha1,
+            &foreign_rollup_asc,
+            &own_rollup,
+            &dead_rollup,
+            &orphan_key,
+        ] {
+            seed_flat_claim(&pool, owner_repo, key).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let collected = collect_repo_maven_flat_keys(&state, owner_repo).await;
+
+        tdh::cleanup(&pool, other_repo, Uuid::nil()).await;
+        tdh::cleanup(&pool, owner_repo, Uuid::nil()).await;
+
+        for key in [&foreign_rollup, &foreign_rollup_sha1, &foreign_rollup_asc] {
+            assert!(
+                !collected.contains(key),
+                "deleting this repository must NOT purge `{key}` — another \
+                 repository still has a live artifact under that directory, \
+                 and the only reason the guard misses it is that the literal \
+                 backslash in the stored key is read as a LIKE escape \
+                 character; collected: {collected:?}"
+            );
+        }
+        assert!(
+            collected.contains(&own_rollup),
+            "positive control: only the DOOMED repository's own artifact sits \
+             under this directory, so its rollup must still be collected even \
+             though the directory contains a backslash — otherwise the anchor \
+             is unscoped and every such object leaks forever; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_rollup),
+            "positive control: a rollup over an empty subtree must still be \
+             collected even though its directory contains a backslash — \
+             otherwise sparing every backslash key would pass; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&orphan_key),
+            "positive control: a plain key no repository references must still \
+             be collected for purge; collected: {collected:?}"
+        );
+    }
+
+    /// The repository-delete collector's rollup anchor must come from the
+    /// shared fragment, carrying `ESCAPE ''`, exactly as the GC sweep's guard 3
+    /// does (`test_flat_predicate_rollup_guard_uses_shared_fragments`).
+    ///
+    /// A shape test, not an oracle: it would pass with the wrong escape
+    /// character. It exists so a future edit cannot quietly re-inline the
+    /// anchor at one of the two delete paths and let them drift again — the
+    /// #1180 lesson, and the direct cause of #3156 and #3197.
+    #[test]
+    fn repo_maven_flat_keys_rollup_anchor_disables_like_escape() {
+        use crate::services::maven_flat_attribution as mfa;
+        let sql = repo_maven_flat_keys_sql();
+        let anchor = mfa::metadata_rollup_dir_anchor_sql("mb.storage_key", "o.storage_key");
+        assert!(
+            sql.contains(&anchor),
+            "the purge list's rollup guard must use the shared anchor fragment \
+             `{anchor}`, not an inline copy; sql: {sql}"
+        );
+        assert!(
+            anchor.contains("ESCAPE ''"),
+            "the rollup anchor must disable LIKE escape processing: without it \
+             a literal backslash in a stored key is read as an escape \
+             character and the guard misses the directory it was derived from, \
+             so deleting one repository purges a rollup another repository is \
+             still serving; anchor: {anchor}"
         );
     }
 

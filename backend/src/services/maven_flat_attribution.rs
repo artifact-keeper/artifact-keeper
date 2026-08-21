@@ -254,15 +254,65 @@ pub(crate) fn is_metadata_rollup_key_sql(key_expr: &str) -> String {
 /// left operand of a `LIKE ... || '%'` anchor test. Only meaningful for keys
 /// [`is_metadata_rollup_key_sql`] accepts — always gate on it.
 ///
+/// Do not build that anchor test by hand: use
+/// [`metadata_rollup_dir_anchor_sql`], which carries the `ESCAPE ''` clause
+/// described below.
+///
 /// The rollup is anchored (spared) while ANY live artifact remains under that
 /// prefix: the document describes the whole groupId/artifactId subtree, so it
-/// is still being served as long as one member of the subtree is. The `LIKE`
-/// operand is a stored key, so SQL wildcards inside it can only make the
-/// pattern match a SUPERSET — i.e. this test can only ever over-PROTECT, which
-/// is the safe direction for a `NOT EXISTS` delete guard.
+/// is still being served as long as one member of the subtree is.
+///
+/// **The anchor test MUST be written `LIKE <prefix> || '%' ESCAPE ''`.** The
+/// pattern operand is a stored key, so whatever characters it contains are
+/// interpreted as pattern syntax — and the direction differs by character:
+///
+/// * `%` and `_` widen the match, so the test matches a SUPERSET of the real
+///   directory. In a `NOT EXISTS` delete guard that is over-PROTECT: the safe
+///   direction, a recoverable leak rather than a loss. `ESCAPE ''` preserves
+///   this behavior deliberately.
+/// * `\` is Postgres's DEFAULT `LIKE` escape character, and it does the
+///   opposite. Without an `ESCAPE` clause, `maven/a\b/` becomes the pattern
+///   `maven/ab/`: the rollup's own live artifact at `maven/a\b/1.0/x.jar`
+///   NO LONGER MATCHES, the guard reads "nothing anchors this", and the
+///   document is DELETED while it is still being served. Verified on
+///   Postgres 16: `'maven/a\b/1.0/x.jar' LIKE 'maven/a\b/' || '%'` is FALSE
+///   without the clause and TRUE with `ESCAPE ''`.
+///
+/// So the pre-`ESCAPE` comment here — "can only ever over-PROTECT" — was true
+/// of `%`/`_` and false of `\`, and a Maven upload can put a literal backslash
+/// in a coordinate (`%5C` in the request path decodes to one). `ESCAPE ''`
+/// disables escape processing entirely, which makes the invariant hold as
+/// stated for every character.
+///
+/// `ESCAPE ''` and not [`crate::api::handlers::escape_like_literal`] +
+/// `ESCAPE '\'`: the prefix is derived in SQL (`substr`/`regexp_replace`),
+/// never in Rust, so the Rust helper cannot reach it; and a SQL-side escaper
+/// would make `%`/`_` match EXACTLY, converting today's harmless over-protect
+/// into a new class of delete on an unrecoverable path. Keeping the failure
+/// direction as leak-not-loss is worth more here than exactness.
+///
+/// `ESCAPE ''` does NOT cost a trigram index on the probed column: `LIKE ...
+/// ESCAPE` is planned as `~~ like_escape(pattern, '')`, still an indexable
+/// `~~`, and forced index-scan vs seq-scan produce identical row sets on a
+/// corpus containing `\`, `\\`, `%`, `_` and non-ASCII keys.
 pub(crate) fn metadata_rollup_dir_prefix_sql(key_expr: &str) -> String {
     let base = sidecar_base_key_sql(key_expr);
     format!("substr({base}, 1, length({base}) - length('{MAVEN_METADATA_FILENAME}'))")
+}
+
+/// SQL predicate: does `artifact_key_expr` name an artifact under the directory
+/// prefix that the rollup at `rollup_key_expr` summarises?
+///
+/// `ESCAPE ''` is load-bearing — see [`metadata_rollup_dir_prefix_sql`].
+/// Both delete paths (the GC sweep's guard 3 and the repository-delete
+/// collector) go through this one fragment so the escape mode cannot be
+/// applied to one and forgotten on the other.
+pub(crate) fn metadata_rollup_dir_anchor_sql(
+    artifact_key_expr: &str,
+    rollup_key_expr: &str,
+) -> String {
+    let prefix = metadata_rollup_dir_prefix_sql(rollup_key_expr);
+    format!("{artifact_key_expr} LIKE {prefix} || '%' ESCAPE ''")
 }
 
 /// Distinct owning repositories of a live parent artifact whose metadata

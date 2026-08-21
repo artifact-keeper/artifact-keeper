@@ -199,8 +199,12 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 ///    requires that NO live artifact exists under its directory prefix on
 ///    the same backend: the metadata document stays while any version of
 ///    its groupId/artifactId (or group, for group-level plugin metadata)
-///    is still live. The `LIKE` prefix test can only over-match (SQL
-///    wildcards in a key match a superset), i.e. only ever over-PROTECT.
+///    is still live. The `LIKE` prefix test carries `ESCAPE ''`
+///    ([`crate::services::maven_flat_attribution::metadata_rollup_dir_anchor_sql`]),
+///    which is what makes it able only to over-match (`%`/`_` in a stored key
+///    match a superset) and never to under-match. Without that clause a
+///    literal `\` in the key is read as an escape character and the guard
+///    misses its own directory -- a `NOT EXISTS` miss means DELETE.
 /// 4. A checksum sidecar additionally requires its base key to be anchored
 ///    by neither an `artifacts` row (any state) nor a metadata `files[]`
 ///    reference on the same backend.
@@ -243,7 +247,7 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 /// sidecar), read as orphan, and was reclaimed while its base stayed live
 /// (#3197). The rollup guard shares
 /// [`crate::services::maven_flat_attribution::is_metadata_rollup_key_sql`] /
-/// [`crate::services::maven_flat_attribution::metadata_rollup_dir_prefix_sql`]
+/// [`crate::services::maven_flat_attribution::metadata_rollup_dir_anchor_sql`]
 /// with the repository-delete collector for the same anti-drift reason.
 static ORPHAN_MAVEN_FLAT_PREDICATE_SQL: Lazy<String> = Lazy::new(|| {
     use crate::services::maven_flat_attribution as mfa;
@@ -272,7 +276,7 @@ AND NOT EXISTS (
     WHERE {is_rollup}
       AND r2.storage_backend = o.storage_backend
       AND a2.is_deleted = false
-      AND a2.storage_key LIKE {rollup_dir} || '%'
+      AND {rollup_anchor}
 )
 AND NOT EXISTS (
     SELECT 1 FROM artifacts ab
@@ -293,7 +297,7 @@ AND NOT EXISTS (
         system_source = mfa::system_written_source_sql("o.source"),
         files_match = mfa::metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key"),
         is_rollup = mfa::is_metadata_rollup_key_sql("o.storage_key"),
-        rollup_dir = mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
+        rollup_anchor = mfa::metadata_rollup_dir_anchor_sql("a2.storage_key", "o.storage_key"),
         is_sidecar = mfa::is_sidecar_key_sql("o.storage_key"),
         sidecar_base_files_match =
             mfa::metadata_files_name_key_sql("am2.metadata->'files'", &sidecar_base),
@@ -4184,9 +4188,11 @@ mod tests {
     #[test]
     fn test_flat_predicate_rollup_guard_uses_shared_fragments() {
         use crate::services::maven_flat_attribution as mfa;
+        let anchor = mfa::metadata_rollup_dir_anchor_sql("a2.storage_key", "o.storage_key");
         for fragment in [
             mfa::is_metadata_rollup_key_sql("o.storage_key"),
             mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
+            anchor.clone(),
         ] {
             assert!(
                 ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(&fragment),
@@ -4194,6 +4200,13 @@ mod tests {
                  not an inline copy"
             );
         }
+        assert!(
+            anchor.contains("ESCAPE ''"),
+            "the rollup anchor must disable LIKE escape processing: without it \
+             a literal backslash in a stored key is read as an escape \
+             character and the guard misses its OWN directory, so a NOT EXISTS \
+             delete guard deletes a still-served rollup; anchor: {anchor}"
+        );
     }
 
     /// #3156: a live parent artifact's metadata `files[]` must anchor its
@@ -4369,6 +4382,115 @@ mod tests {
             collected.contains(&dead_rollup_asc),
             "positive control: a rollup `.asc` over a subtree with no live \
              artifact must still be collected; collected: {collected:?}"
+        );
+    }
+
+    /// The rollup anchor must survive a literal backslash in the stored key.
+    ///
+    /// Guard 3 builds its `LIKE` pattern FROM the candidate key
+    /// (`metadata_rollup_dir_anchor_sql`), and Postgres's default `LIKE`
+    /// escape character is a backslash. Without an `ESCAPE` clause the prefix
+    /// `.../com/ba\ck/lib/` is read as the pattern `.../com/back/lib/`, so the
+    /// rollup's OWN live artifact no longer matches, the guard reads "nothing
+    /// anchors this", and a `NOT EXISTS` miss means DELETE — the sweep
+    /// reclaims a `maven-metadata.xml` that is still being served. The loss is
+    /// silent, because the Maven read path synthesises a substitute document.
+    ///
+    /// The backslash fixture deliberately has NO artifact under the collapsed
+    /// `.../com/back/lib/` directory. If such a sibling existed the accidental
+    /// pattern would match it and the rollup would be spared *without* the
+    /// fix, making the test green for the wrong reason.
+    ///
+    /// The `%` and `_` fixtures pin the OTHER direction: those characters
+    /// widen the pattern, so the guard over-matches and therefore
+    /// over-PROTECTS. That is the safe failure direction on an unrecoverable
+    /// delete path and `ESCAPE ''` keeps it deliberately — these two
+    /// assertions fail if anyone later swaps in an exact SQL-side escaper.
+    ///
+    /// TWO positive controls keep the fix honest: a genuinely unreferenced
+    /// rollup whose directory contains a backslash, and a plain one. Without
+    /// them, sparing every key containing a backslash would pass.
+    #[tokio::test]
+    async fn test_orphan_maven_flat_scan_spares_rollup_whose_directory_contains_a_backslash() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let uid = Uuid::new_v4().simple().to_string();
+        let root = format!("maven/gcesc/{uid}/com");
+
+        // 1. The oracle. `\c` collapses to `c` without ESCAPE, and nothing
+        //    lives under the collapsed `back/lib/` directory.
+        let bs_rollup = format!(r"{root}/ba\ck/lib/maven-metadata.xml");
+        let bs_live = format!(r"{root}/ba\ck/lib/1.0/lib-1.0.jar");
+        // 2/3. Over-protect pins: the live artifact sits under a DIFFERENT
+        //      directory that only the widened pattern reaches.
+        let pct_rollup = format!("{root}/pc%nt/lib/maven-metadata.xml");
+        let pct_live = format!("{root}/pcXXnt/lib/1.0/lib-1.0.jar");
+        let und_rollup = format!("{root}/us_c/lib/maven-metadata.xml");
+        let und_live = format!("{root}/usZc/lib/1.0/lib-1.0.jar");
+        // 4/5. Positive controls: nothing live under either directory, and
+        //      nothing under the backslash one's collapsed `dead/lib/` form.
+        let dead_bs_rollup = format!(r"{root}/de\ad/lib/maven-metadata.xml");
+        let dead_rollup = format!("{root}/plain/lib/maven-metadata.xml");
+
+        for key in [&bs_live, &pct_live, &und_live] {
+            insert_maven_artifact_row(&fixture.pool, fixture.repo_id, fixture.user_id, key, false)
+                .await;
+        }
+        for key in [
+            &bs_rollup,
+            &pct_rollup,
+            &und_rollup,
+            &dead_bs_rollup,
+            &dead_rollup,
+        ] {
+            insert_flat_attribution_row(&fixture.pool, fixture.repo_id, key, 2).await;
+        }
+
+        let rows = service
+            .select_orphan_maven_flat_objects(Some(fixture.repo_id))
+            .await;
+        let collected: Vec<String> = rows
+            .expect("scan succeeds")
+            .iter()
+            .map(|r| r.get::<String, _>("storage_key"))
+            .collect();
+        fixture.teardown().await;
+
+        assert!(
+            !collected.contains(&bs_rollup),
+            "guard 3: a maven-metadata.xml whose directory contains a literal \
+             backslash must NOT be collected while its own subtree is still \
+             live — without ESCAPE '' the derived pattern names a DIFFERENT \
+             directory and the guard misses its own artifact; \
+             collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&pct_rollup),
+            "a `%` in a stored key must keep WIDENING the anchor (over-PROTECT, \
+             the safe direction on an unrecoverable delete path); this fails if \
+             the anchor is switched to an exact SQL-side escaper; \
+             collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&und_rollup),
+            "a `_` in a stored key must keep widening the anchor for the same \
+             reason as `%`; collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_bs_rollup),
+            "positive control: a rollup over an EMPTY subtree must still be \
+             collected even though its directory contains a backslash — \
+             otherwise sparing every backslash key would pass; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_rollup),
+            "positive control: a plain rollup over an empty subtree must still \
+             be collected; collected: {collected:?}"
         );
     }
 
