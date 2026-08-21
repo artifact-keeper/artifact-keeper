@@ -446,7 +446,7 @@ async fn age_gate_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo)
         PackumentCacheAgeGateCheck::Cacheable => false,
         PackumentCacheAgeGateCheck::Bypass => true,
         PackumentCacheAgeGateCheck::CheckVirtualMembers => {
-            virtual_has_age_gated_member(&state.db, repo.id).await
+            proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await
         }
     }
 }
@@ -484,21 +484,6 @@ fn packument_cache_eligible(
     // Local/staging packuments are a cheap indexed DB read and are not cached
     // at all (read-your-writes across replicas).
     false
-}
-
-/// True when any member of a virtual repository has the age gate enabled.
-/// Errs on the side of `true` (bypass) if the lookup fails.
-pub(crate) async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: uuid::Uuid) -> bool {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS( \
-            SELECT 1 FROM repositories r \
-            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
-            WHERE vrm.virtual_repo_id = $1 AND r.age_gate_enabled = true)",
-    )
-    .bind(virtual_repo_id)
-    .fetch_one(db)
-    .await
-    .unwrap_or(true)
 }
 
 /// Cache-fronted packument fetch used by the GET-metadata handlers.
@@ -10441,7 +10426,8 @@ mod db_cov_tests {
         .expect("add virtual member");
 
         assert!(
-            !super::virtual_has_age_gated_member(&pool, virtual_id).await,
+            !crate::api::handlers::proxy_helpers::virtual_has_age_gated_member(&pool, virtual_id)
+                .await,
             "ungated member must not force a cache bypass"
         );
 
@@ -10452,7 +10438,8 @@ mod db_cov_tests {
             .expect("enable member age gate");
 
         assert!(
-            super::virtual_has_age_gated_member(&pool, virtual_id).await,
+            crate::api::handlers::proxy_helpers::virtual_has_age_gated_member(&pool, virtual_id)
+                .await,
             "age-gated member must force a cache bypass"
         );
     }

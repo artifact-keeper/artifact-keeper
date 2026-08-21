@@ -448,10 +448,13 @@ fn filter_cargo_index_lines(content: &[u8], blocked: &HashSet<String>) -> Bytes 
 // alone is bypassable by a lockfile, and a download gate alone would let cargo
 // resolve a version it is then refused.
 //
-// Virtual member parity is Phase 3. [`resolve_gated_index_entry`] and
-// [`gated_remote_index_response`] deliberately take the member's own
-// `AgeGateRepoParams` and base URL rather than reading them off the serving
-// repository, so that phase reuses them per member.
+// A Virtual repository's own row never carries a gate — `gating_requested`
+// only holds for a Remote repository — so its members are resolved and
+// enforced individually, each under its OWN policy
+// ([`member_age_gate_params`]). [`resolve_gated_index_entry`] and
+// [`filter_cargo_index_for_age_gate`] therefore take the member's
+// `AgeGateRepoParams`, id/key and base URL rather than reading them off the
+// serving repository.
 
 /// Resolve the current age-gate policy for a Cargo repository, returning
 /// `Some(params)` only when gating is both requested AND enforceable.
@@ -461,7 +464,7 @@ fn filter_cargo_index_lines(content: &[u8], blocked: &HashSet<String>) -> Bytes 
 /// `goproxy::filter_go_version_list`. Only a Remote repository can request
 /// gating, so every other repository type short-circuits without a query —
 /// a Virtual repository's members carry their own policy and are resolved
-/// per member in Phase 3, not here.
+/// per member by [`member_age_gate_params`], not here.
 ///
 /// Fails closed: an unreadable configuration, or an enabled gate whose
 /// (format, mode) pair is outside the capability matrix, is an error rather
@@ -728,6 +731,52 @@ async fn resolve_gated_index_entry(
     })
 }
 
+/// The policy decision shared by the direct-Remote and Virtual-member download
+/// gates: resolve the basis from an index entry whose existence the caller has
+/// already proven, and turn a block into the terminal 451.
+///
+/// 451-NEVER-LKG. The shared seam offers a last-known-good artifact for formats
+/// that can substitute one (npm rebuilds a tarball path, PyPI a wheel
+/// filename). Cargo must not: cargo verifies the downloaded `.crate` against
+/// the sparse-index `cksum` recorded for the EXACT requested version, so older
+/// bytes served under this coordinate fail that check and present as corruption
+/// or a MITM rather than as policy. The resolver-level analog is already
+/// covered by index filtering — stable cargo resolves the newest eligible
+/// version from the filtered index — so a withheld download is simply the 451.
+///
+/// `version_exists_upstream` is passed as `true` because every caller proves
+/// existence first, which would legitimately let `first_seen` start a clock
+/// here — that mode is nonetheless unreachable for Cargo, whose capability spec
+/// sets `immutable_coordinates = false`, so `require_enforceable` rejects it
+/// before any request gets this far.
+#[allow(clippy::result_large_err)]
+async fn decide_cargo_download_gate(
+    service: &crate::services::age_gate_service::AgeGateService,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    name_lower: &str,
+    version: &str,
+    pubtime: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), Response> {
+    use crate::services::age_gate_service::AgeGateService;
+
+    let basis = service
+        .download_basis(params, name_lower, version, pubtime, true)
+        .await
+        .map_err(|e| e.into_response())?;
+    if let Some(blocked) =
+        proxy_helpers::enforce_age_gate(Some(service), params, name_lower, version, basis).await?
+    {
+        return Err(proxy_helpers::age_gate_blocked_response(
+            blocked.review_id,
+            name_lower,
+            version,
+            params.age_gate_min_age_days,
+            basis.map(|t| AgeGateService::package_age_days(t, chrono::Utc::now())),
+        ));
+    }
+    Ok(())
+}
+
 /// Enforce the download age gate for `{name_lower}/{version}`, returning the
 /// sparse-index `cksum` an allowed download must be verified against.
 ///
@@ -746,8 +795,6 @@ async fn enforce_cargo_download_age_gate(
     name_lower: &str,
     version: &str,
 ) -> Result<String, Response> {
-    use crate::services::age_gate_service::AgeGateService;
-
     let Some(service) = state.age_gate_service.as_deref() else {
         return Err(proxy_helpers::age_gate_unavailable_response(
             &params.key,
@@ -762,34 +809,7 @@ async fn enforce_cargo_download_age_gate(
         state, params, repo.id, repo_key, base_url, name_lower, version,
     )
     .await?;
-    // Existence is proven above, so `first_seen` could legitimately start a
-    // clock here — it is nonetheless unreachable for Cargo, whose capability
-    // spec sets `immutable_coordinates = false`, so `require_enforceable`
-    // rejects that mode before any request gets this far.
-    let basis = service
-        .download_basis(params, name_lower, version, facts.pubtime, true)
-        .await
-        .map_err(|e| e.into_response())?;
-    if let Some(blocked) =
-        proxy_helpers::enforce_age_gate(Some(service), params, name_lower, version, basis).await?
-    {
-        // 451-NEVER-LKG. The shared seam offers a last-known-good artifact for
-        // formats that can substitute one (npm rebuilds a tarball path, PyPI a
-        // wheel filename). Cargo must not: cargo verifies the downloaded
-        // `.crate` against the sparse-index `cksum` recorded for the EXACT
-        // requested version, so older bytes served under this coordinate fail
-        // that check and present as corruption or a MITM rather than as
-        // policy. The resolver-level analog is already covered by index
-        // filtering — stable cargo resolves the newest eligible version from
-        // the filtered index — so the download is simply the terminal 451.
-        return Err(proxy_helpers::age_gate_blocked_response(
-            blocked.review_id,
-            name_lower,
-            version,
-            params.age_gate_min_age_days,
-            basis.map(|t| AgeGateService::package_age_days(t, chrono::Utc::now())),
-        ));
-    }
+    decide_cargo_download_gate(service, params, name_lower, version, facts.pubtime).await?;
     // Allowed — but the verification digest is REQUIRED here, unlike the
     // ungated path's optional best effort. `cksum` is a mandatory field of the
     // registry-index schema, so an entry without a canonical one is a
@@ -799,6 +819,248 @@ async fn enforce_cargo_download_age_gate(
     facts
         .cksum
         .ok_or_else(|| proxy_helpers::age_gate_unavailable_response(&params.key, name_lower))
+}
+
+// ---------------------------------------------------------------------------
+// Virtual member parity (#3480, Phase 3)
+// ---------------------------------------------------------------------------
+//
+// A Virtual repository is not itself gateable, so its policy is the union of
+// its members' policies applied per member: each Remote member's contribution
+// to the aggregated sparse index is filtered with THAT member's params before
+// the merge/dedup, and each gated Remote member is evaluated before the
+// download resolver is allowed to see it. Local and Staging members are
+// unaffected — they publish rather than proxy, and their entries carry no
+// upstream publish time to evaluate.
+
+/// [`cargo_age_gate_params`] for a virtual-repo MEMBER.
+///
+/// Takes a `Repository` (what the member walk yields) rather than a
+/// [`RepoInfo`], and pre-screens on the row's own `age_gate_enabled` so an
+/// ungated member costs no query at all — the same cheap-struct-then-DB
+/// pattern as `npm::apply_npm_download_age_gate`. The authoritative policy
+/// (mode, upstream identity) is still re-resolved from the `repositories` row
+/// by id, because the `Repository` model deliberately carries no
+/// `age_gate_mode` and gate policy is enforcement input (#2264).
+#[allow(clippy::result_large_err)]
+async fn member_age_gate_params(
+    db: &PgPool,
+    member: &crate::models::repository::Repository,
+) -> Result<Option<crate::services::age_gate_service::AgeGateRepoParams>, Response> {
+    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+
+    if member.repo_type != RepositoryType::Remote || !member.age_gate_enabled {
+        return Ok(None);
+    }
+    let params = resolve_repo_params(db, member.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    if !AgeGateService::gating_requested(&params) {
+        return Ok(None);
+    }
+    AgeGateService::require_enforceable(&params).map_err(|e| e.into_response())?;
+    Ok(Some(params))
+}
+
+/// Batch-load the `index_upstream_url` overrides for a set of virtual members
+/// in one query. A failed lookup degrades to "no overrides", which falls back
+/// to each member's `upstream_url` — the same behavior as before the override
+/// existed.
+async fn fetch_index_upstream_overrides(
+    db: &PgPool,
+    member_ids: &[uuid::Uuid],
+) -> HashMap<uuid::Uuid, String> {
+    sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT repository_id, value FROM repository_config \
+         WHERE repository_id = ANY($1) AND key = 'index_upstream_url' AND value IS NOT NULL",
+    )
+    .bind(member_ids)
+    .fetch_all(db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("Failed to fetch index_upstream_url overrides: {}", e);
+        Vec::new()
+    })
+    .into_iter()
+    .collect()
+}
+
+/// One GATED Remote member's contribution to the aggregated sparse index, or
+/// `None` when the member contributes nothing.
+///
+/// Unlike the ungated arm this cannot re-serve the member's bytes, so it uses
+/// the coding-preserving `_encoded` fetch and decodes before parsing. Both
+/// fetch variants key the proxy cache on the same upstream index path, so a
+/// warm entry is shared between them and switching costs no extra round trip.
+///
+/// Fail-closed, member-scoped: a fetch that fails, or a body this build cannot
+/// decode, yields `None` — the member contributes nothing rather than
+/// contributing lines whose age was never evaluated. That matches
+/// `npm::remote_member_packument_value`, which returns the member as a miss for
+/// a body it cannot parse, and matches this loop's pre-existing treatment of a
+/// failed member fetch. An age-gate EVALUATION failure is the opposite case and
+/// propagates as `Err`: it means the policy could not be applied at all, which
+/// the shared 503 reports for the whole response (npm and
+/// `goproxy::filter_go_version_list` both propagate it the same way).
+#[allow(clippy::result_large_err)]
+async fn gated_member_index_contribution(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    member: &crate::models::repository::Repository,
+    base_url: &str,
+    index_path: &str,
+    name_lower: &str,
+) -> Result<Option<Bytes>, Response> {
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return Ok(None);
+    };
+    let Ok((content, _content_type, content_encoding)) = proxy_helpers::proxy_fetch_capped_encoded(
+        proxy,
+        member.id,
+        &member.key,
+        base_url,
+        index_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+    let Ok(decoded) = decode_cargo_index_body(&content, content_encoding.as_deref()) else {
+        tracing::warn!(
+            member_key = %member.key,
+            crate_name = %name_lower,
+            "gated virtual member's sparse index could not be decoded; \
+             withholding its contribution"
+        );
+        return Ok(None);
+    };
+    filter_cargo_index_for_age_gate(state, params, name_lower, &decoded)
+        .await
+        .map(Some)
+}
+
+/// Whether a gated Remote member may serve `{name_lower}/{version}` on the
+/// Virtual download path.
+///
+/// * `Ok(true)` — the member describes the version and the gate allows it.
+/// * `Ok(false)` — the member's upstream index does not describe the version,
+///   so the member is not a candidate for this coordinate at all and is
+///   dropped from the resolver's member list. Dropping it is load-bearing
+///   rather than cosmetic: leaving it in would let the resolver stream bytes
+///   from a download host for a coordinate the member's own index never
+///   described, which is precisely the evidence the gate decides on.
+/// * `Err` — terminal. A block is the 451 (BLOCKED-IS-AUTHORITATIVE: it
+///   propagates instead of falling through to a lower-priority member that
+///   could serve the same coordinate, matching npm's virtual tarball loop),
+///   and any failure to evaluate is the shared 503 / a 502 for an undecodable
+///   coding, never a fall-through to an unevaluated serve.
+///
+/// 451-NEVER-LKG applies here for the same reason as the direct path: cargo
+/// verifies the `.crate` against the sparse-index `cksum` of the EXACT
+/// requested version, so substituting an older member artifact would present
+/// as corruption rather than policy.
+#[allow(clippy::result_large_err)]
+async fn gated_member_download_allowed(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    member: &crate::models::repository::Repository,
+    base_url: Option<&str>,
+    name_lower: &str,
+    version: &str,
+) -> Result<bool, Response> {
+    let Some(service) = state.age_gate_service.as_deref() else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &params.key,
+            name_lower,
+        ));
+    };
+    let facts = match resolve_gated_index_entry(
+        state,
+        params,
+        member.id,
+        &member.key,
+        base_url,
+        name_lower,
+        version,
+    )
+    .await
+    {
+        Ok(facts) => facts,
+        // The only non-terminal arm: a definitive negative from this member's
+        // index (an upstream 404, or a version no parseable line describes).
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => return Ok(false),
+        Err(resp) => return Err(resp),
+    };
+    decide_cargo_download_gate(service, params, name_lower, version, facts.pubtime).await?;
+    // `facts.cksum` is deliberately NOT required here, unlike the direct
+    // download path. That path feeds the digest to
+    // `proxy_fetch_streaming_with_cache_key_verified`, so refusing an entry
+    // without a canonical one costs nothing; the shared virtual resolver
+    // carries no expected-digest seam at all, so requiring it would refuse
+    // downloads no gated or ungated virtual path ever verifies. The gate
+    // decides age, not integrity.
+    Ok(true)
+}
+
+/// Narrow a Virtual repository's authorized member list to the members
+/// eligible to serve `{name_lower}/{version}`, enforcing each gated Remote
+/// member's own download gate first.
+///
+/// Follows the established pre-filtered-member seam (npm's scope policy and
+/// virtual tarball gate, maven's member filter): the shared
+/// `resolve_virtual_download_from_members` is left untouched so no other
+/// format is affected. Non-Remote and ungated Remote members pass through in
+/// their original priority order.
+///
+/// MIXED-GATE ASYMMETRY. Members are filtered here independently of the merged
+/// index, so for a coordinate SHARED by a gated and an ungated member the two
+/// surfaces deliberately disagree: the aggregated index still lists the version
+/// (the ungated member's line survives dedup, since the gated member's line was
+/// already withheld by its own filter), while the download 451s, because
+/// BLOCKED-IS-AUTHORITATIVE across ALL gated members describing the coordinate
+/// — one member's block is not fall-through material for a lower-priority one.
+/// That is the npm virtual-tarball precedent, matched on purpose: the safe
+/// reading of "a member's policy withheld this" is not "ask someone else". It
+/// is also the conservative answer pending the open Virtual-priority question
+/// on artifact-keeper#3480; if the maintainers settle it the other way, this
+/// function is the single place that changes. Both halves are asserted by
+/// `test_virtual_index_filters_each_remote_member_with_its_own_policy_3480` and
+/// `test_virtual_download_blocked_member_never_falls_through_3480`.
+#[allow(clippy::result_large_err)]
+async fn eligible_virtual_download_members(
+    state: &SharedState,
+    members: Vec<crate::models::repository::Repository>,
+    name_lower: &str,
+    version: &str,
+) -> Result<Vec<crate::models::repository::Repository>, Response> {
+    let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    let overrides = fetch_index_upstream_overrides(&state.db, &member_ids).await;
+
+    let mut eligible = Vec::with_capacity(members.len());
+    for member in members {
+        let Some(params) = member_age_gate_params(&state.db, &member).await? else {
+            eligible.push(member);
+            continue;
+        };
+        let base_url = overrides
+            .get(&member.id)
+            .cloned()
+            .or_else(|| member.upstream_url.clone());
+        if gated_member_download_allowed(
+            state,
+            &params,
+            &member,
+            base_url.as_deref(),
+            name_lower,
+            version,
+        )
+        .await?
+        {
+            eligible.push(member);
+        }
+    }
+    Ok(eligible)
 }
 
 // ---------------------------------------------------------------------------
@@ -1506,6 +1768,10 @@ async fn download(
 
     // If crate not found locally, try proxy for remote repos
     let artifact = match artifact {
+        // Virtual invariant (#3480): no top-level gate ran for Virtual (member
+        // gating lives in the proxy arm), and this arm is unreachable there only
+        // because Virtual rejects writes and proxy commits attach to a member's
+        // id. A promotion/replication path attaching rows here must gate first.
         Some(a) => a,
         None => {
             if repo.repo_type == RepositoryType::Remote {
@@ -1690,11 +1956,52 @@ async fn download(
                     state.proxy_service.as_deref()
                 };
 
-                let result = proxy_helpers::resolve_virtual_download(
+                // #3480: enforce each gated Remote member's download gate
+                // BEFORE the byte resolver sees the member list. Per-member
+                // index filtering already keeps an ordinary `cargo build` from
+                // resolving a young version, but a client that already knows
+                // the coordinate (a `Cargo.lock`, or a hand-written URL) would
+                // otherwise stream it straight through. Inlining the member
+                // walk that `resolve_virtual_download` performs internally is
+                // what makes the pre-filtered list possible; the shared
+                // resolver is left untouched so maven/hex and the other
+                // formats routed through it are unaffected.
+                //
+                // Only runs when the name is not locally owned: with
+                // `proxy_for_virtual` at `None` every Remote member resolves to
+                // `VirtualMemberFetchStrategy::Skip` and cannot serve bytes at
+                // all, so evaluating them would be a policy decision (and an
+                // upstream index fetch) with nothing behind it.
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let had_members = !members.is_empty();
+                let members = proxy_helpers::authorize_virtual_members(
                     &state.db,
                     auth.as_ref(),
-                    proxy_for_virtual,
                     repo.id,
+                    members,
+                )
+                .await;
+                if had_members && members.is_empty() {
+                    // Same existence-oracle guard as `resolve_virtual_download`,
+                    // reproduced byte for byte: do NOT fall through to the "has
+                    // no members" message, which would distinguish "this virtual
+                    // is empty" from "this virtual has members you may not see".
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        "Artifact not found in any member repository",
+                    )
+                        .into_response());
+                }
+                let members = if proxy_for_virtual.is_some() {
+                    eligible_virtual_download_members(&state, members, &name_lower, &version)
+                        .await?
+                } else {
+                    members
+                };
+
+                let result = proxy_helpers::resolve_virtual_download_from_members(
+                    members,
+                    proxy_for_virtual,
                     &upstream_path,
                     |member_id, location| {
                         let db = db.clone();
@@ -2015,6 +2322,9 @@ async fn try_remote_index(
 ///   therefore stays in sync with yanks, new releases, and dep changes
 ///   whenever the cache expires. Uses each member's `index_upstream_url`
 ///   config override when present, falling back to `upstream_url`.
+///   A member whose OWN age gate is enabled has its contribution filtered
+///   under its OWN policy before the merge (#3480) — see
+///   [`gated_member_index_contribution`]; the ungated arm is unchanged.
 ///
 /// * **Local / Staging** — the `artifacts` table is authoritative for
 ///   repos that host crates directly; rebuild the sparse-index lines from
@@ -2035,7 +2345,14 @@ async fn try_remote_index(
 /// * Within a single response, dedupe NDJSON entries by `(name, vers)`. When
 ///   the same `(name, vers)` appears in more than one member, the entry from
 ///   the higher-priority member (earlier in the iteration order) wins, which
-///   matches the artifact-listing precedence used elsewhere.
+///   matches the artifact-listing precedence used elsewhere. A version a
+///   gated member withheld never enters the aggregate, so a lower-priority
+///   member that still publishes it contributes it as usual — each member's
+///   policy governs only that member's own lines.
+///
+/// `index_cache_usable` is `serve_index`'s combined caller-view (#3323) and
+/// policy (#3480) decision; it governs the memoization below and is the same
+/// flag that governed the fast-path read there.
 #[allow(clippy::result_large_err)]
 async fn try_virtual_index(
     state: &SharedState,
@@ -2044,7 +2361,7 @@ async fn try_virtual_index(
     name_lower: &str,
     index_cache: &IndexCache,
     cache_key: &str,
-    cache_shareable: bool,
+    index_cache_usable: bool,
 ) -> Option<Result<Response, Response>> {
     use sqlx::Row;
 
@@ -2070,20 +2387,7 @@ async fn try_virtual_index(
 
     // Batch-fetch index_upstream_url overrides for all members in one query.
     let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-    let index_url_overrides: HashMap<uuid::Uuid, String> =
-        sqlx::query_as::<_, (uuid::Uuid, String)>(
-            "SELECT repository_id, value FROM repository_config \
-             WHERE repository_id = ANY($1) AND key = 'index_upstream_url' AND value IS NOT NULL",
-        )
-        .bind(&member_ids)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to fetch index_upstream_url overrides: {}", e);
-            Vec::new()
-        })
-        .into_iter()
-        .collect();
+    let index_url_overrides = fetch_index_upstream_overrides(&state.db, &member_ids).await;
 
     let index_path = cargo_sparse_index_path_upstream(name_lower);
 
@@ -2131,6 +2435,45 @@ async fn try_virtual_index(
                 let base_url =
                     resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
 
+                // #3480: a gated member's contribution is filtered with the
+                // MEMBER's own policy before it reaches the merge.
+                // `merge_index_lines` deliberately keeps lines it cannot
+                // parse, so filtering has to happen here rather than on the
+                // aggregate — and the aggregate has no way to attribute a
+                // line back to the member whose policy governs it.
+                let member_params = match member_age_gate_params(&state.db, member).await {
+                    Ok(params) => params,
+                    Err(resp) => return Some(Err(resp)),
+                };
+                if let Some(params) = member_params {
+                    match gated_member_index_contribution(
+                        state,
+                        &params,
+                        member,
+                        &base_url,
+                        &index_path,
+                        name_lower,
+                    )
+                    .await
+                    {
+                        Ok(Some(filtered)) => {
+                            merge_index_lines(&filtered, &mut aggregated, &mut seen_versions);
+                        }
+                        // Member-scoped fail-closed: the member withheld its
+                        // whole contribution rather than contributing lines
+                        // whose age was never evaluated.
+                        Ok(None) => {}
+                        Err(resp) => return Some(Err(resp)),
+                    }
+                    continue;
+                }
+
+                // Ungated member: unchanged. The 2-tuple fetch discards the
+                // upstream `Content-Encoding`, so a stored-coded member body
+                // still contributes zero entries here — a pre-existing latent
+                // defect (#3184 stopped the shared client decoding) that is
+                // deliberately not "fixed" under this change, which would
+                // alter ungated behavior on a path this PR is not about.
                 if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     member.id,
@@ -2189,10 +2532,13 @@ async fn try_virtual_index(
     match finalize_virtual_index_aggregation(aggregated) {
         Some(Ok(body)) => {
             // Only memoize a document that is the SAME for every caller
-            // (#3323). The index cache is keyed by `repo_key:crate`, not by
-            // caller, so storing a caller-narrowed aggregation would serve one
-            // caller's view to the next — including an anonymous one.
-            if cache_shareable {
+            // (#3323) AND is not a policy-dependent view (#3480). The index
+            // cache is keyed by `repo_key:crate`, so storing a caller-narrowed
+            // aggregation would serve one caller's view to the next —
+            // including an anonymous one — and storing an aggregation any
+            // member's gate filtered would outlive the policy that produced
+            // it. `serve_index` computes both halves; see the flag there.
+            if index_cache_usable {
                 index_cache_set(index_cache, cache_key.to_string(), body.clone()).await;
             }
             Some(Ok(index_response(
@@ -2341,11 +2687,16 @@ async fn serve_index(
     // ProxyService's own body cache is untouched — raw upstream metadata is
     // policy-neutral — so this costs a re-filter, not a re-fetch.
     //
-    // Virtual member gating is Phase 3; `cargo_age_gate_params` returns `None`
-    // for every non-Remote repository, so `cache_shareable` alone still governs
-    // the virtual aggregation (#3323).
+    // A Virtual repository needs the same bypass for a different reason:
+    // `cargo_age_gate_params` returns `None` for it (only a Remote repository
+    // can request gating), but its aggregation is filtered per MEMBER, so any
+    // gated member makes the aggregate a policy-dependent view. The member
+    // lookup is deliberately caller-INDEPENDENT — see
+    // `virtual_has_age_gated_member` — and errs toward bypassing.
     let age_gate = cargo_age_gate_params(state, &repo).await?;
-    let index_cache_usable = cache_shareable && age_gate.is_none();
+    let virtual_member_gated = repo.repo_type == RepositoryType::Virtual
+        && proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await;
+    let index_cache_usable = cache_shareable && age_gate.is_none() && !virtual_member_gated;
 
     // Fast path: serve from in-process index cache (no storage I/O, no SHA-256).
     if index_cache_usable {
@@ -2381,7 +2732,7 @@ async fn serve_index(
             &name_lower,
             &state.index_cache,
             &cache_key,
-            cache_shareable,
+            index_cache_usable,
         )
         .await
         {
@@ -2430,7 +2781,7 @@ async fn serve_index(
             &name_lower,
             &state.index_cache,
             &cache_key,
-            cache_shareable,
+            index_cache_usable,
         )
         .await
         {
@@ -6497,6 +6848,587 @@ mod age_gate_tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
         gated.teardown().await;
+    }
+
+    // ---- Virtual member parity (Phase 3) ----
+
+    /// One Remote member of the virtual repository under test.
+    ///
+    /// Every member gets its OWN wiremock upstream, which is the whole point of
+    /// this rig: the assertions are about one member's policy not reaching
+    /// another member's contribution.
+    struct RemoteMember {
+        id: uuid::Uuid,
+        dir: std::path::PathBuf,
+        server: MockServer,
+    }
+
+    /// A Virtual cargo repository whose members are configured independently.
+    struct VirtualRig {
+        virt: tdh::Fixture,
+        state: SharedState,
+        _cache_dir: tempfile::TempDir,
+        remotes: Vec<RemoteMember>,
+        locals: Vec<(uuid::Uuid, std::path::PathBuf)>,
+    }
+
+    impl VirtualRig {
+        /// `wire_age_gate_service = false` is the fail-closed control: members
+        /// stay gated with no `AgeGateService` on the state, which is what an
+        /// unwired deployment looks like.
+        async fn new(wire_age_gate_service: bool) -> Option<Self> {
+            let virt = tdh::Fixture::setup("virtual", "cargo").await?;
+            // Anonymous probes are the default here, and #3323 resolves only
+            // the members the CALLER may read; the private-member case is
+            // covered explicitly by its own test.
+            tdh::publish_repo(&virt.pool, virt.repo_id).await;
+            let cache_dir = tempfile::tempdir().expect("tempdir");
+            let cache_path = cache_dir.path().to_str().unwrap().to_string();
+            let storage_path = virt.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(virt.pool.clone(), cache_path.as_str());
+            let state = if wire_age_gate_service {
+                tdh::build_state_with_proxy_and_age_gate(
+                    virt.pool.clone(),
+                    storage_path.as_str(),
+                    proxy,
+                )
+            } else {
+                tdh::build_state_with_proxy(virt.pool.clone(), storage_path.as_str(), proxy)
+            };
+            Some(Self {
+                virt,
+                state,
+                _cache_dir: cache_dir,
+                remotes: Vec::new(),
+                locals: Vec::new(),
+            })
+        }
+
+        /// Add a Remote member at `priority`, returning its index in
+        /// `self.remotes`. `gated` configures `upstream_publish_time` with the
+        /// [`MIN_AGE_DAYS`] threshold on THAT member only.
+        async fn add_remote(&mut self, priority: i32, gated: bool, public: bool) -> usize {
+            let (id, _key, dir) = tdh::create_repo(&self.virt.pool, "remote", "cargo").await;
+            let server = MockServer::start().await;
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, age_gate_enabled = $2, \
+                 age_gate_min_age_days = $3, age_gate_mode = 'upstream_publish_time' \
+                 WHERE id = $4",
+            )
+            .bind(server.uri())
+            .bind(gated)
+            .bind(MIN_AGE_DAYS)
+            .bind(id)
+            .execute(&self.virt.pool)
+            .await
+            .expect("configure remote member");
+            if public {
+                tdh::publish_repo(&self.virt.pool, id).await;
+            } else {
+                tdh::grant_repo_access(&self.virt.pool, id, self.virt.user_id).await;
+            }
+            tdh::link_virtual_member(&self.virt.pool, self.virt.repo_id, id, priority).await;
+            self.remotes.push(RemoteMember { id, dir, server });
+            self.remotes.len() - 1
+        }
+
+        /// Add a Local member that HOLDS `name@version`. Local members publish
+        /// rather than proxy, so they carry no upstream publish time and are
+        /// never gated; they also own the crate name for the shadowing guard.
+        async fn add_local(&mut self, priority: i32, name: &str, version: &str) {
+            let (id, key, dir) = tdh::create_repo(&self.virt.pool, "local", "cargo").await;
+            tdh::publish_repo(&self.virt.pool, id).await;
+            tdh::link_virtual_member(&self.virt.pool, self.virt.repo_id, id, priority).await;
+            let repo_info = tdh::make_repo_info(id, &key, &dir, "local", None);
+            tdh::seed_artifact(
+                &self.state,
+                &self.virt.pool,
+                &repo_info,
+                &format!("cargo/{name}/{version}/{name}-{version}.crate"),
+                &format!("api/v1/crates/{name}/{version}/download"),
+                name,
+                version,
+                "application/x-tar",
+                Bytes::from_static(b"a locally published crate"),
+                self.virt.user_id,
+            )
+            .await;
+            self.locals.push((id, dir));
+        }
+
+        async fn mount_index(&self, member: usize, name: &str, index: ResponseTemplate) {
+            Mock::given(wm_method("GET"))
+                .and(wm_path(format!(
+                    "/{}",
+                    cargo_sparse_index_path_upstream(name)
+                )))
+                .respond_with(index)
+                .mount(&self.remotes[member].server)
+                .await;
+        }
+
+        /// `expected_hits` of `0` is the load-bearing case: a member that must
+        /// never serve bytes.
+        async fn mount_download(
+            &self,
+            member: usize,
+            name: &str,
+            version: &str,
+            body: &[u8],
+            expected_hits: u64,
+        ) {
+            Mock::given(wm_method("GET"))
+                .and(wm_path(format!("/api/v1/crates/{name}/{version}/download")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .expect(expected_hits)
+                .mount(&self.remotes[member].server)
+                .await;
+        }
+
+        async fn set_member_gate(&self, member: usize, enabled: bool) {
+            sqlx::query("UPDATE repositories SET age_gate_enabled = $1 WHERE id = $2")
+                .bind(enabled)
+                .bind(self.remotes[member].id)
+                .execute(&self.virt.pool)
+                .await
+                .expect("toggle member age gate");
+        }
+
+        fn index_uri(&self, name: &str) -> String {
+            format!(
+                "/cargo/{}/{}",
+                self.virt.repo_key,
+                cargo_sparse_index_path_upstream(name)
+            )
+        }
+
+        fn download_uri(&self, name: &str, version: &str) -> String {
+            format!(
+                "/cargo/{}/api/v1/crates/{}/{}/download",
+                self.virt.repo_key, name, version
+            )
+        }
+
+        async fn get(&self, uri: String) -> (StatusCode, Bytes, HeaderMap) {
+            tdh::send_with_headers(
+                tdh::router_anon(mounted_router(), self.state.clone()),
+                tdh::get(uri),
+            )
+            .await
+        }
+
+        /// The fixture user holds a grant on every private member this rig
+        /// creates, so this is the "authorized caller" view.
+        async fn get_authorized(&self, uri: String) -> (StatusCode, Bytes, HeaderMap) {
+            let auth = tdh::make_auth(self.virt.user_id, &self.virt.username);
+            tdh::send_with_headers(
+                tdh::router_with_auth(mounted_router(), self.state.clone(), auth),
+                tdh::get(uri),
+            )
+            .await
+        }
+
+        /// Drops every `MockServer`, which is what verifies each `.expect(n)`.
+        async fn teardown(self) {
+            for member in &self.remotes {
+                tdh::cleanup_member_repo(&self.virt.pool, member.id, &member.dir).await;
+            }
+            for (id, dir) in &self.locals {
+                tdh::cleanup_member_repo(&self.virt.pool, *id, dir).await;
+            }
+            self.virt.teardown().await;
+        }
+    }
+
+    /// The core Phase 3 property: inside one Virtual repository, each Remote
+    /// member's contribution is filtered with THAT member's own policy, and
+    /// nothing else changes.
+    ///
+    /// Both Remote members describe `2.0.0`, published minutes ago. The gated
+    /// member withholds it; the ungated member — a deliberate configuration,
+    /// not an oversight — still contributes it, and because the gated member's
+    /// line never entered the aggregate the existing first-member-wins dedup
+    /// hands `2.0.0` to the UNGATED member. A Local member holding the same
+    /// crate name contributes unchanged and stays first in the merge order.
+    ///
+    /// ASSERTED BY DESIGN — half of an asymmetry. The merged index here LISTS a
+    /// young coordinate shared with the ungated member, while
+    /// [`test_virtual_download_blocked_member_never_falls_through_3480`] proves
+    /// the download of exactly such a coordinate 451s: the gated member's block
+    /// is authoritative across the whole virtual, whereas its withheld index
+    /// line simply left the merge to its ungated neighbour. The disagreement is
+    /// deliberate and matches npm — see `eligible_virtual_download_members` for
+    /// the reasoning and for the open Virtual-priority question on
+    /// artifact-keeper#3480 that could revise it.
+    #[tokio::test]
+    async fn test_virtual_index_filters_each_remote_member_with_its_own_policy_3480() {
+        let name = "member-parity";
+        let gated_young_cksum = "a".repeat(64);
+        let ungated_young_cksum = "b".repeat(64);
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        let ungated = rig.add_remote(2, false, true).await;
+        rig.add_local(0, name, "0.5.0").await;
+        rig.mount_index(
+            gated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n{}\n",
+                index_line(name, "1.0.0", &"c".repeat(64), Some(&pubtime_days_ago(400))),
+                index_line(
+                    name,
+                    "2.0.0",
+                    &gated_young_cksum,
+                    Some(&pubtime_days_ago(0))
+                ),
+            )),
+        )
+        .await;
+        rig.mount_index(
+            ungated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n{}\n",
+                index_line(
+                    name,
+                    "2.0.0",
+                    &ungated_young_cksum,
+                    Some(&pubtime_days_ago(0))
+                ),
+                index_line(name, "3.0.0", &"d".repeat(64), Some(&pubtime_days_ago(0))),
+            )),
+        )
+        .await;
+
+        let (status, body, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body).into_owned();
+
+        assert!(
+            text.contains("\"vers\":\"0.5.0\""),
+            "the Local member contributes unchanged; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "the gated member's aged version survives its own filter; got {text}"
+        );
+        assert!(
+            !text.contains(&gated_young_cksum),
+            "the gated member's young version must be absent; got {text}"
+        );
+        assert!(
+            text.contains(&ungated_young_cksum),
+            "the ungated member's identical-name version still merges under the \
+             existing dedup rules; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"3.0.0\""),
+            "an ungated member is not filtered by its neighbour's policy; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// BLOCKED-IS-AUTHORITATIVE on the Virtual download path.
+    ///
+    /// A young version withheld by the highest-priority Remote member returns
+    /// the terminal 451 and never falls through to the lower-priority ungated
+    /// member that holds the same coordinate — the npm virtual-tarball
+    /// precedent. Its `.expect(0)` download mock is the proof: a fall-through
+    /// would have streamed those bytes.
+    ///
+    /// The aged version in the same fixture is the control that keeps this from
+    /// passing as "block everything": it resolves through the gated member.
+    ///
+    /// ASSERTED BY DESIGN — the other half of the asymmetry
+    /// [`test_virtual_index_filters_each_remote_member_with_its_own_policy_3480`]
+    /// records. There the merged index still LISTS a young coordinate a gated
+    /// member withheld, because dedup handed it to an ungated neighbour; here
+    /// the download of that same shape 451s, because a block from ANY gated
+    /// member describing the coordinate is authoritative for the whole virtual.
+    /// Index and download disagreeing for shared coordinates is intentional and
+    /// npm-consistent, pending the Virtual-priority question on
+    /// artifact-keeper#3480; `eligible_virtual_download_members` is the single
+    /// place a different answer would change.
+    #[tokio::test]
+    async fn test_virtual_download_blocked_member_never_falls_through_3480() {
+        let name = "pinned-crate";
+        let aged_body = b"the aged crate bytes".repeat(4);
+        let young_body = b"the young crate bytes".repeat(4);
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        let ungated = rig.add_remote(2, false, true).await;
+        rig.mount_index(
+            gated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n{}\n",
+                index_line(
+                    name,
+                    "1.0.0",
+                    &cksum_of(&aged_body),
+                    Some(&pubtime_days_ago(400))
+                ),
+                index_line(
+                    name,
+                    "2.0.0",
+                    &cksum_of(&young_body),
+                    Some(&pubtime_days_ago(0))
+                ),
+            )),
+        )
+        .await;
+        rig.mount_download(gated, name, "1.0.0", &aged_body, 1)
+            .await;
+        rig.mount_download(gated, name, "2.0.0", &young_body, 0)
+            .await;
+        // The whole point: a lower-priority member that COULD serve the
+        // withheld coordinate, and must not be reached.
+        rig.mount_download(ungated, name, "2.0.0", &young_body, 0)
+            .await;
+
+        let (status, blocked, _) = rig.get(rig.download_uri(name, "2.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            "a blocked higher-priority member is authoritative; got {}",
+            String::from_utf8_lossy(&blocked)
+        );
+        assert_eq!(body_json(&blocked)["error"], "age_gate_blocked");
+        assert_ne!(
+            &blocked[..],
+            &young_body[..],
+            "the block must not be a body from any member"
+        );
+
+        let (status, served, _) = rig.get(rig.download_uri(name, "1.0.0")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &served[..],
+            &aged_body[..],
+            "an allowed version still resolves through the gated member"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// Enabling a MEMBER's gate must take effect on the next request, even
+    /// though the memoized body is the Virtual repository's aggregation.
+    ///
+    /// `cargo_age_gate_params` returns `None` for a Virtual repository, so
+    /// without the widened check this aggregation is memoized under
+    /// `repo_key:crate` — with no policy component — and the pre-gate document
+    /// keeps serving the young version for the rest of the cache TTL. Every
+    /// member here is public, so `cache_shareable` is `true` and the entry is
+    /// genuinely written on the first request.
+    #[tokio::test]
+    async fn test_virtual_warm_index_body_cannot_survive_enabling_a_member_gate_3480() {
+        let name = "warm-virtual";
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let member = rig.add_remote(1, false, true).await;
+        rig.mount_index(
+            member,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n{}\n",
+                index_line(name, "1.0.0", &"e".repeat(64), Some(&pubtime_days_ago(400))),
+                index_line(name, "2.0.0", &"f".repeat(64), Some(&pubtime_days_ago(0))),
+            )),
+        )
+        .await;
+
+        let (status, warmed, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&warmed).contains("\"vers\":\"2.0.0\""),
+            "precondition: the ungated aggregation lists the young version"
+        );
+
+        rig.set_member_gate(member, true).await;
+
+        let (status, filtered, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&filtered).into_owned();
+        assert!(
+            !text.contains("\"vers\":\"2.0.0\""),
+            "a warm pre-gate aggregation must not survive enabling a member's \
+             gate; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "the aged version still resolves; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// The #3323 caller-view guard must survive the age-gate bypass: a gated
+    /// virtual index still must not memoize a private member's entries for the
+    /// next (possibly anonymous) caller.
+    ///
+    /// The private member's version is deliberately OLD, so its absence from
+    /// the anonymous view is attributable to visibility rather than to the
+    /// gate. The authorized request runs first, which is the order that would
+    /// expose a leak.
+    #[tokio::test]
+    async fn test_gated_virtual_does_not_leak_a_private_member_through_the_cache_3480() {
+        let name = "private-view";
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let public_member = rig.add_remote(1, false, true).await;
+        let private_member = rig.add_remote(2, true, false).await;
+        rig.mount_index(
+            public_member,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n",
+                index_line(name, "1.0.0", &"1".repeat(64), Some(&pubtime_days_ago(400)))
+            )),
+        )
+        .await;
+        rig.mount_index(
+            private_member,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n",
+                index_line(name, "7.7.7", &"2".repeat(64), Some(&pubtime_days_ago(400)))
+            )),
+        )
+        .await;
+
+        let (status, authorized, _) = rig.get_authorized(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&authorized).contains("\"vers\":\"7.7.7\""),
+            "precondition: the authorized caller sees the private member's aged entry"
+        );
+
+        let (status, anonymous, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&anonymous).into_owned();
+        assert!(
+            !text.contains("\"vers\":\"7.7.7\""),
+            "a private member's entries must not reach an anonymous caller \
+             through the shared index cache; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "the public member still resolves anonymously; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// A gated member whose policy cannot be EVALUATED fails the whole virtual
+    /// response closed, on both surfaces.
+    ///
+    /// This is the deliberate asymmetry with the test below: an evaluation
+    /// failure means the policy was never applied at all, which the shared 503
+    /// reports for the request — the same propagation npm's virtual packument
+    /// merge and `goproxy::filter_go_version_list` use. It is never a silently
+    /// dropped member, because a caller could not tell that from a member that
+    /// simply had nothing to contribute.
+    #[tokio::test]
+    async fn test_gated_virtual_member_without_age_gate_service_fails_closed_3480() {
+        let name = "unwired-member";
+        let body = b"bytes behind an unevaluable member gate".repeat(4);
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        rig.mount_index(
+            gated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n",
+                index_line(
+                    name,
+                    "1.0.0",
+                    &cksum_of(&body),
+                    Some(&pubtime_days_ago(400))
+                )
+            )),
+        )
+        .await;
+        rig.mount_download(gated, name, "1.0.0", &body, 0).await;
+
+        let (status, index, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unevaluable member gate must not fall back to the raw aggregation"
+        );
+        assert_eq!(body_json(&index)["error"], "age_gate_unavailable");
+
+        let (status, refused, _) = rig.get(rig.download_uri(name, "1.0.0")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(&refused)["error"], "age_gate_unavailable");
+
+        rig.teardown().await;
+    }
+
+    /// A gated member whose index cannot be DECODED contributes nothing, and
+    /// its neighbours are unaffected.
+    ///
+    /// `br` has no decoder linked into this build, so the member's document
+    /// cannot be evaluated. Withholding its contribution is fail-closed for
+    /// that member — no line whose age was never evaluated reaches the client —
+    /// and it is member-scoped for the same reason a failed member FETCH
+    /// already is on this loop: an aggregation is best-effort across members,
+    /// and one misconfigured upstream must not take down a virtual repository
+    /// with healthy members. `npm::remote_member_packument_value` treats an
+    /// undecodable member body the same way.
+    #[tokio::test]
+    async fn test_gated_virtual_member_with_undecodable_index_contributes_nothing_3480() {
+        let name = "brotli-member";
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        let ungated = rig.add_remote(2, false, true).await;
+        rig.mount_index(
+            gated,
+            name,
+            // The bytes are irrelevant: `br` is `Decoded::Unsupported`, which
+            // short-circuits before any decode is attempted.
+            ResponseTemplate::new(200)
+                .set_body_string(format!(
+                    "{}\n",
+                    index_line(name, "4.4.4", &"9".repeat(64), Some(&pubtime_days_ago(400)))
+                ))
+                .append_header("content-encoding", "br"),
+        )
+        .await;
+        rig.mount_index(
+            ungated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n",
+                index_line(name, "1.0.0", &"8".repeat(64), Some(&pubtime_days_ago(400)))
+            )),
+        )
+        .await;
+
+        let (status, body, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            !text.contains("\"vers\":\"4.4.4\""),
+            "an undecodable gated member must contribute nothing; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "a healthy member is unaffected by its neighbour's broken coding; got {text}"
+        );
+
+        rig.teardown().await;
     }
 
     // ---- Pure helpers ----
