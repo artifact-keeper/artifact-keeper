@@ -184,6 +184,15 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 /// lapses in time for the next natural tick rather than blocking it.
 const STORAGE_GC_LEASE_TTL_SECS: f64 = 3600.0;
 
+/// `scheduler_leases.job_name` the scheduled storage-GC tick claims.
+///
+/// This is an OPERATOR-VISIBLE wire value: diagnosing a stuck or contended
+/// tick means `SELECT * FROM scheduler_leases WHERE job_name = 'storage_gc'`,
+/// and it is what the #3384 runbook names. The scheduler passes this constant
+/// rather than a literal so the value the scheduler claims and the value the
+/// regression test pins cannot drift apart.
+pub(crate) const SCHEDULED_GC_JOB_NAME: &str = "storage_gc";
+
 /// SQL fragment expressing the orphaned row-less Maven flat-object predicate
 /// over an outer `maven_flat_object_owner` row aliased `o` (#2668).
 ///
@@ -565,6 +574,17 @@ impl StorageGcService {
     /// admin/per-repo GC endpoints (`storage_gc.rs`) call
     /// `run_gc`/`run_gc_for_repository` directly and must keep working even
     /// while a scheduled tick holds this lease.
+    ///
+    /// SCOPE: this gates `run_gc` only. The blob-GC mark/sweep and the
+    /// storage-stats recompute that share the same scheduler tick are NOT
+    /// under this lease and still run on every replica — #3384 is only
+    /// partially closed by this method. See the scope note at the call site
+    /// in `scheduler_service::spawn_all` and issue #3503.
+    ///
+    /// This method changes WHO runs the sweep, never WHAT it deletes. The
+    /// `MAVEN_FLAT_GC_ENABLED` opt-in gate (#3431) lives further in, in
+    /// `cleanup_orphan_maven_flat_objects`, and is reached through
+    /// `run_gc(false)` exactly as it is from the on-demand endpoints.
     pub(crate) async fn run_scheduled_tick(&self, job_name: &str) -> bool {
         let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
             &self.db,
@@ -3997,24 +4017,74 @@ mod tests {
         );
     }
 
+    /// The lease name is an operator-visible wire value (`SELECT * FROM
+    /// scheduler_leases WHERE job_name = 'storage_gc'`), so pin it. Renaming
+    /// it silently breaks every runbook and dashboard built on #3384 while
+    /// leaving both replicas perfectly happy.
+    #[test]
+    fn scheduled_gc_lease_job_name_is_the_documented_wire_name() {
+        assert_eq!(
+            SCHEDULED_GC_JOB_NAME, "storage_gc",
+            "the scheduled GC lease name is operator-visible (#3384) — do not rename it"
+        );
+    }
+
     /// [`StorageGcService::run_scheduled_tick`] must skip (return `false`)
     /// while another replica holds the named lease, and must acquire, run,
     /// and release it (returning `true`) once that lease is free — the
     /// concurrency guard added for artifact-keeper#3384.
+    ///
+    /// Runs against the REAL [`SCHEDULED_GC_JOB_NAME`], not a random name, so
+    /// the argument the scheduler actually passes is under test; nothing else
+    /// in the tree claims that lease (the scheduler itself never starts in a
+    /// `--lib` test binary).
+    ///
+    /// Also pins the other half of the contract: the on-demand admin endpoint
+    /// is NOT gated by this lease and must still run while a scheduled tick
+    /// holds it. That is the property the whole change is allowed to be
+    /// invisible on — an operator hitting `POST /api/v1/admin/storage-gc`
+    /// during a tick must not silently get a no-op.
     #[tokio::test]
     async fn run_scheduled_tick_respects_the_singleton_lease() {
+        use crate::api::handlers::storage_gc::{run_storage_gc, StorageGcRequest};
         use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
         use crate::services::cluster_work;
 
         let _gc_guard = storage_gc_test_guard().await;
         let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
             return;
         };
-        let job = format!("test-storage-gc-{}", Uuid::new_v4());
+        let storage = fixture_storage(&fixture);
+        let uid = Uuid::new_v4().simple().to_string();
+        let job = SCHEDULED_GC_JOB_NAME;
+
+        // One genuinely orphaned, system-written, past-the-age-floor object.
+        // The fixture config leaves `MAVEN_FLAT_GC_ENABLED` off, so a pass
+        // that reaches it REPORTS it (`maven_flat_objects_gated`) and deletes
+        // nothing. That counter is what makes the on-demand assertion below
+        // observable: a lease-gated no-op would report zero.
+        let probe_key = format!("maven/ondemand3384/{uid}/lib/maven-metadata.xml");
+        seed_objects(&storage, &[&probe_key]).await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &probe_key,
+            2,
+            "metadata_rollup",
+        )
+        .await;
+        // Defensive: a previous crashed run of this test could have left the
+        // singleton row behind, which would make the first assertion pass for
+        // the wrong reason.
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(job)
+            .execute(&fixture.pool)
+            .await;
 
         // Simulate another replica already holding the lease for this tick.
         let other_replica_lease =
-            cluster_work::try_acquire_scheduler_lease(&fixture.pool, &job, "other-replica", 60.0)
+            cluster_work::try_acquire_scheduler_lease(&fixture.pool, job, "other-replica", 60.0)
                 .await
                 .expect("query ok")
                 .expect("first claim wins");
@@ -4022,20 +4092,50 @@ mod tests {
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
         assert!(
-            !service.run_scheduled_tick(&job).await,
+            !service.run_scheduled_tick(job).await,
             "tick must skip while another replica holds the lease"
+        );
+
+        // The on-demand admin endpoint shares the service but NOT the lease:
+        // it calls `run_gc` directly and must still work here.
+        let admin = AuthExtension {
+            user_id: fixture.user_id,
+            username: fixture.username.clone(),
+            is_admin: true,
+            ..Default::default()
+        };
+        let on_demand = run_storage_gc(
+            axum::extract::State(fixture.state.clone()),
+            axum::extract::Extension(admin),
+            axum::Json(StorageGcRequest { dry_run: false }),
+        )
+        .await;
+        let on_demand =
+            on_demand.expect("on-demand admin GC must not error while the lease is held");
+        assert!(
+            on_demand.0.maven_flat_objects_gated >= 1,
+            "the on-demand admin GC endpoint must not be blocked by the \
+             scheduled tick's lease — it must actually run the flat-object \
+             sweep and report the seeded orphan, not return an empty no-op \
+             result: {:?}",
+            on_demand.0
+        );
+        assert!(
+            storage.exists(&probe_key).await.expect("exists check"),
+            "the on-demand pass is gated the same way the scheduled one is: \
+             MAVEN_FLAT_GC_ENABLED is off, so it reports and deletes nothing"
         );
 
         // Free the lease; the next tick must win it, run, and release it.
         other_replica_lease.release(&fixture.pool).await;
         assert!(
-            service.run_scheduled_tick(&job).await,
+            service.run_scheduled_tick(job).await,
             "tick must run once the lease is free"
         );
 
         let held_after = cluster_work::try_acquire_scheduler_lease(
             &fixture.pool,
-            &job,
+            job,
             "post-tick-checker",
             60.0,
         )
@@ -4047,10 +4147,114 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(job)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+    }
+
+    /// Winning the lease must change WHO sweeps, never WHAT is swept.
+    ///
+    /// The #3431 incident was an unrecoverable data loss on exactly this
+    /// sweep, and this PR is its reachability multiplier (the trigram index
+    /// makes the candidate scan orders of magnitude faster, so a pass that
+    /// used to be slow enough to be starved now reliably completes to its
+    /// full 1000-key budget). Both #3431 guards are
+    /// therefore re-asserted THROUGH the leased entry point rather than only
+    /// through `run_gc`/`run_gc_for_repository`:
+    ///
+    /// 1. `MAVEN_FLAT_GC_ENABLED` unset ⇒ a won tick deletes nothing.
+    /// 2. Opted in, the `metadata_rollup` row is reclaimed (positive control,
+    ///    so (1) cannot pass by simply never finding a candidate) while the
+    ///    `operator_repair` row — a source outside
+    ///    `SYSTEM_WRITTEN_ATTRIBUTION_SOURCES` — is preserved.
+    #[tokio::test]
+    async fn run_scheduled_tick_honours_the_flat_gc_gate_and_source_allowlist() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let storage = fixture_storage(&fixture);
+        let uid = Uuid::new_v4().simple().to_string();
+        let job = format!("test-storage-gc-gate-{uid}");
+
+        // Both are genuinely orphaned and past the one-hour age floor; the
+        // ONLY difference between them is `source`.
+        let system_key = format!("maven/gate3384/{uid}/sys/maven-metadata.xml");
+        let operator_key = format!("maven/gate3384/{uid}/ops/maven-metadata.xml");
+        seed_objects(&storage, &[&system_key, &operator_key]).await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &system_key,
+            2,
+            "metadata_rollup",
+        )
+        .await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &operator_key,
+            2,
+            "operator_repair",
+        )
+        .await;
+
+        // (1) Gate unset — default construction, exactly as production builds
+        // it when MAVEN_FLAT_GC_ENABLED is absent.
+        let gated =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        assert!(
+            gated.run_scheduled_tick(&job).await,
+            "the gated tick must still WIN the lease — the gate is about \
+             deleting, not about running"
+        );
+        let after_gated = objects_left(&storage, &[&system_key, &operator_key]).await;
+        let sys_rows_gated = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &system_key).await;
+
+        // (2) Same fixture data, same leased entry point, opted in.
+        let enabled =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_maven_flat_gc_enabled(true);
+        assert!(
+            enabled.run_scheduled_tick(&job).await,
+            "the second tick must win the lease the first one released"
+        );
+        let after_enabled = objects_left(&storage, &[&system_key, &operator_key]).await;
+        let ops_rows_enabled =
+            count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &operator_key).await;
+
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
             .bind(&job)
             .execute(&fixture.pool)
             .await;
         fixture.teardown().await;
+
+        assert_eq!(
+            after_gated,
+            vec![true, true],
+            "with MAVEN_FLAT_GC_ENABLED unset a WON tick must delete nothing \
+             (#3431); leasing the tick must not open a second path around the gate"
+        );
+        assert_eq!(
+            sys_rows_gated, 1,
+            "the gated tick must leave the attribution row in place too"
+        );
+        assert_eq!(
+            after_enabled,
+            vec![false, true],
+            "opted in, the leased tick reclaims the system-written \
+             `metadata_rollup` object (positive control) and PRESERVES the \
+             `operator_repair` one — the #3431 source allowlist still holds \
+             through the lease path"
+        );
+        assert_eq!(
+            ops_rows_enabled, 1,
+            "an operator_repair attribution row is a primary record nothing \
+             can re-derive; it must survive an opted-in leased tick"
+        );
     }
 
     /// Reference kind for [`insert_referenced_soft_deleted_artifact`].
