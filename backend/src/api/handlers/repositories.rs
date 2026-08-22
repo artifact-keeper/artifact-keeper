@@ -8966,7 +8966,7 @@ pub async fn delete_artifact(
     let artifact_service = state.create_artifact_service(storage);
 
     // Find the artifact
-    let artifact = sqlx::query_scalar!(
+    let artifact_id = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
         repo.id,
         path
@@ -8976,9 +8976,96 @@ pub async fn delete_artifact(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
+    // Pre-flight the soft-delete (row load + the `BeforeDelete` veto) BEFORE
+    // opening the transaction below: a veto must abort before any index row is
+    // touched, and plugin I/O must never hold a Postgres transaction open.
+    let artifact = artifact_service.prepare_delete(artifact_id).await?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Docker/OCI manifests are indexed in `oci_tags`/`oci_manifest_refs`/
+    // `manifest_blob_refs` in addition to the `artifacts` row. Soft-deleting the
+    // artifacts row alone leaves those rows orphaned, so a re-push's HEAD
+    // manifest resolves the surviving tag and the client skips the PUT — the
+    // artifacts row is never resurrected (#3476). Unwind the OCI index here,
+    // mirroring `handle_delete_manifest`, so a later re-push cleanly re-creates
+    // it.
+    //
+    // The unwind acts ONLY on the index rows this artifact actually owns:
+    //   * the digest comes from the OCI index for `(repo, image, reference)`,
+    //     never from the row's own checksum — the index is the authority on what
+    //     a reference resolves to;
+    //   * it runs only when that indexed manifest IS this row (checksum
+    //     equality), so a row that is not the indexed manifest cannot drive the
+    //     removal of index rows belonging to a different image;
+    //   * it is scoped to the single `(name = image, tag = reference)` row this
+    //     REST path names, never to a repo-wide content-address sweep — that
+    //     scope is only correct on `/v2`, where the reference IS the resolved
+    //     digest.
+    //
+    // A reference with no index row (peer-replicated Docker artifacts and
+    // non-manifest files under an OCI repository both have `artifacts` rows and
+    // no index rows) simply has nothing to unwind: skip it and still soft-delete.
+    if crate::services::repository_service::format_handler_key(&repo.format) == "oci" {
+        if let Some((image, reference)) = path
+            .strip_prefix("v2/")
+            .and_then(|rest| rest.split_once("/manifests/"))
+        {
+            let indexed = crate::api::handlers::oci_v2::resolve_indexed_manifest_digest(
+                &mut *tx, repo.id, image, reference,
+            )
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            match crate::api::handlers::oci_v2::rest_unwind_digest(
+                indexed.as_deref(),
+                &artifact.checksum_sha256,
+            ) {
+                Some(digest) => {
+                    crate::api::handlers::oci_v2::delete_oci_manifest_content_in_tx(
+                        &mut tx,
+                        repo.id,
+                        image,
+                        reference,
+                        digest,
+                        crate::api::handlers::oci_v2::OciIndexDeleteScope::NamedReference,
+                    )
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+                None => {
+                    tracing::warn!(
+                        repository_id = %repo.id,
+                        path = %path,
+                        indexed_digest = indexed.as_deref().unwrap_or("<none>"),
+                        "OCI index unwind skipped: the reference is not indexed as this artifact's manifest"
+                    );
+                }
+            }
+        }
+    }
+
+    // The index unwind and the soft-delete are ONE transaction: a failure of
+    // either can never leave the index destroyed while the artifacts row still
+    // reads as present (or vice versa).
     artifact_service
-        .delete_with_sync_options(artifact, !is_replication)
+        .commit_delete_in_tx(&mut tx, artifact_id)
         .await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Best-effort side effects, deliberately after COMMIT: sync-task fan-out,
+    // the audit entry, the AfterDelete hook and the search-index removal must
+    // not hold the transaction open, and the audit write must not roll back
+    // with it.
+    artifact_service
+        .finish_delete(&artifact, !is_replication)
+        .await;
 
     // Deleting a Maven artifact changes the version set for its GAV. Drop both
     // the in-memory generation cache AND the *stored* verbatim maven-metadata.xml
@@ -16103,6 +16190,512 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // REST delete: OCI index unwind (#3476)
+    //
+    // The unwind must remove the index rows the deleted artifact OWNS, and
+    // nothing else. Every fixture below seeds the index independently of the
+    // `artifacts` row's checksum so a divergence between the two is observable
+    // — a fixture that derives both sides from one value cannot see it.
+    // -----------------------------------------------------------------------
+
+    /// Test scaffolding for a Docker repo the fixture user may read/write/delete.
+    struct OciDeleteRig {
+        pool: sqlx::PgPool,
+        repo_id: Uuid,
+        key: String,
+        user_id: Uuid,
+        username: String,
+        auth: Option<AuthExtension>,
+        dir: std::path::PathBuf,
+    }
+
+    impl OciDeleteRig {
+        async fn setup() -> Option<Self> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let pool = tdh::try_pool().await?;
+            let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "docker").await;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            tdh::grant_repo_access(&pool, repo_id, user_id).await;
+            tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+            let auth = Some(tdh::make_auth(user_id, &username));
+            Some(Self {
+                pool,
+                repo_id,
+                key,
+                user_id,
+                username,
+                auth,
+                dir,
+            })
+        }
+
+        /// Insert an `artifacts` row at `path` whose content hash is `checksum`,
+        /// exactly as `upsert_manifest_artifact` writes it on a manifest push.
+        async fn seed_artifact(&self, path: &str, checksum: &str) {
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    repository_id, path, name, version, size_bytes,
+                    checksum_sha256, content_type, storage_key
+                )
+                VALUES ($1, $2, $2, 'v', 100,
+                        $3, 'application/vnd.oci.image.manifest.v1+json', $4)
+                "#,
+            )
+            .bind(self.repo_id)
+            .bind(path)
+            .bind(checksum)
+            .bind(format!("sha256:{checksum}"))
+            .execute(&self.pool)
+            .await
+            .expect("seed artifacts row");
+        }
+
+        /// Insert the `oci_tags` index row for `(image, reference)`. `digest` is
+        /// supplied independently of any artifacts row so the fixture can model
+        /// agreement AND divergence.
+        async fn seed_tag(&self, image: &str, reference: &str, digest: &str) {
+            sqlx::query(
+                "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+                 VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')",
+            )
+            .bind(self.repo_id)
+            .bind(image)
+            .bind(reference)
+            .bind(digest)
+            .execute(&self.pool)
+            .await
+            .expect("seed oci_tags row");
+        }
+
+        /// Insert the config + layer `manifest_blob_refs` a pushed manifest pins.
+        async fn seed_blob_refs(&self, digest: &str) {
+            for (kind, blob) in [("config", "cfg"), ("layer", "lay")] {
+                sqlx::query(
+                    "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) \
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(digest)
+                .bind(format!("sha256:{}{}", blob, "0".repeat(61)))
+                .bind(self.repo_id)
+                .bind(kind)
+                .execute(&self.pool)
+                .await
+                .expect("seed manifest_blob_refs");
+            }
+        }
+
+        async fn delete(&self, path: &str) -> Result<()> {
+            self.delete_as(path, self.auth.clone()).await
+        }
+
+        /// Delete as an admin. A literal `sha256:` manifest path classifies as
+        /// immutable, so only the admin retraction escape hatch reaches the
+        /// unwind for a digest-addressed path.
+        async fn delete_as_admin(&self, path: &str) -> Result<()> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let auth = Some(tdh::admin_auth(self.user_id, &self.username));
+            self.delete_as(path, auth).await
+        }
+
+        async fn delete_as(&self, path: &str, auth: Option<AuthExtension>) -> Result<()> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            delete_artifact(
+                State(tdh::build_state(
+                    self.pool.clone(),
+                    self.dir.to_string_lossy().as_ref(),
+                )),
+                Extension(auth),
+                Path((self.key.clone(), path.to_string())),
+                HeaderMap::new(),
+            )
+            .await
+        }
+
+        async fn tag_count(&self, image: &str, reference: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+            )
+            .bind(self.repo_id)
+            .bind(image)
+            .bind(reference)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn blob_ref_count(&self, digest: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+            )
+            .bind(self.repo_id)
+            .bind(digest)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn is_deleted(&self, path: &str) -> bool {
+            sqlx::query_scalar(
+                "SELECT is_deleted FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(self.repo_id)
+            .bind(path)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn teardown(self) {
+            use crate::api::handlers::test_db_helpers as tdh;
+            tdh::cleanup(&self.pool, self.repo_id, self.user_id).await;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// #3476 negative control (STRENGTHENED): a REST delete of a normally-pushed
+    /// manifest must still unwind the whole index footprint it owns — the tag
+    /// row AND the `manifest_blob_refs` that pin its config/layer blobs — while
+    /// leaving another image's tag in the same repository alone.
+    ///
+    /// The blob-ref half is the storage-reclaim half of #3476; the second image
+    /// pins the blast radius so a later "unwind everything with this digest"
+    /// regression cannot pass.
+    #[tokio::test]
+    async fn delete_artifact_docker_removes_oci_tags_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "a".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine";
+
+        rig.seed_artifact(path, &checksum).await;
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+
+        // A second, unrelated image in the same repository at its own digest.
+        let bystander_checksum = "b".repeat(64);
+        let bystander_digest = format!("sha256:{bystander_checksum}");
+        rig.seed_tag("nginx", "stable", &bystander_digest).await;
+        rig.seed_blob_refs(&bystander_digest).await;
+
+        let result = rig.delete(path).await;
+        assert!(
+            result.is_ok(),
+            "docker delete must succeed, got: {result:?}"
+        );
+
+        assert_eq!(
+            rig.tag_count("redis", "7-alpine").await,
+            0,
+            "oci_tags row must be removed by the REST delete"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&digest).await,
+            0,
+            "the deleted manifest's blob refs must be released so GC can reclaim them"
+        );
+        assert!(
+            rig.is_deleted(path).await,
+            "artifacts row must be soft-deleted"
+        );
+
+        assert_eq!(
+            rig.tag_count("nginx", "stable").await,
+            1,
+            "an unrelated image's tag must be untouched"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&bystander_digest).await,
+            2,
+            "an unrelated image's blob refs must be untouched"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// The REST delete resolves the digest it unwinds FROM THE OCI INDEX for
+    /// `(repository, image, reference)` — never from the deleted row's own
+    /// checksum. An `artifacts` row that merely *carries the same content hash*
+    /// as an indexed manifest, under an unrelated image name and a reference the
+    /// index does not know, owns no index rows and must not be able to remove
+    /// any.
+    #[tokio::test]
+    async fn rest_delete_of_decoy_manifest_must_not_unwind_victim_index_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let victim = "1".repeat(64);
+        let victim_digest = format!("sha256:{victim}");
+
+        // Victim: a real, indexed manifest.
+        rig.seed_artifact("v2/prodimg/manifests/1.0.0", &victim)
+            .await;
+        rig.seed_tag("prodimg", "1.0.0", &victim_digest).await;
+        rig.seed_blob_refs(&victim_digest).await;
+
+        // A second tag on the same digest, so a repo-wide content-addressed
+        // sweep would be visible here too.
+        rig.seed_tag("prodimg", "latest", &victim_digest).await;
+
+        // Decoy: an artifacts row under an unrelated image at a digest-SHAPED
+        // reference, holding the victim's content hash, with NO index row of its
+        // own (which is all the generic upload path creates).
+        let decoy_path = "v2/attackersandbox/manifests/blake3:00";
+        rig.seed_artifact(decoy_path, &victim).await;
+
+        let result = rig.delete(decoy_path).await;
+        assert!(
+            result.is_ok(),
+            "deleting an unindexed artifact must still succeed, got: {result:?}"
+        );
+
+        assert_eq!(
+            rig.tag_count("prodimg", "1.0.0").await,
+            1,
+            "the victim image's tag must survive a delete of an unrelated artifact"
+        );
+        assert_eq!(
+            rig.tag_count("prodimg", "latest").await,
+            1,
+            "a second tag on the same digest must survive too"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&victim_digest).await,
+            2,
+            "the victim image's blob refs must survive (they pin its blobs against GC)"
+        );
+        assert!(
+            rig.is_deleted(decoy_path).await,
+            "the deleted artifact must still be soft-deleted"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// Same invariant under a NON-digest-shaped reference: the decision is
+    /// "is this row the manifest the index names?", not "does the reference look
+    /// like a digest?". Guards the index-authority and checksum-identity rules
+    /// independently of the delete SCOPE rule.
+    #[tokio::test]
+    async fn rest_delete_of_unindexed_manifest_path_must_not_touch_index_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let victim = "3".repeat(64);
+        let victim_digest = format!("sha256:{victim}");
+
+        rig.seed_artifact("v2/prodimg/manifests/1.0.0", &victim)
+            .await;
+        rig.seed_tag("prodimg", "1.0.0", &victim_digest).await;
+        rig.seed_blob_refs(&victim_digest).await;
+
+        let decoy_path = "v2/attackersandbox/manifests/rogue";
+        rig.seed_artifact(decoy_path, &victim).await;
+
+        let result = rig.delete(decoy_path).await;
+        assert!(result.is_ok(), "delete must succeed, got: {result:?}");
+
+        assert_eq!(rig.tag_count("prodimg", "1.0.0").await, 1);
+        assert_eq!(rig.blob_ref_count(&victim_digest).await, 2);
+        assert!(rig.is_deleted(decoy_path).await);
+
+        rig.teardown().await;
+    }
+
+    /// The unwind requires the `artifacts` row to BE the manifest the index
+    /// names. When the two have diverged — the row carries different bytes than
+    /// the tag resolves to — the row does not own that tag, so deleting it must
+    /// leave the tag (which still names a stored manifest) alone rather than
+    /// making a live image unpullable.
+    #[tokio::test]
+    async fn rest_delete_of_diverged_artifact_row_must_not_unwind_indexed_manifest_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        // What the index says `prodimg:1.0.0` is...
+        let indexed = "5".repeat(64);
+        let indexed_digest = format!("sha256:{indexed}");
+        // ...and what the artifacts row at that path actually holds.
+        let stored = "6".repeat(64);
+
+        let path = "v2/prodimg/manifests/1.0.0";
+        rig.seed_artifact(path, &stored).await;
+        rig.seed_tag("prodimg", "1.0.0", &indexed_digest).await;
+        rig.seed_blob_refs(&indexed_digest).await;
+
+        let result = rig.delete(path).await;
+        assert!(result.is_ok(), "delete must still succeed, got: {result:?}");
+
+        assert_eq!(
+            rig.tag_count("prodimg", "1.0.0").await,
+            1,
+            "a row that is not the indexed manifest must not remove its tag"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&indexed_digest).await,
+            2,
+            "the indexed manifest's blob refs must stay pinned"
+        );
+        assert!(rig.is_deleted(path).await, "the row is still soft-deleted");
+
+        rig.teardown().await;
+    }
+
+    /// A digest-shaped reference on the REST route is NOT a content-addressed
+    /// delete. The REST verb removes one `artifacts` row, so its index footprint
+    /// is the single `(name, tag)` row that path names — sibling tags pointing
+    /// at the same digest keep the manifest live.
+    #[tokio::test]
+    async fn rest_delete_by_digest_reference_without_index_row_preserves_sibling_tags_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "c".repeat(64);
+        let digest = format!("sha256:{checksum}");
+
+        // Two tags on the same digest, and an artifacts row addressed BY DIGEST
+        // with no `('redis', 'sha256:C')` index row of its own. A literal
+        // `sha256:` manifest path is classified immutable, so this delete runs
+        // through the admin retraction escape hatch.
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_tag("redis", "7", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+        let path = format!("v2/redis/manifests/{digest}");
+        rig.seed_artifact(&path, &checksum).await;
+
+        let result = rig.delete_as_admin(&path).await;
+        assert!(result.is_ok(), "delete must succeed, got: {result:?}");
+
+        assert_eq!(
+            rig.tag_count("redis", "7-alpine").await,
+            1,
+            "a digest-addressed REST delete must not sweep every tag on the digest"
+        );
+        assert_eq!(rig.tag_count("redis", "7").await, 1);
+        assert_eq!(
+            rig.blob_ref_count(&digest).await,
+            2,
+            "the manifest is still tagged, so its blob refs must stay pinned"
+        );
+        assert!(rig.is_deleted(&path).await);
+
+        rig.teardown().await;
+    }
+
+    /// Concurrent deletes of the SAME artifact must produce exactly one
+    /// success. The handler's lookup and `prepare_delete` are non-locking
+    /// reads, so several racers can pass both; the soft-delete UPDATE is what
+    /// serializes them, and its `is_deleted = false` predicate is what makes
+    /// the losers report `NotFound` instead of each claiming a delete it did
+    /// not perform (and each writing an audit entry for it).
+    #[tokio::test]
+    async fn concurrent_rest_deletes_of_one_artifact_yield_exactly_one_success_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "7".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine";
+        rig.seed_artifact(path, &checksum).await;
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+
+        let results = futures::future::join_all((0..6).map(|_| rig.delete(path))).await;
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok, 1,
+            "exactly one concurrent delete may report success, got {ok}: {results:?}"
+        );
+        assert_eq!(rig.tag_count("redis", "7-alpine").await, 0);
+        assert_eq!(rig.blob_ref_count(&digest).await, 0);
+        assert!(rig.is_deleted(path).await);
+
+        rig.teardown().await;
+    }
+
+    /// The index unwind and the `artifacts` soft-delete are ONE transaction: if
+    /// the soft-delete fails, the index must be exactly as it was. Otherwise a
+    /// database hiccup destroys the image while the API reports the delete
+    /// failed — with no audit record of it.
+    ///
+    /// The failure is injected with a BEFORE UPDATE trigger scoped to this
+    /// fixture's single row id, so a leaked trigger is inert for every other row
+    /// in the shared cluster. Pinned to the `db-serial` nextest group all the
+    /// same (see `.config/nextest.toml`).
+    #[tokio::test]
+    async fn rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "d".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine";
+
+        rig.seed_artifact(path, &checksum).await;
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+
+        let artifact_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(rig.repo_id)
+                .bind(path)
+                .fetch_one(&rig.pool)
+                .await
+                .unwrap();
+
+        // Drop first, unconditionally, so a previously panicked run cannot leak
+        // the trigger into this one.
+        let drop_trigger = "DROP TRIGGER IF EXISTS ak_test_block_delete_3475 ON artifacts";
+        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION ak_test_block_delete_3475() RETURNS trigger AS \
+             $$ BEGIN RAISE EXCEPTION 'ak-test-3475 injected failure'; END $$ LANGUAGE plpgsql",
+        )
+        .execute(&rig.pool)
+        .await
+        .expect("create abort function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER ak_test_block_delete_3475 BEFORE UPDATE ON artifacts \
+             FOR EACH ROW WHEN (NEW.is_deleted AND NEW.id = '{artifact_id}') \
+             EXECUTE FUNCTION ak_test_block_delete_3475()"
+        ))
+        .execute(&rig.pool)
+        .await
+        .expect("create abort trigger");
+
+        let result = rig.delete(path).await;
+
+        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query("DROP FUNCTION IF EXISTS ak_test_block_delete_3475()")
+            .execute(&rig.pool)
+            .await
+            .ok();
+
+        assert!(
+            result.is_err(),
+            "the delete must fail when the soft-delete cannot be applied"
+        );
+        assert_eq!(
+            rig.tag_count("redis", "7-alpine").await,
+            1,
+            "a failed delete must not leave the index unwound"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&digest).await,
+            2,
+            "a failed delete must not release the manifest's blob refs"
+        );
+        assert!(
+            !rig.is_deleted(path).await,
+            "the artifacts row must still be live after a failed delete"
+        );
+
+        rig.teardown().await;
     }
 
     /// #2603 G1 core: `require_repo_action` is DENY-BY-DEFAULT. On a RULES-LESS
