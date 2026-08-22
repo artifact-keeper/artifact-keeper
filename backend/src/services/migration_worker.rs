@@ -383,16 +383,19 @@ impl MigrationWorker {
             .update_job_status(job_id, MigrationJobStatus::Running)
             .await?;
 
-        // The run owns the discovered totals from here on. They are rebuilt
-        // page by page below, so clearing them keeps the denominator on the
-        // same footing as the counters, which also restart at zero every run:
-        // an assessment's pre-run estimate, or the totals a previous run left
-        // behind, would otherwise be divided into counts that no longer belong
-        // to it.
-        self.migration_service
-            .update_job_totals(job_id, 0, 0)
-            .await?;
-
+        // The run owns the discovered totals from here on: they are rebuilt
+        // page by page below and republished absolutely, and `flush_job_counters`
+        // publishes them once more on the way out, so an assessment's pre-run
+        // estimate or a previous run's figures cannot survive this run.
+        //
+        // They are deliberately NOT cleared here. The counters restart at zero
+        // every run but the row's do not — a resumed job still carries the
+        // completed_items of the pass that was paused — so zeroing the
+        // denominator up front republished exactly the symptom this fixes
+        // ("73/0 items, 0%") for as long as the first source listing takes.
+        // Overwriting a stale denominator one page later is the smaller error
+        // of the two, and the run-end publish covers a run that enumerates
+        // nothing at all.
         let mut total_completed = 0i32;
         let mut total_failed = 0i32;
         let mut total_skipped = 0i32;
@@ -675,15 +678,17 @@ impl MigrationWorker {
         // Process each repository
         for (keys, package_type) in &repos_to_process {
             // Check for pause/cancel
-            if self.cancel_token.is_cancelled() {
-                tracing::info!(job_id = %job_id, "Migration cancelled by user");
-                self.migration_service
-                    .update_job_status(job_id, MigrationJobStatus::Cancelled)
-                    .await?;
-                return Ok(());
-            }
-            if self.is_paused(job_id).await? {
-                tracing::info!(job_id = %job_id, "Migration paused by user");
+            if self.cancel_token.is_cancelled() || self.is_paused(job_id).await? {
+                self.halt_on_interrupt(
+                    job_id,
+                    total_discovered,
+                    total_discovered_bytes,
+                    total_completed,
+                    total_failed,
+                    total_skipped,
+                    total_transferred,
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -733,14 +738,16 @@ impl MigrationWorker {
                         tracing::info!(repo = %keys.target, "Repository artifacts processed");
                     }
                     Ok(RepoProcessOutcome::Interrupted) => {
-                        if self.cancel_token.is_cancelled() {
-                            tracing::info!(job_id = %job_id, "Migration cancelled by user");
-                            self.migration_service
-                                .update_job_status(job_id, MigrationJobStatus::Cancelled)
-                                .await?;
-                        } else {
-                            tracing::info!(job_id = %job_id, "Migration paused by user");
-                        }
+                        self.halt_on_interrupt(
+                            job_id,
+                            total_discovered,
+                            total_discovered_bytes,
+                            total_completed,
+                            total_failed,
+                            total_skipped,
+                            total_transferred,
+                        )
+                        .await?;
                         return Ok(());
                     }
                     Err(e) => {
@@ -750,6 +757,19 @@ impl MigrationWorker {
                 }
             }
         }
+
+        // Publish the run's counters before stamping a terminal status, so
+        // the row a finished job leaves behind describes what the run did.
+        self.flush_job_counters(
+            job_id,
+            total_discovered,
+            total_discovered_bytes,
+            total_completed,
+            total_failed,
+            total_skipped,
+            total_transferred,
+        )
+        .await?;
 
         // Update final status and stamp `finished_at`. The guarded write
         // skips paused/cancelled jobs, so a pause landing after the last
@@ -790,6 +810,83 @@ impl MigrationWorker {
             // `completed` is "would transfer" on a dry run; nothing was written.
             "Migration job completed"
         );
+
+        Ok(())
+    }
+
+    /// Publish the run's discovered totals and in-memory counters to the job row.
+    ///
+    /// `process_repository_artifacts` flushes progress only after an item it
+    /// actually transferred. Dry runs, items an earlier pass already completed
+    /// and duplicates every `continue` before that write, so a job made
+    /// entirely of them ran to completion with `completed_items` still at the
+    /// zero the row was created with — `0/N` at 0%, the same "stuck at 0%" the
+    /// reporter saw from the other side of the fraction, and the reason a
+    /// dry run reported nothing (#3378). Every exit from `process_job`
+    /// publishes once more so the row matches the run.
+    ///
+    /// The totals go out first: a reader landing between the two writes then
+    /// sees a denominator that is too large rather than a numerator that is,
+    /// so the fraction can only understate, never read past full.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_job_counters(
+        &self,
+        job_id: Uuid,
+        discovered: i32,
+        discovered_bytes: i64,
+        completed: i32,
+        failed: i32,
+        skipped: i32,
+        transferred: i64,
+    ) -> Result<(), MigrationError> {
+        self.migration_service
+            .update_job_totals(job_id, discovered, discovered_bytes)
+            .await?;
+        self.migration_service
+            .update_job_progress(job_id, completed, failed, skipped, transferred)
+            .await
+    }
+
+    /// Stop the run because the operator paused or cancelled it.
+    ///
+    /// The three places that observe an interruption — the repository loop's
+    /// own check, the per-artifact check inside
+    /// `process_repository_artifacts` (via `RepoProcessOutcome::Interrupted`,
+    /// issue #3380) and a fired cancellation token — all end the same way, so
+    /// they share this exit. Publishing first matters here for the same reason
+    /// it matters at the end of a clean run: a run whose last items were skips
+    /// or dry-run reports never reached the per-artifact flush, and a job the
+    /// operator can resume should not show fewer items done than were done.
+    #[allow(clippy::too_many_arguments)]
+    async fn halt_on_interrupt(
+        &self,
+        job_id: Uuid,
+        discovered: i32,
+        discovered_bytes: i64,
+        completed: i32,
+        failed: i32,
+        skipped: i32,
+        transferred: i64,
+    ) -> Result<(), MigrationError> {
+        self.flush_job_counters(
+            job_id,
+            discovered,
+            discovered_bytes,
+            completed,
+            failed,
+            skipped,
+            transferred,
+        )
+        .await?;
+
+        if self.cancel_token.is_cancelled() {
+            tracing::info!(job_id = %job_id, "Migration cancelled by user");
+            self.migration_service
+                .update_job_status(job_id, MigrationJobStatus::Cancelled)
+                .await?;
+        } else {
+            tracing::info!(job_id = %job_id, "Migration paused by user");
+        }
 
         Ok(())
     }
@@ -5452,22 +5549,19 @@ mod tests {
         }
     }
 
-    /// Seed a source connection + single-repo job, run it through
-    /// `process_job` against an [`InterruptingSource`], and return the job's
-    /// `(status, finished_at IS NOT NULL)` after the worker returns. Cleans
-    /// up the provisioned repository row; the job and connection are the
-    /// caller's to delete once done asserting.
-    async fn run_single_repo_job(
-        pool: &sqlx::PgPool,
-        prefix: &str,
-        interrupt: MockInterrupt,
-    ) -> (Uuid, Uuid, String, bool) {
+    /// Seed a source connection and a single-repository migration job, and
+    /// return `(repo_key, conn_id, job_id)`.
+    ///
+    /// Shared by the #3380 interruption fixtures and the #3378 progress
+    /// fixtures below so both start from the same row: a job whose counters
+    /// and totals are all at the zero the schema defaults them to.
+    async fn seed_single_repo_job(pool: &sqlx::PgPool, prefix: &str) -> (String, Uuid, Uuid) {
         let repo_key = format!("{prefix}-{}", Uuid::new_v4().simple());
         let conn_id: Uuid = sqlx::query_scalar(
             "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
              VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
         )
-        .bind(format!("interrupt-conn-{}", Uuid::new_v4()))
+        .bind(format!("{prefix}-conn-{}", Uuid::new_v4()))
         .bind(vec![1u8, 2, 3])
         .fetch_one(pool)
         .await
@@ -5481,6 +5575,20 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("seed migration job");
+        (repo_key, conn_id, job_id)
+    }
+
+    /// Seed a single-repo job, run it through `process_job` against an
+    /// [`InterruptingSource`], and return the job's
+    /// `(status, finished_at IS NOT NULL)` after the worker returns. Cleans
+    /// up the provisioned repository row; the job and connection are the
+    /// caller's to delete once done asserting.
+    async fn run_single_repo_job(
+        pool: &sqlx::PgPool,
+        prefix: &str,
+        interrupt: MockInterrupt,
+    ) -> (Uuid, Uuid, String, bool) {
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(pool, prefix).await;
 
         let staging = tempfile::tempdir().expect("tempdir");
         let registry = Arc::new(StorageRegistry::new(
@@ -5655,6 +5763,250 @@ mod tests {
         cleanup_single_repo_job(&pool, job_id, conn_id).await;
     }
 
+    // -----------------------------------------------------------------------
+    // #3378: the job row carries a real denominator AND a real numerator
+    // (DB-gated via try_pool)
+    // -----------------------------------------------------------------------
+
+    /// The `migration_jobs` columns both progress readers divide.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct JobCounters {
+        total_items: i32,
+        total_bytes: i64,
+        completed_items: i32,
+        failed_items: i32,
+        skipped_items: i32,
+    }
+
+    impl JobCounters {
+        /// What `GET /migration/jobs/{id}` and the SSE stream would show for
+        /// a job in `status` holding these counters.
+        fn reported_percent(&self, status: &str) -> f64 {
+            crate::models::migration::reported_progress_percent(
+                status,
+                self.total_items,
+                self.completed_items,
+                self.failed_items,
+                self.skipped_items,
+            )
+        }
+    }
+
+    async fn read_job_counters(pool: &sqlx::PgPool, job_id: Uuid) -> JobCounters {
+        let row: (i32, i64, i32, i32, i32) = sqlx::query_as(
+            "SELECT total_items, total_bytes, completed_items, failed_items, skipped_items \
+             FROM migration_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("read job counters");
+        JobCounters {
+            total_items: row.0,
+            total_bytes: row.1,
+            completed_items: row.2,
+            failed_items: row.3,
+            skipped_items: row.4,
+        }
+    }
+
+    async fn read_job_status(pool: &sqlx::PgPool, job_id: Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("read job status")
+    }
+
+    /// Mock source that enumerates a fixed artifact list one page at a time
+    /// and samples the job row as it goes, so a test can assert on what a
+    /// client polling mid-run would have been shown rather than only on the
+    /// row the run leaves behind.
+    struct EnumeratingSource {
+        pool: sqlx::PgPool,
+        job_id: Uuid,
+        repo_key: String,
+        /// `(name, size)` for every artifact the source advertises.
+        artifacts: Vec<(String, i64)>,
+        /// Sampled on the first listing call, before this run has published
+        /// anything of its own.
+        at_first_listing: Arc<std::sync::Mutex<Option<JobCounters>>>,
+        /// Sampled on the way in to the second page, once the first page has
+        /// been fully accounted for.
+        before_second_page: Arc<std::sync::Mutex<Option<JobCounters>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::source_registry::SourceRegistry for EnumeratingSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!("not called by process_job")
+        }
+        async fn list_repositories(
+            &self,
+        ) -> Result<
+            Vec<crate::services::artifactory_client::RepositoryListItem>,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(vec![mk_source_repo(&self.repo_key, "LOCAL", "Generic")])
+        }
+        async fn list_artifacts(
+            &self,
+            repo_key: &str,
+            offset: i64,
+            limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            use crate::services::artifactory_client::{AqlRange, AqlResponse, AqlResult};
+
+            let sampled = read_job_counters(&self.pool, self.job_id).await;
+            let slot = if offset == 0 {
+                &self.at_first_listing
+            } else {
+                &self.before_second_page
+            };
+            {
+                let mut guard = slot.lock().expect("sample slot");
+                if guard.is_none() {
+                    *guard = Some(sampled);
+                }
+            }
+
+            let start = (offset.max(0) as usize).min(self.artifacts.len());
+            let end = start
+                .saturating_add(limit.max(0) as usize)
+                .min(self.artifacts.len());
+            let results: Vec<AqlResult> = self.artifacts[start..end]
+                .iter()
+                .map(|(name, size)| AqlResult {
+                    repo: repo_key.to_string(),
+                    path: "pkg/1.0".into(),
+                    name: name.clone(),
+                    size: Some(*size),
+                    created: None,
+                    modified: None,
+                    sha256: None,
+                    actual_sha1: None,
+                })
+                .collect();
+
+            Ok(AqlResponse {
+                range: AqlRange {
+                    start_pos: offset,
+                    end_pos: offset + limit,
+                    total: results.len() as i64,
+                },
+                results,
+            })
+        }
+        async fn download_artifact(
+            &self,
+            _repo_key: &str,
+            path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            // Bodies match the sizes advertised by the listing.
+            let name = extract_name_from_path(path);
+            let size = self
+                .artifacts
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, size)| *size)
+                .unwrap_or(0);
+            Ok(bytes::Bytes::from(vec![b'x'; size as usize]))
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::PropertiesResponse {
+                properties: None,
+                uri: None,
+            })
+        }
+        fn source_type(&self) -> &'static str {
+            "enumerating-mock"
+        }
+    }
+
+    /// The samples an [`EnumeratingSource`] collected during a run.
+    struct RunSamples {
+        at_first_listing: Option<JobCounters>,
+        before_second_page: Option<JobCounters>,
+    }
+
+    /// Run `job_id` to completion over `artifacts` and return what the job row
+    /// looked like at the two sampling points.
+    async fn run_enumerating_job(
+        pool: &sqlx::PgPool,
+        job_id: Uuid,
+        repo_key: &str,
+        artifacts: &[(&str, i64)],
+        config: WorkerConfig,
+    ) -> RunSamples {
+        let source = Arc::new(EnumeratingSource {
+            pool: pool.clone(),
+            job_id,
+            repo_key: repo_key.to_string(),
+            artifacts: artifacts
+                .iter()
+                .map(|(name, size)| ((*name).to_string(), *size))
+                .collect(),
+            at_first_listing: Arc::new(std::sync::Mutex::new(None)),
+            before_second_page: Arc::new(std::sync::Mutex::new(None)),
+        });
+
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let worker = MigrationWorker::new(pool.clone(), registry, config, CancellationToken::new());
+
+        worker
+            .process_job(job_id, source.clone(), ConflictResolution::Skip, None)
+            .await
+            .expect("migration job must not fail");
+
+        let at_first_listing = *source.at_first_listing.lock().expect("first sample");
+        let before_second_page = *source.before_second_page.lock().expect("second sample");
+        RunSamples {
+            at_first_listing,
+            before_second_page,
+        }
+    }
+
+    /// Create the destination repository row a non-dry run needs, backed by
+    /// `dir` so storage resolution succeeds, and return its id.
+    async fn seed_destination_repo(
+        pool: &sqlx::PgPool,
+        repo_key: &str,
+        dir: &std::path::Path,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $1, $2, 'local', 'generic'::repository_format, true) RETURNING id",
+        )
+        .bind(repo_key)
+        .bind(dir.to_str().expect("utf-8 tempdir"))
+        .fetch_one(pool)
+        .await
+        .expect("seed destination repository")
+    }
+
     /// A migration job is measured against the totals the worker enumerates,
     /// not against the zero its row was created with (issue #3378). The source
     /// pages, and the mock reads the job row on its way in to the second page,
@@ -5671,12 +6023,6 @@ mod tests {
     #[tokio::test]
     async fn test_process_job_publishes_discovered_totals_3378() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use crate::services::artifactory_client::{
-            AqlRange, AqlResponse, AqlResult, ArtifactoryError, PropertiesResponse,
-        };
-        use crate::services::source_registry::SourceRegistry;
-        use async_trait::async_trait;
-        use std::sync::{Arc, Mutex};
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -5687,213 +6033,354 @@ mod tests {
         const PAGE_ONE_BYTES: i64 = 4 + 8;
         const ALL_BYTES: i64 = PAGE_ONE_BYTES + 15;
 
-        fn mk_result(repo: &str, name: &str, size: i64) -> AqlResult {
-            AqlResult {
-                repo: repo.to_string(),
-                path: "pkg/1.0".into(),
-                name: name.into(),
-                size: Some(size),
-                created: None,
-                modified: None,
-                sha256: None,
-                actual_sha1: None,
-            }
-        }
-
-        struct PagedSource {
-            db: PgPool,
-            job_id: Uuid,
-            repo_key: String,
-            totals_before_second_page: Arc<Mutex<Option<(i32, i64)>>>,
-        }
-
-        #[async_trait]
-        impl SourceRegistry for PagedSource {
-            async fn ping(&self) -> Result<bool, ArtifactoryError> {
-                Ok(true)
-            }
-            async fn get_version(
-                &self,
-            ) -> Result<crate::services::artifactory_client::SystemVersionResponse, ArtifactoryError>
-            {
-                unimplemented!("not called by process_job")
-            }
-            async fn list_repositories(
-                &self,
-            ) -> Result<
-                Vec<crate::services::artifactory_client::RepositoryListItem>,
-                ArtifactoryError,
-            > {
-                Ok(vec![mk_source_repo(&self.repo_key, "LOCAL", "Generic")])
-            }
-            async fn list_artifacts(
-                &self,
-                repo_key: &str,
-                offset: i64,
-                limit: i64,
-            ) -> Result<AqlResponse, ArtifactoryError> {
-                if offset > 0 {
-                    // The first page is fully accounted for by now, so this is
-                    // the denominator the UI would be showing mid-run.
-                    let totals: (i32, i64) = sqlx::query_as(
-                        "SELECT total_items, total_bytes FROM migration_jobs WHERE id = $1",
-                    )
-                    .bind(self.job_id)
-                    .fetch_one(&self.db)
-                    .await
-                    .expect("read job totals between pages");
-                    *self.totals_before_second_page.lock().unwrap() = Some(totals);
-                }
-
-                let results = if offset == 0 {
-                    vec![
-                        mk_result(repo_key, "one.tar.gz", 4),
-                        mk_result(repo_key, "two.tar.gz", 8),
-                    ]
-                } else {
-                    vec![mk_result(repo_key, "three.tar.gz", 15)]
-                };
-                Ok(AqlResponse {
-                    range: AqlRange {
-                        start_pos: offset,
-                        end_pos: offset + limit,
-                        total: results.len() as i64,
-                    },
-                    results,
-                })
-            }
-            async fn download_artifact(
-                &self,
-                _repo_key: &str,
-                path: &str,
-            ) -> Result<bytes::Bytes, ArtifactoryError> {
-                // Bodies match the sizes advertised by the listing.
-                let size = match path {
-                    "pkg/1.0/one.tar.gz" => 4,
-                    "pkg/1.0/two.tar.gz" => 8,
-                    _ => 15,
-                };
-                Ok(bytes::Bytes::from(vec![b'x'; size]))
-            }
-            async fn get_properties(
-                &self,
-                _repo_key: &str,
-                _path: &str,
-            ) -> Result<PropertiesResponse, ArtifactoryError> {
-                Ok(PropertiesResponse {
-                    properties: None,
-                    uri: None,
-                })
-            }
-            fn source_type(&self) -> &'static str {
-                "paged-mock"
-            }
-        }
-
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "totals-3378").await;
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo_key = format!("totals-3378-{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO repositories (key, name, storage_path, repo_type, format, is_public) \
-             VALUES ($1, $1, $2, 'local', 'generic'::repository_format, true)",
-        )
-        .bind(&repo_key)
-        .bind(tmp.path().to_str().unwrap())
-        .execute(&pool)
-        .await
-        .expect("seed destination repository");
+        seed_destination_repo(&pool, &repo_key, tmp.path()).await;
 
-        let conn_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
-             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
-        )
-        .bind(format!("totals-conn-{}", Uuid::new_v4()))
-        .bind(vec![1u8, 2, 3])
-        .fetch_one(&pool)
-        .await
-        .expect("seed source connection");
-
-        let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
-             VALUES ($1, 'full', $2) RETURNING id",
-        )
-        .bind(conn_id)
-        .bind(serde_json::json!({ "include_repos": [&repo_key] }))
-        .fetch_one(&pool)
-        .await
-        .expect("seed migration job");
-
-        let registry = Arc::new(StorageRegistry::new(
-            std::collections::HashMap::new(),
-            "filesystem".to_string(),
-        ));
-        let worker = MigrationWorker::new(
-            pool.clone(),
-            registry,
+        let samples = run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8), ("three.tar.gz", 15)],
             WorkerConfig {
                 batch_size: 2,
                 throttle_delay_ms: 0,
                 ..WorkerConfig::default()
             },
-            CancellationToken::new(),
-        );
+        )
+        .await;
 
-        let totals_before_second_page = Arc::new(Mutex::new(None));
-        worker
-            .process_job(
-                job_id,
-                Arc::new(PagedSource {
-                    db: pool.clone(),
-                    job_id,
-                    repo_key: repo_key.clone(),
-                    totals_before_second_page: totals_before_second_page.clone(),
-                }),
-                ConflictResolution::Skip,
-                None,
-            )
-            .await
-            .expect("migration job must not fail");
-
-        let mid_run = totals_before_second_page
-            .lock()
-            .unwrap()
+        // The first page is fully accounted for by now, so this is the
+        // denominator the UI would be showing mid-run.
+        let mid_run = samples
+            .before_second_page
             .expect("the second page must have been requested");
         assert_eq!(
-            mid_run,
+            (mid_run.total_items, mid_run.total_bytes),
             (2, PAGE_ONE_BYTES),
             "the first page's totals must be published before the next page is fetched"
         );
 
-        let (total_items, total_bytes, completed, failed, skipped): (i32, i64, i32, i32, i32) =
-            sqlx::query_as(
-                "SELECT total_items, total_bytes, completed_items, failed_items, skipped_items \
-                 FROM migration_jobs WHERE id = $1",
-            )
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read finished job counters");
+        let finished = read_job_counters(&pool, job_id).await;
         assert_eq!(
-            (total_items, total_bytes),
+            (finished.total_items, finished.total_bytes),
             (3, ALL_BYTES),
             "every enumerated artifact must be counted toward the job's totals"
         );
-        assert_eq!((completed, failed, skipped), (3, 0, 0));
+        assert_eq!(
+            (
+                finished.completed_items,
+                finished.failed_items,
+                finished.skipped_items
+            ),
+            (3, 0, 0)
+        );
+        let status = read_job_status(&pool, job_id).await;
         assert!(
-            (crate::models::migration::progress_percent(total_items, completed, failed, skipped)
-                - 100.0)
-                .abs()
-                < f64::EPSILON,
-            "a finished job must report 100%, not 0% against a zero total"
+            (finished.reported_percent(&status) - 100.0).abs() < f64::EPSILON,
+            "a finished job must report 100%, not 0% against a zero total: \
+             {finished:?} in status {status}"
         );
 
-        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// Issue #3378 says the stall is also seen "for dry-run executions", and
+    /// publishing the totals alone does not fix that: a dry run reports every
+    /// artifact through the in-memory counters and `continue`s before the only
+    /// per-artifact `update_job_progress`, so the job row's numerator stays at
+    /// the zero it was created with. `N/0 at 0%` simply becomes `0/N at 0%`.
+    ///
+    /// Fails-before (with only the totals published): `completed_items` is 0
+    /// and the reported share is 0.0 on a job that reported three of three
+    /// artifacts as transferable.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_process_job_dry_run_reports_real_progress_3378() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "dryprog-3378").await;
+        // No destination repository on purpose: a dry run must not need one.
+
+        run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8), ("three.tar.gz", 15)],
+            WorkerConfig {
+                dry_run: true,
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let finished = read_job_counters(&pool, job_id).await;
+        let status = read_job_status(&pool, job_id).await;
+        assert_eq!(
+            (finished.total_items, finished.total_bytes),
+            (3, 27),
+            "a dry run still enumerates, so it still has a denominator"
+        );
+        assert_eq!(
+            finished.completed_items, 3,
+            "a dry run's 'would transfer' count must reach the job row, not just \
+             the in-memory counters: {finished:?}"
+        );
+        assert!(
+            (finished.reported_percent(&status) - 100.0).abs() < f64::EPSILON,
+            "a finished dry run must not report 0% against a full denominator: \
+             {finished:?} in status {status}"
+        );
+
+        let items: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM migration_items WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("item count");
+        assert_eq!(items, 0, "a dry run must still write no migration_items");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// The same gap on the duplicate arm: re-running a migration over content
+    /// that is already in the destination skips every artifact, and every skip
+    /// `continue`s before the per-artifact progress write. The delta run that
+    /// found nothing to do reported `0/N at 0%` (#3378).
+    ///
+    /// Fails-before (with only the totals published): `skipped_items` is 0 and
+    /// the reported share is 0.0 on a completed job.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_process_job_all_duplicates_reports_real_progress_3378() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "dupprog-3378").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id = seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        // Everything the source is about to list already exists in the
+        // destination, so `check_artifact_duplicate` skips all three.
+        for (index, name) in ["one.tar.gz", "two.tar.gz", "three.tar.gz"]
+            .into_iter()
+            .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, $3, 1, $4, 'application/octet-stream', $5)",
+            )
+            .bind(repo_id)
+            .bind(format!("pkg/1.0/{name}"))
+            .bind(name)
+            .bind(format!("{:064x}", index + 1))
+            .bind(format!("{repo_key}/pkg/1.0/{name}"))
+            .execute(&pool)
+            .await
+            .expect("seed pre-existing artifact");
+        }
+
+        run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8), ("three.tar.gz", 15)],
+            WorkerConfig {
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let finished = read_job_counters(&pool, job_id).await;
+        let status = read_job_status(&pool, job_id).await;
+        assert_eq!(
+            finished.total_items, 3,
+            "duplicates are enumerated, so they belong in the denominator"
+        );
+        assert_eq!(
+            finished.skipped_items, 3,
+            "an all-duplicate run's skips must reach the job row, not just the \
+             in-memory counters: {finished:?}"
+        );
+        assert!(
+            (finished.reported_percent(&status) - 100.0).abs() < f64::EPSILON,
+            "a run that found nothing left to do is finished, not 0%: \
+             {finished:?} in status {status}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// The third skip arm: an item an earlier pass of the SAME job already
+    /// completed. `is_item_already_completed` counts it and `continue`s before
+    /// the per-artifact progress write, so a resumed run that finds every item
+    /// already done reported `0/N` at 0% for the same reason a dry run did
+    /// (#3378).
+    ///
+    /// Fails-before (with only the totals published): `skipped_items` is 0 and
+    /// the reported share is 0.0 on a completed job.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_process_job_all_items_already_completed_reports_real_progress_3378() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "doneprog-3378").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        // The rows an earlier pass of this job left behind. Nothing else about
+        // the destination changes, so the duplicate check cannot be what skips.
+        for name in ["one.tar.gz", "two.tar.gz", "three.tar.gz"] {
+            sqlx::query(
+                "INSERT INTO migration_items (job_id, item_type, source_path, status) \
+                 VALUES ($1, 'artifact', $2, 'completed')",
+            )
             .bind(job_id)
+            .bind(format!("{repo_key}/pkg/1.0/{name}"))
+            .execute(&pool)
+            .await
+            .expect("seed completed migration item");
+        }
+
+        run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8), ("three.tar.gz", 15)],
+            WorkerConfig {
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let finished = read_job_counters(&pool, job_id).await;
+        let status = read_job_status(&pool, job_id).await;
+        assert_eq!(
+            finished.total_items, 3,
+            "already-completed items are enumerated, so they belong in the denominator"
+        );
+        assert_eq!(
+            finished.skipped_items, 3,
+            "a resumed run whose items were all already done must say so on the \
+             job row, not just in the in-memory counters: {finished:?}"
+        );
+        assert!(
+            (finished.reported_percent(&status) - 100.0).abs() < f64::EPSILON,
+            "a resumed run with nothing left to do is finished, not 0%: \
+             {finished:?} in status {status}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
             .execute(&pool)
             .await;
-        let _ = sqlx::query("DELETE FROM source_connections WHERE id = $1")
-            .bind(conn_id)
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A resumed run must not republish #3378's own symptom on its way back
+    /// up. `process_job` used to clear the totals to `(0, 0)` before the first
+    /// source listing, while the row still carried the `completed_items` of
+    /// the pass that was paused — so every resume showed a literal
+    /// "73/0 items, 0%" for as long as the first page fetch took, which under
+    /// #3380's now-reachable pause/resume is the normal path rather than a
+    /// corner.
+    ///
+    /// Fails-before: the sample taken on the first listing call reads
+    /// `(0, 0)` with a non-zero numerator.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_process_job_resume_does_not_republish_a_zero_denominator_3378() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "resume-3378").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        // The row an interrupted pass leaves behind: a denominator from the
+        // work it enumerated and a numerator from the work it did.
+        sqlx::query(
+            "UPDATE migration_jobs \
+             SET total_items = 1500, total_bytes = 15000, completed_items = 73 WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("stage a paused job row");
+
+        let samples = run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8)],
+            WorkerConfig {
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let on_resume = samples
+            .at_first_listing
+            .expect("the source must have been listed");
+        assert_eq!(
+            on_resume.completed_items, 73,
+            "the fixture's numerator must survive to the sampling point"
+        );
+        assert_ne!(
+            on_resume.total_items, 0,
+            "a resume must not republish a zero denominator against work already \
+             done — that is exactly the '73/0 items, 0%' of #3378: {on_resume:?}"
+        );
+        assert_eq!(
+            (on_resume.total_items, on_resume.total_bytes),
+            (1500, 15000),
+            "until this run has enumerated a page, the previous figures stand"
+        );
+
+        // And the run still ends owning the totals: the stale 1500 is gone.
+        let finished = read_job_counters(&pool, job_id).await;
+        assert_eq!(
+            (finished.total_items, finished.total_bytes),
+            (2, 12),
+            "the run must overwrite the totals it inherited: {finished:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
             .execute(&pool)
             .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
     }
 
     #[test]
