@@ -758,6 +758,45 @@ impl MigrationService {
         Ok(())
     }
 
+    /// Update the totals a job is measured against
+    ///
+    /// The worker calls this as it enumerates the source, so `total_items`
+    /// tracks what has actually been discovered instead of staying at the zero
+    /// the row was created with, which left every job reporting `N/0` and 0%
+    /// (#3378). The values are written absolutely rather than accumulated:
+    /// a resumed or re-run job enumerates from the first page again, so
+    /// rebuilding the totals is correct and adding to them would double count.
+    ///
+    /// The write is guarded the same way `finalize_job_status` is. A page
+    /// listing already in flight when the operator pauses or cancels lands
+    /// after the row has left `running`, and while this statement never
+    /// touches `status` — so it cannot revive a stopped job — an ungated
+    /// write left a dead job advertising a denominator covering work it
+    /// never processed (`cancelled`, `1000/2000`, 50%). Returns whether the
+    /// totals were published.
+    pub async fn update_job_totals(
+        &self,
+        job_id: Uuid,
+        total_items: i32,
+        total_bytes: i64,
+    ) -> Result<bool, MigrationError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE migration_jobs
+            SET total_items = $1,
+                total_bytes = $2
+            WHERE id = $3 AND status NOT IN ('paused', 'cancelled')
+            "#,
+        )
+        .bind(total_items)
+        .bind(total_bytes)
+        .bind(job_id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Add migration items for a job
     pub async fn add_migration_items(
         &self,
@@ -1350,6 +1389,16 @@ impl MigrationService {
     }
 
     /// Save assessment result to database
+    ///
+    /// The totals written here are the assessment's pre-run estimate and hold
+    /// only until the job runs: the worker republishes what it enumerates as
+    /// it goes and once more when the run ends (see `update_job_totals`), so
+    /// a repository whose real content differs from the assessment does not
+    /// leave a stale denominator behind. The estimate is overwritten rather
+    /// than cleared up front, so the row never shows a zero denominator
+    /// against a non-zero numerator while the first page is being fetched
+    /// (#3378). The estimate itself survives in `config.assessment`, which is
+    /// what `GET /assessment` reads.
     pub async fn save_assessment(
         &self,
         job_id: Uuid,
@@ -3031,5 +3080,97 @@ mod tests {
         assert!(deserialized.repositories.is_empty());
         assert_eq!(deserialized.blockers.len(), 1);
         assert_eq!(deserialized.warnings.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // update_job_totals — the same terminal-state guard finalize_job_status has
+    // -----------------------------------------------------------------------
+
+    /// A page listing already in flight when the operator stops the job lands
+    /// after the row has left `running`. `update_job_totals` never touches
+    /// `status`, so it cannot revive a stopped job, but without a guard it
+    /// leaves a dead job advertising a denominator covering work it never
+    /// processed — `cancelled, 1000/2000, 50%`. `finalize_job_status` has
+    /// carried this guard since #3380; the totals write needs the same one.
+    ///
+    /// Fails-before: the ungated `UPDATE ... WHERE id = $1` writes the totals
+    /// to both stopped rows and reports success.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_update_job_totals_does_not_write_to_a_stopped_job_3378() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let svc = MigrationService::new(pool.clone());
+
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("totals-guard-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed source connection");
+
+        let mut job_ids = Vec::new();
+        for status in ["paused", "cancelled", "running"] {
+            let job_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO migration_jobs (source_connection_id, job_type, config, status) \
+                 VALUES ($1, 'full', '{}'::jsonb, $2) RETURNING id",
+            )
+            .bind(conn_id)
+            .bind(status)
+            .fetch_one(&pool)
+            .await
+            .expect("seed migration job");
+            job_ids.push((status, job_id));
+
+            let published = svc
+                .update_job_totals(job_id, 2000, 20_000)
+                .await
+                .expect("update_job_totals must not error");
+
+            let (total_items, total_bytes, row_status): (i32, i64, String) = sqlx::query_as(
+                "SELECT total_items, total_bytes, status FROM migration_jobs WHERE id = $1",
+            )
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read job row");
+
+            if status == "running" {
+                // Positive control: the guard must not block the normal path.
+                assert!(published, "a running job's totals must still be published");
+                assert_eq!((total_items, total_bytes), (2000, 20_000));
+            } else {
+                assert!(
+                    !published,
+                    "{status}: update_job_totals must report that it published nothing"
+                );
+                assert_eq!(
+                    (total_items, total_bytes),
+                    (0, 0),
+                    "{status}: a stopped job must not be given a denominator it never processed"
+                );
+            }
+            // The write never touches `status` either way.
+            assert_eq!(row_status, status);
+        }
+
+        for (_, job_id) in job_ids {
+            let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+                .bind(job_id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await;
     }
 }

@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::models::migration::MigrationConfig;
+use crate::models::migration::{is_terminal_status, reported_progress_percent, MigrationConfig};
 use crate::services::artifactory_client::{
     ArtifactoryAuth, ArtifactoryClient, ArtifactoryClientConfig,
 };
@@ -337,13 +337,13 @@ pub struct MigrationJobResponse {
 
 impl From<MigrationJobRow> for MigrationJobResponse {
     fn from(row: MigrationJobRow) -> Self {
-        let total = row.total_items;
-        let done = row.completed_items + row.failed_items + row.skipped_items;
-        let progress = if total > 0 {
-            done as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        };
+        let progress = reported_progress_percent(
+            &row.status,
+            row.total_items,
+            row.completed_items,
+            row.failed_items,
+            row.skipped_items,
+        );
 
         Self {
             id: row.id,
@@ -1471,8 +1471,6 @@ async fn stream_migration_progress(
         // Send initial connection event
         yield Ok(Event::default().event("connected").data(format!(r#"{{"job_id":"{}"}}"#, id)));
 
-        let terminal_statuses = ["completed", "completed_with_errors", "failed", "cancelled"];
-
         loop {
             // Fetch current progress
             let result: Option<(String, i32, i32, i32, i32, i64, i64)> = sqlx::query_as(
@@ -1492,12 +1490,8 @@ async fn stream_migration_progress(
             match result {
                 Some((status, total, completed, failed, skipped, total_bytes, transferred)) => {
                     // Calculate progress
-                    let done = completed + failed + skipped;
-                    let progress = if total > 0 {
-                        done as f64 / total as f64 * 100.0
-                    } else {
-                        0.0
-                    };
+                    let progress =
+                        reported_progress_percent(&status, total, completed, failed, skipped);
 
                     // Create progress event
                     let event_data = serde_json::json!({
@@ -1514,8 +1508,10 @@ async fn stream_migration_progress(
 
                     yield Ok(Event::default().event("progress").data(event_data.to_string()));
 
-                    // Check if job is finished
-                    if terminal_statuses.contains(&status.as_str()) {
+                    // Check if job is finished. Same predicate the reported
+                    // percentage uses, so the stream cannot stop polling at a
+                    // status the percentage still treats as in progress.
+                    if is_terminal_status(&status) {
                         yield Ok(Event::default().event("complete").data(event_data.to_string()));
                         break;
                     }
@@ -1601,16 +1597,6 @@ async fn list_migration_items(
             total_pages: (total.0 + per_page - 1) / per_page,
         }),
     }))
-}
-
-/// Terminal migration job states, i.e. those where the job has stopped and an
-/// audit report is meaningful. Mirrors the terminal set used by the progress
-/// stream loop.
-fn is_terminal_status(status: &str) -> bool {
-    matches!(
-        status,
-        "completed" | "completed_with_errors" | "failed" | "cancelled"
-    )
 }
 
 /// Fetch the persisted report row for a job, if one exists.
