@@ -1648,8 +1648,20 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
     // token-channel read. Skip the `t/<TOKEN>` pair for conda token URLs so the
     // actual repository key is returned.
     if format == "conda" && segments.clone().next() == Some("t") {
-        segments.next(); // "t"
-        segments.next(); // "<TOKEN>"
+        // Only a real token channel carries the repository key AFTER the
+        // credential (`/conda/t/<TOKEN>/<repo_key>/...`). A two-segment
+        // `/conda/t/<route>` — `/conda/t/upload`, `/conda/t/channeldata.json`,
+        // `/conda/t/notices.json` — is the PLAIN conda router serving a
+        // repository whose key is literally `t`, and skipping the pair there
+        // yields an empty key for a request that does name a repository.
+        // Only skip when a segment actually follows the token.
+        let mut after_token = segments.clone();
+        after_token.next(); // "t"
+        after_token.next(); // "<TOKEN>"
+        if after_token.next().is_some() {
+            segments.next(); // "t"
+            segments.next(); // "<TOKEN>"
+        }
     }
     // WASM plugin proxy routes are nested as
     //   /ext/<format_key>/<repo_key>/...
@@ -1707,10 +1719,19 @@ pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     if segments.next()? != "t" {
         return None;
     }
-    match segments.next() {
-        Some(token) if !token.is_empty() => Some(token),
-        _ => None,
-    }
+    let token = match segments.next() {
+        Some(token) if !token.is_empty() => token,
+        _ => return None,
+    };
+    // A token channel carries the repository key AFTER the credential
+    // (`/conda/t/<TOKEN>/<repo_key>/...`). With nothing after it, the path is
+    // the plain conda route for a repository whose key is literally `t`
+    // (`/conda/t/upload`, `/conda/t/channeldata.json`) and that route segment
+    // is not a credential — treating it as one made an anonymous read of such
+    // a repository fail with 401 for an *invalid credential* it never sent.
+    // Same shape test `extract_repo_key` applies to the matching skip.
+    segments.next()?;
+    Some(token)
 }
 
 /// Is `path` the NuGet package-push route (`/nuget/<repo_key>/api/v2/package`)?
@@ -2096,19 +2117,36 @@ pub async fn repo_visibility_middleware(
     let repo_key = extract_repo_key(&path);
 
     if repo_key.is_empty() {
-        // No repository key to authorize, but the handler this falls through
-        // to still binds `Extension<Option<AuthExtension>>`, and axum answers
-        // a missing extension with a 500 that prints the extension's type
-        // path. Every format route reaches this branch when its `:repo_key`
-        // segment is empty (`/npm//pkg`, `/maven//`, `/api/cargo//ve/ri/x`),
-        // so the anonymous, unauthenticated 500 was reachable on all of them.
-        // Insert the anonymous value the middleware would have inserted below
-        // so the handler runs and answers 401/404 on its own terms. This
-        // grants nothing: `None` is exactly what an unauthenticated caller
-        // gets on the normal path, and every handler that reads the extension
-        // re-derives its own decision from it.
-        request.extensions_mut().insert(None::<AuthExtension>);
-        return next.run(request).await;
+        // An empty `:repo_key` segment names no repository: repository keys are
+        // non-empty by construction, so no row can ever match and no format
+        // route can serve anything here. Every format route reaches this branch
+        // when its key segment is empty (`/npm//pkg`, `/maven//`,
+        // `/pypi//simple/`, `/api/cargo//ve/ri/x`).
+        //
+        // Answer the existence-hiding 404 directly instead of running the
+        // handler. Two properties depend on not falling through:
+        //
+        // 1. No unauthenticated 500. The handler binds
+        //    `Extension<Option<AuthExtension>>`, and axum answers a missing
+        //    extension with a 500 that prints the extension's type path (#3443
+        //    / #3444). Never invoking the handler closes that without having to
+        //    inject an extension for it.
+        //
+        // 2. No request body is read for a caller this middleware has not
+        //    authorized. `next.run` hands the request to the handler, whose
+        //    extractors run in order, so a body extractor (`Bytes`, `Multipart`,
+        //    ...) buffers the WHOLE upload before the handler's own auth check
+        //    can reject it. Falling through therefore gave an anonymous caller a
+        //    `MAX_UPLOAD_SIZE`-per-request (10 GiB default) heap allocation on
+        //    every format prefix, with no credential and no repository — the
+        //    write gate below, which would have refused it, sits after this
+        //    branch. Returning here rejects before the body is touched.
+        //
+        // The empty key carries no information about which repositories exist,
+        // so a flat 404 leaks nothing (contrast the non-empty no-repo branch
+        // below, which mirrors the private-repo 401 to close the #1808
+        // existence oracle).
+        return not_found_response();
     }
 
     // Check the shared repo cache first to avoid a DB round-trip on every
@@ -3676,7 +3714,30 @@ mod tests {
         );
         // A conda channel that merely happens to be named "t" (no token
         // segment shape) still resolves to that key when addressed plainly.
-        assert_eq!(extract_repo_key("/conda/t"), "");
+        assert_eq!(extract_repo_key("/conda/t"), "t");
+    }
+
+    #[test]
+    fn test_extract_repo_key_conda_t_route_is_not_a_token_channel() {
+        // `/conda/t/<TOKEN>/<repo_key>/...` is a token channel; `/conda/t/x` is
+        // the PLAIN conda router serving a repository whose key is literally
+        // `t` (`/conda/<repo_key>/upload`, `/conda/<repo_key>/notices.json`).
+        // Skipping the `t/<TOKEN>` pair on those two-segment paths returned an
+        // EMPTY key for a request that does name a repository, so the
+        // repository never got a visibility, token-scope or write-gate check
+        // and the caller's credential was replaced with the anonymous value.
+        // The token skip applies only when a segment follows the token.
+        assert_eq!(extract_repo_key("/conda/t/upload"), "t");
+        assert_eq!(extract_repo_key("/conda/t/channeldata.json"), "t");
+        assert_eq!(extract_repo_key("/conda/t/notices.json"), "t");
+        // Three or more segments: unchanged token-channel behaviour.
+        assert_eq!(extract_repo_key("/conda/t/tok/my-channel"), "my-channel");
+        assert_eq!(
+            extract_repo_key("/conda/t/tok/my-channel/noarch/repodata.json"),
+            "my-channel"
+        );
+        // An empty repo-key segment inside a token channel stays empty.
+        assert_eq!(extract_repo_key("/conda/t/tok//noarch/repodata.json"), "");
     }
 
     #[test]
@@ -3816,6 +3877,16 @@ mod tests {
         // Empty token segment is not a credential.
         assert_eq!(extract_conda_url_token("/conda/t//my-channel"), None);
         assert_eq!(extract_conda_url_token("/conda/t"), None);
+        // Two-segment `/conda/t/<route>` is the plain conda router serving a
+        // repository keyed `t`, not a token channel: the route segment is not
+        // a credential. (`extract_repo_key` resolves the same paths to `t`.)
+        assert_eq!(extract_conda_url_token("/conda/t/upload"), None);
+        assert_eq!(extract_conda_url_token("/conda/t/channeldata.json"), None);
+        // A repo key after the token is what makes it a token channel.
+        assert_eq!(
+            extract_conda_url_token("/conda/t/abc123token/my-channel"),
+            Some("abc123token")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6611,12 +6682,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_repo_visibility_pass_through_when_no_repo_key() {
+    async fn test_repo_visibility_no_repo_key_is_not_found() {
         // A path with no repo segment short-circuits at the empty-key check,
-        // before the cache is touched. Hitting `/` for example.
+        // before the cache is touched. It names no repository, so it is
+        // answered with the existence-hiding 404 and the handler never runs.
         let state = make_vis_state(None).await;
         let resp = run_through_visibility(state, empty_get("/")).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -7159,48 +7231,287 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_repo_visibility_empty_key_still_provides_auth_extension() {
-        // An empty `:repo_key` segment (`/npm//pkg`, `/api/cargo//ve/ri/x`)
-        // leaves nothing to authorize, so the middleware falls through — but
-        // the handler behind it still binds `Extension<Option<AuthExtension>>`,
-        // and axum answers a missing extension with a 500 whose body prints
-        // the extension's type path. The fall-through therefore has to insert
-        // the anonymous value it would otherwise have inserted further down.
+    /// Every format prefix, addressed with an EMPTY `:repo_key` segment. Used
+    /// by both empty-key regression tests below so the two axes (#3443's 500
+    /// and the body-buffering primitive) are proven over the same surface.
+    ///
+    /// `/conda/t/upload` is deliberately included: it is a SINGLE-slash path,
+    /// so a reverse proxy that collapses `//` does not filter it. It is also
+    /// the one entry here whose second segment is NOT empty — it addresses a
+    /// repository whose key is literally `t` (see
+    /// `test_extract_repo_key_conda_t_route_is_not_a_token_channel`), so it is
+    /// answered by the no-repo branch with the #1808 401 challenge rather than
+    /// by the empty-key branch. Either way the body is never read, which is
+    /// what the third column pins.
+    const EMPTY_REPO_KEY_PROBES: &[(Method, &str, StatusCode)] = &[
+        (Method::PUT, "/npm//pkg", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/maven//com/x/1.0/x-1.0.jar",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/pypi//", StatusCode::NOT_FOUND),
+        (Method::POST, "/debian//upload", StatusCode::NOT_FOUND),
+        (Method::PUT, "/nuget//api/v2/package", StatusCode::NOT_FOUND),
+        (Method::POST, "/rpm//upload", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/cargo//api/v1/crates/new",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/api/cargo//api/v1/crates/new",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/gems//api/v1/gems", StatusCode::NOT_FOUND),
+        (Method::PUT, "/lfs//objects/deadbeef", StatusCode::NOT_FOUND),
+        (
+            Method::POST,
+            "/pub//api/packages/versions/newUpload",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::PUT, "/go//x", StatusCode::NOT_FOUND),
+        (Method::POST, "/helm//api/charts", StatusCode::NOT_FOUND),
+        (Method::POST, "/api/helm//charts", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/composer//api/packages",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/conan//v2/conans/n/v/u/c/revisions/r/files/f",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/alpine//upload", StatusCode::NOT_FOUND),
+        (Method::POST, "/conda//upload", StatusCode::NOT_FOUND),
+        (Method::POST, "/conda/t/upload", StatusCode::UNAUTHORIZED),
+        (
+            Method::PUT,
+            "/swift//scope/name/1.0.0",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/terraform//v1/modules/ns/n/p/1.0.0",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/cocoapods//pods", StatusCode::NOT_FOUND),
+        (Method::POST, "/hex//publish", StatusCode::NOT_FOUND),
+        (
+            Method::POST,
+            "/huggingface//api/models/m/upload/main",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/jetbrains//plugin/uploadPlugin",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/chef//api/v1/cookbooks",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/puppet//v3/releases", StatusCode::NOT_FOUND),
+        (
+            Method::POST,
+            "/ansible//api/v3/artifacts/collections/",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/cran//src/contrib/f.tar.gz",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::PUT, "/ivy//x/y.jar", StatusCode::NOT_FOUND),
+        (
+            Method::POST,
+            "/vscode//api/extensions",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/proto//buf.registry.module.v1beta1.UploadService/Upload",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/incus//images/p/v/f/uploads",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/lxc//images/p/v/f/uploads",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::PUT, "/ext/wasmfmt//x", StatusCode::NOT_FOUND),
+        (Method::GET, "/general//x", StatusCode::NOT_FOUND),
+    ];
+
+    /// A request body that records whether anything ever polled it.
+    ///
+    /// The generator does not run until the stream is first polled, so the flag
+    /// answers exactly one question: did anything downstream of the middleware
+    /// start reading the request body?
+    fn tripwire_body(read_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> axum::body::Body {
+        use std::sync::atomic::Ordering;
+        axum::body::Body::from_stream(async_stream::stream! {
+            read_flag.store(true, Ordering::SeqCst);
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[0u8; 4096]));
+        })
+    }
+
+    /// Run `request` through the real middleware in front of a handler that
+    /// binds the two extractors every format upload handler binds: the strict
+    /// `Extension<Option<AuthExtension>>` and a body extractor.
+    async fn run_through_visibility_body_probe(
+        state: RepoVisibilityState,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> (StatusCode, String) {
         use axum::{middleware, routing::any, Extension, Router};
         use tower::ServiceExt;
 
-        // A handler with the strict extractor every format handler uses.
         async fn probe(
             Extension(auth): Extension<Option<AuthExtension>>,
-        ) -> (StatusCode, &'static str) {
-            assert!(auth.is_none(), "an anonymous request must arrive as None");
-            (StatusCode::OK, "handler-reached")
+            body: bytes::Bytes,
+        ) -> (StatusCode, String) {
+            let _ = auth;
+            (StatusCode::OK, format!("handler-read-{}-bytes", body.len()))
         }
 
-        for uri in [
-            "/npm//pkg",
-            "/pypi//simple/",
-            "/maven//",
-            "/api/cargo//ve/ri/verifycrate",
-            "/api/helm//charts",
-        ] {
+        let app: Router = Router::new()
+            .fallback(any(probe))
+            .layer(middleware::from_fn_with_state(
+                state,
+                repo_visibility_middleware,
+            ));
+        let resp = app.oneshot(request).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_empty_key_never_leaks_a_500() {
+        // Axis 1 (#3443/#3444): an empty `:repo_key` segment must never produce
+        // an unauthenticated 500. Every format handler binds
+        // `Extension<Option<AuthExtension>>`, and axum answers a missing
+        // extension with a 500 whose body prints the extension's type path.
+        // The middleware closes that by answering the request itself, so the
+        // handler — and its strict extractor — never runs.
+        for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
             let state = make_vis_state(None).await;
-            let app: Router =
-                Router::new()
-                    .fallback(any(probe))
-                    .layer(middleware::from_fn_with_state(
-                        state,
-                        repo_visibility_middleware,
-                    ));
-            let resp = app.oneshot(empty_get(uri)).await.unwrap();
+            let req = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(*uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, body) = run_through_visibility_body_probe(state, req).await;
+            assert_ne!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {uri} answered 500: {body}"
+            );
+            assert!(
+                !body.contains("Missing request extension"),
+                "{method} {uri} leaked the extension type path: {body}"
+            );
             assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{uri} must reach the handler with an auth extension present, \
-                 not fail with a 500 for a missing extension"
+                status, *expected,
+                "{method} {uri} must be refused by the middleware itself"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_empty_key_does_not_read_the_request_body() {
+        // Axis 2: an anonymous, unauthorized request with an empty `:repo_key`
+        // must be refused BEFORE its body is read.
+        //
+        // The middleware used to insert an anonymous extension and fall through
+        // to the handler. Handler extractors then ran in order, so a body
+        // extractor buffered the ENTIRE upload into memory before the handler's
+        // own auth check could reject it — an unauthenticated allocation of up
+        // to `MAX_UPLOAD_SIZE` (10 GiB default) per request, on every format
+        // prefix, multiplied by `GLOBAL_MAX_CONCURRENCY`. The #508 write gate
+        // that would have refused it sits AFTER this branch.
+        //
+        // The tripwire body flips its flag on the first poll, so this asserts
+        // the property directly rather than by proxy: nothing read the body.
+        for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
+            let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let state = make_vis_state(None).await;
+            let req = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(*uri)
+                .header("Content-Type", "application/octet-stream")
+                .body(tripwire_body(read.clone()))
+                .unwrap();
+            let (status, body) = run_through_visibility_body_probe(state, req).await;
+            assert!(
+                !read.load(std::sync::atomic::Ordering::SeqCst),
+                "{method} {uri} read the request body of an unauthorized \
+                 anonymous request (status {status}, body {body})"
+            );
+            assert!(
+                !body.contains("handler-read"),
+                "{method} {uri} reached the handler: {body}"
+            );
+            assert_eq!(status, *expected, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_body_tripwire_flips_when_the_handler_is_reached() {
+        // Negative control for the two tests above: on a path the middleware
+        // DOES pass through (public repo, anonymous read), the same probe
+        // handler runs and reads the same tripwire body — so the flag flips.
+        // Without this, "the body was not read" could be an artifact of a
+        // tripwire that never flips at all.
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some(("myrepo".to_string(), cached))).await;
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/pypi/myrepo/simple/")
+            .body(tripwire_body(read.clone()))
+            .unwrap();
+        let (status, body) = run_through_visibility_body_probe(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(
+            body.contains("handler-read-4096-bytes"),
+            "the probe handler must have read the tripwire body, got {body}"
+        );
+        assert!(
+            read.load(std::sync::atomic::Ordering::SeqCst),
+            "the tripwire must flip when the body IS read"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_non_empty_key_write_gate_unchanged() {
+        // The empty-key change must not move any authorization outcome on a
+        // NON-empty key: an anonymous write to a public repository is still
+        // refused by the #508 gate with 401 (not the empty-key 404), and it is
+        // still refused before the body is read.
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some(("myrepo".to_string(), cached))).await;
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri("/npm/myrepo/pkg")
+            .body(tripwire_body(read.clone()))
+            .unwrap();
+        let (status, body) = run_through_visibility_body_probe(state, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+        assert!(
+            !read.load(std::sync::atomic::Ordering::SeqCst),
+            "the #508 write gate must reject before the body is read"
+        );
     }
 
     #[tokio::test]
