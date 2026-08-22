@@ -10,7 +10,7 @@ use crate::models::migration::{MigrationItemType, MigrationJobStatus};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::artifactory_client::ArtifactoryClient;
 use crate::services::migration_service::{
-    ConflictType, MigrationError, MigrationService, RepositoryType,
+    ConflictType, MigrationError, MigrationService, RepositoryType, SourceView,
 };
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::source_registry::SourceRegistry;
@@ -378,10 +378,20 @@ impl MigrationWorker {
             );
         }
 
-        // Update job status to running
-        self.migration_service
-            .update_job_status(job_id, MigrationJobStatus::Running)
-            .await?;
+        // Claim the job for this run. `start_migration` sets `running` and then
+        // spawns this task detached, so an operator cancel can land in between;
+        // an unguarded flip back to `running` here undid it, and the guarded
+        // finalize then had a `running` row in front of it and stamped the
+        // cancelled job `completed` (#3510). If the job was stopped first there
+        // is nothing to do — returning before the source is contacted also
+        // means a cancelled migration transfers no artifacts.
+        if !self.migration_service.claim_job_running(job_id).await? {
+            tracing::info!(
+                job_id = %job_id,
+                "Migration job was paused or cancelled before the worker started; not running it"
+            );
+            return Ok(());
+        }
 
         // The run owns the discovered totals from here on: they are rebuilt
         // page by page below and republished absolutely, and `flush_job_counters`
@@ -760,6 +770,9 @@ impl MigrationWorker {
 
         // Publish the run's counters before stamping a terminal status, so
         // the row a finished job leaves behind describes what the run did.
+        // This run enumerated the whole source and re-classified everything it
+        // found, so it is entitled to replace the row's figures outright — that
+        // is what corrects an assessment estimate the content never matched.
         self.flush_job_counters(
             job_id,
             total_discovered,
@@ -768,6 +781,7 @@ impl MigrationWorker {
             total_failed,
             total_skipped,
             total_transferred,
+            SourceView::Complete,
         )
         .await?;
 
@@ -838,13 +852,15 @@ impl MigrationWorker {
         failed: i32,
         skipped: i32,
         transferred: i64,
+        view: SourceView,
     ) -> Result<(), MigrationError> {
         self.migration_service
-            .update_job_totals(job_id, discovered, discovered_bytes)
+            .update_job_totals(job_id, discovered, discovered_bytes, view)
             .await?;
         self.migration_service
-            .update_job_progress(job_id, completed, failed, skipped, transferred)
-            .await
+            .update_job_progress(job_id, completed, failed, skipped, transferred, view)
+            .await?;
+        Ok(())
     }
 
     /// Stop the run because the operator paused or cancelled it.
@@ -868,6 +884,12 @@ impl MigrationWorker {
         skipped: i32,
         transferred: i64,
     ) -> Result<(), MigrationError> {
+        // A Partial view: the run stopped part-way through enumerating, so its
+        // counters describe less of the job than the row may already record.
+        // They may advance the row, never replace it — publishing them
+        // absolutely reset a resumed job's `completed_items` and
+        // `transferred_bytes` to zero while the transfers they described were
+        // still in `migration_items` and in the destination (#3510).
         self.flush_job_counters(
             job_id,
             discovered,
@@ -876,6 +898,7 @@ impl MigrationWorker {
             failed,
             skipped,
             transferred,
+            SourceView::Partial,
         )
         .await?;
 
@@ -960,7 +983,7 @@ impl MigrationWorker {
                 .map(|a| a.size.unwrap_or(0))
                 .sum::<i64>();
             self.migration_service
-                .update_job_totals(job_id, *discovered, *discovered_bytes)
+                .update_job_totals(job_id, *discovered, *discovered_bytes, SourceView::Partial)
                 .await?;
 
             for artifact in &artifacts.results {
@@ -1071,7 +1094,14 @@ impl MigrationWorker {
 
                 // Update progress
                 self.migration_service
-                    .update_job_progress(job_id, *completed, *failed, *skipped, *transferred)
+                    .update_job_progress(
+                        job_id,
+                        *completed,
+                        *failed,
+                        *skipped,
+                        *transferred,
+                        SourceView::Partial,
+                    )
                     .await?;
 
                 self.send_progress_update(
@@ -1087,6 +1117,28 @@ impl MigrationWorker {
 
                 self.apply_throttle().await;
             }
+
+            // Publish the numerator now the page is fully accounted for.
+            //
+            // The only other per-artifact progress write sits at the end of the
+            // transfer block, and the three arms that `continue` before it -- a
+            // dry run, an item an earlier pass already completed, and a
+            // duplicate already in the destination -- reach it for no artifact
+            // at all. A job made of those published a denominator per page and
+            // a numerator only once the run was over, so for its whole running
+            // life it read `0/N` at 0% and then jumped straight to `N/N`
+            // (#3510). Per page rather than per artifact keeps the write rate
+            // of an all-skip delta run where it was.
+            self.migration_service
+                .update_job_progress(
+                    job_id,
+                    *completed,
+                    *failed,
+                    *skipped,
+                    *transferred,
+                    SourceView::Partial,
+                )
+                .await?;
 
             // Advance the cursor. AQL's `range.total` reports the count of
             // rows in the current page (matching `end_pos - start_pos`), so
@@ -2204,7 +2256,14 @@ impl MigrationWorker {
 
             // Update progress
             self.migration_service
-                .update_job_progress(job_id, *completed, *failed, *skipped, 0)
+                .update_job_progress(
+                    job_id,
+                    *completed,
+                    *failed,
+                    *skipped,
+                    0,
+                    SourceView::Partial,
+                )
                 .await?;
 
             // Throttle
@@ -2306,7 +2365,14 @@ impl MigrationWorker {
 
             // Update progress
             self.migration_service
-                .update_job_progress(job_id, *completed, *failed, *skipped, 0)
+                .update_job_progress(
+                    job_id,
+                    *completed,
+                    *failed,
+                    *skipped,
+                    0,
+                    SourceView::Partial,
+                )
                 .await?;
         }
 
@@ -2369,7 +2435,14 @@ impl MigrationWorker {
 
             // Update progress
             self.migration_service
-                .update_job_progress(job_id, *completed, *failed, *skipped, 0)
+                .update_job_progress(
+                    job_id,
+                    *completed,
+                    *failed,
+                    *skipped,
+                    0,
+                    SourceView::Partial,
+                )
                 .await?;
         }
 
@@ -5776,6 +5849,9 @@ mod tests {
         completed_items: i32,
         failed_items: i32,
         skipped_items: i32,
+        /// The column `generate_report` publishes as
+        /// `summary.total_bytes_transferred`.
+        transferred_bytes: i64,
     }
 
     impl JobCounters {
@@ -5793,8 +5869,9 @@ mod tests {
     }
 
     async fn read_job_counters(pool: &sqlx::PgPool, job_id: Uuid) -> JobCounters {
-        let row: (i32, i64, i32, i32, i32) = sqlx::query_as(
-            "SELECT total_items, total_bytes, completed_items, failed_items, skipped_items \
+        let row: (i32, i64, i32, i32, i32, i64) = sqlx::query_as(
+            "SELECT total_items, total_bytes, completed_items, failed_items, skipped_items, \
+                    transferred_bytes \
              FROM migration_jobs WHERE id = $1",
         )
         .bind(job_id)
@@ -5807,6 +5884,7 @@ mod tests {
             completed_items: row.2,
             failed_items: row.3,
             skipped_items: row.4,
+            transferred_bytes: row.5,
         }
     }
 
@@ -5816,6 +5894,57 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("read job status")
+    }
+
+    /// Build the AQL page a mock source should answer with for
+    /// `offset`/`limit` over `artifacts`. Shared by the mocks below so they
+    /// paginate identically to one another.
+    fn mock_artifact_page(
+        artifacts: &[(String, i64)],
+        repo_key: &str,
+        offset: i64,
+        limit: i64,
+    ) -> crate::services::artifactory_client::AqlResponse {
+        use crate::services::artifactory_client::{AqlRange, AqlResponse, AqlResult};
+
+        let start = (offset.max(0) as usize).min(artifacts.len());
+        let end = start
+            .saturating_add(limit.max(0) as usize)
+            .min(artifacts.len());
+        let results: Vec<AqlResult> = artifacts[start..end]
+            .iter()
+            .map(|(name, size)| AqlResult {
+                repo: repo_key.to_string(),
+                path: "pkg/1.0".into(),
+                name: name.clone(),
+                size: Some(*size),
+                created: None,
+                modified: None,
+                sha256: None,
+                actual_sha1: None,
+            })
+            .collect();
+
+        AqlResponse {
+            range: AqlRange {
+                start_pos: offset,
+                end_pos: offset + limit,
+                total: results.len() as i64,
+            },
+            results,
+        }
+    }
+
+    /// The body a mock source should serve for `path`: exactly the number of
+    /// bytes the listing advertised for that artifact.
+    fn mock_artifact_body(artifacts: &[(String, i64)], path: &str) -> bytes::Bytes {
+        let name = extract_name_from_path(path);
+        let size = artifacts
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, size)| *size)
+            .unwrap_or(0);
+        bytes::Bytes::from(vec![b'x'; size as usize])
     }
 
     /// Mock source that enumerates a fixed artifact list one page at a time
@@ -5868,8 +5997,6 @@ mod tests {
             crate::services::artifactory_client::AqlResponse,
             crate::services::artifactory_client::ArtifactoryError,
         > {
-            use crate::services::artifactory_client::{AqlRange, AqlResponse, AqlResult};
-
             let sampled = read_job_counters(&self.pool, self.job_id).await;
             let slot = if offset == 0 {
                 &self.at_first_listing
@@ -5883,32 +6010,7 @@ mod tests {
                 }
             }
 
-            let start = (offset.max(0) as usize).min(self.artifacts.len());
-            let end = start
-                .saturating_add(limit.max(0) as usize)
-                .min(self.artifacts.len());
-            let results: Vec<AqlResult> = self.artifacts[start..end]
-                .iter()
-                .map(|(name, size)| AqlResult {
-                    repo: repo_key.to_string(),
-                    path: "pkg/1.0".into(),
-                    name: name.clone(),
-                    size: Some(*size),
-                    created: None,
-                    modified: None,
-                    sha256: None,
-                    actual_sha1: None,
-                })
-                .collect();
-
-            Ok(AqlResponse {
-                range: AqlRange {
-                    start_pos: offset,
-                    end_pos: offset + limit,
-                    total: results.len() as i64,
-                },
-                results,
-            })
+            Ok(mock_artifact_page(&self.artifacts, repo_key, offset, limit))
         }
         async fn download_artifact(
             &self,
@@ -5916,14 +6018,7 @@ mod tests {
             path: &str,
         ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
             // Bodies match the sizes advertised by the listing.
-            let name = extract_name_from_path(path);
-            let size = self
-                .artifacts
-                .iter()
-                .find(|(candidate, _)| candidate == name)
-                .map(|(_, size)| *size)
-                .unwrap_or(0);
-            Ok(bytes::Bytes::from(vec![b'x'; size as usize]))
+            Ok(mock_artifact_body(&self.artifacts, path))
         }
         async fn get_properties(
             &self,
@@ -5941,6 +6036,28 @@ mod tests {
         fn source_type(&self) -> &'static str {
             "enumerating-mock"
         }
+    }
+
+    /// Drive `process_job` for `job_id` against `source` with `config`.
+    ///
+    /// Shared by the fixtures below so every one of them enters production
+    /// code the same way `spawn_migration_worker` does.
+    async fn run_job_with_source(
+        pool: &sqlx::PgPool,
+        job_id: Uuid,
+        source: Arc<dyn crate::services::source_registry::SourceRegistry>,
+        config: WorkerConfig,
+    ) {
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let worker = MigrationWorker::new(pool.clone(), registry, config, CancellationToken::new());
+
+        worker
+            .process_job(job_id, source, ConflictResolution::Skip, None)
+            .await
+            .expect("migration job must not fail");
     }
 
     /// The samples an [`EnumeratingSource`] collected during a run.
@@ -5970,16 +6087,7 @@ mod tests {
             before_second_page: Arc::new(std::sync::Mutex::new(None)),
         });
 
-        let registry = Arc::new(StorageRegistry::new(
-            std::collections::HashMap::new(),
-            "filesystem".to_string(),
-        ));
-        let worker = MigrationWorker::new(pool.clone(), registry, config, CancellationToken::new());
-
-        worker
-            .process_job(job_id, source.clone(), ConflictResolution::Skip, None)
-            .await
-            .expect("migration job must not fail");
+        run_job_with_source(pool, job_id, source.clone(), config).await;
 
         let at_first_listing = *source.at_first_listing.lock().expect("first sample");
         let before_second_page = *source.before_second_page.lock().expect("second sample");
@@ -6195,17 +6303,33 @@ mod tests {
             .expect("seed pre-existing artifact");
         }
 
-        run_enumerating_job(
+        let samples = run_enumerating_job(
             &pool,
             job_id,
             &repo_key,
             &[("one.tar.gz", 4), ("two.tar.gz", 8), ("three.tar.gz", 15)],
             WorkerConfig {
+                // Two pages, so the mock samples the row mid-run.
+                batch_size: 2,
                 throttle_delay_ms: 0,
                 ..WorkerConfig::default()
             },
         )
         .await;
+
+        // The duplicate arm `continue`s before the per-artifact progress
+        // write, so publishing the numerator only at the end of the run left a
+        // re-run that had nothing left to do reading `0/N` at 0% for its whole
+        // running life (#3510).
+        let mid_run = samples
+            .before_second_page
+            .expect("the second page must have been requested");
+        assert_eq!(
+            (mid_run.total_items, mid_run.skipped_items),
+            (2, 2),
+            "a running all-duplicate re-run must report the page it has already \
+             skipped: {mid_run:?}"
+        );
 
         let finished = read_job_counters(&pool, job_id).await;
         let status = read_job_status(&pool, job_id).await;
@@ -6374,6 +6498,410 @@ mod tests {
             (finished.total_items, finished.total_bytes),
             (2, 12),
             "the run must overwrite the totals it inherited: {finished:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3510: a run's per-run figures must not overwrite the job row's record
+    // of what earlier passes of the same job really did (DB-gated via try_pool)
+    // -----------------------------------------------------------------------
+
+    /// Mock source that lets a run do real work and *then* interrupts it, so a
+    /// test can assert on figures production code wrote rather than on figures
+    /// its own fixture wrote.
+    ///
+    /// `pause_after_downloads` flips the job row to `paused` from inside the
+    /// Nth artifact download — the operator pressing pause while a transfer is
+    /// in flight. `pause_on_listing` flips it from inside the first listing,
+    /// so the run is interrupted before it has accounted for a single
+    /// artifact, which is the state a resumed run is in when it publishes the
+    /// counters that restarted at zero.
+    struct PausingSource {
+        pool: sqlx::PgPool,
+        job_id: Uuid,
+        repo_key: String,
+        artifacts: Vec<(String, i64)>,
+        pause_after_downloads: Option<usize>,
+        pause_on_listing: bool,
+        downloads: std::sync::atomic::AtomicUsize,
+        /// Every call the worker made into the source, so a test can assert a
+        /// run never started at all.
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PausingSource {
+        fn new(
+            pool: &sqlx::PgPool,
+            job_id: Uuid,
+            repo_key: &str,
+            artifacts: &[(&str, i64)],
+            pause_after_downloads: Option<usize>,
+            pause_on_listing: bool,
+        ) -> Self {
+            Self {
+                pool: pool.clone(),
+                job_id,
+                repo_key: repo_key.to_string(),
+                artifacts: artifacts
+                    .iter()
+                    .map(|(name, size)| ((*name).to_string(), *size))
+                    .collect(),
+                pause_after_downloads,
+                pause_on_listing,
+                downloads: std::sync::atomic::AtomicUsize::new(0),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        /// Share the call counter with the test.
+        fn watching(mut self, calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            self.calls = calls;
+            self
+        }
+
+        fn record_call(&self) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// What `POST /migrations/{id}/pause` writes.
+        async fn pause_the_job(&self) {
+            sqlx::query("UPDATE migration_jobs SET status = 'paused' WHERE id = $1")
+                .bind(self.job_id)
+                .execute(&self.pool)
+                .await
+                .expect("pause the job mid-run");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::source_registry::SourceRegistry for PausingSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!("not called by process_job")
+        }
+        async fn list_repositories(
+            &self,
+        ) -> Result<
+            Vec<crate::services::artifactory_client::RepositoryListItem>,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            self.record_call();
+            Ok(vec![mk_source_repo(&self.repo_key, "LOCAL", "Generic")])
+        }
+        async fn list_artifacts(
+            &self,
+            repo_key: &str,
+            offset: i64,
+            limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            self.record_call();
+            let page = mock_artifact_page(&self.artifacts, repo_key, offset, limit);
+            if self.pause_on_listing {
+                self.pause_the_job().await;
+            }
+            Ok(page)
+        }
+        async fn download_artifact(
+            &self,
+            _repo_key: &str,
+            path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            self.record_call();
+            let served = self
+                .downloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if self.pause_after_downloads == Some(served) {
+                self.pause_the_job().await;
+            }
+            Ok(mock_artifact_body(&self.artifacts, path))
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            self.record_call();
+            Ok(crate::services::artifactory_client::PropertiesResponse {
+                properties: None,
+                uri: None,
+            })
+        }
+        fn source_type(&self) -> &'static str {
+            "pausing-mock"
+        }
+    }
+
+    /// A resumed run that is interrupted before it has re-classified anything
+    /// must not erase what the pass before it did.
+    ///
+    /// `process_job` restarts its counters at zero on every entry while the
+    /// job row's do not, and #3445 added a `flush_job_counters` on the
+    /// interruption exits that published those counters *absolutely*. A job
+    /// paused, resumed and paused again therefore had `completed_items` and
+    /// `transferred_bytes` rewritten to zero — while the transfers they
+    /// described were still recorded in `migration_items` and still present in
+    /// the destination, and while the guarded `total_items` held. The row read
+    /// `0/4`, and because `generate_report` takes
+    /// `summary.total_bytes_transferred` straight off it, the job's migration
+    /// report claimed nothing had moved.
+    ///
+    /// Every figure this asserts on was written by production code: pass one
+    /// transfers two artifacts for real and the per-artifact progress write
+    /// puts them on the row. The only thing the fixture writes between the two
+    /// passes is `status = 'running'`, which is exactly what
+    /// `resume_migration` does before it spawns the worker.
+    ///
+    /// Fails-before: `completed_items` 2 -> 0 and `transferred_bytes` 12 -> 0
+    /// across the resumed pass.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_interrupted_resume_does_not_erase_the_inherited_row_3510() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "clobber-3510").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        let artifacts: [(&str, i64); 4] = [
+            ("one.tar.gz", 4),
+            ("two.tar.gz", 8),
+            ("three.tar.gz", 15),
+            ("four.tar.gz", 16),
+        ];
+        let config = || WorkerConfig {
+            throttle_delay_ms: 0,
+            ..WorkerConfig::default()
+        };
+
+        // Pass one: two artifacts move, then the operator pauses.
+        run_job_with_source(
+            &pool,
+            job_id,
+            Arc::new(PausingSource::new(
+                &pool,
+                job_id,
+                &repo_key,
+                &artifacts,
+                Some(2),
+                false,
+            )),
+            config(),
+        )
+        .await;
+
+        let after_pause = read_job_counters(&pool, job_id).await;
+        assert_eq!(read_job_status(&pool, job_id).await, "paused");
+        assert_eq!(
+            (after_pause.completed_items, after_pause.transferred_bytes),
+            (2, 12),
+            "the interrupted pass must leave the two transfers it made on the \
+             row: {after_pause:?}"
+        );
+
+        // The operator resumes. This is the one write the fixture makes, and
+        // it is the write `resume_migration` makes before spawning the worker.
+        sqlx::query("UPDATE migration_jobs SET status = 'running' WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("resume the job");
+
+        // Pass two is stopped before it accounts for a single artifact, so its
+        // counters are all still zero when it publishes them on the way out.
+        run_job_with_source(
+            &pool,
+            job_id,
+            Arc::new(PausingSource::new(
+                &pool, job_id, &repo_key, &artifacts, None, true,
+            )),
+            config(),
+        )
+        .await;
+
+        let after_resume = read_job_counters(&pool, job_id).await;
+        assert_eq!(read_job_status(&pool, job_id).await, "paused");
+        assert_eq!(
+            after_resume.completed_items, after_pause.completed_items,
+            "a pass that re-classified nothing must not publish its empty \
+             counters over the row: {after_resume:?}"
+        );
+        assert_eq!(
+            after_resume.transferred_bytes, after_pause.transferred_bytes,
+            "the bytes `generate_report` reports as transferred must not be \
+             reset by a pass that transferred nothing: {after_resume:?}"
+        );
+
+        // The durable per-item record and the job row still agree.
+        let completed_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM migration_items WHERE job_id = $1 AND status = 'completed'",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count completed items");
+        assert_eq!(
+            completed_rows, after_resume.completed_items as i64,
+            "the job row must still agree with the migration_items it has"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A *running* dry run must show real progress, not only the row it leaves
+    /// behind.
+    ///
+    /// Every artifact of a dry run `continue`s before the only per-artifact
+    /// progress write, so #3445 published the numerator once, at the end of
+    /// the run. The denominator went out per page, so for its whole running
+    /// life the job read `0/N` at 0% and then jumped straight to `N/N` — the
+    /// CHANGELOG entry claiming a running dry run no longer reports `0/N` was
+    /// true only of the final row (#3510).
+    ///
+    /// The mock samples the job row on its way in to the second page, which is
+    /// what a client polling mid-run would have seen once the first page was
+    /// fully accounted for.
+    ///
+    /// Fails-before: `completed_items` is 0 at the mid-run sample against a
+    /// denominator of 2.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_running_dry_run_publishes_its_numerator_per_page_3510() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "dryflow-3510").await;
+        // No destination repository on purpose: a dry run must not need one.
+
+        let samples = run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8), ("three.tar.gz", 15)],
+            WorkerConfig {
+                dry_run: true,
+                batch_size: 2,
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let mid_run = samples
+            .before_second_page
+            .expect("the second page must have been requested");
+        assert_eq!(
+            (mid_run.total_items, mid_run.completed_items),
+            (2, 2),
+            "a running dry run must report the page it has already reported on, \
+             not 0 against it: {mid_run:?}"
+        );
+        assert!(
+            mid_run.reported_percent("running") > 0.0,
+            "a dry run half way through its source must not read 0%: {mid_run:?}"
+        );
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// The worker must not run a job the operator has already stopped.
+    ///
+    /// `start_migration` sets `running` and then spawns a detached task, so a
+    /// cancel can land before that task is scheduled. `process_job` opened with
+    /// an unguarded `update_job_status(Running)` which put the row back to
+    /// `running`; `finalize_job_status`'s `WHERE status NOT IN
+    /// ('paused','cancelled')` guard then had nothing to protect and stamped
+    /// the job `completed` — after the run had migrated every artifact of a
+    /// migration the operator cancelled and got a `200 OK` for (#3510).
+    ///
+    /// The load-bearing assertion is that the source was never contacted: it
+    /// cannot be satisfied by the fixture, and it is what shows the run
+    /// stopped rather than merely ended up with the right status.
+    ///
+    /// Fails-before: `calls` is 1 (provisioning lists the source repositories)
+    /// and the job row reads `completed`.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_process_job_does_not_revive_a_job_the_operator_stopped_3510() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "cancelrace-3510").await;
+
+        // Exactly what `cancel_migration` writes, landing while the spawned
+        // worker task was still waiting to be scheduled.
+        sqlx::query(
+            "UPDATE migration_jobs SET status = 'cancelled', finished_at = NOW() WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("cancel the job");
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run_job_with_source(
+            &pool,
+            job_id,
+            Arc::new(
+                PausingSource::new(&pool, job_id, &repo_key, &[("one.tar.gz", 4)], None, false)
+                    .watching(calls.clone()),
+            ),
+            WorkerConfig {
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a cancelled job must not be enumerated: the worker contacted the \
+             source anyway"
+        );
+        assert_eq!(
+            read_job_status(&pool, job_id).await,
+            "cancelled",
+            "the worker must not walk a cancelled job back to running and then \
+             finalize it"
         );
 
         let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
