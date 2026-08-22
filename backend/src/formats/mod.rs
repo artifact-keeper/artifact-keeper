@@ -402,6 +402,27 @@ static VSCODE_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
     publish_time_resolver: true,
 };
 
+static CARGO_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Cargo,
+    label: "cargo",
+    // crates.io (and the sparse-index protocol generally) permits
+    // administrative deletion of a published (name, version), and the
+    // registry-index spec does not guarantee a deleted coordinate can never
+    // be republished with different content. Trusting elapsed time since
+    // this server's own first observation would be unsound under that
+    // threat model, so `first_seen` stays rejected for the initial slice
+    // (artifact-keeper#3480) until crates.io's delete/reuse semantics are
+    // explicitly resolved.
+    immutable_coordinates: false,
+    // The sparse-index protocol's optional `pubtime` field is a
+    // registry-assigned UTC publish timestamp the index itself carries per
+    // version — a direct publish-time resolver, and the same field the
+    // 2026-08-20 incident timeline was reconstructed from. See
+    // `crate::api::handlers::cargo::parse_cargo_pubtime` for the strict
+    // parsing contract.
+    publish_time_resolver: true,
+};
+
 /// Look up the age-gate capability spec for a repository format, collapsing
 /// protocol aliases (yarn/pnpm speak npm; poetry speaks PyPI) onto the
 /// canonical format that owns their policy. `None` means the format has no
@@ -414,6 +435,7 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         RepositoryFormat::Pypi | RepositoryFormat::Poetry => Some(&PYPI_AGE_GATE_SPEC),
         RepositoryFormat::Go => Some(&GO_AGE_GATE_SPEC),
         RepositoryFormat::Vscode => Some(&VSCODE_AGE_GATE_SPEC),
+        RepositoryFormat::Cargo => Some(&CARGO_AGE_GATE_SPEC),
         _ => None,
     }
 }
