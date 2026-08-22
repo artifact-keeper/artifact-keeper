@@ -155,6 +155,25 @@ pub struct LdapUserInfo {
     pub groups: Vec<String>,
 }
 
+/// The single client-facing message for every credential-level failure on the
+/// LDAP login path (issue #3371).
+///
+/// `POST /api/v1/auth/sso/ldap/{id}/login` is unauthenticated, and
+/// `AppError::Authentication` passes its message through to the response body
+/// verbatim (see `crate::error::AppError::user_message`). Any wording that
+/// varies with whether the submitted username exists in the directory turns
+/// that endpoint into a user-enumeration oracle: an attacker iterates
+/// usernames, keeps the ones that answer differently, and sprays passwords at
+/// a confirmed account list. So every credential-level arm — missing input, no
+/// matching directory entry, rejected bind — returns this exact string, and
+/// the diagnostics stay in the server log.
+///
+/// Infrastructure failures are deliberately NOT folded in here. A connection
+/// failure, a failed search and a timeout stay `AppError::Internal` (5xx) so a
+/// real directory outage is still visible to operators as an outage instead of
+/// being reported to every user as a bad password.
+pub(crate) const LDAP_AUTH_FAILURE_MESSAGE: &str = "Invalid credentials";
+
 /// LDAP authentication service
 ///
 /// Uses ldap3 for real LDAP/LDAPS bind and search operations.
@@ -177,10 +196,13 @@ impl LdapService {
     /// Classify an LDAP bind rejection as an authentication error.
     ///
     /// The original error is logged but never exposed to the caller,
-    /// preventing credential or server details from leaking.
+    /// preventing credential or server details from leaking. A rejected bind
+    /// is a routine wrong-password event on a public endpoint, so it is logged
+    /// at WARN rather than ERROR: a username sweep should not fill the error
+    /// log (issue #3371).
     fn bind_error(e: impl std::fmt::Display) -> AppError {
-        tracing::error!(error = %e, "LDAP bind failed");
-        AppError::Authentication("Invalid credentials".into())
+        tracing::warn!(target: "security", error = %e, "LDAP bind failed");
+        AppError::Authentication(LDAP_AUTH_FAILURE_MESSAGE.into())
     }
 
     /// Classify an LDAP search failure as an internal server error.
@@ -308,9 +330,16 @@ impl LdapService {
     /// service account is available.
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<LdapUserInfo> {
         if username.is_empty() || password.is_empty() {
-            return Err(AppError::Authentication(
-                "Username and password required".into(),
-            ));
+            // Same generic message as every other failure arm (#3371): the
+            // reason is recorded server-side only, so the login endpoint
+            // offers no response an attacker can use as a control probe.
+            tracing::warn!(
+                target: "security",
+                username_empty = username.is_empty(),
+                password_empty = password.is_empty(),
+                "LDAP login attempted with empty credentials"
+            );
+            return Err(AppError::Authentication(LDAP_AUTH_FAILURE_MESSAGE.into()));
         }
 
         let user_info = tokio::time::timeout(Self::AUTH_TIMEOUT, async {
@@ -729,10 +758,22 @@ impl LdapService {
 
         ldap.unbind().await.ok();
 
-        let entry = results
-            .into_iter()
-            .next()
-            .ok_or_else(|| AppError::Authentication("User not found in LDAP".into()))?;
+        let entry = results.into_iter().next().ok_or_else(|| {
+            // A directory miss must be indistinguishable from a rejected bind
+            // to an unauthenticated caller (#3371). It used to answer "User
+            // not found in LDAP" while a wrong password answered "Invalid
+            // credentials", which is a user-enumeration oracle on a public
+            // endpoint. The username and the base DN that produced the miss
+            // stay in the server log, where operators debugging a filter still
+            // need them.
+            tracing::warn!(
+                target: "security",
+                username = %username,
+                base_dn = %self.config.base_dn,
+                "LDAP user search matched no directory entry"
+            );
+            AppError::Authentication(LDAP_AUTH_FAILURE_MESSAGE.into())
+        })?;
 
         let entry = SearchEntry::construct(entry);
 
@@ -3018,5 +3059,342 @@ mod tests {
             )
             .await;
         assert_eq!(names, vec!["devops_".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3371: the unauthenticated LDAP login endpoint must not tell an
+    // attacker whether a username exists in the directory.
+    //
+    // These tests drive the real `authenticate()` path against a scripted
+    // in-process directory over a real socket, then render the resulting
+    // `AppError` through `IntoResponse` — i.e. they assert on the exact bytes
+    // an anonymous HTTP client receives, which is where the oracle lived.
+    // -----------------------------------------------------------------------
+
+    /// LDAP protocolOp application tags used by [`spawn_mock_directory`].
+    const LDAP_OP_BIND_REQUEST: u8 = 0x60;
+    const LDAP_OP_BIND_RESPONSE: u8 = 0x61;
+    const LDAP_OP_UNBIND_REQUEST: u8 = 0x42;
+    const LDAP_OP_SEARCH_REQUEST: u8 = 0x63;
+    const LDAP_OP_SEARCH_RES_ENTRY: u8 = 0x64;
+    const LDAP_OP_SEARCH_RES_DONE: u8 = 0x65;
+
+    /// How the scripted directory answers one login attempt.
+    struct MockDirectory {
+        /// DN the service account binds with; that bind always succeeds.
+        service_dn: String,
+        /// Entry the user search returns, if any: `(dn, uid, mail)`.
+        entry: Option<(String, String, String)>,
+        /// resultCode for the second (user) bind: 0 accept, 49 reject.
+        user_bind_rc: u8,
+    }
+
+    /// Encode one BER tag-length-value.
+    fn ber_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else if len < 0x100 {
+            out.extend_from_slice(&[0x81, len as u8]);
+        } else {
+            out.extend_from_slice(&[0x82, (len >> 8) as u8, (len & 0xff) as u8]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// Encode a non-negative BER INTEGER with the minimum number of octets.
+    fn ber_int(v: u32) -> Vec<u8> {
+        let be = v.to_be_bytes();
+        let mut bytes: Vec<u8> = be.iter().copied().skip_while(|b| *b == 0).collect();
+        if bytes.is_empty() {
+            bytes.push(0);
+        }
+        if bytes[0] & 0x80 != 0 {
+            bytes.insert(0, 0);
+        }
+        ber_tlv(0x02, &bytes)
+    }
+
+    /// Encode an LDAPResult body (resultCode, empty matchedDN, empty message).
+    fn ber_ldap_result(tag: u8, rc: u8) -> Vec<u8> {
+        let mut body = ber_tlv(0x0a, &[rc]);
+        body.extend(ber_tlv(0x04, b""));
+        body.extend(ber_tlv(0x04, b""));
+        ber_tlv(tag, &body)
+    }
+
+    /// Wrap a protocolOp in an LDAPMessage carrying `msgid`.
+    fn ber_ldap_message(msgid: u32, op: Vec<u8>) -> Vec<u8> {
+        let mut body = ber_int(msgid);
+        body.extend(op);
+        ber_tlv(0x30, &body)
+    }
+
+    /// Split the first TLV off `buf`, returning `(tag, value, bytes_consumed)`.
+    fn ber_next_tlv(buf: &[u8]) -> Option<(u8, &[u8], usize)> {
+        if buf.len() < 2 {
+            return None;
+        }
+        let tag = buf[0];
+        let (len, header) = if buf[1] < 0x80 {
+            (buf[1] as usize, 2)
+        } else {
+            let n = (buf[1] & 0x7f) as usize;
+            if buf.len() < 2 + n {
+                return None;
+            }
+            let len = buf[2..2 + n]
+                .iter()
+                .fold(0usize, |a, b| (a << 8) | *b as usize);
+            (len, 2 + n)
+        };
+        if buf.len() < header + len {
+            return None;
+        }
+        Some((tag, &buf[header..header + len], header + len))
+    }
+
+    /// Read one complete LDAPMessage and return its SEQUENCE contents.
+    async fn read_ldap_frame(sock: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut header = [0u8; 2];
+        sock.read_exact(&mut header).await.ok()?;
+        let len = if header[1] < 0x80 {
+            header[1] as usize
+        } else {
+            let n = (header[1] & 0x7f) as usize;
+            let mut ext = vec![0u8; n];
+            sock.read_exact(&mut ext).await.ok()?;
+            ext.iter().fold(0usize, |a, b| (a << 8) | *b as usize)
+        };
+        let mut body = vec![0u8; len];
+        sock.read_exact(&mut body).await.ok()?;
+        Some(body)
+    }
+
+    /// Spawn a scripted LDAP directory on 127.0.0.1 and return its port.
+    ///
+    /// It speaks just enough of RFC 4511 for `search_user_entry` +
+    /// `validate_ldap_credentials`: it accepts the service-account bind,
+    /// answers the user search with zero or one entry, and accepts or rejects
+    /// the subsequent user bind. `authenticate()` opens a fresh connection for
+    /// each bind, so the listener serves connections in a loop.
+    async fn spawn_mock_directory(dir: MockDirectory) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock directory");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                loop {
+                    use tokio::io::AsyncWriteExt;
+                    let Some(frame) = read_ldap_frame(&mut sock).await else {
+                        break;
+                    };
+                    let Some((_, msgid_bytes, used)) = ber_next_tlv(&frame) else {
+                        break;
+                    };
+                    let msgid = msgid_bytes.iter().fold(0u32, |a, b| (a << 8) | *b as u32);
+                    let Some((op_tag, op_body, _)) = ber_next_tlv(&frame[used..]) else {
+                        break;
+                    };
+                    let reply = match op_tag {
+                        LDAP_OP_BIND_REQUEST => {
+                            // bindRequest ::= { version INTEGER, name LDAPDN, ... }
+                            let (_, _, after_version) =
+                                ber_next_tlv(op_body).expect("bind version");
+                            let (_, dn_bytes, _) =
+                                ber_next_tlv(&op_body[after_version..]).expect("bind dn");
+                            let dn = String::from_utf8_lossy(dn_bytes).to_string();
+                            let rc = if dn == dir.service_dn {
+                                0x00
+                            } else {
+                                dir.user_bind_rc
+                            };
+                            ber_ldap_message(msgid, ber_ldap_result(LDAP_OP_BIND_RESPONSE, rc))
+                        }
+                        LDAP_OP_SEARCH_REQUEST => {
+                            let mut out = Vec::new();
+                            if let Some((dn, uid, mail)) = &dir.entry {
+                                let mut attrs = Vec::new();
+                                for (name, value) in [("uid", uid), ("mail", mail)] {
+                                    let mut attr = ber_tlv(0x04, name.as_bytes());
+                                    attr.extend(ber_tlv(0x31, &ber_tlv(0x04, value.as_bytes())));
+                                    attrs.extend(ber_tlv(0x30, &attr));
+                                }
+                                let mut entry = ber_tlv(0x04, dn.as_bytes());
+                                entry.extend(ber_tlv(0x30, &attrs));
+                                out.extend(ber_ldap_message(
+                                    msgid,
+                                    ber_tlv(LDAP_OP_SEARCH_RES_ENTRY, &entry),
+                                ));
+                            }
+                            out.extend(ber_ldap_message(
+                                msgid,
+                                ber_ldap_result(LDAP_OP_SEARCH_RES_DONE, 0x00),
+                            ));
+                            out
+                        }
+                        LDAP_OP_UNBIND_REQUEST => break,
+                        _ => break,
+                    };
+                    if sock.write_all(&reply).await.is_err() {
+                        break;
+                    }
+                    let _ = sock.flush().await;
+                }
+            }
+        });
+        port
+    }
+
+    const MOCK_SERVICE_DN: &str = "cn=svc,dc=example,dc=com";
+    const MOCK_USER_DN: &str = "uid=alice,ou=people,dc=example,dc=com";
+
+    /// Build a search-then-bind service pointed at a scripted directory port.
+    fn make_search_then_bind_service(port: u16) -> LdapService {
+        let mut config = make_test_ldap_config();
+        config.url = format!("ldap://127.0.0.1:{port}");
+        config.bind_dn = Some(MOCK_SERVICE_DN.to_string());
+        config.bind_password = Some("svc-secret".to_string());
+        make_test_service(config)
+    }
+
+    /// Render an `AppError` exactly as the HTTP layer would and return
+    /// `(status, body)` — what an anonymous client actually observes.
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn client_visible(err: AppError) -> (axum::http::StatusCode, String) {
+        use axum::response::IntoResponse;
+        let response = err.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .expect("read error body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A username with no directory entry.
+    async fn authenticate_unknown_user() -> AppError {
+        let port = spawn_mock_directory(MockDirectory {
+            service_dn: MOCK_SERVICE_DN.to_string(),
+            entry: None,
+            user_bind_rc: 0x00,
+        })
+        .await;
+        make_search_then_bind_service(port)
+            .authenticate("ghost", "any-password")
+            .await
+            .expect_err("a username with no directory entry must not authenticate")
+    }
+
+    /// A username that exists, presenting the wrong password.
+    async fn authenticate_wrong_password() -> AppError {
+        let port = spawn_mock_directory(MockDirectory {
+            service_dn: MOCK_SERVICE_DN.to_string(),
+            entry: Some((
+                MOCK_USER_DN.to_string(),
+                "alice".to_string(),
+                "alice@example.com".to_string(),
+            )),
+            user_bind_rc: 0x31, // invalidCredentials
+        })
+        .await;
+        make_search_then_bind_service(port)
+            .authenticate("alice", "wrong-password")
+            .await
+            .expect_err("a rejected bind must not authenticate")
+    }
+
+    #[tokio::test]
+    async fn test_unknown_directory_user_gets_generic_credential_failure() {
+        let (status, body) = client_visible(authenticate_unknown_user().await).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            body.contains(LDAP_AUTH_FAILURE_MESSAGE),
+            "expected the shared credential message, got: {body}"
+        );
+        // The historical wording that made this endpoint an enumeration
+        // oracle must not come back in any form (#3371).
+        let lowered = body.to_lowercase();
+        assert!(
+            !lowered.contains("not found"),
+            "response reveals that the username is absent from the directory: {body}"
+        );
+        assert!(
+            !lowered.contains("ghost"),
+            "response echoes the probed username: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wrong_password_gets_generic_credential_failure() {
+        let (status, body) = client_visible(authenticate_wrong_password().await).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            body.contains(LDAP_AUTH_FAILURE_MESSAGE),
+            "expected the shared credential message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_absent_user_and_wrong_password_are_indistinguishable() {
+        let absent = client_visible(authenticate_unknown_user().await).await;
+        let wrong = client_visible(authenticate_wrong_password().await).await;
+        assert_eq!(
+            absent, wrong,
+            "the LDAP login endpoint distinguishes an absent username from a \
+             wrong password, which is a user-enumeration oracle (#3371)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_credentials_get_generic_credential_failure() {
+        let svc = make_search_then_bind_service(1);
+        let err = svc
+            .authenticate("alice", "")
+            .await
+            .expect_err("empty password must not authenticate");
+        let (status, body) = client_visible(err).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            body.contains(LDAP_AUTH_FAILURE_MESSAGE),
+            "expected the shared credential message, got: {body}"
+        );
+    }
+
+    /// Negative control: folding every failure into "invalid credentials"
+    /// must NOT swallow a real directory outage. An unreachable directory is
+    /// an operational failure and has to stay a distinguishable server error,
+    /// or an operator reads a dead LDAP server as "everyone's password is
+    /// suddenly wrong".
+    #[tokio::test]
+    async fn test_directory_outage_stays_a_server_error() {
+        // Reserve an ephemeral port and drop the listener so connect is refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let err = make_search_then_bind_service(port)
+            .authenticate("alice", "any-password")
+            .await
+            .expect_err("an unreachable directory must not authenticate");
+        assert!(
+            matches!(err, AppError::Internal(_)),
+            "a directory outage must not be classified as a credential failure, got: {err:?}"
+        );
+
+        let (status, body) = client_visible(err).await;
+        assert!(
+            status.is_server_error(),
+            "expected a 5xx for a directory outage, got {status}: {body}"
+        );
+        // ...and it must still be distinguishable from a credential failure.
+        let (auth_status, _) = client_visible(authenticate_wrong_password().await).await;
+        assert_ne!(status, auth_status);
     }
 }
