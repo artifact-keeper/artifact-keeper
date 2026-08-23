@@ -8481,6 +8481,115 @@ mod tests {
         );
     }
 
+    /// The existence-hiding property this change PRESERVES (#3452).
+    ///
+    /// #3452 asks for consistent errors, and the cheapest way to give an
+    /// operator that would have been to distinguish "no such repository" from
+    /// "a repository you may not see". That is the #1808 / GHSA-fv45-mwhh-q23r
+    /// oracle and is deliberately NOT traded away: on a private repository with
+    /// no fine-grained rules, a caller holding no grant gets the same bytes a
+    /// nonexistent key gets. The diagnosis added by this change goes to the
+    /// server log instead, which is why that branch now emits a `tracing::info!`
+    /// before returning.
+    ///
+    /// Asserted as a byte-for-byte comparison of status, content-type and body,
+    /// because "the same 404" is exactly the property and a status-only check
+    /// would miss a body that differed.
+    #[tokio::test]
+    async fn test_3452_private_no_grant_stays_indistinguishable_from_no_such_repository() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // A private repository with NO fine-grained rules, so the read arm falls
+        // through to the role-assignment check, and a caller holding nothing.
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (bare_user, _n) = tdh::create_user(&pool).await;
+        // A second principal WITH a role assignment, as the positive control:
+        // without it, a fixture that 404s every request would satisfy the
+        // equality below.
+        let (member_user, _m) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, member_user).await;
+
+        let config = std::sync::Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let entry = CachedRepo {
+                id: repo_id,
+                format: "maven".to_string(),
+                ..make_cached_repo(/* is_public */ false)
+            };
+            cache.write().await.insert(
+                "hidden-repo".to_string(),
+                (entry, std::time::Instant::now()),
+            );
+        }
+        let state = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(pool.clone(), config)),
+            db: pool.clone(),
+            repo_cache: cache,
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+
+        async fn probe(
+            state: &RepoVisibilityState,
+            key: &str,
+            user_id: Uuid,
+        ) -> (u16, String, String) {
+            let req = axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/maven/{key}/com/example/demo/1.0.0/demo-1.0.0.pom"
+                ))
+                .header("Authorization", role_gate_bearer(user_id))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            let status = resp.status().as_u16();
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, ct, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let hidden = probe(&state, "hidden-repo", bare_user).await;
+        let nonexistent = probe(&state, "no-such-repository-key", bare_user).await;
+        let granted = probe(&state, "hidden-repo", member_user).await;
+
+        tdh::cleanup(&pool, repo_id, member_user).await;
+        tdh::cleanup_user(&pool, bare_user).await;
+
+        assert_eq!(
+            granted.0,
+            StatusCode::OK.as_u16(),
+            "POSITIVE CONTROL: a principal with a role assignment on the rules-less private \
+             repository must read it, or the equality below is vacuous"
+        );
+        assert_eq!(
+            hidden, nonexistent,
+            "#1808 / GHSA-fv45-mwhh-q23r: a private repository the caller holds no grant on must \
+             be byte-for-byte indistinguishable from a repository key that names nothing. #3452 \
+             asks for a clearer error; the clarification belongs in the server log, not here"
+        );
+        assert_eq!(
+            hidden.0,
+            StatusCode::NOT_FOUND.as_u16(),
+            "both must be the existence-hiding 404, not some other shared status"
+        );
+    }
+
     /// Characterization test for the POLICY half of #3387, tracked in #3522.
     ///
     /// There are two role stores and only one of them is an authorization
