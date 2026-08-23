@@ -709,6 +709,43 @@ pub fn forward_verbatim_metadata(
     builder.body(axum::body::Body::from(content)).unwrap()
 }
 
+/// Wrap already-buffered bytes in a response [`Body`] that OWNS a
+/// [`proxy_metadata_budget`] reservation, releasing it only after the buffered
+/// chunk has been handed to the response writer (#2665).
+///
+/// Holding the permit to the end of the FUNCTION that buffered the document is
+/// not the same bound. Anything derived from the buffer before the response is
+/// built — a parsed tree, a re-serialized rendering — outlives that scope, and
+/// the rendered body itself stays resident until it leaves the server. A caller
+/// that drops its permit at handler return therefore lets the next request pile
+/// another buffer on top of a body still queued for the socket, which is the
+/// difference between "each request is capped" and "the concurrent total is
+/// bounded". Callers that PARSE and re-serialize (rather than forwarding the
+/// upstream bytes verbatim) should keep the permit across that work and then
+/// hand it here, so the whole working set is accounted for.
+///
+/// Extracted from the RPM repodata proxy, which is where the bound was first
+/// established; it is now shared so a second parse-and-reserialize caller does
+/// not re-derive it.
+pub fn budgeted_body(content: Bytes, permit: OwnedSemaphorePermit) -> axum::body::Body {
+    enum State {
+        Data(Bytes, OwnedSemaphorePermit),
+        Done(OwnedSemaphorePermit),
+    }
+    axum::body::Body::from_stream(futures::stream::unfold(
+        State::Data(content, permit),
+        |state| async move {
+            match state {
+                State::Data(bytes, permit) => {
+                    Some((Ok::<Bytes, std::io::Error>(bytes), State::Done(permit)))
+                }
+                // Permit dropped here, after the chunk reached the response writer.
+                State::Done(_permit) => None,
+            }
+        },
+    ))
+}
+
 /// Budget-reserving sibling of [`proxy_fetch_capped`] (#2684).
 ///
 /// Reserves `max` bytes of the process-wide [`proxy_metadata_budget`] BEFORE
