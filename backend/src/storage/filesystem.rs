@@ -68,6 +68,24 @@ async fn remove_temp_file_best_effort(path: &Path, context: &'static str) {
 /// Filesystem-based storage backend
 pub struct FilesystemStorage {
     base_path: PathBuf,
+    /// Global storage root (`STORAGE_PATH`), when known.
+    ///
+    /// `base_path` is the *repository's* directory
+    /// (`<STORAGE_PATH>/<repo_key>`, see `repositories.rs`), but the proxy
+    /// cache writes through a handle rooted at `<STORAGE_PATH>` itself
+    /// (`StorageService::from_config`'s `FilesystemBackend`). The two roots
+    /// differ by exactly the repository segment, which is the filesystem
+    /// spelling of the same divergence `S3_PREFIX` produces on S3 (#3368):
+    /// a `proxy-cache/...` key written at `<STORAGE_PATH>/proxy-cache/...`
+    /// was read at `<STORAGE_PATH>/<repo_key>/proxy-cache/...` and missed
+    /// every time.
+    ///
+    /// When set, keys in a [`crate::storage::BUCKET_ROOT_KEY_NAMESPACES`]
+    /// namespace resolve against this root instead of `base_path`, so both
+    /// handles address the same file. `None` keeps the pre-existing
+    /// single-root behaviour for the standalone constructions that have no
+    /// global root to offer.
+    bucket_root: Option<PathBuf>,
 }
 
 impl FilesystemStorage {
@@ -75,6 +93,26 @@ impl FilesystemStorage {
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
         Self {
             base_path: base_path.into(),
+            bucket_root: None,
+        }
+    }
+
+    /// Anchor reserved bucket-root namespaces at `root` (`STORAGE_PATH`)
+    /// rather than at this handle's repository directory (#3368).
+    ///
+    /// Set by [`crate::storage::StorageRegistry::backend_for`], which is the
+    /// only construction site that knows the global root.
+    pub fn with_bucket_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.bucket_root = Some(root.into());
+        self
+    }
+
+    /// The root `key` resolves against: the global storage root for reserved
+    /// bucket-root namespaces, this handle's repository directory otherwise.
+    fn root_for(&self, key: &str) -> &PathBuf {
+        match &self.bucket_root {
+            Some(root) if crate::storage::key_is_bucket_root_anchored(key) => root,
+            _ => &self.base_path,
         }
     }
 
@@ -109,12 +147,16 @@ impl FilesystemStorage {
         // path-style keys land where every other call site expects them.
         // See #1073: proxy-cache writes went to `<base>/proxy-cache/...` while
         // reads looked under `<base>/pr/proxy-cache/...`.
+        // Reserved bucket-root namespaces resolve against the global storage
+        // root, not this repository's directory (#3368) — see `bucket_root`.
+        let root = self.root_for(key);
+
         if sanitized.components().count() > 1 {
-            return self.base_path.join(&sanitized);
+            return root.join(&sanitized);
         }
 
         let prefix = &sanitized_str[..2.min(sanitized_str.len())];
-        self.base_path.join(prefix).join(&sanitized)
+        root.join(prefix).join(&sanitized)
     }
 }
 

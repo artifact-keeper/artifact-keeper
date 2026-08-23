@@ -544,9 +544,11 @@ pub fn backend_supports_proxy_cache(storage_backend: &str) -> bool {
 ///
 /// The mirror-image mistake — reading proxy-cache content through the
 /// ArtifactSource handle, which composed `<S3_PREFIX>/proxy-cache/...` — was
-/// #3368. It is no longer expressible: `make_full_key` anchors the reserved
-/// `proxy-cache/` and `proxy-cache-staging/` namespaces at the bucket root for
-/// both roles, so the key, not the handle, decides the layout.
+/// #3368. It is no longer expressible: the reserved `proxy-cache/` and
+/// `proxy-cache-staging/` namespaces are anchored at the shared root for both
+/// roles — by `make_full_key` on S3, and by `StorageRegistry::backend_for`
+/// handing the filesystem handle the global root — so the key, not the handle,
+/// decides where an object lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageRole {
     /// Cache facade for remote/proxy repositories. Content is anchored at the
@@ -560,8 +562,12 @@ pub enum StorageRole {
 impl StorageRole {
     /// Apply this role's S3 key-prefix policy to an env-derived config.
     ///
-    /// Only the S3 backend has a key prefix; filesystem and GCS resolve keys
-    /// identically for both roles, so this is the whole of the divergence.
+    /// Only the S3 backend has a key *prefix*, so this is the whole of the
+    /// divergence **for S3**. It is not the whole of the divergence overall:
+    /// on the filesystem backend the two roles differ by ROOT DIRECTORY
+    /// instead (`STORAGE_PATH` vs `<STORAGE_PATH>/<repo_key>`), which is
+    /// handled where that root is chosen — `StorageRegistry::backend_for`
+    /// (#3368). GCS and Azure have neither and are unaffected.
     ///
     /// Since #3368 this is belt-and-braces rather than the sole guarantee: the
     /// S3 backend anchors every key in a

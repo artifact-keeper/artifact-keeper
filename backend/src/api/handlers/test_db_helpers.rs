@@ -625,10 +625,16 @@ pub fn build_state_with(
     let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
         crate::storage::filesystem::FilesystemStorage::new(storage_path),
     );
-    let registry = Arc::new(crate::storage::StorageRegistry::new(
-        std::collections::HashMap::new(),
-        "filesystem".to_string(),
-    ));
+    // Production parity (#3368): the registry knows the global storage root,
+    // so reserved bucket-root namespaces resolve there rather than under a
+    // per-repository directory.
+    let registry = Arc::new(
+        crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        )
+        .with_filesystem_bucket_root(storage_path),
+    );
     let mut config = cfg(storage_path);
     mutate(&mut config);
     Arc::new(AppState::new(config, pool, storage, registry))
@@ -636,15 +642,33 @@ pub fn build_state_with(
 
 /// Minimal in-memory [`crate::storage::StorageBackend`] double for tests that
 /// need a registered *cloud* backend (shared flat namespace) instead of the
-/// per-repo-rooted filesystem storage `build_state` provides. Missing keys
-/// return a "not found" storage error, matching how handlers detect misses.
+/// per-repo-rooted filesystem storage `build_state` provides.
+///
+/// A missing key returns [`crate::error::AppError::NotFound`], which is the
+/// #1016 contract every real backend honours and the variant handlers match on
+/// to tell "object absent" from "backend broken". This double previously
+/// returned a generic storage error whose *message* contained "not found", so
+/// only the string-sniffing call sites saw a miss and the `Err(NotFound(_))`
+/// arms were unreachable under test (#3463).
 #[derive(Default)]
 pub struct MemStorage {
     pub objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+    /// Count of `get` calls, so a test can assert how many storage round
+    /// trips a handler actually made (#3463: a repair path that cannot
+    /// succeed still costs a read, and "did it stop re-reading" is not
+    /// observable from the response alone).
+    pub gets: std::sync::atomic::AtomicUsize,
     /// When true the double advertises presigned-redirect capability, standing
     /// in for an S3/GCS backend with `S3_REDIRECT_DOWNLOADS=true`. Defaults to
     /// false so every existing `MemStorage` user keeps the streaming path.
     pub presign: bool,
+}
+
+impl MemStorage {
+    /// Number of `get` calls observed so far.
+    pub fn get_count(&self) -> usize {
+        self.gets.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[async_trait::async_trait]
@@ -658,12 +682,13 @@ impl crate::storage::StorageBackend for MemStorage {
     }
 
     async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.objects
             .lock()
             .unwrap()
             .get(key)
             .cloned()
-            .ok_or_else(|| crate::error::AppError::Storage(format!("Key not found: {key}")))
+            .ok_or_else(|| crate::error::AppError::NotFound(format!("Key not found: {key}")))
     }
 
     async fn exists(&self, key: &str) -> crate::error::Result<bool> {
@@ -1672,10 +1697,16 @@ fn app_state_with(config: Config, pool: PgPool, storage_path: &str) -> crate::ap
     let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
         crate::storage::filesystem::FilesystemStorage::new(storage_path),
     );
-    let registry = Arc::new(crate::storage::StorageRegistry::new(
-        std::collections::HashMap::new(),
-        "filesystem".to_string(),
-    ));
+    // Production parity (#3368): the registry knows the global storage root,
+    // so reserved bucket-root namespaces resolve there rather than under a
+    // per-repository directory.
+    let registry = Arc::new(
+        crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        )
+        .with_filesystem_bucket_root(storage_path),
+    );
     crate::api::AppState::new(config, pool, storage, registry)
 }
 

@@ -1978,9 +1978,17 @@ impl S3Backend {
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
         // Compose the search prefix through `make_full_key` so a listing
         // resolves the same physical location a `get`/`put` of a key under it
-        // would (#3368): a `proxy-cache/...` listing must search the bucket
-        // root, not `<S3_PREFIX>/proxy-cache/...`, or the sweep sees nothing
-        // and every purge/GC pass over the cache is a silent no-op.
+        // would (#3368).
+        //
+        // Defensive, not a live fix: today every caller that lists a
+        // `proxy-cache/...` prefix (`purge_repo_cache`, `list_cached_paths`
+        // and friends) goes through `ProxyService`, which `main.rs` always
+        // builds from `StorageService::from_config` — i.e. the prefix-less
+        // `StorageRole::ProxyCache` handle — and the storage GC never lists at
+        // all, it drives off `artifacts` rows. So no production path reaches
+        // this arm with a reserved key today. It is kept so that the FIRST one
+        // that does resolves the same object `get`/`put` would, rather than
+        // silently listing an empty prefix.
         let search_prefix = match (&self.prefix, prefix) {
             (Some(_), Some(p)) => make_full_key(self.prefix.as_deref(), p),
             (Some(base), None) => format!("{}/", base.trim_end_matches('/')),
@@ -2519,9 +2527,13 @@ mod tests {
     }
 
     /// `strip_key_prefix` is the inverse used to map listing results back to
-    /// logical keys. It must round-trip BOTH layouts, or a cache sweep
-    /// (`purge_repo_cache`, GC) would hand back keys that no `get`/`delete`
-    /// can resolve.
+    /// logical keys, and must round-trip BOTH layouts or a listing would hand
+    /// back keys no `get`/`delete` can resolve.
+    ///
+    /// This is a property guard, NOT a regression test: the round trip holds
+    /// on `main` too (there the prefix is applied and stripped symmetrically).
+    /// It is here to stop the anchoring rule from being added on the compose
+    /// side only, which WOULD break it.
     #[test]
     fn test_full_key_strip_round_trips_both_layouts_3368() {
         for prefix in [None, Some("artifacts"), Some("team-a/registry")] {

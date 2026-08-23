@@ -25,7 +25,9 @@ use crate::error::Result;
 /// One bucket holds two kinds of object and they do NOT share a key layout:
 ///
 /// * **Artifact bytes** — written under `S3_PREFIX` by primary storage, so a
-///   deployment can share a bucket with other applications (#3171).
+///   deployment can share a bucket with other applications (#3171); on the
+///   filesystem backend the equivalent scope is the repository's own
+///   directory, `<STORAGE_PATH>/<repo_key>`.
 /// * **Proxy-cache content** — `proxy-cache/<repo_key>/<path>/__content__`
 ///   plus its `__cache_meta__.json` sidecar, and the per-write staging objects
 ///   under `proxy-cache-staging/` — written at the bucket root (#1555).
@@ -49,10 +51,21 @@ use crate::error::Result;
 pub const BUCKET_ROOT_KEY_NAMESPACES: &[&str] = &["proxy-cache/", "proxy-cache-staging/"];
 
 /// Whether `key` lives in a [`BUCKET_ROOT_KEY_NAMESPACES`] namespace and must
-/// therefore be resolved at the bucket root, with no `S3_PREFIX` applied.
+/// therefore be resolved at the shared root rather than under whatever scope
+/// the calling handle was built for.
 ///
-/// Backends without a key prefix (filesystem, GCS, Azure) resolve every key
-/// identically and are unaffected; this only decides S3 key composition.
+/// Two backends have such a scope, and both are affected:
+///
+/// * **S3** — the scope is the `S3_PREFIX` key prefix, applied by
+///   `make_full_key`.
+/// * **Filesystem** — the scope is the ROOT DIRECTORY. The proxy cache writes
+///   through a handle rooted at `STORAGE_PATH`, while an `artifacts` row is
+///   read through one rooted at `<STORAGE_PATH>/<repo_key>`
+///   (`StorageRegistry::backend_for`), so the same key named two different
+///   files. Same defect, different spelling, and on the DEFAULT backend.
+///
+/// GCS and Azure register one shared instance with no per-repository or
+/// per-prefix scope, so they resolve every key identically and are unaffected.
 pub fn key_is_bucket_root_anchored(key: &str) -> bool {
     BUCKET_ROOT_KEY_NAMESPACES
         .iter()

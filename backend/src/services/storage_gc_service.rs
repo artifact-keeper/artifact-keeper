@@ -46,6 +46,23 @@ const OCI_CLEANUP_KEY_CLAIM_TTL_SQL: &str = "INTERVAL '15 minutes'";
 /// (#1180); keeping them literally identical is the cheap structural
 /// guarantee that they stay aligned.
 ///
+/// The `proxy-cache/%` exclusion (#3368): a soft-deleted `artifacts` row can
+/// carry a proxy-cache storage key. Those are legacy rows from before the
+/// proxy catalog was split out (#1278) — modern proxy traffic writes
+/// `proxy_cache_artifacts`, never `artifacts` — but the KEY is derived purely
+/// from `(repo_key, path)`, so the object such a row names is the *same*
+/// object a live `proxy_cache_artifacts` row points at. This predicate does
+/// not consult `proxy_cache_artifacts` at all, so without the exclusion GC
+/// would delete a live cache entry out from under its own catalog row,
+/// leaving a `size_bytes` over-count that only clears on the next fetch.
+///
+/// It never mattered before because the delete was issued against the wrong
+/// key anyway (`<S3_PREFIX>/proxy-cache/...`, or the per-repo filesystem
+/// root), so it silently hit nothing. Anchoring the layout makes the delete
+/// land, which is exactly why the exclusion has to land with it. Proxy-cache
+/// objects have their own reclamation path (`purge_repo_cache`, TTL/lifecycle
+/// expiry); they are not this GC's to collect.
+///
 /// The `'oci-manifests/'` literals below are the SQL embedding of
 /// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX) — the same prefix `manifest_storage_key()`
 /// (`oci_v2.rs`) produces on writes and the lifecycle cascade
@@ -54,6 +71,7 @@ const OCI_CLEANUP_KEY_CLAIM_TTL_SQL: &str = "INTERVAL '15 minutes'";
 /// `const _: () = assert!(...)` after this constant (#1413).
 const ORPHAN_PREDICATE_SQL: &str = r#"
 a.is_deleted = true
+AND a.storage_key NOT LIKE 'proxy-cache/%'
 AND NOT EXISTS (
     SELECT 1 FROM artifacts a2
     WHERE a2.storage_key = a.storage_key
@@ -3361,6 +3379,34 @@ pub(crate) async fn storage_gc_test_guard() -> tokio::sync::MutexGuard<'static, 
 
 #[cfg(test)]
 mod tests {
+    /// #3368: GC must not collect proxy-cache objects.
+    ///
+    /// A soft-deleted legacy `artifacts` row can name the very object a live
+    /// `proxy_cache_artifacts` row points at (`CacheKeys::derive` is pure, so
+    /// the two rows carry the SAME key), and this predicate never consults
+    /// that catalog. Anchoring the key layout made the delete actually land,
+    /// so the exclusion has to be part of the predicate rather than an
+    /// accident of the delete missing.
+    ///
+    /// FAILS ON MAIN: the predicate has no proxy-cache exclusion.
+    #[test]
+    fn test_orphan_predicate_excludes_proxy_cache_keys_3368() {
+        assert!(
+            super::ORPHAN_PREDICATE_SQL.contains("a.storage_key NOT LIKE 'proxy-cache/%'"),
+            "the orphan predicate must exclude proxy-cache keys; they belong to the proxy \
+             cache's own reclamation path (purge_repo_cache / lifecycle expiry), and this \
+             predicate cannot see proxy_cache_artifacts"
+        );
+        // Control: the exclusion must be scoped to the reserved namespace and
+        // must not disturb the hosted / OCI arms the predicate exists for.
+        for still_present in ["oci-manifests/", "oci-blobs/", "oci_manifest_refs"] {
+            assert!(
+                super::ORPHAN_PREDICATE_SQL.contains(still_present),
+                "{still_present} arm must be untouched"
+            );
+        }
+    }
+
     use super::*;
 
     use async_trait::async_trait;

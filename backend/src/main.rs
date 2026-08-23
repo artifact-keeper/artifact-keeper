@@ -529,10 +529,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         };
         tracing::info!("Storage backends available: {:?}", available);
 
-        Arc::new(artifact_keeper_backend::storage::StorageRegistry::new(
-            backends,
-            config.storage_backend.clone(),
-        ))
+        Arc::new(
+            artifact_keeper_backend::storage::StorageRegistry::new(
+                backends,
+                config.storage_backend.clone(),
+            )
+            // #3368: filesystem locations are rooted at the repository's own
+            // directory (`<STORAGE_PATH>/<repo_key>`), but the proxy cache
+            // writes through a handle rooted at `STORAGE_PATH`. Hand the
+            // registry the global root so reserved bucket-root namespaces
+            // resolve to the same file through either handle.
+            .with_filesystem_bucket_root(&config.storage_path),
+        )
     };
 
     // One-shot backfill of oci_manifest_refs for index manifests that
