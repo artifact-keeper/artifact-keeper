@@ -25,6 +25,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace --lib --test-threads 8
 ```
 
+Tier 1 also runs one **integration** target explicitly, because it is pure
+YAML parsing with no database and it guards a release control (#3437):
+
+```bash
+cargo nextest run --workspace --test workflow_scan_gate_tests --no-tests=fail
+```
+
+It cannot go in the Tier 2 allowlist below: that job runs `-- --ignored`, and
+these tests are not `#[ignore]`d, so it would report `0 tests` and pass.
+
 ### Integration Tests (Tier 2) - Main/Release Pushes & Backend PRs
 
 CI does **not** run the whole `backend/tests/` tree. It names a fixed list of

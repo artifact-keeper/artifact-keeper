@@ -517,6 +517,33 @@ jobs:
         # under nextest at 8 threads.
         run: cargo nextest run --workspace --lib --test-threads 8
 
+      # `workflow_scan_gate_tests` is the #2609 contract guard: it asserts that
+      # docker-publish.yml's Trivy enforcement pass still gates (exit-code '1',
+      # CRITICAL/HIGH, ignore-unfixed, .trivyignore, non-SARIF format) and that
+      # every merge-* job `needs: scan-containers`. It lives in backend/tests/
+      # so it is an INTEGRATION target, and it ran in NO job at all (#3437):
+      # the step above is `--lib`, and the Tier 2 job passes an explicit
+      # `--test` allowlist that never included it. So the guard that exists to
+      # stop image publishing from silently becoming non-blocking was itself
+      # non-blocking, and had been failing on `main` since #3122 split the scan
+      # into two passes with nobody to see it.
+      #
+      # It is run HERE, in Tier 1, rather than added to that allowlist, because
+      # the Tier 2 job invokes `cargo test ... -- --ignored`: every suite in its
+      # allowlist is 100% `#[ignore]`d by construction, and these three tests
+      # are not. Adding the file there yields `running 0 tests ... 3 filtered
+      # out` and exit 0 — a green, permanently vacuous gate, which is the exact
+      # defect being fixed. Tier 1 is also where it belongs on the merits: pure
+      # YAML parsing, no database, no network, ~20ms, and it gates every PR
+      # rather than only backend-touching ones.
+      #
+      # `--no-tests=fail` so a rename or deletion of the target is a red job
+      # instead of a silent zero-test pass.
+      - name: Run workflow contract tests
+        env:
+          SQLX_OFFLINE: true
+        run: cargo nextest run --workspace --test workflow_scan_gate_tests --no-tests=fail
+
       # Hit-rate data to evaluate dropping the Swatinem rust-cache step once sccache sustains >80% hits.
       - name: sccache stats
         if: always()
