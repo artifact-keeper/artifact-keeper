@@ -634,6 +634,16 @@ jobs:
       - name: Check the supply-chain soft-fail gate catches what it must
         run: bash scripts/ci/test-check-supply-chain-soft-fail.sh
 
+      # The duplication gate measures whatever jscpd-prepare-sources.py hands
+      # it, so a bug there silently changes the gate's verdict (#3495). The
+      # dangerous direction is over-removal: an INDENTED `#[cfg(test)]` sits
+      # inside another item, and treating it as a top-level boundary would
+      # delete every production line up to the enclosing item's closing brace
+      # — which the gate would then report as a clean measurement. Pure python
+      # on throwaway files, ~1s.
+      - name: Check the duplication gate's source preparation
+        run: bash scripts/ci/test-jscpd-prepare-sources.sh
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
@@ -1037,14 +1047,138 @@ jobs:
           # Write changed files to a list for jscpd
           echo "$CHANGED_RS" > /tmp/changed-files.txt
 
-          # Run jscpd on the filtered changed files (min 10 lines, threshold 3%).
-          RESULT=$(jscpd --min-lines 10 --threshold 3 --reporters json \
+          # Copy the changed sources with their inline `#[cfg(test)]` modules
+          # removed, and keep a map of the removed line ranges so failures can
+          # still report real line numbers (#3495).
+          #
+          # WHY: `backend/src` is 474k lines of which 265k -- 56% -- are inline
+          # test modules; `repositories.rs` alone is 26,328 lines, 22,164 of
+          # them test code. .jscpd.json already ignores `**/*_test.rs` and
+          # `**/tests/**`, and the CHANGED_RS filter above already drops
+          # `_test`/`tests/` paths, so test code is out of scope BY POLICY.
+          # Inline test modules were out of scope only BY ACCIDENT, because the
+          # files holding them were too big for jscpd to open (see the limits
+          # below). Measured with the limits raised and nothing else changed,
+          # the non-ignored tree scores 3.38% and 23 of the last 44
+          # code-touching commits on main would have failed this gate, with 58
+          # of 61 clones sitting entirely inside `#[cfg(test)]`. Stripping them
+          # applies the existing policy: 2.27% tree-wide, 2 of those 44
+          # commits over threshold, both on genuine production-code clones.
+          rm -rf /tmp/jscpd-src /tmp/jscpd-linemap.json
+          echo "Preparing sources (inline test modules are out of scope):"
+          python3 scripts/ci/jscpd-prepare-sources.py \
+            /tmp/jscpd-src /tmp/jscpd-linemap.json \
+            $(echo "$CHANGED_RS" | tr '\n' ' ')
+
+          # A source with fewer than --min-lines lines is legitimately not
+          # analysed, and jscpd emits NO REPORT AT ALL for a set containing
+          # only such files. Distinguish that from "the whole file set was
+          # skipped", which must fail below.
+          MEASURABLE=$(python3 -c "
+          import os
+          n = 0
+          for path in open('/tmp/changed-files.txt').read().split():
+              prepared = os.path.join('/tmp/jscpd-src', path)
+              if not os.path.exists(prepared):
+                  continue
+              if len(open(prepared, encoding='utf-8', errors='replace').read().split('\n')) >= 10:
+                  n += 1
+          print(n)
+          ")
+          if [ "$MEASURABLE" -eq 0 ]; then
+            echo "No changed file has 10+ production lines after inline test modules are excluded; nothing for jscpd to detect."
+            echo "### Code Duplication: N/A (no changed file has 10+ production lines)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # jscpd's own defaults are maxLines 1000 / maxSize 100kb, and a file
+          # over EITHER is skipped SILENTLY -- no error, no report entry (#3495).
+          # That skipped 152 of 336 files under backend/src, 125 of them not on
+          # the ignore list, so any PR whose Rust changes landed only in one of
+          # them got a duplication verdict computed from an empty file set.
+          # .jscpd.json is the single source of truth for the limits, the same
+          # way it is for `ignore`; they are passed explicitly so the behaviour
+          # does not depend on jscpd's config discovery or version.
+          read -r MAX_LINES MAX_SIZE <<<"$(python3 -c "
+          import json
+          cfg = json.load(open('.jscpd.json'))
+          print(cfg['maxLines'], cfg['maxSize'])
+          ")"
+          echo "jscpd limits from .jscpd.json: max-lines=${MAX_LINES} max-size=${MAX_SIZE}"
+
+          # Run jscpd on the prepared copies (min 10 lines, threshold 3%).
+          # `cd` so the report names the real repo-relative paths.
+          RESULT=$(cd /tmp/jscpd-src && jscpd --min-lines 10 --threshold 3 \
+            --max-lines "$MAX_LINES" --max-size "$MAX_SIZE" --reporters json \
             --format rust --output /tmp/jscpd-report \
             $(echo "$CHANGED_RS" | tr '\n' ' ') 2>&1) || true
 
-          # Parse results
-          if [ -f /tmp/jscpd-report/jscpd-report.json ]; then
-            DUP_PCT=$(python3 -c "
+          # A missing report used to be reported as "0% (no duplicates found)"
+          # and passed. That is exactly what a whole-file-set skip looks like,
+          # so it must be a failure, not a clean bill of health.
+          if [ ! -f /tmp/jscpd-report/jscpd-report.json ]; then
+            echo "::error::jscpd produced no report for $(echo "$CHANGED_RS" | wc -l) changed file(s). It analysed nothing, so this gate measured nothing (#3495)."
+            echo "$RESULT"
+            echo "### Code Duplication: FAILED (jscpd produced no report)" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          # Every changed file must actually appear in the report. jscpd skips
+          # silently for several reasons (over max-lines, over max-size,
+          # unreadable, unknown format) and reports whatever the remainder
+          # measured; a file below --min-lines is the one legitimate omission.
+          SKIP_FAIL=0
+          python3 - <<'PYSKIP' || SKIP_FAIL=1
+          import json, os, sys
+
+          report = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          analysed = set(
+              report.get('statistics', {})
+              .get('formats', {})
+              .get('rust', {})
+              .get('sources', {})
+              .keys()
+          )
+          cfg = json.load(open('.jscpd.json'))
+          max_lines = int(cfg['maxLines'])
+          max_size = cfg['maxSize']
+          units = {'b': 1, 'kb': 1024, 'mb': 1024 ** 2, 'gb': 1024 ** 3}
+          number = max_size.rstrip('abgkm')
+          suffix = max_size[len(number):].lower() or 'b'
+          max_bytes = float(number) * units[suffix]
+
+          missing = []
+          for path in open('/tmp/changed-files.txt').read().split():
+              if path in analysed:
+                  continue
+              prepared = os.path.join('/tmp/jscpd-src', path)
+              if not os.path.exists(prepared):
+                  missing.append((path, 'was not prepared'))
+                  continue
+              lines = len(open(prepared, encoding='utf-8', errors='replace').read().split('\n'))
+              size = os.path.getsize(prepared)
+              if lines < 10:
+                  continue  # below --min-lines; nothing to detect
+              if lines > max_lines:
+                  missing.append((path, f'{lines} lines exceeds maxLines {max_lines}'))
+              elif size > max_bytes:
+                  missing.append((path, f'{size} bytes exceeds maxSize {max_size}'))
+              else:
+                  missing.append((path, f'skipped by jscpd for an unknown reason ({lines} lines, {size} bytes)'))
+
+          if missing:
+              print('::error::The duplication gate did not analyse every changed file, so its verdict is not a measurement of this change (#3495).')
+              for path, why in missing:
+                  print(f'  {path}: {why}')
+              print('Raise maxLines/maxSize in .jscpd.json, or exempt the file there deliberately.')
+              sys.exit(1)
+          PYSKIP
+          if [ "$SKIP_FAIL" -ne 0 ]; then
+            echo "### Code Duplication: FAILED (a changed file was not analysed)" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          DUP_PCT=$(python3 -c "
           import json
           data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
           stats = data.get('statistics', {})
@@ -1053,36 +1187,48 @@ jobs:
           dups = total.get('duplicatedLines', 0)
           lines = total.get('lines', 0)
           clones = len(data.get('duplicates', []))
-          print(f'{pct:.1f} {dups} {lines} {clones}')
-          " 2>/dev/null) || DUP_PCT="0.0 0 0 0"
+          sources = len(stats.get('formats', {}).get('rust', {}).get('sources', {}))
+          print(f'{pct:.1f} {dups} {lines} {clones} {sources}')
+          " 2>/dev/null) || DUP_PCT="0.0 0 0 0 0"
 
-            PCT=$(echo "$DUP_PCT" | awk '{print $1}')
-            DUP_LINES=$(echo "$DUP_PCT" | awk '{print $2}')
-            TOTAL_LINES=$(echo "$DUP_PCT" | awk '{print $3}')
-            CLONES=$(echo "$DUP_PCT" | awk '{print $4}')
+          PCT=$(echo "$DUP_PCT" | awk '{print $1}')
+          DUP_LINES=$(echo "$DUP_PCT" | awk '{print $2}')
+          TOTAL_LINES=$(echo "$DUP_PCT" | awk '{print $3}')
+          CLONES=$(echo "$DUP_PCT" | awk '{print $4}')
+          SOURCES=$(echo "$DUP_PCT" | awk '{print $5}')
 
-            echo "### Code Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)" >> $GITHUB_STEP_SUMMARY
-            echo "Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)"
+          echo "### Code Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones, ${SOURCES} files analysed)" >> $GITHUB_STEP_SUMMARY
+          echo "Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones, ${SOURCES} files analysed)"
 
-            # Fail if duplication exceeds 3%
-            OVER=$(python3 -c "print('yes' if float('${PCT}') > 3.0 else 'no')")
-            if [ "$OVER" = "yes" ]; then
-              echo "::error::Code duplication is ${PCT}%, exceeding 3% threshold"
+          # Fail if duplication exceeds 3%
+          OVER=$(python3 -c "print('yes' if float('${PCT}') > 3.0 else 'no')")
+          if [ "$OVER" = "yes" ]; then
+            echo "::error::Code duplication is ${PCT}%, exceeding 3% threshold"
 
-              # Show the duplicate blocks
-              python3 -c "
+            # Show the duplicate blocks, with line numbers translated back
+            # through the stripped test modules to the real file.
+            python3 - <<'PYCLONES'
           import json
-          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
-          for d in data.get('duplicates', []):
-              fa = d['firstFile']
-              sa = d['secondFile']
-              print(f\"  {fa['name']}:{fa['startLoc']['line']}-{fa['endLoc']['line']} <-> {sa['name']}:{sa['startLoc']['line']}-{sa['endLoc']['line']}\")
-          " 2>/dev/null || true
 
-              exit 1
-            fi
-          else
-            echo "### Code Duplication: 0% (no duplicates found)" >> $GITHUB_STEP_SUMMARY
+          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          line_map = json.load(open('/tmp/jscpd-linemap.json'))
+
+          def original(name, line):
+              shift = 0
+              for start, end in line_map.get(name, []):
+                  if start <= line + shift:
+                      shift += end - start + 1
+              return line + shift
+
+          for d in data.get('duplicates', []):
+              fa, sa = d['firstFile'], d['secondFile']
+              a1, a2 = original(fa['name'], fa['startLoc']['line']), original(fa['name'], fa['endLoc']['line'])
+              b1, b2 = original(sa['name'], sa['startLoc']['line']), original(sa['name'], sa['endLoc']['line'])
+              print(f"  {fa['name']}:{a1}-{a2} <-> {sa['name']}:{b1}-{b2}")
+          print("Clones may pre-date this change: the gate measures whole changed FILES, not changed lines (#1619).")
+          PYCLONES
+
+            exit 1
           fi
 
       - name: Upload coverage artifact
