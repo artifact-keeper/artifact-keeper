@@ -1555,7 +1555,6 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
           subject-digest: ${{ steps.incoming.outputs.digest }}
           push-to-registry: true
-        continue-on-error: true
 
   merge-scanner-adapter:
     name: Scanner Adapter Multi-Arch Manifest
