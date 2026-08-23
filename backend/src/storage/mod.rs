@@ -19,6 +19,46 @@ use std::time::Duration;
 
 use crate::error::Result;
 
+/// Key namespaces that are anchored at the **bucket root**, never under the
+/// configured `S3_PREFIX`.
+///
+/// One bucket holds two kinds of object and they do NOT share a key layout:
+///
+/// * **Artifact bytes** — written under `S3_PREFIX` by primary storage, so a
+///   deployment can share a bucket with other applications (#3171).
+/// * **Proxy-cache content** — `proxy-cache/<repo_key>/<path>/__content__`
+///   plus its `__cache_meta__.json` sidecar, and the per-write staging objects
+///   under `proxy-cache-staging/` — written at the bucket root (#1555).
+///
+/// Which layout applied used to depend on *which handle a caller happened to
+/// hold*: a `StorageRole::ProxyCache` handle forced the prefix off while a
+/// `StorageRole::ArtifactSource` handle kept it. Every reader of a proxy-cache
+/// key therefore had to guess, and the ones that guessed wrong addressed
+/// `<S3_PREFIX>/proxy-cache/...` — a key nothing ever writes. On a prefixed
+/// deployment those reads missed every time while the object sat untouched at
+/// the root (#3368), and the miss-recovery write-back then deposited a second,
+/// permanently unread copy under the prefix.
+///
+/// Anchoring the layout to the **key** instead of to the handle makes that
+/// class of mistake unrepresentable: both handles resolve a proxy-cache key to
+/// the same physical object, whatever `S3_PREFIX` is set to.
+///
+/// These are reserved namespaces. No repository format writes artifact bytes
+/// here — hosted keys are `<format>/...` — and the storage-accounting queries
+/// already treat `proxy-cache/%` as "not a hosted artifact".
+pub const BUCKET_ROOT_KEY_NAMESPACES: &[&str] = &["proxy-cache/", "proxy-cache-staging/"];
+
+/// Whether `key` lives in a [`BUCKET_ROOT_KEY_NAMESPACES`] namespace and must
+/// therefore be resolved at the bucket root, with no `S3_PREFIX` applied.
+///
+/// Backends without a key prefix (filesystem, GCS, Azure) resolve every key
+/// identically and are unaffected; this only decides S3 key composition.
+pub fn key_is_bucket_root_anchored(key: &str) -> bool {
+    BUCKET_ROOT_KEY_NAMESPACES
+        .iter()
+        .any(|ns| key.starts_with(ns))
+}
+
 /// Build an inclusive HTTP `Range` header (`bytes=START-END`) for a download
 /// window, validating that the requested length is non-zero and that
 /// `offset + length` does not overflow `u64`.
@@ -850,5 +890,45 @@ mod tests {
 
         assert!(*backend.put_file_called.lock().unwrap());
         assert!(!*backend.put_stream_called.lock().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod bucket_root_namespace_tests {
+    use super::*;
+
+    /// The reserved namespaces, and only those, are anchored at the bucket
+    /// root (#3368).
+    #[test]
+    fn test_reserved_namespaces_are_bucket_root_anchored() {
+        assert!(key_is_bucket_root_anchored(
+            "proxy-cache/repo/simple/six/six.whl/__content__"
+        ));
+        assert!(key_is_bucket_root_anchored(
+            "proxy-cache/repo/simple/six/six.whl/__cache_meta__.json"
+        ));
+        assert!(key_is_bucket_root_anchored(
+            "proxy-cache-staging/0f8fad5b-d9cb-469f-a165-70867728950e"
+        ));
+    }
+
+    /// Hosted artifact keys are `<format>/...` and must never be mistaken for
+    /// cache content, or #3171 (artifact bytes read without their prefix)
+    /// comes back. A `proxy-cache`-ish name that is not the reserved ROOT is
+    /// an ordinary key.
+    #[test]
+    fn test_artifact_keys_are_not_bucket_root_anchored() {
+        for key in [
+            "pypi/six/1.17.0/six-1.17.0-py2.py3-none-any.whl",
+            "maven/org/example/demo/1.0/demo-1.0.jar",
+            "npm/proxy-cache-notes/-/proxy-cache-notes-1.0.0.tgz",
+            "generic/proxy-cache",
+            "",
+        ] {
+            assert!(
+                !key_is_bucket_root_anchored(key),
+                "{key} must keep S3_PREFIX (#3171)"
+            );
+        }
     }
 }

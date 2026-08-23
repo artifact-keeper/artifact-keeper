@@ -507,7 +507,15 @@ const TEE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 /// just fail and degrade like a rejected write). Filesystem-backed
 /// deployments have no equivalent lifecycle mechanism and need a cron/
 /// tmpwatch-style sweep instead.
+/// Kept in lockstep with [`crate::storage::BUCKET_ROOT_KEY_NAMESPACES`]: the
+/// staging objects are written by the prefix-less proxy-cache handle, so the
+/// storage layer must know this namespace is anchored at the bucket root or a
+/// prefixed deployment resolves the same key to two different objects (#3368).
+/// `assert_bucket_root_namespaces_cover_proxy_cache_keys` pins the pairing.
 const TEE_STAGING_KEY_PREFIX: &str = "proxy-cache-staging/";
+
+/// Root of the proxy cache's own key space. Also a bucket-root namespace.
+const PROXY_CACHE_KEY_PREFIX: &str = "proxy-cache/";
 
 /// Default TTL for APT InRelease/Release index files (5 minutes).
 /// Controls how often the proxy re-checks upstream for changes.
@@ -1190,8 +1198,17 @@ impl CacheKeys {
     /// individually: same validation order, same error values, same key format.
     pub(crate) fn derive(repo_key: &str, path: &str) -> Result<CacheKeys> {
         let trimmed = ProxyService::validate_cache_path(path)?;
-        let content = format!("proxy-cache/{}/{}/__content__", repo_key, trimmed);
-        let metadata = format!("proxy-cache/{}/{}/__cache_meta__.json", repo_key, trimmed);
+        // Built from the constant, not a literal, so the namespace declared in
+        // `BUCKET_ROOT_KEY_NAMESPACES` and the namespace actually written are
+        // one string (#3368).
+        let content = format!(
+            "{PROXY_CACHE_KEY_PREFIX}{}/{}/__content__",
+            repo_key, trimmed
+        );
+        let metadata = format!(
+            "{PROXY_CACHE_KEY_PREFIX}{}/{}/__cache_meta__.json",
+            repo_key, trimmed
+        );
         ProxyService::check_cache_key_length(repo_key, trimmed)?;
         Ok(CacheKeys { content, metadata })
     }
@@ -5588,7 +5605,7 @@ impl ProxyService {
     /// distinction matters when presigning: cache keys must be signed through
     /// the no-prefix [`Self::cache_storage_backend`] handle (#1555).
     pub fn is_proxy_cache_key(storage_key: &str) -> bool {
-        storage_key.starts_with("proxy-cache/")
+        storage_key.starts_with(PROXY_CACHE_KEY_PREFIX)
     }
 
     /// Purge every proxy-cache object for a repository from the global default
@@ -6856,6 +6873,39 @@ mod tests {
         // TEE_STAGING_KEY_PREFIX to "proxy-cache/staging/" would silently
         // invert it, which is why this is pinned rather than left to inspection.
         assert!(!ProxyService::is_proxy_cache_key(&format!(
+            "{TEE_STAGING_KEY_PREFIX}0f8fad5b-d9cb-469f-a165-70867728950e"
+        )));
+    }
+
+    /// #3368 drift guard: BOTH key spaces the proxy cache writes must be
+    /// declared bucket-root-anchored in the storage layer.
+    ///
+    /// The prefix policy now follows the key, not the handle. If a new cache
+    /// namespace is introduced here (or one of these constants is renamed)
+    /// without updating `BUCKET_ROOT_KEY_NAMESPACES`, S3 would compose
+    /// `<S3_PREFIX>/<key>` for objects the prefix-less proxy handle writes at
+    /// the root — reopening exactly the split this closed. There is no
+    /// compiler link between the two lists, so it is asserted.
+    #[test]
+    fn test_proxy_cache_namespaces_are_declared_bucket_root_anchored_3368() {
+        for prefix in [PROXY_CACHE_KEY_PREFIX, TEE_STAGING_KEY_PREFIX] {
+            assert!(
+                crate::storage::BUCKET_ROOT_KEY_NAMESPACES.contains(&prefix),
+                "{prefix} is written by the prefix-less proxy-cache handle but is not \
+                 declared in BUCKET_ROOT_KEY_NAMESPACES (#3368)"
+            );
+        }
+
+        // Not just the constants: the keys actually derived from them.
+        let keys = CacheKeys::derive("pypi-remote", "simple/six/six-1.17.0.whl")
+            .expect("derive cache keys");
+        for key in [keys.content.as_str(), keys.metadata.as_str()] {
+            assert!(
+                crate::storage::key_is_bucket_root_anchored(key),
+                "derived cache key {key} must resolve at the bucket root"
+            );
+        }
+        assert!(crate::storage::key_is_bucket_root_anchored(&format!(
             "{TEE_STAGING_KEY_PREFIX}0f8fad5b-d9cb-469f-a165-70867728950e"
         )));
     }

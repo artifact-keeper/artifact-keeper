@@ -1777,14 +1777,7 @@ async fn download_or_metadata(
                 .await;
             }
         }
-        return serve_metadata(
-            &state,
-            &state.db,
-            repo.id,
-            &repo.storage_location(),
-            real_filename,
-        )
-        .await;
+        return serve_metadata(&state, &state.db, &repo, &normalized, real_filename).await;
     }
 
     // Regular file download.
@@ -1981,15 +1974,7 @@ async fn serve_virtual_metadata(
         // Set when this member owns the name but its bytes are temporarily
         // unavailable; confines the fallback to this member (#3372).
         let mut owns_unavailable_bytes = false;
-        match serve_metadata(
-            state,
-            &state.db,
-            member.id,
-            &member.storage_location(),
-            filename,
-        )
-        .await
-        {
+        match serve_metadata(state, &state.db, &member_info, normalized_project, filename).await {
             Ok(response) => return Ok(response),
             Err(response) if response.status() == StatusCode::NOT_FOUND => {}
             // 507: this member HAS an `artifacts` row for the file, but
@@ -3882,13 +3867,79 @@ async fn serve_scanned_pypi_file(
     }
 }
 
+/// What to do when the storage read behind a PEP 658 `.metadata` request
+/// misses — the "row present, object absent" state.
+///
+/// Pure decision, split out from [`serve_metadata`] so the routing rule is
+/// unit-testable without storage, a database or an upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataMissRecovery {
+    /// Re-fetch from **this repository's own upstream** — the same provenance
+    /// the wheel download resolves to — and extract METADATA from those bytes.
+    ///
+    /// Chosen when the row is proxy-cache-backed and the repository is a
+    /// Remote with an upstream: "the bytes are not in the cache" is an
+    /// ordinary, recoverable state for a proxy, not a storage fault. Nothing
+    /// local will ever produce them, so re-reading the same key cannot help.
+    RefetchUpstream,
+    /// The local missing-file repair path: take the cluster-wide hydration
+    /// lease, re-read, and answer 507 if the object is still absent.
+    ///
+    /// Correct for a Local/Staging-owned row, where another replica really may
+    /// be mid-write, and for a proxy-cache row with no upstream to fall back
+    /// to.
+    CoordinatedRetry,
+}
+
+/// Route a `.metadata` storage miss to the recovery that can actually succeed.
+///
+/// `coordinated_retry_get` is documented as the repair path for a **locally
+/// stored** artifact. Applying it to a proxy-cache-backed row on a Remote
+/// repository made the recovery branch dead code: it only ever re-read the
+/// same key, so every miss logged an ERROR and terminated in a permanent 507
+/// while the wheel path — which re-fetches upstream — served the same row
+/// fine (#3463).
+///
+/// Note what does NOT reach this function: a non-`NotFound` storage error.
+/// A real backend fault (auth, timeout, genuine insufficient storage) is still
+/// mapped by `map_storage_err` and surfaced, never silently converted into an
+/// upstream re-fetch.
+fn metadata_miss_recovery(
+    storage_key: &str,
+    is_remote: bool,
+    has_upstream: bool,
+    has_proxy_service: bool,
+) -> MetadataMissRecovery {
+    let proxy_cache_backed =
+        crate::services::proxy_service::ProxyService::is_proxy_cache_key(storage_key);
+    if proxy_cache_backed && is_remote && has_upstream && has_proxy_service {
+        MetadataMissRecovery::RefetchUpstream
+    } else {
+        MetadataMissRecovery::CoordinatedRetry
+    }
+}
+
+/// The single 507 answer for "this repository owns the name but its bytes are
+/// unavailable", worded identically to the one `serve_virtual_metadata`
+/// synthesises so a client sees one message whichever layer produced it.
+#[allow(clippy::result_large_err)]
+fn insufficient_storage_metadata_response() -> Response {
+    (
+        StatusCode::INSUFFICIENT_STORAGE,
+        "artifact metadata unavailable; retry later",
+    )
+        .into_response()
+}
+
 async fn serve_metadata(
     state: &SharedState,
     db: &PgPool,
-    repo_id: uuid::Uuid,
-    location: &crate::storage::StorageLocation,
+    repo: &RepoInfo,
+    project: &NormalizedProjectName,
     filename: &str,
 ) -> Result<Response, Response> {
+    let repo_id = repo.id;
+    let location = &repo.storage_location();
     // Find the artifact through the SAME resolver the distribution download
     // uses (#3405).
     //
@@ -3931,14 +3982,78 @@ async fn serve_metadata(
         // 507 keeps metadata and the wheel failing together, which is the
         // invariant that matters. The caller's loop treats it as "owns the
         // name, bytes unavailable" and confines the fallback to this member.
+        //
+        // #3463: that reasoning holds for a LOCALLY stored row. It does not
+        // hold for a proxy-cache-backed row on a Remote repository, where "the
+        // bytes are not in the cache" is the repository's ordinary state and
+        // no local writer will ever produce them — re-reading the same key
+        // 507s forever. Route that case to the repository's OWN upstream
+        // instead, which is the same provenance the wheel download resolves
+        // to, so #3372's "metadata and wheel fail together, never fall through
+        // to a different member" invariant is preserved: on failure we still
+        // answer 507, never the 404 that would let resolution continue.
         Err(AppError::NotFound(_)) => {
-            crate::api::handlers::proxy_helpers::coordinated_retry_get(
-                db,
-                artifact.id,
+            match metadata_miss_recovery(
                 &artifact.storage_key,
-                storage.as_ref(),
-            )
-            .await?
+                repo.repo_type == RepositoryType::Remote,
+                repo.upstream_url.is_some(),
+                state.proxy_service.is_some(),
+            ) {
+                MetadataMissRecovery::RefetchUpstream => {
+                    // Both are `Some` by construction of the branch above.
+                    let (Some(upstream_url), Some(proxy)) =
+                        (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+                    else {
+                        return Err(insufficient_storage_metadata_response());
+                    };
+                    tracing::debug!(
+                        artifact_id = %artifact.id,
+                        storage_key = %artifact.storage_key,
+                        repo_key = %repo.key,
+                        "proxy-cache-backed metadata row is not in the cache; \
+                         re-fetching from this repository's own upstream (#3463)"
+                    );
+                    return match serve_remote_metadata(
+                        state,
+                        proxy,
+                        repo_id,
+                        &repo.key,
+                        upstream_url,
+                        project,
+                        filename,
+                    )
+                    .await
+                    {
+                        Ok(response) => Ok(response),
+                        // The member owns the name and its own upstream could
+                        // not produce it either. Answer 507, NOT the upstream
+                        // status: a 404 here is the virtual member loop's
+                        // "this member does not have it" signal and would let
+                        // a lower-priority member answer for a name this one
+                        // owns (#3372).
+                        Err(response) => {
+                            tracing::warn!(
+                                artifact_id = %artifact.id,
+                                storage_key = %artifact.storage_key,
+                                repo_key = %repo.key,
+                                upstream_status = %response.status(),
+                                "upstream re-fetch could not produce METADATA for a \
+                                 proxy-cache-backed row; answering 507"
+                            );
+                            Err(insufficient_storage_metadata_response())
+                        }
+                    };
+                }
+                MetadataMissRecovery::CoordinatedRetry => {
+                    crate::api::handlers::proxy_helpers::coordinated_retry_get(
+                        db,
+                        artifact.id,
+                        &artifact.storage_key,
+                        storage.as_ref(),
+                    )
+                    .await?
+                }
+            }
         }
         Err(other) => return Err(map_storage_err(other)),
     };
@@ -15116,9 +15231,10 @@ mod tests {
             .await;
         }
 
-        let bare_meta = super::serve_metadata(&state, &fx.pool, fx.repo_id, &location, bare).await;
+        let project = crate::formats::pypi_name::NormalizedProjectName::parse("barepkg").unwrap();
+        let bare_meta = super::serve_metadata(&state, &fx.pool, &repo_info, &project, bare).await;
         let nested_meta =
-            super::serve_metadata(&state, &fx.pool, fx.repo_id, &location, nested).await;
+            super::serve_metadata(&state, &fx.pool, &repo_info, &project, nested).await;
         // The wheel itself resolved fine before this fix; assert the pair stays
         // consistent rather than trusting that separately.
         let bare_wheel = proxy_helpers::local_fetch_or_redirect_by_suffix(
@@ -16215,6 +16331,195 @@ mod tests {
         assert!(
             html.contains("data-core-metadata"),
             "wheel core-metadata not advertised in the HTML branch"
+        );
+    }
+
+    // -- #3463: PEP 658 metadata recovery on a proxy-cache-backed row -------
+
+    /// The routing rule, exhaustively. `coordinated_retry_get` is the repair
+    /// path for a LOCALLY stored artifact: it re-reads the same key under a
+    /// hydration lease and 507s if the object is still absent. On a
+    /// proxy-cache-backed row in a Remote repository nothing local will ever
+    /// write those bytes, so the retry is dead code and the 507 is permanent —
+    /// observed 1:1 with the miss on a real deployment.
+    ///
+    /// FAILS ON MAIN: there is no routing at all, every miss went to
+    /// `coordinated_retry_get`.
+    #[test]
+    fn test_metadata_miss_recovery_routes_proxy_cache_rows_upstream_3463() {
+        let cache_key = "proxy-cache/pypi-remote/simple/six/six-1.17.0.whl/__content__";
+        let hosted_key = "pypi/six/1.17.0/six-1.17.0.whl";
+
+        assert_eq!(
+            super::metadata_miss_recovery(cache_key, true, true, true),
+            super::MetadataMissRecovery::RefetchUpstream,
+            "a proxy-cache row on a Remote repo with an upstream must re-fetch, \
+             exactly as the wheel download does"
+        );
+
+        // Every other combination keeps the pre-existing behaviour. These are
+        // the controls: a fix that returned RefetchUpstream unconditionally
+        // would pass the assertion above while sending Local/Staging rows —
+        // which genuinely are a local-storage fault with no upstream — down a
+        // path that cannot help them.
+        for (key, is_remote, has_upstream, has_proxy, why) in [
+            (
+                hosted_key,
+                true,
+                true,
+                true,
+                "a hosted row on a Remote repo is a real local-storage fault",
+            ),
+            (
+                cache_key,
+                false,
+                true,
+                true,
+                "a Local/Staging repo has no upstream of its own to recover from",
+            ),
+            (
+                cache_key,
+                true,
+                false,
+                true,
+                "a Remote with no upstream_url has nothing to re-fetch from",
+            ),
+            (
+                cache_key,
+                true,
+                true,
+                false,
+                "no proxy service (e.g. an Azure deployment) means no fetch path",
+            ),
+        ] {
+            assert_eq!(
+                super::metadata_miss_recovery(key, is_remote, has_upstream, has_proxy),
+                super::MetadataMissRecovery::CoordinatedRetry,
+                "{why}"
+            );
+        }
+    }
+
+    /// End-to-end on the real function: a `.metadata` request against a
+    /// proxy-cache-backed row whose object is absent must recover from the
+    /// repository's OWN upstream and serve the extracted METADATA — instead of
+    /// terminating in a permanent 507 (#3463).
+    ///
+    /// Driven through `serve_metadata` directly, which is what
+    /// `serve_virtual_metadata` calls for every member (local-first). Driving
+    /// it through the HTTP route would prove nothing: a direct Remote with an
+    /// upstream dispatches to `serve_remote_metadata` before reaching here, and
+    /// the virtual loop's own fallback masks the 507 by re-resolving the member
+    /// upstream a second time. The point of this fix is that the recovery
+    /// happens where the miss happens.
+    ///
+    /// The second half is the negative control that keeps a legitimate 507
+    /// distinguishable: an identically-absent object behind a HOSTED storage
+    /// key must still take the coordinated-retry path and answer 507. Without
+    /// it, "always re-fetch" would pass.
+    ///
+    /// FAILS ON MAIN: the proxy-cache row answers 507.
+    #[tokio::test]
+    async fn test_serve_metadata_refetches_upstream_for_proxy_cache_row_3463() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(wheel_with_metadata("demo-1.0", metadata)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        let normalized =
+            crate::formats::pypi_name::NormalizedProjectName::parse(project).expect("valid name");
+
+        // Two rows, same repository, same absent-object state, different key
+        // layouts. Nothing is written to storage for either.
+        let rows: [(&str, &str); 2] = [
+            (
+                wheel,
+                "proxy-cache/pypi-remote/simple/demo/demo-1.0-py3-none-any.whl/__content__",
+            ),
+            (
+                "demo-2.0-py3-none-any.whl",
+                "pypi/demo/2.0/demo-2.0-py3-none-any.whl",
+            ),
+        ];
+        for (filename, storage_key) in rows {
+            sqlx::query(
+                "INSERT INTO artifacts ( \
+                     repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by \
+                 ) VALUES ($1, $2, 'demo', '1.0', 42, $3, 'application/zip', $4, $5)",
+            )
+            .bind(fx.repo_id)
+            .bind(format!("demo/1.0/{filename}"))
+            .bind(format!("sha-{filename}"))
+            .bind(storage_key)
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await
+            .expect("seed artifact row");
+        }
+
+        let cached = super::serve_metadata(&state, &fx.pool, &repo_info, &normalized, wheel).await;
+        let hosted = super::serve_metadata(
+            &state,
+            &fx.pool,
+            &repo_info,
+            &normalized,
+            "demo-2.0-py3-none-any.whl",
+        )
+        .await;
+
+        let (cached_status, cached_body) = collect_serve_3220(cached).await;
+        let (hosted_status, _) = collect_serve_3220(hosted).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            cached_status,
+            StatusCode::OK,
+            "#3463: a proxy-cache-backed row whose bytes are not in the cache must be \
+             recovered from this repository's own upstream, not answered 507 forever; \
+             body: {}",
+            String::from_utf8_lossy(&cached_body)
+        );
+        assert_eq!(
+            &cached_body[..],
+            metadata,
+            "the served METADATA must be the re-fetched wheel's own METADATA"
+        );
+        assert_eq!(
+            hosted_status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "negative control: a HOSTED row with an absent object is a real local-storage \
+             fault and must still take the coordinated-retry path and surface 507"
         );
     }
 }

@@ -541,6 +541,12 @@ pub fn backend_supports_proxy_cache(storage_backend: &str) -> bool {
 /// Reusing the prefix-less proxy-cache handle to read artifact bytes was the
 /// #3171 bug: backup looked for `<storage_key>` while the bytes lived at
 /// `<S3_PREFIX>/<storage_key>`, so it missed every object.
+///
+/// The mirror-image mistake — reading proxy-cache content through the
+/// ArtifactSource handle, which composed `<S3_PREFIX>/proxy-cache/...` — was
+/// #3368. It is no longer expressible: `make_full_key` anchors the reserved
+/// `proxy-cache/` and `proxy-cache-staging/` namespaces at the bucket root for
+/// both roles, so the key, not the handle, decides the layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageRole {
     /// Cache facade for remote/proxy repositories. Content is anchored at the
@@ -556,6 +562,14 @@ impl StorageRole {
     ///
     /// Only the S3 backend has a key prefix; filesystem and GCS resolve keys
     /// identically for both roles, so this is the whole of the divergence.
+    ///
+    /// Since #3368 this is belt-and-braces rather than the sole guarantee: the
+    /// S3 backend anchors every key in a
+    /// [`crate::storage::BUCKET_ROOT_KEY_NAMESPACES`] namespace at the bucket
+    /// root regardless of which role built the handle, so a proxy-cache key
+    /// resolves to the same object through either handle. The role policy is
+    /// retained because it keeps the ProxyCache handle's *whole* key space
+    /// prefix-free and documents intent at construction time.
     pub fn apply_s3_prefix_policy(self, config: &mut crate::storage::s3::S3Config) {
         match self {
             // Proxy-cache content is anchored at the bucket root (#1555).
@@ -1753,6 +1767,61 @@ mod tests {
         assert_ne!(
             proxy.prefix, source.prefix,
             "the two roles must genuinely differ when S3_PREFIX is set"
+        );
+
+        let restore = |name: &str, val: Option<String>| match val {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        restore("S3_BUCKET", orig_bucket);
+        restore("S3_PREFIX", orig_prefix);
+    }
+
+    /// #3368: whichever role a caller holds, a proxy-cache key must resolve to
+    /// the SAME physical object.
+    ///
+    /// The role prefix policy alone does not give that: it only decides what
+    /// the handle's own key space looks like, and an `artifacts` row carrying a
+    /// `proxy-cache/...` key is read through the ArtifactSource handle by every
+    /// format's local-artifact path. The layout has to follow the KEY. Composes
+    /// the physical key through both roles' configs and asserts they agree.
+    ///
+    /// FAILS ON MAIN: the ArtifactSource composition was
+    /// `<S3_PREFIX>/proxy-cache/...`, which nothing ever writes.
+    #[test]
+    fn storage_roles_resolve_proxy_cache_keys_to_the_same_object_3368() {
+        let _guard = s3_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+        let orig_bucket = std::env::var("S3_BUCKET").ok();
+        let orig_prefix = std::env::var("S3_PREFIX").ok();
+        std::env::set_var("S3_BUCKET", "ak-artifacts");
+        // The variable under test. Without a prefix the two layouts coincide
+        // and the bug is invisible, which is why it went unnoticed.
+        std::env::set_var("S3_PREFIX", "team-a/registry");
+
+        let mut source = crate::storage::s3::S3Config::from_env().expect("source config");
+        StorageRole::ArtifactSource.apply_s3_prefix_policy(&mut source);
+        let mut proxy = crate::storage::s3::S3Config::from_env().expect("proxy config");
+        StorageRole::ProxyCache.apply_s3_prefix_policy(&mut proxy);
+
+        let cache_key = "proxy-cache/pypi-remote/simple/six/six-1.17.0.whl/__content__";
+        let written = crate::storage::s3::make_full_key(proxy.prefix.as_deref(), cache_key);
+        let read = crate::storage::s3::make_full_key(source.prefix.as_deref(), cache_key);
+        assert_eq!(
+            read, written,
+            "an artifacts row whose storage_key is proxy-cache content is read through \
+             the ArtifactSource handle; it must address the object the ProxyCache handle \
+             wrote (#3368)"
+        );
+        assert_eq!(written, cache_key, "and that object is at the bucket root");
+
+        // Negative control: artifact bytes must still diverge from the
+        // prefix-less handle, or #3171 is back.
+        let artifact_key = "pypi/six/1.17.0/six-1.17.0.whl";
+        assert_ne!(
+            crate::storage::s3::make_full_key(source.prefix.as_deref(), artifact_key),
+            crate::storage::s3::make_full_key(proxy.prefix.as_deref(), artifact_key),
+            "artifact bytes still live under S3_PREFIX; a prefix-less read misses them (#3171)"
         );
 
         let restore = |name: &str, val: Option<String>| match val {
