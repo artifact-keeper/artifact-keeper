@@ -1895,6 +1895,143 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // A partial success must be STORABLE, not just computable (issue #3497)
+    // -----------------------------------------------------------------------
+
+    /// DB-backed proof for #3497.
+    ///
+    /// `determine_final_status(failed > 0, completed > 0)` returns
+    /// `CompletedWithErrors`, which `Display`s as `completed_with_errors`.
+    /// Migration 020's CHECK constraint on `migration_jobs.status` never listed
+    /// that value and was never altered, so `finalize_job_status` came back with
+    /// a check-constraint violation for every mixed-outcome job; `process_job`
+    /// propagated it and the spawn wrapper in `api/handlers/migration.rs`
+    /// stamped the job `failed` with the raw Postgres text in `error_summary` —
+    /// a total failure reported for a run most of whose artifacts transferred.
+    /// Migration 207 adds the value to the constraint.
+    ///
+    /// This test goes through the database on purpose. `migration_worker` has
+    /// seven `determine_final_status` tests, two of which assert exactly this
+    /// enum; all of them passed for as long as the write was impossible,
+    /// because none of them writes. The function was never wrong — the column
+    /// was. So the status under test is taken from `determine_final_status`
+    /// itself rather than hand-written, and every assertion is on the row that
+    /// came back out of Postgres.
+    ///
+    /// The loop over the whole status set is the negative control: it proves
+    /// the constraint still REJECTS an unknown value, so this cannot be
+    /// satisfied by simply dropping the constraint.
+    ///
+    /// No-ops when `DATABASE_URL` is unset so it skips cleanly off-CI.
+    #[tokio::test]
+    async fn test_finalize_job_status_stores_completed_with_errors_3497() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::migration_worker::determine_final_status;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("partial-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed source connection");
+
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config, status, \
+             completed_items, failed_items) \
+             VALUES ($1, 'full', '{}'::jsonb, 'running', 47, 3) RETURNING id",
+        )
+        .bind(conn_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed migration job");
+
+        // 47 transferred, 3 failed: the mixed outcome the worker reports.
+        let final_status = determine_final_status(3, 47);
+        assert_eq!(
+            final_status,
+            MigrationJobStatus::CompletedWithErrors,
+            "a mixed outcome must resolve to CompletedWithErrors"
+        );
+
+        let svc = MigrationService::new(pool.clone());
+        let finalized = svc
+            .finalize_job_status(job_id, final_status)
+            .await
+            .expect("a partially-successful job must be storable, not a constraint violation");
+        assert!(finalized, "a running job finalizes");
+
+        let (status, finished, completed_items, failed_items): (String, bool, i32, i32) =
+            sqlx::query_as(
+                "SELECT status, finished_at IS NOT NULL, completed_items, failed_items \
+                 FROM migration_jobs WHERE id = $1",
+            )
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read finalized job row");
+        assert_eq!(
+            status, "completed_with_errors",
+            "the partial success must be recorded as itself, not collapsed into failed"
+        );
+        assert!(finished, "finalize must stamp finished_at");
+        assert_eq!(
+            (completed_items, failed_items),
+            (47, 3),
+            "the per-item counters that explain the partial outcome must survive"
+        );
+
+        // The constraint must still accept every status the model can produce
+        // and still reject anything else — a fix that just dropped the CHECK
+        // would satisfy the assertions above.
+        for accepted in [
+            MigrationJobStatus::Pending,
+            MigrationJobStatus::Assessing,
+            MigrationJobStatus::Ready,
+            MigrationJobStatus::Running,
+            MigrationJobStatus::Paused,
+            MigrationJobStatus::Completed,
+            MigrationJobStatus::CompletedWithErrors,
+            MigrationJobStatus::Failed,
+            MigrationJobStatus::Cancelled,
+        ] {
+            sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
+                .bind(accepted.to_string())
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("status '{accepted}' must be storable: {e}"));
+        }
+
+        let rejected = sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
+            .bind("definitely_not_a_status")
+            .bind(job_id)
+            .execute(&pool)
+            .await;
+        assert!(
+            rejected.is_err(),
+            "the status CHECK must still reject a value outside the model's set"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    // -----------------------------------------------------------------------
     // storage_path convention for auto-provisioned repos (#2336, #2025)
     // -----------------------------------------------------------------------
 
