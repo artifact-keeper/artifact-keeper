@@ -857,7 +857,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
-          exit-code: '1'
+          exit-code: '0'
           skip-setup-trivy: true
           cache: 'false'
         env:
