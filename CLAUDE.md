@@ -22,13 +22,20 @@ tests/
 # Backend lint and unit tests
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --lib
+cargo nextest run --workspace --lib --test-threads 8
 ```
 
 ### Integration Tests (Tier 2) - Main/Release Pushes & Backend PRs
+
+CI does **not** run the whole `backend/tests/` tree. It names a fixed list of
+test files and runs their `#[ignore]`d cases serially, because the rest either
+need a live HTTP server or race on shared schema state. See the "Run
+integration tests" step in `.github/workflows/ci.yml` for the current list, and
+mirror that shape locally:
+
 ```bash
 # Backend integration tests (requires PostgreSQL)
-cargo test --workspace
+cargo test --workspace --verbose --test <test_file_name> -- --ignored --test-threads=1
 ```
 CI runs this suite on pushes to `main` / `release/*` **and** on every pull
 request that touches `backend/**`, `Cargo.toml`, `Cargo.lock`, `.sqlx/**`, or
@@ -215,8 +222,36 @@ Every commit must pass these checks locally before pushing. Do NOT use "push and
 ```bash
 cargo fmt --check                                          # formatting
 cargo clippy --workspace --all-targets -- -D warnings      # linting
-cargo test --workspace --lib                               # unit tests
+cargo nextest run --workspace --lib --test-threads 8       # unit tests
 ```
+
+**Use `cargo nextest`, not plain `cargo test`.** That is the runner both CI
+unit-test jobs invoke (`.github/workflows/ci.yml`), and the difference is
+load-bearing rather than cosmetic: nextest runs each test in its own process,
+and a number of unit tests depend on that isolation because they touch
+process-global state (upload semaphores, proxy environment variables) or are
+serialized only by `.config/nextest.toml`'s `db-serial` test groups, which a
+plain `cargo test` run does not honour. Run the suite under the single-process
+runner instead and a clean tree fails tests that have nothing to do with your
+change (#3479). Install it once with `cargo install cargo-nextest --locked`.
+
+The unit tests need the same environment CI gives them, or the DB-backed ones
+quietly no-op:
+
+```bash
+# A throwaway database — never point this at a live instance; the tests
+# create, mutate and delete rows across the whole schema.
+export DATABASE_URL=postgresql://registry:registry@localhost:5432/artifact_registry
+export AK_TESTS_REQUIRE_DB=1  # a DB-backed test that cannot connect FAILS instead of skipping
+export SQLX_OFFLINE=true      # compile against the committed .sqlx query cache
+export JWT_SECRET=any-value-at-least-32-bytes-long-for-tests
+sqlx migrate run --source backend/migrations
+cargo nextest run --workspace --lib --test-threads 8
+```
+
+Without `AK_TESTS_REQUIRE_DB=1` a missing or unreachable database makes every
+DB-backed test skip and report success — a green run that proved nothing. The
+tell is a test that finishes in ~0.04s.
 
 Additionally, before pushing:
 - **Code coverage**: new/changed lines MUST have >= 70% test coverage. The CI gate measures only lines you added or modified (not the entire file). Extract testable logic into pure helper functions to make handler code coverable.

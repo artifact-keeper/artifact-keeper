@@ -605,6 +605,20 @@ jobs:
       - name: Check release-branch gate exemptions stay narrow
         run: bash scripts/ci/test-check-release-branch-commits.sh
 
+      # Documentation describing a gate configuration that has since moved is
+      # invisible to every other check here: docs are not compiled, linted or
+      # executed. CLAUDE.md's mandatory pre-push checklist named
+      # a plain `cargo test` unit-test run long after both CI unit-test jobs had
+      # moved to nextest, so a contributor following it saw ten NuGet failures
+      # unrelated to their change on a clean tree, and a hung run at the default
+      # thread count — which teaches people to ignore red (#3479). This pins the
+      # documented command to the one CI invokes. ~1s, no dependencies.
+      - name: Check the pre-push test command matches CI
+        run: ./scripts/ci/check-docs-test-command.sh
+
+      - name: Check the docs/CI drift gate catches what it must
+        run: bash scripts/ci/test-check-docs-test-command.sh
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners

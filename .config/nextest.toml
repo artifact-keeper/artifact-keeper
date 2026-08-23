@@ -44,13 +44,24 @@
 # Under nextest's process-per-test model those in-process mutexes do NOT
 # serialize across the suite, so the tests interfere nondeterministically, fail,
 # and abort the instrumented run before `lcov.info` is written — leaving the
-# Code Coverage gate red (#1753). The plain `cargo test --workspace --lib`
-# unit-test job runs every test in a single process, so the in-process mutexes
-# still work there — which is why that gate stays green while coverage fails.
+# Code Coverage gate red (#1753).
+#
+# There is no longer a single-process unit-test job to fall back on (#3479).
+# BOTH CI unit-test jobs — the Tier 1 unit tests and the coverage job — run
+# `cargo nextest run --workspace --lib --test-threads 8`, so the groups below
+# are the ONLY thing serializing these suites in CI. They are not a
+# coverage-specific workaround, and removing an entry breaks the unit-test gate
+# outright rather than degrading one job.
+#
+# An earlier revision of this comment claimed a plain single-process
+# `cargo test` job kept the in-process mutexes working there. That job no
+# longer exists, and the premise did not generalize anyway: the `sync_worker`
+# entries below have no in-process mutex at all — under a multi-threaded
+# single-process run they fail today — so for those the groups are the only
+# serialization that has ever existed.
 #
 # Pin every test that mutates this shared DB state to a single-threaded test
-# group so nextest never runs two of them at once, restoring the serialization
-# the in-process mutexes provide under `cargo test`. Add new tests that take
+# group so nextest never runs two of them at once. Add new tests that take
 # STUCK_SCAN_LOCK_ID or `storage_gc_test_guard()`, or that call
 # `recover_expired_sync_task_claims` or `run_repair` and assert on its global
 # result, to the matching filter below.
