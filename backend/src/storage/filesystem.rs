@@ -107,11 +107,21 @@ impl FilesystemStorage {
         self
     }
 
-    /// The root `key` resolves against: the global storage root for reserved
+    /// The root a key resolves against: the global storage root for reserved
     /// bucket-root namespaces, this handle's repository directory otherwise.
-    fn root_for(&self, key: &str) -> &PathBuf {
+    ///
+    /// Takes the SANITIZED key, not the raw one. Deciding the root from the
+    /// raw key while `key_to_path` builds the tail from the sanitized key
+    /// would let the two disagree, so one logical object could land in two
+    /// physical places — a miniature of the very defect this anchoring exists
+    /// to remove. `"proxy-cache/r/x"` is anchored but `"/proxy-cache/r/x"` and
+    /// `"../proxy-cache/r/x"` are not, even though all three sanitize to the
+    /// same relative path. Nothing reaches this with such a key today
+    /// (`validate_cache_path` trims a leading `/` and rejects dot segments),
+    /// which is exactly why it is worth closing while it is still cheap.
+    fn root_for(&self, sanitized_key: &str) -> &PathBuf {
         match &self.bucket_root {
-            Some(root) if crate::storage::key_is_bucket_root_anchored(key) => root,
+            Some(root) if crate::storage::key_is_bucket_root_anchored(sanitized_key) => root,
             _ => &self.base_path,
         }
     }
@@ -149,7 +159,9 @@ impl FilesystemStorage {
         // reads looked under `<base>/pr/proxy-cache/...`.
         // Reserved bucket-root namespaces resolve against the global storage
         // root, not this repository's directory (#3368) — see `bucket_root`.
-        let root = self.root_for(key);
+        // Decided from the SANITIZED key so the root and the path tail cannot
+        // be derived from different strings.
+        let root = self.root_for(&sanitized_str);
 
         if sanitized.components().count() > 1 {
             return root.join(&sanitized);

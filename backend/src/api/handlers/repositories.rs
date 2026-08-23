@@ -4185,6 +4185,23 @@ async fn purge_repo_artifact_objects(
 ///
 /// The exclusivity and OCI-exclusion rules are documented on
 /// [`purge_repo_artifact_objects`].
+///
+/// `proxy-cache/%` is excluded for the same reason the storage GC excludes it
+/// (#3368), and the reason is worth restating because the exclusivity guard
+/// above does NOT cover it: that guard only asks whether another *`artifacts`*
+/// row shares the key, and a proxy-cache object's real owner is a
+/// `proxy_cache_artifacts` row, which this query cannot see. A legacy
+/// `artifacts` row carrying a proxy-cache key therefore looks exclusively
+/// owned while the live cache entry it names belongs to the proxy catalog —
+/// deleting the object would strand that catalog row and its `size_bytes`.
+///
+/// Cache keys are derived from `(repo_key, path)`, so this is normally the
+/// repository's own cache content, which `purge_repo_cache` reclaims properly
+/// on delete anyway. It stops being the repository's own content after a key
+/// rename with reuse, at which point this sweep would reach into another
+/// repository's cache. Before the layout was anchored the delete resolved to a
+/// key nothing had written and silently hit nothing; anchoring it makes the
+/// delete land, so the exclusion lands with it.
 async fn collect_repo_artifact_object_keys(
     state: &SharedState,
     repo_id: Uuid,
@@ -4193,6 +4210,7 @@ async fn collect_repo_artifact_object_keys(
     let mut keys: std::collections::BTreeSet<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.storage_key FROM artifacts a \
          WHERE a.repository_id = $1 \
+           AND a.storage_key NOT LIKE 'proxy-cache/%' \
            AND a.storage_key NOT LIKE 'oci-manifests/%' \
            AND a.storage_key NOT LIKE 'oci-blobs/%' \
            AND NOT EXISTS ( \
@@ -20741,6 +20759,83 @@ mod tests {
             .await
             .expect("delete other repo");
         fx.teardown().await;
+    }
+
+    /// #3368: the repository-delete purge must not reclaim proxy-cache
+    /// objects.
+    ///
+    /// The purge's exclusivity guard asks only whether another *`artifacts`*
+    /// row shares the key. A proxy-cache object's real owner is a
+    /// `proxy_cache_artifacts` row, which that query cannot see, so a legacy
+    /// `artifacts` row carrying a cache key looks exclusively owned while the
+    /// object it names is live cache content. Cache keys embed the *cache
+    /// owner's* repository key, so after a repository key rename with reuse
+    /// this reaches into a different repository's cache entirely.
+    ///
+    /// Before the layout was anchored the delete resolved to a key nothing had
+    /// written and silently hit nothing; anchoring it makes the delete land.
+    ///
+    /// FAILS ON MAIN (with the anchoring in place): the cache object is
+    /// deleted while its `proxy_cache_artifacts` row survives.
+    #[tokio::test]
+    async fn purge_repo_artifact_objects_spares_proxy_cache_objects_3368() {
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = state.storage_for_repo(&location).expect("resolve storage");
+
+        // One cache object (owned by a DIFFERENT repository's cache key space)
+        // and one ordinary hosted object, both referenced by rows on the
+        // repository being deleted.
+        let uid = Uuid::new_v4().simple().to_string();
+        let cache_key =
+            format!("proxy-cache/some-other-remote-{uid}/simple/six/six-1.0.whl/__content__");
+        let hosted_key = format!("pypi/six/1.0/six-1.0-{uid}.whl");
+        for key in [&cache_key, &hosted_key] {
+            storage
+                .put(key, bytes::Bytes::from_static(b"payload"))
+                .await
+                .expect("seed object");
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by) \
+                 VALUES ($1, $2, 'six', '1.0', 7, 'cafe', 'application/zip', $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(key)
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await
+            .expect("insert artifacts row");
+        }
+
+        purge_repo_artifact_objects(&state, fx.repo_id, &location).await;
+
+        let cache_object = storage
+            .exists(&cache_key)
+            .await
+            .expect("probe cache object");
+        let hosted_object = storage
+            .exists(&hosted_key)
+            .await
+            .expect("probe hosted object");
+        fx.teardown().await;
+
+        assert!(
+            cache_object,
+            "#3368: proxy-cache content belongs to proxy_cache_artifacts, which this purge \
+             cannot see; deleting it strands that catalog row and its size_bytes"
+        );
+        assert!(
+            !hosted_object,
+            "negative control: the repository's own hosted object must still be purged, or \
+             the sweep has been disabled rather than scoped"
+        );
     }
 
     #[tokio::test]

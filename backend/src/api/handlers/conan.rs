@@ -3812,10 +3812,16 @@ mod tests {
             let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
                 crate::storage::filesystem::FilesystemStorage::new(storage_path),
             );
-            let registry = Arc::new(crate::storage::StorageRegistry::new(
-                std::collections::HashMap::new(),
-                "filesystem".to_string(),
-            ));
+            // Production parity (#3368): the registry knows the global storage
+            // root, matching `test_db_helpers`' filesystem builders, so
+            // reserved bucket-root namespaces resolve there.
+            let registry = Arc::new(
+                crate::storage::StorageRegistry::new(
+                    std::collections::HashMap::new(),
+                    "filesystem".to_string(),
+                )
+                .with_filesystem_bucket_root(storage_path),
+            );
             Arc::new(AppState::new(
                 test_config(storage_path),
                 pool,

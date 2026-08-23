@@ -46,23 +46,6 @@ const OCI_CLEANUP_KEY_CLAIM_TTL_SQL: &str = "INTERVAL '15 minutes'";
 /// (#1180); keeping them literally identical is the cheap structural
 /// guarantee that they stay aligned.
 ///
-/// The `proxy-cache/%` exclusion (#3368): a soft-deleted `artifacts` row can
-/// carry a proxy-cache storage key. Those are legacy rows from before the
-/// proxy catalog was split out (#1278) — modern proxy traffic writes
-/// `proxy_cache_artifacts`, never `artifacts` — but the KEY is derived purely
-/// from `(repo_key, path)`, so the object such a row names is the *same*
-/// object a live `proxy_cache_artifacts` row points at. This predicate does
-/// not consult `proxy_cache_artifacts` at all, so without the exclusion GC
-/// would delete a live cache entry out from under its own catalog row,
-/// leaving a `size_bytes` over-count that only clears on the next fetch.
-///
-/// It never mattered before because the delete was issued against the wrong
-/// key anyway (`<S3_PREFIX>/proxy-cache/...`, or the per-repo filesystem
-/// root), so it silently hit nothing. Anchoring the layout makes the delete
-/// land, which is exactly why the exclusion has to land with it. Proxy-cache
-/// objects have their own reclamation path (`purge_repo_cache`, TTL/lifecycle
-/// expiry); they are not this GC's to collect.
-///
 /// The `'oci-manifests/'` literals below are the SQL embedding of
 /// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX) — the same prefix `manifest_storage_key()`
 /// (`oci_v2.rs`) produces on writes and the lifecycle cascade
@@ -71,7 +54,6 @@ const OCI_CLEANUP_KEY_CLAIM_TTL_SQL: &str = "INTERVAL '15 minutes'";
 /// `const _: () = assert!(...)` after this constant (#1413).
 const ORPHAN_PREDICATE_SQL: &str = r#"
 a.is_deleted = true
-AND a.storage_key NOT LIKE 'proxy-cache/%'
 AND NOT EXISTS (
     SELECT 1 FROM artifacts a2
     WHERE a2.storage_key = a.storage_key
@@ -764,16 +746,52 @@ impl StorageGcService {
                 // retry after a crash mid-delete still reclaims the soft-deleted
                 // row instead of erroring every pass — matching the cloud
                 // backends' NotFound→Ok mapping.
-                match storage.delete(&storage_key).await {
-                    Ok(()) | Err(AppError::NotFound(_)) => {}
-                    Err(e) => {
-                        let _ = tx.rollback().await;
-                        let msg =
-                            format_gc_error("delete storage key", &storage_key, &e.to_string());
-                        tracing::warn!("{}", msg);
-                        result.errors.push(msg);
-                        // Skip DB cleanup if storage delete fails
-                        continue;
+                //
+                // ...except for proxy-cache content, whose object is NOT this
+                // sweep's to reclaim (#3368). A soft-deleted `artifacts` row
+                // can carry a `proxy-cache/` key — legacy rows from before the
+                // proxy catalog was split out (#1278). The key is derived
+                // purely from `(repo_key, path)`, so the object such a row
+                // names is the SAME object a live `proxy_cache_artifacts` row
+                // points at, and this predicate never consults that catalog:
+                // deleting it would destroy a live cache entry and leave a
+                // dangling catalog row whose `size_bytes` only clears on the
+                // next fetch. Proxy-cache objects are reclaimed by
+                // `purge_repo_cache` and by TTL/lifecycle expiry.
+                //
+                // The stale `artifacts` ROW is still reclaimed below, which is
+                // the point of skipping only the delete rather than excluding
+                // the key from the candidate scan: the row is a redundant
+                // second reference to an object the proxy catalog owns, and
+                // leaving it behind would make these rows unreclaimable — the
+                // hard-delete here is the only reaper of soft-deleted
+                // `artifacts` rows in the codebase.
+                //
+                // It never mattered before because the delete was issued
+                // against a key nothing had written (`<S3_PREFIX>/proxy-cache/…`,
+                // or the per-repository filesystem root) and silently hit
+                // nothing. Anchoring the layout makes it land, which is why
+                // the guard has to be explicit now.
+                let is_cache_object =
+                    crate::services::proxy_service::ProxyService::is_proxy_cache_key(&storage_key);
+                if is_cache_object {
+                    tracing::debug!(
+                        storage_key = storage_key.as_str(),
+                        "GC reclaiming the stale artifacts row only; the object belongs to the \
+                         proxy cache catalog and is left for purge_repo_cache / lifecycle expiry"
+                    );
+                } else {
+                    match storage.delete(&storage_key).await {
+                        Ok(()) | Err(AppError::NotFound(_)) => {}
+                        Err(e) => {
+                            let _ = tx.rollback().await;
+                            let msg =
+                                format_gc_error("delete storage key", &storage_key, &e.to_string());
+                            tracing::warn!("{}", msg);
+                            result.errors.push(msg);
+                            // Skip DB cleanup if storage delete fails
+                            continue;
+                        }
                     }
                 }
 
@@ -846,7 +864,14 @@ impl StorageGcService {
                     continue;
                 }
 
-                record_gc_success(&mut result, bytes, count);
+                if is_cache_object {
+                    // No object was deleted and no bytes were freed: only the
+                    // stale row went away. Counting it as a reclaimed storage
+                    // key would overstate what GC actually recovered.
+                    result.artifacts_removed += count;
+                } else {
+                    record_gc_success(&mut result, bytes, count);
+                }
             }
         }
 
@@ -3379,33 +3404,6 @@ pub(crate) async fn storage_gc_test_guard() -> tokio::sync::MutexGuard<'static, 
 
 #[cfg(test)]
 mod tests {
-    /// #3368: GC must not collect proxy-cache objects.
-    ///
-    /// A soft-deleted legacy `artifacts` row can name the very object a live
-    /// `proxy_cache_artifacts` row points at (`CacheKeys::derive` is pure, so
-    /// the two rows carry the SAME key), and this predicate never consults
-    /// that catalog. Anchoring the key layout made the delete actually land,
-    /// so the exclusion has to be part of the predicate rather than an
-    /// accident of the delete missing.
-    ///
-    /// FAILS ON MAIN: the predicate has no proxy-cache exclusion.
-    #[test]
-    fn test_orphan_predicate_excludes_proxy_cache_keys_3368() {
-        assert!(
-            super::ORPHAN_PREDICATE_SQL.contains("a.storage_key NOT LIKE 'proxy-cache/%'"),
-            "the orphan predicate must exclude proxy-cache keys; they belong to the proxy \
-             cache's own reclamation path (purge_repo_cache / lifecycle expiry), and this \
-             predicate cannot see proxy_cache_artifacts"
-        );
-        // Control: the exclusion must be scoped to the reserved namespace and
-        // must not disturb the hosted / OCI arms the predicate exists for.
-        for still_present in ["oci-manifests/", "oci-blobs/", "oci_manifest_refs"] {
-            assert!(
-                super::ORPHAN_PREDICATE_SQL.contains(still_present),
-                "{still_present} arm must be untouched"
-            );
-        }
-    }
 
     use super::*;
 
@@ -3413,6 +3411,112 @@ mod tests {
     use bytes::Bytes;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// #3368: GC must not delete proxy-cache OBJECTS, but must still reap the
+    /// stale `artifacts` ROWS that name them.
+    ///
+    /// A soft-deleted legacy `artifacts` row can carry a proxy-cache key, and
+    /// because `CacheKeys::derive` is pure, that is the SAME key a live
+    /// `proxy_cache_artifacts` row points at. The orphan predicate never
+    /// consults that catalog, so deleting the object destroys a live cache
+    /// entry and strands its catalog row (whose `size_bytes` then over-counts
+    /// until the next fetch). Anchoring the key layout is what made that
+    /// delete actually land — before, it addressed a key nothing had written.
+    ///
+    /// Skipping the *object* rather than excluding the *key* from the
+    /// candidate scan is load-bearing: this hard-delete is the only reaper of
+    /// soft-deleted `artifacts` rows in the codebase (the only other
+    /// production `DELETE FROM artifacts` is the path-specific re-upload
+    /// tombstone in `handlers/mod.rs`), so excluding the key would leave these
+    /// rows unreclaimable forever.
+    ///
+    /// FAILS ON MAIN: the object is deleted.
+    #[tokio::test]
+    async fn test_gc_spares_proxy_cache_objects_but_reaps_their_rows_3368() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        // A live cache object, written where the proxy cache writes it, plus
+        // the stale soft-deleted `artifacts` row that also names it.
+        let uid = Uuid::new_v4().simple().to_string();
+        let cache_key = format!("proxy-cache/remote-{uid}/simple/six/six-1.0.whl/__content__");
+        let hosted_key = format!("pypi/six/1.0/six-1.0-{uid}.whl");
+        let storage = fixture
+            .state
+            .storage_for_repo(
+                &tdh::make_repo_info(
+                    fixture.repo_id,
+                    &fixture.repo_key,
+                    &fixture.storage_dir,
+                    "local",
+                    None,
+                )
+                .storage_location(),
+            )
+            .expect("resolve storage");
+        for key in [&cache_key, &hosted_key] {
+            storage
+                .put(key, bytes::Bytes::from_static(b"payload"))
+                .await
+                .expect("seed object");
+        }
+        for key in [&cache_key, &hosted_key] {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by, is_deleted) \
+                 VALUES ($1, $2, 'six', '1.0', 7, 'cafe', 'application/zip', $2, $3, true)",
+            )
+            .bind(fixture.repo_id)
+            .bind(key)
+            .bind(fixture.user_id)
+            .execute(&fixture.pool)
+            .await
+            .expect("insert soft-deleted row");
+        }
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        service.run_gc(false).await.expect("gc run");
+
+        let cache_object = storage
+            .exists(&cache_key)
+            .await
+            .expect("probe cache object");
+        let hosted_object = storage
+            .exists(&hosted_key)
+            .await
+            .expect("probe hosted object");
+        let rows_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND storage_key = ANY($2)",
+        )
+        .bind(fixture.repo_id)
+        .bind(vec![cache_key.clone(), hosted_key.clone()])
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count surviving rows");
+
+        fixture.teardown().await;
+
+        assert!(
+            cache_object,
+            "#3368: the proxy-cache object is owned by proxy_cache_artifacts, which this \
+             predicate cannot see; GC must leave it to purge_repo_cache / lifecycle expiry"
+        );
+        assert!(
+            !hosted_object,
+            "negative control: a hosted orphan object must still be reclaimed, or the whole \
+             sweep has been disabled rather than scoped"
+        );
+        assert_eq!(
+            rows_left, 0,
+            "both stale rows must still be hard-deleted; this is the only reaper of \
+             soft-deleted artifacts rows, so sparing the object must not spare the row"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Mock storage backend for unit tests

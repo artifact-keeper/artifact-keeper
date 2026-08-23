@@ -1978,8 +1978,13 @@ async fn serve_virtual_metadata(
             Ok(response) => return Ok(response),
             Err(response) if response.status() == StatusCode::NOT_FOUND => {}
             // 507: this member HAS an `artifacts` row for the file, but
-            // storage could not produce the bytes even after the coordinated
-            // re-read. That is NOT "this member does not have it" -- the
+            // storage could not produce the bytes. For a hosted row that is
+            // after the coordinated re-read; for a proxy-cache-backed row
+            // `serve_metadata` answers immediately, because no local writer
+            // owns that key and the re-read cannot succeed -- the recovery
+            // that works is the upstream re-fetch just below, which is exactly
+            // why it hands us the 507 straight away (#3463). Either way this
+            // is NOT "this member does not have it" -- the
             // member owns the name, so falling through to a lower-priority
             // member would serve THAT member's upstream METADATA for a
             // distribution this one owns. We still try this member's OWN
@@ -9493,6 +9498,52 @@ mod tests {
         assert!(
             storage.deletes.lock().expect("deletes mutex").is_empty(),
             "and the truncation compensator must never delete the live cache object"
+        );
+    }
+
+    /// The property the #3368 tee removal RESTS ON: the refetch writes the
+    /// same key the tee would have written.
+    ///
+    /// Dropping the write-back is only safe because `refetch` already commits
+    /// that object — through `fetch_from_pypi_remote_streaming`, which caches
+    /// under `target.cache_path` = `build_pypi_proxy_cache_path(project,
+    /// filename)`, which `CacheKeys::derive` turns into
+    /// `proxy-cache/<repo_key>/simple/<project>/<file>/__content__`. If that
+    /// algebra ever drifts from the `artifacts.storage_key` shape the read
+    /// path resolves, the refetch would warm one key while the row names
+    /// another, and the entry would be permanently cold with nothing to say
+    /// so. The sibling tests above prove the tee does NOT write; this one
+    /// proves the cache DOES.
+    #[test]
+    fn test_refetch_cache_key_matches_the_row_key_the_tee_no_longer_writes_3368() {
+        let project = proj("six");
+        let filename = "six-1.17.0-py2.py3-none-any.whl";
+        let cache_path = build_pypi_proxy_cache_path(&project, filename);
+
+        let derived = crate::services::proxy_service::ProxyService::cache_storage_key(
+            "pypi-remote",
+            &cache_path,
+        )
+        .expect("derive cache key");
+
+        assert_eq!(
+            derived,
+            "proxy-cache/pypi-remote/simple/six/six-1.17.0-py2.py3-none-any.whl/__content__",
+            "the key the refetch warms must be exactly the `artifacts.storage_key` shape the \
+             read path resolves, or removing the tee leaves the entry permanently cold"
+        );
+        assert!(
+            crate::services::proxy_service::ProxyService::is_proxy_cache_key(&derived),
+            "and it must be classified as proxy-cache content, which is what routes the \
+             read to the shared root and suppresses the tee"
+        );
+        // The sidecar the verdict is read from sits beside it, so a warmed
+        // entry is immediately servable rather than Unvouched.
+        assert_eq!(
+            proxy_cache_metadata_key_for(&derived).as_deref(),
+            Some("proxy-cache/pypi-remote/simple/six/six-1.17.0-py2.py3-none-any.whl/__cache_meta__.json"),
+            "the refetch commits body AND sidecar; without the sidecar the next read would \
+             be Unvouched and re-fetch forever"
         );
     }
 

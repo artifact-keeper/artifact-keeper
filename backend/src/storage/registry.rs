@@ -251,6 +251,92 @@ mod tests {
             cache_handle.get(hosted_key).await.is_err(),
             "the global-root handle must not see another repository's hosted bytes"
         );
+
+        // The OTHER direction, asserted because it is a deliberate design
+        // consequence rather than an oversight: within the reserved
+        // namespaces the isolation boundary is no longer the repository. A
+        // handle rooted at a DIFFERENT repository resolves the same
+        // `proxy-cache/...` key to the same object — that is the whole point,
+        // since the writer (the proxy cache) and the reader (an `artifacts`
+        // row on some repository) are rooted differently by construction.
+        //
+        // What keeps that safe is that no caller can put a
+        // `proxy-cache/`-prefixed `storage_key` on an `artifacts` row through
+        // any API: every format composes hosted keys as `<format>/...`, and
+        // the cache keys are derived server-side from `(repo_key, path)`. The
+        // boundary is therefore "who can write such a row", not "which
+        // repository is asking". Pinned here so a future change that starts
+        // accepting a caller-supplied storage key has to confront it.
+        let other_location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: root
+                .path()
+                .join("some-other-repo")
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let other_handle = registry
+            .backend_for(&other_location)
+            .expect("resolve backend");
+        assert_eq!(
+            other_handle.get(cache_key).await.ok(),
+            Some(body),
+            "a proxy-cache key resolves to one shared object regardless of which repository's \
+             handle asks; the reserved namespace is deliberately not repo-scoped"
+        );
+    }
+
+    /// #3368 hardening: the root and the path tail must be derived from the
+    /// SAME string.
+    ///
+    /// `key_to_path` builds the tail from the sanitized key (only
+    /// `Component::Normal` survives), so deciding the root from the raw key
+    /// let spellings that sanitize identically land in different places —
+    /// `proxy-cache/r/x` at the global root but `/proxy-cache/r/x` and
+    /// `../proxy-cache/r/x` under the repository directory. One logical
+    /// object, two physical locations: a miniature of the divergence this
+    /// anchoring removes.
+    ///
+    /// Not reachable through any caller today (`validate_cache_path` trims a
+    /// leading `/` and rejects dot segments), so this pins the property rather
+    /// than fixing a live bug.
+    #[tokio::test]
+    async fn test_filesystem_root_is_decided_from_the_sanitized_key_3368() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let registry = StorageRegistry::new(HashMap::new(), "filesystem".to_string())
+            .with_filesystem_bucket_root(root.path());
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: root.path().join("repoA").to_string_lossy().into_owned(),
+        };
+        let handle = registry.backend_for(&location).expect("resolve backend");
+
+        // All three sanitize to `proxy-cache/repoB/x/__content__`, so all three
+        // must address the one object at the global root.
+        let canonical = "proxy-cache/repoB/x/__content__";
+        handle
+            .put(canonical, Bytes::from_static(b"cache"))
+            .await
+            .expect("write");
+        for spelling in [
+            canonical,
+            "/proxy-cache/repoB/x/__content__",
+            "../proxy-cache/repoB/x/__content__",
+        ] {
+            assert_eq!(
+                handle.get(spelling).await.ok(),
+                Some(Bytes::from_static(b"cache")),
+                "{spelling} sanitizes to the canonical key and must resolve to the same object"
+            );
+        }
+        assert!(
+            root.path().join(canonical).exists(),
+            "and that object lives at the global root"
+        );
+        assert!(
+            !root.path().join("repoA").join(canonical).exists(),
+            "not a second copy under the repository directory"
+        );
     }
 
     /// Without a global root the registry keeps its historical single-root
