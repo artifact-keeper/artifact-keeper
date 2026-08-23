@@ -729,7 +729,18 @@ pub struct RoleListResponse {
     pub items: Vec<RoleResponse>,
 }
 
-/// Get user roles
+/// Get user roles.
+///
+/// Lists the `user_roles` rows [`assign_role`] writes, together with each
+/// role's `permissions` array. Those capabilities describe the ROLE, not this
+/// user's effective access: `user_roles` is identity/SSO-mapping metadata and
+/// is read by no authorization gate (#3387 / #3522 — see [`assign_role`] for
+/// the full split between the two role stores). A user can appear here with
+/// `developer` / `["read","write"]` and still have access to no repository.
+///
+/// Effective repository access is the union of `role_assignments` and the
+/// fine-grained `permissions` table; `GET /api/v1/permissions` lists the
+/// latter.
 #[utoipa::path(
     get,
     path = "/{id}/roles",
@@ -739,7 +750,11 @@ pub struct RoleListResponse {
         ("id" = Uuid, Path, description = "User ID"),
     ),
     responses(
-        (status = 200, description = "List of user roles", body = RoleListResponse),
+        (status = 200, description = "List of user roles. The `permissions` \
+         array describes the ROLE's capabilities, not this user's effective \
+         repository access: roles listed here are identity/SSO-mapping \
+         metadata and grant no repository access on their own (#3387 / #3522).",
+         body = RoleListResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -782,7 +797,31 @@ pub struct AssignRoleRequest {
     pub role_id: Uuid,
 }
 
-/// Assign role to user
+/// Assign role to user.
+///
+/// **This does not by itself grant access to any repository (#3387 / #3522).**
+///
+/// There are two role stores and they are not interchangeable. This endpoint
+/// writes `user_roles`, which is identity metadata: it is listed back by
+/// `GET /api/v1/users/{id}/roles`, it is what SSO role mapping rebuilds on
+/// every federated login (`AuthService::apply_role_mapping`), and it is read by
+/// no authorization gate. Repository authorization resolves
+/// `role_assignments` (creator auto-grant, `repository-owner`, the rows
+/// migration 172 wrote) and the fine-grained `permissions` table — never this
+/// one.
+///
+/// To give a principal access to repositories, write a fine-grained grant with
+/// `POST /api/v1/permissions`. That endpoint takes `user`, `service_account`
+/// and `group` principals against `repository` or `project` targets, and IS
+/// resolved by every gate (`check_repository_action`, `query_actions`,
+/// `permissions_grant_exists_for`).
+///
+/// Wiring `user_roles` into the gates is deliberately NOT done here: the table
+/// carries no repository scope, so every row is global, and the built-in
+/// `developer` role carries `read` + `write` — making it live would retroactively
+/// hand every existing row write access to every repository in the instance,
+/// and would turn an IdP role claim into a global write grant. That decision is
+/// tracked in #3522 rather than taken as a side effect of a bug fix.
 #[utoipa::path(
     post,
     path = "/{id}/roles",
@@ -793,7 +832,10 @@ pub struct AssignRoleRequest {
     ),
     request_body = AssignRoleRequest,
     responses(
-        (status = 200, description = "Role assigned successfully"),
+        (status = 200, description = "Role assigned successfully. NOTE: roles \
+         assigned here are identity/SSO-mapping metadata and do NOT by \
+         themselves grant access to any repository — use POST \
+         /api/v1/permissions for that (#3387 / #3522)."),
     ),
     security(("bearer_auth" = []))
 )]

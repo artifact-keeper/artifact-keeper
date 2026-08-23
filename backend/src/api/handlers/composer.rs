@@ -393,7 +393,7 @@ where
         proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
 
     if members.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+        return Err(proxy_helpers::no_accessible_members_response());
     }
 
     for member in &members {

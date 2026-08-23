@@ -967,10 +967,7 @@ async fn simple_project(
                     .await?;
 
             if members.is_empty() {
-                return Err(
-                    AppError::NotFound("Virtual repository has no members".to_string())
-                        .into_response(),
-                );
+                return Err(proxy_helpers::no_accessible_members_response());
             }
 
             // PEP 708 (#1600, priority-aware per #2311): when a local member
@@ -1905,13 +1902,17 @@ async fn serve_virtual_metadata(
 ) -> Result<Response, Response> {
     let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo.id).await?;
     if members.is_empty() {
-        return Err(
-            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
-        );
+        return Err(proxy_helpers::no_accessible_members_response());
     }
 
     let members =
         proxy_helpers::authorize_virtual_members(&state.db, auth, virtual_repo.id, members).await;
+    // #3452: a fully-filtered member set must answer the SAME body the
+    // genuinely-empty set above answers, or the pair is an existence oracle
+    // over the private members this virtual aggregates.
+    if members.is_empty() {
+        return Err(proxy_helpers::no_accessible_members_response());
+    }
 
     // Keep PEP 658 metadata resolution symmetric with the simple-index and
     // distribution-download paths. A higher-priority local owner suppresses a
@@ -2722,10 +2723,7 @@ async fn serve_file(
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
                 if members.is_empty() {
-                    return Err(AppError::NotFound(
-                        "Virtual repository has no members".to_string(),
-                    )
-                    .into_response());
+                    return Err(proxy_helpers::no_accessible_members_response());
                 }
 
                 // #2073 (sibling of #1804, fixed for Maven by #1816): authorize
@@ -2740,6 +2738,13 @@ async fn serve_file(
                 let members =
                     proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
                         .await;
+                // #3452: a fully-filtered member set must answer the SAME body
+                // the genuinely-empty set above answers, or the pair is an
+                // existence oracle over the private members this virtual
+                // aggregates.
+                if members.is_empty() {
+                    return Err(proxy_helpers::no_accessible_members_response());
+                }
 
                 // PEP 708 dependency-confusion guard (#1600), superseding the
                 // version-aware shadowing guard (#1217, #1582) and the

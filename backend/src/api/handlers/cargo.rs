@@ -1460,10 +1460,7 @@ async fn try_virtual_index(
     };
 
     if members.is_empty() {
-        return Some(Err(AppError::NotFound(
-            "Virtual repository has no members".to_string(),
-        )
-        .into_response()));
+        return Some(Err(proxy_helpers::no_accessible_members_response()));
     }
 
     // Batch-fetch index_upstream_url overrides for all members in one query.

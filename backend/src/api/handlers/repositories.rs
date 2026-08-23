@@ -1475,7 +1475,9 @@ pub(crate) fn clamp_per_page(per_page: Option<u32>) -> u32 {
 /// with no members.
 ///
 /// Such repos are unusable: every fetch returns
-/// `404 Resource not found: Virtual repository has no members`. Pre-fix
+/// `404 Resource not found: Virtual repository has no accessible members`
+/// (`proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG`, shared with the case where the
+/// members exist but the caller may read none of them — see #3452). Pre-fix
 /// (#1279) the create handler tolerated both broken shapes silently:
 ///
 ///   * `member_repos` field omitted entirely. Operators who naturally

@@ -2440,6 +2440,12 @@ pub async fn repo_visibility_middleware(
                         // "admin" which implies all actions (#827 policy compat).
                         // Both calls resolve from the same cached action set, so
                         // the second call is essentially free.
+                        //
+                        // These two are a CACHED FAST PATH for the common
+                        // "an applicable rule names this principal" case, not
+                        // the decision itself: `check_permission` reads the
+                        // `permissions` table only. The canonical decision is
+                        // `check_repository_action` below (#3387/#3452).
                         let allowed = vis_state
                             .permission_service
                             .check_permission(ext.user_id, "repository", repo.id, action, false)
@@ -2455,9 +2461,58 @@ pub async fn repo_visibility_middleware(
                                     false,
                                 )
                                 .await
+                                .unwrap_or(false)
+                            // #3387/#3452: role assignments are part of the read
+                            // decision, exactly as they already are for the
+                            // write/delete arm ~40 lines above, for REST reads
+                            // (`require_visible` -> `user_can_access_repo` ->
+                            // `RepoAccess::READ`) and for virtual members
+                            // (`try_authorize_virtual_members`). This branch was
+                            // the ONLY read gate in the codebase resolving reads
+                            // from `permissions` alone, so the FIRST fine-grained
+                            // rule written against a repository — for any
+                            // principal, including an unrelated one — silently
+                            // revoked native-protocol READ for every principal
+                            // whose grant is a `role_assignment` (the creator
+                            // auto-grant, `repository-owner`, and the rows
+                            // migration 172 wrote on upgrade), while leaving that
+                            // same principal's WRITE on the same route intact.
+                            // Reproduced as 403 on `GET /maven/{repo}/…` with 201
+                            // on `PUT` to the same path and 200 on
+                            // `GET /api/v1/repositories/{key}`.
+                            //
+                            // `check_repository_action` is a strict SUPERSET of
+                            // the two calls above (an applicable rule carrying
+                            // `action` or `admin` satisfies both), so this can
+                            // only widen, never narrow. What it adds is the
+                            // codebase's documented principal-scoped transition:
+                            // "an applicable rule is authoritative for the
+                            // principals it names, everyone else keeps their role
+                            // capabilities, and a role carrying `admin` always
+                            // wins".
+                            //
+                            // Ordering is deliberate. The two cached calls
+                            // short-circuit the hot allow path (a 30s action
+                            // cache) so the uncached canonical query is only
+                            // issued for a request that would otherwise be
+                            // DENIED, keeping one extra round trip off every
+                            // index fetch. `unwrap_or(false)` keeps the existing
+                            // fail-closed direction of this branch rather than
+                            // converting a DB blip from 403 to 503.
+                            || vis_state
+                                .permission_service
+                                .check_repository_action(ext.user_id, repo.id, action, false)
+                                .await
                                 .unwrap_or(false);
 
                         if !allowed {
+                            tracing::info!(
+                                repository_id = %repo.id,
+                                user_id = %ext.user_id,
+                                action,
+                                "native-format read denied: no applicable permission rule and no \
+                                 role assignment carrying the action"
+                            );
                             return forbidden_permission_response();
                         }
                     }
@@ -2492,7 +2547,27 @@ pub async fn repo_visibility_middleware(
                     match granted {
                         Ok(true) => {}
                         // Existence-hiding 404, matching REST `require_visible`.
-                        Ok(false) => return not_found_response(),
+                        //
+                        // The RESPONSE stays byte-identical to the one a
+                        // nonexistent key produces — that indistinguishability
+                        // is the point (#1808 / GHSA-fv45-mwhh-q23r) and is not
+                        // traded away here. The operator-facing half of #3452
+                        // was that nothing on the server said WHICH of the two
+                        // it was either: the only clue in the reporter's log was
+                        // an unrelated `no permission rules found for target`
+                        // line, so a 20-byte `Repository not found` was
+                        // indistinguishable from a missing repository in the
+                        // logs as well as on the wire. Say it here, where the
+                        // decision is made.
+                        Ok(false) => {
+                            tracing::info!(
+                                repository_id = %repo.id,
+                                user_id = %ext.user_id,
+                                "private repository read denied: caller holds no grant on this \
+                                 repository; answering the existence-hiding 404"
+                            );
+                            return not_found_response();
+                        }
                         Err(_) => {
                             // DB error on access check: fail closed.
                             tracing::error!("repo access check failed: database unreachable");
@@ -8244,6 +8319,290 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "unflagged principal must not be gated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3387 / #3386 / #3452: role assignments are part of the native READ
+    // decision, exactly as they already are for writes and for REST reads.
+    // -----------------------------------------------------------------------
+
+    /// Fixture for the native-format read gate on a PRIVATE repository that
+    /// carries at least one fine-grained rule.
+    ///
+    /// The repository is a REAL row: `role_assignments.repository_id` is a
+    /// foreign key, so a synthetic id would silently drop the role grant and
+    /// the test would pass for the wrong reason. The middleware resolves the
+    /// repository from its cache, keyed by `repo_key`, so the cached entry
+    /// carries the real id.
+    ///
+    /// Returns `(pool, state, repo_id, role_user, ruled_user, bare_user)`:
+    ///
+    ///   * `role_user`  — holds a `developer` **role assignment** scoped to the
+    ///     repository (the shape the creator auto-grant, `repository-owner` and
+    ///     migration 172 write) and NO fine-grained rule;
+    ///   * `ruled_user` — holds a `{write}` rule, i.e. an APPLICABLE rule that
+    ///     does not carry `read`, PLUS the same `developer` role assignment;
+    ///   * `bare_user`  — holds nothing at all.
+    ///
+    /// A separate unrelated principal holds the `{read}` rule that makes
+    /// `has_any_rules_for_target` true for this repository. That is the whole
+    /// trigger: before this fix, the FIRST rule written against a repository —
+    /// for anyone — moved every read on it onto a gate that consults the
+    /// `permissions` table alone.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset, and `AK_TESTS_REQUIRE_DB=1`
+    /// (set by the unit-test and coverage CI jobs) turns an unreachable
+    /// database into a hard failure rather than a silent skip.
+    async fn role_assignment_read_fixture(
+        repo_key: &str,
+    ) -> Option<(sqlx::PgPool, RepoVisibilityState, Uuid, Uuid, Uuid, Uuid)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let pool = tdh::try_pool().await?;
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+
+        let (rule_holder, _n1) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, repo_id, rule_holder, &["read"]).await;
+
+        let (role_user, _n2) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, role_user).await;
+
+        let (ruled_user, _n3) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, ruled_user).await;
+        tdh::grant_repo_actions(&pool, repo_id, ruled_user, &["write"]).await;
+
+        let (bare_user, _n4) = tdh::create_user(&pool).await;
+
+        let config = std::sync::Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let entry = CachedRepo {
+                id: repo_id,
+                format: "maven".to_string(),
+                ..make_cached_repo(/* is_public */ false)
+            };
+            cache
+                .write()
+                .await
+                .insert(repo_key.to_string(), (entry, std::time::Instant::now()));
+        }
+        let state = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(pool.clone(), config)),
+            db: pool.clone(),
+            repo_cache: cache,
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        Some((pool, state, repo_id, role_user, ruled_user, bare_user))
+    }
+
+    const ROLE_GATE_SECRET: &str = "test-secret-at-least-32-bytes-long-for-testing";
+
+    /// An UNSCOPED bearer for `user_id` (no repository ceiling), so the only
+    /// thing under test is the permission gate.
+    fn role_gate_bearer(user_id: Uuid) -> String {
+        format!(
+            "Bearer {}",
+            mint_access_jwt(ROLE_GATE_SECRET, user_id, "rolegate")
+        )
+    }
+
+    async fn role_gate_status(state: &RepoVisibilityState, uri: &str, user_id: Uuid) -> StatusCode {
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("Authorization", role_gate_bearer(user_id))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        run_through_visibility(state.clone(), req).await.status()
+    }
+
+    /// Verified-bug regression for #3387 (and #3386, its other framing).
+    ///
+    /// `repo_visibility_middleware` was the ONLY read gate in the codebase that
+    /// resolved reads from the `permissions` table alone. Every other gate on
+    /// the same repositories — this middleware's own write/delete arm
+    /// (`check_repository_action`), the ~23 REST read surfaces behind
+    /// `require_visible` (`user_can_access_repo` with `RepoAccess::READ`), and
+    /// the virtual-member filter (`try_authorize_virtual_members`) — resolves
+    /// through `check_repository_action`, which additionally honours role
+    /// assignments when no rule applies to the principal.
+    ///
+    /// The consequence, reproduced live before the fix: writing the FIRST
+    /// fine-grained rule against a repository, for ANY principal including a
+    /// completely unrelated one, silently revoked native-protocol READ for
+    /// every principal whose grant is a `role_assignment` — while leaving that
+    /// same principal's WRITE on the same route working.
+    ///
+    ///   GET  /maven/{repo}/…  403   (was 200 before the unrelated rule existed)
+    ///   PUT  /maven/{repo}/…  201   (unchanged)
+    ///   GET  /api/v1/repositories/{key}  200   (unchanged)
+    ///
+    /// Two formats are driven through the same fixture because the middleware
+    /// is mounted on every native format route; a fix scoped to one path would
+    /// pass the first assertion and fail the second.
+    #[tokio::test]
+    async fn test_3387_role_assignment_satisfies_native_read_on_a_ruled_repository() {
+        let Some((pool, state, repo_id, role_user, _ruled_user, _bare_user)) =
+            role_assignment_read_fixture("rolegate-a").await
+        else {
+            return;
+        };
+
+        let maven = role_gate_status(
+            &state,
+            "/maven/rolegate-a/com/example/demo/1.0.0/demo-1.0.0.pom",
+            role_user,
+        )
+        .await;
+        let npm = role_gate_status(&state, "/npm/rolegate-a/demo-pkg", role_user).await;
+
+        crate::api::handlers::test_db_helpers::cleanup(&pool, repo_id, role_user).await;
+
+        assert_eq!(
+            maven,
+            StatusCode::OK,
+            "#3387: a principal holding a `developer` role assignment on this repository must be \
+             able to READ it over a native format route. Before the fix the presence of an \
+             unrelated principal's fine-grained rule moved this read onto a `permissions`-only \
+             gate and answered 403, while the same principal's PUT on the same path still \
+             succeeded."
+        );
+        assert_eq!(
+            npm,
+            StatusCode::OK,
+            "#3387: the gate is the shared middleware, so the same principal must read through \
+             every native format mount, not just the one the fix was tested against"
+        );
+    }
+
+    /// Characterization test for the POLICY half of #3387, tracked in #3522.
+    ///
+    /// There are two role stores and only one of them is an authorization
+    /// input:
+    ///
+    /// | table | written by | read by a gate |
+    /// |---|---|---|
+    /// | `role_assignments` | repository creation, migration 172 | yes |
+    /// | `user_roles` | `POST /api/v1/users/{id}/roles`, SSO role mapping | no |
+    ///
+    /// A user can therefore hold `developer` (`["read","write"]`) as reported
+    /// by `GET /api/v1/users/{id}/roles` and still reach nothing — which is
+    /// the operational complaint in #3387 ("group/role-level access is not
+    /// honored; it has to be duplicated as an individual grant").
+    ///
+    /// This test asserts the CURRENT behaviour on purpose. Making `user_roles`
+    /// live would move the gate in the fail-open direction with instance-wide
+    /// blast radius: the table has no `repository_id` column, so every row is
+    /// global, and `developer` carries `write` — every existing row would
+    /// become read+write on every repository, and an IdP role claim would
+    /// become a global write grant (`apply_role_mapping` rebuilds the table on
+    /// every federated login). If that is later decided to be right, this test
+    /// must be deleted deliberately as part of the decision rather than
+    /// discovered to be failing.
+    ///
+    /// The positive control is the same fixture's `role_assignments` principal,
+    /// so "everything is denied here" cannot make the assertion pass.
+    #[tokio::test]
+    async fn test_3522_user_roles_is_not_a_repository_authorization_input() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some((pool, state, repo_id, role_user, _ruled_user, bare_user)) =
+            role_assignment_read_fixture("rolegate-c").await
+        else {
+            return;
+        };
+        let uri = "/maven/rolegate-c/com/example/demo/1.0.0/demo-1.0.0.pom";
+
+        // Give the otherwise-ungranted principal the `developer` role through
+        // the only public role API's table. `GET /api/v1/users/{id}/roles`
+        // would now report `developer` with `["read","write"]` for this user.
+        sqlx::query(
+            "INSERT INTO user_roles (user_id, role_id) \
+             SELECT $1, r.id FROM roles r WHERE r.name = 'developer' \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(bare_user)
+        .execute(&pool)
+        .await
+        .expect("insert user_roles row");
+
+        let via_user_roles = role_gate_status(&state, uri, bare_user).await;
+        let via_role_assignments = role_gate_status(&state, uri, role_user).await;
+
+        tdh::cleanup(&pool, repo_id, role_user).await;
+        tdh::cleanup_user(&pool, bare_user).await;
+
+        assert_eq!(
+            via_role_assignments,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the `role_assignments` principal must read, or the denial below \
+             says nothing about `user_roles` specifically"
+        );
+        assert_eq!(
+            via_user_roles,
+            StatusCode::FORBIDDEN,
+            "#3522: a `user_roles` row confers no repository access today. This is the \
+             documented state, not an oversight to patch in passing -- see the doc comment"
+        );
+    }
+
+    /// The two negative controls for
+    /// `test_3387_role_assignment_satisfies_native_read_on_a_ruled_repository`.
+    ///
+    /// Without these, "always allow" would satisfy that test. They pin the two
+    /// properties the change must NOT alter:
+    ///
+    ///   1. **An applicable rule stays authoritative.** `ruled_user` holds a
+    ///      `{write}` rule AND the same `developer` role assignment. The rule
+    ///      applies to that principal, so it decides, and it does not carry
+    ///      `read` — the role must NOT override it. A naive "OR the role in"
+    ///      fix turns this into a 200 and hands every write-only grantee read.
+    ///   2. **A bare principal is still denied.** No rule, no role: 403,
+    ///      exactly as before.
+    #[tokio::test]
+    async fn test_3387_applicable_rule_still_beats_the_role_and_bare_callers_stay_denied() {
+        let Some((pool, state, repo_id, role_user, ruled_user, bare_user)) =
+            role_assignment_read_fixture("rolegate-b").await
+        else {
+            return;
+        };
+        let uri = "/maven/rolegate-b/com/example/demo/1.0.0/demo-1.0.0.pom";
+
+        let write_only_rule = role_gate_status(&state, uri, ruled_user).await;
+        let bare = role_gate_status(&state, uri, bare_user).await;
+        // Positive control in the same fixture, so a fixture that denies
+        // everyone cannot make the two assertions below pass vacuously.
+        let granted = role_gate_status(&state, uri, role_user).await;
+
+        crate::api::handlers::test_db_helpers::cleanup(&pool, repo_id, role_user).await;
+        for uid in [ruled_user, bare_user] {
+            crate::api::handlers::test_db_helpers::cleanup_user(&pool, uid).await;
+        }
+
+        assert_eq!(
+            granted,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the role-assigned principal must still read, or the two \
+             denials below prove nothing"
+        );
+        assert_eq!(
+            write_only_rule,
+            StatusCode::FORBIDDEN,
+            "an APPLICABLE rule is authoritative for the principal it names: a `{{write}}` rule \
+             must keep denying `read` even though this principal also holds a `developer` role \
+             assignment. Widening the gate must not turn a write-only grant into a read grant \
+             (the #3325 shape, in reverse)"
+        );
+        assert_eq!(
+            bare,
+            StatusCode::FORBIDDEN,
+            "a principal with no rule and no role assignment must stay denied on a private \
+             repository"
         );
     }
 }

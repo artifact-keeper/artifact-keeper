@@ -2826,9 +2826,7 @@ async fn collect_virtual_packument(
     // versions, dist-tags, tarball URLs or shasums to it.
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
     if members.is_empty() {
-        return Err(
-            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
-        );
+        return Err(proxy_helpers::no_accessible_members_response());
     }
 
     // Batch-load per-member npm scope policies once per request (#2327).
