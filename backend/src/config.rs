@@ -10,6 +10,12 @@ use std::path::Path;
 #[cfg(test)]
 use test_env as env;
 
+/// Default freshness window for the OCI virtual-resolution negative cache.
+pub const DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
+
+/// Default maximum entry count for the OCI virtual-resolution negative cache.
+pub const DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+
 #[cfg(test)]
 mod test_env {
     //! Thread-local overlay over the process environment, compiled only into
@@ -809,6 +815,17 @@ pub struct Config {
     /// Default: 65.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
 
+    // -- OCI virtual-resolution negative cache (#1424) --
+    /// Freshness window in milliseconds for negative OCI virtual-resolution
+    /// cache entries. Env `OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`, default 5000.
+    /// Set to 0 to disable negative-cache hits.
+    pub oci_virtual_negative_cache_ttl_ms: u64,
+
+    /// Maximum number of OCI virtual-resolution negative-cache entries. Env
+    /// `OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`, default 4096. Set to 0 to
+    /// disable negative-cache inserts.
+    pub oci_virtual_negative_cache_max_entries: usize,
+
     // -- SMTP (optional, notifications are disabled when smtp_host is None) --
     /// SMTP server hostname. When absent, email delivery is disabled and the
     /// SMTP service operates as a no-op.
@@ -971,6 +988,8 @@ redacted_debug!(Config {
     show proxy_singleflight_advisory_locks_enabled,
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
+    show oci_virtual_negative_cache_ttl_ms,
+    show oci_virtual_negative_cache_max_entries,
     show smtp_host,
     show smtp_port,
     show smtp_username,
@@ -1091,6 +1110,8 @@ impl Default for Config {
             proxy_singleflight_advisory_locks_enabled: false,
             proxy_singleflight_lock_poll_interval_ms: 200,
             proxy_singleflight_lock_wait_timeout_secs: 65,
+            oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
@@ -1410,6 +1431,14 @@ impl Config {
             proxy_singleflight_lock_wait_timeout_secs: env_parse(
                 "PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS",
                 65,
+            ),
+            oci_virtual_negative_cache_ttl_ms: env_parse(
+                "OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS",
+                DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            ),
+            oci_virtual_negative_cache_max_entries: env_parse(
+                "OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES",
+                DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             ),
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
@@ -3548,6 +3577,70 @@ mod tests {
         env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
         env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
         env::remove_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_defaults() {
+        let config = Config::default();
+        assert_eq!(config.oci_virtual_negative_cache_ttl_ms, 5_000);
+        assert_eq!(config.oci_virtual_negative_cache_max_entries, 4096);
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_config_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "1234");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "17");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(config.oci_virtual_negative_cache_ttl_ms, 1234);
+        assert_eq!(config.oci_virtual_negative_cache_max_entries, 17);
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_invalid_values_fall_back_to_defaults() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "invalid");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "-1");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(
+            config.oci_virtual_negative_cache_ttl_ms,
+            DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS
+        );
+        assert_eq!(
+            config.oci_virtual_negative_cache_max_entries,
+            DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+        );
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_explicit_zero_is_preserved() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "0");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "0");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(config.oci_virtual_negative_cache_ttl_ms, 0);
+        assert_eq!(config.oci_virtual_negative_cache_max_entries, 0);
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
     }
 
     #[test]

@@ -3190,9 +3190,6 @@ fn finalize_upstream_manifest(
 // The cache is intentionally process-local (no Redis, no DB) — it's a
 // micro-optimisation, not a correctness primitive. Restarting the
 // process or scaling out re-pays the upstream walk once.
-const VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
-const VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
-
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
 struct VirtualResolveKey {
     repo_id: Uuid,
@@ -3250,9 +3247,8 @@ fn negative_cache_should_evict_before_insert(current_len: usize, max_entries: us
 
 /// Returns true if a recent resolution attempt for this `(repo_id, kind,
 /// image, reference)` returned None, and the entry has not yet expired.
-fn virtual_negative_cache_hit(key: &VirtualResolveKey) -> bool {
+fn virtual_negative_cache_hit(key: &VirtualResolveKey, ttl: std::time::Duration) -> bool {
     let now = std::time::Instant::now();
-    let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
     let cache = virtual_negative_cache();
     let read = match cache.read() {
         Ok(g) => g,
@@ -3287,16 +3283,18 @@ fn negative_cache_evict_and_has_room<K: Eq + std::hash::Hash>(
 
 /// Record a None resolution. Best-effort: lock poisoning silently degrades
 /// to "no caching", which is still correct, just slower.
-fn virtual_negative_cache_insert(key: VirtualResolveKey) {
+fn virtual_negative_cache_insert(
+    key: VirtualResolveKey,
+    ttl: std::time::Duration,
+    max_entries: usize,
+) {
     let cache = virtual_negative_cache();
     let mut write = match cache.write() {
         Ok(g) => g,
         Err(_) => return,
     };
-    let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
     let now = std::time::Instant::now();
-    if !negative_cache_evict_and_has_room(&mut write, ttl, now, VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES)
-    {
+    if !negative_cache_evict_and_has_room(&mut write, ttl, now, max_entries) {
         return;
     }
     write.insert(key, now);
@@ -3364,7 +3362,9 @@ async fn authorized_virtual_members(
     let total = all.len();
     let members = proxy_helpers::authorize_virtual_members(&state.db, auth, repo_id, all).await;
     let cacheable = members.len() == total;
-    if cacheable && virtual_negative_cache_hit(cache_key) {
+    let negative_cache_ttl =
+        std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms);
+    if cacheable && virtual_negative_cache_hit(cache_key, negative_cache_ttl) {
         return None;
     }
     Some((members, cacheable))
@@ -3463,7 +3463,11 @@ pub async fn resolve_virtual_blob(
     }
 
     if cacheable {
-        virtual_negative_cache_insert(cache_key);
+        virtual_negative_cache_insert(
+            cache_key,
+            std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms),
+            state.config.oci_virtual_negative_cache_max_entries,
+        );
     }
     None
 }
@@ -3606,7 +3610,11 @@ pub async fn resolve_virtual_manifest(
     }
 
     if cacheable {
-        virtual_negative_cache_insert(cache_key);
+        virtual_negative_cache_insert(
+            cache_key,
+            std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms),
+            state.config.oci_virtual_negative_cache_max_entries,
+        );
     }
     None
 }
@@ -15469,14 +15477,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_virtual_negative_cache_constants_are_sensible() {
-        // Pin the configured TTL and cap so an accidental edit (e.g.
-        // bumping TTL to 5 minutes) trips review attention.
-        assert_eq!(super::VIRTUAL_NEGATIVE_CACHE_TTL_MS, 5_000);
-        assert_eq!(super::VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES, 4096);
-    }
-
     // virtual_negative_cache hit / insert: end-to-end roundtrip through the
     // process-global cache. The cache is process-local and shared across
     // tests, so we isolate per-test state by using a fresh random `repo_id`
@@ -15495,7 +15495,10 @@ mod tests {
             "never-inserted",
             "sha256:zzz",
         );
-        assert!(!super::virtual_negative_cache_hit(&key));
+        assert!(!super::virtual_negative_cache_hit(
+            &key,
+            std::time::Duration::from_secs(5)
+        ));
     }
 
     #[test]
@@ -15508,9 +15511,10 @@ mod tests {
             "sha256:cachehit",
         );
         // Sanity: before insert, no hit for this unique key.
-        assert!(!super::virtual_negative_cache_hit(&key));
-        super::virtual_negative_cache_insert(key.clone());
-        assert!(super::virtual_negative_cache_hit(&key));
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(!super::virtual_negative_cache_hit(&key, ttl));
+        super::virtual_negative_cache_insert(key.clone(), ttl, 4096);
+        assert!(super::virtual_negative_cache_hit(&key, ttl));
     }
 
     #[test]
@@ -15526,13 +15530,53 @@ mod tests {
         let manifest_key =
             VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "alpine", "sha256:shared");
         // Sanity: both kinds are uncached for this unique repo_id.
-        assert!(!super::virtual_negative_cache_hit(&blob_key));
-        assert!(!super::virtual_negative_cache_hit(&manifest_key));
-        super::virtual_negative_cache_insert(blob_key.clone());
-        assert!(super::virtual_negative_cache_hit(&blob_key));
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(!super::virtual_negative_cache_hit(&blob_key, ttl));
+        assert!(!super::virtual_negative_cache_hit(&manifest_key, ttl));
+        super::virtual_negative_cache_insert(blob_key.clone(), ttl, 4096);
+        assert!(super::virtual_negative_cache_hit(&blob_key, ttl));
         // The manifest variant of the same image+reference must still
         // miss: kinds are isolated.
-        assert!(!super::virtual_negative_cache_hit(&manifest_key));
+        assert!(!super::virtual_negative_cache_hit(&manifest_key, ttl));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_zero_ttl_disables_hits() {
+        let key = VirtualResolveKey::new(
+            Uuid::new_v4(),
+            VirtualResolveKind::Blob,
+            "zero-ttl",
+            "sha256:zero-ttl",
+        );
+        let ttl = std::time::Duration::from_secs(5);
+        super::virtual_negative_cache_insert(key.clone(), ttl, usize::MAX);
+
+        assert!(
+            super::virtual_negative_cache_hit(&key, ttl),
+            "the entry must be inserted before testing zero-TTL behavior"
+        );
+
+        assert!(
+            !super::virtual_negative_cache_hit(&key, std::time::Duration::ZERO),
+            "a zero TTL must make every entry stale"
+        );
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_zero_max_entries_disables_inserts() {
+        let key = VirtualResolveKey::new(
+            Uuid::new_v4(),
+            VirtualResolveKind::Blob,
+            "zero-cap",
+            "sha256:zero-cap",
+        );
+        let ttl = std::time::Duration::from_secs(5);
+        super::virtual_negative_cache_insert(key.clone(), ttl, 0);
+
+        assert!(
+            !super::virtual_negative_cache_hit(&key, ttl),
+            "a zero max-entry cap must refuse every insert"
+        );
     }
 
     // Note: `virtual_negative_cache_clear()` is exercised by the
@@ -15723,11 +15767,12 @@ mod tests {
             "clear-target",
             "sha256:cleared",
         );
-        super::virtual_negative_cache_insert(key.clone());
-        assert!(super::virtual_negative_cache_hit(&key));
+        let ttl = std::time::Duration::from_secs(5);
+        super::virtual_negative_cache_insert(key.clone(), ttl, 4096);
+        assert!(super::virtual_negative_cache_hit(&key, ttl));
         super::virtual_negative_cache_clear();
         assert!(
-            !super::virtual_negative_cache_hit(&key),
+            !super::virtual_negative_cache_hit(&key, ttl),
             "clear() must drop the just-inserted entry"
         );
     }
