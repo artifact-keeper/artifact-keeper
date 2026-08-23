@@ -619,6 +619,21 @@ jobs:
       - name: Check the docs/CI drift gate catches what it must
         run: bash scripts/ci/test-check-docs-test-command.sh
 
+      # Six STEP-level `continue-on-error: true` on `Generate artifact
+      # attestation` and `Attach VEX attestations` meant a failed provenance
+      # push left the merge job GREEN and published the image anyway, with no
+      # annotation and nothing in `needs.<job>.result` — so build provenance
+      # had never been proven to attach to any image (#3496). Same species as
+      # #2824 (cosign failed, 1.6.1 shipped unsigned). This pins the
+      # invariant: attestation and cosign steps may never be soft-failed, and
+      # docker-publish.yml may carry no step-level continue-on-error at all.
+      # Pure YAML inspection, no network, ~1s.
+      - name: Check supply-chain steps cannot fail silently
+        run: ./scripts/ci/check-supply-chain-soft-fail.sh
+
+      - name: Check the supply-chain soft-fail gate catches what it must
+        run: bash scripts/ci/test-check-supply-chain-soft-fail.sh
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners

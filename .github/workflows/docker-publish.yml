@@ -1279,26 +1279,71 @@ jobs:
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.incoming.outputs.digest }}
 
+      # CONTROL, not telemetry (#3496). This step carried
+      # `continue-on-error: true` from the day it was added, so a failed
+      # provenance push (OIDC token unavailable, registry rejection, action
+      # outage, rate limit) was indistinguishable from success: the job stayed
+      # green, `needs.<job>.result` stayed green, and the image published with
+      # no provenance and no annotation anywhere. That is the same shape as
+      # #2824, where the cosign step failed and 1.6.1 shipped unsigned and was
+      # caught only because a human went looking.
+      #
+      # Hard-failing here does NOT block a publish: the tags were already
+      # applied and mirrored by the steps above, so what this converts is a
+      # silent supply-chain gap into a visible red job. Recovery is
+      # "Re-run failed jobs" — every step in this job is idempotent
+      # (imagetools re-points the SAME digest, cosign sign and attest are
+      # both safe to repeat), which is what makes hard-fail affordable here.
+      #
+      # Enforced by scripts/ci/check-supply-chain-soft-fail.sh: no
+      # attestation or cosign step in .github/workflows/ may be soft-failed,
+      # and docker-publish.yml may carry no step-level continue-on-error at
+      # all. If a step here is ever genuinely best-effort, express that in
+      # its script with an explicit ::warning:: (see "Attach VEX
+      # attestations" below) rather than with an invisible YAML key.
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           subject-digest: ${{ steps.incoming.outputs.digest }}
           push-to-registry: true
-        continue-on-error: true
 
       # .vex was fetched by the checkout at the top of this job.
+      #
+      # BEST-EFFORT, and explicitly so (#3496). `docker scout attestation add`
+      # depends on an external SaaS (Docker Scout) and on Docker Hub
+      # credentials, so an outage there is not a reason to redden a publish —
+      # unlike the provenance attestation above, which is a control. This step
+      # used to say that with `continue-on-error: true`, which also made the
+      # failure invisible: no annotation, no job-summary line, nothing to
+      # notice. The soft-fail now lives in the script where a reader can see
+      # it, and every failure raises a ::warning:: and a summary entry. If VEX
+      # ever becomes a control, delete the failure-collecting arm rather than
+      # re-adding continue-on-error.
       - name: Attach VEX attestations
         run: |
+          set -uo pipefail
+          failed=()
           for vex in .vex/*.vex.json; do
             [ -f "$vex" ] || continue
             echo "Attaching VEX: $vex"
-            docker scout attestation add \
+            if ! docker scout attestation add \
               --file "$vex" \
               --predicate-type https://openvex.dev/ns/v0.2.0 \
-              ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.incoming.outputs.digest }}
+              ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.incoming.outputs.digest }}; then
+              failed+=("$vex")
+            fi
           done
-        continue-on-error: true
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::warning title=VEX attestation not attached::docker scout attestation add failed for ${failed[*]}. The image is published and its provenance is attested; only the VEX predicate is missing. Re-run this job to retry."
+            {
+              echo "### VEX attestations NOT attached"
+              echo ""
+              printf -- '- `%s`\n' "${failed[@]}"
+              echo ""
+              echo "Best-effort step (#3496): the published image is unaffected. Re-run this job to retry."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   merge-openscap:
     name: OpenSCAP Multi-Arch Manifest
@@ -1501,13 +1546,15 @@ jobs:
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@${{ steps.incoming.outputs.digest }}
 
+      # CONTROL, not telemetry (#3496) — see the long note on the same step
+      # in merge-backend. No continue-on-error: a provenance push that fails
+      # must be visible, and this job is idempotent so the fix is a re-run.
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
           subject-digest: ${{ steps.incoming.outputs.digest }}
           push-to-registry: true
-        continue-on-error: true
 
   merge-scanner-adapter:
     name: Scanner Adapter Multi-Arch Manifest
@@ -1865,13 +1912,15 @@ jobs:
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
 
+      # CONTROL, not telemetry (#3496) — see the long note on the same step
+      # in merge-backend. No continue-on-error: a provenance push that fails
+      # must be visible, and this job is idempotent so the fix is a re-run.
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
           subject-digest: ${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
           push-to-registry: true
-        continue-on-error: true
 
   merge-backend-alpine:
     name: Backend Alpine Multi-Arch Manifest
@@ -1976,30 +2025,47 @@ jobs:
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
 
+      # CONTROL, not telemetry (#3496) — see the long note on the same step
+      # in merge-backend. No continue-on-error: a provenance push that fails
+      # must be visible, and this job is idempotent so the fix is a re-run.
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           subject-digest: ${{ steps.inspect.outputs.digest }}
           push-to-registry: true
-        continue-on-error: true
 
       - name: Checkout (for VEX files)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .vex
 
+      # BEST-EFFORT and loud — see the note on the same step in merge-backend
+      # (#3496). Soft-fail lives in the script, not in continue-on-error.
       - name: Attach VEX attestations
         run: |
+          set -uo pipefail
+          failed=()
           for vex in .vex/*.vex.json; do
             [ -f "$vex" ] || continue
             echo "Attaching VEX: $vex"
-            docker scout attestation add \
+            if ! docker scout attestation add \
               --file "$vex" \
               --predicate-type https://openvex.dev/ns/v0.2.0 \
-              ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
+              ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}; then
+              failed+=("$vex")
+            fi
           done
-        continue-on-error: true
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::warning title=VEX attestation not attached::docker scout attestation add failed for ${failed[*]}. The image is published and its provenance is attested; only the VEX predicate is missing. Re-run this job to retry."
+            {
+              echo "### VEX attestations NOT attached"
+              echo ""
+              printf -- '- `%s`\n' "${failed[@]}"
+              echo ""
+              echo "Best-effort step (#3496): the published image is unaffected. Re-run this job to retry."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # ════════════════════════════════════════════════════════════════════════════
   # VERIFY-PUBLISHED: fail fast if a tag-triggered run did not actually
