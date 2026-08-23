@@ -2485,20 +2485,48 @@ pub async fn repo_visibility_middleware(
                             // the two calls above (an applicable rule carrying
                             // `action` or `admin` satisfies both), so this can
                             // only widen, never narrow. What it adds is the
-                            // codebase's documented principal-scoped transition:
-                            // "an applicable rule is authoritative for the
-                            // principals it names, everyone else keeps their role
-                            // capabilities, and a role carrying `admin` always
-                            // wins".
+                            // codebase's documented rule, in FULL:
                             //
-                            // Ordering is deliberate. The two cached calls
-                            // short-circuit the hot allow path (a 30s action
-                            // cache) so the uncached canonical query is only
-                            // issued for a request that would otherwise be
-                            // DENIED, keeping one extra round trip off every
-                            // index fetch. `unwrap_or(false)` keeps the existing
-                            // fail-closed direction of this branch rather than
-                            // converting a DB blip from 403 to 503.
+                            //   a) a role assignment carrying `admin` wins over
+                            //      everything, including an applicable rule —
+                            //      the "durable owner capability" migration 172
+                            //      established, OR-ed OUTSIDE the CASE in
+                            //      `check_repository_action`;
+                            //   b) otherwise an applicable direct/group/project
+                            //      rule is authoritative for the principals it
+                            //      names;
+                            //   c) otherwise the principal keeps its role
+                            //      capabilities.
+                            //
+                            // (a) is easy to state loosely and get wrong: the
+                            // consequence is that `POST /api/v1/permissions`
+                            // CANNOT narrow a repository owner's read here, and
+                            // `repository-owner` is auto-granted to every
+                            // repository creator. That is not introduced by this
+                            // line — the write/delete arm below, `require_visible`
+                            // (~23 REST read surfaces) and
+                            // `try_authorize_virtual_members` have all resolved
+                            // through this same function since #3331, and a
+                            // baseline `GET /api/v1/artifacts/…/download`
+                            // already answered 200 for exactly that principal.
+                            // This line makes the native read arm agree with
+                            // them instead of being the lone holdout.
+                            // `test_3387_applicable_rule_beats_an_ordinary_role_but_not_an_admin_carrying_one`
+                            // pins all three arms, including (a), so the
+                            // carve-out cannot be quietly re-described.
+                            //
+                            // Ordering is deliberate but is NOT a claim that the
+                            // canonical query only runs on denials: for the
+                            // role-assignment principal this change unblocks,
+                            // `check_permission` returns false every time, so
+                            // the uncached 2-CTE query runs on every ALLOWED
+                            // read too (measured ~0.5 ms cold, ~0 warm). What
+                            // the two cached calls do buy is short-circuiting
+                            // the population that IS named by a rule — the
+                            // common case on a ruled repository — off the
+                            // uncached path. `unwrap_or(false)` keeps the
+                            // existing fail-closed direction of this branch
+                            // rather than converting a DB blip from 403 to 503.
                             || vis_state
                                 .permission_service
                                 .check_repository_action(ext.user_id, repo.id, action, false)
@@ -8354,9 +8382,23 @@ mod tests {
     /// DB-backed: no-ops when `DATABASE_URL` is unset, and `AK_TESTS_REQUIRE_DB=1`
     /// (set by the unit-test and coverage CI jobs) turns an unreachable
     /// database into a hard failure rather than a silent skip.
-    async fn role_assignment_read_fixture(
-        repo_key: &str,
-    ) -> Option<(sqlx::PgPool, RepoVisibilityState, Uuid, Uuid, Uuid, Uuid)> {
+    struct RoleGateFixture {
+        pool: sqlx::PgPool,
+        state: RepoVisibilityState,
+        repo_id: Uuid,
+        /// `developer` role assignment, no fine-grained rule.
+        role_user: Uuid,
+        /// `developer` role assignment PLUS an applicable `{write}` rule.
+        ruled_user: Uuid,
+        /// `repository-owner` role assignment PLUS an applicable `{write}`
+        /// rule. `repository-owner` carries `admin`, which is the documented
+        /// durable-owner carve-out (#3387 review F1).
+        owner_user: Uuid,
+        /// No rule, no role.
+        bare_user: Uuid,
+    }
+
+    async fn role_assignment_read_fixture(repo_key: &str) -> Option<RoleGateFixture> {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::services::permission_service::PermissionService;
         use std::sync::Arc;
@@ -8373,6 +8415,23 @@ mod tests {
         let (ruled_user, _n3) = tdh::create_user(&pool).await;
         tdh::grant_repo_access(&pool, repo_id, ruled_user).await;
         tdh::grant_repo_actions(&pool, repo_id, ruled_user, &["write"]).await;
+
+        // Same shape as `ruled_user`, but the role is `repository-owner`, which
+        // carries `admin`. `grant_repo_access` deliberately grants `developer`,
+        // the ONE built-in role for which "an applicable rule wins" is true, so
+        // a fixture built only from it cannot see the carve-out below.
+        let (owner_user, _n5) = tdh::create_user(&pool).await;
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'repository-owner' \
+             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+        )
+        .bind(owner_user)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("grant repository-owner role");
+        tdh::grant_repo_actions(&pool, repo_id, owner_user, &["write"]).await;
 
         let (bare_user, _n4) = tdh::create_user(&pool).await;
 
@@ -8398,7 +8457,15 @@ mod tests {
             repo_cache: cache,
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
-        Some((pool, state, repo_id, role_user, ruled_user, bare_user))
+        Some(RoleGateFixture {
+            pool,
+            state,
+            repo_id,
+            role_user,
+            ruled_user,
+            owner_user,
+            bare_user,
+        })
     }
 
     const ROLE_GATE_SECRET: &str = "test-secret-at-least-32-bytes-long-for-testing";
@@ -8448,21 +8515,19 @@ mod tests {
     /// pass the first assertion and fail the second.
     #[tokio::test]
     async fn test_3387_role_assignment_satisfies_native_read_on_a_ruled_repository() {
-        let Some((pool, state, repo_id, role_user, _ruled_user, _bare_user)) =
-            role_assignment_read_fixture("rolegate-a").await
-        else {
+        let Some(fx) = role_assignment_read_fixture("rolegate-a").await else {
             return;
         };
 
         let maven = role_gate_status(
-            &state,
+            &fx.state,
             "/maven/rolegate-a/com/example/demo/1.0.0/demo-1.0.0.pom",
-            role_user,
+            fx.role_user,
         )
         .await;
-        let npm = role_gate_status(&state, "/npm/rolegate-a/demo-pkg", role_user).await;
+        let npm = role_gate_status(&fx.state, "/npm/rolegate-a/demo-pkg", fx.role_user).await;
 
-        crate::api::handlers::test_db_helpers::cleanup(&pool, repo_id, role_user).await;
+        crate::api::handlers::test_db_helpers::cleanup(&fx.pool, fx.repo_id, fx.role_user).await;
 
         assert_eq!(
             maven,
@@ -8620,11 +8685,18 @@ mod tests {
     #[tokio::test]
     async fn test_3522_user_roles_is_not_a_repository_authorization_input() {
         use crate::api::handlers::test_db_helpers as tdh;
-        let Some((pool, state, repo_id, role_user, _ruled_user, bare_user)) =
-            role_assignment_read_fixture("rolegate-c").await
-        else {
+        let Some(fx) = role_assignment_read_fixture("rolegate-c").await else {
             return;
         };
+        let (pool, state, repo_id, role_user, bare_user) = (
+            fx.pool.clone(),
+            fx.state.clone(),
+            fx.repo_id,
+            fx.role_user,
+            fx.bare_user,
+        );
+        let owner_user = fx.owner_user;
+        let ruled_user = fx.ruled_user;
         let uri = "/maven/rolegate-c/com/example/demo/1.0.0/demo-1.0.0.pom";
 
         // Give the otherwise-ungranted principal the `developer` role through
@@ -8644,7 +8716,9 @@ mod tests {
         let via_role_assignments = role_gate_status(&state, uri, role_user).await;
 
         tdh::cleanup(&pool, repo_id, role_user).await;
-        tdh::cleanup_user(&pool, bare_user).await;
+        for uid in [bare_user, owner_user, ruled_user] {
+            tdh::cleanup_user(&pool, uid).await;
+        }
 
         assert_eq!(
             via_role_assignments,
@@ -8660,52 +8734,89 @@ mod tests {
         );
     }
 
-    /// The two negative controls for
-    /// `test_3387_role_assignment_satisfies_native_read_on_a_ruled_repository`.
+    /// The negative controls for
+    /// `test_3387_role_assignment_satisfies_native_read_on_a_ruled_repository`,
+    /// and the exact boundary of "an applicable rule is authoritative".
     ///
-    /// Without these, "always allow" would satisfy that test. They pin the two
-    /// properties the change must NOT alter:
+    /// Without these, "always allow" would satisfy that test. Three properties
+    /// are pinned, and the third is a CARVE-OUT rather than a guarantee:
     ///
-    ///   1. **An applicable rule stays authoritative.** `ruled_user` holds a
-    ///      `{write}` rule AND the same `developer` role assignment. The rule
-    ///      applies to that principal, so it decides, and it does not carry
-    ///      `read` — the role must NOT override it. A naive "OR the role in"
-    ///      fix turns this into a 200 and hands every write-only grantee read.
-    ///   2. **A bare principal is still denied.** No rule, no role: 403,
-    ///      exactly as before.
+    ///   1. **A bare principal is still denied.** No rule, no role: 403.
+    ///   2. **An applicable rule beats an ORDINARY role.** `ruled_user` holds a
+    ///      `{write}` rule and a `developer` role assignment. The rule applies
+    ///      to that principal, it does not carry `read`, and `developer` does
+    ///      not carry `admin` — so the rule decides and the answer is 403. A
+    ///      naive "OR the role in" fix turns this into a 200 and hands every
+    ///      write-only grantee read.
+    ///   3. **An applicable rule does NOT beat a role carrying `admin`.**
+    ///      `owner_user` holds the same `{write}` rule but the
+    ///      `repository-owner` role, and reads: **200**. This is not a bug in
+    ///      this change and not something it introduced —
+    ///      `check_repository_action` OR-s
+    ///      `EXISTS (assigned_roles WHERE 'admin' = ANY(permissions))`
+    ///      *outside* the `CASE WHEN EXISTS (applicable_rules)` block, which is
+    ///      the "durable owner capability" its own doc comment describes and
+    ///      which migration 172 was written to establish. The write/delete arm
+    ///      of this same middleware, `require_visible`, and
+    ///      `try_authorize_virtual_members` have all behaved this way since
+    ///      #3331; adopting the canonical function on native reads makes the
+    ///      read arm agree with them. `repository-owner` is auto-granted to
+    ///      every repository CREATOR (`repository_service.rs`) and, on upgrade,
+    ///      to repo-scoped `developer`s on creator-less rules-less repositories
+    ///      (migration 172), so the population is not marginal.
+    ///
+    ///      The practical consequence, stated so it is not discovered later:
+    ///      **`POST /api/v1/permissions` cannot narrow a repository owner's
+    ///      read on the native routes** (nor on REST, nor its writes — that was
+    ///      already true). Revoking an owner means removing the
+    ///      `repository-owner` role assignment, not writing a narrower rule.
+    ///
+    /// Pinning (3) rather than asserting its opposite is the point of this
+    /// test: an earlier revision of this PR claimed "an applicable rule is
+    /// authoritative for the principals it names" without the carve-out, and
+    /// the claim survived review only because `tdh::grant_repo_access` grants
+    /// `developer` — the one built-in role for which it happens to be true.
     #[tokio::test]
-    async fn test_3387_applicable_rule_still_beats_the_role_and_bare_callers_stay_denied() {
-        let Some((pool, state, repo_id, role_user, ruled_user, bare_user)) =
-            role_assignment_read_fixture("rolegate-b").await
-        else {
+    async fn test_3387_applicable_rule_beats_an_ordinary_role_but_not_an_admin_carrying_one() {
+        let Some(fx) = role_assignment_read_fixture("rolegate-b").await else {
             return;
         };
         let uri = "/maven/rolegate-b/com/example/demo/1.0.0/demo-1.0.0.pom";
 
-        let write_only_rule = role_gate_status(&state, uri, ruled_user).await;
-        let bare = role_gate_status(&state, uri, bare_user).await;
+        let write_only_rule = role_gate_status(&fx.state, uri, fx.ruled_user).await;
+        let owner_with_write_only_rule = role_gate_status(&fx.state, uri, fx.owner_user).await;
+        let bare = role_gate_status(&fx.state, uri, fx.bare_user).await;
         // Positive control in the same fixture, so a fixture that denies
-        // everyone cannot make the two assertions below pass vacuously.
-        let granted = role_gate_status(&state, uri, role_user).await;
+        // everyone cannot make the denials below pass vacuously.
+        let granted = role_gate_status(&fx.state, uri, fx.role_user).await;
 
-        crate::api::handlers::test_db_helpers::cleanup(&pool, repo_id, role_user).await;
-        for uid in [ruled_user, bare_user] {
-            crate::api::handlers::test_db_helpers::cleanup_user(&pool, uid).await;
+        crate::api::handlers::test_db_helpers::cleanup(&fx.pool, fx.repo_id, fx.role_user).await;
+        for uid in [fx.ruled_user, fx.owner_user, fx.bare_user] {
+            crate::api::handlers::test_db_helpers::cleanup_user(&fx.pool, uid).await;
         }
 
         assert_eq!(
             granted,
             StatusCode::OK,
-            "POSITIVE CONTROL: the role-assigned principal must still read, or the two \
-             denials below prove nothing"
+            "POSITIVE CONTROL: the role-assigned principal must still read, or the denials \
+             below prove nothing"
         );
         assert_eq!(
             write_only_rule,
             StatusCode::FORBIDDEN,
-            "an APPLICABLE rule is authoritative for the principal it names: a `{{write}}` rule \
-             must keep denying `read` even though this principal also holds a `developer` role \
-             assignment. Widening the gate must not turn a write-only grant into a read grant \
+            "an APPLICABLE rule is authoritative over an ORDINARY role: a `{{write}}` rule must \
+             keep denying `read` for a principal whose role (`developer`) does not carry \
+             `admin`. Widening the gate must not turn a write-only grant into a read grant \
              (the #3325 shape, in reverse)"
+        );
+        assert_eq!(
+            owner_with_write_only_rule,
+            StatusCode::OK,
+            "CARVE-OUT, pinned deliberately: a role carrying `admin` (`repository-owner`) wins \
+             over an applicable `{{write}}` rule, because `check_repository_action` OR-s the \
+             admin-role term OUTSIDE its CASE. If this ever flips to 403, the durable-owner \
+             capability changed and the write arm, `require_visible` and the virtual-member \
+             filter changed with it -- that is a policy decision, not a refactor"
         );
         assert_eq!(
             bare,

@@ -2572,11 +2572,7 @@ where
     match outcome {
         Some(MemberResolveOutcome::Hit(result)) => Ok(result),
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response()),
+        _ => Err(member_miss_response()),
     }
 }
 
@@ -2788,11 +2784,7 @@ where
             Ok(response)
         }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response()),
+        _ => Err(member_miss_response()),
     }
 }
 
@@ -3489,14 +3481,33 @@ fn log_narrowed(
     admitted: Vec<Repository>,
 ) -> Vec<Repository> {
     if admitted.len() < member_count {
-        tracing::info!(
-            virtual_repo_id = %virtual_repo_id,
-            user_id = ?auth.map(|a| a.user_id),
-            members_total = member_count,
-            members_accessible = admitted.len(),
-            "virtual member walk narrowed by caller authorization; members the caller holds no \
-             read grant on (or that a repository-scoped token's ceiling excludes) are dropped"
-        );
+        // Level depends on the PRINCIPAL, not on the outcome. An authenticated
+        // caller is the diagnostic case an operator needs at default verbosity,
+        // and the volume is bounded by who holds a credential. The ANONYMOUS
+        // arm is reached by any unauthenticated GET to a public virtual that
+        // lists a private member, which is 1:1 with request volume and emitted
+        // nothing extra before this change — logging that at `info` turns a
+        // public read path into unsampled log amplification, so it goes to
+        // `debug`. The message and fields are identical either way.
+        let message = "virtual member walk narrowed by caller authorization; members the caller \
+                       holds no read grant on (or that a repository-scoped token's ceiling \
+                       excludes) are dropped";
+        match auth {
+            Some(principal) => tracing::info!(
+                virtual_repo_id = %virtual_repo_id,
+                user_id = %principal.user_id,
+                members_total = member_count,
+                members_accessible = admitted.len(),
+                message
+            ),
+            None => tracing::debug!(
+                virtual_repo_id = %virtual_repo_id,
+                user_id = tracing::field::Empty,
+                members_total = member_count,
+                members_accessible = admitted.len(),
+                message
+            ),
+        }
     }
     admitted
 }
@@ -3552,8 +3563,20 @@ pub async fn authorized_virtual_members(
 /// any member repository" while the genuinely-empty arm, reached through
 /// [`resolve_virtual_download_from_members`], still said "Virtual repository
 /// has no members". The pair remained distinguishable, so the property the
-/// comment claimed was never actually held. One constant holds it by
-/// construction.
+/// comment claimed was never actually held. One constant holds it for the
+/// RESPONSE BODY by construction.
+///
+/// Scope of that claim, stated because "by construction" invites a stronger
+/// reading than it deserves: this makes the status, headers and bytes
+/// identical. It does not make the two arms indistinguishable by TIMING — the
+/// filtered arm does strictly more work (`fetch_virtual_members` ->
+/// `filter_visible_repo_ids` -> a per-member `check_repository_action`) than
+/// the empty arm, which early-returns at the `members.is_empty()` guard in
+/// `try_authorize_virtual_members`. Measured at ~2x median (roughly 3 ms vs
+/// 2 ms over 120 samples), with disjoint quartiles. That side channel is
+/// structural and pre-existing — closing it means doing the filter work for a
+/// virtual with no members — so it is not addressed here, only recorded so the
+/// property is not over-claimed.
 ///
 /// The wording is the second half of #3452. `"Virtual repository has no
 /// members"` is not merely inconsistent, it is actively misdiagnosing: it names
@@ -3578,6 +3601,31 @@ pub const NO_ACCESSIBLE_MEMBERS_MSG: &str = "Virtual repository has no accessibl
 /// error body should not have to special-case which AK route it asked.
 pub fn no_accessible_members_response() -> Response {
     crate::error::AppError::NotFound(NO_ACCESSIBLE_MEMBERS_MSG.to_string()).into_response()
+}
+
+/// The 404 body for a virtual walk that DID have members the caller may read
+/// and simply did not find the artifact in any of them.
+///
+/// Distinct from [`NO_ACCESSIBLE_MEMBERS_MSG`] on purpose, and safely so: a
+/// caller who sees this has already learned that at least one member is visible
+/// to it, which it can equally learn by listing. The dangerous distinction is
+/// *within* the zero-visible-members case, and that one is collapsed.
+///
+/// Exists as a helper for the same reason its sibling does: four call sites
+/// (`cargo`, `pypi`, and two in `repositories`) already emitted this exact text
+/// through `AppError::NotFound` — i.e. the JSON error envelope — while the two
+/// `proxy_helpers` primitives that maven's download path funnels into emitted
+/// it as a bare `(StatusCode, &str)` tuple, which renders `text/plain`. So the
+/// same message, for the same condition, came back as `application/json` on
+/// pypi and `text/plain` on maven. That is the per-format divergence #3452
+/// reported, surviving in the miss case after the zero-members case was
+/// unified; a client should not have to special-case which AK route it asked.
+pub const MEMBER_MISS_MSG: &str = "Artifact not found in any member repository";
+
+/// [`MEMBER_MISS_MSG`] in the JSON error envelope every other emitter of this
+/// text already used.
+pub fn member_miss_response() -> Response {
+    crate::error::AppError::NotFound(MEMBER_MISS_MSG.to_string()).into_response()
 }
 
 /// True when any member of a virtual repository is NOT public (#3323).
@@ -13793,6 +13841,12 @@ mod tests {
     /// | virtual has no member rows | `Virtual repository has no members` | `text/plain` (maven) |
     /// | every member filtered by authz | `Artifact not found in any member repository` | `text/plain` |
     /// | same, via the metadata primitive | `Virtual repository has no members` | `application/json` |
+    ///
+    /// The adjacent "members were visible, the artifact simply was not there"
+    /// case keeps its own distinct message (`MEMBER_MISS_MSG`) — a caller that
+    /// reaches it has already learned a member is visible to it — but it, too,
+    /// now renders as the JSON envelope on every format rather than
+    /// `text/plain` on maven and JSON on pypi.
     ///
     /// Two properties were broken by that:
     ///

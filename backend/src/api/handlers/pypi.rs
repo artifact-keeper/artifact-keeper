@@ -15418,6 +15418,203 @@ mod tests {
         assert!(String::from_utf8_lossy(&nested_body).contains("Version: 2.0.0"));
     }
 
+    /// Verified-bug regression for the PyPI half of #3452, and the guard the
+    /// rest of the PR's tests do NOT reach.
+    ///
+    /// `serve_file` and `serve_virtual_metadata` walk their members by hand
+    /// rather than going through the `proxy_helpers` primitives, so the shared
+    /// `no_accessible_members_response` collapse in those primitives does not
+    /// apply to them. Both fetch members, filter with
+    /// `authorize_virtual_members`, and — before this PR — carried on with an
+    /// EMPTY set, ultimately answering a different body from the one the
+    /// genuinely-empty virtual gets a few lines above. Measured on a build of
+    /// the parent commit, one caller holding `read` on the virtual PARENT only:
+    ///
+    /// ```text
+    /// /pypi/{virtual-with-private-member}/simple/demo/demo-1.0.tar.gz  404 "Artifact not found in any member repository"
+    /// /pypi/{virtual-with-no-members}/simple/demo/demo-1.0.tar.gz      404 "Virtual repository has no members"
+    /// ```
+    ///
+    /// — a live existence oracle over the private repositories a virtual
+    /// aggregates, on the byte-serving route and on the PEP 658 metadata route.
+    ///
+    /// This test exists because reverting ONLY those two guards left all five
+    /// of the PR's other tests green: `proxy_helpers`' test drives the shared
+    /// primitives, which PyPI's two hand-rolled walks bypass, and coverage
+    /// measures execution rather than assertion, so 94% new-code coverage did
+    /// not contradict it either. Without this, a later refactor can delete the
+    /// guards and re-open the oracle with CI green.
+    ///
+    /// Both routes are asserted, and both against the same principal, so a fix
+    /// applied to one walk and not its sibling fails here.
+    #[tokio::test]
+    async fn test_3452_pypi_virtual_filtered_members_answer_the_empty_virtual_body() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // A virtual with a PRIVATE member, and a virtual with no members at
+        // all. Both real rows: the member filter is evaluated in SQL.
+        let (parent_id, parent_key, parent_dir) = tdh::create_repo(&pool, "virtual", "pypi").await;
+        let (empty_id, empty_key, empty_dir) = tdh::create_repo(&pool, "virtual", "pypi").await;
+        let (member_id, _mk, member_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        tdh::link_virtual_member(&pool, parent_id, member_id, 1).await;
+
+        // The reported principal: granted on the PARENT, nothing on the member.
+        let (user_id, uname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, parent_id, user_id, &["read"]).await;
+        tdh::grant_repo_actions(&pool, empty_id, user_id, &["read"]).await;
+        let auth = tdh::make_auth(user_id, &uname);
+
+        let state = tdh::build_state(pool.clone(), &parent_dir.to_string_lossy());
+        let parent = tdh::make_repo_info(parent_id, &parent_key, &parent_dir, "virtual", None);
+        let empty = tdh::make_repo_info(empty_id, &empty_key, &empty_dir, "virtual", None);
+
+        async fn describe(r: Result<Response, Response>) -> (StatusCode, Option<String>, String) {
+            let resp = match r {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            };
+            let status = resp.status();
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, ct, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let project = proj("demo");
+        let sdist = "demo-1.0.tar.gz";
+
+        // Route 1: the byte-serving download walk.
+        let filtered_file = describe(
+            super::serve_file(
+                &state,
+                &parent,
+                &parent_key,
+                &project,
+                sdist,
+                Some(&auth),
+                &Default::default(),
+            )
+            .await,
+        )
+        .await;
+        let empty_file = describe(
+            super::serve_file(
+                &state,
+                &empty,
+                &empty_key,
+                &project,
+                sdist,
+                Some(&auth),
+                &Default::default(),
+            )
+            .await,
+        )
+        .await;
+
+        // Route 2: the PEP 658 `.metadata` walk.
+        let filtered_meta = describe(
+            super::serve_virtual_metadata(&state, Some(&auth), &parent, &project, None, sdist)
+                .await,
+        )
+        .await;
+        let empty_meta = describe(
+            super::serve_virtual_metadata(&state, Some(&auth), &empty, &project, None, sdist).await,
+        )
+        .await;
+
+        // POSITIVE CONTROL, before cleanup: a caller who MAY read the member
+        // must get PAST the member gate on both routes, so an implementation
+        // that refused everyone cannot satisfy the equalities below.
+        let (allowed_id, allowed_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, parent_id, allowed_id, &["read"]).await;
+        tdh::grant_repo_actions(&pool, member_id, allowed_id, &["read"]).await;
+        let allowed_auth = tdh::make_auth(allowed_id, &allowed_name);
+        let walked_file = describe(
+            super::serve_file(
+                &state,
+                &parent,
+                &parent_key,
+                &project,
+                sdist,
+                Some(&allowed_auth),
+                &Default::default(),
+            )
+            .await,
+        )
+        .await;
+        let walked_meta = describe(
+            super::serve_virtual_metadata(
+                &state,
+                Some(&allowed_auth),
+                &parent,
+                &project,
+                None,
+                sdist,
+            )
+            .await,
+        )
+        .await;
+
+        for (id, dir) in [
+            (member_id, &member_dir),
+            (parent_id, &parent_dir),
+            (empty_id, &empty_dir),
+        ] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
+        for uid in [user_id, allowed_id] {
+            tdh::cleanup_user(&pool, uid).await;
+        }
+
+        let expected = (
+            StatusCode::NOT_FOUND,
+            Some("application/json".to_string()),
+            format!(
+                "{{\"code\":\"NOT_FOUND\",\"message\":\"{}\"}}",
+                proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG
+            ),
+        );
+        assert_eq!(
+            empty_file, expected,
+            "a pypi virtual with no member rows must answer the shared \
+             no-accessible-members body on the download route"
+        );
+        assert_eq!(
+            filtered_file, empty_file,
+            "#3452: `serve_file` walks its members by hand, so the collapse in the shared \
+             proxy_helpers primitives does not cover it. A caller granted on the PARENT only \
+             must not be able to tell that this virtual aggregates a member it may not see"
+        );
+        assert_eq!(
+            empty_meta, expected,
+            "the PEP 658 metadata route must answer the same body as the download route"
+        );
+        assert_eq!(
+            filtered_meta, empty_meta,
+            "#3452: `serve_virtual_metadata` is the sibling hand-rolled walk; fixing one route \
+             and not the other leaves the oracle open on `.metadata` URLs"
+        );
+        assert_ne!(
+            walked_file.2, empty_file.2,
+            "POSITIVE CONTROL (download): a caller who MAY read the member must get PAST the \
+             member gate. If this equals the refusal body the walk refuses everyone and every \
+             equality above is vacuous"
+        );
+        assert_ne!(
+            walked_meta.2, empty_meta.2,
+            "POSITIVE CONTROL (metadata): as above, for the sibling route"
+        );
+    }
+
     /// Clean via virtual -> 200 (no over-block).
     #[tokio::test]
     async fn test_virtual_serve_file_serves_clean_member_wheel() {
