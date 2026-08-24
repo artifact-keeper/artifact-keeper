@@ -126,7 +126,13 @@ jobs:
         run: |
           set -euo pipefail
           audited_sha="$(git rev-parse HEAD)"
-          mkdir -p .preflight-evidence
+          # NOT a dot-directory: actions/upload-artifact defaults
+          # `include-hidden-files: false`, so a `.preflight-evidence/` path
+          # uploads nothing at all. Caught by the falsifiability harness on
+          # #3538 -- the first run of it produced no artifact and the gate
+          # correctly refused the commit, which is the right failure but for
+          # the wrong reason.
+          mkdir -p preflight-evidence
           {
             echo "repository=${GITHUB_REPOSITORY}"
             echo "audited_sha=${audited_sha}"
@@ -135,8 +141,8 @@ jobs:
             echo "run_id=${GITHUB_RUN_ID}"
             echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
             echo "verdict=READY"
-          } > .preflight-evidence/verdict.txt
-          cat .preflight-evidence/verdict.txt
+          } > preflight-evidence/verdict.txt
+          cat preflight-evidence/verdict.txt
           echo "audited_sha=${audited_sha}" >> "$GITHUB_OUTPUT"
           {
             echo "### Release Preflight: READY"
@@ -151,6 +157,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-preflight-${{ steps.evidence.outputs.audited_sha }}
-          path: .preflight-evidence/
+          path: preflight-evidence/
           retention-days: 90
           if-no-files-found: error
