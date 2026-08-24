@@ -439,7 +439,9 @@ pub async fn poll_device_token(
                 StatusCode::OK,
                 axum::Json(TokenResponse {
                     token_type: "Bearer".into(),
-                    expires_in: 900,
+                    // Report the real configured access-token TTL
+                    // (JWT_ACCESS_TOKEN_EXPIRY_MINUTES), not a hardcoded value.
+                    expires_in: state.config.jwt_access_token_expiry_minutes.max(0) as u64 * 60,
                     access_token: tokens.access_token,
                     refresh_token: tokens.refresh_token,
                 }),
@@ -710,6 +712,7 @@ mod tests {
             return;
         };
         let state = state(pool.clone(), "poll-token");
+        let expected_expiry_secs = state.config.jwt_access_token_expiry_minutes.max(0) as u64 * 60;
         let provider_id = seed_oidc_provider(&pool, true).await;
         let user_id = seed_user(&pool).await;
         let svc = OidcDeviceService::new(pool.clone());
@@ -807,7 +810,9 @@ mod tests {
         let (status, json) = poll_json(state, GRANT, &approved.device_code, "handler-client").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["token_type"], "Bearer");
-        assert_eq!(json["expires_in"], 900);
+        // expires_in mirrors the configured access-token TTL
+        // (JWT_ACCESS_TOKEN_EXPIRY_MINUTES), not a hardcoded constant.
+        assert_eq!(json["expires_in"], expected_expiry_secs);
         assert!(json["access_token"].as_str().unwrap().len() > 20);
         assert!(json["refresh_token"].as_str().unwrap().len() > 20);
 
