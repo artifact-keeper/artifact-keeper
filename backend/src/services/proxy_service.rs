@@ -747,6 +747,23 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a revalidation response status says anything about whether the
+/// cached content changed.
+///
+/// A throttle (429), a refusal (403) or an upstream fault (5xx) is the upstream
+/// declining to answer the question, not answering "yes". Treating them as
+/// "changed" discards a valid cached entry and spends a full refill on an
+/// upstream that is already refusing us, which is strictly worse than serving
+/// the copy we hold: the refill cannot succeed where the probe was refused.
+///
+/// 401 is deliberately excluded, the OCI bearer-token exchange depends on it
+/// meaning "re-fetch with a token".
+fn revalidation_status_carries_no_content_information(status: StatusCode) -> bool {
+    status == StatusCode::FORBIDDEN
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
 /// Whether a single path segment is a dot segment, in the same sense the WHATWG
 /// URL parser uses when it normalizes a path.
 ///
@@ -3096,6 +3113,18 @@ impl UpstreamClient {
                     url
                 );
                 Ok(true)
+            }
+            status if revalidation_status_carries_no_content_information(status) => {
+                tracing::warn!(
+                    "Upstream returned {} on the ETag check for {}; serving the cached copy instead of refilling",
+                    status,
+                    redact_url_for_diagnostics(url)
+                );
+                Err(AppError::ServiceUnavailable(format!(
+                    "Upstream returned {} on revalidation: {}",
+                    status,
+                    redact_url_for_diagnostics(url)
+                )))
             }
             status => {
                 tracing::warn!(
@@ -12425,6 +12454,38 @@ mod tests {
                 );
             }
             other => panic!("403 must map to redacted AppError::BadGateway; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_revalidation_status_carries_no_content_information() {
+        for status in [
+            StatusCode::FORBIDDEN,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(
+                revalidation_status_carries_no_content_information(status),
+                "{status} is a refusal to answer, not a 'yes, it changed'"
+            );
+        }
+
+        // 401 drives the OCI bearer-token re-fetch, and 404/410 are real
+        // statements about the resource. None of them may take the stale path.
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+            StatusCode::OK,
+            StatusCode::NOT_MODIFIED,
+        ] {
+            assert!(
+                !revalidation_status_carries_no_content_information(status),
+                "{status} must keep its existing handling"
+            );
         }
     }
 
