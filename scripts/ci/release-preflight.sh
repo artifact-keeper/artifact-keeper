@@ -144,6 +144,14 @@
 #   2  INFRA       -- tooling/network failure (git ls-remote / gh / file reads
 #                     failed); retryable, NOT a readiness verdict.
 #
+# Exit 1 OUTRANKS exit 2 (#3538). If a check has already counted a blocking
+# problem and a LATER check cannot be measured, the run exits 1, not 2: the
+# blocking problem is definite, retrying will not remove it, and "retryable"
+# is the wrong instruction to hand an operator who is already not ready. This
+# does not weaken exit 2 in the direction that matters -- an indeterminate
+# result still never reads as a pass, and nothing that used to block stops
+# blocking. It only converts some exit-2s into exit-1s.
+#
 # Env overrides:
 #   PREFLIGHT_REF    the ref this run is a statement about. Names the verdict
 #                    line and decides whether check 1 applies. Defaults to the
@@ -189,6 +197,35 @@ note() { printf '  %s\n' "$*"; }
 ok()   { printf '%s[ok]%s   %s\n' "$GRN" "$RST" "$*"; }
 bad()  { printf '%s[FAIL]%s %s\n' "$RED" "$RST" "$*"; problems=$((problems + 1)); }
 warn() { printf '%s[warn]%s %s\n' "$YEL" "$RST" "$*"; }
+
+# The single exit point for "this check could not be measured" (#3538).
+#
+# An indeterminate result must never read as a pass -- that part is #3308's
+# lesson and it is unchanged. It must not mask a verdict that is ALREADY
+# definite either, and that part was reachable: every INFRA site below exits
+# immediately, discarding whatever `problems` the earlier checks had already
+# counted. A run where check 1 found real forward-port drift AND ghcr was
+# briefly unreadable reported exit 2 -- "retryable" -- when the true answer
+# was "you are not ready, and retrying will not help". Telling an operator to
+# retry a definite red is how a red gets laundered into a rerun.
+#
+# So the exit code is the STRONGEST claim the run has actually earned:
+#   * nothing blocking counted yet -> exit 2, INFRA, exactly as before.
+#   * something blocking counted   -> exit 1, NOT READY.
+# Checks only ever ADD problems (`bad` increments, nothing decrements), so a
+# NOT READY reached here cannot be withdrawn by a check that did not run. The
+# audit IS incomplete, though, so the verdict line says so instead of implying
+# a clean sweep.
+infra_exit() {
+  if [[ "$problems" -gt 0 ]]; then
+    echo "${RED}NOT READY${RST} to cut from ${AUDIT_REF:-?}@${AUDIT_SHA:-?}: $problems blocking problem(s) found before a later check could not be measured (see the INFRA line above)."
+    echo "  The blocking problems are real and are not retryable. The remaining"
+    echo "  checks did not run, so this audit is incomplete -- fix these, then"
+    echo "  re-run the preflight for a full verdict."
+    exit 1
+  fi
+  exit 2
+}
 
 # repo slug for gh
 REPO="${PREFLIGHT_REPO:-}"
@@ -263,7 +300,7 @@ else
   # enumerate active release branches (works on a shallow checkout)
   if ! remote_refs="$(git ls-remote --heads origin 'release/*' 2>/dev/null)"; then
     echo "INFRA: git ls-remote for release/* failed" >&2
-    exit 2
+    infra_exit
   fi
   rel_branches="$(printf '%s\n' "$remote_refs" | sed -E 's#^[0-9a-f]+\trefs/heads/##' | sort -u)"
   if [[ -z "$rel_branches" ]]; then
@@ -333,7 +370,7 @@ else
   head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
   if [[ -z "$head_sha" ]]; then
     echo "INFRA: could not resolve HEAD" >&2
-    exit 2
+    infra_exit
   fi
   # Select the run for THIS commit, never "the latest run" (#3338): recency
   # is a proxy that diverges when main has moved, a publish is in flight, or
@@ -345,7 +382,7 @@ else
     # gh is present but the query failed (auth, network, API). We could not
     # measure, so we must not render a readiness verdict either way.
     echo "INFRA: could not query Docker Publish runs for $head_sha" >&2
-    exit 2
+    infra_exit
   fi
   if [[ -z "$run_info" ]]; then
     # A fourth outcome, distinct from "ran and failed" (#3338): the query
@@ -359,7 +396,7 @@ else
     read -r run_id run_status <<< "$run_info"
     if [[ -z "$run_id" || -z "$run_status" ]]; then
       echo "INFRA: unparseable Docker Publish run answer for $head_sha ('$run_info')" >&2
-      exit 2
+      infra_exit
     fi
     if [[ "$run_status" != "completed" ]]; then
       # In flight is not absent and not green: block and say to wait rather
@@ -375,7 +412,7 @@ else
       note "run $run_id: Security Scan=$sec, Backend Multi-Arch Manifest=$man"
       if [[ "$sec" == "?" || "$man" == "?" ]]; then
         echo "INFRA: could not read job conclusions from run $run_id" >&2
-        exit 2
+        infra_exit
       elif [[ "$sec" == "success" && "$man" == "success" ]]; then
         ok "this commit's images published cleanly"
       elif [[ "${PREFLIGHT_ALLOW_RED_PUBLISH:-0}" == "1" ]]; then
@@ -422,7 +459,7 @@ if [[ "${PREFLIGHT_SKIP_VERSION_PIN:-0}" == "1" ]]; then
   note "which is not the same as it passing."
 elif [[ ! -x "$TAG_STATE_CMD" || ! -x "$TAG_REVISION_CMD" ]]; then
   echo "INFRA: registry probe scripts not found/executable ($TAG_STATE_CMD, $TAG_REVISION_CMD)" >&2
-  exit 2
+  infra_exit
 else
   for component in "${VERSION_PINNED_COMPONENTS[@]}"; do
     IFS='|' read -r vfile suffix srcpaths <<< "$component"
@@ -450,7 +487,7 @@ else
         # Includes `indeterminate` and an empty/absent probe answer. We could
         # not read the registry, so we must not render a verdict either way.
         echo "INFRA: could not determine whether $image:$pinned is published (got '${state:-<no answer>}')" >&2
-        exit 2
+        infra_exit
         ;;
     esac
 
@@ -465,7 +502,7 @@ else
     fi
     if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
       echo "INFRA: could not read the source revision of $image:$pinned (got '${rev:-<no answer>}')" >&2
-      exit 2
+      infra_exit
     fi
 
     # A shallow checkout will not have the published commit; fetch just it.
@@ -474,7 +511,7 @@ else
     fi
     if ! git cat-file -e "${rev}^{commit}" 2>/dev/null; then
       echo "INFRA: $image:$pinned names commit $rev, which could not be fetched" >&2
-      exit 2
+      infra_exit
     fi
 
     if git diff --quiet "$rev" HEAD -- "${srcarr[@]}"; then
@@ -565,14 +602,14 @@ if [[ "${PREFLIGHT_SKIP_CHANGELOG_RECON:-0}" == "1" ]]; then
   note "which is not the same as it passing."
 elif [[ ! -f CHANGELOG.md ]]; then
   echo "INFRA: no CHANGELOG.md at the repo root" >&2
-  exit 2
+  infra_exit
 elif ! command -v gh >/dev/null 2>&1; then
   # Deliberately INFRA rather than a note: unlike checks 3 and 4 there is no
   # partial answer to give. Without the issue<->PR map every entry looks
   # unreconciled, so a "soft" version of this check would either spray false
   # positives or quietly pass.
   echo "INFRA: gh is not on PATH; the issue<->PR map cannot be built" >&2
-  exit 2
+  infra_exit
 else
   prev_tag="${PREFLIGHT_PREV_TAG:-}"
   if [[ -z "$prev_tag" ]]; then
@@ -582,7 +619,7 @@ else
   if [[ -z "$prev_tag" ]]; then
     echo "INFRA: no previous stable tag is reachable from HEAD -- cannot bound the" >&2
     echo "       commit range. Run 'git fetch --tags' and retry." >&2
-    exit 2
+    infra_exit
   fi
   note "range: ${prev_tag}..HEAD"
 
@@ -685,7 +722,7 @@ else
             --jq '.data.repository | to_entries[] | "\(.value.number):\([.value.closingIssuesReferences.nodes[].number] | join(","))"' \
             2>/dev/null)"; then
         echo "INFRA: could not resolve the PR->closing-issue map for ${prev_tag}..HEAD" >&2
-        exit 2
+        infra_exit
       fi
     fi
     closing_issues="$(printf '%s\n' "$closes_map" | cut -d: -f2 | tr ',' '\n' \

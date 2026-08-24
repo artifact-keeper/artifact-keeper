@@ -146,6 +146,12 @@ jobs:
       contents: read
       actions: read   # list release-preflight runs and their artifacts
     steps:
+      # Depth 1 and sparse on purpose, and NOT `fetch-depth: 0` by analogy with
+      # release-preflight.yml -- that workflow needs full history because check
+      # 5 bounds a commit range with `git describe` and `git log <tag>..HEAD`.
+      # This job reads the Actions API, not the repository: the only git call
+      # in the script is deriving the repo slug from the origin remote, and
+      # even that is bypassed because GATE_REPO is passed explicitly below.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

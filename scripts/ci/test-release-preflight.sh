@@ -284,6 +284,16 @@ echo "release-preflight ref-awareness"
 #   for a detached HEAD, which is what a sha checkout gives) would silently
 #   delete the #3039 gate, so case 3 below re-runs the exact forward-port miss
 #   from check-1 case 1 with PREFLIGHT_REF=main and demands it still fails.
+#
+#   These cases are SCOPED to check 1, the same way every other helper in this
+#   file is scoped to the check it is about (checks 3 and 4 are neutralised
+#   here; check 5's own cases at the bottom neutralise 3 and 4 symmetrically).
+#   That is deliberate and it should stay that way: the alternative -- giving
+#   this fixture a CHANGELOG.md, a reachable stable tag and a gh stub that
+#   answers check 5's GraphQL PR->issue query -- would make a check-1 assertion
+#   fail whenever check 5's fixture requirements change, which is the coupling
+#   that made these two changes collide in the first place. A case should be a
+#   statement about one check.
 expectref() { # <label> <expected-exit> <expected-substring> <preflight-ref> [main-trivyignore] [rel-trivyignore]
   local label="$1" want="$2" needle="$3" pref="$4" main_ti="${5:-}" rel_ti="${6:-}" got
   [ -n "$main_ti" ] && printf '%s\n' "$main_ti" > "$REPO_DIR/.trivyignore"
@@ -293,6 +303,7 @@ expectref() { # <label> <expected-exit> <expected-substring> <preflight-ref> [ma
       FAKE_RELEASE_REFS="$REL_REFS" \
       FAKE_REL_TRIVYIGNORE="$rel_ti" \
       PREFLIGHT_SKIP_VERSION_PIN=1 \
+      PREFLIGHT_SKIP_CHANGELOG_RECON=1 \
       bash scripts/ci/release-preflight.sh > "$WORK/out.txt" 2>&1 )
   got=$?
   rm -f "$REPO_DIR/.trivyignore"
@@ -335,6 +346,76 @@ expectref "NOT READY names the audited ref" 1 "NOT READY to cut from main@" \
   "CVE-2099-0001" \
   "CVE-2099-0001
 CVE-2099-0002"
+
+echo
+echo "release-preflight INFRA precedence (#3538)"
+
+# --- exit 1 outranks exit 2 -------------------------------------------------
+#   Every INFRA site exits the script immediately, which used to DISCARD the
+#   `problems` the earlier checks had already counted. A run where check 1
+#   found real forward-port drift and a later check could not be measured
+#   reported exit 2 -- "retryable" -- when the true answer was "you are not
+#   ready, and retrying will not help". Telling an operator to retry a definite
+#   red is how a red gets laundered into a rerun, which is the same species of
+#   defect as #3308 one layer along.
+#
+#   This is not hypothetical: it is exactly what surfaced when #3539's check 5
+#   (which reports INFRA on a repo with no CHANGELOG.md) landed alongside the
+#   ref-awareness cases above, whose synthetic repos have none. The state is
+#   reproduced here on purpose rather than only skipped away, so the precedence
+#   stays asserted after the skip that scopes those cases.
+#
+#   The pair matters in both directions. A definite red must survive a later
+#   indeterminate (case 1), and an indeterminate must NOT be promoted into a
+#   verdict when there is no blocking problem to promote (case 2) -- that would
+#   turn "I could not measure" into "not ready", which is a different lie.
+expectinfra() { # <label> <expected-exit> <expected-substring> <main-trivyignore> <rel-trivyignore>
+  local label="$1" want="$2" needle="$3" main_ti="$4" rel_ti="$5" got
+  [ -n "$main_ti" ] && printf '%s\n' "$main_ti" > "$REPO_DIR/.trivyignore"
+  # No CHANGELOG.md in the fixture, and check 5 is NOT skipped -- so check 5
+  # reports INFRA after check 1 has had its say.
+  ( cd "$REPO_DIR" && PATH="$STUB:$PATH" \
+      PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
+      PREFLIGHT_REF=main \
+      FAKE_RELEASE_REFS="$REL_REFS" \
+      FAKE_REL_TRIVYIGNORE="$rel_ti" \
+      PREFLIGHT_SKIP_VERSION_PIN=1 \
+      bash scripts/ci/release-preflight.sh > "$WORK/out.txt" 2>&1 )
+  got=$?
+  rm -f "$REPO_DIR/.trivyignore"
+  if [ "$got" != "$want" ]; then
+    fail "$label: expected exit $want, got $got"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  elif ! grep -qF "$needle" "$WORK/out.txt"; then
+    fail "$label: exit $got correct but output lacks '$needle'"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  else
+    pass "$label (exit $got)"
+  fi
+}
+
+# 1. A blocking problem already counted, then a check that cannot be measured:
+#    NOT READY wins. Retrying does not forward-port a suppression.
+expectinfra "blocking problem then INFRA -> NOT READY (exit 1)" 1 \
+  "blocking problem(s) found before a later check could not be measured" \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+# 2. ...and the transcript says the audit is incomplete rather than implying a
+#    clean sweep of every check.
+expectinfra "the incomplete-audit caveat is stated" 1 \
+  "this audit is incomplete" \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+# 3. Nothing blocking counted: an unmeasurable check is still INFRA, never a
+#    manufactured verdict and never a pass.
+expectinfra "no blocking problem, then INFRA -> still INFRA (exit 2)" 2 \
+  "INFRA: no CHANGELOG.md at the repo root" \
+  "CVE-2099-0001" \
+  "CVE-2099-0001"
 
 echo
 echo "release-preflight check 4 (#3339)"

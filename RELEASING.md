@@ -34,7 +34,12 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    range `<previous stable tag>..HEAD` describe the same work in both
    directions (#3537). A `NOT READY` (exit 1) means fix main first;
    tagging over it costs a full re-cut cycle. An exit 2 is `INFRA` — a check
-   that could not be measured, which is neither a pass nor a failure.
+   that could not be measured, which is neither a pass nor a failure. If a
+   check has already found a blocking problem and a *later* check cannot be
+   measured, you get exit 1, not exit 2 (#3538): the blocking problem is
+   definite and retrying will not remove it, so "retryable" would be the wrong
+   instruction. The transcript says which checks did not run, so re-run the
+   preflight for a full verdict once you have fixed them.
 
    **This step is now enforced, not advisory (#3538).** `release.yml`'s
    `preflight-evidence` job refuses to proceed unless a green run of the
