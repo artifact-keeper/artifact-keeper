@@ -305,6 +305,37 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
+    // result_large_err threshold anchor (#3551)
+    // -----------------------------------------------------------------------
+
+    /// `.clippy.toml` sets `large-error-threshold = 129` so that the axum
+    /// `Result<T, Response>` idiom used by every handler in this module does
+    /// not trip `clippy::result_large_err`. That number is derived from the
+    /// size of one concrete type, and nothing in the lint configuration can
+    /// notice when the type outgrows it: the symptom is instead hundreds of
+    /// clippy errors across hundreds of unchanged functions, attributed to
+    /// whichever pull request happens to reach CI first. That is exactly how
+    /// #3551 presented.
+    ///
+    /// This is the assertion that fires first, by name, with the two numbers
+    /// side by side. If it fails, an axum or compiler upgrade has changed the
+    /// layout of `Response`: raise `large-error-threshold` to the new size
+    /// plus one in the same pull request that takes the upgrade, and record
+    /// why in the CHANGELOG. Do not silence it with an `allow`.
+    #[test]
+    fn response_fits_under_the_result_large_err_threshold() {
+        const LARGE_ERROR_THRESHOLD: usize = 129; // must match .clippy.toml
+        let actual = std::mem::size_of::<axum::response::Response>();
+        assert!(
+            actual < LARGE_ERROR_THRESHOLD,
+            "size_of::<axum::response::Response>() is {actual} bytes, which is \
+             not below the large-error-threshold of {LARGE_ERROR_THRESHOLD} in \
+             .clippy.toml. Every `Result<_, Response>` in backend/src/api/handlers \
+             is about to fail clippy::result_large_err. See #3551."
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // escape_like_literal — SQL LIKE wildcard escape for user-supplied input
     // -----------------------------------------------------------------------
 

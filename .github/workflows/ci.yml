@@ -323,6 +323,23 @@ jobs:
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
+      # The compiler is an input to this job and it used to be an untracked one
+      # (#3551). This job installs no toolchain: it compiles with whatever rustc
+      # the self-hosted ak-ci-runners image happens to bake in. When that image
+      # picked up Rust 1.98.0, `cargo clippy -- -D warnings` went from clean to
+      # 555 result_large_err errors on an unchanged tree and took main, every
+      # open PR and the release chain red at once, with no diff to point at.
+      #
+      # rust-toolchain.toml now pins it. This step is what makes the pin
+      # falsifiable rather than decorative: it prints the pinned channel next to
+      # the rustc this job is actually about to use and fails if they differ --
+      # which is also the check that catches a runner image whose cargo is not a
+      # rustup shim and therefore ignores the file entirely. It runs before the
+      # cache restore so a drifted toolchain fails in seconds with a named
+      # reason, instead of ten minutes later as a wall of lints.
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
       # Cache the dependency build so only the workspace crate recompiles.
       # ~635 deps are byte-identical run-to-run; cold compile was ~9m.
       #
@@ -657,6 +674,18 @@ jobs:
       # Pure YAML inspection, no network, ~1s.
       - name: Check supply-chain steps cannot fail silently
         run: ./scripts/ci/check-supply-chain-soft-fail.sh
+
+      # Static half of the #3551 toolchain pin: rust-toolchain.toml must name a
+      # concrete version, and no workflow may re-float past it with a
+      # `dtolnay/rust-toolchain@stable` ref or a contradicting `toolchain:`
+      # input. check-rust asserts the live compiler; this asserts the
+      # configuration, on every PR including ones that touch no Rust. Pure file
+      # inspection, no network, ~1s.
+      - name: Check the Rust toolchain pin has not re-floated
+        run: ./scripts/ci/check-toolchain-pin.sh
+
+      - name: Check the toolchain-pin gate catches what it must
+        run: bash scripts/ci/test-check-toolchain-pin.sh
 
       - name: Check the supply-chain soft-fail gate catches what it must
         run: bash scripts/ci/test-check-supply-chain-soft-fail.sh
@@ -1787,7 +1816,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
