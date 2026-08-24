@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `[Unreleased]` CHANGELOG guard now runs on this branch too** (#3541). `scripts/ci/check-changelog-unreleased.sh` has been on `main` since #3436, where it closes the #3433 shape: a release-prep commit that renames `## [Unreleased]` to `## [X.Y.Z]` without opening a fresh empty one, after which every PR branch cut before the rename merges its hunk into the *already-released* section with no conflict and no warning. It was never ported here — yet v1.7.3, v1.7.4, v1.7.6 and v1.7.8 were all cut from this branch, and a release prep is exactly the kind of commit that lands on a maintenance branch. The gate and its self-test now run in the `shell-tests` job.
+
 ## [1.7.8] - 2026-08-21
 
 > **`v1.7.7` is a dead tag — do not use it.** It was tagged at `5828bdb`, its
