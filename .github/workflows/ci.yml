@@ -593,6 +593,27 @@ jobs:
       - name: Check release-branch gate exemptions stay narrow
         run: bash scripts/ci/test-check-release-branch-commits.sh
 
+      # A release prep that renames `## [Unreleased]` to `## [X.Y.Z]` without
+      # opening a fresh empty one strands every entry that lands after it: PR
+      # branches cut before the rename anchor into the renamed, ALREADY
+      # RELEASED section and merge with no conflict and no warning. That is
+      # how 30 entries of 1.8.0 work ended up filed under `[1.7.5]`, a version
+      # that produced no images and no release object (#3433, #3429).
+      #
+      # It matters at least as much on THIS branch as on main: v1.7.3, v1.7.4,
+      # v1.7.6 and v1.7.8 were all cut from here, and a release prep is
+      # precisely the kind of commit that lands on a maintenance branch. The
+      # gate has been on main since #3436 and was never ported (#3541).
+      #
+      # The assertion is one grep — the first `## [` heading must be
+      # `## [Unreleased]` — and it is a repo-state invariant, so it fires on
+      # whichever PR reaches CI first rather than depending on who did it.
+      - name: Check CHANGELOG has an open [Unreleased] section
+        run: ./scripts/ci/check-changelog-unreleased.sh
+
+      - name: Check the CHANGELOG gate catches what it must
+        run: bash scripts/ci/test-check-changelog-unreleased.sh
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
