@@ -27,12 +27,21 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    `# RETIRED:` tombstone (the drift that stalled v1.7.0-rc.1 at Security
    Scan, #3039; the tombstone mechanism is #3309), the version set is
    consistent, Docker Publish for the exact commit being tagged (not
-   merely the latest run, #3338) cleanly published its manifest, and no
+   merely the latest run, #3338) cleanly published its manifest, no
    component pinned by a checked-in `VERSION` file would try to republish an
    exact tag that already exists with different content (the collision that
-   killed the v1.7.2 tag). A `NOT READY` (exit 1) means fix main first;
+   killed the v1.7.2 tag), and the pending CHANGELOG section and the commit
+   range `<previous stable tag>..HEAD` describe the same work in both
+   directions (#3537). A `NOT READY` (exit 1) means fix main first;
    tagging over it costs a full re-cut cycle. An exit 2 is `INFRA` — a check
    that could not be measured, which is neither a pass nor a failure.
+
+   Check 5 reads the issue reference each entry leads with, so **every
+   CHANGELOG bullet must name the issue it closes** — `- **Summary**
+   (#NNNN). prose` — and every merged PR in the range must be named by some
+   pending entry. Dependency bumps (`chore: bump …`) and `chore(release):`
+   commits are the only exemptions. `### Sponsors` and `### Thank You`
+   bullets are credits, not entries, and are not reconciled.
 
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
@@ -151,7 +160,13 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
 - The GitHub Release body is a curated high-level paraphrase of the
   version's `## [X.Y.Z]` CHANGELOG section (see "Release-notes style"),
   NOT the raw auto-generated PR list; recognition sections (Sponsors,
-  Thank You) follow the CLAUDE.md policy.
+  Thank You) follow the CLAUDE.md policy. For a stable release
+  `.github/release-notes/<version>.md` is REQUIRED on the ref being
+  released — `generate_release_notes` is a prerelease-only fallback, and a
+  stable tag without the file is refused (#3537).
+- Every CHANGELOG entry names the issue it closes, and every merged PR
+  since the previous stable tag is named by some pending entry. Enforced
+  in both directions by `release-preflight.sh` check 5 (#3537).
 - Prerelease tags (`-rc.N`, `-beta.N`) are exempt from the CHANGELOG
   entry requirement; final releases are not.
 - `CHANGELOG.md` always has an open `## [Unreleased]` as its first `## [`
@@ -200,7 +215,26 @@ section**:
 
 Mechanics: author the body as `.github/release-notes/<version>.md` and
 commit it in the same PR as the CHANGELOG promotion. `release.yml`'s
-"Resolve release notes" step uses that file as the Release `body_path`
-when present, and falls back to `generate_release_notes` only for versions
-without a curated file (e.g. `-rc.N` prereleases). Security hotfix releases
-use the tighter "am I affected" table format instead.
+"Resolve release notes" step uses that file as the Release `body_path`.
+
+For a stable `vX.Y.Z` the file is **required**: with no curated file the
+release-preflight job refuses the tag, and the "Resolve release notes" step
+refuses it again an hour later. `generate_release_notes` survives only for
+prereleases (`-rc.N`, `-beta.N`). That fallback used to apply to everything,
+silently: v1.7.1 was cut with no curated file, the step logged "using GitHub
+auto-generated notes", and the release published — and because auto-notes do
+not promote the CHANGELOG, eight `[Unreleased]` entries that had already
+shipped stayed under `[Unreleased]`, one of them telling operators to act
+"before upgrading to 1.7.2" when they had been exposed for a week (#3318,
+#3537).
+
+The notes file is read from **the ref being released**, not from `main`.
+`main` and `release/1.7.x` hold disjoint halves of the 1.7.x set — 1.7.6 and
+1.7.8 live only on the release branch, which is where they belong. Put the
+file on the branch you are cutting from.
+
+`.github/release-notes/` must also hold no file for a version that has
+neither a tag nor a Release. A stale notes file is what a human reads when
+reconstructing what shipped, and it is one rename away from being published
+as another version's body. Security hotfix releases use the tighter "am I
+affected" table format instead.

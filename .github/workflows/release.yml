@@ -37,7 +37,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          # Cone mode always includes top-level files, so CHANGELOG.md comes
+          # with the checkout; the three directories are what the bookkeeping
+          # assertions read (the notes set, the delegated [Unreleased] gate).
+          sparse-checkout: |
+            .github/scripts
+            .github/release-notes
+            scripts/ci
 
       # Scope, stated honestly: `created` is false only when a push updates an
       # existing ref, so this catches a force-push over a live tag -- the
@@ -71,6 +77,23 @@ jobs:
         run: |
           set -euo pipefail
           .github/scripts/assert-release-absent.sh "${GITHUB_REF_NAME}"
+
+      # Bookkeeping, checked here so it costs a minute rather than the hour of
+      # gates that precedes the release job (issue #3537). Four of the last
+      # eight releases shipped with wrong or missing notes/CHANGELOG state and
+      # every one was found by a human days later; the only automated check
+      # asserted that a `## [X.Y.Z]` heading exists and is non-empty, which a
+      # section describing a DIFFERENT release also satisfies.
+      #
+      # Everything it reads comes from the ref being released, never from main
+      # -- `main` and `release/1.7.x` hold disjoint halves of the 1.7.x notes
+      # set, so a main-relative check would fail two correct releases.
+      - name: Verify release bookkeeping
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          .github/scripts/assert-release-bookkeeping.sh "${GITHUB_REF_NAME}"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RESOLVE CANDIDATE IMAGE DIGEST  (issues #2696, #2711)
@@ -709,10 +732,24 @@ jobs:
 
       - name: Resolve release notes
         id: notes
-        # Prefer a curated per-version notes body (.github/release-notes/<version>.md):
-        # a high-level paraphrase of the CHANGELOG, not the raw PR dump (see
-        # RELEASING.md "Release-notes style"). Fall back to GitHub's auto-generated
-        # notes only when no curated file exists (e.g. -rc/-beta prereleases).
+        # A stable release publishes a curated per-version body
+        # (.github/release-notes/<version>.md): a high-level paraphrase of the
+        # CHANGELOG, not the raw PR dump (RELEASING.md "Release-notes style").
+        # The `generate_release_notes` fallback survives for PRERELEASES only.
+        #
+        # It used to apply to everything, silently. v1.7.1 was cut with no
+        # curated file, this step logged "using GitHub auto-generated notes"
+        # and the release published anyway -- and because auto-notes do not
+        # promote the CHANGELOG, 8 `[Unreleased]` entries that had already
+        # shipped stayed under `[Unreleased]`, one of them an upgrade note
+        # telling 1.7.1 operators to act "before upgrading to 1.7.2" when they
+        # had been exposed for a week. Found six days later by a human
+        # (#3318, #3537).
+        #
+        # The preflight job asserts the same thing an hour earlier so this is
+        # rarely the arm that fires; it is here because this is where the
+        # decision is actually made, and a gate that lives only in a different
+        # job is one refactor away from being bypassed.
         run: |
           set -euo pipefail
           VER="${{ steps.version.outputs.version }}"
@@ -721,8 +758,11 @@ jobs:
             echo "Using curated release notes: $F"
             echo "body_path=$F" >> "$GITHUB_OUTPUT"
             echo "generate=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Curated release notes missing::${F} does not exist on this ref. A stable release publishes a curated body, not GitHub's auto-generated PR list. Author it, commit it with the CHANGELOG promotion, and re-cut the tag."
+            exit 1
           else
-            echo "No curated notes for ${VER}; using GitHub auto-generated notes."
+            echo "No curated notes for prerelease ${VER}; using GitHub auto-generated notes."
             echo "body_path=" >> "$GITHUB_OUTPUT"
             echo "generate=true" >> "$GITHUB_OUTPUT"
           fi

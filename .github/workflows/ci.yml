@@ -661,6 +661,20 @@ jobs:
       - name: Check the supply-chain soft-fail gate catches what it must
         run: bash scripts/ci/test-check-supply-chain-soft-fail.sh
 
+      # Four of the last eight releases shipped with wrong release bookkeeping
+      # — a missing curated notes file, bullets filed under an already-released
+      # heading, an [Unreleased] heading renamed without a fresh one being
+      # opened — and every one was found by a human days later (#3537). The
+      # gates that close those shapes fire only on a `v*` tag push, a handful
+      # of runs per release, and their interesting cases are ones nobody wants
+      # to reproduce live: a release that publishes with no curated notes
+      # cannot be un-published. This exercises them offline, including the
+      # `Resolve release notes` run-block extracted straight out of
+      # release.yml, so a revert to the silent auto-notes fallback is a red
+      # test rather than a review miss. Stubs `gh`; ~2s.
+      - name: Check the release-bookkeeping gates catch what they must
+        run: bash scripts/ci/test-assert-release-bookkeeping.sh
+
       # The duplication gate measures whatever jscpd-prepare-sources.py hands
       # it, so a bug there silently changes the gate's verdict (#3495). The
       # dangerous direction is over-removal: an INDENTED `#[cfg(test)]` sits
