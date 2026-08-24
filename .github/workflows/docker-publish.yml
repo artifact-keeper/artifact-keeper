@@ -2260,6 +2260,16 @@ jobs:
             # aimed at a never-released version (the v1.7.2/v1.7.5 shape) fails
             # here rather than moving `:latest`.
             echo "Post-gate floating promotion for ${PROMOTE_VERSION}."
+            # The digest about to be aliased must be the one the EXACT identity
+            # tag names -- that equality is the whole "bytes tested == bytes
+            # published" claim, so it is checked rather than assumed. The merge
+            # jobs report the version they guarded; it has to be this one.
+            for pair in "backend:${BACKEND_VERSION}" "openscap:${OPENSCAP_VERSION}"; do
+              if [[ "${pair#*:}" != "${PROMOTE_VERSION}" ]]; then
+                echo "::error title=Promote version mismatch::${pair%%:*} published '${pair#*:}' but this run is promoting '${PROMOTE_VERSION}'. Refusing to alias a floating tag onto a digest that is not the promoted version's."
+                exit 1
+              fi
+            done
             gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
               --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
               > /tmp/published-releases.txt
@@ -2281,8 +2291,16 @@ jobs:
             # Plain promote (the documented recovery dispatch). Unchanged
             # behaviour: mirror ghcr's current floating state, move nothing.
             echo "Promote without floating advance: mirroring ghcr's current floating state only."
-            plan "$GB" "$HB" "${BACKEND_DIGEST}"  mirror "${PROMOTE_VERSION%.*}" latest
-            plan "$GO" "$HO" "${OPENSCAP_DIGEST}" mirror "${PROMOTE_VERSION%.*}" latest
+            # A prerelease has no AK floating line at all, so there is nothing
+            # to mirror and `${PROMOTE_VERSION%.*}` would name a tag that never
+            # existed (`1.8.2-rc`). Mirror mode would skip it either way; say so
+            # instead of printing a phantom tag name.
+            if [[ "${PROMOTE_VERSION}" == *-* ]]; then
+              echo "  prerelease ${PROMOTE_VERSION}: no AK floating tags exist to mirror."
+            else
+              plan "$GB" "$HB" "${BACKEND_DIGEST}"  mirror "${PROMOTE_VERSION%.*}" latest
+              plan "$GO" "$HO" "${OPENSCAP_DIGEST}" mirror "${PROMOTE_VERSION%.*}" latest
+            fi
           else
             echo "Normal build: backend/openscap floating tags are NOT applied here."
             echo "  :X.Y.Z is published and immutable; :latest and :X.Y are applied by the"
