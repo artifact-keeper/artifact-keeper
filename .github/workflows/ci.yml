@@ -323,6 +323,21 @@ jobs:
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
+
       # The compiler is an input to this job and it used to be an untracked one
       # (#3551). This job installs no toolchain: it compiles with whatever rustc
       # the self-hosted ak-ci-runners image happens to bake in. When that image
@@ -462,6 +477,21 @@ jobs:
       # (job 93341706470, PR #3237).
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
 
       # Separate cache key from check-rust: same target dir but a different
       # build profile (test vs clippy), so they must not share a cache.
@@ -796,6 +826,21 @@ jobs:
       - name: Isolate CARGO_HOME per job (#3154)
         if: steps.detect.outputs.rust_changed == 'true'
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
 
       # Distinct cache key: the instrumented coverage build is incompatible
       # with the clippy/unit profiles, and cargo-llvm-cov builds into
@@ -1387,6 +1432,21 @@ jobs:
       # minutes of download.
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
 
       # Resolve and download the dependency graph in its own step, ahead of the
       # test steps, with a retry.
@@ -2049,6 +2109,21 @@ jobs:
       # per run, which this main-push-only job can afford.
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
 
       - name: Build Windows binary (cross-compile)
         env:

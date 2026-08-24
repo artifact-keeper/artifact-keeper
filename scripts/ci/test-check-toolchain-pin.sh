@@ -133,6 +133,19 @@ out="$(PATH="$STUBDIR:$PATH" REPO_ROOT="$d" "$GATE" --active 2>&1)"; rc=$?
 if [ $rc -ne 0 ]; then echo "  ok   — --active FAILS when the live rustc drifts from the pin"; pass=$((pass + 1))
 else echo "  FAIL — --active FAILS when the live rustc drifts from the pin"; echo "$out" | sed 's/^/         /'; fail=$((fail + 1)); fi
 
+# A rustc that cannot resolve the pin at all (a read-only RUSTUP_HOME, no
+# network) must fail WITH THE REASON. The first cut of this gate piped rustc's
+# stderr to /dev/null and reported an empty failure, which cost a CI round.
+printf '#!/bin/sh\necho "info: syncing channel updates for 1.98.0" >&2\necho "error: could not create temp file /usr/local/rustup/tmp/x" >&2\nexit 1\n' > "$STUBDIR/rustc"
+chmod +x "$STUBDIR/rustc"
+out="$(PATH="$STUBDIR:$PATH" REPO_ROOT="$d" "$GATE" --active 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && grep -q "could not create temp file" <<<"$out"; then
+  echo "  ok   — --active reports rustc's own error when the pin cannot resolve"; pass=$((pass + 1))
+else
+  echo "  FAIL — --active reports rustc's own error when the pin cannot resolve"
+  echo "$out" | sed 's/^/         /'; fail=$((fail + 1))
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

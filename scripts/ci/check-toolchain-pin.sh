@@ -102,9 +102,16 @@ fi
 if [ "$CHECK_ACTIVE" = "1" ]; then
   if ! command -v rustc >/dev/null 2>&1; then
     fail "--active was requested but no rustc is on PATH."
+  # Capture rather than swallow: when a rustup shim cannot MATERIALISE the
+  # pinned toolchain (a read-only RUSTUP_HOME, no network) the whole reason is
+  # in rustc's stderr, and a gate that hides it reports an empty failure.
+  elif ! rustc_out="$(cd "$REPO_ROOT" && rustc --version 2>&1)"; then
+    fail "\`rustc --version\` failed inside the repository, so the pinned
+      toolchain could not be resolved. rustc said:
+$(sed 's/^/        /' <<<"$rustc_out")"
   else
-    active="$(cd "$REPO_ROOT" && rustc --version 2>/dev/null | awk '{print $2}')"
-    echo "  active rustc:   $active  ($(cd "$REPO_ROOT" && rustc --version))"
+    active="$(awk '{print $2}' <<<"$rustc_out")"
+    echo "  active rustc:   $active  ($rustc_out)"
     # "1.98" in the file legitimately matches rustc 1.98.0.
     if [ "$active" != "$PINNED" ] && [ "${active%.*}" != "$PINNED" ]; then
       fail "rust-toolchain.toml pins $PINNED but this job is compiling with
