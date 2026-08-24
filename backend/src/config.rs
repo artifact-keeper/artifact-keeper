@@ -537,6 +537,21 @@ pub struct Config {
     /// deployments are unchanged. Env var: `SSO_DISABLE_ADMIN_BREAK_GLASS`.
     pub sso_disable_admin_break_glass: bool,
 
+    /// Kill switch for the web UI's silent SSO auto-login (check-sso).
+    ///
+    /// When an OIDC provider is enabled, the web frontend attempts one
+    /// invisible `prompt=none` authorization per browser session so a user
+    /// with a live IdP session is signed in without clicking the SSO button,
+    /// while anonymous visitors stay anonymous (the IdP answers
+    /// `login_required` and the attempt ends silently). Operators who do not
+    /// want the automatic attempt at all set `OIDC_SILENT_SSO=false` (or `0`):
+    /// the flag is advertised to the frontend through
+    /// `GET /api/v1/system/config` (`auth.silent_sso_enabled`) and the web UI
+    /// then never initiates the silent flow. Defaults to `true`. Display-only
+    /// on the server side: it gates no endpoint, so flipping it never locks
+    /// anyone out.
+    pub oidc_silent_sso_enabled: bool,
+
     /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
     ///
     /// When set, this value overrides the `security.totp_policy` row in
@@ -929,6 +944,7 @@ redacted_debug!(Config {
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show sso_disable_admin_break_glass,
+    show oidc_silent_sso_enabled,
     show totp_policy,
     show metrics_port,
     show database_max_connections,
@@ -1046,6 +1062,7 @@ impl Default for Config {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
+            oidc_silent_sso_enabled: true,
             totp_policy: None,
             metrics_port: None,
             database_max_connections: 50,
@@ -1284,6 +1301,13 @@ impl Config {
             sso_disable_admin_break_glass: matches!(
                 env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").as_deref(),
                 Ok("true" | "1")
+            ),
+            // Default-on kill switch: only an explicit "false"/"0" disables
+            // the web UI's silent SSO attempt, so existing deployments get
+            // the seamless sign-in without new configuration.
+            oidc_silent_sso_enabled: !matches!(
+                env::var("OIDC_SILENT_SSO").as_deref(),
+                Ok("false" | "0")
             ),
             totp_policy: parse_totp_policy_env(
                 env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
@@ -2967,6 +2991,43 @@ mod tests {
         restore_env("DATABASE_URL", saved_db);
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("SSO_DISABLE_ADMIN_BREAK_GLASS", saved_flag);
+    }
+
+    #[test]
+    fn test_config_oidc_silent_sso_kill_switch() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("OIDC_SILENT_SSO").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Default is ON: existing deployments get silent SSO without new
+        // configuration.
+        env::remove_var("OIDC_SILENT_SSO");
+        let config = Config::from_env().unwrap();
+        assert!(config.oidc_silent_sso_enabled);
+
+        // "false" and "0" are the explicit kill switch.
+        env::set_var("OIDC_SILENT_SSO", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.oidc_silent_sso_enabled);
+
+        env::set_var("OIDC_SILENT_SSO", "0");
+        let config = Config::from_env().unwrap();
+        assert!(!config.oidc_silent_sso_enabled);
+
+        // Any other value (including a typo) leaves the feature enabled, so a
+        // misspelled opt-out is visible rather than silently flipping an
+        // unrelated default.
+        env::set_var("OIDC_SILENT_SSO", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.oidc_silent_sso_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("OIDC_SILENT_SSO", saved_flag);
     }
 
     #[test]

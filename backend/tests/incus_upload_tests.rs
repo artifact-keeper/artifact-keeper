@@ -86,6 +86,7 @@ fn test_config(storage_path: &str) -> Config {
         stuck_scan_reap_limit: 1000,
         allow_local_admin_login: false,
         sso_disable_admin_break_glass: false,
+        oidc_silent_sso_enabled: true,
         totp_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,

@@ -119,6 +119,35 @@ pub async fn list_providers(
 // OIDC login redirect
 // ---------------------------------------------------------------------------
 
+/// Query parameters accepted by the OIDC login redirect.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct OidcLoginQuery {
+    /// Optional OIDC `prompt` value forwarded to the IdP's authorization
+    /// endpoint. Only `none` is accepted (silent check-sso): the web UI uses
+    /// it to probe for an existing IdP session without ever rendering the
+    /// IdP's login page. Any other value is rejected so the login redirect
+    /// cannot be steered into unexpected IdP behaviours.
+    prompt: Option<String>,
+}
+
+/// Resolve the `prompt` value the login redirect forwards to the IdP.
+///
+/// `prompt=none` (OIDC Core 3.1.2.1) asks the IdP to answer WITHOUT any user
+/// interaction: a live IdP session completes the code flow invisibly, no
+/// session comes back as `login_required` on the callback. That is the whole
+/// silent check-sso mechanism, so `none` is the only value forwarded; the
+/// interactive values (`login`, `consent`, `select_account`) are not needed
+/// by any current flow and are rejected rather than proxied blindly.
+pub(crate) fn resolve_login_prompt(prompt: Option<&str>) -> Result<Option<&'static str>> {
+    match prompt {
+        None => Ok(None),
+        Some("none") => Ok(Some("none")),
+        Some(_) => Err(AppError::Validation(
+            "Unsupported prompt value: only prompt=none is supported".to_string(),
+        )),
+    }
+}
+
 /// Initiate OIDC login redirect
 #[utoipa::path(
     get,
@@ -126,18 +155,25 @@ pub async fn list_providers(
     context_path = "/api/v1/auth/sso",
     tag = "sso",
     params(
-        ("id" = Uuid, Path, description = "OIDC provider configuration ID")
+        ("id" = Uuid, Path, description = "OIDC provider configuration ID"),
+        OidcLoginQuery,
     ),
     responses(
         (status = 307, description = "Redirect to OIDC authorization endpoint"),
+        (status = 400, description = "Unsupported prompt value", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "OIDC provider not found", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn oidc_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<OidcLoginQuery>,
     base_url: RequestBaseUrl,
 ) -> Result<Redirect> {
+    // 0. Validate the optional prompt before any session/state is created so
+    //    a rejected request leaves nothing behind.
+    let prompt = resolve_login_prompt(query.prompt.as_deref())?;
+
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
 
@@ -214,6 +250,14 @@ pub async fn oidc_login(
         auth_url.push_str("&code_challenge_method=S256");
     }
 
+    // 7. Forward the validated prompt (silent check-sso). The explicit
+    //    "Sign in with ..." button never sends `prompt`, so its behaviour is
+    //    byte-for-byte unchanged.
+    if let Some(prompt) = prompt {
+        auth_url.push_str("&prompt=");
+        auth_url.push_str(prompt);
+    }
+
     Ok(Redirect::temporary(&auth_url))
 }
 
@@ -230,6 +274,27 @@ pub struct OidcCallbackQuery {
     error_uri: Option<String>,
 }
 
+/// The OIDC/OAuth error codes that mean "the authorization server needs user
+/// interaction" (OIDC Core 3.1.2.6). An IdP returns them (instead of showing
+/// UI) precisely when the request carried `prompt=none`, so together they are
+/// the "no live IdP session" answer to a silent check-sso probe — an expected
+/// outcome for an anonymous visitor, not a login failure.
+pub(crate) fn is_interaction_required_error(error: &str) -> bool {
+    matches!(
+        error,
+        "login_required"
+            | "interaction_required"
+            | "consent_required"
+            | "account_selection_required"
+    )
+}
+
+/// Where a denied silent check-sso attempt lands: the frontend callback page
+/// with a `silent_denied` marker and deliberately NO error payload. The web
+/// UI treats it as "remain anonymous" (records the attempt and returns the
+/// user to where they were); it must never render an error for it.
+pub(crate) const SILENT_DENIED_CALLBACK_URL: &str = "/callback?silent_denied=1";
+
 /// Classification of an OIDC authorization callback (RFC 6749 4.1.2 / 4.1.2.1).
 #[derive(Debug, PartialEq, Eq)]
 enum OidcCallbackOutcome {
@@ -237,6 +302,11 @@ enum OidcCallbackOutcome {
         code: String,
         state: String,
     },
+    /// The IdP answered a silent (`prompt=none`) probe with one of the
+    /// interaction-required error codes: the visitor simply has no live IdP
+    /// session. Not an error — the browser is sent back to the frontend
+    /// callback with `silent_denied=1` so it can stay anonymous quietly.
+    SilentDenied,
     IdpError {
         error: String,
         description: Option<String>,
@@ -248,10 +318,16 @@ enum OidcCallbackOutcome {
 ///
 /// An IdP error response (RFC 6749 4.1.2.1) carries `error` and no `code`, so
 /// it MUST be checked first; otherwise the missing `code` would be misread as
-/// a malformed callback. A well-formed success carries non-empty `code` and
-/// `state`; anything else is malformed.
+/// a malformed callback. Within the error family, the interaction-required
+/// codes (OIDC Core 3.1.2.6) classify as [`OidcCallbackOutcome::SilentDenied`]
+/// because they are the expected "no IdP session" answer to a `prompt=none`
+/// probe, never a failure to surface. A well-formed success carries non-empty
+/// `code` and `state`; anything else is malformed.
 fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
     if let Some(error) = params.error.as_deref().filter(|s| !s.is_empty()) {
+        if is_interaction_required_error(error) {
+            return OidcCallbackOutcome::SilentDenied;
+        }
         return OidcCallbackOutcome::IdpError {
             error: error.to_string(),
             description: params
@@ -274,6 +350,15 @@ fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
     }
 }
 
+/// A callback that passed [`resolve_oidc_callback`]: either a `code`/`state`
+/// pair to exchange, or a silent-probe denial to relay to the frontend
+/// without any error payload.
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedOidcCallback {
+    Proceed { code: String, state: String },
+    SilentDenied,
+}
+
 /// Resolve an OIDC callback's `code` and `state` before any session lookup or
 /// IdP exchange.
 ///
@@ -285,11 +370,23 @@ fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
 ///
 /// Returns `AppError::Validation` (400) for missing/empty parameters and
 /// `AppError::Authentication` (401) when the IdP itself redirected back with
-/// an error (RFC 6749 4.1.2.1). The CSRF replay defense (401) still fires for
+/// an error (RFC 6749 4.1.2.1) — except the interaction-required family,
+/// which resolves to [`ResolvedOidcCallback::SilentDenied`]: the expected
+/// anonymous answer to a `prompt=none` probe, handled with a clean redirect
+/// rather than an error status. The CSRF replay defense (401) still fires for
 /// non-empty state values that don't match a cached session.
-fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)> {
+fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<ResolvedOidcCallback> {
     match classify_oidc_callback(params) {
-        OidcCallbackOutcome::Proceed { code, state } => Ok((code, state)),
+        OidcCallbackOutcome::Proceed { code, state } => {
+            Ok(ResolvedOidcCallback::Proceed { code, state })
+        }
+        OidcCallbackOutcome::SilentDenied => {
+            tracing::debug!(
+                idp_error = ?params.error,
+                "silent SSO probe denied by IdP (no live session); returning anonymous"
+            );
+            Ok(ResolvedOidcCallback::SilentDenied)
+        }
         OidcCallbackOutcome::IdpError { error, description } => {
             tracing::warn!(
                 idp_error = %error,
@@ -307,6 +404,21 @@ fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)>
     }
 }
 
+/// Complete a silent (`prompt=none`) probe that the IdP answered with an
+/// interaction-required error: consume the one-time SSO session (best effort,
+/// so the state value cannot be replayed) and send the browser back to the
+/// frontend callback with `silent_denied=1` and NO error payload. The
+/// frontend treats that as "remain anonymous" — the user must never see an
+/// error UI or a visible IdP login page they did not ask for.
+async fn finish_silent_denied(state: &SharedState, sso_state: Option<&str>) -> Response {
+    if let Some(s) = sso_state.filter(|s| !s.is_empty()) {
+        // A miss is irrelevant here: nothing is exchanged on this path, the
+        // lookup exists purely to burn the single-use session row.
+        let _ = AuthConfigService::validate_sso_session(&state.db, s).await;
+    }
+    Redirect::temporary(SILENT_DENIED_CALLBACK_URL).into_response()
+}
+
 /// Handle OIDC authorization callback
 #[utoipa::path(
     get,
@@ -318,7 +430,7 @@ fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)>
         OidcCallbackQuery,
     ),
     responses(
-        (status = 307, description = "Redirect to frontend with exchange code"),
+        (status = 307, description = "Redirect to frontend with exchange code, or to /callback?silent_denied=1 when a prompt=none probe found no IdP session"),
         (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "IdP error or invalid/expired SSO state", body = crate::api::openapi::ErrorResponse),
     )
@@ -334,7 +446,12 @@ pub async fn oidc_callback(
     // Resolve parameter shape BEFORE hitting the session store. Empty state or
     // code is a malformed callback (400), an IdP error redirect is a 401, not a
     // CSRF failure. See `resolve_oidc_callback` doc comment.
-    let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
+    let (auth_code, sso_state) = match resolve_oidc_callback(&params)? {
+        ResolvedOidcCallback::Proceed { code, state } => (code, state),
+        ResolvedOidcCallback::SilentDenied => {
+            return Ok(finish_silent_denied(&state, params.state.as_deref()).await);
+        }
+    };
 
     // Validate SSO session (CSRF check), then delegate to shared logic.
     //
@@ -377,7 +494,12 @@ pub async fn oidc_callback_generic(
     let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. See
     // `resolve_oidc_callback` doc comment.
-    let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
+    let (auth_code, sso_state) = match resolve_oidc_callback(&params)? {
+        ResolvedOidcCallback::Proceed { code, state } => (code, state),
+        ResolvedOidcCallback::SilentDenied => {
+            return Ok(finish_silent_denied(&state, params.state.as_deref()).await);
+        }
+    };
 
     // Validate SSO session and resolve the provider from the stored state
     let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
@@ -2413,9 +2535,14 @@ mod tests {
         // exercise the DB path here; the contract is that this resolver
         // does NOT veto well-formed inputs.
         let params = query(Some("ac_xyz"), Some("st_xyz"), None, None);
-        let (code, state) = resolve_oidc_callback(&params).expect("well-formed params should pass");
-        assert_eq!(code, "ac_xyz");
-        assert_eq!(state, "st_xyz");
+        let resolved = resolve_oidc_callback(&params).expect("well-formed params should pass");
+        assert_eq!(
+            resolved,
+            ResolvedOidcCallback::Proceed {
+                code: "ac_xyz".to_string(),
+                state: "st_xyz".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -2544,6 +2671,157 @@ mod tests {
                 description: Some("User is not assigned to the client application.".to_string()),
             }
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Silent SSO (check-sso, prompt=none)
+    //
+    // The web UI probes for a live IdP session with `prompt=none`. The IdP
+    // answers "no session" with the OIDC Core 3.1.2.6 interaction-required
+    // error family; that is the EXPECTED outcome for an anonymous visitor and
+    // must resolve to a clean `silent_denied` redirect, never an error UI and
+    // never a visible IdP login page the visitor did not ask for.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_interaction_required_error_family() {
+        for code in [
+            "login_required",
+            "interaction_required",
+            "consent_required",
+            "account_selection_required",
+        ] {
+            assert!(
+                is_interaction_required_error(code),
+                "{code} is in the OIDC interaction-required family"
+            );
+        }
+    }
+
+    #[test]
+    fn test_interaction_required_rejects_other_errors() {
+        // Everything else keeps the pre-existing 401 error behaviour: these
+        // are real failures (or garbage), not the anonymous-probe answer.
+        for code in [
+            "access_denied",
+            "server_error",
+            "temporarily_unavailable",
+            "invalid_request",
+            // Case-sensitive per RFC 6749 (ASCII error codes): a non-standard
+            // casing is not silently normalized into the silent path.
+            "Login_Required",
+            "LOGIN_REQUIRED",
+            "login_required ",
+            "",
+        ] {
+            assert!(
+                !is_interaction_required_error(code),
+                "{code:?} must NOT classify as interaction-required"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_login_required_is_silent_denied() {
+        for code in [
+            "login_required",
+            "interaction_required",
+            "consent_required",
+            "account_selection_required",
+        ] {
+            let params = query(None, Some("csrf_state_456"), Some(code), None);
+            assert_eq!(
+                classify_oidc_callback(&params),
+                OidcCallbackOutcome::SilentDenied,
+                "{code} must classify as SilentDenied"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_silent_denied_is_ok_not_error() {
+        // The whole point: a denied probe is NOT an AppError. It resolves Ok
+        // so the handler can answer with a clean redirect instead of a 401.
+        let params = query(
+            None,
+            Some("csrf_state_456"),
+            Some("login_required"),
+            Some("Authentication required"),
+        );
+        assert_eq!(
+            resolve_oidc_callback(&params).expect("silent denial must resolve Ok"),
+            ResolvedOidcCallback::SilentDenied
+        );
+    }
+
+    #[test]
+    fn test_classify_access_denied_still_an_idp_error() {
+        // Regression guard: introducing the silent-denied family must not
+        // absorb the ordinary IdP error path (#1657 behaviour unchanged).
+        let params = query(None, Some("csrf_state_456"), Some("access_denied"), None);
+        assert_eq!(
+            classify_oidc_callback(&params),
+            OidcCallbackOutcome::IdpError {
+                error: "access_denied".to_string(),
+                description: None,
+            }
+        );
+        let err = resolve_oidc_callback(&params).expect_err("access_denied stays an error");
+        assert_status(&err, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_silent_denied_beats_stray_code() {
+        // An IdP error with a stray code param still classifies by the error
+        // (error precedence is unchanged from #1657); the silent family maps
+        // to SilentDenied even then.
+        let params = query(
+            Some("stray-code"),
+            Some("csrf_state_456"),
+            Some("login_required"),
+            None,
+        );
+        assert_eq!(
+            classify_oidc_callback(&params),
+            OidcCallbackOutcome::SilentDenied
+        );
+    }
+
+    #[test]
+    fn test_silent_denied_redirect_carries_no_error_payload() {
+        // The frontend contract: a marker, not an error. If this URL ever
+        // grows an `error` parameter the callback page will render an error
+        // card for every anonymous visitor with no IdP session.
+        assert!(SILENT_DENIED_CALLBACK_URL.starts_with("/callback?"));
+        assert!(SILENT_DENIED_CALLBACK_URL.contains("silent_denied=1"));
+        assert!(!SILENT_DENIED_CALLBACK_URL.contains("error"));
+    }
+
+    #[test]
+    fn test_resolve_login_prompt_accepts_only_none() {
+        assert_eq!(resolve_login_prompt(None).unwrap(), None);
+        assert_eq!(resolve_login_prompt(Some("none")).unwrap(), Some("none"));
+        for bad in [
+            "login",
+            "consent",
+            "select_account",
+            "NONE",
+            "",
+            "none login",
+        ] {
+            let err = resolve_login_prompt(Some(bad))
+                .expect_err("only prompt=none may be forwarded to the IdP");
+            assert!(matches!(err, AppError::Validation(_)), "{bad:?} -> 400");
+            assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn test_oidc_login_query_deserializes_prompt() {
+        let q: OidcLoginQuery = serde_urlencoded::from_str("prompt=none").unwrap();
+        assert_eq!(q.prompt.as_deref(), Some("none"));
+        let q: OidcLoginQuery = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(q.prompt, None);
     }
 
     #[test]
