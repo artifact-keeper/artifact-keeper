@@ -123,7 +123,9 @@ pub fn public_router() -> Router<SharedState> {
 }
 
 pub fn device_page_router() -> Router<SharedState> {
-    Router::new().route("/device", get(device_page))
+    Router::new()
+        .route("/device", get(device_page))
+        .route("/device/app.js", get(device_page_script))
 }
 
 // ---------------------------------------------------------------------------
@@ -171,8 +173,19 @@ pub async fn device_page() -> impl IntoResponse {
   <button id="approve" disabled>Approve</button>
   <div class="msg" id="msg"></div>
 </div>
-<script>
-(function () {
+<script src="/device/app.js" defer></script>
+</body>
+</html>"#,
+    )
+}
+
+/// GET /device/app.js — the activation page script, served as a separate
+/// same-origin file so it runs under the `script-src 'self'` CSP (inline
+/// scripts are blocked).
+pub async fn device_page_script() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+        r#"(function () {
   var input = document.getElementById('code');
   var btn = document.getElementById('approve');
   var msg = document.getElementById('msg');
@@ -227,10 +240,7 @@ pub async fn device_page() -> impl IntoResponse {
       btn.disabled = false;
     });
   });
-})();
-</script>
-</body>
-</html>"#,
+})();"#,
     )
 }
 
