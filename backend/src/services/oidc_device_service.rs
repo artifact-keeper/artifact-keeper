@@ -155,9 +155,9 @@ impl OidcDeviceService {
             "pending" => Ok(DevicePollResult::Pending),
             "denied" => Ok(DevicePollResult::Denied),
             "approved" => {
-                let user_id = session.approved_user_id.ok_or_else(|| {
-                    AppError::Internal("approved session missing user_id".into())
-                })?;
+                let user_id = session
+                    .approved_user_id
+                    .ok_or_else(|| AppError::Internal("approved session missing user_id".into()))?;
                 Ok(DevicePollResult::Approved { user_id })
             }
             _ => Ok(DevicePollResult::Expired),
@@ -195,7 +195,9 @@ impl OidcDeviceService {
         .rows_affected();
 
         if rows == 0 {
-            return Err(AppError::NotFound("Device session not found or expired".into()));
+            return Err(AppError::NotFound(
+                "Device session not found or expired".into(),
+            ));
         }
         Ok(())
     }

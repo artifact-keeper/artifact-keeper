@@ -34,8 +34,7 @@ use crate::services::oidc_device_service::{DevicePollResult, OidcDeviceService};
 // Rate limiter for device code creation: max 10 per IP per minute
 // ---------------------------------------------------------------------------
 
-static DEVICE_CODE_RATE_LIMITER: OnceLock<Mutex<HashMap<IpAddr, (u32, Instant)>>> =
-    OnceLock::new();
+static DEVICE_CODE_RATE_LIMITER: OnceLock<Mutex<HashMap<IpAddr, (u32, Instant)>>> = OnceLock::new();
 
 fn check_device_code_rate_limit(ip: IpAddr) -> bool {
     let limiter = DEVICE_CODE_RATE_LIMITER.get_or_init(|| Mutex::new(HashMap::new()));
@@ -216,18 +215,14 @@ pub async fn poll_device_token(
     State(state): State<SharedState>,
     axum::extract::Form(form): axum::extract::Form<DeviceTokenForm>,
 ) -> Response {
-    const DEVICE_GRANT_TYPE: &str =
-        "urn:ietf:params:oauth:grant-type:device_code";
+    const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
     if form.grant_type != DEVICE_GRANT_TYPE {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(OAuthErrorResponse {
                 error: "unsupported_grant_type".into(),
-                error_description: format!(
-                    "grant_type must be '{}'",
-                    DEVICE_GRANT_TYPE
-                ),
+                error_description: format!("grant_type must be '{}'", DEVICE_GRANT_TYPE),
             }),
         )
             .into_response();
@@ -317,10 +312,8 @@ pub async fn poll_device_token(
                 }
             };
 
-            let auth_service = AuthService::new(
-                state.db.clone(),
-                std::sync::Arc::new(state.config.clone()),
-            );
+            let auth_service =
+                AuthService::new(state.db.clone(), std::sync::Arc::new(state.config.clone()));
             let tokens = match auth_service.generate_tokens(&user) {
                 Ok(t) => t,
                 Err(e) => {
