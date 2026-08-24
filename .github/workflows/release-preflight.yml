@@ -11,8 +11,10 @@ name: Release Preflight
 #
 # This publishes NOTHING. It only reads: the repo tree, the .trivyignore of
 # active release/* branches, the status of the Docker Publish run for the
-# exact commit being checked (selected by head_sha, not recency -- #3338), and
-# the manifests of already-published component images (check 4, #3339).
+# exact commit being checked (selected by head_sha, not recency -- #3338),
+# the manifests of already-published component images (check 4, #3339), and
+# the PR -> closing-issue map for the commits since the last stable tag
+# (check 5, #3537).
 # A red run means "do not tag yet"; a green run means main is safe to cut.
 
 on:
@@ -41,7 +43,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          fetch-depth: 1
+          # Full history and tags: check 5 bounds its commit range with
+          # `git describe` against the previous stable tag and then reads
+          # `git log <tag>..HEAD`. On a depth-1 checkout neither exists, and
+          # the check would report INFRA (exit 2) on every run -- an
+          # indeterminate verdict forever, which is the shape of gate this
+          # change exists to remove. Check 4 also stops needing its
+          # single-commit fetch for the revision a published tag names.
+          fetch-depth: 0
 
       # Runs first, and offline. If check 3 has regressed into a soft warn
       # again (#3308), this fails here rather than silently blessing a cut
@@ -50,6 +59,14 @@ jobs:
       # against stubs rather than waited for.
       - name: Self-test the preflight gate
         run: bash scripts/ci/test-release-preflight.sh
+
+      # The release-time half of the bookkeeping gates (#3537) never runs on
+      # this path -- it fires on a `v*` tag push -- so its self-test runs here
+      # too. A preflight that says "safe to cut" while the tag would be
+      # refused an hour later is the failure mode being removed, not a new one
+      # to introduce.
+      - name: Self-test the release-bookkeeping gates
+        run: bash scripts/ci/test-assert-release-bookkeeping.sh
 
       - name: Run release preflight
         env:
