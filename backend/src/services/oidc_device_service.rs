@@ -222,3 +222,314 @@ impl OidcDeviceService {
         Ok(rows)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const USER_CODE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+
+    async fn seed_oidc_provider(pool: &PgPool, enabled: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        let name = format!("oidc-device-provider-{id}");
+        sqlx::query(
+            r#"
+            INSERT INTO oidc_configs
+                (id, name, issuer_url, client_id, client_secret_encrypted,
+                 scopes, attribute_mapping, is_enabled)
+            VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, $7)
+            "#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(format!("https://issuer-{id}.example.com"))
+        .bind(format!("client-{id}"))
+        .bind("encrypted-secret")
+        .bind(vec!["openid".to_string(), "profile".to_string()])
+        .bind(enabled)
+        .execute(pool)
+        .await
+        .expect("seed oidc provider");
+        id
+    }
+
+    async fn seed_user(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let username = format!("oidc-device-user-{id}");
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin)
+            VALUES ($1, $2, $3, 'unused', 'local', true, false)
+            "#,
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{username}@example.com"))
+        .execute(pool)
+        .await
+        .expect("seed user");
+        id
+    }
+
+    async fn expire_session(pool: &PgPool, session_id: Uuid) {
+        sqlx::query(
+            "UPDATE oidc_device_sessions SET expires_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .expect("expire session");
+    }
+
+    async fn allow_next_poll(pool: &PgPool, session_id: Uuid) {
+        sqlx::query(
+            "UPDATE oidc_device_sessions SET last_polled_at = now() - interval '10 seconds' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .expect("age poll timestamp");
+    }
+
+    async fn cleanup_provider(pool: &PgPool, provider_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM oidc_device_sessions WHERE provider_id = $1")
+            .bind(provider_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oidc_configs WHERE id = $1")
+            .bind(provider_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[test]
+    fn oidc_device_generated_codes_have_rfc_friendly_shapes() {
+        let device_code = OidcDeviceService::generate_device_code();
+        assert_eq!(device_code.len(), 64);
+        assert!(device_code.chars().all(|c| c.is_ascii_hexdigit()));
+
+        for _ in 0..100 {
+            let user_code = OidcDeviceService::generate_user_code();
+            assert_eq!(user_code.len(), 9);
+            assert_eq!(user_code.as_bytes()[4], b'-');
+            assert!(user_code
+                .chars()
+                .filter(|c| *c != '-')
+                .all(|c| USER_CODE_ALPHABET.contains(c)));
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_device_create_session_persists_pending_codes_and_scopes() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let provider_id = seed_oidc_provider(&pool, true).await;
+        let svc = OidcDeviceService::new(pool.clone());
+        let scopes = vec![
+            "openid".to_string(),
+            "profile".to_string(),
+            "read:artifacts".to_string(),
+        ];
+
+        let session = svc
+            .create_session(
+                provider_id,
+                "device-client".to_string(),
+                scopes.clone(),
+                "https://registry.example.com/",
+            )
+            .await
+            .expect("create device session");
+
+        assert_eq!(session.provider_id, provider_id);
+        assert_eq!(
+            session.verification_uri,
+            "https://registry.example.com/device"
+        );
+        assert_eq!(session.interval_secs, 5);
+        assert_eq!(session.status, "pending");
+        assert_eq!(session.scopes, scopes);
+        assert_eq!(session.client_id, "device-client");
+        assert!(session.expires_at > Utc::now());
+        assert_eq!(session.device_code.len(), 64);
+        assert!(session.device_code.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(session.user_code.len(), 9);
+        assert_eq!(session.user_code.as_bytes()[4], b'-');
+
+        let persisted: (String, Vec<String>, i32, i32) = sqlx::query_as(
+            "SELECT status, scopes, interval_secs, poll_count FROM oidc_device_sessions WHERE id = $1",
+        )
+        .bind(session.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted session");
+        assert_eq!(persisted.0, "pending");
+        assert_eq!(persisted.1, scopes);
+        assert_eq!(persisted.2, 5);
+        assert_eq!(persisted.3, 0);
+
+        cleanup_provider(&pool, provider_id).await;
+    }
+
+    #[tokio::test]
+    async fn oidc_device_poll_token_state_machine_covers_pending_slowdown_and_terminal_states() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let provider_id = seed_oidc_provider(&pool, true).await;
+        let user_id = seed_user(&pool).await;
+        let svc = OidcDeviceService::new(pool.clone());
+
+        let pending = svc
+            .create_session(
+                provider_id,
+                "state-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create pending session");
+        assert!(matches!(
+            svc.poll_token(&pending.device_code, "state-client")
+                .await
+                .expect("poll pending"),
+            DevicePollResult::Pending
+        ));
+        assert!(matches!(
+            svc.poll_token(&pending.device_code, "state-client")
+                .await
+                .expect("poll too quickly"),
+            DevicePollResult::SlowDown
+        ));
+        svc.approve_session(
+            &pending.user_code,
+            user_id,
+            "oidc-sub".to_string(),
+            "user@example.com".to_string(),
+            "Example User".to_string(),
+        )
+        .await
+        .expect("approve session");
+        allow_next_poll(&pool, pending.id).await;
+        match svc
+            .poll_token(&pending.device_code, "state-client")
+            .await
+            .expect("poll approved")
+        {
+            DevicePollResult::Approved { user_id: approved } => assert_eq!(approved, user_id),
+            other => panic!("expected approved, got {other:?}"),
+        }
+
+        let denied = svc
+            .create_session(
+                provider_id,
+                "state-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create denied session");
+        svc.deny_session(&denied.user_code)
+            .await
+            .expect("deny session");
+        assert!(matches!(
+            svc.poll_token(&denied.device_code, "state-client")
+                .await
+                .expect("poll denied"),
+            DevicePollResult::Denied
+        ));
+
+        let expired = svc
+            .create_session(
+                provider_id,
+                "state-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create expired session");
+        expire_session(&pool, expired.id).await;
+        assert!(matches!(
+            svc.poll_token(&expired.device_code, "state-client")
+                .await
+                .expect("poll expired"),
+            DevicePollResult::Expired
+        ));
+        assert!(matches!(
+            svc.poll_token("missing-device-code", "state-client")
+                .await
+                .expect("poll missing"),
+            DevicePollResult::Expired
+        ));
+
+        let missing = svc
+            .approve_session(
+                "NOPE-NOPE",
+                user_id,
+                "sub".to_string(),
+                "email@example.com".to_string(),
+                "Name".to_string(),
+            )
+            .await;
+        assert!(matches!(missing, Err(AppError::NotFound(_))));
+
+        cleanup_provider(&pool, provider_id).await;
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn oidc_device_cleanup_expired_removes_old_sessions() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let provider_id = seed_oidc_provider(&pool, true).await;
+        let svc = OidcDeviceService::new(pool.clone());
+        let expired = svc
+            .create_session(
+                provider_id,
+                "cleanup-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create expired cleanup session");
+        let active = svc
+            .create_session(
+                provider_id,
+                "cleanup-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create active cleanup session");
+        expire_session(&pool, expired.id).await;
+
+        let removed = svc.cleanup_expired().await.expect("cleanup expired");
+        assert!(removed >= 1);
+
+        let expired_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oidc_device_sessions WHERE id = $1")
+                .bind(expired.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count expired session");
+        let active_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oidc_device_sessions WHERE id = $1")
+                .bind(active.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count active session");
+        assert_eq!(expired_count, 0);
+        assert_eq!(active_count, 1);
+
+        cleanup_provider(&pool, provider_id).await;
+    }
+}

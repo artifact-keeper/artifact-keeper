@@ -371,3 +371,400 @@ pub async fn approve_session_handler(
     .await?;
     Ok((StatusCode::OK, axum::Json(serde_json::json!({"ok": true}))))
 }
+
+#[allow(clippy::disallowed_methods)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::extract::Form;
+    use axum::http::Request;
+    use serde_json::Value;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    async fn seed_oidc_provider(pool: &sqlx::PgPool, enabled: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        let name = format!("oidc-device-handler-provider-{id}");
+        sqlx::query(
+            r#"
+            INSERT INTO oidc_configs
+                (id, name, issuer_url, client_id, client_secret_encrypted,
+                 scopes, attribute_mapping, is_enabled)
+            VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, $7)
+            "#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(format!("https://issuer-{id}.example.com"))
+        .bind(format!("client-{id}"))
+        .bind("encrypted-secret")
+        .bind(vec!["openid".to_string(), "email".to_string()])
+        .bind(enabled)
+        .execute(pool)
+        .await
+        .expect("seed oidc provider");
+        id
+    }
+
+    async fn seed_user(pool: &sqlx::PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let username = format!("oidc-device-handler-user-{id}");
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin)
+            VALUES ($1, $2, $3, 'unused', 'local', true, false)
+            "#,
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{username}@example.com"))
+        .execute(pool)
+        .await
+        .expect("seed user");
+        id
+    }
+
+    fn storage_path(label: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("oidc-device-tests")
+            .join(label)
+            .join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&path).expect("create test storage dir");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn state(pool: sqlx::PgPool, label: &str) -> SharedState {
+        crate::api::handlers::test_db_helpers::build_state(pool, &storage_path(label))
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let json = serde_json::from_slice(&body).expect("json response");
+        (status, json)
+    }
+
+    async fn poll_json(
+        state: SharedState,
+        grant_type: &str,
+        device_code: &str,
+        client_id: &str,
+    ) -> (StatusCode, Value) {
+        response_json(
+            poll_device_token(
+                State(state),
+                Form(DeviceTokenForm {
+                    grant_type: grant_type.to_string(),
+                    device_code: device_code.to_string(),
+                    client_id: client_id.to_string(),
+                }),
+            )
+            .await,
+        )
+        .await
+    }
+
+    async fn cleanup_provider(pool: &sqlx::PgPool, provider_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM oidc_device_sessions WHERE provider_id = $1")
+            .bind(provider_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oidc_configs WHERE id = $1")
+            .bind(provider_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn cleanup_user(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[test]
+    fn oidc_device_code_rate_limiter_allows_ten_per_ip_per_minute() {
+        let ip = IpAddr::V6(Ipv6Addr::from(Uuid::new_v4().as_u128()));
+        for _ in 0..10 {
+            assert!(check_device_code_rate_limit(ip));
+        }
+        assert!(!check_device_code_rate_limit(ip));
+
+        let other_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
+        assert!(check_device_code_rate_limit(other_ip));
+    }
+
+    #[tokio::test]
+    async fn oidc_device_page_returns_activation_html() {
+        let response = device_page().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read device page");
+        let html = std::str::from_utf8(&body).expect("utf8 html");
+        assert!(html.contains("Device Activation"));
+        assert!(html.contains("/api/v1/auth/oidc/device/approve"));
+    }
+
+    #[tokio::test]
+    async fn oidc_device_create_code_validates_scopes_and_builds_response() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), "create-code");
+        let addr = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), 12345));
+
+        let invalid_scope = create_device_code(
+            State(state.clone()),
+            ConnectInfo(addr),
+            RequestBaseUrl("https://registry.example.com/root/".to_string()),
+            Json(DeviceCodeRequest {
+                provider_id: Uuid::new_v4(),
+                client_id: "handler-client".to_string(),
+                scopes: vec!["openid".to_string(), "admin".to_string()],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            invalid_scope,
+            Err(AppError::Validation(message)) if message.contains("Scope 'admin' is not allowed")
+        ));
+
+        let disabled_provider_id = seed_oidc_provider(&pool, false).await;
+        let disabled_provider = create_device_code(
+            State(state.clone()),
+            ConnectInfo(addr),
+            RequestBaseUrl("https://registry.example.com".to_string()),
+            Json(DeviceCodeRequest {
+                provider_id: disabled_provider_id,
+                client_id: "handler-client".to_string(),
+                scopes: vec!["openid".to_string()],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            disabled_provider,
+            Err(AppError::Validation(message)) if message.contains("is disabled")
+        ));
+
+        let provider_id = seed_oidc_provider(&pool, true).await;
+        let response = create_device_code(
+            State(state),
+            ConnectInfo(addr),
+            RequestBaseUrl("https://registry.example.com/root/".to_string()),
+            Json(DeviceCodeRequest {
+                provider_id,
+                client_id: "handler-client".to_string(),
+                scopes: vec!["openid".to_string(), "read:artifacts".to_string()],
+            }),
+        )
+        .await
+        .expect("create device code")
+        .into_response();
+        let (status, json) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["expires_in"], 600);
+        assert_eq!(json["interval"], 5);
+        assert_eq!(
+            json["verification_uri"],
+            "https://registry.example.com/root/device"
+        );
+        assert_eq!(
+            json["verification_uri_complete"],
+            format!(
+                "{}?user_code={}",
+                json["verification_uri"].as_str().unwrap(),
+                json["user_code"].as_str().unwrap()
+            )
+        );
+        assert_eq!(json["device_code"].as_str().unwrap().len(), 64);
+        assert_eq!(json["user_code"].as_str().unwrap().len(), 9);
+
+        cleanup_provider(&pool, disabled_provider_id).await;
+        cleanup_provider(&pool, provider_id).await;
+    }
+
+    #[tokio::test]
+    async fn oidc_device_poll_token_maps_rfc8628_errors_and_success() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), "poll-token");
+        let provider_id = seed_oidc_provider(&pool, true).await;
+        let user_id = seed_user(&pool).await;
+        let svc = OidcDeviceService::new(pool.clone());
+        const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+        let (status, json) = poll_json(
+            state.clone(),
+            "client_credentials",
+            "missing-device",
+            "handler-client",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "unsupported_grant_type");
+
+        let (status, json) =
+            poll_json(state.clone(), GRANT, "missing-device", "handler-client").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "expired_token");
+
+        let pending = svc
+            .create_session(
+                provider_id,
+                "handler-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create pending session");
+        let (status, json) =
+            poll_json(state.clone(), GRANT, &pending.device_code, "handler-client").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "authorization_pending");
+        let (status, json) =
+            poll_json(state.clone(), GRANT, &pending.device_code, "handler-client").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "slow_down");
+
+        let denied = svc
+            .create_session(
+                provider_id,
+                "handler-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create denied session");
+        svc.deny_session(&denied.user_code)
+            .await
+            .expect("deny session");
+        let (status, json) =
+            poll_json(state.clone(), GRANT, &denied.device_code, "handler-client").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "access_denied");
+
+        let expired = svc
+            .create_session(
+                provider_id,
+                "handler-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create expired session");
+        sqlx::query(
+            "UPDATE oidc_device_sessions SET expires_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(expired.id)
+        .execute(&pool)
+        .await
+        .expect("expire session");
+        let (status, json) =
+            poll_json(state.clone(), GRANT, &expired.device_code, "handler-client").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "expired_token");
+
+        let approved = svc
+            .create_session(
+                provider_id,
+                "handler-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create approved session");
+        svc.approve_session(
+            &approved.user_code,
+            user_id,
+            "oidc-sub".to_string(),
+            "user@example.com".to_string(),
+            "Example User".to_string(),
+        )
+        .await
+        .expect("approve session");
+        let (status, json) = poll_json(state, GRANT, &approved.device_code, "handler-client").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["token_type"], "Bearer");
+        assert_eq!(json["expires_in"], 900);
+        assert!(json["access_token"].as_str().unwrap().len() > 20);
+        assert!(json["refresh_token"].as_str().unwrap().len() > 20);
+
+        cleanup_provider(&pool, provider_id).await;
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn oidc_device_approve_handler_marks_session_for_authenticated_user() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), "approve-handler");
+        let provider_id = seed_oidc_provider(&pool, true).await;
+        let user_id = seed_user(&pool).await;
+        let svc = OidcDeviceService::new(pool.clone());
+        let session = svc
+            .create_session(
+                provider_id,
+                "approve-client".to_string(),
+                vec!["openid".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create session");
+        let auth = crate::api::handlers::test_db_helpers::make_auth(user_id, "device-user");
+
+        let response = approve_session_handler(
+            State(state),
+            axum::extract::Extension(auth),
+            Json(ApproveDeviceRequest {
+                user_code: session.user_code.clone(),
+            }),
+        )
+        .await
+        .expect("approve handler")
+        .into_response();
+        let (status, json) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+
+        let row: (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT status, approved_user_id FROM oidc_device_sessions WHERE id = $1",
+        )
+        .bind(session.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load approved session");
+        assert_eq!(row.0, "approved");
+        assert_eq!(row.1, Some(user_id));
+
+        cleanup_provider(&pool, provider_id).await;
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn oidc_device_public_router_rejects_bad_form_grant() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let app = public_router().with_state(state(pool, "public-router"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "grant_type=not-device&device_code=abc&client_id=handler-client",
+            ))
+            .expect("request");
+        let response = tower::ServiceExt::oneshot(app, request)
+            .await
+            .expect("oneshot");
+        let (status, json) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "unsupported_grant_type");
+    }
+}
