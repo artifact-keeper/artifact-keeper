@@ -191,13 +191,13 @@ echo "indeterminate is not a pass"
 reset_case
 FAKE_RUNS_FAIL=1
 expect "runs query fails -> INFRA (exit 2)" 2 \
-  "could not query"
+  "Could not query"
 
 reset_case
 FAKE_RUNS=$'555\tcompleted\tsuccess\t2026-08-21T13:56:49Z\tschedule'
 FAKE_ARTIFACTS_FAIL=1
 expect "artifact listing fails -> INFRA (exit 2)" 2 \
-  "could not list artifacts"
+  "Could not list artifacts"
 
 reset_case
 CASE_SHA="not-a-sha"
@@ -224,6 +224,27 @@ CASE_TAG_MESSAGE=$'Release 9.9.9\n\nPreflight-Override: cut off-branch at 635496
 expect "an honoured override still prints the verdict it overrode" 0 \
   "No Release Preflight has ever run against this commit."
 
+# `git tag -a -m` hard-wraps what a human types, so a wrapped reason must be
+# folded rather than truncated at the first newline -- a half-sentence in the
+# audit trail is not a stated reason.
+reset_case
+CASE_TAG_MESSAGE=$'Release 9.9.9\n\nPreflight-Override: no branch exists to dispatch Release Preflight on\nfor this off-branch commit; run locally against that exact tree, transcript\non #3538\n\nSigned-off-by: someone'
+expect "a wrapped override reason is folded, not truncated" 0 \
+  "on #3538"
+
+# ...and folding stops at the next trailer, so an unrelated one is not swallowed.
+reset_case
+CASE_TAG_MESSAGE=$'Release 9.9.9\n\nPreflight-Override: this is a long enough reason to be accepted here\nSigned-off-by: someone'
+expect "folding stops at the next trailer" 0 \
+  "reason: this is a long enough reason to be accepted here"
+
+# A reason that only reaches the minimum length by folding a continuation line
+# is still a reason; a bare key with a wrapped-away nothing is not.
+reset_case
+CASE_TAG_MESSAGE=$'Release 9.9.9\n\nPreflight-Override:\n\nthis prose is after a blank line and is not part of the trailer'
+expect "a blank line ends the trailer -> reason is empty -> BLOCKED" 1 \
+  "reason is too short"
+
 # A bypass with no stated reason is the thing being removed, so it must not be
 # the easy path.
 reset_case
@@ -241,7 +262,7 @@ reset_case
 FAKE_RUNS_FAIL=1
 CASE_TAG_MESSAGE=$'Release 9.9.9\n\nPreflight-Override: the registry probe is down for maintenance, accepting the risk'
 expect "override cannot convert INFRA into a pass" 2 \
-  "could not query"
+  "cannot override an INFRA result"
 
 # An ordinary tag message is not an override, however it is worded.
 reset_case

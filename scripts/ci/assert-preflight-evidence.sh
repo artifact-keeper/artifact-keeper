@@ -154,12 +154,13 @@ command -v gh >/dev/null 2>&1 || {
 # ---------------------------------------------------------------------------
 # `head_sha=` resolves server-side; recency is never used to pick a run (the
 # #3338 lesson, one layer out).
+query_failed=0
 if ! runs_tsv="$(gh api \
       "repos/${REPO}/actions/workflows/${WORKFLOW}/runs?head_sha=${SHA}&per_page=100" \
       --jq '.workflow_runs[] | [.id, .status, (.conclusion // ""), .created_at, .event] | @tsv' \
       2>/dev/null)"; then
-  echo "INFRA: could not query ${WORKFLOW} runs for ${SHA}" >&2
-  exit 2
+  query_failed=1
+  runs_tsv=""
 fi
 
 # Newest first, by created_at, rather than trusting the API's ordering.
@@ -180,7 +181,16 @@ while IFS=$'\t' read -r r_id r_status r_conclusion r_created r_event; do
   fi
 done <<< "$runs_sorted"
 
-if [[ "$n_runs" -eq 0 ]]; then
+if [[ "$query_failed" -eq 1 ]]; then
+  # An indeterminate answer is not a verdict. It is reported as INFRA, kept
+  # distinct from NOT READY exactly as release-preflight.sh keeps them apart,
+  # and -- see below -- it is the one outcome the break-glass override cannot
+  # convert into a pass, because there is no measurement to accept the risk of.
+  verdict="infra"
+  verdict_line="Could not query ${WORKFLOW} runs for ${SHA}."
+  say "$verdict_line"
+  say "gh returned an error, so whether a preflight ran is unknown. Retry."
+elif [[ "$n_runs" -eq 0 ]]; then
   verdict="blocked"
   verdict_line="No Release Preflight has ever run against this commit."
   say "$verdict_line"
@@ -223,10 +233,11 @@ else
   if ! artifacts="$(gh api \
         "repos/${REPO}/actions/runs/${newest_id}/artifacts?per_page=100" \
         --jq '.artifacts[].name' 2>/dev/null)"; then
-    echo "INFRA: could not list artifacts of preflight run ${newest_id}" >&2
-    exit 2
-  fi
-  if printf '%s\n' "$artifacts" | grep -qxF "$want_artifact"; then
+    verdict="infra"
+    verdict_line="Could not list artifacts of preflight run ${newest_id}."
+    say "$verdict_line"
+    say "The run is green, but whether it audited ${SHA} is unknown. Retry."
+  elif printf '%s\n' "$artifacts" | grep -qxF "$want_artifact"; then
     verdict="ok"
     verdict_line="Green Release Preflight run ${newest_id} audited ${SHA}."
     say "$verdict_line"
@@ -267,9 +278,29 @@ if [[ -z "${GATE_TAG_MESSAGE+x}" && -n "$TAG" ]]; then
 fi
 
 if [[ -n "$tag_message" ]]; then
-  raw="$(printf '%s\n' "$tag_message" | grep -im1 '^[[:space:]]*Preflight-Override:' || true)"
-  if [[ -n "$raw" ]]; then
-    override_reason="${raw#*:}"
+  # A trailer whose reason wraps is the normal case -- `git tag -a -m` hard-wraps
+  # what a human types -- so continuation lines are folded in rather than
+  # truncated at the first newline. Folding stops at a blank line or at the next
+  # `Key: ` trailer, and `https://...` is not mistaken for one because a trailer
+  # key must be followed by whitespace or end of line.
+  override_reason="$(printf '%s\n' "$tag_message" | awk '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    {
+      l = trim($0)
+      if (grab) {
+        if (l == "") exit
+        if (l ~ /^[A-Za-z][A-Za-z0-9-]*:([[:space:]]|$)/) exit
+        out = out " " l
+        next
+      }
+      if (tolower(l) ~ /^preflight-override:/) {
+        grab = 1
+        out = trim(substr(l, index(l, ":") + 1))
+      }
+    }
+    END { if (grab) print out }
+  ')"
+  if printf '%s\n' "$tag_message" | grep -qi '^[[:space:]]*Preflight-Override:'; then
     # trim both ends
     override_reason="${override_reason#"${override_reason%%[![:space:]]*}"}"
     override_reason="${override_reason%"${override_reason##*[![:space:]]}"}"
