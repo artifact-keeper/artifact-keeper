@@ -604,7 +604,26 @@ mod tests {
             .expect("read device page");
         let html = std::str::from_utf8(&body).expect("utf8 html");
         assert!(html.contains("Device Activation"));
-        assert!(html.contains("/api/v1/auth/oidc/device/approve"));
+        // CSP is script-src 'self': the page must reference the external
+        // script, never inline it.
+        assert!(html.contains("/device/app.js"));
+        assert!(!html.contains("<script>"));
+
+        let response = device_page_script().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/javascript")
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read device page script");
+        let js = std::str::from_utf8(&body).expect("utf8 js");
+        assert!(js.contains("/api/v1/auth/oidc/device/approve"));
+        assert!(js.contains("X-Requested-With"));
     }
 
     #[tokio::test]
