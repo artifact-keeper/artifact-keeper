@@ -130,17 +130,105 @@ pub fn device_page_router() -> Router<SharedState> {
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// GET /device — placeholder browser approval page.
+/// GET /device — browser approval page for the RFC 8628 device flow.
+///
+/// Reads `?user_code=` (from `verification_uri_complete`) or lets the user
+/// type the code, verifies the browser session via `GET /api/v1/auth/me`,
+/// and approves with a same-origin `fetch` that carries the
+/// `X-Requested-With` header required by the cookie-auth CSRF guard.
 pub async fn device_page() -> impl IntoResponse {
     Html(
         r#"<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>Device Activation</title></head>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Device Activation</title>
+<style>
+  body { font-family: system-ui, sans-serif; display: flex; justify-content: center;
+         padding-top: 8vh; background: #f6f8fa; margin: 0; }
+  .card { background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
+          padding: 2rem; max-width: 24rem; width: 100%; text-align: center; }
+  h1 { font-size: 1.25rem; }
+  input { font-size: 1.5rem; letter-spacing: .2em; text-align: center; width: 100%;
+          box-sizing: border-box; padding: .5rem; border: 1px solid #d0d7de;
+          border-radius: 6px; text-transform: uppercase; font-family: monospace; }
+  button { margin-top: 1rem; width: 100%; padding: .6rem; font-size: 1rem;
+           border: 0; border-radius: 6px; background: #1f883d; color: #fff;
+           cursor: pointer; }
+  button:disabled { background: #94d3a2; cursor: default; }
+  .msg { margin-top: 1rem; min-height: 1.2em; }
+  .ok { color: #1a7f37; } .err { color: #cf222e; }
+  a { color: #0969da; }
+</style>
+</head>
 <body>
-<h1>Device Activation</h1>
-<p>Enter the code displayed on your device to authorize access.</p>
-<p><em>Full browser flow coming soon. Use the authenticated
-<code>POST /api/v1/auth/oidc/device/approve</code> endpoint for now.</em></p>
+<div class="card">
+  <h1>Device Activation</h1>
+  <p>Enter the code displayed in the app or on the device you're signing in to.
+     Never enter a code sent to you by someone else.</p>
+  <input id="code" placeholder="XXXX-XXXX" maxlength="9" autocomplete="off" spellcheck="false">
+  <button id="approve" disabled>Approve</button>
+  <div class="msg" id="msg"></div>
+</div>
+<script>
+(function () {
+  var input = document.getElementById('code');
+  var btn = document.getElementById('approve');
+  var msg = document.getElementById('msg');
+  var authed = false;
+
+  function setMsg(text, cls) { msg.textContent = text; msg.className = 'msg ' + (cls || ''); }
+  function normalize(v) {
+    var raw = v.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 8);
+    return raw.length > 4 ? raw.slice(0, 4) + '-' + raw.slice(4) : raw;
+  }
+  function refresh() {
+    input.value = normalize(input.value);
+    btn.disabled = !(authed && input.value.length === 9);
+  }
+  input.addEventListener('input', refresh);
+
+  var params = new URLSearchParams(window.location.search);
+  input.value = normalize(params.get('user_code') || '');
+
+  fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(function (r) {
+    if (r.ok) { authed = true; refresh(); return r.json(); }
+    setMsg('You are not signed in. Sign in first, then return to this page ' +
+           '(use the link shown by your device).', 'err');
+    msg.insertAdjacentHTML('beforeend', ' <a href="/">Sign in</a>');
+    return null;
+  }).then(function (me) {
+    if (me) { setMsg('Signed in as ' + me.username + '.', 'ok'); }
+  }).catch(function () { setMsg('Could not verify your session.', 'err'); });
+
+  btn.addEventListener('click', function () {
+    btn.disabled = true;
+    setMsg('Approving…');
+    fetch('/api/v1/auth/oidc/device/approve', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest'
+      },
+      body: JSON.stringify({ user_code: input.value })
+    }).then(function (r) {
+      if (r.ok) {
+        setMsg('Device approved. You can return to your device.', 'ok');
+      } else {
+        return r.text().then(function (t) {
+          setMsg('Approval failed (' + r.status + '): ' + t.slice(0, 200), 'err');
+          btn.disabled = false;
+        });
+      }
+    }).catch(function (e) {
+      setMsg('Approval failed: ' + e, 'err');
+      btn.disabled = false;
+    });
+  });
+})();
+</script>
 </body>
 </html>"#,
     )
