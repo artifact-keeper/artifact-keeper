@@ -193,11 +193,62 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    (for a missing CHANGELOG entry: land the promotion on `main`, delete
    and re-cut the tag) rather than publishing the draft by hand.
 
-8. **Post-release checks.** Confirm the GitHub Release is published (not
+   While the gates run, the registry holds only the immutable `:X.Y.Z`
+   tags. `:latest` and `:X.Y` still point at the PREVIOUS release, and
+   that is correct: nothing has certified the new bytes yet.
+
+8. **Watch the floating-tag promotion.** After the GitHub Release
+   publishes, `promote-floating-tags` dispatches `docker-publish.yml` with
+   `promote_version=X.Y.Z -f promote_floating=true`. That run rebuilds
+   nothing: it re-points `:latest` and `:X.Y` at the manifest-list digest
+   `:X.Y.Z` already names, and the job then asserts that both tags, on both
+   registries, resolve to the digest the release gate tested.
+
+   If it fails, the release is published and correct but `:latest` has not
+   moved. Re-run the job, or dispatch it by hand:
+
+   ```bash
+   gh workflow run docker-publish.yml --repo artifact-keeper/artifact-keeper \
+     --ref vX.Y.Z -f promote_version=X.Y.Z -f promote_floating=true
+   ```
+
+   A backport moves only its series alias: promoting `1.7.9` while `1.8.2`
+   is the newest release advances `:1.7` and leaves `:latest` alone.
+
+9. **Post-release checks.** Confirm the GitHub Release is published (not
    draft), release notes are the curated per-version body (see "Release-notes
-   style" below), not the raw auto-generated PR list, `:latest` moved only if this is a stable release, and the demo
+   style" below), not the raw auto-generated PR list, `:latest` and `:X.Y`
+   moved (stable releases only), and the demo
    or any pinned environments are updated intentionally (see
    "Infrastructure & Cost Rules" in CLAUDE.md).
+
+## Rolling `:latest` back
+
+There is no separate rollback path, because there is nothing to roll back in
+the normal failure case: if any gate fails, `:latest` and `:X.Y` were never
+moved and still name the previous release. The only visible consequence is
+that after a failed cut the registry looks like the release did not happen —
+`:X.Y.Z` exists and is immutable, but the floating tags are unchanged.
+
+To move `:latest` back off a release that DID publish and then turned out to
+be bad:
+
+1. Delete the bad GitHub Release, or mark it as a prerelease. This is the
+   deliberate act; the tag movement follows from it.
+2. Dispatch the promotion for the version you want:
+
+   ```bash
+   gh workflow run docker-publish.yml --repo artifact-keeper/artifact-keeper \
+     --ref vX.Y.Z -f promote_version=X.Y.Z -f promote_floating=true
+   ```
+
+`.github/scripts/floating-tag-plan.sh` reads the published-release set, so once
+the bad release is gone the previous version is the newest one and the floating
+tags are allowed to move to it. While the bad release is still published, the
+same command is refused — floating tags never move backwards by accident.
+
+Do NOT delete container tags to roll back. `:X.Y.Z` is immutable and names real,
+scanned bytes; deleting it breaks every chart that pins it.
 
 ## Policy summary
 
@@ -220,6 +271,14 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
 - `CHANGELOG.md` always has an open `## [Unreleased]` as its first `## [`
   heading. Enforced by `scripts/ci/check-changelog-unreleased.sh` in CI's
   shell-tests job (#3433).
+- Floating tags (`:latest`, `:X.Y`) are applied ONLY after the release gate
+  and the GitHub Release, by a build-free promotion that re-points them at the
+  digest `:X.Y.Z` already names. A floating tag may only name a version with a
+  published, non-draft, non-prerelease GitHub Release, and only if that version
+  is the newest in the line the tag represents. Enforced by
+  `.github/scripts/floating-tag-plan.sh` and pinned by
+  `scripts/ci/check-floating-tag-promotion.sh` in CI's shell-tests job.
+  Prereleases never take a floating tag.
 - No change reaches a tag that touches a versioned component's source set
   (`docker/*/VERSION` and its sibling Dockerfile) without bumping that
   component's `VERSION` — step 5. Exact version tags are never republished,

@@ -748,6 +748,30 @@ jobs:
       - name: Check the release-bookkeeping gates catch what they must
         run: bash scripts/ci/test-assert-release-bookkeeping.sh
 
+      # `:latest` and `:X.Y` used to be written by the merge jobs at tag-push
+      # time -- before the release gate, which is what tests the bytes those
+      # tags name. On v1.8.1 that gap was 78 minutes on a cut where nothing
+      # went wrong; v1.7.2 published `:latest` for a version that was retired
+      # with the gate never run. The fix is an ORDERING, and an ordering is
+      # invisible on a green run: the same tags exist either way. So the
+      # arrangement is pinned structurally -- exactly one job writes floating
+      # tags, it fans in from every merge job with no `if:`, and the release
+      # path promotes only after the gate and the release. Pure YAML
+      # inspection, no network, ~1s.
+      - name: Check floating tags are confined to the post-gate promotion
+        run: ./scripts/ci/check-floating-tag-promotion.sh
+
+      - name: Check the floating-tag gate catches what it must
+        run: bash scripts/ci/test-check-floating-tag-promotion.sh
+
+      # The rule the promotion obeys: a floating tag may only name a version
+      # with a published GitHub Release, and only if it is newest in that line.
+      # Its interesting cases (a backport that moves :X.Y but not :latest, a
+      # version whose images exist but whose release never published) happen
+      # about once per release and never on a normal one.
+      - name: Check the floating-tag promotion rule
+        run: bash scripts/ci/test-floating-tag-plan.sh
+
       # The duplication gate measures whatever jscpd-prepare-sources.py hands
       # it, so a bug there silently changes the gate's verdict (#3495). The
       # dangerous direction is over-removal: an INDENTED `#[cfg(test)]` sits
