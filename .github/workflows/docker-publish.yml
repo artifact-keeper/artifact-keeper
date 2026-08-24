@@ -184,7 +184,10 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROMOTE_VERSION: ${{ github.event.inputs.promote_version }}
-          PROMOTE_FLOATING: ${{ github.event.inputs.promote_floating }}
+          # See the note on the refuse-step below for why this goes through
+          # `format`: it renders "true"/"false" for a boolean or a string input
+          # alike, so the shell comparison has one shape to handle.
+          PROMOTE_FLOATING: ${{ format('{0}', github.event.inputs.promote_floating) }}
         run: |
           set -euo pipefail
           V="$PROMOTE_VERSION"
@@ -224,8 +227,16 @@ jobs:
       # `promote_floating` alone does nothing -- the floating plan is keyed on
       # the promote target -- so accepting it silently would let an operator
       # believe a floating tag had been considered when no job ever looked.
+      #
+      # `format('{0}', ...)` rather than a bare comparison: a `type: boolean`
+      # dispatch input arrives as the STRING "true" from `gh workflow run -f`
+      # and the UI checkbox, but as a JSON boolean from a typed API call.
+      # `'true' == true` is false in GitHub expressions (the boolean is cast to
+      # a number, the string to NaN), and a bare truthiness test is worse still
+      # -- the non-empty string "false" is truthy. Rendering both through
+      # `format` gives one comparison that is right for either shape.
       - name: Refuse promote_floating without promote_version
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.promote_floating == 'true' && github.event.inputs.promote_version == ''
+        if: github.event_name == 'workflow_dispatch' && format('{0}', github.event.inputs.promote_floating) == 'true' && github.event.inputs.promote_version == ''
         run: |
           echo "::error title=promote_floating needs promote_version::promote_floating only applies to a promote dispatch; set promote_version to the release you want :latest / :X.Y to name."
           exit 1
