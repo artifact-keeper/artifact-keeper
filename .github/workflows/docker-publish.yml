@@ -2329,7 +2329,9 @@ jobs:
             # leaves a release half-tagged, and re-pointing to the SAME digest
             # makes every attempt a safe no-op-or-complete.
             n=0; max=5
-            until docker buildx imagetools create "${args[@]}" "${img}@${digest}"; do
+            # `</dev/null` because this loop's own stdin is the plan pipeline:
+            # a child that reads stdin would eat the remaining images.
+            until docker buildx imagetools create "${args[@]}" "${img}@${digest}" </dev/null; do
               n=$((n + 1))
               if [[ "$n" -ge "$max" ]]; then
                 echo "::error title=Floating tag write failed::imagetools create for ${img} failed after ${max} attempts."
@@ -2354,7 +2356,8 @@ jobs:
           bad=0
           while IFS='|' read -r img digest tag; do
             [[ -n "$img" ]] || continue
-            got=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${img}:${tag}" 2>/dev/null \
+            # `</dev/null`: this loop reads the plan file on stdin.
+            got=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${img}:${tag}" </dev/null 2>/dev/null \
               | jq -r '.digest' 2>/dev/null || true)
             if [[ "$got" == "$digest" ]]; then
               echo "  ok  ${img}:${tag} == ${digest}"
