@@ -937,8 +937,13 @@ jobs:
         run: |
           set -euo pipefail
           # Recorded BEFORE the dispatch so the run we then follow cannot be an
-          # older workflow_dispatch for the same commit.
-          START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # older workflow_dispatch for the same commit. Backdated two minutes
+          # because this is a runner clock compared against GitHub's
+          # `created_at`: a runner running slightly fast would otherwise filter
+          # out the very run it just started and report the dispatch dead. The
+          # window stays far too small to catch a different promote of the same
+          # commit, and the newest match is the one taken.
+          START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
           echo "start=${START}" >> "$GITHUB_OUTPUT"
           # Dispatched at the RELEASE TAG, not at a branch: the scanner-adapter
           # promote path reads docker/scanner-adapter/VERSION from the ref it
