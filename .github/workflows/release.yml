@@ -96,6 +96,70 @@ jobs:
           .github/scripts/assert-release-bookkeeping.sh "${GITHUB_REF_NAME}"
 
   # ════════════════════════════════════════════════════════════════════════════
+  # REQUIRE A GREEN RELEASE PREFLIGHT FOR THIS EXACT COMMIT  (issue #3538)
+  #
+  # RELEASING.md step 1 has said "run the release preflight and get a READY
+  # before you tag" since #3043. Nothing enforced it, and a guard's absence is
+  # invisible -- only its failure is visible. The two most expensive incidents
+  # in the 1.7.x line were both that shape:
+  #
+  #   v1.7.5  preflight check 4 (#3339) exists exactly to catch an unbumped
+  #           `docker/scanner-adapter/VERSION`, was merged 2026-08-13, and was
+  #           never run: zero Release Preflight runs between 2026-08-14T14:19Z
+  #           and 2026-08-17T13:51Z. The tag's Docker Publish hit the
+  #           never-republish guard, the chain stopped, and the immutable tag
+  #           was abandoned. ~38h and a burned version number.
+  #
+  #   v1.7.7  the preflight RAN and was RIGHT. Run 32377238021 reported the
+  #           manifest had not published cleanly; two dispatches at 21:22Z
+  #           reported the follow-up's `verdict does not exist yet`. v1.7.7 was
+  #           tagged at 21:40:17Z and that docker-publish concluded `failure`
+  #           19 seconds later.
+  #
+  # This job is the missing assertion, and it is deliberately EVIDENCE-BASED
+  # rather than a preflight re-run. Running the preflight inline here would be
+  # simpler and could not be stale -- but it would run it AFTER the tag exists,
+  # which is after the version number is already spent, and the tag is
+  # immutable. The value of the preflight is that it is cheap and BEFORE the
+  # tag; requiring its evidence is what actually forces it back in front of the
+  # cut, because the only way to have a green preflight for commit X is to have
+  # run it on X. An inline copy would move the red later, not earlier, and
+  # would still have burned v1.7.5's number.
+  #
+  # It also costs ~2 API calls rather than ~40s of duplicated work on every
+  # release, and it keeps ONE definition of "releasable" instead of two that
+  # can drift.
+  #
+  # The hazards the API route has to handle are handled in the script, with a
+  # self-test per leg (scripts/ci/test-assert-preflight-evidence.sh):
+  # in-flight runs block, a superseded green does not count, and the run must
+  # carry an artifact naming the commit it actually checked out -- because
+  # `head_sha` is the sha of the ref the run was DISPATCHED on, which is how
+  # v1.7.5/6/7 were each cut on a transcript that had audited main.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  preflight-evidence:
+    name: Require a green Release Preflight for this commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read   # list release-preflight runs and their artifacts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: Assert a green preflight audited this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_REPO: ${{ github.repository }}
+          GATE_SHA: ${{ github.sha }}
+          GATE_TAG: ${{ github.ref_name }}
+        run: bash scripts/ci/assert-preflight-evidence.sh
+
+  # ════════════════════════════════════════════════════════════════════════════
   # RESOLVE CANDIDATE IMAGE DIGEST  (issues #2696, #2711)
   #
   # docker-publish.yml runs INDEPENDENTLY on the same tag push and publishes
@@ -125,7 +189,7 @@ jobs:
 
   resolve-candidate-digest:
     name: Resolve candidate image digest
-    needs: [release-preflight]
+    needs: [release-preflight, preflight-evidence]
     runs-on: ubuntu-latest
     # docker-publish's wall time is dominated by the amd64 backend image build
     # on the self-hosted runners: with a cold buildx cache it legitimately
@@ -682,13 +746,20 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, release-gate, verify-images-published]
+    needs: [preflight-evidence, build-binaries, release-gate, verify-images-published]
     # Every named gate is now required, but the condition stays explicit rather
     # than falling back to the default `success()`. `!cancelled()` rather than
     # `always()`: with `always()`, cancelling the run does not stop the
     # publication, because the gates it names have already reported success.
+    #
+    # `preflight-evidence` is named here as well as being an ancestor of every
+    # other job listed. That is redundant on purpose: it is the one gate whose
+    # whole subject is "a guard that is not required is a guard that will be
+    # skipped", so it is stated where the publication decision is actually
+    # made, not only where the dependency graph implies it (#3538).
     if: |
       !cancelled() &&
+      needs.preflight-evidence.result == 'success' &&
       needs.build-binaries.result == 'success' &&
       needs.release-gate.result == 'success' &&
       needs.verify-images-published.result == 'success'

@@ -36,6 +36,49 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    tagging over it costs a full re-cut cycle. An exit 2 is `INFRA` — a check
    that could not be measured, which is neither a pass nor a failure.
 
+   **This step is now enforced, not advisory (#3538).** `release.yml`'s
+   `preflight-evidence` job refuses to proceed unless a green run of the
+   **Release Preflight workflow** exists for the exact commit the tag points
+   at. A local `scripts/ci/release-preflight.sh` run is still useful, but it
+   leaves no evidence — only the workflow does, as a
+   `release-preflight-<sha>` artifact carrying the sha it actually checked
+   out. So:
+
+   - Run **Release Preflight** from the Actions UI (or
+     `gh workflow run release-preflight.yml --ref <branch>`) on the branch
+     whose tip is the commit you are about to tag, and wait for it to go
+     green. Cutting a maintenance release? Dispatch it **on that branch** —
+     the workflow audits the ref it was dispatched on, and says which one in
+     its verdict line.
+   - A preflight that is still running does **not** satisfy the gate. That is
+     deliberate: v1.7.7 was tagged 18 minutes after a preflight reported
+     `verdict does not exist yet`, and the run it was waiting on concluded
+     `failure` 19 seconds after the tag push.
+   - If the branch moves after the preflight goes green, the preflight no
+     longer applies — tag the commit it audited, or run it again.
+
+   **Break glass.** The gate predicts whether the chain will stall; it does
+   not certify the bytes, so it is override-able (the gates that *do* certify
+   bytes — `resolve-candidate-digest`, `release-gate`,
+   `verify-images-published` — are not). The override is a trailer in the
+   annotated tag's own message, and it requires a real reason:
+
+   ```bash
+   git tag -a v1.8.2 -m "Release 1.8.2
+
+   Preflight-Override: cut off-branch at 635496d0, which has no branch to
+   dispatch the workflow on; preflight run locally against that exact tree,
+   transcript on #3538"
+   ```
+
+   It lives there rather than in a workflow input or a repository variable
+   because the tag object is immutable (ruleset 19144026), is scoped to
+   exactly one version, cannot be added after the fact, and is readable
+   forever with `git show v1.8.2`. A trailer with no reason (or under 20
+   characters of one) is **refused**, not honoured. Every honoured override is
+   printed as a workflow warning and written to the release run's summary,
+   together with the verdict it overrode.
+
    Check 5 reads the issue reference each entry leads with, so **every
    CHANGELOG bullet must name the issue it closes** — `- **Summary**
    (#NNNN). prose` — and every merged PR in the range must be named by some

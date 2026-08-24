@@ -646,6 +646,20 @@ jobs:
       - name: Check release-preflight gates block on what they measure
         run: bash scripts/ci/test-release-preflight.sh
 
+      # One layer further out again (#3538). The preflight can be right and
+      # still not matter: nothing asserted that one had RUN against the commit
+      # being tagged. v1.7.5 burned a version number to a check that existed
+      # and was never run; v1.7.7 was tagged 18 minutes after a preflight
+      # reported "verdict does not exist yet", and the run it was waiting on
+      # concluded failure 19 seconds after the tag push. release.yml now
+      # requires evidence of a green preflight for `github.sha`, and this
+      # exercises every leg of that gate -- most importantly the ones that must
+      # BLOCK (in-flight, superseded green, evidence naming another commit) and
+      # the break-glass override, which must be loud and must refuse a bypass
+      # with no stated reason. Stubs `gh`; offline, ~1s.
+      - name: Check the preflight-evidence gate blocks what it must
+        run: bash scripts/ci/test-assert-preflight-evidence.sh
+
       # Duplicate sqlx migration versions merge CLEAN and abort the backend at
       # startup (#3313, #1128). The live gate runs in test-backend-unit against
       # the merge result; this exercises the script's failure modes (numeric
