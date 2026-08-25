@@ -27,7 +27,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::sbt::SbtHandler;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -105,13 +105,20 @@ async fn download_by_path(
                     // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
                     // is not counted. Removing this marker without adding that call fails the
                     // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    // #3459: carry the real format. `proxy_fetch_streaming`
+                    // synthesizes a `Generic` repository, and `Generic` has no
+                    // `cache_classifier` arm, so every sbt/ivy `.jar`, `.pom`
+                    // and checksum sidecar was cached with the conservative
+                    // 5-minute mutable TTL and re-fetched from upstream after
+                    // it. Sbt shares Maven's classifier rules.
+                    return proxy_helpers::proxy_fetch_streaming_with_format(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         artifact_path,
                         "application/octet-stream",
+                        RepositoryFormat::Sbt,
                     )
                     .await;
                 }
@@ -454,6 +461,96 @@ mod tests {
         }
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
         teardown().await;
+    }
+
+    /// #3459. The sbt/ivy remote download arm used `proxy_fetch_streaming`,
+    /// which synthesizes a `RepositoryFormat::Generic` repository. `Generic`
+    /// has no `cache_classifier` arm, so every released `.jar` was stamped
+    /// with the conservative 5-minute mutable TTL and re-fetched from upstream
+    /// after it. Sbt shares Maven's classifier rules, so a released coordinate
+    /// must cache effectively forever.
+    ///
+    /// The `-SNAPSHOT` coordinate is the negative control: same branch, same
+    /// helper, same format, but republished in place, so it must stay mutable.
+    /// Asserts the SIDECAR TTL actually written, not the classifier — the
+    /// classifier was already correct; it was being handed the wrong format.
+    #[tokio::test]
+    async fn test_remote_sbt_release_artifact_is_cached_immutably_3459() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Floor for "cached effectively forever" (the immutable write TTL is
+        /// a decade); anything above a year is not the 300s mutable default.
+        const IMMUTABLE_FLOOR_SECS: i64 = 365 * 24 * 3600;
+        const RELEASE: &str = "org/example/1.0/jars/example-1.0.jar";
+        const SNAPSHOT: &str = "org/example/1.1-SNAPSHOT/jars/example-1.1-SNAPSHOT.jar";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "sbt").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        for p in [RELEASE, SNAPSHOT] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{p}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sbt-3459-body".to_vec()))
+                .mount(&server)
+                .await;
+        }
+
+        let (state, cache_dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        for p in [RELEASE, SNAPSHOT] {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, _body) =
+                tdh::send(app, tdh::get(format!("/{key}/{p}", key = fx.repo_key))).await;
+            if status != axum::http::StatusCode::OK {
+                fx.teardown().await;
+                panic!("expected 200 from remote sbt download of {p}, got {status}");
+            }
+        }
+
+        // The streaming arm commits the sidecar on a background writer.
+        // Presence is polled, never asserted: both the fixed and the pre-fix
+        // code write it, so a revert fails on the TTL under test.
+        let sidecar = |p: &str| {
+            cache_dir.path().join(format!(
+                "proxy-cache/{key}/{p}/__cache_meta__.json",
+                key = fx.repo_key
+            ))
+        };
+        let ttl = |p: &str| -> i64 {
+            let raw = std::fs::read(sidecar(p))
+                .unwrap_or_else(|e| panic!("sidecar for {p} must exist: {e}"));
+            let v: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar JSON");
+            let cached_at =
+                chrono::DateTime::parse_from_rfc3339(v["cached_at"].as_str().expect("cached_at"))
+                    .expect("rfc3339");
+            let expires_at =
+                chrono::DateTime::parse_from_rfc3339(v["expires_at"].as_str().expect("expires_at"))
+                    .expect("rfc3339");
+            (expires_at - cached_at).num_seconds()
+        };
+        for p in [RELEASE, SNAPSHOT] {
+            for _ in 0..100 {
+                if sidecar(p).exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let release_ttl = ttl(RELEASE);
+        let snapshot_ttl = ttl(SNAPSHOT);
+        fx.teardown().await;
+
+        assert!(
+            release_ttl >= IMMUTABLE_FLOOR_SECS,
+            "a released sbt coordinate must be cached immutably; got {release_ttl}s —              {mutable}s is the #3459 symptom (a `Generic` stand-in repository              reaching the cache-TTL classifier)",
+            mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+        );
+        assert!(
+            snapshot_ttl <= crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+            "a SNAPSHOT coordinate is republished in place and must stay mutable;              got {snapshot_ttl}s — this negative control is what keeps the              immutable assertion from passing under a 'cache everything forever' change"
+        );
     }
 
     #[test]

@@ -763,6 +763,16 @@ pub fn budgeted_body(content: Bytes, permit: OwnedSemaphorePermit) -> axum::body
 /// resident metadata memory past the budget. The reservation is sized to the
 /// cap rather than the (not-yet-known) body length, matching the RPM path, so
 /// the bound holds during the buffering read itself and not only afterwards.
+///
+/// Takes the repository's real `format` (#3459, the buffered-metadata sibling
+/// of #2312/#3206). Maven/Gradle clients fetch a `.sha1`/`.md5` sidecar for
+/// every artifact they download, and those sidecars are served through this
+/// helper. The pre-#3459 `build_remote_repo` synthesis handed
+/// `cache_classifier::classify` a `Generic` format, which has no classifier
+/// arm, so `foo-1.0.pom.sha1` fell to the conservative
+/// [`cache_classifier::MUTABLE_DEFAULT_TTL_SECS`] 5-minute TTL even though the
+/// released coordinate it describes is immutable and is itself cached for a
+/// decade. The result was an upstream round-trip per checksum per build.
 pub async fn proxy_fetch_capped_budgeted(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -770,10 +780,14 @@ pub async fn proxy_fetch_capped_budgeted(
     upstream_url: &str,
     path: &str,
     max: usize,
+    format: RepositoryFormat,
 ) -> Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response> {
     let permit = proxy_metadata_budget().reserve(max).await;
-    let (content, content_type) =
-        proxy_fetch_capped(proxy_service, repo_id, repo_key, upstream_url, path, max).await?;
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let (content, content_type) = proxy_service
+        .fetch_artifact_capped(&repo, path, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))?;
     Ok((content, content_type, permit))
 }
 
@@ -936,6 +950,41 @@ pub async fn proxy_fetch_streaming(
         None,
     )
     .await
+}
+
+/// Format-carrying sibling of [`proxy_fetch_streaming`] (#3459).
+///
+/// Identical in every respect except that the synthesized [`Repository`]
+/// carries the caller's REAL format instead of the `Generic` stand-in
+/// [`build_remote_repo`] produces, so `cache_classifier::classify` can reach
+/// its per-format arm. A handler serving a format whose classifier marks
+/// version-pinned coordinates immutable (Maven/Gradle/Sbt jars and poms and
+/// their checksum sidecars, RPM packages, Debian `pool/` ...) must use this;
+/// with `Generic` every one of those paths falls to the conservative
+/// 5-minute mutable TTL and is re-fetched from upstream on the next request.
+///
+/// Same class as #2312/#3206, which fixed it for the OCI blob/manifest arms.
+pub async fn proxy_fetch_streaming_with_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    default_content_type: &str,
+    format: RepositoryFormat,
+) -> Result<Response, Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let result = proxy_service
+        .fetch_artifact_streaming(&repo, path)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))?;
+    build_streaming_response_with_disposition(result, default_content_type, None).map_err(|e| {
+        map_proxy_error(
+            repo_key,
+            path,
+            crate::error::AppError::Internal(e.to_string()),
+        )
+    })
 }
 
 /// Streaming sibling of [`proxy_fetch`] that also forwards a
@@ -11988,6 +12037,17 @@ mod tests {
     const VERIFIED_STREAMING_CALL_TOKEN: &str =
         "proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(";
 
+    /// The format-carrying streaming sibling: same streaming/tee semantics as
+    /// `proxy_fetch_streaming` (no buffering), plus the repository's REAL
+    /// format, so `cache_classifier::classify` can reach its per-format arm
+    /// instead of the `Generic` stand-in `build_remote_repo` synthesizes. The
+    /// Maven and sbt artifact downloads moved to this helper in #3459 — with
+    /// `Generic` every released coordinate was stamped with the conservative
+    /// 5-minute mutable TTL and re-fetched from upstream after it — so their
+    /// pins assert this token. A revert to the buffered `proxy_fetch` OR to
+    /// the format-less streaming helper must fail the pin.
+    const FORMAT_STREAMING_CALL_TOKEN: &str = "proxy_helpers::proxy_fetch_streaming_with_format(";
+
     /// One pin test per handler. Kept as separate `#[test]` functions
     /// (rather than a single loop) so a CI failure points directly at
     /// the regressing handler. The macro keeps the surface area small
@@ -12014,8 +12074,14 @@ mod tests {
     streaming_pin_test!(
         test_maven_remote_fetch_uses_streaming_helper_1183,
         "maven.rs",
-        STREAMING_CALL_TOKEN,
+        FORMAT_STREAMING_CALL_TOKEN,
         "the remote catch-all download"
+    );
+    streaming_pin_test!(
+        test_sbt_remote_fetch_uses_streaming_helper_1183,
+        "sbt.rs",
+        FORMAT_STREAMING_CALL_TOKEN,
+        "the remote sbt/ivy artifact download"
     );
     streaming_pin_test!(
         test_goproxy_remote_fetch_uses_streaming_helper_1183,

@@ -413,6 +413,7 @@ async fn fetch_upstream_index(
         upstream_url,
         "index.yaml",
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Helm,
     )
     .await?;
 
