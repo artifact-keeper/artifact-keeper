@@ -296,7 +296,8 @@ pub async fn create_device_code(
     State(state): State<SharedState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     base_url: RequestBaseUrl,
-    request: axum::extract::Request,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
 ) -> Result<impl IntoResponse> {
     // Rate limit
     if !check_device_code_rate_limit(addr.ip()) {
@@ -307,16 +308,14 @@ pub async fn create_device_code(
 
     // Accept both the AK JSON shape and the RFC 8628 §3.1 form encoding
     // (client_id + space-delimited scope), so standard OAuth tooling
-    // (oauth2c, oauthlib, ...) can call this endpoint directly.
-    let is_form = request
-        .headers()
+    // (oauth2c, oauthlib, ...) can call this endpoint directly. The `Bytes`
+    // extractor is bounded by the router's request body limit, so this
+    // cannot buffer unbounded input (.clippy.toml / #1608 policy).
+    let is_form = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|ct| ct.starts_with("application/x-www-form-urlencoded"))
         .unwrap_or(false);
-    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
-        .await
-        .map_err(|e| AppError::Validation(format!("Failed to read request body: {e}")))?;
     let req: DeviceCodeRequest = if is_form {
         let form: DeviceCodeForm = serde_urlencoded::from_bytes(&body)
             .map_err(|e| AppError::Validation(format!("Invalid form body: {e}")))?;
@@ -726,20 +725,19 @@ mod tests {
         assert!(js.contains("X-Requested-With"));
     }
 
-    fn json_device_request(body: serde_json::Value) -> axum::extract::Request {
-        axum::http::Request::builder()
-            .method("POST")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(body.to_string()))
-            .expect("build json request")
+    fn json_device_request(body: serde_json::Value) -> (axum::http::HeaderMap, bytes::Bytes) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        (headers, bytes::Bytes::from(body.to_string()))
     }
 
-    fn form_device_request(body: &str) -> axum::extract::Request {
-        axum::http::Request::builder()
-            .method("POST")
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(axum::body::Body::from(body.to_string()))
-            .expect("build form request")
+    fn form_device_request(body: &str) -> (axum::http::HeaderMap, bytes::Bytes) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        (headers, bytes::Bytes::from(body.to_string()))
     }
 
     #[tokio::test]
@@ -758,7 +756,14 @@ mod tests {
                 "provider_id": Uuid::new_v4(),
                 "client_id": "handler-client",
                 "scopes": ["openid", "admin"],
-            })),
+            }))
+            .0,
+            json_device_request(serde_json::json!({
+                "provider_id": Uuid::new_v4(),
+                "client_id": "handler-client",
+                "scopes": ["openid", "admin"],
+            }))
+            .1,
         )
         .await;
         assert!(matches!(
@@ -775,7 +780,14 @@ mod tests {
                 "provider_id": disabled_provider_id,
                 "client_id": "handler-client",
                 "scopes": ["openid"],
-            })),
+            }))
+            .0,
+            json_device_request(serde_json::json!({
+                "provider_id": disabled_provider_id,
+                "client_id": "handler-client",
+                "scopes": ["openid"],
+            }))
+            .1,
         )
         .await;
         assert!(matches!(
@@ -794,7 +806,12 @@ mod tests {
             RequestBaseUrl("https://registry.example.com/root/".to_string()),
             form_device_request(&format!(
                 "client_id=oauth2c&scope=openid%20profile&provider_id={provider_id}"
-            )),
+            ))
+            .0,
+            form_device_request(&format!(
+                "client_id=oauth2c&scope=openid%20profile&provider_id={provider_id}"
+            ))
+            .1,
         )
         .await
         .expect("create device code from form")
@@ -811,7 +828,14 @@ mod tests {
                 "provider_id": provider_id,
                 "client_id": "handler-client",
                 "scopes": ["openid", "read:artifacts"],
-            })),
+            }))
+            .0,
+            json_device_request(serde_json::json!({
+                "provider_id": provider_id,
+                "client_id": "handler-client",
+                "scopes": ["openid", "read:artifacts"],
+            }))
+            .1,
         )
         .await
         .expect("create device code")
