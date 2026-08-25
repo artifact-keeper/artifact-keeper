@@ -2700,6 +2700,78 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Rescan inconclusive-cause discrimination (#3455) -- RED probe
+    // -----------------------------------------------------------------------
+
+    // streaming-invariant: test-only body read, not an artifact path (#1608)
+    #[allow(clippy::disallowed_methods)]
+    async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    /// DB-backed regression proving the actual endpoint discriminates, not
+    /// just the pure response builder above. This is the genuine red -> green
+    /// case for #3455: pre-fix, `proxy_scan_and_record` returned `None` for
+    /// EVERY inconclusive cause and this handler's `.ok_or_else` turned that
+    /// into one indistinguishable `AppError::ServiceUnavailable` -- so this
+    /// test's `.expect` panics (not a compile error, not a setup failure)
+    /// against that code, and passes once the handler discriminates.
+    #[tokio::test]
+    async fn rescan_with_no_scanner_configured_returns_discriminated_503() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool.clone()).await;
+        let digest = unique_digest();
+        let path = "simple/x/x-1.0.whl";
+        seed_cached_path(&pool, fx.repo_id, path, Some(&digest), chrono::Utc::now()).await;
+        // `seed_cached_path` only inserts the catalog row; the handler also
+        // reads the bytes back from storage at the SAME key it computed
+        // (`proxy-cache/{repo_id}/{path}/__content__`), so the object must
+        // actually exist there too or the handler 404s before it ever
+        // reaches the scanner gate this test is probing.
+        fx.state()
+            .storage
+            .put(
+                &format!("proxy-cache/{}/{}/__content__", fx.repo_id, path),
+                bytes::Bytes::from_static(b"stub cached bytes"),
+            )
+            .await
+            .expect("seed cached bytes in storage");
+
+        let auth = crate::api::handlers::test_db_helpers::make_auth(fx.user_id, &fx.username);
+        let body = ProxyRescanRequest {
+            path: path.to_string(),
+        };
+        let result = rescan_proxy_cached_path(
+            State(fx.state()),
+            Extension(Some(auth)),
+            Path(fx.key.clone()),
+            Json(body),
+        )
+        .await;
+
+        let resp = result.expect(
+            "an inconclusive rescan must be a built 503 Response (Ok(_)), not \
+             an AppError -- the pre-#3455 handler propagated a single generic \
+             AppError::ServiceUnavailable for every cause here",
+        );
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let json = json_body(resp).await;
+        assert_eq!(
+            json["error"],
+            serde_json::json!("NO_SCANNER_CONFIGURED"),
+            "must name the specific cause, not a generic inconclusive message"
+        );
+
+        fx.cleanup(&[digest]).await;
+    }
+
+    // -----------------------------------------------------------------------
     // Proxy scan visibility -- DB-backed
     // -----------------------------------------------------------------------
 
