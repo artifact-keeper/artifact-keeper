@@ -128,6 +128,45 @@ pub struct OidcLoginQuery {
     /// IdP's login page. Any other value is rejected so the login redirect
     /// cannot be steered into unexpected IdP behaviours.
     prompt: Option<String>,
+    /// Optional same-origin path to land on after the SSO callback instead
+    /// of the web `/callback` page (e.g. the RFC 8628 `/device` approval
+    /// page). Strictly a relative path (`/...`, not `//...`), so it can
+    /// never become an open redirect. Carried across the IdP round-trip in
+    /// a short-lived cookie, not in OAuth state.
+    return_to: Option<String>,
+}
+
+/// Cookie that carries the validated `return_to` path across the IdP
+/// round-trip. Short-lived and HttpOnly; scoped to the SSO callback paths.
+const SSO_RETURN_TO_COOKIE: &str = "ak_sso_return_to";
+
+/// Validate a `return_to` candidate: same-origin relative path only.
+/// Rejects scheme-relative (`//evil`), backslash tricks and control chars.
+pub(crate) fn sanitize_return_to(candidate: &str) -> Option<&str> {
+    if candidate.starts_with('/')
+        && !candidate.starts_with("//")
+        && !candidate.contains('\\')
+        && !candidate.chars().any(|c| c.is_control())
+        && candidate.len() <= 512
+    {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Read the sanitized `return_to` path from the SSO cookie, if present.
+fn return_to_from_cookie(headers: &HeaderMap) -> Option<String> {
+    let cookies = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|c| {
+        let (name, value) = c.trim().split_once('=')?;
+        if name != SSO_RETURN_TO_COOKIE {
+            return None;
+        }
+        let decoded = urlencoding::decode(value).ok()?.into_owned();
+        sanitize_return_to(&decoded)?;
+        Some(decoded)
+    })
 }
 
 /// Resolve the `prompt` value the login redirect forwards to the IdP.
@@ -169,10 +208,17 @@ pub async fn oidc_login(
     Path(id): Path<Uuid>,
     Query(query): Query<OidcLoginQuery>,
     base_url: RequestBaseUrl,
-) -> Result<Redirect> {
+) -> Result<Response> {
     // 0. Validate the optional prompt before any session/state is created so
     //    a rejected request leaves nothing behind.
     let prompt = resolve_login_prompt(query.prompt.as_deref())?;
+    // Validate return_to up front too; an invalid value is silently dropped
+    // (login still works, the user just lands on the default page).
+    let return_to = query
+        .return_to
+        .as_deref()
+        .and_then(sanitize_return_to)
+        .map(str::to_string);
 
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
@@ -258,7 +304,23 @@ pub async fn oidc_login(
         auth_url.push_str(prompt);
     }
 
-    Ok(Redirect::temporary(&auth_url))
+    let mut response = Redirect::temporary(&auth_url).into_response();
+    // Carry the validated return_to across the IdP round-trip in a short-
+    // lived cookie so the callback can land the user back where they
+    // started (e.g. the /device approval page) instead of /callback.
+    if let Some(rt) = return_to {
+        let cookie = format!(
+            "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600",
+            SSO_RETURN_TO_COOKIE,
+            urlencoding::encode(&rt)
+        );
+        if let Ok(value) = cookie.parse() {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
+    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +529,7 @@ pub async fn oidc_callback(
             "SSO state does not match provider".to_string(),
         ));
     }
+    let return_to = return_to_from_cookie(&headers);
     oidc_callback_inner(
         state,
         session.provider_id,
@@ -475,6 +538,7 @@ pub async fn oidc_callback(
         session.pkce_code_verifier,
         base_url,
         client_is_https,
+        return_to,
     )
     .await
 }
@@ -503,6 +567,7 @@ pub async fn oidc_callback_generic(
 
     // Validate SSO session and resolve the provider from the stored state
     let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
+    let return_to = return_to_from_cookie(&headers);
     oidc_callback_inner(
         state,
         session.provider_id,
@@ -511,12 +576,14 @@ pub async fn oidc_callback_generic(
         session.pkce_code_verifier,
         base_url,
         client_is_https,
+        return_to,
     )
     .await
 }
 
 /// Shared OIDC callback logic used by both the provider-specific and generic
 /// callback handlers. Assumes the SSO session has already been validated.
+#[allow(clippy::too_many_arguments)]
 async fn oidc_callback_inner(
     state: SharedState,
     provider_id: Uuid,
@@ -525,6 +592,7 @@ async fn oidc_callback_inner(
     pkce_code_verifier: Option<String>,
     base_url: RequestBaseUrl,
     client_is_https: bool,
+    return_to: Option<String>,
 ) -> Result<Response> {
     // 1. Get decrypted OIDC config
     let (row, client_secret) =
@@ -748,7 +816,14 @@ async fn oidc_callback_inner(
     )
     .await?;
 
-    let frontend_url = build_frontend_callback_url(&exchange_code);
+    // A validated return_to (e.g. the /device approval page) replaces the
+    // default web /callback destination. Auth cookies are set on the redirect
+    // itself (see below), so the user arrives already authenticated and no
+    // frontend exchange step is needed for backend-served pages.
+    let frontend_url = match &return_to {
+        Some(rt) => rt.clone(),
+        None => build_frontend_callback_url(&exchange_code),
+    };
 
     // Set auth cookies on the redirect itself (closes #1405).
     //
@@ -763,13 +838,24 @@ async fn oidc_callback_inner(
     // eager `/auth/me` from the frontend succeeds. The `/exchange` POST still
     // runs and re-sets cookies (idempotent) so the existing flow continues to
     // work for frontends that read the response body.
-    build_sso_callback_redirect(
+    let mut response = build_sso_callback_redirect(
         &frontend_url,
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
         client_is_https,
-    )
+    )?;
+    if return_to.is_some() {
+        // One-shot: clear the return_to cookie now that it has been consumed.
+        if let Ok(value) =
+            format!("{SSO_RETURN_TO_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0").parse()
+        {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
+    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------

@@ -70,10 +70,24 @@ const ALLOWED_SCOPES: &[&str] = &[
 
 #[derive(Debug, Deserialize)]
 pub struct DeviceCodeRequest {
-    pub provider_id: Uuid,
+    /// Target OIDC provider. Optional: when omitted (as standard RFC 8628
+    /// clients like `oauth2c` cannot know it), the single enabled provider
+    /// is used; ambiguous configurations return a validation error.
+    pub provider_id: Option<Uuid>,
     pub client_id: String,
     #[serde(default)]
     pub scopes: Vec<String>,
+}
+
+/// RFC 8628 §3.1 form shape (`application/x-www-form-urlencoded`), as sent
+/// by standard OAuth tooling: `client_id`, space-delimited `scope`, plus the
+/// AK-specific optional `provider_id`.
+#[derive(Debug, Deserialize)]
+pub struct DeviceCodeForm {
+    pub provider_id: Option<Uuid>,
+    pub client_id: String,
+    #[serde(default)]
+    pub scope: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,26 +210,59 @@ pub async fn device_page_script() -> impl IntoResponse {
     var raw = v.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 8);
     return raw.length > 4 ? raw.slice(0, 4) + '-' + raw.slice(4) : raw;
   }
+  var loginUrl = null;
+
   function refresh() {
     input.value = normalize(input.value);
-    btn.disabled = !(authed && input.value.length === 9);
+    btn.disabled = !((authed || loginUrl) && input.value.length === 9);
   }
   input.addEventListener('input', refresh);
 
   var params = new URLSearchParams(window.location.search);
   input.value = normalize(params.get('user_code') || '');
 
+  function offerSsoLogin() {
+    // Not signed in: turn Approve into a sign-in redirect that returns to
+    // this exact page (code preserved) after the SSO round-trip.
+    fetch('/api/v1/auth/sso/providers', { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (providers) {
+        var oidc = (providers || []).filter(function (p) {
+          return p.provider_type === 'oidc';
+        });
+        if (oidc.length > 0) {
+          var back = window.location.pathname + window.location.search;
+          loginUrl = oidc[0].login_url + '?return_to=' + encodeURIComponent(back);
+          btn.textContent = 'Sign in to approve';
+          setMsg('You will be redirected to ' + oidc[0].name +
+                 ' to sign in, then brought back here.', '');
+          refresh();
+        } else {
+          setMsg('You are not signed in. Sign in first, then return to this ' +
+                 'page (use the link shown by your device).', 'err');
+          msg.insertAdjacentHTML('beforeend', ' <a href="/">Sign in</a>');
+        }
+      })
+      .catch(function () {
+        setMsg('You are not signed in. Sign in first, then return to this ' +
+               'page (use the link shown by your device).', 'err');
+        msg.insertAdjacentHTML('beforeend', ' <a href="/">Sign in</a>');
+      });
+  }
+
   fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(function (r) {
     if (r.ok) { authed = true; refresh(); return r.json(); }
-    setMsg('You are not signed in. Sign in first, then return to this page ' +
-           '(use the link shown by your device).', 'err');
-    msg.insertAdjacentHTML('beforeend', ' <a href="/">Sign in</a>');
+    offerSsoLogin();
     return null;
   }).then(function (me) {
     if (me) { setMsg('Signed in as ' + me.username + '.', 'ok'); }
   }).catch(function () { setMsg('Could not verify your session.', 'err'); });
 
   btn.addEventListener('click', function () {
+    if (!authed && loginUrl) {
+      window.location.assign(loginUrl);
+      return;
+    }
     btn.disabled = true;
     setMsg('Approving…');
     fetch('/api/v1/auth/oidc/device/approve', {
@@ -249,7 +296,7 @@ pub async fn create_device_code(
     State(state): State<SharedState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     base_url: RequestBaseUrl,
-    Json(req): Json<DeviceCodeRequest>,
+    request: axum::extract::Request,
 ) -> Result<impl IntoResponse> {
     // Rate limit
     if !check_device_code_rate_limit(addr.ip()) {
@@ -257,6 +304,31 @@ pub async fn create_device_code(
             "Too many device code requests. Please wait before trying again.".into(),
         ));
     }
+
+    // Accept both the AK JSON shape and the RFC 8628 §3.1 form encoding
+    // (client_id + space-delimited scope), so standard OAuth tooling
+    // (oauth2c, oauthlib, ...) can call this endpoint directly.
+    let is_form = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/x-www-form-urlencoded"))
+        .unwrap_or(false);
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|e| AppError::Validation(format!("Failed to read request body: {e}")))?;
+    let req: DeviceCodeRequest = if is_form {
+        let form: DeviceCodeForm = serde_urlencoded::from_bytes(&body)
+            .map_err(|e| AppError::Validation(format!("Invalid form body: {e}")))?;
+        DeviceCodeRequest {
+            provider_id: form.provider_id,
+            client_id: form.client_id,
+            scopes: form.scope.split_whitespace().map(str::to_string).collect(),
+        }
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::Validation(format!("Invalid JSON body: {e}")))?
+    };
 
     // Validate scopes
     for scope in &req.scopes {
@@ -269,8 +341,39 @@ pub async fn create_device_code(
         }
     }
 
+    // Resolve the provider: explicit id, or the single enabled provider when
+    // omitted (standard RFC 8628 clients have no way to know AK's UUIDs).
+    let provider_id = match req.provider_id {
+        Some(id) => id,
+        None => {
+            let enabled: Vec<_> = AuthConfigService::list_oidc(&state.db)
+                .await?
+                .into_iter()
+                .filter(|p| p.is_enabled)
+                .collect();
+            match enabled.len() {
+                0 => {
+                    return Err(AppError::Validation(
+                        "No enabled OIDC provider is configured".into(),
+                    ))
+                }
+                1 => enabled[0].id,
+                _ => {
+                    return Err(AppError::Validation(format!(
+                        "Multiple OIDC providers are enabled; pass provider_id. Candidates: {}",
+                        enabled
+                            .iter()
+                            .map(|p| format!("{} ({})", p.name, p.id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )))
+                }
+            }
+        }
+    };
+
     // Verify provider exists and is enabled
-    let provider = AuthConfigService::get_oidc(&state.db, req.provider_id).await?;
+    let provider = AuthConfigService::get_oidc(&state.db, provider_id).await?;
     if !provider.is_enabled {
         return Err(AppError::Validation(format!(
             "OIDC provider '{}' is disabled",
@@ -280,12 +383,7 @@ pub async fn create_device_code(
 
     let svc = OidcDeviceService::new(state.db.clone());
     let session = svc
-        .create_session(
-            req.provider_id,
-            req.client_id,
-            req.scopes,
-            base_url.as_str(),
-        )
+        .create_session(provider_id, req.client_id, req.scopes, base_url.as_str())
         .await?;
 
     let verification_uri_complete = format!(
@@ -628,6 +726,22 @@ mod tests {
         assert!(js.contains("X-Requested-With"));
     }
 
+    fn json_device_request(body: serde_json::Value) -> axum::extract::Request {
+        axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("build json request")
+    }
+
+    fn form_device_request(body: &str) -> axum::extract::Request {
+        axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("build form request")
+    }
+
     #[tokio::test]
     async fn oidc_device_create_code_validates_scopes_and_builds_response() {
         let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
@@ -640,11 +754,11 @@ mod tests {
             State(state.clone()),
             ConnectInfo(addr),
             RequestBaseUrl("https://registry.example.com/root/".to_string()),
-            Json(DeviceCodeRequest {
-                provider_id: Uuid::new_v4(),
-                client_id: "handler-client".to_string(),
-                scopes: vec!["openid".to_string(), "admin".to_string()],
-            }),
+            json_device_request(serde_json::json!({
+                "provider_id": Uuid::new_v4(),
+                "client_id": "handler-client",
+                "scopes": ["openid", "admin"],
+            })),
         )
         .await;
         assert!(matches!(
@@ -657,11 +771,11 @@ mod tests {
             State(state.clone()),
             ConnectInfo(addr),
             RequestBaseUrl("https://registry.example.com".to_string()),
-            Json(DeviceCodeRequest {
-                provider_id: disabled_provider_id,
-                client_id: "handler-client".to_string(),
-                scopes: vec!["openid".to_string()],
-            }),
+            json_device_request(serde_json::json!({
+                "provider_id": disabled_provider_id,
+                "client_id": "handler-client",
+                "scopes": ["openid"],
+            })),
         )
         .await;
         assert!(matches!(
@@ -670,15 +784,34 @@ mod tests {
         ));
 
         let provider_id = seed_oidc_provider(&pool, true).await;
+
+        // RFC 8628 §3.1 form encoding (oauth2c et al.): client_id +
+        // space-delimited scope, provider_id resolved explicitly here since
+        // parallel tests may leave several enabled providers in the shared DB.
+        let form_response = create_device_code(
+            State(state.clone()),
+            ConnectInfo(addr),
+            RequestBaseUrl("https://registry.example.com/root/".to_string()),
+            form_device_request(&format!(
+                "client_id=oauth2c&scope=openid%20profile&provider_id={provider_id}"
+            )),
+        )
+        .await
+        .expect("create device code from form")
+        .into_response();
+        let (status, json) = response_json(form_response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["device_code"].as_str().unwrap().len() == 64);
+
         let response = create_device_code(
             State(state),
             ConnectInfo(addr),
             RequestBaseUrl("https://registry.example.com/root/".to_string()),
-            Json(DeviceCodeRequest {
-                provider_id,
-                client_id: "handler-client".to_string(),
-                scopes: vec!["openid".to_string(), "read:artifacts".to_string()],
-            }),
+            json_device_request(serde_json::json!({
+                "provider_id": provider_id,
+                "client_id": "handler-client",
+                "scopes": ["openid", "read:artifacts"],
+            })),
         )
         .await
         .expect("create device code")
