@@ -734,6 +734,23 @@ jobs:
       - name: Check the supply-chain soft-fail gate catches what it must
         run: bash scripts/ci/test-check-supply-chain-soft-fail.sh
 
+      # The soft-fail guard above proves the signing step CAN report its own
+      # failure. It cannot prove the signature reached the image that ships:
+      # `cosign sign` prints nothing on the happy path, and the digest it is
+      # given comes from the same job, so a green publish is not evidence
+      # (#3559). docker-publish.yml now re-resolves each published TAG through
+      # the registry and demands a cosign signature over that digest, and this
+      # exercises every leg of that check — most importantly the three that
+      # must BLOCK and would be easy to get wrong: an image carrying only an
+      # `attest-build-provenance` bundle (which a bare `cosign verify` under
+      # cosign v3 ACCEPTS), a valid signature over a DIFFERENT digest than the
+      # tag resolves to, and an identity pattern loose enough to accept any
+      # signer. The infrastructure legs assert exit 2 specifically, so a
+      # Fulcio/Rekor outage can never be reported as a tampered image. Stubs
+      # `curl` and `cosign`; offline, ~1s.
+      - name: Check the published-signature gate catches what it must
+        run: bash scripts/ci/test-check-published-image-signature.sh
+
       # Four of the last eight releases shipped with wrong release bookkeeping
       # — a missing curated notes file, bullets filed under an already-released
       # heading, an [Unreleased] heading renamed without a fresh one being

@@ -1139,6 +1139,7 @@ jobs:
           sparse-checkout: |
             .github/scripts
             .vex
+            scripts/ci
 
       - name: Download digests
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1372,6 +1373,48 @@ jobs:
           subject-digest: ${{ steps.incoming.outputs.digest }}
           push-to-registry: true
 
+      # THE INVARIANT, ASSERTED AGAINST WHAT ACTUALLY SHIPPED (#3559):
+      #
+      #     THE BYTES A USER PULLS BY TAG ARE THE BYTES THAT WERE SIGNED.
+      #
+      # Every control above this line is anchored to `steps.incoming.outputs.
+      # digest` -- a value this job computed. That is the right thing to sign,
+      # but it is the wrong thing to VERIFY: a check fed the signer's own
+      # digest can only ever report that the signer signed what the signer
+      # was given. It cannot notice a tag that names something else.
+      #
+      # The step below starts over from the published TAG, resolves it through
+      # the registry the way `docker pull` would, and demands a cosign
+      # signature over THAT digest, by THIS workflow's identity, from GitHub's
+      # OIDC issuer. An unpinned identity would verify nothing -- anyone can
+      # sign any public image with Sigstore -- so the regexp is pinned here
+      # and the script refuses a pattern that matches every signer.
+      #
+      # Why the signing step is not already this check: `cosign sign` prints
+      # "Generating ephemeral keys... / Signing artifact..." and nothing else
+      # on success, so a green log is not evidence a signature was pushed;
+      # ghcr.io does not implement the OCI referrers API and cosign v3 no
+      # longer writes the legacy `sha256-<digest>.sig` tag, so hand-rolled
+      # registry probes report "unsigned" for images that are properly signed;
+      # and under cosign v3 a bare `cosign verify` is satisfied by the
+      # `attest-build-provenance` bundle alone, so the script additionally
+      # requires a signature whose payload type is the cosign one.
+      #
+      # Hard-fail, like every other step here (#3496). The script separates a
+      # genuine BLOCK (exit 1 -- the image is not verifiably signed) from an
+      # INFRASTRUCTURE failure (exit 2 -- registry 5xx, Fulcio/Rekor outage),
+      # so a Sigstore outage does not read in the log as a tampered image.
+      # Both fail the job; every step in this job is idempotent, so recovery
+      # is "Re-run failed jobs".
+      - name: Verify the published tags resolve to signed bytes
+        env:
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json)
+          scripts/ci/check-published-image-signature.sh "${REFS[@]}"
+
       # .vex was fetched by the checkout at the top of this job.
       #
       # BEST-EFFORT, and explicitly so (#3496). `docker scout attestation add`
@@ -1435,7 +1478,9 @@ jobs:
       - name: Checkout (scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            scripts/ci
 
       - name: Download digests
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1610,6 +1655,18 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
           subject-digest: ${{ steps.incoming.outputs.digest }}
           push-to-registry: true
+
+      # Same assertion as merge-backend, same reasoning -- see the long note
+      # there (#3559). Anchored to the published tag, never to the digest this
+      # job handed the signer.
+      - name: Verify the published tags resolve to signed bytes
+        env:
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json)
+          scripts/ci/check-published-image-signature.sh "${REFS[@]}"
 
   merge-scanner-adapter:
     name: Scanner Adapter Multi-Arch Manifest
@@ -1971,6 +2028,25 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
           subject-digest: ${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
           push-to-registry: true
+
+      # Same assertion as merge-backend, same reasoning -- see the long note
+      # there (#3559). The adapter's tag set comes from its own metadata step
+      # on a normal build and is the single exact version tag on a promote,
+      # which is exactly what the steps above wrote.
+      - name: Verify the published tags resolve to signed bytes
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+          ADAPTER_VERSION: ${{ steps.adapter_version.outputs.version }}
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${PROMOTE_VERSION}" ]]; then
+            REFS=( "${REGISTRY}/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION}" )
+          else
+            mapfile -t REFS < <(jq -r '.tags[]' <<< "${META_JSON}")
+          fi
+          scripts/ci/check-published-image-signature.sh "${REFS[@]}"
 
   merge-backend-alpine:
     name: Backend Alpine Multi-Arch Manifest
@@ -2542,5 +2618,11 @@ jobs:
           echo "See the **Apply Floating Tags** job for which floating tags (if any) moved." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Supply Chain Security" >> $GITHUB_STEP_SUMMARY
-          echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC)" >> $GITHUB_STEP_SUMMARY
-          echo "- Verify: \`cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com --certificate-identity-regexp='https://github.com/artifact-keeper/.*' ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:<version>\`" >> $GITHUB_STEP_SUMMARY
+          echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC), and each merge job re-checks that the tags it published resolve to signed bytes (#3559)" >> $GITHUB_STEP_SUMMARY
+          # The identity pattern below is pinned to the workflow that is
+          # allowed to sign. The previous hint said `https://github.com/artifact-keeper/.*`,
+          # which accepts a signature from ANY workflow in the org — including
+          # one a contributor could add in a fork-triggered run. An identity
+          # pattern is half the assertion; a loose one gives a green verify
+          # that means very little.
+          echo "- Verify: \`cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com --certificate-identity-regexp='^https://github[.]com/artifact-keeper/artifact-keeper/[.]github/workflows/docker-publish[.]yml@refs/tags/v.+$' ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:<version>\`" >> $GITHUB_STEP_SUMMARY
