@@ -3442,7 +3442,14 @@ pub(crate) async fn capture_cli_output_with_timeout(
     // Spawn with stdout piped so we can bound the read. `Command::output`
     // would buffer the entire stdout into memory unconditionally; a
     // hostile binary printing 1 GiB to stdout would OOM the backend.
-    let mut child = match tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    // Callers can run scanner-version probes inside a wider scan timeout. If
+    // that outer timeout drops this future, Tokio otherwise leaves the probe
+    // child running. Version collection is best-effort and has no reason to
+    // outlive its caller, so cancellation must own the child just as it does
+    // for scanner and cleanup subprocesses (#3455).
+    command.kill_on_drop(true);
+    let mut child = match command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -6835,6 +6842,48 @@ mod tests {
         assert!(
             body.contains(".args([\"-R\", \"u+rwX\", &workspace_str])"),
             "the chmod pin must cover the recursive workspace cleanup command: {body}"
+        );
+    }
+
+    /// Source slice of the shared version-probe capture helper. This is a
+    /// deterministic cancellation-ownership regression: process-table timing
+    /// is host dependent, while the Tokio command configuration is the direct
+    /// behavior contract CI needs to preserve.
+    fn capture_cli_output_spawn_body() -> &'static str {
+        let src = include_str!("scanner_service.rs");
+        let marker = "pub(crate) async fn capture_cli_output_with_timeout(";
+        let start = src
+            .find(marker)
+            .expect("capture_cli_output_with_timeout must exist");
+        let rest = &src[start + marker.len()..];
+        &rest[..rest
+            .find("\n}\n\n/// TTL")
+            .expect("capture_cli_output_with_timeout must end before cache constants")]
+    }
+
+    /// A wider caller timeout can drop the shared version-probe future. Pin
+    /// the explicit command ownership that makes Tokio kill that child rather
+    /// than leaving a hung probe alive after its scan has timed out (#3455).
+    #[test]
+    fn capture_cli_output_spawn_is_cancellation_owned() {
+        let body = capture_cli_output_spawn_body();
+        let command = "let mut command = tokio::process::Command::new(binary);";
+        let ownership = "command.kill_on_drop(true);";
+        assert!(
+            body.contains(command),
+            "the shared CLI probe must construct one explicit Command: {body}"
+        );
+        assert!(
+            body.contains(ownership),
+            "a dropped outer timeout must kill the shared CLI probe child: {body}"
+        );
+        let ownership_at = body
+            .find(ownership)
+            .expect("the ownership assertion above found this text");
+        let spawn_at = body.find(".spawn()").expect("probe must spawn a child");
+        assert!(
+            ownership_at < spawn_at,
+            "kill_on_drop must be configured before spawning the probe: {body}"
         );
     }
 

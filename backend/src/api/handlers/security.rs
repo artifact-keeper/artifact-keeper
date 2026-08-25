@@ -2007,10 +2007,26 @@ fn remaining_rescan_cooldown(repo_id: Uuid) -> Option<std::time::Duration> {
     )
 }
 
+/// Convert a remaining cooldown to HTTP `Retry-After` delay-seconds.
+///
+/// The header accepts whole seconds only. Round UP rather than truncating: a
+/// client that receives `1` for 1.2 seconds of remaining cooldown retries
+/// early and is guaranteed another 429. Saturate at `u64::MAX` for the
+/// representable `Duration` edge, and keep the existing one-second minimum so
+/// a direct caller cannot emit the retry-now lie `Retry-After: 0`.
+fn retry_after_delay_seconds(remaining: std::time::Duration) -> u64 {
+    let whole_seconds = remaining.as_secs();
+    if remaining.subsec_nanos() == 0 {
+        whole_seconds.max(1)
+    } else {
+        whole_seconds.saturating_add(1)
+    }
+}
+
 /// 429 for a rescan asked for inside the cooldown, with `Retry-After`.
 fn rescan_throttled_response(remaining: std::time::Duration) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let secs = remaining.as_secs().max(1);
+    let secs = retry_after_delay_seconds(remaining);
     (
         axum::http::StatusCode::TOO_MANY_REQUESTS,
         [(axum::http::header::RETRY_AFTER, secs.to_string())],
@@ -2077,7 +2093,7 @@ fn rescan_inconclusive_response(
     let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
 
     if let Some(remaining) = retry_after {
-        let secs = remaining.as_secs().max(1);
+        let secs = retry_after_delay_seconds(remaining);
         let value = axum::http::HeaderValue::from_str(&secs.to_string())
             .expect("a decimal second count is always a valid header value");
         resp.headers_mut()
@@ -2827,8 +2843,9 @@ mod tests {
         );
     }
 
-    /// The throttle response is a 429 carrying `Retry-After`, not a 4xx a
-    /// client would retry immediately or treat as permanent.
+    /// The throttle response is a 429 carrying an upward-rounded
+    /// `Retry-After`, not a 4xx a client would retry immediately or treat as
+    /// permanent.
     #[test]
     fn rescan_throttled_response_is_429_with_retry_after() {
         let resp = rescan_throttled_response(std::time::Duration::from_secs(7));
@@ -2847,6 +2864,21 @@ mod tests {
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok()),
             Some("1")
+        );
+        // Delay-seconds is integral, so a remaining cooldown with a fractional
+        // second must round UP. Truncating 7.2 seconds to 7 tells a conforming
+        // client to retry before the in-process throttle has expired.
+        let resp = rescan_throttled_response(std::time::Duration::from_millis(7200));
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("8")
+        );
+        assert_eq!(
+            retry_after_delay_seconds(std::time::Duration::new(u64::MAX, 1)),
+            u64::MAX,
+            "the ceiling operation must saturate at the largest delay-seconds value"
         );
     }
 
@@ -2961,15 +2993,15 @@ mod tests {
 
         let resp = rescan_inconclusive_response(
             ProxyScanInconclusive::BudgetExceeded,
-            Some(std::time::Duration::from_secs(3)),
+            Some(std::time::Duration::from_millis(3200)),
         );
         assert_eq!(
             resp.headers()
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok()),
-            Some("3"),
-            "when cooldown genuinely remains, Retry-After reflects it exactly, \
-             not the 120s budget constant"
+            Some("4"),
+            "when cooldown genuinely remains, Retry-After rounds up rather than \
+             advertising an early retry or the 120s budget constant"
         );
     }
 
