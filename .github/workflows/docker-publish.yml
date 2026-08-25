@@ -1339,10 +1339,42 @@ jobs:
             sleep $((n * 10))
           done
 
+      # BOTH REGISTRIES, BECAUSE BOTH ARE PUBLISHED (#3562).
+      #
+      # A cosign signature lives in the repository it was pushed to. The ghcr
+      # signature below covers this digest inside
+      # `ghcr.io/artifact-keeper/...`; it is invisible to anyone verifying
+      # `docker.io/artifactkeeper/...`, even though the "Copy to Docker Hub"
+      # step above put byte-identical content there. Until this second line
+      # existed, every Docker Hub tag this project ever published was
+      # unverifiable -- the bytes were right, the signature simply was not
+      # there to find.
+      #
+      # The subject is the DIGEST on both sides, and it is the SAME digest:
+      # `imagetools create` copies a manifest list without rewriting it, so
+      # ghcr and Docker Hub resolve a given tag to identical bytes (measured
+      # on 1.8.1 for all three images). Signing by digest is therefore also a
+      # self-assertion -- if the Hub copy had produced different content, this
+      # `cosign sign` would fail on a manifest that is not there, loudly and
+      # immediately, rather than attaching a signature to the wrong thing.
+      #
+      # Signing the digest rather than a tag is likewise what lets
+      # `apply-floating-tags` stay build-free: it re-points `:latest` / `:X.Y`
+      # on both registries at this same digest and uploads nothing, so this
+      # signature keeps covering them.
+      #
+      # SURFACE NOTE: unlike ghcr.io, Docker Hub implements the OCI referrers
+      # API, and on Hub the referrer index is also addressable as the
+      # `sha256-<digest>` tag. Expect that tag to become visible in the PUBLIC
+      # Docker Hub repository's tag list. That is a deliberate, accepted
+      # trade -- see #3562.
       - name: Sign image with cosign (keyless)
         run: |
+          set -euo pipefail
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.incoming.outputs.digest }}
+          cosign sign --yes \
+            docker.io/${{ env.DOCKERHUB_BACKEND }}@${{ steps.incoming.outputs.digest }}
 
       # CONTROL, not telemetry (#3496). This step carried
       # `continue-on-error: true` from the day it was added, so a failed
@@ -1406,13 +1438,27 @@ jobs:
       # so a Sigstore outage does not read in the log as a tampered image.
       # Both fail the job; every step in this job is idempotent, so recovery
       # is "Re-run failed jobs".
+      #
+      # BOTH REGISTRIES (#3562). A gate pointed at one of the two channels this
+      # workflow publishes to is precisely the hole it exists to close: the
+      # Docker Hub mirrors shipped unsigned for the project's entire history
+      # while a correct, hard-failing, well-tested ghcr check stayed green over
+      # them. The Docker Hub tag set goes in alongside the ghcr one.
+      #
+      # PUBLISHED_SIG_BASIC_AUTH_HOST pins the ghcr credential below to ghcr.
+      # The token endpoint a registry credential gets presented to is named by
+      # a WWW-Authenticate header the REGISTRY sends, and Docker Hub's realm is
+      # auth.docker.io -- a different origin. Without the pin, adding a
+      # docker.io ref to this invocation would hand a GITHUB_TOKEN to Docker's
+      # auth server. Public mirrors resolve anonymously, so nothing is lost.
       - name: Verify the published tags resolve to signed bytes
         env:
           PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
           PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
         run: |
           set -euo pipefail
-          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json)
+          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json /tmp/hub-tags.json)
           scripts/ci/check-published-image-signature.sh "${REFS[@]}"
 
       # .vex was fetched by the checkout at the top of this job.
@@ -1641,10 +1687,16 @@ jobs:
             sleep $((n * 10))
           done
 
+      # Both registries; see the long note on the same step in merge-backend
+      # (#3562). Same digest on each -- the Docker Hub copy above re-points
+      # tags at bytes it did not rewrite.
       - name: Sign image with cosign (keyless)
         run: |
+          set -euo pipefail
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@${{ steps.incoming.outputs.digest }}
+          cosign sign --yes \
+            docker.io/${{ env.DOCKERHUB_OPENSCAP }}@${{ steps.incoming.outputs.digest }}
 
       # CONTROL, not telemetry (#3496) — see the long note on the same step
       # in merge-backend. No continue-on-error: a provenance push that fails
@@ -1659,13 +1711,27 @@ jobs:
       # Same assertion as merge-backend, same reasoning -- see the long note
       # there (#3559). Anchored to the published tag, never to the digest this
       # job handed the signer.
+      #
+      # BOTH REGISTRIES (#3562). A gate pointed at one of the two channels this
+      # workflow publishes to is precisely the hole it exists to close: the
+      # Docker Hub mirrors shipped unsigned for the project's entire history
+      # while a correct, hard-failing, well-tested ghcr check stayed green over
+      # them. The Docker Hub tag set goes in alongside the ghcr one.
+      #
+      # PUBLISHED_SIG_BASIC_AUTH_HOST pins the ghcr credential below to ghcr.
+      # The token endpoint a registry credential gets presented to is named by
+      # a WWW-Authenticate header the REGISTRY sends, and Docker Hub's realm is
+      # auth.docker.io -- a different origin. Without the pin, adding a
+      # docker.io ref to this invocation would hand a GITHUB_TOKEN to Docker's
+      # auth server. Public mirrors resolve anonymously, so nothing is lost.
       - name: Verify the published tags resolve to signed bytes
         env:
           PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
           PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
         run: |
           set -euo pipefail
-          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json)
+          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json /tmp/hub-tags.json)
           scripts/ci/check-published-image-signature.sh "${REFS[@]}"
 
   merge-scanner-adapter:
@@ -2014,10 +2080,18 @@ jobs:
             sleep $((n * 10))
           done
 
+      # Both registries; see the long note on the same step in merge-backend
+      # (#3562). The adapter's Docker Hub copy re-applies the same index
+      # annotations the ghcr push used, which is idempotent -- both registries
+      # resolve the adapter's tags to one digest (measured), so one digest is
+      # the subject on both sides.
       - name: Sign image with cosign (keyless)
+        env:
+          DIGEST: ${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
         run: |
-          cosign sign --yes \
-            ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
+          set -euo pipefail
+          cosign sign --yes "${REGISTRY}/${SCANNER_ADAPTER_IMAGE}@${DIGEST}"
+          cosign sign --yes "docker.io/${DOCKERHUB_SCANNER_ADAPTER}@${DIGEST}"
 
       # CONTROL, not telemetry (#3496) — see the long note on the same step
       # in merge-backend. No continue-on-error: a provenance push that fails
@@ -2033,18 +2107,34 @@ jobs:
       # there (#3559). The adapter's tag set comes from its own metadata step
       # on a normal build and is the single exact version tag on a promote,
       # which is exactly what the steps above wrote.
+      #
+      # BOTH REGISTRIES (#3562). A gate pointed at one of the two channels this
+      # workflow publishes to is precisely the hole it exists to close: the
+      # Docker Hub mirrors shipped unsigned for the project's entire history
+      # while a correct, hard-failing, well-tested ghcr check stayed green over
+      # them. The Docker Hub tag set goes in alongside the ghcr one.
+      #
+      # PUBLISHED_SIG_BASIC_AUTH_HOST pins the ghcr credential below to ghcr.
+      # The token endpoint a registry credential gets presented to is named by
+      # a WWW-Authenticate header the REGISTRY sends, and Docker Hub's realm is
+      # auth.docker.io -- a different origin. Without the pin, adding a
+      # docker.io ref to this invocation would hand a GITHUB_TOKEN to Docker's
+      # auth server. Public mirrors resolve anonymously, so nothing is lost.
       - name: Verify the published tags resolve to signed bytes
         env:
           META_JSON: ${{ steps.meta.outputs.json }}
+          META_HUB_JSON: ${{ steps.meta-dockerhub.outputs.json }}
           ADAPTER_VERSION: ${{ steps.adapter_version.outputs.version }}
           PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
           PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
         run: |
           set -euo pipefail
           if [[ -n "${PROMOTE_VERSION}" ]]; then
-            REFS=( "${REGISTRY}/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION}" )
+            REFS=( "${REGISTRY}/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION}"
+                   "docker.io/${DOCKERHUB_SCANNER_ADAPTER}:${ADAPTER_VERSION}" )
           else
-            mapfile -t REFS < <(jq -r '.tags[]' <<< "${META_JSON}")
+            mapfile -t REFS < <(jq -r '.tags[]' <<< "${META_JSON}"; jq -r '.tags[]' <<< "${META_HUB_JSON}")
           fi
           scripts/ci/check-published-image-signature.sh "${REFS[@]}"
 
