@@ -122,7 +122,14 @@ impl TrivyFsScanner {
             "standalone"
         };
 
-        let output = tokio::process::Command::new("trivy")
+        let mut command = tokio::process::Command::new("trivy");
+        // `tokio::process::Command` defaults `kill_on_drop` to `false`. This
+        // scan runs inside the caller's inline-proxy-gate timeout, and when
+        // that timeout fires it drops this future -- without this, the trivy
+        // child is ORPHANED and keeps running to completion unsupervised.
+        // Same fix, same rationale, as the grype spawn (#3455).
+        command.kill_on_drop(true);
+        let output = command
             .args(&args)
             .output()
             .await
