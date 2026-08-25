@@ -7044,6 +7044,38 @@ pub(crate) fn stored_verdict_blocks_under_gate(
     }
 }
 
+/// Pure decision for the `ScanInline` (fail-closed) arm of
+/// [`gate_proxy_scan_serve`]: given the outcome of one
+/// [`proxy_scan_and_record`] call, decide serve vs. deny.
+///
+/// Pulled out (#3455) so this decision is provable WITHOUT a DB or a scanner
+/// subprocess -- including for [`ProxyScanInconclusive::BudgetExceeded`],
+/// which is otherwise only reachable by actually exceeding a 30s+ budget.
+/// The `Err(_)` arm is a wildcard on purpose and must stay one: every one of
+/// [`ProxyScanInconclusive`]'s three reasons (NoScanner / ScanFailed /
+/// BudgetExceeded) maps here identically -- this gate does not discriminate,
+/// see the type's own doc comment.
+fn scan_inline_serve_decision(
+    result: std::result::Result<
+        crate::services::scanner_service::ProxyScanVerdict,
+        ProxyScanInconclusive,
+    >,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    repo_id: Uuid,
+    filename: &str,
+    digest: &str,
+) -> ProxyScanServeOutcome {
+    match result {
+        Ok(verdict) if verdict.is_vulnerable() && severity_gate.blocks(verdict.max_severity) => {
+            tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
+            ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
+        }
+        Ok(_) => ProxyScanServeOutcome::Serve { pending: false },
+        // Inconclusive under fail-closed => 423, never unscanned bytes.
+        Err(_) => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn gate_proxy_scan_serve(
     state: &crate::api::SharedState,
@@ -7117,23 +7149,11 @@ pub(crate) async fn gate_proxy_scan_serve(
                 ProxyScanIdentity::NotApplicable => None,
             };
             let budget = proxy_scan_mode_budget(&mode);
-            match proxy_scan_and_record(
+            let result = proxy_scan_and_record(
                 state, repo_id, digest, &synthetic, bytes, expected, &mode, budget,
             )
-            .await
-            {
-                Ok(verdict)
-                    if verdict.is_vulnerable() && severity_gate.blocks(verdict.max_severity) =>
-                {
-                    tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
-                    ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
-                }
-                Ok(_) => ProxyScanServeOutcome::Serve { pending: false },
-                // Inconclusive under fail-closed => 423, never unscanned bytes.
-                // Every arm (#3455's NoScanner / ScanFailed / BudgetExceeded)
-                // maps here identically -- this gate does not discriminate.
-                Err(_) => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
-            }
+            .await;
+            scan_inline_serve_decision(result, severity_gate, repo_id, filename, digest)
         }
         ServeDecision::ServePendingScanAsync => {
             // Fail-open: serve immediately (loud: X-AK-Scan pending) and scan
@@ -7440,13 +7460,57 @@ mod tests {
         ));
     }
 
-    /// BudgetExceeded arm: a scanner that never finishes inside the inline
-    /// File-mode budget ([`crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET`],
-    /// 30s). Run under a PAUSED tokio clock so the real budget elapses in
-    /// virtual rather than wall-clock time -- this test does not sleep 30
-    /// real seconds.
-    #[tokio::test(start_paused = true)]
-    async fn inline_gate_budget_exceeded_arm_is_byte_identical_fail_closed_and_fail_open() {
+    // BudgetExceeded arm (#3455). Split in two rather than driven end-to-end
+    // through an actually-hung scanner under a paused clock (#2974 follow-up):
+    // genuinely exceeding the 30s inline File-mode budget needs either a real
+    // 30s wait or a paused tokio clock, and the fail-closed half of this gate
+    // does real Postgres I/O (`ProxyScanService::lookup_verdict`, inside
+    // `gate_proxy_scan_serve`) before the scan future is even polled. Pairing
+    // that DB round trip with a paused virtual clock is exactly the hazard
+    // documented at `http_client.rs:884` (#2974): `pool.acquire()` arms
+    // sqlx's own acquire-timeout in virtual time across a real socket await,
+    // so tokio's auto-advance can fire it early -- a spurious `PoolTimedOut`
+    // that either panics the test or makes `Fixture::setup` return `None`,
+    // which this test module's `let Some(fx) = ... else { return; }` idiom
+    // turns into a SILENT no-op reported as green. This repo has hit
+    // `PoolTimedOut` flakes from exactly this shape before.
+    //
+    // fail-closed is proven against `scan_inline_serve_decision` directly --
+    // the very function `gate_proxy_scan_serve`'s `ScanInline` arm now calls
+    // -- with zero DB, zero clock, zero scanner subprocess.
+    //
+    // fail-open is proven end-to-end with a real, UNPAUSED clock and is safe
+    // to do so: `ServePendingScanAsync` fires the scan in a background
+    // `tokio::spawn` and returns `Serve { pending: true }` without ever
+    // looking at its outcome (see that arm in `gate_proxy_scan_serve`), so
+    // the assertion below returns long before the mock's hang could matter --
+    // there is no timer this test needs to wait out, paused or otherwise.
+
+    /// Pure fail-closed half: `BudgetExceeded` denies via the SAME decision
+    /// function `gate_proxy_scan_serve` calls, byte-identical to the
+    /// NoScanner/ScanFailed arms proven end-to-end below and above.
+    #[test]
+    fn inline_gate_budget_exceeded_arm_fail_closed_denies_via_shared_decision() {
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        match scan_inline_serve_decision(
+            Err(ProxyScanInconclusive::BudgetExceeded),
+            ProxySeverityGate::BlockOnAny,
+            Uuid::new_v4(),
+            "pkg-1.0.tgz",
+            "deadbeef",
+        ) {
+            ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
+            ProxyScanServeOutcome::Serve { .. } => {
+                panic!("fail-closed must never serve on a budget-exceeded scan")
+            }
+        }
+    }
+
+    /// Fail-open half: `ServePendingScanAsync` ignores the scan outcome
+    /// entirely, so this proves the gate returns immediately without waiting
+    /// on the mock's (arbitrarily long) hang -- see the module comment above.
+    #[tokio::test]
+    async fn inline_gate_budget_exceeded_arm_fail_open_serves_pending_without_waiting() {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::services::proxy_scan_service::ProxyScanAction;
         use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
@@ -7454,26 +7518,15 @@ mod tests {
             return;
         };
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
-        let hang_past_budget = crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET
-            + std::time::Duration::from_secs(1);
-        let scanner = || {
-            std::sync::Arc::new(VersionedCveScanner {
-                live_version: Some("grype-test"),
-                rescan: MockCveRescan::Hang(hang_past_budget),
-            }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>
-        };
-
-        let fail_closed_state =
-            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
-        match run_gate(&fail_closed_state, ProxyScanAction::FailClosed).await {
-            ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
-            ProxyScanServeOutcome::Serve { .. } => {
-                panic!("fail-closed must never serve when the scan timed out")
-            }
-        }
+        let scanner = std::sync::Arc::new(VersionedCveScanner {
+            live_version: Some("grype-test"),
+            // Far longer than any budget in this suite: irrelevant, since
+            // fail-open never awaits the scan before answering.
+            rescan: MockCveRescan::Hang(std::time::Duration::from_secs(3600)),
+        }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
 
         let fail_open_state =
-            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner]);
         assert!(matches!(
             run_gate(&fail_open_state, ProxyScanAction::FailOpen).await,
             ProxyScanServeOutcome::Serve { pending: true }
