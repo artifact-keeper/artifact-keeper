@@ -1890,6 +1890,13 @@ async fn get_repo_proxy_scans(
 /// shorter than the budget would let a second, third, fourth... rescan queue
 /// up against the same repository while the first is still running -- up to
 /// `budget / cooldown` of them stacked on the box this fix targets.
+///
+/// [`release_rescan_slot`] (#3455 review) does not weaken this: it is only
+/// ever called for [`crate::api::handlers::proxy_helpers::ProxyScanInconclusive::NoScanner`],
+/// detected before any scan future exists, so a released claim never
+/// overlaps a scan actually consuming budget. Every claim this invariant is
+/// protecting against -- one still holding a scanner subprocess or still
+/// inside its budget -- is never released early.
 const PROXY_RESCAN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(120);
 
 // The cooldown must be at least the budget, for the reason above. Enforced at
@@ -1957,6 +1964,49 @@ fn claim_rescan_slot(repo_id: Uuid) -> std::result::Result<(), std::time::Durati
     Ok(())
 }
 
+/// Release a previously-claimed rescan slot for `repo_id` (#3455 review).
+///
+/// Only correct to call when NO scan actually ran: a rescan whose only cost
+/// was a claim -- never a scanner subprocess or any of `PROXY_RESCAN_BUDGET`
+/// -- should not still cost the caller the full `PROXY_RESCAN_COOLDOWN`. The
+/// one caller of this function is `ProxyScanInconclusive::NoScanner`, which
+/// `proxy_scan_and_record` returns BEFORE constructing a scan future at all,
+/// so releasing here can never race or overlap a scan still in flight.
+///
+/// Deliberately narrow: `ScanFailed` is NOT released, because this endpoint
+/// cannot cleanly tell "failed instantly, before touching the scanner" apart
+/// from "failed after paying real scanner cost" -- inventing that distinction
+/// would be fragile, so a scan failure keeps the full cooldown, same as
+/// today. `BudgetExceeded` is not released either: by definition it consumed
+/// (up to) the entire budget.
+fn release_rescan_slot(repo_id: Uuid) {
+    let mut guard = PROXY_RESCAN_LAST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.remove(&repo_id);
+}
+
+/// The ACTUAL remaining cooldown for `repo_id` right now, reading the same
+/// claim map [`claim_rescan_slot`] writes and [`release_rescan_slot`] clears.
+///
+/// Pulled out so `Retry-After` on an inconclusive response (#3455 review) is
+/// truthful rather than a hardcoded constant: a claim just released by
+/// [`release_rescan_slot`] correctly reports `None` here, and a claim whose
+/// budget has fully elapsed (the `BudgetExceeded` case -- recall
+/// `PROXY_RESCAN_COOLDOWN` is at least `PROXY_RESCAN_BUDGET`, per the
+/// assertion above) correctly reports `None` too -- immediate retry really
+/// is allowed by then.
+fn remaining_rescan_cooldown(repo_id: Uuid) -> Option<std::time::Duration> {
+    let guard = PROXY_RESCAN_LAST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    rescan_cooldown_remaining(
+        guard.get(&repo_id).copied(),
+        std::time::Instant::now(),
+        PROXY_RESCAN_COOLDOWN,
+    )
+}
+
 /// 429 for a rescan asked for inside the cooldown, with `Retry-After`.
 fn rescan_throttled_response(remaining: std::time::Duration) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -1979,13 +2029,24 @@ fn rescan_throttled_response(remaining: std::time::Duration) -> axum::response::
 /// `RESCAN_BUDGET_EXCEEDED` each point the operator at a different remedy, so
 /// the response body -- not just the shared 503 status -- must say which one
 /// fired.
+///
+/// `retry_after` is the caller's job to compute (#3455 review), via
+/// [`remaining_rescan_cooldown`] AFTER any [`release_rescan_slot`] call --
+/// this function only renders whatever it is handed. It used to be hardcoded
+/// per-arm to `PROXY_RESCAN_BUDGET` on `BudgetExceeded` only, which was
+/// backwards both ways: by the time a `BudgetExceeded` response is built,
+/// `PROXY_RESCAN_COOLDOWN >= PROXY_RESCAN_BUDGET` means the cooldown has
+/// already elapsed and an immediate retry is really allowed, while
+/// `NoScanner`/`ScanFailed` answer in milliseconds with most of the cooldown
+/// still outstanding and advertised nothing at all.
 fn rescan_inconclusive_response(
     reason: crate::api::handlers::proxy_helpers::ProxyScanInconclusive,
+    retry_after: Option<std::time::Duration>,
 ) -> axum::response::Response {
     use crate::api::handlers::proxy_helpers::ProxyScanInconclusive;
     use axum::response::IntoResponse;
 
-    match reason {
+    let mut resp = match reason {
         ProxyScanInconclusive::NoScanner => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -2011,7 +2072,6 @@ fn rescan_inconclusive_response(
             let secs = crate::services::scanner_service::PROXY_RESCAN_BUDGET.as_secs();
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                [(axum::http::header::RETRY_AFTER, secs.to_string())],
                 Json(serde_json::json!({
                     "error": "RESCAN_BUDGET_EXCEEDED",
                     "message": format!(
@@ -2023,7 +2083,16 @@ fn rescan_inconclusive_response(
             )
                 .into_response()
         }
+    };
+
+    if let Some(remaining) = retry_after {
+        let secs = remaining.as_secs().max(1);
+        let value = axum::http::HeaderValue::from_str(&secs.to_string())
+            .expect("a decimal second count is always a valid header value");
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
     }
+    resp
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -2166,7 +2235,21 @@ async fn rescan_proxy_cached_path(
     .await
     {
         Ok(verdict) => verdict,
-        Err(reason) => return Ok(rescan_inconclusive_response(reason)),
+        Err(reason) => {
+            // Release the slot for causes that did no scanning work at all
+            // (#3455 review): `NoScanner` returns in milliseconds having spent
+            // zero scanner budget, so it must not still cost the caller the
+            // full PROXY_RESCAN_COOLDOWN. See `release_rescan_slot`'s doc for
+            // why `ScanFailed` is deliberately NOT released the same way.
+            if matches!(
+                reason,
+                crate::api::handlers::proxy_helpers::ProxyScanInconclusive::NoScanner
+            ) {
+                release_rescan_slot(repo.id);
+            }
+            let retry_after = remaining_rescan_cooldown(repo.id);
+            return Ok(rescan_inconclusive_response(reason, retry_after));
+        }
     };
 
     let mut findings = verdict.findings.clone();
@@ -2783,12 +2866,15 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json body")
     }
 
-    /// `NoScanner` -> 503 `NO_SCANNER_CONFIGURED`, no `Retry-After`: no wait
-    /// fixes this, only an operator configuring a scanner does.
+    /// `NoScanner` -> 503 `NO_SCANNER_CONFIGURED`. No `Retry-After` when the
+    /// caller passes `None` -- which is what the real endpoint does, because
+    /// this arm always releases its slot first (`release_rescan_slot`) and
+    /// `remaining_rescan_cooldown` then has nothing left to report (#3455
+    /// review).
     #[tokio::test]
     async fn rescan_inconclusive_no_scanner_is_503_with_distinct_code() {
         use crate::api::handlers::proxy_helpers::ProxyScanInconclusive;
-        let resp = rescan_inconclusive_response(ProxyScanInconclusive::NoScanner);
+        let resp = rescan_inconclusive_response(ProxyScanInconclusive::NoScanner, None);
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             resp.headers()
@@ -2808,11 +2894,28 @@ mod tests {
     /// `ScanFailed` -> 503 `RESCAN_SCAN_FAILED`, message stays GENERIC: the
     /// scan error is not echoed into the response, matching the storage-error
     /// redaction a few lines above this handler in the source.
+    ///
+    /// Unlike `NoScanner`, this arm's slot is deliberately NOT released
+    /// (#3455 review: the endpoint cannot cleanly tell "failed instantly"
+    /// from "failed after paying real scanner cost"), so the caller passes
+    /// the genuine remaining cooldown and this response now DOES carry
+    /// `Retry-After` -- it advertised none at all before this change.
     #[tokio::test]
     async fn rescan_inconclusive_scan_failed_is_503_with_generic_message() {
         use crate::api::handlers::proxy_helpers::ProxyScanInconclusive;
-        let resp = rescan_inconclusive_response(ProxyScanInconclusive::ScanFailed);
+        let resp = rescan_inconclusive_response(
+            ProxyScanInconclusive::ScanFailed,
+            Some(std::time::Duration::from_secs(119)),
+        );
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("119"),
+            "Retry-After must reflect the caller's actual remaining cooldown, \
+             not a hardcoded constant"
+        );
         let json = json_body(resp).await;
         assert_eq!(json["error"], serde_json::json!("RESCAN_SCAN_FAILED"));
         let message = json["message"].as_str().expect("message string");
@@ -2822,27 +2925,49 @@ mod tests {
         );
     }
 
-    /// `BudgetExceeded` -> 503 `RESCAN_BUDGET_EXCEEDED`, WITH `Retry-After`:
-    /// unlike the other two arms, a warm retry may succeed once the
-    /// scanner's startup cost has already been paid.
+    /// `BudgetExceeded` -> 503 `RESCAN_BUDGET_EXCEEDED`. `Retry-After` used to
+    /// be hardcoded to `PROXY_RESCAN_BUDGET` on this arm alone, which was
+    /// backwards (#3455 review): by the time this response is actually built
+    /// end-to-end, `PROXY_RESCAN_COOLDOWN >= PROXY_RESCAN_BUDGET` means the
+    /// cooldown has typically already elapsed, so the caller passes `None`
+    /// and this must NOT invite a wait the client doesn't need. A caller
+    /// passing a genuine remaining duration gets exactly that value back
+    /// instead, never the budget constant.
     #[tokio::test]
-    async fn rescan_inconclusive_budget_exceeded_is_503_with_retry_after() {
+    async fn rescan_inconclusive_budget_exceeded_retry_after_reflects_actual_cooldown() {
         use crate::api::handlers::proxy_helpers::ProxyScanInconclusive;
-        let resp = rescan_inconclusive_response(ProxyScanInconclusive::BudgetExceeded);
+
+        let resp = rescan_inconclusive_response(ProxyScanInconclusive::BudgetExceeded, None);
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "an elapsed cooldown must not advertise a wait the client doesn't need"
+        );
         let secs = crate::services::scanner_service::PROXY_RESCAN_BUDGET.as_secs();
+        let json = json_body(resp).await;
+        assert_eq!(json["error"], serde_json::json!("RESCAN_BUDGET_EXCEEDED"));
+        assert!(
+            json["message"]
+                .as_str()
+                .expect("message string")
+                .contains(&secs.to_string()),
+            "the message still names the budget duration; that's independent of Retry-After"
+        );
+
+        let resp = rescan_inconclusive_response(
+            ProxyScanInconclusive::BudgetExceeded,
+            Some(std::time::Duration::from_secs(3)),
+        );
         assert_eq!(
             resp.headers()
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok()),
-            Some(secs.to_string().as_str())
+            Some("3"),
+            "when cooldown genuinely remains, Retry-After reflects it exactly, \
+             not the 120s budget constant"
         );
-        let json = json_body(resp).await;
-        assert_eq!(json["error"], serde_json::json!("RESCAN_BUDGET_EXCEEDED"));
-        assert!(json["message"]
-            .as_str()
-            .expect("message string")
-            .contains(&secs.to_string()));
     }
 
     /// DB-backed regression proving the actual endpoint discriminates, not
@@ -2899,6 +3024,101 @@ mod tests {
             json["error"],
             serde_json::json!("NO_SCANNER_CONFIGURED"),
             "must name the specific cause, not a generic inconclusive message"
+        );
+
+        fx.cleanup(&[digest]).await;
+    }
+
+    /// Pins the #3455 budget widening itself: without a real scanner run that
+    /// takes LONGER than the inline download gate's 30s file budget but LESS
+    /// than the rescan endpoint's own 120s [`PROXY_RESCAN_BUDGET`], every
+    /// other test on this branch still passes if `rescan_proxy_cached_path`'s
+    /// call at the bottom of this file is quietly narrowed back to the 30s
+    /// file-gate budget -- the inline-gate tests exercise the gate, not this
+    /// endpoint, and the pure builder tests above only echo the constant into
+    /// a response they construct directly, never through the handler.
+    ///
+    /// Deliberately real, UNPAUSED wall-clock time rather than a paused tokio
+    /// clock (#2974, Finding 2 of this same review): this handler does real
+    /// Postgres I/O (repository/catalog lookups, `claim_rescan_slot`'s
+    /// in-memory map notwithstanding) interleaved with the scan future, and
+    /// pairing that with a paused virtual clock is the exact
+    /// spurious-`PoolTimedOut` / silent-no-op hazard documented at
+    /// `http_client.rs:884` and fixed for the inline-gate test elsewhere in
+    /// this change. A ~32s real sleep is the honest price of proving this
+    /// without touching the clock at all.
+    ///
+    /// Why this fails on a reverted budget: at 30s exactly, a hang of 32s
+    /// exceeds the file-gate budget and `proxy_scan_and_record` returns
+    /// `BudgetExceeded`, so the handler answers 503
+    /// `RESCAN_BUDGET_EXCEEDED` and `result.expect("rescan must succeed...")`
+    /// panics. Only the wider 120s `PROXY_RESCAN_BUDGET` lets the 32s scan
+    /// finish and the handler answer 200.
+    #[tokio::test]
+    async fn rescan_uses_its_own_wider_budget_not_the_inline_file_gate_budget() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::new(pool.clone()).await;
+        let digest = unique_digest();
+        let path = "simple/x/x-1.0.whl";
+        seed_cached_path(&pool, fx.repo_id, path, Some(&digest), chrono::Utc::now()).await;
+
+        let storage_path = fx.dir.to_string_lossy().to_string();
+        // Longer than PROXY_SCAN_INLINE_BUDGET (30s), shorter than
+        // PROXY_RESCAN_BUDGET (120s): the whole point of this test.
+        let hang = std::time::Duration::from_secs(32);
+        assert!(hang > crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET);
+        assert!(hang < crate::services::scanner_service::PROXY_RESCAN_BUDGET);
+        let scanner = std::sync::Arc::new(VersionedCveScanner {
+            live_version: Some("grype-test"),
+            rescan: MockCveRescan::Hang(hang),
+        }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+
+        let mut state = tdh::build_state(pool.clone(), &storage_path);
+        let svc = crate::services::scanner_service::ScannerService::new_for_test_with_scanners(
+            pool.clone(),
+            vec![scanner],
+            state.storage.clone(),
+            state.storage_registry.clone(),
+            storage_path.clone(),
+            format!("{storage_path}/scan-workspace"),
+        );
+        std::sync::Arc::get_mut(&mut state)
+            .expect("fresh Arc from build_state, no other references yet")
+            .set_scanner_service(std::sync::Arc::new(svc));
+
+        state
+            .storage
+            .put(
+                &format!("proxy-cache/{}/{}/__content__", fx.repo_id, path),
+                bytes::Bytes::from_static(b"stub cached bytes"),
+            )
+            .await
+            .expect("seed cached bytes in storage");
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let body = ProxyRescanRequest {
+            path: path.to_string(),
+        };
+        let result = rescan_proxy_cached_path(
+            State(state),
+            Extension(Some(auth)),
+            Path(fx.key.clone()),
+            Json(body),
+        )
+        .await;
+
+        let resp = result.expect("rescan handler must return a built Response");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "a 32s scan must SUCCEED under the 120s rescan budget; a 503 here \
+             means the handler is passing something narrower than \
+             PROXY_RESCAN_BUDGET (the #3455 regression this test pins)"
         );
 
         fx.cleanup(&[digest]).await;
