@@ -700,6 +700,23 @@ async fn find_local_quick_spec(
 ) -> Result<Option<crate::formats::rubygems::GemSpec>, Response> {
     // Narrow to artifacts whose name is a prefix of the requested full name so
     // hyphenated gem names disambiguate correctly against the version suffix.
+    //
+    // #3500: the PATTERN operand is a stored column (`a.name`), so the Rust
+    // `escape_like_literal` helper cannot reach it — the same shape as the
+    // Maven rollup guards, and so the same answer #3492/#3493 chose:
+    // `ESCAPE ''`, which disables escape processing entirely.
+    //
+    // The two directions differ and only one of them is a defect here. `%` and
+    // `_` in a stored name WIDEN the pattern, which merely returns extra
+    // candidate rows — the loop below re-verifies every row exactly in Rust
+    // (`base == full_name`, or a `{base}-` platform prefix), so a widened match
+    // cannot select a wrong row. `\` is Postgres's DEFAULT `LIKE` escape
+    // character and does the opposite: for a stored name `foo\bar` the pattern
+    // became `foobar-%`, which does NOT match the request `foo\bar-1.0`, so
+    // the gem's own row was filtered out before the exact check could see it
+    // and the quick gemspec 404'd. Verified on Postgres 16:
+    // `'foo\bar-1.0' LIKE 'foo\bar' || '-%'` is FALSE without the clause and
+    // TRUE with `ESCAPE ''`.
     let rows = sqlx::query(
         r#"
         SELECT a.name, a.version, am.metadata AS metadata
@@ -707,7 +724,7 @@ async fn find_local_quick_spec(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND $2 LIKE a.name || '-%'
+          AND $2 LIKE a.name || '-%' ESCAPE ''
         "#,
     )
     .bind(repo_id)
@@ -1335,6 +1352,95 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #3500. `find_local_quick_spec` narrows candidates with
+    /// `$2 LIKE a.name || '-%'`, whose PATTERN operand is a stored column.
+    /// Without an `ESCAPE` clause a backslash in the stored name — Postgres's
+    /// default `LIKE` escape character — quoted the character after it, so the
+    /// pattern for `foo\bar` became `foobar-%`, which does NOT match the
+    /// request `foo\bar-1.0`. The gem's own row was filtered out before the
+    /// exact Rust re-check could see it and the quick gemspec 404'd.
+    ///
+    /// The other direction is NOT a defect and is pinned here as such: `%` and
+    /// `_` in a stored name only WIDEN the candidate set, and the loop
+    /// re-verifies every row exactly (`name-version == full_name`), so a
+    /// widened match cannot select the wrong gem. The hyphenated-name case the
+    /// helper exists for is the control — `foo-bar-1.0` must still resolve to
+    /// the gem named `foo-bar` and not to the gem named `foo`.
+    #[tokio::test]
+    async fn test_find_local_quick_spec_matches_a_name_containing_a_backslash_3500() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        for (name, version) in [
+            (r"foo\bar", "1.0"),
+            ("foo", "1.0"),
+            ("foo-bar", "1.0"),
+            ("pct%gem", "1.0"),
+        ] {
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &repo,
+                &format!("gems/{name}-{version}.gem"),
+                &format!("gems/{name}-{version}.gem"),
+                name,
+                version,
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"gem"),
+                f.user_id,
+            )
+            .await;
+        }
+
+        let backslash = super::find_local_quick_spec(&f.pool, f.repo_id, r"foo\bar-1.0").await;
+        let hyphenated = super::find_local_quick_spec(&f.pool, f.repo_id, "foo-bar-1.0").await;
+        let plain = super::find_local_quick_spec(&f.pool, f.repo_id, "foo-1.0").await;
+        let percent = super::find_local_quick_spec(&f.pool, f.repo_id, "pct%gem-1.0").await;
+        let absent = super::find_local_quick_spec(&f.pool, f.repo_id, "nosuchgem-9.9").await;
+        f.teardown().await;
+
+        assert_eq!(
+            backslash
+                .expect("lookup must not error")
+                .map(|spec| (spec.name, spec.version)),
+            Some((r"foo\bar".to_string(), "1.0".to_string())),
+            r"a stored gem name containing a backslash must still match its own \
+              quick-gemspec request; without `ESCAPE ''` the pattern \
+              `foo\bar-%` is read as `foobar-%` and the row is filtered out \
+              before the exact check runs"
+        );
+        assert_eq!(
+            hyphenated
+                .expect("lookup must not error")
+                .map(|spec| (spec.name, spec.version)),
+            Some(("foo-bar".to_string(), "1.0".to_string())),
+            "control: the hyphenated-name disambiguation this helper exists \
+             for must still pick `foo-bar` over `foo`"
+        );
+        assert_eq!(
+            plain
+                .expect("lookup must not error")
+                .map(|spec| (spec.name, spec.version)),
+            Some(("foo".to_string(), "1.0".to_string())),
+            "control: an ordinary gem must still resolve"
+        );
+        assert_eq!(
+            percent
+                .expect("lookup must not error")
+                .map(|spec| (spec.name, spec.version)),
+            Some(("pct%gem".to_string(), "1.0".to_string())),
+            "a `%` in a stored name only widens the candidate set, and the \
+             exact Rust re-check still selects this gem"
+        );
+        assert!(
+            absent.expect("lookup must not error").is_none(),
+            "control: a request for a gem that does not exist must stay a miss \
+             — `ESCAPE ''` must not turn the narrowing predicate into a \
+             match-anything"
+        );
+    }
 
     #[tokio::test]
     async fn test_rubygems_download_404_when_missing() {

@@ -824,3 +824,100 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// #3500: SQL-assembled `LIKE` patterns must carry an `ESCAPE` clause.
+//
+// The class is narrow and mechanically recognisable: a predicate that builds
+// its `LIKE` *pattern* inside SQL by concatenating an operand (`LIKE $2 ||
+// '%'`, `LIKE '%' || $2 || '%'`, `$2 LIKE a.name || '-%'`). At those sites the
+// Rust call site shows a plain bind and nothing hints that a pattern is being
+// assembled, which is why four of them survived the #998/#1000 escaping wave
+// and the #3492 audit. A constant pattern (`LIKE 'maven/%'`) is not in the
+// class — escaping applies to the pattern, not to the column being probed.
+//
+// Two clauses are correct, and which one a site needs is decided by where its
+// pattern operand lives:
+//
+// * The operand is a Rust value -> escape it with [`escape_like_literal`] and
+//   match under `ESCAPE '\'`, so `%`, `_` and `\` are all literal. Read paths
+//   want this: over-matching is the defect, not the safe direction.
+// * The operand is a SQL expression the Rust helper cannot reach (a column, a
+//   `substr()` of one) -> `ESCAPE ''`, which disables escape processing so a
+//   backslash stops quoting the character after it. `%`/`_` keep widening the
+//   pattern deliberately; see `maven_flat_attribution::
+//   metadata_rollup_dir_anchor_sql` (#3492/#3493) for why that direction is
+//   the right one on a delete guard.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod like_pattern_escape_class_tests {
+    /// Every `.rs` file under `backend/src`, scanned for the class. Read at
+    /// test time rather than from a hardcoded list so a NEW file carrying a
+    /// new site is covered too — the failure mode a curated list has, and the
+    /// reason the two sites #998/#1000 missed stayed missed.
+    fn assembled_like_sites_without_escape() -> Vec<String> {
+        let mut found = Vec::new();
+        let mut checked = 0usize;
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(current) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (n, line) in src.lines().enumerate() {
+                    // Prose about the class (this module included) is not a
+                    // call site.
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    for (at, _) in line.match_indices("LIKE ") {
+                        let rest = &line[at + "LIKE ".len()..];
+                        // `||` after the operator is the tell that the PATTERN
+                        // is being assembled from something.
+                        if !rest.contains("||") {
+                            continue;
+                        }
+                        checked += 1;
+                        if !rest.contains("ESCAPE") {
+                            found.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 6,
+            "the scan matched only {checked} assembled-pattern sites; it has \
+             stopped recognising the shape and would pass vacuously"
+        );
+        found
+    }
+
+    /// The whole class, in one assertion. A new site that builds its pattern
+    /// in SQL without an `ESCAPE` clause fails here with its own file and line
+    /// rather than as a wrong-rows bug report months later.
+    #[test]
+    fn every_sql_assembled_like_pattern_carries_an_escape_clause() {
+        let offenders = assembled_like_sites_without_escape();
+        assert!(
+            offenders.is_empty(),
+            "a `LIKE` pattern assembled in SQL must carry an `ESCAPE` clause \
+             (#3500). Escape the operand with `escape_like_literal` and match \
+             under `ESCAPE '\\'` when it is a Rust value; use `ESCAPE ''` when \
+             it is a SQL expression the helper cannot reach. Offenders:\n{}",
+            offenders.join("\n")
+        );
+    }
+}
