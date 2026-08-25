@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::api::handlers::escape_like_literal;
 use crate::api::middleware::download_telemetry::DownloadContext;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata, ArtifactVersion};
@@ -1684,7 +1685,19 @@ impl ArtifactService {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<Artifact>> {
-        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        // #3500: `path_prefix` is REQUEST input that becomes a `LIKE` pattern,
+        // so it is escaped here and matched under `ESCAPE '\'`. Unescaped, a
+        // `%` or `_` in the browsed folder acted as a wildcard and the listing
+        // pulled in sibling folders, and a backslash — Postgres's DEFAULT
+        // `LIKE` escape character — quoted the character after it, so browsing
+        // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
+        // repository tree listing, on the artifact-listing API.
+        //
+        // `search_query` below is NOT escaped here: it is a free-text search
+        // term, part of the wider `format!("%{}%", q)` cohort across the admin
+        // and package-search listings, which is tracked separately rather than
+        // swept in a fix for the folder-browse filter.
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
         let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
         let artifacts: Vec<Artifact> = sqlx::query_as(
@@ -1698,7 +1711,7 @@ impl ArtifactService {
             FROM artifacts
             WHERE repository_id = $1
               AND is_deleted = false
-              AND ($2::text IS NULL OR path LIKE $2)
+              AND ($2::text IS NULL OR path LIKE $2 ESCAPE '\')
               AND ($3::text IS NULL OR LOWER(name) LIKE $3 OR LOWER(path) LIKE $3)
               AND ($4::text IS NULL OR path > $4)
             ORDER BY path
@@ -1730,7 +1743,19 @@ impl ArtifactService {
         path_prefix: Option<&str>,
         search_query: Option<&str>,
     ) -> Result<i64> {
-        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        // #3500: `path_prefix` is REQUEST input that becomes a `LIKE` pattern,
+        // so it is escaped here and matched under `ESCAPE '\'`. Unescaped, a
+        // `%` or `_` in the browsed folder acted as a wildcard and the listing
+        // pulled in sibling folders, and a backslash — Postgres's DEFAULT
+        // `LIKE` escape character — quoted the character after it, so browsing
+        // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
+        // repository tree listing, on the artifact-listing API.
+        //
+        // `search_query` below is NOT escaped here: it is a free-text search
+        // term, part of the wider `format!("%{}%", q)` cohort across the admin
+        // and package-search listings, which is tracked separately rather than
+        // swept in a fix for the folder-browse filter.
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
         let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
         let total = sqlx::query_scalar!(
@@ -1739,7 +1764,7 @@ impl ArtifactService {
             FROM artifacts
             WHERE repository_id = $1
               AND is_deleted = false
-              AND ($2::text IS NULL OR path LIKE $2)
+              AND ($2::text IS NULL OR path LIKE $2 ESCAPE '\')
               AND ($3::text IS NULL OR LOWER(name) LIKE $3 OR LOWER(path) LIKE $3)
             "#,
             repository_id,
@@ -1809,7 +1834,19 @@ impl ArtifactService {
             return Ok(Vec::new());
         }
 
-        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        // #3500: `path_prefix` is REQUEST input that becomes a `LIKE` pattern,
+        // so it is escaped here and matched under `ESCAPE '\'`. Unescaped, a
+        // `%` or `_` in the browsed folder acted as a wildcard and the listing
+        // pulled in sibling folders, and a backslash — Postgres's DEFAULT
+        // `LIKE` escape character — quoted the character after it, so browsing
+        // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
+        // repository tree listing, on the artifact-listing API.
+        //
+        // `search_query` below is NOT escaped here: it is a free-text search
+        // term, part of the wider `format!("%{}%", q)` cohort across the admin
+        // and package-search listings, which is tracked separately rather than
+        // swept in a fix for the folder-browse filter.
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
         let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
         // Use DISTINCT ON (path) with priority ordering so that artifacts
@@ -1835,7 +1872,7 @@ impl ArtifactService {
                 FROM artifacts a
                 WHERE a.repository_id = ANY($1)
                   AND a.is_deleted = false
-                  AND ($2::text IS NULL OR a.path LIKE $2)
+                  AND ($2::text IS NULL OR a.path LIKE $2 ESCAPE '\')
                   AND ($5::text IS NULL OR LOWER(a.name) LIKE $5 OR LOWER(a.path) LIKE $5)
                   AND ($6::text IS NULL OR a.path > $6)
                 ORDER BY a.path, repo_priority
@@ -1874,7 +1911,19 @@ impl ArtifactService {
             return Ok(0);
         }
 
-        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        // #3500: `path_prefix` is REQUEST input that becomes a `LIKE` pattern,
+        // so it is escaped here and matched under `ESCAPE '\'`. Unescaped, a
+        // `%` or `_` in the browsed folder acted as a wildcard and the listing
+        // pulled in sibling folders, and a backslash — Postgres's DEFAULT
+        // `LIKE` escape character — quoted the character after it, so browsing
+        // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
+        // repository tree listing, on the artifact-listing API.
+        //
+        // `search_query` below is NOT escaped here: it is a free-text search
+        // term, part of the wider `format!("%{}%", q)` cohort across the admin
+        // and package-search listings, which is tracked separately rather than
+        // swept in a fix for the folder-browse filter.
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
         let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
         let total: i64 = sqlx::query_scalar(
@@ -1885,7 +1934,7 @@ impl ArtifactService {
                 FROM artifacts a
                 WHERE a.repository_id = ANY($1)
                   AND a.is_deleted = false
-                  AND ($2::text IS NULL OR a.path LIKE $2)
+                  AND ($2::text IS NULL OR a.path LIKE $2 ESCAPE '\')
                   AND ($3::text IS NULL OR LOWER(a.name) LIKE $3 OR LOWER(a.path) LIKE $3)
                 ORDER BY a.path, array_position($1::uuid[], a.repository_id)
             ) sub
@@ -1912,10 +1961,16 @@ impl ArtifactService {
     /// members of a virtual repository, matching the virtual listing's
     /// de-duplication contract.
     ///
-    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards (the same
-    /// convention as [`list_page`]'s `path_prefix`); an over-broad match is
-    /// harmless because the grouped caller re-parses each artifact's GAV from
-    /// its path and discards rows outside the requested component keys.
+    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards here, and an
+    /// over-broad match is harmless because the grouped caller re-parses each
+    /// artifact's GAV from its path and discards rows outside the requested
+    /// component keys. These prefixes are DERIVED (the GAV directory of each
+    /// component on the page), never request input.
+    ///
+    /// This is deliberately NOT the convention [`list_page`]'s `path_prefix`
+    /// follows any more: that one is the request's browsed folder, where an
+    /// over-broad match IS the defect (it merges sibling folders into the
+    /// folder view), so #3500 escapes it. Do not re-align the two.
     ///
     /// Uses runtime query binding (`sqlx::query_as`) so no `.sqlx` offline
     /// cache entry is required.
@@ -2623,6 +2678,105 @@ mod tests {
     /// listing handler can surface per-artifact quarantine state. Guards
     /// against a future refactor dropping them from the SELECT (which would
     /// silently report every artifact as unquarantined again).
+    /// #3500. `path_prefix` is the browsed folder from the request and it
+    /// becomes a `LIKE` pattern, so it must be matched literally. Identical to
+    /// the repository tree listing's bug, on the artifact-listing API:
+    ///
+    /// * a backslash is Postgres's DEFAULT `LIKE` escape character, so the
+    ///   pattern `a\b/%` was read as `ab/%` — it hid the requested folder's
+    ///   own contents and returned a DIFFERENT folder's instead;
+    /// * `%` and `_` acted as wildcards, so a folder view could show entries
+    ///   from siblings.
+    ///
+    /// Asserts through `list_page` AND `count`, which are separate queries: a
+    /// fix on one leaves the `?count=exact` total disagreeing with the page.
+    /// The plain folder is the positive control — escaping must not stop
+    /// ordinary browsing from working.
+    #[tokio::test]
+    async fn test_list_page_path_prefix_treats_like_metacharacters_literally_3500() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        for path in [
+            r"a\b/real.bin",    // the requested folder's own entry
+            "ab/collapsed.bin", // what the unescaped pattern returned instead
+            "a%b/pct.bin",
+            "axxxb/wide.bin",
+            "a_b/underscore.bin",
+            "aXb/single.bin",
+            "plain/ok.bin",
+        ] {
+            seed_artifact(&pool, repo_id, path, &format!("generic/{}", Uuid::new_v4())).await;
+        }
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+
+        let listed = |prefix: &'static str| {
+            let service = &service;
+            async move {
+                let mut paths: Vec<String> = service
+                    .list_page(repo_id, Some(prefix), None, None, 0, 50)
+                    .await
+                    .expect("list page")
+                    .into_iter()
+                    .map(|a| a.path)
+                    .collect();
+                paths.sort();
+                let total = service
+                    .count(repo_id, Some(prefix), None)
+                    .await
+                    .expect("count");
+                (paths, total)
+            }
+        };
+
+        let backslash = listed(r"a\b/").await;
+        let percent = listed("a%b/").await;
+        let underscore = listed("a_b/").await;
+        let plain = listed("plain/").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            backslash.0,
+            vec![r"a\b/real.bin".to_string()],
+            r"listing `a\b/` must return only its own entry: a backslash is Postgres's \
+              default LIKE escape character, so the unescaped pattern `a\b/%` was read \
+              as `ab/%` and returned `ab/collapsed.bin` in its place"
+        );
+        assert_eq!(backslash.1, 1, "count must agree with the page");
+        assert_eq!(
+            percent.0,
+            vec!["a%b/pct.bin".to_string()],
+            "listing `a%b/` must return only its own entry; unescaped, the `%` is a \
+             wildcard and `axxxb/`'s contents appear in the folder view"
+        );
+        assert_eq!(percent.1, 1, "count must agree with the page");
+        assert_eq!(
+            underscore.0,
+            vec!["a_b/underscore.bin".to_string()],
+            "listing `a_b/` must return only its own entry; unescaped, `_` matches any \
+             single character and `aXb/`'s contents appear"
+        );
+        assert_eq!(underscore.1, 1, "count must agree with the page");
+        assert_eq!(
+            plain.0,
+            vec!["plain/ok.bin".to_string()],
+            "positive control: an ordinary folder must still list normally, so a fix \
+             that escaped its way into matching nothing fails here"
+        );
+        assert_eq!(plain.1, 1, "count must agree with the page");
+    }
+
     #[tokio::test]
     async fn test_list_page_carries_quarantine_state() {
         use crate::api::handlers::test_db_helpers as tdh;

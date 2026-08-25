@@ -1361,12 +1361,18 @@ mod tests {
     /// request `foo\bar-1.0`. The gem's own row was filtered out before the
     /// exact Rust re-check could see it and the quick gemspec 404'd.
     ///
-    /// The other direction is NOT a defect and is pinned here as such: `%` and
-    /// `_` in a stored name only WIDEN the candidate set, and the loop
-    /// re-verifies every row exactly (`name-version == full_name`), so a
-    /// widened match cannot select the wrong gem. The hyphenated-name case the
-    /// helper exists for is the control — `foo-bar-1.0` must still resolve to
-    /// the gem named `foo-bar` and not to the gem named `foo`.
+    /// The other direction is NOT a defect, and is pinned here by a case that
+    /// can only pass if the claim holds. `%` in the stored name `pct%gem`
+    /// widens its pattern to `pct%gem-%`, which the SQL matches against the
+    /// UNRELATED request `pctZZgem-1.0` — so the candidate set really is
+    /// widened — and the answer must still be `None`, because the loop
+    /// re-verifies every row exactly (`name-version == full_name`). A handler
+    /// that returned the first row the narrowing query produced would answer
+    /// `Some(pct%gem)` there. That is why over-matching is not the defect the
+    /// report describes, and why `ESCAPE ''` is the right clause here.
+    ///
+    /// The hyphenated-name case the helper exists for is the other control:
+    /// `foo-bar-1.0` must resolve to the gem named `foo-bar`, not `foo`.
     #[tokio::test]
     async fn test_find_local_quick_spec_matches_a_name_containing_a_backslash_3500() {
         let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
@@ -1398,6 +1404,9 @@ mod tests {
         let hyphenated = super::find_local_quick_spec(&f.pool, f.repo_id, "foo-bar-1.0").await;
         let plain = super::find_local_quick_spec(&f.pool, f.repo_id, "foo-1.0").await;
         let percent = super::find_local_quick_spec(&f.pool, f.repo_id, "pct%gem-1.0").await;
+        // The widened pattern `pct%gem-%` MATCHES this request in SQL; only
+        // the exact Rust re-check rejects it.
+        let widened = super::find_local_quick_spec(&f.pool, f.repo_id, "pctZZgem-1.0").await;
         let absent = super::find_local_quick_spec(&f.pool, f.repo_id, "nosuchgem-9.9").await;
         f.teardown().await;
 
@@ -1433,6 +1442,14 @@ mod tests {
             Some(("pct%gem".to_string(), "1.0".to_string())),
             "a `%` in a stored name only widens the candidate set, and the \
              exact Rust re-check still selects this gem"
+        );
+        assert!(
+            widened.expect("lookup must not error").is_none(),
+            "`%` in the stored name `pct%gem` widens its pattern to `pct%gem-%`, which \
+             the narrowing query matches against `pctZZgem-1.0`. The exact re-check in \
+             Rust must still reject it — this is what makes the report's \
+             over-matching claim a non-defect, and a handler that served the first \
+             candidate row would answer Some(pct%gem) here"
         );
         assert!(
             absent.expect("lookup must not error").is_none(),

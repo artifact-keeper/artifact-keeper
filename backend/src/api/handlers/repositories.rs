@@ -7039,6 +7039,10 @@ const DOCKER_TAG_ROWS_WHERE_SQL: &str = r#"WHERE t.repository_id = $1
 /// typing it. Both arms of the listing (the page and the `?count=exact`
 /// total) build the filter from this one fragment so they cannot drift and
 /// report a count that disagrees with the rows.
+///
+/// The operand is bound by the callers, not here, so the #3500 class gate is
+/// pointed at them explicitly and checks each one for the escaper:
+/// LIKE-OPERAND-ESCAPED-BY-CALLER: fetch_docker_tag_rows, count_docker_tag_rows
 fn docker_tag_search_sql(param: usize) -> String {
     format!(" AND LOWER(t.tag) LIKE '%' || LOWER(${param}) || '%' ESCAPE '\\'")
 }
