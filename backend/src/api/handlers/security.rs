@@ -2044,46 +2044,37 @@ fn rescan_inconclusive_response(
     retry_after: Option<std::time::Duration>,
 ) -> axum::response::Response {
     use crate::api::handlers::proxy_helpers::ProxyScanInconclusive;
+    use crate::api::openapi::ErrorResponse;
     use axum::response::IntoResponse;
 
-    let mut resp = match reason {
-        ProxyScanInconclusive::NoScanner => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "NO_SCANNER_CONFIGURED",
-                "message": "No vulnerability scanner is configured for this instance; \
-                             an operator must configure one before a rescan can run.",
-            })),
-        )
-            .into_response(),
+    let error = match reason {
+        ProxyScanInconclusive::NoScanner => ErrorResponse {
+            code: "NO_SCANNER_CONFIGURED".to_string(),
+            message: "No vulnerability scanner is configured for this instance; \
+                      an operator must configure one before a rescan can run."
+                .to_string(),
+        },
         // The scan error itself is deliberately not echoed here, for the same
         // reason the storage error above is redacted: it can name scanner
         // internals the caller can act on none of. The warn! logged inside
         // proxy_scan_and_record carries the detail for triage.
-        ProxyScanInconclusive::ScanFailed => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "RESCAN_SCAN_FAILED",
-                "message": "The scan failed. The stored verdict is unchanged.",
-            })),
-        )
-            .into_response(),
+        ProxyScanInconclusive::ScanFailed => ErrorResponse {
+            code: "RESCAN_SCAN_FAILED".to_string(),
+            message: "The scan failed. The stored verdict is unchanged.".to_string(),
+        },
         ProxyScanInconclusive::BudgetExceeded => {
             let secs = crate::services::scanner_service::PROXY_RESCAN_BUDGET.as_secs();
-            (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "RESCAN_BUDGET_EXCEEDED",
-                    "message": format!(
-                        "The scan did not finish inside the {secs}s rescan budget. \
-                         The stored verdict is unchanged; a retry may succeed once \
-                         the scanner's startup cost has already been paid."
-                    ),
-                })),
-            )
-                .into_response()
+            ErrorResponse {
+                code: "RESCAN_BUDGET_EXCEEDED".to_string(),
+                message: format!(
+                    "The scan did not finish inside the {secs}s rescan budget. \
+                     The stored verdict is unchanged; a retry may succeed once \
+                     the scanner's startup cost has already been paid."
+                ),
+            }
         }
     };
+    let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
 
     if let Some(remaining) = retry_after {
         let secs = remaining.as_secs().max(1);
@@ -2141,8 +2132,9 @@ pub struct ProxyRescanResponse {
         (status = 503, description = "Rescan could not produce a verdict: \
             `NO_SCANNER_CONFIGURED` (no scanner is configured for this instance), \
             `RESCAN_SCAN_FAILED` (the scan ran and errored), or \
-            `RESCAN_BUDGET_EXCEEDED` (the scan did not finish inside its budget, \
-            `Retry-After` set). The stored verdict is unchanged in every case."),
+            `RESCAN_BUDGET_EXCEEDED` (the scan did not finish inside its budget). \
+            `Retry-After` is set only when cooldown time actually remains. \
+            The stored verdict is unchanged in every case.", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2186,10 +2178,6 @@ async fn rescan_proxy_cached_path(
         )));
     }
 
-    if let Err(remaining) = claim_rescan_slot(repo.id) {
-        return Ok(rescan_throttled_response(remaining));
-    }
-
     // The storage error text is deliberately not echoed: it names storage keys
     // and backend internals, and the caller can act on none of it.
     let bytes = state.storage.get(&entry.storage_key).await.map_err(|e| {
@@ -2212,6 +2200,15 @@ async fn rescan_proxy_cached_path(
         bytes.len() as i64,
         entry.content_type.as_deref(),
     );
+
+    // Claim only after every pre-scan operation has succeeded. A missing object
+    // or storage read failure must retain its canonical 404 without consuming
+    // this repository's 120s scanner budget; no scanner has run yet. Keeping
+    // this immediately before dispatch still prevents concurrent scans once
+    // the request reaches the expensive scanner work.
+    if let Err(remaining) = claim_rescan_slot(repo.id) {
+        return Ok(rescan_throttled_response(remaining));
+    }
 
     // Identity is deliberately NOT asserted here. The inline gate can name the
     // coordinate a client asked for; a rescan of stored bytes cannot, and
@@ -2883,7 +2880,11 @@ mod tests {
             "no scanner configured is not a transient condition a bare retry fixes"
         );
         let json = json_body(resp).await;
-        assert_eq!(json["error"], serde_json::json!("NO_SCANNER_CONFIGURED"));
+        assert_eq!(json["code"], serde_json::json!("NO_SCANNER_CONFIGURED"));
+        assert!(
+            json.get("error").is_none(),
+            "the standard error schema uses `code`, not an undocumented `error` field: {json}"
+        );
         assert!(json["message"]
             .as_str()
             .expect("message string")
@@ -2917,7 +2918,8 @@ mod tests {
              not a hardcoded constant"
         );
         let json = json_body(resp).await;
-        assert_eq!(json["error"], serde_json::json!("RESCAN_SCAN_FAILED"));
+        assert_eq!(json["code"], serde_json::json!("RESCAN_SCAN_FAILED"));
+        assert!(json.get("error").is_none());
         let message = json["message"].as_str().expect("message string");
         assert!(
             !message.to_lowercase().contains("grype") && !message.contains("simulated"),
@@ -2947,7 +2949,8 @@ mod tests {
         );
         let secs = crate::services::scanner_service::PROXY_RESCAN_BUDGET.as_secs();
         let json = json_body(resp).await;
-        assert_eq!(json["error"], serde_json::json!("RESCAN_BUDGET_EXCEEDED"));
+        assert_eq!(json["code"], serde_json::json!("RESCAN_BUDGET_EXCEEDED"));
+        assert!(json.get("error").is_none());
         assert!(
             json["message"]
                 .as_str()
@@ -3021,10 +3024,84 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
         let json = json_body(resp).await;
         assert_eq!(
-            json["error"],
+            json["code"],
             serde_json::json!("NO_SCANNER_CONFIGURED"),
             "must name the specific cause, not a generic inconclusive message"
         );
+
+        fx.cleanup(&[digest]).await;
+    }
+
+    /// An unreadable cached object is a pre-scan failure: it returns the
+    /// canonical 404 and must not spend this repository's rescan slot. This is
+    /// deliberately endpoint-level because a pure claim/release test cannot
+    /// prove the handler keeps the storage read ahead of the claim.
+    ///
+    /// `try_pool` preserves the DB-free local no-op convention. This test also
+    /// refuses to skip under any CI environment, so a staging job that forgot
+    /// `AK_TESTS_REQUIRE_DB=1` still fails loudly instead of fiction-greening
+    /// this endpoint regression. The normal CI configuration sets that flag
+    /// too, so either guard makes a missing database a hard failure.
+    #[tokio::test]
+    async fn rescan_missing_storage_object_does_not_consume_the_repository_slot() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => panic!(
+                "this CI regression requires Postgres; refusing to skip the \
+                 missing-storage rescan-slot assertion"
+            ),
+            None => return,
+        };
+        let fx = ProxyScanFixture::new(pool.clone()).await;
+        let digest = unique_digest();
+        let path = "simple/x/x-1.0.whl";
+        seed_cached_path(&pool, fx.repo_id, path, Some(&digest), chrono::Utc::now()).await;
+
+        let auth = crate::api::handlers::test_db_helpers::make_auth(fx.user_id, &fx.username);
+        let request = || ProxyRescanRequest {
+            path: path.to_string(),
+        };
+
+        let first = rescan_proxy_cached_path(
+            State(fx.state()),
+            Extension(Some(auth.clone())),
+            Path(fx.key.clone()),
+            Json(request()),
+        )
+        .await;
+        assert!(
+            matches!(&first, Err(AppError::NotFound(message)) if message.as_str() == PROXY_PATH_NOT_FOUND_MSG),
+            "a missing backing object must remain the canonical 404, got {first:?}"
+        );
+
+        // Make the same catalog entry readable, then immediately request the
+        // same rescan. If the first 404 claimed before reading storage, this
+        // response is 429; with the claim at the last safe pre-dispatch point
+        // it reaches the no-scanner arm instead.
+        fx.state()
+            .storage
+            .put(
+                &format!("proxy-cache/{}/{}/__content__", fx.repo_id, path),
+                bytes::Bytes::from_static(b"stub cached bytes"),
+            )
+            .await
+            .expect("seed cached bytes in storage for the retry");
+        let second = rescan_proxy_cached_path(
+            State(fx.state()),
+            Extension(Some(auth)),
+            Path(fx.key.clone()),
+            Json(request()),
+        )
+        .await
+        .expect("the immediate retry must not be throttled");
+        assert_eq!(
+            second.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "the retry must reach scanner dispatch (no scanner), not receive 429"
+        );
+        let json = json_body(second).await;
+        assert_eq!(json["code"], serde_json::json!("NO_SCANNER_CONFIGURED"));
 
         fx.cleanup(&[digest]).await;
     }

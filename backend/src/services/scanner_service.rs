@@ -1258,11 +1258,13 @@ impl ScanWorkspace {
         // recursive delete actually succeeds; otherwise it fails with EACCES and
         // silently leaves the (often multi-GiB) tree on the PVC until it fills.
         let workspace_str = workspace.to_string_lossy().to_string();
-        if let Err(e) = tokio::process::Command::new("chmod")
-            .args(["-R", "u+rwX", &workspace_str])
-            .output()
-            .await
-        {
+        let mut chmod = tokio::process::Command::new("chmod");
+        // Cleanup itself remains inside the scanner future that an outer
+        // wall-clock timeout can drop. `Command` otherwise leaves chmod
+        // running against the workspace after that cancellation, so make this
+        // child cancellation-owned just like the scanner subprocesses (#3455).
+        chmod.kill_on_drop(true);
+        if let Err(e) = chmod.args(["-R", "u+rwX", &workspace_str]).output().await {
             warn!(
                 "Failed to pre-chmod scan workspace {} before cleanup: {}",
                 workspace.display(),
@@ -6798,6 +6800,43 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    /// Extract the cancellation-owned `chmod` invocation from
+    /// [`ScanWorkspace::cleanup_path`]. A source-shape pin is intentionally
+    /// cheap: exercising a dropped future while a recursive chmod races real
+    /// filesystem cleanup is not deterministic enough to be a useful runtime
+    /// regression.
+    fn cleanup_chmod_body() -> &'static str {
+        let src = include_str!("scanner_service.rs");
+        let marker = "pub async fn cleanup_path(workspace: &Path) {";
+        let start = src
+            .find(marker)
+            .expect("ScanWorkspace::cleanup_path must exist");
+        let rest = &src[start + marker.len()..];
+        &rest[..rest
+            .find("\n    }\n")
+            .expect("ScanWorkspace::cleanup_path must close")]
+    }
+
+    /// `chmod` runs inside the same timeout-owned scanner future as the
+    /// scanner processes. Pin its explicit command configuration so a future
+    /// cleanup refactor cannot reintroduce an orphaned child (#3455).
+    #[test]
+    fn cleanup_chmod_is_killed_when_the_scanner_future_is_dropped() {
+        let body = cleanup_chmod_body();
+        assert!(
+            body.contains("let mut chmod = tokio::process::Command::new(\"chmod\");"),
+            "cleanup must retain a distinct chmod Command so its cancellation ownership is explicit: {body}"
+        );
+        assert!(
+            body.contains("chmod.kill_on_drop(true);"),
+            "a timeout dropping cleanup must kill chmod rather than orphan it: {body}"
+        );
+        assert!(
+            body.contains(".args([\"-R\", \"u+rwX\", &workspace_str])"),
+            "the chmod pin must cover the recursive workspace cleanup command: {body}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // post_scan_status_decision (pure post-scan quarantine decision)
