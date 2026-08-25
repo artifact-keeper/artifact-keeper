@@ -484,13 +484,30 @@ mod tests {
         /// a decade); anything above a year is not the 300s mutable default.
         const IMMUTABLE_FLOOR_SECS: i64 = 365 * 24 * 3600;
         const RELEASE: &str = "org/example/1.0/jars/example-1.0.jar";
+        /// Maven-shaped SNAPSHOT: the filename repeats the version. This is
+        /// the shape this module's own doc comment describes
+        /// (`jars/{name}-{version}.jar`).
         const SNAPSHOT: &str = "org/example/1.1-SNAPSHOT/jars/example-1.1-SNAPSHOT.jar";
+        /// IVY-NATIVE SNAPSHOT: `Resolver.ivyStylePatterns` keeps the revision
+        /// in the DIRECTORY only, so the leaf carries no `-SNAPSHOT` token.
+        /// The route is a wildcard `*path`, so this shape reaches the same arm
+        /// and is equally valid. Before the component-wise SNAPSHOT rule this
+        /// classified as a released coordinate and was cached for a decade —
+        /// and `cache_classifier::evaluate` short-circuits Immutable to Fresh
+        /// without consulting `expires_at`, so a republished snapshot was
+        /// never re-fetched.
+        const IVY_SNAPSHOT: &str = "org.example/mylib/1.0.0-SNAPSHOT/jars/mylib.jar";
+        /// A RESOLVED unique snapshot names exactly one deployment and must
+        /// STAY immutable, in the Ivy layout too. Without this row, "make
+        /// everything under a -SNAPSHOT directory mutable" would pass.
+        const IVY_RESOLVED: &str =
+            "org.example/mylib/1.0.0-SNAPSHOT/jars/mylib-20240101.120000-7.jar";
 
         let Some(fx) = tdh::Fixture::setup("remote", "sbt").await else {
             return;
         };
         let server = MockServer::start().await;
-        for p in [RELEASE, SNAPSHOT] {
+        for p in [RELEASE, SNAPSHOT, IVY_SNAPSHOT, IVY_RESOLVED] {
             Mock::given(method("GET"))
                 .and(path(format!("/{p}")))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sbt-3459-body".to_vec()))
@@ -499,7 +516,7 @@ mod tests {
         }
 
         let (state, cache_dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
-        for p in [RELEASE, SNAPSHOT] {
+        for p in [RELEASE, SNAPSHOT, IVY_SNAPSHOT, IVY_RESOLVED] {
             let app = tdh::router_anon(super::router(), state.clone());
             let (status, _body) =
                 tdh::send(app, tdh::get(format!("/{key}/{p}", key = fx.repo_key))).await;
@@ -530,7 +547,7 @@ mod tests {
                     .expect("rfc3339");
             (expires_at - cached_at).num_seconds()
         };
-        for p in [RELEASE, SNAPSHOT] {
+        for p in [RELEASE, SNAPSHOT, IVY_SNAPSHOT, IVY_RESOLVED] {
             for _ in 0..100 {
                 if sidecar(p).exists() {
                     break;
@@ -540,16 +557,38 @@ mod tests {
         }
         let release_ttl = ttl(RELEASE);
         let snapshot_ttl = ttl(SNAPSHOT);
+        let ivy_snapshot_ttl = ttl(IVY_SNAPSHOT);
+        let ivy_resolved_ttl = ttl(IVY_RESOLVED);
         fx.teardown().await;
 
+        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
         assert!(
             release_ttl >= IMMUTABLE_FLOOR_SECS,
-            "a released sbt coordinate must be cached immutably; got {release_ttl}s —              {mutable}s is the #3459 symptom (a `Generic` stand-in repository              reaching the cache-TTL classifier)",
-            mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+            "a released sbt coordinate must be cached immutably; got {release_ttl}s. \
+             {mutable}s is the #3459 symptom: a `Generic` stand-in repository reaching \
+             the cache-TTL classifier."
         );
         assert!(
-            snapshot_ttl <= crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
-            "a SNAPSHOT coordinate is republished in place and must stay mutable;              got {snapshot_ttl}s — this negative control is what keeps the              immutable assertion from passing under a 'cache everything forever' change"
+            snapshot_ttl <= mutable,
+            "a Maven-shaped SNAPSHOT is republished in place and must stay mutable; \
+             got {snapshot_ttl}s. This negative control is what keeps the immutable \
+             assertion from passing under a 'cache everything forever' change."
+        );
+        assert!(
+            ivy_snapshot_ttl <= mutable,
+            "an IVY-LAYOUT snapshot keeps its revision in the DIRECTORY only, so its \
+             leaf carries no `-SNAPSHOT` token; got {ivy_snapshot_ttl}s. A leaf-only \
+             SNAPSHOT test reads it as a released coordinate and caches it for a \
+             decade, and `cache_classifier::evaluate` short-circuits Immutable to \
+             Fresh without consulting `expires_at`, so a republished snapshot is \
+             never re-fetched."
+        );
+        assert!(
+            ivy_resolved_ttl >= IMMUTABLE_FLOOR_SECS,
+            "a RESOLVED unique snapshot names exactly one deployment and must stay \
+             immutable in the Ivy layout too; got {ivy_resolved_ttl}s. Without this \
+             row, 'make everything under a -SNAPSHOT directory mutable' passes and \
+             Maven's unique-snapshot behaviour is silently destroyed."
         );
     }
 

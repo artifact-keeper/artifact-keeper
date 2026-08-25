@@ -957,11 +957,21 @@ pub async fn proxy_fetch_streaming(
 /// Identical in every respect except that the synthesized [`Repository`]
 /// carries the caller's REAL format instead of the `Generic` stand-in
 /// [`build_remote_repo`] produces, so `cache_classifier::classify` can reach
-/// its per-format arm. A handler serving a format whose classifier marks
-/// version-pinned coordinates immutable (Maven/Gradle/Sbt jars and poms and
-/// their checksum sidecars, RPM packages, Debian `pool/` ...) must use this;
-/// with `Generic` every one of those paths falls to the conservative
-/// 5-minute mutable TTL and is re-fetched from upstream on the next request.
+/// its per-format arm. With `Generic` there is no arm, so a coordinate the
+/// format considers immutable falls to the conservative 5-minute mutable TTL
+/// and is re-fetched from upstream on the next request.
+///
+/// **Scope.** #3459 moved the Maven/Gradle and sbt artifact arms here. It did
+/// NOT sweep the rest of the class, and this helper does not by itself make
+/// that possible: `proxy_fetch_streaming_with_disposition` and
+/// `proxy_fetch_capped` have no format-carrying sibling, so the RPM
+/// (`rpm.rs`), conda (`conda.rs`) and OCI inline-scan (`oci_v2.rs`) arms that
+/// call them still synthesize `Generic` and still cache immutable content for
+/// five minutes. Those are real instances of this bug, tracked separately;
+/// they are not fixed here because flipping a path from mutable to immutable
+/// serves stale content forever if the classification is wrong for that
+/// handler's cache-path shape, which needs per-site reading. See #3556 before
+/// adding a sibling and sweeping them.
 ///
 /// Same class as #2312/#3206, which fixed it for the OCI blob/manifest arms.
 pub async fn proxy_fetch_streaming_with_format(
@@ -15978,6 +15988,7 @@ mod proxy_download_recording_tests {
     const SERVE_PRIMITIVES: &[&str] = &[
         "proxy_fetch_streaming(",
         "proxy_fetch_streaming_with_disposition(",
+        "proxy_fetch_streaming_with_format(",
         "proxy_fetch_streaming_with_cache_key(",
         "proxy_fetch_streaming_with_cache_key_verified(",
         "proxy_fetch_streaming_response_with_cache_key(",
@@ -16158,6 +16169,14 @@ mod proxy_download_recording_tests {
         // span heuristic, or the top-level-`fn` parser stops seeing the code it
         // is supposed to police. Without this a gate that matched NOTHING would
         // report the same green as a gate that matched everything.
+        //
+        // The floor is deliberately slack, so it is NOT what catches a handler
+        // silently dropping out: #3459 moved maven.rs and sbt.rs onto
+        // `proxy_fetch_streaming_with_format`, the count fell 33 -> 31, and
+        // this assertion stayed green while the gate had stopped watching
+        // either file. That is what
+        // `the_recording_gate_actually_scans_live_serve_sites` now pins
+        // per-handler.
         assert!(
             scanned >= 25,
             "#3446: the recording gate only reached {scanned} proxy serve sites, which \
@@ -16188,6 +16207,35 @@ mod proxy_download_recording_tests {
             cargo.1.contains("record_proxy_download("),
             "#3446: cargo's proxied crate download must record"
         );
+
+        // Per-handler pins for the serve sites a rename can silently drop.
+        // The coverage floor below is slack by design (25 against 33), so it
+        // does NOT catch two handlers falling out — which is exactly what
+        // happened when #3459 moved these two onto the format-carrying
+        // streaming sibling and SERVE_PRIMITIVES was not updated with it:
+        // maven.rs and sbt.rs each went 1 scanned site -> 0, the total went
+        // 33 -> 31, and the gate stayed green while no longer policing
+        // maven's `record_proxy_download` (#3265) or sbt's deferral marker.
+        for (format, primitive) in [
+            ("maven.rs", "proxy_fetch_streaming_with_format("),
+            ("sbt.rs", "proxy_fetch_streaming_with_format("),
+        ] {
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(n, _)| *n == format)
+                .unwrap_or_else(|| panic!("{format} is scanned"));
+            assert!(
+                src.contains(primitive),
+                "#3446: {format}'s Remote download arm must still call `{primitive}`"
+            );
+            assert!(
+                SERVE_PRIMITIVES.contains(&primitive),
+                "#3446: `{primitive}` is a live serve primitive in {format} but is \
+                 not in SERVE_PRIMITIVES, so the recording gate no longer sees that \
+                 handler at all"
+            );
+        }
+
         for format in [
             "debian.rs",
             "goproxy.rs",
