@@ -110,6 +110,20 @@ pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
 /// pending, fail-closed 423) — never an unscanned serve.
 pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
 
+/// Wall-clock budget for the on-demand proxy-cache rescan endpoint (#3455).
+///
+/// [`PROXY_SCAN_INLINE_BUDGET`] exists to bound the latency a scan adds to a
+/// client's `pip install` (#2954) -- a request with a real client waiting on
+/// the other end. A rescan has no such client: it is an explicit,
+/// authenticated, write-gated, per-repository-throttled operator action
+/// (`POST .../security/proxy-scans/rescan`) whose only waiting party is the
+/// operator who asked for it. Reusing the 30s file budget there means an
+/// instance whose grype cold-start alone costs ~30s can NEVER complete a
+/// rescan. 120s matches [`OCI_PROXY_SCAN_INLINE_BUDGET`], the in-tree
+/// precedent for a context that can legitimately take longer than the file
+/// gate's 30s.
+pub const PROXY_RESCAN_BUDGET: Duration = Duration::from_secs(120);
+
 /// Below this size we keep the scan input in heap (`Bytes`) and skip the
 /// tempfile + mmap machinery entirely. The mmap path exists to keep
 /// multi-GiB artifacts off anon heap so the cgroup OOM killer leaves the
@@ -6662,12 +6676,19 @@ pub(crate) mod test_helpers {
     }
 
     /// Outcome of the mock CVE engine when a proxy serve path re-scans.
-    /// Shared by the #2976 verdict-freshness handler tests (PyPI, npm).
+    /// Shared by the #2976 verdict-freshness handler tests (PyPI, npm) and the
+    /// #3455 inline-gate / rescan-budget regression tests.
+    #[derive(Clone, Copy)]
     pub enum MockCveRescan {
         /// Re-scan against the bumped CVE-DB now flags the bytes.
         Vulnerable,
         /// Re-scan is inconclusive (scanner hard-error).
         Error,
+        /// Re-scan never finishes inside the caller's `tokio::time::timeout`
+        /// budget: sleeps for the given duration (longer than the budget
+        /// under test) before completing. Proves the BudgetExceeded arm
+        /// end-to-end (#3455) without a real grype subprocess.
+        Hang(std::time::Duration),
     }
 
     /// CVE-authoritative mock scanner reporting a fixed live version string.
@@ -6704,6 +6725,10 @@ pub(crate) mod test_helpers {
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
                 )),
+                MockCveRescan::Hang(d) => {
+                    tokio::time::sleep(d).await;
+                    Ok(crate::services::scanner_service::ScanOutput::default())
+                }
                 MockCveRescan::Vulnerable => {
                     Ok(crate::services::scanner_service::ScanOutput::findings_only(
                         vec![crate::models::security::RawFinding {

@@ -1884,7 +1884,20 @@ async fn get_repo_proxy_scans(
 /// service to do. The throttle is per repository rather than per path because
 /// the cost being bounded is scanner work, and a caller cycling through 10 000
 /// distinct cached paths would defeat a per-path limit entirely.
-const PROXY_RESCAN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+///
+/// Matches [`PROXY_RESCAN_BUDGET`](crate::services::scanner_service::PROXY_RESCAN_BUDGET)
+/// (#3455): the slot is claimed at scan START, not release, so a cooldown
+/// shorter than the budget would let a second, third, fourth... rescan queue
+/// up against the same repository while the first is still running -- up to
+/// `budget / cooldown` of them stacked on the box this fix targets.
+const PROXY_RESCAN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(120);
+
+// The cooldown must be at least the budget, for the reason above. Enforced at
+// compile time so the two knobs cannot drift independently.
+const _: () = assert!(
+    PROXY_RESCAN_COOLDOWN.as_secs()
+        >= crate::services::scanner_service::PROXY_RESCAN_BUDGET.as_secs()
+);
 
 /// Last rescan per repository, for [`PROXY_RESCAN_COOLDOWN`].
 ///
@@ -1961,6 +1974,58 @@ fn rescan_throttled_response(remaining: std::time::Duration) -> axum::response::
         .into_response()
 }
 
+/// 503 for a rescan that could not produce a verdict, discriminated by cause
+/// (#3455). `NO_SCANNER_CONFIGURED`, `RESCAN_SCAN_FAILED` and
+/// `RESCAN_BUDGET_EXCEEDED` each point the operator at a different remedy, so
+/// the response body -- not just the shared 503 status -- must say which one
+/// fired.
+fn rescan_inconclusive_response(
+    reason: crate::api::handlers::proxy_helpers::ProxyScanInconclusive,
+) -> axum::response::Response {
+    use crate::api::handlers::proxy_helpers::ProxyScanInconclusive;
+    use axum::response::IntoResponse;
+
+    match reason {
+        ProxyScanInconclusive::NoScanner => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "NO_SCANNER_CONFIGURED",
+                "message": "No vulnerability scanner is configured for this instance; \
+                             an operator must configure one before a rescan can run.",
+            })),
+        )
+            .into_response(),
+        // The scan error itself is deliberately not echoed here, for the same
+        // reason the storage error above is redacted: it can name scanner
+        // internals the caller can act on none of. The warn! logged inside
+        // proxy_scan_and_record carries the detail for triage.
+        ProxyScanInconclusive::ScanFailed => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "RESCAN_SCAN_FAILED",
+                "message": "The scan failed. The stored verdict is unchanged.",
+            })),
+        )
+            .into_response(),
+        ProxyScanInconclusive::BudgetExceeded => {
+            let secs = crate::services::scanner_service::PROXY_RESCAN_BUDGET.as_secs();
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, secs.to_string())],
+                Json(serde_json::json!({
+                    "error": "RESCAN_BUDGET_EXCEEDED",
+                    "message": format!(
+                        "The scan did not finish inside the {secs}s rescan budget. \
+                         The stored verdict is unchanged; a retry may succeed once \
+                         the scanner's startup cost has already been paid."
+                    ),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ProxyRescanRequest {
     /// Cache path within this repository, e.g.
@@ -2004,7 +2069,11 @@ pub struct ProxyRescanResponse {
         (status = 404, description = "Repository or path not found", body = crate::api::openapi::ErrorResponse),
         (status = 422, description = "Cached object is above the inline scan cap", body = crate::api::openapi::ErrorResponse),
         (status = 429, description = "Rescan cooldown in effect"),
-        (status = 503, description = "No scanner configured, or the scan was inconclusive"),
+        (status = 503, description = "Rescan could not produce a verdict: \
+            `NO_SCANNER_CONFIGURED` (no scanner is configured for this instance), \
+            `RESCAN_SCAN_FAILED` (the scan ran and errored), or \
+            `RESCAN_BUDGET_EXCEEDED` (the scan did not finish inside its budget, \
+            `Retry-After` set). The stored verdict is unchanged in every case."),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2080,7 +2149,11 @@ async fn rescan_proxy_cached_path(
     // inventing one would let a rescan record a `clean` verdict against an
     // identity the engine never graded (#3003). Passing `None` runs the same
     // code without the expected-component assertion.
-    let verdict = crate::api::handlers::proxy_helpers::proxy_scan_and_record(
+    // Rescan-specific budget (#3455): this request's only waiting party is
+    // the operator who asked for it, not a client `pip install`, so it gets
+    // the wider PROXY_RESCAN_BUDGET rather than the inline gate's 30s file
+    // budget -- see that const's doc comment for the full rationale.
+    let verdict = match crate::api::handlers::proxy_helpers::proxy_scan_and_record(
         &state,
         repo.id,
         &digest,
@@ -2088,15 +2161,13 @@ async fn rescan_proxy_cached_path(
         &bytes,
         None,
         &crate::api::handlers::proxy_helpers::ProxyScanMode::File,
+        crate::services::scanner_service::PROXY_RESCAN_BUDGET,
     )
     .await
-    .ok_or_else(|| {
-        AppError::ServiceUnavailable(
-            "Rescan was inconclusive: no scanner is configured, or the scan failed or \
-             exceeded its budget. The stored verdict is unchanged."
-                .to_string(),
-        )
-    })?;
+    {
+        Ok(verdict) => verdict,
+        Err(reason) => return Ok(rescan_inconclusive_response(reason)),
+    };
 
     let mut findings = verdict.findings.clone();
     findings.truncate(MAX_PROXY_FINDINGS as usize);
@@ -2700,7 +2771,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Rescan inconclusive-cause discrimination (#3455) -- RED probe
+    // Rescan inconclusive-cause discrimination (#3455) -- pure response shape
     // -----------------------------------------------------------------------
 
     // streaming-invariant: test-only body read, not an artifact path (#1608)
@@ -2710,6 +2781,68 @@ mod tests {
             .await
             .expect("read body");
         serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    /// `NoScanner` -> 503 `NO_SCANNER_CONFIGURED`, no `Retry-After`: no wait
+    /// fixes this, only an operator configuring a scanner does.
+    #[tokio::test]
+    async fn rescan_inconclusive_no_scanner_is_503_with_distinct_code() {
+        use crate::api::handlers::proxy_helpers::ProxyScanInconclusive;
+        let resp = rescan_inconclusive_response(ProxyScanInconclusive::NoScanner);
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "no scanner configured is not a transient condition a bare retry fixes"
+        );
+        let json = json_body(resp).await;
+        assert_eq!(json["error"], serde_json::json!("NO_SCANNER_CONFIGURED"));
+        assert!(json["message"]
+            .as_str()
+            .expect("message string")
+            .to_lowercase()
+            .contains("scanner"));
+    }
+
+    /// `ScanFailed` -> 503 `RESCAN_SCAN_FAILED`, message stays GENERIC: the
+    /// scan error is not echoed into the response, matching the storage-error
+    /// redaction a few lines above this handler in the source.
+    #[tokio::test]
+    async fn rescan_inconclusive_scan_failed_is_503_with_generic_message() {
+        use crate::api::handlers::proxy_helpers::ProxyScanInconclusive;
+        let resp = rescan_inconclusive_response(ProxyScanInconclusive::ScanFailed);
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let json = json_body(resp).await;
+        assert_eq!(json["error"], serde_json::json!("RESCAN_SCAN_FAILED"));
+        let message = json["message"].as_str().expect("message string");
+        assert!(
+            !message.to_lowercase().contains("grype") && !message.contains("simulated"),
+            "the scan error must not be echoed into the response body: {message}"
+        );
+    }
+
+    /// `BudgetExceeded` -> 503 `RESCAN_BUDGET_EXCEEDED`, WITH `Retry-After`:
+    /// unlike the other two arms, a warm retry may succeed once the
+    /// scanner's startup cost has already been paid.
+    #[tokio::test]
+    async fn rescan_inconclusive_budget_exceeded_is_503_with_retry_after() {
+        use crate::api::handlers::proxy_helpers::ProxyScanInconclusive;
+        let resp = rescan_inconclusive_response(ProxyScanInconclusive::BudgetExceeded);
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let secs = crate::services::scanner_service::PROXY_RESCAN_BUDGET.as_secs();
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some(secs.to_string().as_str())
+        );
+        let json = json_body(resp).await;
+        assert_eq!(json["error"], serde_json::json!("RESCAN_BUDGET_EXCEEDED"));
+        assert!(json["message"]
+            .as_str()
+            .expect("message string")
+            .contains(&secs.to_string()));
     }
 
     /// DB-backed regression proving the actual endpoint discriminates, not
