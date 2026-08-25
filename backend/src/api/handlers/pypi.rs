@@ -486,6 +486,7 @@ async fn fetch_remote_simple_root(
         &effective_upstream,
         &upstream_path,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Pypi,
     )
     .await
     {
@@ -849,6 +850,7 @@ async fn simple_project(
                         &effective_upstream,
                         &upstream_path,
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                        RepositoryFormat::Pypi,
                     )
                     .await?
                 };
@@ -1148,6 +1150,7 @@ async fn simple_project(
                         &effective_upstream,
                         &upstream_path,
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                        RepositoryFormat::Pypi,
                     )
                     .await
                 };

@@ -935,6 +935,7 @@ async fn resolve_maven_sha1_sidecar(
         upstream_url,
         &format!("{}.sha1", path),
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        RepositoryFormat::Maven,
     )
     .await
     .ok()?;
@@ -1239,6 +1240,15 @@ async fn download(
                         upstream_url,
                         &path,
                         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        // #3459: a `.sha1`/`.md5`/`.sha256`/`.sha512` sidecar of
+                        // a RELEASED coordinate is as immutable as the file it
+                        // describes. Without the format the classifier sees
+                        // `Generic`, has no arm for it, and stamps the
+                        // conservative 5-minute mutable TTL — so a Maven build
+                        // went back upstream for every checksum it verified.
+                        // `Maven` is also correct for a `gradle` repository:
+                        // both share `cache_classifier::classify_maven`.
+                        RepositoryFormat::Maven,
                     )
                     .await?;
                 return Ok(Response::builder()
@@ -1280,6 +1290,11 @@ async fn download(
                                 upstream_url,
                                 &path,
                                 proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                                // #3459: the member's OWN format, so a released
+                                // coordinate's `.sha1`/`.md5` sidecar classifies
+                                // immutable instead of falling to the 5-minute
+                                // mutable default a `Generic` stand-in produces.
+                                member.format.clone(),
                             )
                             .await
                         {
@@ -1340,6 +1355,7 @@ async fn fetch_remote_member_metadata(
         upstream_url,
         path,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Maven,
     )
     .await
     .ok()?;
@@ -1408,6 +1424,7 @@ async fn fetch_maven_metadata_bytes(
                 upstream_url,
                 path,
                 proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                RepositoryFormat::Maven,
             )
             .await?;
             return Ok(content);
@@ -1930,13 +1947,21 @@ async fn serve_artifact(
                             .await;
                         return Ok(response);
                     }
-                    let response = proxy_helpers::proxy_fetch_streaming(
+                    // #3459: carry the Maven format so a released coordinate
+                    // caches immutably. `proxy_fetch_streaming` synthesizes a
+                    // `Generic` repository, which has no classifier arm, so
+                    // every jar/pom reaching this ungated arm was stamped with
+                    // the conservative 5-minute mutable TTL. `Maven` also
+                    // classifies a `gradle`-format repository correctly — both
+                    // share `cache_classifier::classify_maven`.
+                    let response = proxy_helpers::proxy_fetch_streaming_with_format(
                         proxy,
                         repo.id,
                         repo_key,
                         upstream_url,
                         path,
                         content_type_for_path(path),
+                        RepositoryFormat::Maven,
                     )
                     .await?;
                     // #3265: same counting as the sidecar-gated branch above.
@@ -5046,6 +5071,228 @@ mod tests {
                 .execute(&pool)
                 .await;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #3459: proxy-cache TTL of Maven checksum sidecars.
+    //
+    // A Maven/Gradle client asks for `<artifact>.sha1` after every artifact it
+    // downloads. Those requests are served by the checksum branch of
+    // `download`, which proxies them through `proxy_fetch_capped_budgeted`.
+    // That helper used to synthesize its upstream `Repository` with
+    // `RepositoryFormat::Generic`, and `Generic` has no `cache_classifier`
+    // arm, so `foo-1.0.pom.sha1` fell to the conservative 5-minute mutable
+    // default while the `foo-1.0.pom` it describes was cached for a decade —
+    // an upstream round-trip per checksum, forever.
+    //
+    // These assert the SIDECAR TTL actually written to the cache, not the
+    // classifier: `cache_classifier::classify(Maven, "…pom.sha1")` was already
+    // Immutable before the fix, so a classifier-level test passes with the bug
+    // fully intact.
+    // -----------------------------------------------------------------------
+
+    /// Floor for "cached effectively forever". The immutable write TTL is a
+    /// decade; anything above a year is unambiguously not the 300s default.
+    #[cfg(test)]
+    const CHECKSUM_IMMUTABLE_FLOOR_SECS: i64 = 365 * 24 * 3600;
+
+    /// `expires_at - cached_at` of a proxy-cache sidecar, in seconds.
+    fn proxy_sidecar_ttl_secs(sidecar: &std::path::Path) -> i64 {
+        let raw = std::fs::read(sidecar)
+            .unwrap_or_else(|e| panic!("sidecar {} must exist: {e}", sidecar.display()));
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar JSON");
+        let cached_at =
+            chrono::DateTime::parse_from_rfc3339(v["cached_at"].as_str().expect("cached_at"))
+                .expect("cached_at rfc3339");
+        let expires_at =
+            chrono::DateTime::parse_from_rfc3339(v["expires_at"].as_str().expect("expires_at"))
+                .expect("expires_at rfc3339");
+        (expires_at - cached_at).num_seconds()
+    }
+
+    /// Bounded wait for the sidecar to appear. Presence is polled, never
+    /// asserted: BOTH the fixed and the pre-fix code write this sidecar (they
+    /// differ only in its TTL), so a revert fails on the claim under test
+    /// rather than on the barrier.
+    async fn await_proxy_sidecar(sidecar: &std::path::Path) {
+        for _ in 0..100 {
+            if sidecar.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// #3459. A released coordinate's `.sha1` sidecar must be cached with the
+    /// same effectively-infinite lifetime as the coordinate it describes,
+    /// through BOTH shapes the report covers: a direct Remote repo and a
+    /// Virtual repo resolving to a Remote member (the reporter's topology).
+    ///
+    /// The `-SNAPSHOT` sidecar is the negative control. It travels the exact
+    /// same handler branch, helper and format, but a non-unique SNAPSHOT is
+    /// republished in place, so it must STAY on the 5-minute mutable TTL — a
+    /// "fix" that stamped every checksum immutable fails here.
+    #[tokio::test]
+    async fn test_remote_maven_checksum_sidecar_is_cached_immutably_3459() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        const RELEASE_DIRECT: &str = "com/example/lib/1.0/lib-1.0.pom.sha1";
+        const RELEASE_VIRTUAL: &str = "com/example/other/2.0/other-2.0.pom.sha1";
+        const SNAPSHOT: &str = "com/example/lib/1.1-SNAPSHOT/lib-1.1-SNAPSHOT.pom.sha1";
+        // A released PRIMARY whose upstream carries no `.sha1` sidecar, so the
+        // GHSA-qxv7 digest gate does not engage and the download falls to the
+        // ungated streaming arm — the third call site that synthesized
+        // `Generic`.
+        const UNGATED_PRIMARY: &str = "com/example/nosum/3.0/nosum-3.0.jar";
+        const SHA1_BODY: &str = "0123456789abcdef0123456789abcdef01234567";
+
+        let mock = MockServer::start().await;
+        for p in [RELEASE_DIRECT, RELEASE_VIRTUAL, SNAPSHOT] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{p}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/plain")
+                        .set_body_string(SHA1_BODY),
+                )
+                .mount(&mock)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{UNGATED_PRIMARY}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/java-archive")
+                    .set_body_bytes(b"jar-bytes-3459".to_vec()),
+            )
+            .mount(&mock)
+            .await;
+        // Its sidecar is absent upstream: 404 -> no digest to gate on.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{UNGATED_PRIMARY}.sha1")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        tdh::publish_repo(&pool, remote_id).await;
+
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_id)
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("link remote as virtual member");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        async fn get_ok(
+            state: &crate::api::SharedState,
+            repo_key: &str,
+            path: &str,
+            ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+        ) {
+            let resp = download(
+                State(state.clone()),
+                Extension(None),
+                Path((repo_key.to_string(), path.to_string())),
+                axum::http::HeaderMap::new(),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("GET {repo_key}/{path} must proxy 200, got {e:?}"));
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "GET {repo_key}/{path} must proxy 200"
+            );
+            // Drain the body: the streaming arm tees bytes into the cache as
+            // the client consumes them, so dropping the response undrained
+            // would leave no sidecar to inspect.
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+        }
+
+        get_ok(&state, &remote_key, RELEASE_DIRECT, &ctx).await;
+        get_ok(&state, &remote_key, SNAPSHOT, &ctx).await;
+        get_ok(&state, &virtual_key, RELEASE_VIRTUAL, &ctx).await;
+        get_ok(&state, &remote_key, UNGATED_PRIMARY, &ctx).await;
+
+        // Every entry is keyed under the repository that actually contacted
+        // upstream — the Remote repo itself for the direct requests, and the
+        // Remote MEMBER for the virtual one.
+        let sidecar =
+            |p: &str| dir.join(format!("proxy-cache/{remote_key}/{p}/__cache_meta__.json"));
+        let release_direct_sidecar = sidecar(RELEASE_DIRECT);
+        let release_virtual_sidecar = sidecar(RELEASE_VIRTUAL);
+        let snapshot_sidecar = sidecar(SNAPSHOT);
+        let ungated_primary_sidecar = sidecar(UNGATED_PRIMARY);
+        for s in [
+            &release_direct_sidecar,
+            &release_virtual_sidecar,
+            &snapshot_sidecar,
+            &ungated_primary_sidecar,
+        ] {
+            await_proxy_sidecar(s).await;
+        }
+        let release_direct_ttl = proxy_sidecar_ttl_secs(&release_direct_sidecar);
+        let release_virtual_ttl = proxy_sidecar_ttl_secs(&release_virtual_sidecar);
+        let snapshot_ttl = proxy_sidecar_ttl_secs(&snapshot_sidecar);
+        let ungated_primary_ttl = proxy_sidecar_ttl_secs(&ungated_primary_sidecar);
+
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert!(
+            release_direct_ttl >= CHECKSUM_IMMUTABLE_FLOOR_SECS,
+            "a released coordinate's `.sha1` must be cached as immutably as the \
+             coordinate it describes; got {release_direct_ttl}s — \
+             {mutable}s is the #3459 symptom (the checksum branch handing the \
+             classifier a `Generic` format)",
+            mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+        );
+        assert!(
+            release_virtual_ttl >= CHECKSUM_IMMUTABLE_FLOOR_SECS,
+            "the Virtual -> Remote member arm is a SEPARATE call site and must \
+             carry the member's format too; got {release_virtual_ttl}s"
+        );
+        assert!(
+            ungated_primary_ttl >= CHECKSUM_IMMUTABLE_FLOOR_SECS,
+            "a released jar whose upstream publishes no `.sha1` takes the ungated \
+             streaming arm, which is a THIRD call site and must carry the format \
+             too; got {ungated_primary_ttl}s"
+        );
+        assert!(
+            snapshot_ttl <= crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+            "a non-unique SNAPSHOT sidecar is republished in place and must stay \
+             mutable; got {snapshot_ttl}s — this negative control is what keeps \
+             the immutable assertions from passing under a \
+             'cache every checksum forever' change"
+        );
     }
 
     /// #3211: `download_root` forwards the upstream root body VERBATIM, so it

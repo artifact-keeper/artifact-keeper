@@ -226,14 +226,29 @@ pub async fn get_tree(
         FROM artifacts a
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND ($2 = '' OR a.path LIKE $2 || '%')
+          AND ($2 = '' OR a.path LIKE $2 || '%' ESCAPE '\')
         ORDER BY a.path
         "#,
         repo_id,
+        // #3500: the requested folder is REQUEST input that becomes part of a
+        // `LIKE` pattern, so it must be escaped before it is bound. Unescaped,
+        // a `%` or `_` in the path acted as a wildcard and the listing pulled
+        // in sibling folders, and a backslash — Postgres's DEFAULT `LIKE`
+        // escape character — quoted the character after it, so browsing
+        // `a\b` returned `ab/`'s contents and hid `a\b`'s own.
+        //
+        // Escaped in Rust with `ESCAPE '\'`, rather than the `ESCAPE ''` the
+        // Maven rollup delete guards use (#3492/#3493): there the pattern is
+        // derived in SQL and `escape_like_literal` cannot reach it, and
+        // over-matching is the SAFE direction for a `NOT EXISTS` delete guard.
+        // Here the pattern is a bind parameter, and on a read path
+        // over-matching IS the defect — a folder listing that includes another
+        // folder's entries. Same rule the shared helper documents, applied to
+        // the operand shape this site actually has.
         if prefix.is_empty() {
             String::new()
         } else {
-            format!("{}/", prefix)
+            format!("{}/", crate::api::handlers::escape_like_literal(&prefix))
         }
     )
     .fetch_all(&state.db)
@@ -838,6 +853,127 @@ mod tests {
 
     use crate::api::handlers::test_db_helpers as tdh;
     use axum::http::StatusCode;
+
+    // ── #3500: the folder prefix is a LIKE pattern operand ────────────────
+    //
+    // `GET /tree?path=<folder>` built `a.path LIKE $2 || '%'` from the
+    // requested folder with no `ESCAPE` clause, so the pattern stopped
+    // describing the folder it was derived from whenever the folder contained
+    // a `LIKE` metacharacter.
+
+    /// Insert an `artifacts` row at `path`. The tree handler reads only the
+    /// `artifacts` table, so no storage object is needed.
+    async fn seed_tree_path(pool: &sqlx::PgPool, repo_id: Uuid, path: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, $2, $3, 1, \
+             '0000000000000000000000000000000000000000000000000000000000000000', \
+             'application/octet-stream', $2)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(path.rsplit('/').next().unwrap_or(path))
+        .execute(pool)
+        .await
+        .expect("seed artifact row");
+    }
+
+    /// The segments `GET /tree?path=<folder>` reports, sorted.
+    async fn tree_segments(state: &SharedState, repo_key: &str, folder: &str) -> Vec<String> {
+        let app = tdh::router_anon(router(), state.clone());
+        let uri = format!(
+            "/?repository_key={}&path={}",
+            repo_key,
+            urlencoding::encode(folder)
+        );
+        let (status, body) = tdh::send(app, tdh::get(uri)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET /tree?path={folder} must be 200"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("tree JSON");
+        let mut out: Vec<String> = v["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .iter()
+            .map(|n| n["name"].as_str().expect("name").to_string())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// #3500. Browsing a folder whose name contains a `LIKE` metacharacter
+    /// must list that folder's own contents and nothing else.
+    ///
+    /// Both directions of the defect are asserted, because the unescaped
+    /// pattern failed in both:
+    ///
+    /// * `\` is Postgres's DEFAULT `LIKE` escape character, so the pattern
+    ///   `a\b/%` was read as `ab/%` — it MISSED the requested folder's own
+    ///   entry and MATCHED the unrelated `ab/` folder instead.
+    /// * `%` and `_` acted as wildcards, so `a%b/%` matched `axxxb/`.
+    ///
+    /// A plain folder in the same fixture is the positive control: escaping
+    /// must not stop ordinary browsing from working.
+    #[tokio::test]
+    async fn test_get_tree_folder_with_like_metacharacters_lists_only_its_own_entries_3500() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::publish_repo(&pool, repo_id).await;
+
+        for path in [
+            r"a\b/real.jar",    // the requested folder's own entry
+            "ab/collapsed.jar", // what the unescaped pattern matched instead
+            "a%b/pct.jar",      // the requested folder's own entry
+            "axxxb/wide.jar",   // what the `%` wildcard matched instead
+            "a_b/underscore.jar",
+            "aXb/single.jar", // what the `_` wildcard matched instead
+            "plain/ok.jar",   // positive control
+        ] {
+            seed_tree_path(&pool, repo_id, path).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let backslash = tree_segments(&state, &repo_key, r"a\b").await;
+        let percent = tree_segments(&state, &repo_key, "a%b").await;
+        let underscore = tree_segments(&state, &repo_key, "a_b").await;
+        let plain = tree_segments(&state, &repo_key, "plain").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            backslash,
+            vec!["real.jar".to_string()],
+            r"browsing `a\b` must list only its own entry: a backslash is \
+              Postgres's default LIKE escape character, so the unescaped \
+              pattern `a\b/%` was read as `ab/%` — it hid `a\b/real.jar` and \
+              returned `ab/collapsed.jar` in its place"
+        );
+        assert_eq!(
+            percent,
+            vec!["pct.jar".to_string()],
+            "browsing `a%b` must list only its own entry; unescaped, the `%` \
+             is a wildcard and `axxxb/`'s contents appear in the folder view"
+        );
+        assert_eq!(
+            underscore,
+            vec!["underscore.jar".to_string()],
+            "browsing `a_b` must list only its own entry; unescaped, the `_` \
+             matches any single character and `aXb/`'s contents appear"
+        );
+        assert_eq!(
+            plain,
+            vec!["ok.jar".to_string()],
+            "positive control: an ordinary folder must still browse normally, \
+             so a fix that escaped its way into matching nothing fails here"
+        );
+    }
 
     /// A non-admin caller with NO role assignment on a private repo must get a
     /// 404 (existence-hiding) from GET /tree — not the private tree.

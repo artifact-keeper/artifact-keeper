@@ -7028,6 +7028,25 @@ const DOCKER_TAG_ROWS_FROM_SQL: &str = r#"FROM oci_tags t
 const DOCKER_TAG_ROWS_WHERE_SQL: &str = r#"WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0"#;
 
+/// The `?search=` substring filter for the docker-tag listing, as a format
+/// template over the parameter index.
+///
+/// #3500: carries `ESCAPE '\'` and is fed [`super::escape_like_literal`]
+/// output. The search term is REQUEST input concatenated into a `LIKE`
+/// pattern, so unescaped a `%` or `_` in the term acted as a wildcard —
+/// searching for `1_0` matched `1.0`, `120`, `1a0` — and a backslash quoted
+/// the character after it, so a tag containing one could not be found by
+/// typing it. Both arms of the listing (the page and the `?count=exact`
+/// total) build the filter from this one fragment so they cannot drift and
+/// report a count that disagrees with the rows.
+///
+/// The operand is bound by the callers, not here, so the #3500 class gate is
+/// pointed at them explicitly and checks each one for the escaper:
+/// LIKE-OPERAND-ESCAPED-BY-CALLER: fetch_docker_tag_rows, count_docker_tag_rows
+fn docker_tag_search_sql(param: usize) -> String {
+    format!(" AND LOWER(t.tag) LIKE '%' || LOWER(${param}) || '%' ESCAPE '\\'")
+}
+
 /// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
 /// latest `scan_results` rows. Returns at most `limit` rows, ordered by
 /// `(name, tag)`.
@@ -7082,9 +7101,7 @@ async fn fetch_docker_tag_rows(
     );
     let mut next_param = 2;
     if search_query.is_some() {
-        sql.push_str(&format!(
-            " AND LOWER(t.tag) LIKE '%' || LOWER(${next_param}) || '%'"
-        ));
+        sql.push_str(&docker_tag_search_sql(next_param));
         next_param += 1;
     }
     if keyset.is_some() {
@@ -7103,7 +7120,7 @@ async fn fetch_docker_tag_rows(
 
     let mut query = sqlx::query(&sql).bind(repository_id);
     if let Some(q) = search_query {
-        query = query.bind(q);
+        query = query.bind(super::escape_like_literal(q));
     }
     if let Some((name, tag)) = keyset {
         query = query.bind(name.as_str()).bind(tag.as_str());
@@ -7163,11 +7180,11 @@ async fn count_docker_tag_rows(
 ) -> Result<i64> {
     let mut sql = format!("SELECT COUNT(*) {DOCKER_TAG_ROWS_FROM_SQL} {DOCKER_TAG_ROWS_WHERE_SQL}");
     if search_query.is_some() {
-        sql.push_str(" AND LOWER(t.tag) LIKE '%' || LOWER($2) || '%'");
+        sql.push_str(&docker_tag_search_sql(2));
     }
     let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(repository_id);
     if let Some(q) = search_query {
-        query = query.bind(q);
+        query = query.bind(super::escape_like_literal(q));
     }
     query
         .fetch_one(db)
@@ -23518,6 +23535,119 @@ mod tests {
 // --------------------------------------------------------------------------
 // Unit tests: APT field validation helpers
 // --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod docker_tag_search_escape_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Seed one `oci_tags` row plus the `artifacts` row the listing joins to.
+    async fn seed_tag(pool: &sqlx::PgPool, repo_id: Uuid, image: &str, tag: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, $2, $3, 1, \
+             '0000000000000000000000000000000000000000000000000000000000000000', \
+             'application/vnd.oci.image.manifest.v1+json', $2)",
+        )
+        .bind(repo_id)
+        .bind(format!("v2/{image}/manifests/{tag}"))
+        .bind(image)
+        .execute(pool)
+        .await
+        .expect("seed manifest artifact");
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest) \
+             VALUES ($1, $2, $3, 'sha256:0000000000000000000000000000000000000000000000000000000000000000')",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .bind(tag)
+        .execute(pool)
+        .await
+        .expect("seed oci tag");
+    }
+
+    /// #3500. The docker-tag listing's `?search=` filter builds its `LIKE`
+    /// pattern in SQL (`LIKE '%' || LOWER($n) || '%'`) from REQUEST input.
+    /// Unescaped, a `%` or `_` in the search term was a wildcard — searching
+    /// `1_0` also returned `1.0` and `120` — and a backslash quoted the
+    /// character after it, so a tag containing one could not be found by
+    /// typing it.
+    ///
+    /// The `?count=exact` arm is asserted alongside the rows, because it is a
+    /// SEPARATE query: a fix applied to one arm and not the other reports a
+    /// total that disagrees with the page.
+    #[tokio::test]
+    async fn test_docker_tag_search_treats_wildcards_literally_3500() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "docker").await;
+        for tag in ["1_0", "1.0", "120", r"we\ird", "weird", "plain"] {
+            seed_tag(&pool, repo_id, "app", tag).await;
+        }
+
+        async fn search(pool: &sqlx::PgPool, repo_id: Uuid, q: &str) -> (Vec<String>, i64) {
+            let rows = fetch_docker_tag_rows(pool, repo_id, Some(q), None, 0, 50)
+                .await
+                .expect("tag rows");
+            let mut tags: Vec<String> = rows.into_iter().map(|r| r.tag).collect();
+            tags.sort();
+            let total = count_docker_tag_rows(pool, repo_id, Some(q))
+                .await
+                .expect("tag count");
+            (tags, total)
+        }
+
+        let underscore = search(&pool, repo_id, "1_0").await;
+        let backslash = search(&pool, repo_id, r"we\ir").await;
+        let plain = search(&pool, repo_id, "plain").await;
+        let substring = search(&pool, repo_id, "ir").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            underscore.0,
+            vec!["1_0".to_string()],
+            "searching `1_0` must match the tag literally named `1_0`; \
+             unescaped, `_` matches any single character and `1.0` and `120` \
+             come back too"
+        );
+        assert_eq!(
+            underscore.1, 1,
+            "the ?count=exact arm is a separate query and must agree with the page"
+        );
+        assert_eq!(
+            backslash.0,
+            vec![r"we\ird".to_string()],
+            r"searching `we\ir` must find the tag containing a backslash; \
+              unescaped, the backslash quotes the `i` and the pattern becomes \
+              `weir`, which matches the OTHER tag instead"
+        );
+        assert_eq!(
+            backslash.1, 1,
+            "count arm must agree for the backslash term"
+        );
+        assert_eq!(
+            plain.0,
+            vec!["plain".to_string()],
+            "positive control: an ordinary search term must still work"
+        );
+        assert_eq!(
+            substring.0,
+            vec![r"we\ird".to_string(), "weird".to_string()],
+            "positive control: this is still a SUBSTRING search — escaping the \
+             term must not turn it into an exact match"
+        );
+        assert_eq!(
+            substring.1, 2,
+            "count arm must agree for the substring term"
+        );
+    }
+}
 
 #[cfg(test)]
 mod apt_validation_tests {

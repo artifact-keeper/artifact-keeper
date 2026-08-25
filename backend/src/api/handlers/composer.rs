@@ -921,6 +921,7 @@ async fn resolve_v1_provider_metadata(
         upstream_url,
         "packages.json",
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Composer,
     )
     .await
     else {
@@ -952,6 +953,7 @@ async fn resolve_v1_provider_metadata(
                     upstream_url,
                     &include_path,
                     proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    RepositoryFormat::Composer,
                 )
                 .await
                 else {
@@ -994,6 +996,7 @@ async fn resolve_v1_provider_metadata(
         upstream_url,
         &doc_path,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Composer,
     )
     .await
     {
@@ -1023,6 +1026,7 @@ async fn fetch_remote_composer_metadata(
         upstream_url,
         upstream_path,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Composer,
     )
     .await
     {

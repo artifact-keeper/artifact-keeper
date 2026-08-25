@@ -43,6 +43,24 @@ on:
         description: 'PROMOTE: finish/re-apply a version already built on ghcr (e.g. 1.6.2) — re-applies all tags + the Docker Hub mirror for all three images WITHOUT rebuilding. Leave blank for a normal build.'
         required: false
         default: ''
+      # POST-GATE FLOATING PROMOTION. Off by default, which is what keeps the
+      # documented recovery dispatch (`-f promote_version=X.Y.Z` on its own)
+      # byte-for-byte the operation it has always been: re-apply the exact
+      # version tag and mirror ghcr's CURRENT floating state to Docker Hub,
+      # never moving a floating tag.
+      #
+      # Turned on, it lets the promote re-point `:latest` / `:X.Y` AT THE SAME
+      # DIGEST the exact version tag already names, which is how release.yml
+      # applies floating tags only after the release gate has certified those
+      # bytes. It is not a licence to name anything: `apply-floating-tags`
+      # runs `.github/scripts/floating-tag-plan.sh`, which refuses any version
+      # without a published, non-draft, non-prerelease GitHub Release and
+      # refuses to move a floating tag backwards.
+      promote_floating:
+        description: 'PROMOTE: also advance the floating tags (:latest, :X.Y) to promote_version. Only permitted for a version with a published GitHub Release that is the newest in its line. Requires promote_version.'
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -108,6 +126,10 @@ jobs:
       # dispatch). Non-empty flips the build jobs off and the merge jobs into
       # re-apply-existing-digest mode.
       promote_version: ${{ steps.promote.outputs.version }}
+      # 'true' only when this promote dispatch was explicitly asked to advance
+      # the floating tags AND the target is a stable X.Y.Z. Consumed by
+      # `apply-floating-tags` (the only job that writes a floating tag).
+      advance_floating: ${{ steps.promote.outputs.advance_floating }}
       # The `X.Y-dev` floating alias for a maintenance branch push -- `1.1-dev`
       # for release/1.1.x, `1.7-dev` for release/1.7.x -- and empty for every
       # other ref. Computed once here rather than hardcoded per image, which
@@ -131,8 +153,15 @@ jobs:
       # Genuine tag immutability is a repository ruleset (restrict updates AND
       # deletions on refs/tags/v*), not a workflow control. This job narrows
       # the window; it does not close it.
+      # `github.event.created` / `.forced` only exist on a `push` event. A
+      # workflow_dispatch aimed at a tag ref -- which is exactly how a promote
+      # is run "from the release commit", and how release.yml dispatches the
+      # post-gate floating promotion -- has neither, so this check used to fail
+      # closed on an operation that moves no tag at all. Scoping it to `push`
+      # keeps the force-push protection it was written for and stops it firing
+      # on a build-free re-application of an existing digest.
       - name: Reject moved version tags
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           TAG_CREATED: ${{ github.event.created }}
           TAG_FORCED: ${{ github.event.forced }}
@@ -155,6 +184,10 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROMOTE_VERSION: ${{ github.event.inputs.promote_version }}
+          # See the note on the refuse-step below for why this goes through
+          # `format`: it renders "true"/"false" for a boolean or a string input
+          # alike, so the shell comparison has one shape to handle.
+          PROMOTE_FLOATING: ${{ format('{0}', github.event.inputs.promote_floating) }}
         run: |
           set -euo pipefail
           V="$PROMOTE_VERSION"
@@ -174,6 +207,39 @@ jobs:
           fi
           echo "Promote target validated: ${V} (present on ghcr.io/${BACKEND_IMAGE})."
           echo "version=${V}" >> "$GITHUB_OUTPUT"
+
+          # Floating advance is opt-in and stable-only. A prerelease has never
+          # taken a floating tag (`type=raw,value=latest` is gated on
+          # `!contains(github.ref, '-')`), and that stays true here: the
+          # request is refused rather than silently downgraded, so an operator
+          # who typed an -rc version gets told, not ignored.
+          if [[ "${PROMOTE_FLOATING}" == "true" ]]; then
+            if [[ "${V}" == *-* ]]; then
+              echo "::error title=Floating tags are stable-only::promote_floating was requested for prerelease ${V}. Prereleases never take :latest or :X.Y."
+              exit 1
+            fi
+            echo "advance_floating=true" >> "$GITHUB_OUTPUT"
+            echo "Floating tags (:latest, :${V%.*}) will be considered for advancement to ${V}; the published-release rule decides which actually move."
+          else
+            echo "advance_floating=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # `promote_floating` alone does nothing -- the floating plan is keyed on
+      # the promote target -- so accepting it silently would let an operator
+      # believe a floating tag had been considered when no job ever looked.
+      #
+      # `format('{0}', ...)` rather than a bare comparison: a `type: boolean`
+      # dispatch input arrives as the STRING "true" from `gh workflow run -f`
+      # and the UI checkbox, but as a JSON boolean from a typed API call.
+      # `'true' == true` is false in GitHub expressions (the boolean is cast to
+      # a number, the string to NaN), and a bare truthiness test is worse still
+      # -- the non-empty string "false" is truthy. Rendering both through
+      # `format` gives one comparison that is right for either shape.
+      - name: Refuse promote_floating without promote_version
+        if: github.event_name == 'workflow_dispatch' && format('{0}', github.event.inputs.promote_floating) == 'true' && github.event.inputs.promote_version == ''
+        run: |
+          echo "::error title=promote_floating needs promote_version::promote_floating only applies to a promote dispatch; set promote_version to the release you want :latest / :X.Y to name."
+          exit 1
 
       # Manual builds are useful for candidate/dev labels, but must not be a
       # back door around the guarded release path. See the script for why the
@@ -1049,6 +1115,14 @@ jobs:
       ${{ !cancelled() && needs.publish-preflight.result == 'success'
           && (needs.publish-preflight.outputs.promote_version != ''
               || (needs.build-backend.result == 'success' && needs.scan-containers.result == 'success')) }}
+    outputs:
+      # Handed to `apply-floating-tags`, which re-points :latest / :X.Y at THIS
+      # manifest-list digest -- the very digest :X.Y.Z already names. A floating
+      # tag is therefore an alias for tested bytes, never a second build.
+      digest: ${{ steps.incoming.outputs.digest }}
+      # The exact chart-pinned identity version published by this job, or empty
+      # for a branch/pr/manual build that publishes no such tag.
+      version: ${{ steps.plan.outputs.exact }}
     permissions:
       contents: read
       packages: write
@@ -1065,6 +1139,7 @@ jobs:
           sparse-checkout: |
             .github/scripts
             .vex
+            scripts/ci
 
       - name: Download digests
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1103,11 +1178,9 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
@@ -1120,11 +1193,9 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       # Resolve, for BOTH modes, the full ghcr + Docker Hub tag sets and the
@@ -1140,11 +1211,14 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${PROMOTE_VERSION}" ]]; then
-            # PROMOTE: no build metadata. Always re-apply the exact identity tag;
-            # for each floating tag (X.Y, latest) re-apply it ONLY if ghcr ALREADY
-            # points it at this version's digest. That way promote mirrors ghcr's
-            # CURRENT state to the missing registry and can never move a floating
-            # tag backwards to an older promoted version.
+            # PROMOTE: no build metadata. Re-apply the EXACT identity tag, and
+            # only that. The floating tags (X.Y, latest) used to be decided here
+            # too; they now belong to `apply-floating-tags`, which is the single
+            # job that writes a floating tag for any of the three images. This
+            # job cannot see whether its siblings published, so a floating tag
+            # written from here is a floating tag that can move on a partial
+            # publish -- the shape that let v1.7.2 put `:latest` on bytes no
+            # gate ever ran against.
             VERSION="${PROMOTE_VERSION}"
             GIMG="${REGISTRY}/${BACKEND_IMAGE}"; HIMG="docker.io/${DOCKERHUB_BACKEND}"
             vdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${VERSION}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
@@ -1152,15 +1226,6 @@ jobs:
               echo "::error title=Nothing to promote::${GIMG}:${VERSION} is not present on ghcr; cannot promote."; exit 1
             fi
             ghcr=( "${GIMG}:${VERSION}" ); hub=( "${HIMG}:${VERSION}" )
-            for ft in "${VERSION%.*}" latest; do
-              fdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${ft}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
-              if [[ -n "${fdig}" && "${fdig}" == "${vdig}" ]]; then
-                ghcr+=( "${GIMG}:${ft}" ); hub+=( "${HIMG}:${ft}" )
-                echo "  floating :${ft} -> included (ghcr already at ${VERSION})"
-              else
-                echo "  floating :${ft} -> skipped (ghcr=${fdig:-absent}, not this version)"
-              fi
-            done
             printf '%s\n' "${ghcr[@]}" | jq -R . | jq -cs . > /tmp/ghcr-tags.json
             printf '%s\n' "${hub[@]}"  | jq -R . | jq -cs . > /tmp/hub-tags.json
             echo "exact=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -1308,6 +1373,48 @@ jobs:
           subject-digest: ${{ steps.incoming.outputs.digest }}
           push-to-registry: true
 
+      # THE INVARIANT, ASSERTED AGAINST WHAT ACTUALLY SHIPPED (#3559):
+      #
+      #     THE BYTES A USER PULLS BY TAG ARE THE BYTES THAT WERE SIGNED.
+      #
+      # Every control above this line is anchored to `steps.incoming.outputs.
+      # digest` -- a value this job computed. That is the right thing to sign,
+      # but it is the wrong thing to VERIFY: a check fed the signer's own
+      # digest can only ever report that the signer signed what the signer
+      # was given. It cannot notice a tag that names something else.
+      #
+      # The step below starts over from the published TAG, resolves it through
+      # the registry the way `docker pull` would, and demands a cosign
+      # signature over THAT digest, by THIS workflow's identity, from GitHub's
+      # OIDC issuer. An unpinned identity would verify nothing -- anyone can
+      # sign any public image with Sigstore -- so the regexp is pinned here
+      # and the script refuses a pattern that matches every signer.
+      #
+      # Why the signing step is not already this check: `cosign sign` prints
+      # "Generating ephemeral keys... / Signing artifact..." and nothing else
+      # on success, so a green log is not evidence a signature was pushed;
+      # ghcr.io does not implement the OCI referrers API and cosign v3 no
+      # longer writes the legacy `sha256-<digest>.sig` tag, so hand-rolled
+      # registry probes report "unsigned" for images that are properly signed;
+      # and under cosign v3 a bare `cosign verify` is satisfied by the
+      # `attest-build-provenance` bundle alone, so the script additionally
+      # requires a signature whose payload type is the cosign one.
+      #
+      # Hard-fail, like every other step here (#3496). The script separates a
+      # genuine BLOCK (exit 1 -- the image is not verifiably signed) from an
+      # INFRASTRUCTURE failure (exit 2 -- registry 5xx, Fulcio/Rekor outage),
+      # so a Sigstore outage does not read in the log as a tampered image.
+      # Both fail the job; every step in this job is idempotent, so recovery
+      # is "Re-run failed jobs".
+      - name: Verify the published tags resolve to signed bytes
+        env:
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json)
+          scripts/ci/check-published-image-signature.sh "${REFS[@]}"
+
       # .vex was fetched by the checkout at the top of this job.
       #
       # BEST-EFFORT, and explicitly so (#3496). `docker scout attestation add`
@@ -1355,6 +1462,10 @@ jobs:
       ${{ !cancelled() && needs.publish-preflight.result == 'success'
           && (needs.publish-preflight.outputs.promote_version != ''
               || (needs.build-openscap.result == 'success' && needs.scan-containers.result == 'success')) }}
+    outputs:
+      # See merge-backend.
+      digest: ${{ steps.incoming.outputs.digest }}
+      version: ${{ steps.plan.outputs.exact }}
     permissions:
       contents: read
       packages: write
@@ -1367,7 +1478,9 @@ jobs:
       - name: Checkout (scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            scripts/ci
 
       - name: Download digests
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1406,11 +1519,9 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
@@ -1423,11 +1534,9 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       # See merge-backend for the full rationale of the plan/anchor/guard/apply/
@@ -1442,8 +1551,8 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${PROMOTE_VERSION}" ]]; then
-            # See merge-backend for the floating-tag rule: re-apply a floating tag
-            # only if ghcr already points it at this version (never move it back).
+            # Exact identity tag only; floating tags belong to
+            # `apply-floating-tags`. See merge-backend.
             VERSION="${PROMOTE_VERSION}"
             GIMG="${REGISTRY}/${OPENSCAP_IMAGE}"; HIMG="docker.io/${DOCKERHUB_OPENSCAP}"
             vdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${VERSION}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
@@ -1451,15 +1560,6 @@ jobs:
               echo "::error title=Nothing to promote::${GIMG}:${VERSION} is not present on ghcr; cannot promote."; exit 1
             fi
             ghcr=( "${GIMG}:${VERSION}" ); hub=( "${HIMG}:${VERSION}" )
-            for ft in "${VERSION%.*}" latest; do
-              fdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${ft}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
-              if [[ -n "${fdig}" && "${fdig}" == "${vdig}" ]]; then
-                ghcr+=( "${GIMG}:${ft}" ); hub+=( "${HIMG}:${ft}" )
-                echo "  floating :${ft} -> included (ghcr already at ${VERSION})"
-              else
-                echo "  floating :${ft} -> skipped (ghcr=${fdig:-absent}, not this version)"
-              fi
-            done
             printf '%s\n' "${ghcr[@]}" | jq -R . | jq -cs . > /tmp/ghcr-tags.json
             printf '%s\n' "${hub[@]}"  | jq -R . | jq -cs . > /tmp/hub-tags.json
             echo "exact=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -1556,6 +1656,18 @@ jobs:
           subject-digest: ${{ steps.incoming.outputs.digest }}
           push-to-registry: true
 
+      # Same assertion as merge-backend, same reasoning -- see the long note
+      # there (#3559). Anchored to the published tag, never to the digest this
+      # job handed the signer.
+      - name: Verify the published tags resolve to signed bytes
+        env:
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t REFS < <(jq -r '.[]' /tmp/ghcr-tags.json)
+          scripts/ci/check-published-image-signature.sh "${REFS[@]}"
+
   merge-scanner-adapter:
     name: Scanner Adapter Multi-Arch Manifest
     runs-on: ubuntu-latest
@@ -1566,6 +1678,17 @@ jobs:
       ${{ !cancelled() && needs.publish-preflight.result == 'success'
           && (needs.publish-preflight.outputs.promote_version != ''
               || (needs.build-scanner-adapter.result == 'success' && needs.scan-containers.result == 'success')) }}
+    outputs:
+      # The adapter's floating line (X.Y / X / latest) is its OWN, decoupled
+      # from the AK release version, and it deliberately follows an
+      # unchanged-source rebuild that the exact tag does not (#2391). So the
+      # digest is passed explicitly rather than re-resolved from the version
+      # tag: re-resolving would put the adapter's floating tags on the PREVIOUS
+      # build whenever the exact tag stayed put, which is the opposite of what
+      # that rebuild is for.
+      digest: ${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
+      version: ${{ steps.adapter_version.outputs.version }}
+      floating: ${{ steps.adapter_publish.outputs.publish_floating }}
     permissions:
       contents: read
       packages: write
@@ -1748,14 +1871,12 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
           # Tags come from the adapter's own VERSION file, NOT the AK git-tag
           # semver used by backend/web/openscap. The exact version tag is
-          # created once per adapter VERSION; the floating tags may also follow
-          # an unchanged-source rebuild. Main builds keep only dev + sha-<sha>
-          # for traceability.
+          # created once per adapter VERSION. Main builds keep only dev +
+          # sha-<sha> for traceability. The floating tags (X.Y / X / latest)
+          # are applied by `apply-floating-tags` from this job's digest output,
+          # so they cannot move unless all three merge jobs published.
           tags: |
             type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
-            type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
@@ -1768,12 +1889,10 @@ jobs:
         with:
           images: docker.io/${{ env.DOCKERHUB_SCANNER_ADAPTER }}
           # Mirror of the ghcr.io tag set above: adapter's own VERSION, not the
-          # AK git-tag semver. Same tags published to both registries.
+          # AK git-tag semver. Same tags published to both registries; the
+          # floating tags are added later by `apply-floating-tags`.
           tags: |
             type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
-            type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=${{ needs.publish-preflight.outputs.series_dev_tag }},enable=${{ needs.publish-preflight.outputs.series_dev_tag != '' }}
@@ -1874,27 +1993,15 @@ jobs:
         if: ${{ env.PROMOTE_VERSION != '' }}
         env:
           V: ${{ steps.adapter_version.outputs.version }}
-          MINOR: ${{ steps.adapter_version.outputs.minor }}
-          MAJOR: ${{ steps.adapter_version.outputs.major }}
           DIGEST: ${{ steps.promote_digest.outputs.digest }}
         run: |
           set -euo pipefail
           GIMG="${REGISTRY}/${SCANNER_ADAPTER_IMAGE}"
           HIMG="docker.io/${DOCKERHUB_SCANNER_ADAPTER}"
-          # Always re-apply the exact identity tag (guarded to the same digest).
+          # Exact identity tag only, guarded to the same digest. The adapter's
+          # floating line (X.Y / X / latest) is re-applied by
+          # `apply-floating-tags`, which runs after all three merge jobs.
           gargs=( -t "${GIMG}:${V}" ); hargs=( -t "${HIMG}:${V}" )
-          # Re-apply each floating tag (adapter's own X.Y / X / latest line) ONLY
-          # if ghcr already points it at this version, so promote never moves a
-          # floating tag backwards (mirror ghcr's current state to Docker Hub).
-          for ft in "${MINOR}" "${MAJOR}" latest; do
-            fdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${ft}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
-            if [[ -n "${fdig}" && "${fdig}" == "${DIGEST}" ]]; then
-              gargs+=( -t "${GIMG}:${ft}" ); hargs+=( -t "${HIMG}:${ft}" )
-              echo "  floating :${ft} -> included (ghcr already at ${V})"
-            else
-              echo "  floating :${ft} -> skipped (ghcr=${fdig:-absent}, not this version)"
-            fi
-          done
           docker buildx imagetools create "${gargs[@]}" "${GIMG}@${DIGEST}"
           n=0; max=5
           until docker buildx imagetools create "${hargs[@]}" "${GIMG}@${DIGEST}"; do
@@ -1921,6 +2028,25 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
           subject-digest: ${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
           push-to-registry: true
+
+      # Same assertion as merge-backend, same reasoning -- see the long note
+      # there (#3559). The adapter's tag set comes from its own metadata step
+      # on a normal build and is the single exact version tag on a promote,
+      # which is exactly what the steps above wrote.
+      - name: Verify the published tags resolve to signed bytes
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+          ADAPTER_VERSION: ${{ steps.adapter_version.outputs.version }}
+          PUBLISHED_SIG_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${PROMOTE_VERSION}" ]]; then
+            REFS=( "${REGISTRY}/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION}" )
+          else
+            mapfile -t REFS < <(jq -r '.tags[]' <<< "${META_JSON}")
+          fi
+          scripts/ci/check-published-image-signature.sh "${REFS[@]}"
 
   merge-backend-alpine:
     name: Backend Alpine Multi-Arch Manifest
@@ -2067,6 +2193,294 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  # ══════════════════════════════════════════════════════════════════════════
+  # APPLY FLOATING TAGS  (issues #2698, #3540)
+  #
+  # THE ONLY JOB IN THIS WORKFLOW THAT WRITES A FLOATING TAG. `:latest`, the
+  # AK `:X.Y` series alias and the scanner-adapter's own `X.Y` / `X` / `latest`
+  # line are all applied here and nowhere else.
+  #
+  # Why it is a separate job (the partial-publish problem)
+  # -----------------------------------------------------
+  # `merge-backend`, `merge-openscap` and `merge-scanner-adapter` are parallel
+  # siblings. When each wrote its own floating tags, backend's `:latest` moved
+  # the moment backend's build and scan passed -- whether or not the other two
+  # images ever published. That is how v1.7.2 came to serve
+  # `backend:1.7.2` and `backend:latest` publicly for hours as a version that
+  # was then retired. This job `needs:` all three, with the default `success()`
+  # semantics, so a failed OR SKIPPED sibling means no floating tag moves at
+  # all; the immutable `:X.Y.Z` identity tags that did publish stay published,
+  # which is the correct outcome -- they name exactly the bytes they name.
+  #
+  # Why backend/openscap floating tags are NOT applied on a tag push
+  # ---------------------------------------------------------------
+  # Because this workflow runs BEFORE the release gate, and always will: it is
+  # what produces the bytes the gate tests. On v1.8.1 docker-publish finished
+  # at 14:59:49 and the release published at 16:17:54, so under the old
+  # arrangement `:latest` named gate-uncertified bytes for 78 minutes on a
+  # release where nothing went wrong. A tag push therefore publishes only the
+  # immutable `:X.Y.Z`, and `release.yml` dispatches this workflow again with
+  # `promote_version=X.Y.Z -f promote_floating=true` AFTER the gate and the
+  # GitHub Release. That second run rebuilds nothing: it resolves the digest
+  # that `:X.Y.Z` already names and re-points the floating tags at it.
+  #
+  # The scanner-adapter is deliberately NOT deferred, for two reasons that are
+  # specific to it and are worth stating rather than hiding:
+  #   * `release.yml`'s `verify-images-published` requires the adapter's
+  #     floating `:1` before the release job runs, so deferring it past the
+  #     release would deadlock the first publish of any new adapter MAJOR; and
+  #   * the adapter's floating tags intentionally follow an unchanged-source
+  #     rebuild that its exact tag does NOT (#2391, Alpine errata), so a
+  #     version-keyed post-gate promote would pin them to the previous build.
+  # Its floating tags therefore still move pre-gate; they gain the sibling
+  # barrier above but not the gate ordering. Tracked as follow-up work.
+  # ══════════════════════════════════════════════════════════════════════════
+  apply-floating-tags:
+    name: Apply Floating Tags
+    runs-on: ubuntu-latest
+    # No `if:` and no `always()`: the default `success()` on all three merge
+    # jobs IS the control. Adding `!cancelled()` here would re-open exactly the
+    # partial-publish hole this job exists to close.
+    needs: [publish-preflight, merge-backend, merge-openscap, merge-scanner-adapter]
+    permissions:
+      contents: read   # read published GitHub Releases (the floating-tag rule)
+      packages: write  # re-point ghcr tags
+    env:
+      PROMOTE_VERSION: ${{ needs.publish-preflight.outputs.promote_version }}
+      ADVANCE_FLOATING: ${{ needs.publish-preflight.outputs.advance_floating }}
+      BACKEND_DIGEST: ${{ needs.merge-backend.outputs.digest }}
+      BACKEND_VERSION: ${{ needs.merge-backend.outputs.version }}
+      OPENSCAP_DIGEST: ${{ needs.merge-openscap.outputs.digest }}
+      OPENSCAP_VERSION: ${{ needs.merge-openscap.outputs.version }}
+      ADAPTER_DIGEST: ${{ needs.merge-scanner-adapter.outputs.digest }}
+      ADAPTER_VERSION: ${{ needs.merge-scanner-adapter.outputs.version }}
+      ADAPTER_FLOATING: ${{ needs.merge-scanner-adapter.outputs.floating }}
+
+    steps:
+      - name: Checkout (scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Produces /tmp/floating-plan.txt, one `<image>|<digest>|<tag>` line per
+      # tag to write. Deciding first and writing second keeps the whole plan
+      # visible in the log even on the (common) do-nothing paths.
+      - name: Plan floating tags
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          : > /tmp/floating-plan.txt
+
+          # Current ghcr digest for a tag; empty when the tag is absent.
+          tag_digest() {
+            docker buildx imagetools inspect --format '{{json .Manifest}}' "$1" 2>/dev/null \
+              | jq -r '.digest' 2>/dev/null || true
+          }
+
+          # plan <ghcr-image> <hub-image> <digest> <mode> <tag>...
+          #   advance - write the tag at <digest> unconditionally (the caller
+          #             has already established that it is allowed to move).
+          #   mirror  - write the tag ONLY where ghcr ALREADY has it at
+          #             <digest>. This is the historic promote behaviour: copy
+          #             ghcr's CURRENT state to a registry that is missing it,
+          #             never move a floating tag.
+          plan() {
+            local gimg="$1" himg="$2" digest="$3" mode="$4"; shift 4
+            local t cur
+            for t in "$@"; do
+              [[ -n "$t" ]] || continue
+              if [[ "$mode" == "mirror" ]]; then
+                cur="$(tag_digest "${gimg}:${t}")"
+                if [[ -z "$cur" || "$cur" != "$digest" ]]; then
+                  echo "  ${gimg}:${t} -> skipped (ghcr=${cur:-absent}, not this digest)"
+                  continue
+                fi
+                echo "  ${gimg}:${t} -> ${digest} (mirror)"
+              else
+                echo "  ${gimg}:${t} -> ${digest} (advance)"
+              fi
+              printf '%s|%s|%s\n' "${gimg}" "${digest}" "${t}" >> /tmp/floating-plan.txt
+              printf '%s|%s|%s\n' "${himg}" "${digest}" "${t}" >> /tmp/floating-plan.txt
+            done
+          }
+
+          GB="${REGISTRY}/${BACKEND_IMAGE}";         HB="docker.io/${DOCKERHUB_BACKEND}"
+          GO="${REGISTRY}/${OPENSCAP_IMAGE}";        HO="docker.io/${DOCKERHUB_OPENSCAP}"
+          GS="${REGISTRY}/${SCANNER_ADAPTER_IMAGE}"; HS="docker.io/${DOCKERHUB_SCANNER_ADAPTER}"
+
+          # ── backend + openscap: the AK-versioned floating line ─────────────
+          if [[ "${ADVANCE_FLOATING}" == "true" ]]; then
+            # POST-GATE PROMOTION. Which floating tags may name this version is
+            # not this workflow's decision to make on its own -- it is decided
+            # by whether a published GitHub Release exists for it, which only
+            # happens after the gate. floating-tag-plan.sh applies that rule and
+            # exits non-zero if the version has no release at all, so a promote
+            # aimed at a never-released version (the v1.7.2/v1.7.5 shape) fails
+            # here rather than moving `:latest`.
+            echo "Post-gate floating promotion for ${PROMOTE_VERSION}."
+            # The digest about to be aliased must be the one the EXACT identity
+            # tag names -- that equality is the whole "bytes tested == bytes
+            # published" claim, so it is checked rather than assumed. The merge
+            # jobs report the version they guarded; it has to be this one.
+            for pair in "backend:${BACKEND_VERSION}" "openscap:${OPENSCAP_VERSION}"; do
+              if [[ "${pair#*:}" != "${PROMOTE_VERSION}" ]]; then
+                echo "::error title=Promote version mismatch::${pair%%:*} published '${pair#*:}' but this run is promoting '${PROMOTE_VERSION}'. Refusing to alias a floating tag onto a digest that is not the promoted version's."
+                exit 1
+              fi
+            done
+            gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+              > /tmp/published-releases.txt
+            echo "Published stable releases seen:"
+            sed 's/^/    /' /tmp/published-releases.txt
+
+            if ! .github/scripts/floating-tag-plan.sh "${PROMOTE_VERSION}" \
+                  < /tmp/published-releases.txt > /tmp/allowed-floating.txt; then
+              echo "::error title=Floating promotion refused::floating-tag-plan.sh refused ${PROMOTE_VERSION}; no floating tag will be moved."
+              exit 1
+            fi
+            mapfile -t FT < /tmp/allowed-floating.txt
+            if [[ "${#FT[@]}" -eq 0 ]]; then
+              echo "::notice title=No floating tag advances::${PROMOTE_VERSION} is newest in neither its series nor overall; :latest and :X.Y stay where they are."
+            fi
+            plan "$GB" "$HB" "${BACKEND_DIGEST}"  advance ${FT[@]+"${FT[@]}"}
+            plan "$GO" "$HO" "${OPENSCAP_DIGEST}" advance ${FT[@]+"${FT[@]}"}
+          elif [[ -n "${PROMOTE_VERSION}" ]]; then
+            # Plain promote (the documented recovery dispatch). Unchanged
+            # behaviour: mirror ghcr's current floating state, move nothing.
+            echo "Promote without floating advance: mirroring ghcr's current floating state only."
+            # A prerelease has no AK floating line at all, so there is nothing
+            # to mirror and `${PROMOTE_VERSION%.*}` would name a tag that never
+            # existed (`1.8.2-rc`). Mirror mode would skip it either way; say so
+            # instead of printing a phantom tag name.
+            if [[ "${PROMOTE_VERSION}" == *-* ]]; then
+              echo "  prerelease ${PROMOTE_VERSION}: no AK floating tags exist to mirror."
+            else
+              plan "$GB" "$HB" "${BACKEND_DIGEST}"  mirror "${PROMOTE_VERSION%.*}" latest
+              plan "$GO" "$HO" "${OPENSCAP_DIGEST}" mirror "${PROMOTE_VERSION%.*}" latest
+            fi
+          else
+            echo "Normal build: backend/openscap floating tags are NOT applied here."
+            echo "  :X.Y.Z is published and immutable; :latest and :X.Y are applied by the"
+            echo "  post-gate promotion release.yml dispatches after the release gate passes."
+          fi
+
+          # ── scanner-adapter: its own independent floating line ─────────────
+          # Not gate-deferred; see this job's header for why.
+          if [[ -n "${PROMOTE_VERSION}" ]]; then
+            plan "$GS" "$HS" "${ADAPTER_DIGEST}" mirror \
+              "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}" latest
+          elif [[ "${ADAPTER_FLOATING}" == "true" ]]; then
+            plan "$GS" "$HS" "${ADAPTER_DIGEST}" advance \
+              "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}" latest
+          else
+            echo "Scanner-adapter floating tags: not requested by this build."
+          fi
+
+          sort -u -o /tmp/floating-plan.txt /tmp/floating-plan.txt
+          echo ""
+          echo "Floating tag plan ($(wc -l < /tmp/floating-plan.txt) writes):"
+          sed 's/^/    /' /tmp/floating-plan.txt
+
+      # `imagetools create` re-points a tag to an EXISTING manifest-list digest.
+      # It uploads no layers, produces no new manifest and therefore does not
+      # change the digest -- the cosign signature and the provenance attestation
+      # the merge jobs bound to that digest keep covering it. That is the whole
+      # reason the promotion can be build-free and still satisfy
+      # bytes-tested == bytes-published: the floating tag is an alias, not a
+      # second artifact.
+      - name: Apply floating tags
+        run: |
+          set -euo pipefail
+          if [[ ! -s /tmp/floating-plan.txt ]]; then
+            echo "No floating tags to apply."
+            exit 0
+          fi
+          while IFS='|' read -r img digest; do
+            [[ -n "$img" ]] || continue
+            mapfile -t tags < <(awk -F'|' -v i="$img" -v d="$digest" '$1 == i && $2 == d { print $3 }' /tmp/floating-plan.txt)
+            args=(); for t in "${tags[@]}"; do args+=( -t "${img}:${t}" ); done
+            echo "==> ${img}@${digest} <- ${tags[*]}"
+            # Retry: a transient Docker Hub PROTOCOL_ERROR/ETIMEDOUT is what
+            # leaves a release half-tagged, and re-pointing to the SAME digest
+            # makes every attempt a safe no-op-or-complete.
+            n=0; max=5
+            # `</dev/null` because this loop's own stdin is the plan pipeline:
+            # a child that reads stdin would eat the remaining images.
+            until docker buildx imagetools create "${args[@]}" "${img}@${digest}" </dev/null; do
+              n=$((n + 1))
+              if [[ "$n" -ge "$max" ]]; then
+                echo "::error title=Floating tag write failed::imagetools create for ${img} failed after ${max} attempts."
+                exit 1
+              fi
+              echo "attempt ${n}/${max} failed; retrying in $((n * 10))s..."
+              sleep $((n * 10))
+            done
+          done < <(cut -d'|' -f1,2 /tmp/floating-plan.txt | sort -u)
+
+      # Digest identity, asserted rather than assumed. Every tag this job wrote
+      # must now resolve to the digest it was written at. A promotion that
+      # rebuilt instead of re-pointing, or a registry that silently kept an old
+      # manifest, fails here.
+      - name: Assert every floating tag resolves to the digest it was written at
+        run: |
+          set -euo pipefail
+          if [[ ! -s /tmp/floating-plan.txt ]]; then
+            echo "Nothing written; nothing to verify."
+            exit 0
+          fi
+          bad=0
+          while IFS='|' read -r img digest tag; do
+            [[ -n "$img" ]] || continue
+            # `</dev/null`: this loop reads the plan file on stdin.
+            got=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${img}:${tag}" </dev/null 2>/dev/null \
+              | jq -r '.digest' 2>/dev/null || true)
+            if [[ "$got" == "$digest" ]]; then
+              echo "  ok  ${img}:${tag} == ${digest}"
+            else
+              echo "::error title=Floating tag digest mismatch::${img}:${tag} resolves to ${got:-<unresolvable>}, expected ${digest}."
+              bad=1
+            fi
+          done < /tmp/floating-plan.txt
+          exit "$bad"
+
+      - name: Summarise
+        run: |
+          set -euo pipefail
+          {
+            echo "### Floating tags"
+            echo ""
+            if [[ -s /tmp/floating-plan.txt ]]; then
+              while IFS='|' read -r img digest tag; do
+                echo "- \`${img}:${tag}\` -> \`${digest}\`"
+              done < /tmp/floating-plan.txt
+            else
+              echo "None applied by this run."
+              if [[ -z "${PROMOTE_VERSION}" ]]; then
+                echo ""
+                echo "On a release tag this is expected: \`:latest\` and \`:X.Y\` are applied by the post-gate promotion that \`release.yml\` dispatches once the release gate has passed."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ════════════════════════════════════════════════════════════════════════════
   # VERIFY-PUBLISHED: fail fast if a tag-triggered run did not actually
   # publish the expected semver tags on ghcr.io.
@@ -2091,7 +2505,13 @@ jobs:
       packages: read
     # `merge-backend-alpine` removed from `needs` while alpine builds are
     # suspended (it is `if: false` and would never report success).
-    needs: [merge-backend, merge-openscap, merge-scanner-adapter]
+    #
+    # `apply-floating-tags` is in `needs` for ORDER, not for content: this job
+    # probes the immutable `:X.Y.Z` identity tags only, and deliberately still
+    # does. Floating tags are no longer part of what a tag push promises to
+    # publish -- on a stable tag `:latest` and `:X.Y` are applied by the
+    # post-gate promotion, so asserting them here would fail every cut.
+    needs: [merge-backend, merge-openscap, merge-scanner-adapter, apply-floating-tags]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       # Needed to read docker/scanner-adapter/VERSION — the adapter is
@@ -2174,27 +2594,35 @@ jobs:
     name: Publish Summary
     runs-on: ubuntu-latest
     permissions: {}
-    needs: [merge-backend, merge-openscap, merge-scanner-adapter]
+    needs: [merge-backend, merge-openscap, merge-scanner-adapter, apply-floating-tags]
     # always() would otherwise run this even when the fork guard on
     # publish-preflight skipped everything else; mirror that guard here.
     if: ${{ always() && (github.event_name != 'schedule' || github.repository == 'artifact-keeper/artifact-keeper') }}
     steps:
+      # Names the images this run publishes, NOT `:latest` for each of them --
+      # which is what it used to print unconditionally, on every branch build
+      # and on every failed one. `:latest` is now applied by
+      # `apply-floating-tags` (adapter) or by the post-gate promotion
+      # (backend/openscap), and each writes its own summary section saying what
+      # it actually moved.
       - name: Summary
         run: |
           echo "## Docker Images Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Backend" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`docker.io/${{ env.DOCKERHUB_BACKEND }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | ghcr.io | Docker Hub |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend | \`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}\` | \`docker.io/${{ env.DOCKERHUB_BACKEND }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| OpenSCAP | \`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}\` | \`docker.io/${{ env.DOCKERHUB_OPENSCAP }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner Adapter | \`${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}\` | \`docker.io/${{ env.DOCKERHUB_SCANNER_ADAPTER }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### OpenSCAP" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`docker.io/${{ env.DOCKERHUB_OPENSCAP }}:latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Scanner Adapter" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`docker.io/${{ env.DOCKERHUB_SCANNER_ADAPTER }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "See the **Apply Floating Tags** job for which floating tags (if any) moved." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Supply Chain Security" >> $GITHUB_STEP_SUMMARY
-          echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC)" >> $GITHUB_STEP_SUMMARY
-          echo "- Verify: \`cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com --certificate-identity-regexp='https://github.com/artifact-keeper/.*' ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC), and each merge job re-checks that the tags it published resolve to signed bytes (#3559)" >> $GITHUB_STEP_SUMMARY
+          # The identity pattern below is pinned to the workflow that is
+          # allowed to sign. The previous hint said `https://github.com/artifact-keeper/.*`,
+          # which accepts a signature from ANY workflow in the org — including
+          # one a contributor could add in a fork-triggered run. An identity
+          # pattern is half the assertion; a loose one gives a green verify
+          # that means very little.
+          echo "- Verify: \`cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com --certificate-identity-regexp='^https://github[.]com/artifact-keeper/artifact-keeper/[.]github/workflows/docker-publish[.]yml@refs/tags/v.+$' ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:<version>\`" >> $GITHUB_STEP_SUMMARY

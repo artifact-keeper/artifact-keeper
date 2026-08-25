@@ -306,6 +306,37 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
+    // result_large_err threshold anchor (#3551)
+    // -----------------------------------------------------------------------
+
+    /// `.clippy.toml` sets `large-error-threshold = 129` so that the axum
+    /// `Result<T, Response>` idiom used by every handler in this module does
+    /// not trip `clippy::result_large_err`. That number is derived from the
+    /// size of one concrete type, and nothing in the lint configuration can
+    /// notice when the type outgrows it: the symptom is instead hundreds of
+    /// clippy errors across hundreds of unchanged functions, attributed to
+    /// whichever pull request happens to reach CI first. That is exactly how
+    /// #3551 presented.
+    ///
+    /// This is the assertion that fires first, by name, with the two numbers
+    /// side by side. If it fails, an axum or compiler upgrade has changed the
+    /// layout of `Response`: raise `large-error-threshold` to the new size
+    /// plus one in the same pull request that takes the upgrade, and record
+    /// why in the CHANGELOG. Do not silence it with an `allow`.
+    #[test]
+    fn response_fits_under_the_result_large_err_threshold() {
+        const LARGE_ERROR_THRESHOLD: usize = 129; // must match .clippy.toml
+        let actual = std::mem::size_of::<axum::response::Response>();
+        assert!(
+            actual < LARGE_ERROR_THRESHOLD,
+            "size_of::<axum::response::Response>() is {actual} bytes, which is \
+             not below the large-error-threshold of {LARGE_ERROR_THRESHOLD} in \
+             .clippy.toml. Every `Result<_, Response>` in backend/src/api/handlers \
+             is about to fail clippy::result_large_err. See #3551."
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // escape_like_literal — SQL LIKE wildcard escape for user-supplied input
     // -----------------------------------------------------------------------
 
@@ -792,5 +823,615 @@ mod tests {
         assert!(res.is_ok(), "first upload with no tombstone must proceed");
 
         cleanup_repo(&pool, repo).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3500: a SQL-assembled `LIKE` pattern must escape its operand.
+//
+// The class is narrow and mechanically recognisable: a predicate that builds
+// its `LIKE` *pattern* inside SQL by concatenating an operand (`LIKE $2 ||
+// '%'`, `LIKE '%' || $2 || '%'`, `$2 LIKE a.name || '-%'`, `LIKE concat($2,
+// '%')`). At those sites the Rust call site shows a plain bind and nothing
+// hints that a pattern is being assembled, which is why four of them survived
+// the #998/#1000 escaping wave and the #3492 audit. A constant pattern
+// (`LIKE 'maven/%'`) is not in the class — escaping applies to the pattern,
+// not to the column being probed.
+//
+// WHAT ACTUALLY FIXES IT, and why this gate checks a PAIR. `ESCAPE '\'` names
+// the character Postgres already uses by default, so on its own that clause
+// changes nothing: `'ab/x' LIKE 'a\b/' || '%'` and the same predicate with
+// `ESCAPE '\'` are both true, and `_` stays a wildcard either way. What fixes
+// the bug is [`escape_like_literal`] on the value that becomes the pattern.
+// A gate that demanded only the clause would therefore be green while #3500
+// was fully live. So a site must satisfy BOTH:
+//
+//   1. an `ESCAPE` clause on the predicate, and
+//   2. either `ESCAPE ''` — for an operand derived in SQL, which the Rust
+//      helper cannot reach (see `maven_flat_attribution::
+//      metadata_rollup_dir_anchor_sql`, #3492/#3493) — or an
+//      `escape_like_literal` in the same function, for an operand that is a
+//      bind parameter.
+//
+// WHAT THIS CANNOT PROVE. Requirement 2 is function-scoped: it shows an
+// escaper is applied somewhere in the function that owns the predicate, NOT
+// that it is applied to *this* operand. A function that escapes one value and
+// binds another raw still passes. Only the per-site behavioural tests
+// (`tree.rs`, `rubygems.rs`, `repositories.rs`, `cargo.rs`,
+// `artifact_service.rs`) prove the operand half, and they are what caught the
+// bug. This gate's job is narrower: stop a NEW site in this shape from being
+// added with no escaping story at all.
+//
+// OUT OF SCOPE, tracked separately: patterns built in RUST
+// (`format!("%{}%", q)`) for free-text search listings, and `LIKE ANY($n)`
+// over a Rust-built array. Those have no SQL-side assembly for this scanner
+// to key on, and several of them are correct today because their caller
+// pre-escapes or their handler re-checks the match exactly.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod like_pattern_escape_class_tests {
+    /// A `LIKE`-family operator, in every spelling that reaches the same
+    /// pattern-matching semantics. `~~` is `LIKE`'s operator form and is what
+    /// `LIKE ... ESCAPE` is rewritten to before planning, so a site written
+    /// that way is the same defect.
+    /// One entry per predicate, not per spelling: a `NOT LIKE` is matched by
+    /// `LIKE ` and every `~~` spelling (`~~*`, `!~~`, `!~~*`) by `~~`, so a
+    /// single predicate is never counted twice. `LIKE ` matched inside
+    /// `ILIKE ` is rejected by the preceding-character guard in [`scan`].
+    const OPERATORS: &[&str] = &["ILIKE ", "LIKE ", "SIMILAR TO ", "~~"];
+
+    /// How far past the operator the pattern expression and its `ESCAPE`
+    /// clause may run. Generous enough to span a wrapped predicate, short
+    /// enough that an `ESCAPE` belonging to a LATER, unrelated predicate
+    /// cannot vouch for this one.
+    const OPERAND_WINDOW: usize = 160;
+
+    /// The sanctioned escapers. `escape_filename_for_like` and
+    /// `escape_path_prefix` are thin wrappers that route through
+    /// [`escape_like_literal`]; `the_escaper_family_all_routes_through_the_helper`
+    /// pins that, so accepting them here cannot become a way in for a helper
+    /// that does not actually escape.
+    const ESCAPERS: &[&str] = &[
+        "escape_like_literal(",
+        "escape_filename_for_like(",
+        "escape_path_prefix(",
+    ];
+
+    /// Marker for a site whose operand is escaped by a DIFFERENT function —
+    /// a SQL fragment builder whose callers do the binding. It must name the
+    /// binding functions, each of which is then checked for the escaper, so
+    /// the exception is verified rather than merely asserted.
+    const CALLER_ESCAPES_MARKER: &str = "LIKE-OPERAND-ESCAPED-BY-CALLER:";
+
+    /// One flagged site.
+    struct Offender {
+        location: String,
+        line: String,
+        reason: &'static str,
+    }
+
+    /// Collapse every run of ASCII whitespace to one space, keeping a map from
+    /// each output byte to its source line number.
+    ///
+    /// Wrapping is the realistic way this class re-appears: the offending
+    /// lines are 80+ characters, so the next author to let rustfmt or a hand
+    /// edit split `LIKE $2` from `|| '%'` would have silently disabled a
+    /// line-based scanner.
+    fn flatten(src: &str) -> (String, Vec<usize>) {
+        let mut out = String::with_capacity(src.len());
+        let mut lines = Vec::with_capacity(src.len());
+        let mut line = 1usize;
+        let mut in_ws = false;
+        for ch in src.chars() {
+            if ch == '\n' {
+                line += 1;
+            }
+            if ch.is_ascii_whitespace() {
+                if !in_ws {
+                    out.push(' ');
+                    lines.push(line);
+                    in_ws = true;
+                }
+                continue;
+            }
+            in_ws = false;
+            let mut buf = [0u8; 4];
+            for _ in ch.encode_utf8(&mut buf).bytes() {
+                lines.push(line);
+            }
+            out.push(ch);
+        }
+        (out, lines)
+    }
+
+    /// Whether `window` carries a real `ESCAPE` clause, i.e. `ESCAPE` followed
+    /// by a quoted character. The quote requirement is what stops a trailing
+    /// SQL comment (`-- TODO ESCAPE later`) from satisfying the check.
+    fn escape_clause(window: &str) -> Option<&str> {
+        let at = window.find("ESCAPE ")?;
+        let rest = window[at + "ESCAPE ".len()..].trim_start();
+        if !rest.starts_with('\'') {
+            return None;
+        }
+        let end = rest[1..].find('\'')? + 2;
+        Some(&rest[..end])
+    }
+
+    /// The source of the `fn` item containing byte offset `at`.
+    ///
+    /// Split on `fn` header lines rather than on column-0 braces so methods
+    /// inside an `impl` are scoped to themselves. `cargo fmt --check` is
+    /// enforced in CI, so a header line is reliably `…fn name(`.
+    fn enclosing_fn(src: &str, at: usize) -> &str {
+        let is_fn_header = |line: &str| {
+            let t = line.trim_start();
+            t.starts_with("fn ")
+                || t.starts_with("async fn ")
+                || t.starts_with("pub fn ")
+                || t.starts_with("pub async fn ")
+                || (t.starts_with("pub(") && t.contains(") fn "))
+                || (t.starts_with("pub(") && t.contains(") async fn "))
+        };
+        let mut start = 0usize;
+        let mut end = src.len();
+        let mut header_index = 0usize;
+        let mut lines: Vec<(usize, &str)> = Vec::new();
+        for (index, (offset, line)) in line_offsets(src).enumerate() {
+            lines.push((offset, line));
+            if !is_fn_header(line) {
+                continue;
+            }
+            if offset <= at {
+                start = offset;
+                header_index = index;
+            } else if end == src.len() {
+                end = offset;
+            }
+        }
+        // Include the item's own doc comment and attributes: a
+        // `LIKE-OPERAND-ESCAPED-BY-CALLER` marker belongs in the doc, and an
+        // explanatory `///` above the `fn` line is part of the item.
+        let mut from = header_index;
+        while from > 0 {
+            let candidate = lines[from - 1].1.trim_start();
+            if candidate.starts_with("///")
+                || candidate.starts_with("//")
+                || candidate.starts_with("#[")
+            {
+                from -= 1;
+                start = lines[from].0;
+            } else {
+                break;
+            }
+        }
+        &src[start..end]
+    }
+
+    /// `(byte offset, line)` for every line of `src`.
+    fn line_offsets(src: &str) -> impl Iterator<Item = (usize, &str)> {
+        let mut offset = 0usize;
+        src.split_inclusive('\n').map(move |line| {
+            let at = offset;
+            offset += line.len();
+            (at, line.trim_end_matches('\n'))
+        })
+    }
+
+    /// Every `.rs` file under `backend/src`, scanned for the class. Read at
+    /// test time rather than from a hardcoded list so a NEW file carrying a
+    /// new site is covered too.
+    fn rust_sources() -> Vec<(std::path::PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(current) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    if let Ok(src) = std::fs::read_to_string(&path) {
+                        out.push((path, src));
+                    }
+                }
+            }
+        }
+        assert!(!out.is_empty(), "#3500: the source scan found no files");
+        out
+    }
+
+    /// Scan the tree and return `(offenders, sites_examined)`.
+    fn scan() -> (Vec<Offender>, usize) {
+        let mut offenders = Vec::new();
+        let mut examined = 0usize;
+
+        for (path, raw) in rust_sources() {
+            // This module's own prose describes the shape it hunts for.
+            if path.ends_with("api/handlers/mod.rs") {
+                continue;
+            }
+            let (flat, lines) = flatten(&raw);
+            for operator in OPERATORS {
+                for (at, _) in flat.match_indices(operator) {
+                    let from = at + operator.len();
+                    let to = (from + OPERAND_WINDOW).min(flat.len());
+                    let (from, to) = (floor_boundary(&flat, from), floor_boundary(&flat, to));
+                    let window = predicate_window(&flat[from..to]);
+
+                    // `LIKE ` inside `ILIKE ` is the same predicate, already
+                    // matched by the `ILIKE ` entry.
+                    if *operator == "LIKE "
+                        && flat[..at].ends_with(|c: char| c.is_ascii_alphanumeric())
+                    {
+                        continue;
+                    }
+                    // Only a pattern ASSEMBLED in SQL is in this class. The
+                    // pattern EXPRESSION ends at the next boolean operand or
+                    // the end of the SQL literal; without that bound a
+                    // constant pattern inherits the `||` of an unrelated
+                    // predicate further down the same statement.
+                    if !assembles_pattern(window) {
+                        continue;
+                    }
+                    // A Rust string mentioning the operator inside a comment
+                    // is not a predicate.
+                    let line_no = lines.get(at).copied().unwrap_or(0);
+                    let line = raw.lines().nth(line_no.saturating_sub(1)).unwrap_or("");
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    examined += 1;
+
+                    let location = format!("{}:{}", path.display(), line_no);
+                    let Some(clause) = escape_clause(window) else {
+                        offenders.push(Offender {
+                            location,
+                            line: line.trim().to_string(),
+                            reason: "no ESCAPE clause on a SQL-assembled pattern",
+                        });
+                        continue;
+                    };
+                    // `ESCAPE ''` disables escape processing: the operand is
+                    // derived in SQL and the Rust helper cannot reach it.
+                    if clause == "''" {
+                        continue;
+                    }
+                    // Otherwise the operand is a bind, and the clause alone is
+                    // a no-op (it names Postgres's default). Require the
+                    // escaper in the same function, or a verified marker.
+                    let owner = enclosing_fn(&raw, byte_of_line(&raw, line_no));
+                    if escapes_operand(&raw, owner) {
+                        continue;
+                    }
+                    if let Some(binders) = marker_binders(owner) {
+                        if binders.iter().all(|name| binder_escapes(&raw, name)) {
+                            continue;
+                        }
+                        offenders.push(Offender {
+                            location,
+                            line: line.trim().to_string(),
+                            reason: "the marker names a binder that does not escape its operand",
+                        });
+                        continue;
+                    }
+                    offenders.push(Offender {
+                        location,
+                        line: line.trim().to_string(),
+                        reason: "ESCAPE '\\' names Postgres's DEFAULT escape character, so it \
+                                 changes nothing on its own; the bound operand must go through \
+                                 one of the escape_like_literal helpers",
+                    });
+                }
+            }
+        }
+        (offenders, examined)
+    }
+
+    /// Trim a raw look-ahead window to the single PREDICATE that starts at the
+    /// operator: everything up to the next boolean operand or the end of the
+    /// enclosing SQL string literal.
+    ///
+    /// Without this the `ESCAPE` check is not scoped to the operator it
+    /// matched, and an `ESCAPE` belonging to a LATER predicate — even one in a
+    /// different function further down the flattened file — vouches for this
+    /// one. Caught in review on `… LIKE $2 || '%' ESCAPE '' AND … LIKE $3 ||
+    /// '%'`, where the unescaped second predicate borrowed the first's clause.
+    fn predicate_window(window: &str) -> &str {
+        let mut end = window.len();
+        for stop in ["\"", ";", " AND ", " OR "] {
+            if let Some(at) = window.find(stop) {
+                end = end.min(at);
+            }
+        }
+        &window[..floor_boundary(window, end)]
+    }
+
+    /// Whether the pattern expression starting at `window` is ASSEMBLED in
+    /// SQL rather than being a single constant, bind or column.
+    ///
+    /// Decided by reading the FIRST term of the pattern expression and asking
+    /// whether the very next token concatenates onto it. Searching the window
+    /// for a `||` anywhere instead would inherit the concatenation of an
+    /// unrelated later branch of the same statement — `NOT LIKE
+    /// 'oci-manifests/%'` followed twelve tokens later by a `UNION ALL SELECT
+    /// 'oci-blobs/' || digest` is a constant pattern, not a member of this
+    /// class.
+    fn assembles_pattern(window: &str) -> bool {
+        let expr = window.trim_start();
+        if expr.starts_with("concat(") {
+            return true;
+        }
+        match skip_term(expr) {
+            Some(rest) => rest.trim_start().starts_with("||"),
+            None => false,
+        }
+    }
+
+    /// Consume one SQL term — a quoted literal, a `$n` placeholder, a `{…}`
+    /// interpolation, or an identifier with an optional call/argument list —
+    /// and return what follows it.
+    fn skip_term(expr: &str) -> Option<&str> {
+        let bytes = expr.as_bytes();
+        let first = *bytes.first()?;
+        let mut i = 0usize;
+        match first {
+            b'\'' => {
+                i = 1;
+                loop {
+                    let close = expr[i..].find('\'')? + i;
+                    // `''` is an escaped quote inside a SQL literal.
+                    if bytes.get(close + 1) == Some(&b'\'') {
+                        i = close + 2;
+                        continue;
+                    }
+                    i = close + 1;
+                    break;
+                }
+            }
+            b'$' => {
+                i = 1;
+                while bytes.get(i).is_some_and(u8::is_ascii_alphanumeric) {
+                    i += 1;
+                }
+            }
+            b'{' => {
+                i = expr.find('}')? + 1;
+            }
+            _ => {
+                while bytes
+                    .get(i)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'.')
+                {
+                    i += 1;
+                }
+                if i == 0 {
+                    return None;
+                }
+                // A call: consume the balanced argument list.
+                if bytes.get(i) == Some(&b'(') {
+                    let mut depth = 0usize;
+                    for (offset, ch) in expr[i..].char_indices() {
+                        match ch {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += offset + 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        expr.get(i..)
+    }
+
+    /// Byte offset of the first character of 1-based `line_no`.
+    fn byte_of_line(src: &str, line_no: usize) -> usize {
+        line_offsets(src)
+            .nth(line_no.saturating_sub(1))
+            .map(|(at, _)| at)
+            .unwrap_or(0)
+    }
+
+    /// Largest index `<= at` that is a UTF-8 char boundary (the sources carry
+    /// em dashes, and slicing mid-codepoint would panic).
+    fn floor_boundary(src: &str, at: usize) -> usize {
+        let mut at = at.min(src.len());
+        while at > 0 && !src.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    /// The binder function names a [`CALLER_ESCAPES_MARKER`] comment lists.
+    fn marker_binders(owner: &str) -> Option<Vec<String>> {
+        let at = owner.find(CALLER_ESCAPES_MARKER)?;
+        let rest = &owner[at + CALLER_ESCAPES_MARKER.len()..];
+        let list = rest.lines().next()?;
+        let names: Vec<String> = list
+            .split(',')
+            .map(|n| n.trim().trim_end_matches('.').to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        (!names.is_empty()).then_some(names)
+    }
+
+    /// Whether `owner` escapes the value it binds — directly, or through a
+    /// helper in the same file that it calls.
+    ///
+    /// One level of call-following, because the escape step is routinely
+    /// factored out next to the query that needs it
+    /// (`proxy_helpers::reverse_suffix_for_like`, whose whole reason to exist
+    /// is that the reverse must happen BEFORE the escape). Following further
+    /// would start vouching for arbitrarily distant code.
+    fn escapes_operand(src: &str, owner: &str) -> bool {
+        if ESCAPERS.iter().any(|e| owner.contains(e)) {
+            return true;
+        }
+        called_helpers(src, owner)
+            .iter()
+            .any(|body| ESCAPERS.iter().any(|e| body.contains(e)))
+    }
+
+    /// Bodies of the same-file functions `owner` calls by name.
+    fn called_helpers<'a>(src: &'a str, owner: &str) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        for (at, line) in line_offsets(src) {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed
+                .split_once("fn ")
+                .filter(|(head, _)| head.is_empty() || head.ends_with(' '))
+                .map(|(_, rest)| rest)
+            else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once('(') else {
+                continue;
+            };
+            if name.is_empty() || !owner.contains(&format!("{name}(")) {
+                continue;
+            }
+            out.push(enclosing_fn(src, at));
+        }
+        out
+    }
+
+    /// Whether the named function in `src` escapes its operand.
+    fn binder_escapes(src: &str, name: &str) -> bool {
+        let Some(at) = src.find(&format!("fn {name}(")) else {
+            return false;
+        };
+        let owner = enclosing_fn(src, at);
+        escapes_operand(src, owner)
+    }
+
+    /// The whole class, in one assertion. A new site that assembles its
+    /// pattern in SQL without an escaping story fails here with its own file
+    /// and line.
+    #[test]
+    fn every_sql_assembled_like_pattern_escapes_its_operand() {
+        let (offenders, examined) = scan();
+        assert!(
+            examined >= 10,
+            "#3500: the scan examined only {examined} SQL-assembled pattern sites (13 at \
+             the time of writing); it has stopped recognising the shape and would pass \
+             vacuously"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#3500: a `LIKE` pattern assembled in SQL must escape its operand. Use \
+             `escape_like_literal` on the bound value and match under `ESCAPE '\\'` \
+             when the operand is a Rust value; use `ESCAPE ''` when it is a SQL \
+             expression the helper cannot reach. Offenders:\n{}",
+            offenders
+                .iter()
+                .map(|o| format!("  {}: {}\n      -> {}", o.location, o.line, o.reason))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// The scanner's own recognisers, pinned against the evasions found in
+    /// review: an `ESCAPE '\'` clause with a raw operand (#3500 fully live and
+    /// the gate green), a predicate wrapped across lines, the `~~` operator
+    /// form, `concat()`, a trailing SQL comment containing the word ESCAPE,
+    /// and two predicates on one line where only the first is escaped.
+    #[test]
+    fn the_scanner_recognises_the_shapes_it_claims_to() {
+        // The pattern-assembly recogniser.
+        for probe in [
+            "path LIKE $2 || '%'",
+            "path LIKE $2\n    || '%'",
+            "path LIKE\n    $2 || '%'",
+            "name ILIKE '%' || $2 || '%'",
+            "path ~~ $2 || '%'",
+            "path LIKE concat($2, '%')",
+            "path SIMILAR TO $2 || '%'",
+        ] {
+            assert!(
+                assembled_sites(probe) >= 1,
+                "the scanner must see a SQL-assembled pattern in {probe:?}"
+            );
+        }
+        // Two predicates on one line: BOTH must be examined.
+        assert_eq!(
+            assembled_sites("a.path LIKE $2 || '%' AND b.path LIKE $3 || '%'"),
+            2,
+            "a second predicate on the same line must not be skipped"
+        );
+        // A constant pattern is not in the class.
+        for probe in ["path LIKE 'maven/%'", "path LIKE ANY($2)"] {
+            assert_eq!(
+                assembled_sites(probe),
+                0,
+                "{probe:?} assembles no pattern in SQL and is out of this class"
+            );
+        }
+        // The ESCAPE recogniser.
+        assert!(escape_clause(" $2 || '%' ESCAPE '\\' AND x").is_some());
+        assert!(escape_clause(" $2 || '%' ESCAPE '' AND x").is_some());
+        assert_eq!(escape_clause(" $2 || '%' ESCAPE '' AND x"), Some("''"));
+        assert!(
+            escape_clause(" $2 || '%' -- TODO ESCAPE later").is_none(),
+            "the word ESCAPE in a trailing SQL comment is not an ESCAPE clause"
+        );
+        // The clause must belong to THIS operator, not a later predicate.
+        assert!(
+            escape_clause(predicate_window(
+                " $3 || '%'\" ); fn other() { LIKE $2 ESCAPE '\\'"
+            ))
+            .is_none(),
+            "an ESCAPE clause further down the flattened file must not vouch for an \
+             unescaped predicate"
+        );
+        assert!(
+            escape_clause(predicate_window(" $2 || '%' ESCAPE '' AND b.path LIKE $3")).is_some(),
+            "the predicate's own clause must still be found"
+        );
+    }
+
+    /// Count the SQL-assembled sites the scanner finds in a snippet, using the
+    /// same recogniser [`scan`] uses.
+    fn assembled_sites(probe: &str) -> usize {
+        let (flat, _) = flatten(probe);
+        let mut n = 0;
+        for operator in OPERATORS {
+            for (at, _) in flat.match_indices(operator) {
+                if *operator == "LIKE " && flat[..at].ends_with(|c: char| c.is_ascii_alphanumeric())
+                {
+                    continue;
+                }
+                let from = at + operator.len();
+                let to = (from + OPERAND_WINDOW).min(flat.len());
+                let window = &flat[floor_boundary(&flat, from)..floor_boundary(&flat, to)];
+                if assembles_pattern(window) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// The wrappers [`ESCAPERS`] accepts must really escape. Without this,
+    /// adding a name to that list would be a way to silence the gate.
+    #[test]
+    fn the_escaper_family_all_routes_through_the_helper() {
+        let src = include_str!("mod.rs");
+        for wrapper in ["escape_filename_for_like", "escape_path_prefix"] {
+            let at = src
+                .find(&format!("pub fn {wrapper}("))
+                .unwrap_or_else(|| panic!("{wrapper} is defined here"));
+            assert!(
+                enclosing_fn(src, at).contains("escape_like_literal("),
+                "#3500: `{wrapper}` is accepted as an escaper by the class gate, so it \
+                 must route through `escape_like_literal`"
+            );
+        }
     }
 }
