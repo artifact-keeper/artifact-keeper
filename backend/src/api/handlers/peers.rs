@@ -134,6 +134,22 @@ pub struct SubscriptionResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+impl From<crate::models::peer_instance::PeerRepoSubscription> for SubscriptionResponse {
+    fn from(s: crate::models::peer_instance::PeerRepoSubscription) -> Self {
+        Self {
+            id: s.id,
+            peer_instance_id: s.peer_instance_id,
+            repository_id: s.repository_id,
+            sync_enabled: s.sync_enabled,
+            replication_mode: s.replication_mode,
+            replication_schedule: s.replication_schedule,
+            replication_filter: s.replication_filter,
+            last_replicated_at: s.last_replicated_at,
+            created_at: s.created_at,
+        }
+    }
+}
+
 /// Result of `POST /:id/repositories/:repo_id/sync` (run-now trigger).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunNowResponse {
@@ -558,17 +574,7 @@ pub async fn get_assigned_repos(
         .list_subscriptions(id)
         .await?
         .into_iter()
-        .map(|s| SubscriptionResponse {
-            id: s.id,
-            peer_instance_id: s.peer_instance_id,
-            repository_id: s.repository_id,
-            sync_enabled: s.sync_enabled,
-            replication_mode: s.replication_mode,
-            replication_schedule: s.replication_schedule,
-            replication_filter: s.replication_filter,
-            last_replicated_at: s.last_replicated_at,
-            created_at: s.created_at,
-        })
+        .map(SubscriptionResponse::from)
         .collect();
     Ok(Json(items))
 }
@@ -654,17 +660,7 @@ pub async fn get_subscription(
 ) -> Result<Json<SubscriptionResponse>> {
     let service = PeerInstanceService::new(state.db.clone());
     let sub = service.get_subscription(id, repo_id).await?;
-    Ok(Json(SubscriptionResponse {
-        id: sub.id,
-        peer_instance_id: sub.peer_instance_id,
-        repository_id: sub.repository_id,
-        sync_enabled: sub.sync_enabled,
-        replication_mode: sub.replication_mode,
-        replication_schedule: sub.replication_schedule,
-        replication_filter: sub.replication_filter,
-        last_replicated_at: sub.last_replicated_at,
-        created_at: sub.created_at,
-    }))
+    Ok(Json(sub.into()))
 }
 
 /// Trigger an immediate sync for a single (peer, repo) subscription.
