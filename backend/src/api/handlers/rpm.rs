@@ -1288,7 +1288,9 @@ async fn repodata_proxy(
 
 async fn upstream_proxy(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, upstream_path)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
@@ -1331,12 +1333,45 @@ async fn upstream_proxy(
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
-    // A normal (non-`@N`) request only serves from Remote repos.
+    let filename = upstream_path.rsplit('/').next().unwrap_or(&upstream_path);
+
+    // Virtual repos walk their members here, same as `download_package` does for
+    // `/packages/`. Without this a group over Remote members 404s every real yum
+    // layout (`9-stream/BaseOS/…`, `elrepo/el9/…`, `rpm/<arch>/…`), because those
+    // paths reach this catch-all rather than the `/packages/` or `/repodata/`
+    // routes above. Worse than the 404: the generated `/repodata/` document a
+    // client fetches first renders from the `artifacts` table, which never holds
+    // proxy-cached content (#1278), so dnf is told the repository is empty and
+    // silently does nothing — the #1447 failure, fixed for Remote and missed here.
+    //
+    // `PathSuffix` matches this file's convention (the Remote arm below and
+    // `download_package` both key on the filename); it only affects Local members,
+    // since Remote members are resolved by proxy-fetching `upstream_path`.
+    if repo.repo_type == RepositoryType::Virtual {
+        return match proxy_helpers::try_remote_or_virtual_download(
+            &state,
+            auth.as_ref(),
+            &repo,
+            &ctx,
+            proxy_helpers::DownloadResponseOpts {
+                upstream_path: &upstream_path,
+                virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                default_content_type: "application/octet-stream",
+                content_disposition_filename: None,
+                suppress_upstream_proxy: false,
+            },
+        )
+        .await?
+        {
+            Some(resp) => Ok(resp),
+            None => Err((StatusCode::NOT_FOUND, "Not found").into_response()),
+        };
+    }
+
+    // A normal (non-`@N`) request otherwise only serves from Remote repos.
     if repo.repo_type != RepositoryType::Remote {
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
-
-    let filename = upstream_path.rsplit('/').next().unwrap_or(&upstream_path);
 
     // Cache hit by filename: serve the local copy.
     if let Some(hit) =
@@ -3743,6 +3778,63 @@ mod tests {
             .await
             .ok();
         f.teardown().await;
+    }
+
+    /// A virtual repo must walk its members on the arbitrary-path catch-all,
+    /// not just on `/packages/`. Real yum layouts put packages under
+    /// `9-stream/BaseOS/x86_64/os/…`, `elrepo/el9/x86_64/…`, `rpm/<arch>/…`,
+    /// all of which reach `upstream_proxy`, which used to 404 anything that was
+    /// not Remote. Two members, artifact only in the SECOND, so a fix that
+    /// merely tried the first member still fails.
+    #[tokio::test]
+    async fn test_rpm_virtual_upstream_path_resolves_from_later_member() {
+        let Some(f) = tdh::Fixture::setup("virtual", "rpm").await else {
+            return;
+        };
+
+        let (empty_id, _k1, empty_dir) = tdh::create_repo(&f.pool, "local", "rpm").await;
+        let (holder_id, holder_key, holder_dir) = tdh::create_repo(&f.pool, "local", "rpm").await;
+        // Anonymous callers only see PUBLIC members: `authorize_virtual_members`
+        // filters the walk, so private members would 404 for reasons unrelated
+        // to the path resolution under test.
+        tdh::publish_repo(&f.pool, empty_id).await;
+        tdh::publish_repo(&f.pool, holder_id).await;
+        let holder_repo = tdh::make_repo_info(holder_id, &holder_key, &holder_dir, "local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &holder_repo,
+            "el/9/x86_64/deep-2.0-1.x86_64.rpm",
+            "el/9/x86_64/deep-2.0-1.x86_64.rpm",
+            "deep",
+            "2.0-1",
+            "application/x-rpm",
+            bytes::Bytes::from_static(b"deep-member-rpm"),
+            f.user_id,
+        )
+        .await;
+
+        tdh::link_virtual_member(&f.pool, f.repo_id, empty_id, 0).await;
+        tdh::link_virtual_member(&f.pool, f.repo_id, holder_id, 1).await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/el/9/x86_64/deep-2.0-1.x86_64.rpm", f.repo_key)),
+        )
+        .await;
+
+        // Cleanup BEFORE asserting so a failure does not leak member rows/dirs.
+        tdh::cleanup_member_repo(&f.pool, empty_id, &empty_dir).await;
+        tdh::cleanup_member_repo(&f.pool, holder_id, &holder_dir).await;
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "virtual repo must resolve an arbitrary upstream path from a member"
+        );
+        assert_eq!(&body[..], b"deep-member-rpm");
     }
 
     // -----------------------------------------------------------------------
