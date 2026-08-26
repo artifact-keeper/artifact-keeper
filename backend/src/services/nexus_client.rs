@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::services::artifactory_client::{
     AqlRange, AqlResponse, AqlResult, ArtifactoryError, PropertiesResponse, RepositoryListItem,
-    SystemVersionResponse,
+    RetryConfig, SystemVersionResponse,
 };
 
 /// Nexus authentication credentials
@@ -24,8 +24,14 @@ pub struct NexusAuth {
 pub struct NexusClientConfig {
     pub base_url: String,
     pub auth: NexusAuth,
+    /// How long a read may stall with no bytes arriving. Not a deadline for the
+    /// whole request, so large downloads are not penalized for taking a while.
     pub timeout_secs: u64,
+    /// How long to wait for the connection itself.
+    pub connect_timeout_secs: u64,
     pub throttle_delay_ms: u64,
+    /// Backoff for transient upstream failures. Matches the Artifactory client.
+    pub retry_config: RetryConfig,
 }
 
 impl Default for NexusClientConfig {
@@ -37,7 +43,9 @@ impl Default for NexusClientConfig {
                 password: String::new(),
             },
             timeout_secs: 30,
+            connect_timeout_secs: 10,
             throttle_delay_ms: 100,
+            retry_config: RetryConfig::default(),
         }
     }
 }
@@ -150,8 +158,13 @@ pub struct NexusChecksum {
 impl NexusClient {
     /// Create a new Nexus client
     pub fn new(config: NexusClientConfig) -> Result<Self, ArtifactoryError> {
+        // `timeout()` covers reading the body, so it killed any download that
+        // took longer than it, reported as "error decoding response body". That
+        // made the real size limit depend on throughput. Bound the connect and
+        // per-read phases instead: a slow download survives, a dead one does not.
         let client = crate::services::http_client::base_client_builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .read_timeout(Duration::from_secs(config.timeout_secs))
             .build()?;
 
         Ok(Self { client, config })
@@ -160,13 +173,79 @@ impl NexusClient {
     /// Send an authenticated GET. Returns the raw response so the caller can
     /// map success/failure to its own error type and extract the body shape
     /// it needs (JSON, bytes, streaming).
+    ///
+    /// Retries 5xx, 429 (honouring `Retry-After`) and connect/read timeouts with
+    /// exponential backoff. Every request goes through here, so `get`,
+    /// `download_artifact` and `download_artifact_stream` all inherit it.
+    ///
+    /// Only the request and response-header phase is retried. A body that dies
+    /// mid-stream is not re-issued, since the caller is already consuming chunks;
+    /// `read_timeout` bounds that case and item-level retry is the caller's job.
     async fn send_authenticated(&self, url: String) -> Result<reqwest::Response, ArtifactoryError> {
-        self.client
-            .get(&url)
-            .basic_auth(&self.config.auth.username, Some(&self.config.auth.password))
-            .send()
-            .await
-            .map_err(ArtifactoryError::from)
+        let retry = &self.config.retry_config;
+        let mut attempt = 0;
+        let mut delay_ms = retry.initial_delay_ms;
+
+        loop {
+            let result = self
+                .client
+                .get(&url)
+                .basic_auth(&self.config.auth.username, Some(&self.config.auth.password))
+                .send()
+                .await;
+
+            // Classify without holding a borrow on `result`, so the non-retry
+            // path can return it as-is.
+            let retryable: Option<(u64, String)> = match &result {
+                Ok(response) if response.status().as_u16() == 429 => {
+                    let retry_after = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    Some((
+                        retry_after.map(|s| s * 1000).unwrap_or(delay_ms),
+                        "rate limited (429)".to_string(),
+                    ))
+                }
+                Ok(response) if response.status().is_server_error() => {
+                    Some((delay_ms, format!("server error {}", response.status())))
+                }
+                Err(e) if e.is_connect() || e.is_timeout() => {
+                    Some((delay_ms, format!("network error: {e}")))
+                }
+                _ => None,
+            };
+
+            let Some((wait_ms, reason)) = retryable else {
+                return result.map_err(ArtifactoryError::from);
+            };
+
+            if attempt >= retry.max_retries {
+                tracing::warn!(
+                    url = %url,
+                    reason = %reason,
+                    attempts = attempt + 1,
+                    "Nexus request failed and retries are exhausted"
+                );
+                return result.map_err(ArtifactoryError::from);
+            }
+
+            tracing::warn!(
+                url = %url,
+                reason = %reason,
+                wait_ms,
+                attempt = attempt + 1,
+                max_retries = retry.max_retries,
+                "Nexus request failed, retrying"
+            );
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            attempt += 1;
+            delay_ms = std::cmp::min(
+                (delay_ms as f64 * retry.backoff_multiplier) as u64,
+                retry.max_delay_ms,
+            );
+        }
     }
 
     /// Build an authenticated GET request
@@ -584,6 +663,7 @@ mod tests {
             },
             timeout_secs: 30,
             throttle_delay_ms: 0,
+            ..Default::default()
         })
         .unwrap();
         (server, client)
@@ -594,6 +674,93 @@ mod tests {
         let config = NexusClientConfig::default();
         assert_eq!(config.timeout_secs, 30);
         assert_eq!(config.throttle_delay_ms, 100);
+        assert_eq!(config.connect_timeout_secs, 10);
+        // A source restart must not permanently fail in-flight downloads.
+        assert!(config.retry_config.max_retries > 0);
+    }
+
+    /// Fast backoff so the retry tests do not sleep for seconds.
+    fn retrying_client(base_url: String, max_retries: u32) -> NexusClient {
+        NexusClient::new(NexusClientConfig {
+            base_url,
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            retry_config: RetryConfig {
+                max_retries,
+                initial_delay_ms: 1,
+                max_delay_ms: 5,
+                backoff_multiplier: 2.0,
+            },
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_retries_transient_5xx() {
+        let server = MockServer::start().await;
+        // 503 twice then success: what a source restart looks like mid-migration.
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let client = retrying_client(server.uri(), 3);
+        let bytes = client
+            .download_artifact("repo", "dir/file.bin")
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_gives_up_after_max_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = retrying_client(server.uri(), 2);
+        let err = client
+            .download_artifact("repo", "dir/file.bin")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ArtifactoryError::ApiError { status: 503, .. }),
+            "expected the 503 to surface once retries are exhausted, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_does_not_retry_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/missing.bin"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1) // a missing artifact is a definitive answer, not a transient one
+            .mount(&server)
+            .await;
+
+        let client = retrying_client(server.uri(), 3);
+        let err = client
+            .download_artifact("repo", "missing.bin")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ArtifactoryError::NotFound(_)), "got {err:?}");
     }
 
     #[test]
@@ -619,6 +786,7 @@ mod tests {
             },
             timeout_secs: 60,
             throttle_delay_ms: 200,
+            ..Default::default()
         };
         let client = NexusClient::new(config);
         assert!(client.is_ok());
@@ -916,6 +1084,7 @@ mod tests {
             },
             timeout_secs: 30,
             throttle_delay_ms: 0,
+            ..Default::default()
         })
         .unwrap();
 
