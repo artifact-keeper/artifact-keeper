@@ -1684,4 +1684,70 @@ mod tests {
     fn test_peer_write_guard_allows_admin() {
         assert!(admin_auth().require_admin().is_ok());
     }
+
+    /// The list and item routes must describe a subscription identically, which
+    /// is the whole point of both mapping through this `From`. Every field is
+    /// asserted because a mismatched pair here (e.g. schedule into filter)
+    /// still compiles: both are `Option`s of the same shape.
+    #[test]
+    fn test_subscription_response_from_row_carries_every_field() {
+        let id = Uuid::new_v4();
+        let peer_instance_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let created_at = chrono::Utc::now();
+        let last_replicated_at = created_at - chrono::Duration::minutes(5);
+
+        let row = crate::models::peer_instance::PeerRepoSubscription {
+            id,
+            peer_instance_id,
+            repository_id,
+            sync_enabled: true,
+            replication_mode: Some("mirror".to_string()),
+            replication_schedule: Some("0 * * * *".to_string()),
+            replication_filter: Some(serde_json::json!({"include_patterns": ["\\.tar\\.gz$"]})),
+            last_replicated_at: Some(last_replicated_at),
+            created_at,
+        };
+
+        let resp = SubscriptionResponse::from(row);
+
+        assert_eq!(resp.id, id);
+        assert_eq!(resp.peer_instance_id, peer_instance_id);
+        assert_eq!(resp.repository_id, repository_id);
+        assert!(resp.sync_enabled);
+        assert_eq!(resp.replication_mode.as_deref(), Some("mirror"));
+        assert_eq!(resp.replication_schedule.as_deref(), Some("0 * * * *"));
+        assert_eq!(
+            resp.replication_filter,
+            Some(serde_json::json!({"include_patterns": ["\\.tar\\.gz$"]}))
+        );
+        assert_eq!(resp.last_replicated_at, Some(last_replicated_at));
+        assert_eq!(resp.created_at, created_at);
+    }
+
+    /// `replication_mode` is nullable in the DB, and the dashboard bug this
+    /// change fixes was a wrong *default* being displayed. So a row with no
+    /// mode must arrive as `None` rather than being filled in.
+    #[test]
+    fn test_subscription_response_from_row_preserves_absent_mode() {
+        let row = crate::models::peer_instance::PeerRepoSubscription {
+            id: Uuid::new_v4(),
+            peer_instance_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            sync_enabled: false,
+            replication_mode: None,
+            replication_schedule: None,
+            replication_filter: None,
+            last_replicated_at: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let resp = SubscriptionResponse::from(row);
+
+        assert!(resp.replication_mode.is_none());
+        assert!(resp.replication_schedule.is_none());
+        assert!(resp.replication_filter.is_none());
+        assert!(resp.last_replicated_at.is_none());
+        assert!(!resp.sync_enabled);
+    }
 }
