@@ -37,7 +37,7 @@
 # a stale builder cache into a loud build failure instead of a silently
 # vulnerable stdlib. Raise GO_MIN_PATCH in lockstep with the backend
 # Dockerfiles when a new Go stdlib advisory lands.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH
