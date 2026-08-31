@@ -557,13 +557,16 @@ fn version_info_document(
 /// repository's own `download/` route, which already resolves a Remote miss
 /// upstream.
 ///
-/// The filename is taken from the upstream's own `artifact.filename` when it is
-/// addressable, because that is the name the download route will ask the
-/// upstream for; it falls back to the canonical
-/// `{namespace}-{name}-{version}.tar.gz` that Galaxy uses when the upstream
-/// omits or mangles it. `sha256` and `dependencies` are carried across
-/// unchanged -- the client verifies the tarball against that digest, so
-/// inventing one would be worse than passing none.
+/// The advertised filename is always the canonical
+/// `{namespace}-{name}-{version}.tar.gz` for the requested coordinate, and the
+/// upstream's `sha256` must be usable or the version is refused with a 502 --
+/// see [`rewrite_upstream_version_info`] for both invariants. `dependencies`
+/// is carried across unchanged.
+///
+/// Note the raw upstream document is cached by the proxy layer under its
+/// mutable-metadata TTL, so a refusal repeats from cache until that TTL
+/// expires and the upstream is consulted again; a refused version is never
+/// served in the interim, only re-refused.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_upstream_version_info(
     proxy: &ProxyService,
@@ -596,9 +599,16 @@ async fn fetch_upstream_version_info(
             .into_response()
     })?;
 
-    Ok(rewrite_upstream_version_info(
-        repo_key, namespace, name, version, &doc,
-    ))
+    rewrite_upstream_version_info(repo_key, namespace, name, version, &doc).map_err(|reason| {
+        tracing::warn!(
+            repository = %repo_key,
+            collection = %format!("{}.{}", namespace, name),
+            version = %version,
+            %reason,
+            "refusing to advertise an upstream collection version"
+        );
+        (StatusCode::BAD_GATEWAY, reason).into_response()
+    })
 }
 
 /// Fetch a collection's detail document from the upstream Galaxy server and
@@ -683,34 +693,71 @@ fn rewrite_upstream_collection_info(
 }
 
 /// Pure half of [`fetch_upstream_version_info`]: turn an upstream Galaxy
-/// version document into this repository's own.
+/// version document into this repository's own, or refuse it (`Err` carries
+/// the reason, surfaced by the caller as a 502).
+///
+/// Two upstream fields are load-bearing for integrity and are therefore
+/// validated rather than forwarded on trust:
+///
+/// * `artifact.filename` is only ever consulted, never advertised: the
+///   emitted `download_url` ALWAYS names the canonical
+///   `{namespace}-{name}-{version}.tar.gz` for the coordinate the client
+///   asked about. An upstream that names any other file (a different
+///   collection, a different version, a traversal) is attempting — or would
+///   enable — content substitution: the advertised URL would resolve through
+///   this repository's download route to bytes other than the version this
+///   document claims to describe. The mismatch is logged and ignored.
+/// * `artifact.sha256` must be a non-empty string. `ansible-galaxy` verifies
+///   the downloaded tarball only `if expected_hash:` — an empty string is
+///   falsy in Python, so relaying `""` silently DISABLES the client's
+///   integrity check, and this server does not verify the proxied bytes
+///   either. Inventing a digest would be worse than passing none, so a
+///   version whose upstream document carries no usable digest is refused
+///   outright rather than advertised as unverifiable.
 fn rewrite_upstream_version_info(
     repo_key: &str,
     namespace: &str,
     name: &str,
     version: &str,
     upstream: &serde_json::Value,
-) -> serde_json::Value {
-    let canonical = collection_filename(namespace, name, version);
-    // An upstream-supplied filename is interpolated into a URL this server
-    // publishes, so an unaddressable one is replaced by the canonical name
-    // rather than advertised: every `download_url` emitted here has to resolve
-    // back through this repository's own route to the version it names.
-    let filename = upstream
+) -> Result<serde_json::Value, String> {
+    let filename = collection_filename(namespace, name, version);
+    if let Some(claimed) = upstream
         .pointer("/artifact/filename")
         .and_then(|v| v.as_str())
-        .filter(|f| galaxy_coordinate_is_addressable(f))
-        .unwrap_or(&canonical)
-        .to_string();
+    {
+        if claimed != filename {
+            tracing::warn!(
+                repository = %repo_key,
+                collection = %format!("{}.{}", namespace, name),
+                version = %version,
+                upstream_filename = %claimed,
+                advertised = %filename,
+                "upstream artifact.filename does not name the requested version; \
+                 advertising the canonical filename instead (content-substitution guard)"
+            );
+        }
+    }
 
     let size_bytes = upstream
         .pointer("/artifact/size")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let sha256 = upstream
+    let sha256 = match upstream
         .pointer("/artifact/sha256")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s,
+        None => {
+            return Err(format!(
+                "Upstream did not supply an artifact sha256 for {}.{} {}; \
+                 refusing to advertise a version the client could not verify",
+                namespace, name, version
+            ));
+        }
+    };
     let dependencies = upstream
         .pointer("/metadata/dependencies")
         .cloned()
@@ -721,7 +768,7 @@ fn rewrite_upstream_version_info(
         .unwrap_or_else(|| serde_json::json!({}));
     let requires_ansible = upstream.get("requires_ansible").and_then(|v| v.as_str());
 
-    version_info_document(
+    Ok(version_info_document(
         repo_key,
         namespace,
         name,
@@ -734,7 +781,7 @@ fn rewrite_upstream_version_info(
         metadata,
         requires_ansible,
         0,
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +1112,34 @@ async fn version_info(
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
 
+        // Same fail-closed rule as the Remote branch: `ansible-galaxy` skips
+        // tarball verification when `artifact.sha256` is falsy, so a stored
+        // row with no checksum must be refused, not advertised with `""`.
+        // Every native upload computes the digest at ingest; a NULL/empty
+        // checksum means an out-of-band import and is a server-side data
+        // problem, hence 500 rather than 502.
+        let Some(sha256) = artifact
+            .checksum_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            tracing::error!(
+                repository = %repo_key,
+                collection = %format!("{}.{}", namespace, name),
+                version = %version,
+                artifact_id = %artifact.id,
+                "stored collection version has no sha256 checksum; refusing to \
+                 advertise a version the client could not verify"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Stored collection version has no sha256 checksum; refusing to \
+                 advertise a version the client could not verify",
+            )
+                .into_response());
+        };
+
         let json = version_info_document(
             &repo_key,
             &namespace,
@@ -1076,7 +1151,7 @@ async fn version_info(
             ),
             &collection_download_url(&repo_key, &artifact.path, &namespace, &name, &version),
             artifact.size_bytes.unwrap_or(0),
-            artifact.checksum_sha256.as_deref().unwrap_or_default(),
+            sha256,
             dependencies,
             metadata,
             None,
@@ -2786,7 +2861,8 @@ mod tests {
     fn test_rewrite_upstream_version_info_points_download_at_this_repo_3365() {
         let upstream: serde_json::Value =
             serde_json::from_str(&upstream_version_info_doc()).unwrap();
-        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream);
+        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream)
+            .expect("a complete upstream document must be accepted");
 
         assert_eq!(
             doc["download_url"], "/ansible/gx/download/testns-testcoll-1.5.1.tar.gz",
@@ -2823,12 +2899,86 @@ mod tests {
         let upstream = serde_json::json!({
             "artifact": { "filename": "../../../../etc/passwd", "sha256": "abc", "size": 1 },
         });
-        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream);
+        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream)
+            .expect("a document with a usable sha256 must be accepted");
         assert_eq!(
             doc["download_url"], "/ansible/gx/download/testns-testcoll-1.5.1.tar.gz",
-            "an unaddressable upstream filename must fall back to the canonical \
-             name, never be interpolated into an advertised URL: {doc}"
+            "an unaddressable upstream filename must never be interpolated into \
+             an advertised URL: {doc}"
         );
+    }
+
+    /// Content-substitution guard: an upstream `artifact.filename` that IS a
+    /// single addressable path segment but names a DIFFERENT collection or
+    /// version must not survive into the advertised `download_url`. The
+    /// document describes `testns.testcoll 1.5.1`; advertising
+    /// `other-coll-9.9.9.tar.gz` would make this repository's own download
+    /// route hand back another collection's bytes under this version's name.
+    #[test]
+    fn test_rewrite_upstream_version_info_pins_filename_to_the_requested_coordinate() {
+        let upstream = serde_json::json!({
+            "artifact": {
+                "filename": "evilns-evilcoll-9.9.9.tar.gz",
+                "sha256": "abc",
+                "size": 1,
+            },
+        });
+        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream)
+            .expect("a document with a usable sha256 must be accepted");
+        assert_eq!(
+            doc["download_url"], "/ansible/gx/download/testns-testcoll-1.5.1.tar.gz",
+            "an addressable-but-substituted upstream filename must not reach the \
+             advertised download_url: the URL must resolve to the version this \
+             document names: {doc}"
+        );
+        assert_eq!(
+            doc["artifact"]["filename"], "testns-testcoll-1.5.1.tar.gz",
+            "the advertised artifact.filename must be the canonical name for the \
+             requested coordinate: {doc}"
+        );
+    }
+
+    /// Integrity fail-closed: `ansible-galaxy` verifies the tarball only
+    /// `if expected_hash:`, so relaying an absent/null/non-string/empty
+    /// upstream sha256 as `""` silently disables the client's verification.
+    /// Such a version must be refused, not advertised.
+    #[test]
+    fn test_rewrite_upstream_version_info_refuses_an_unusable_sha256() {
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("no artifact object", serde_json::json!({})),
+            (
+                "sha256 absent",
+                serde_json::json!({ "artifact": { "filename": "testns-testcoll-1.5.1.tar.gz", "size": 1 } }),
+            ),
+            (
+                "sha256 null",
+                serde_json::json!({ "artifact": { "sha256": null, "size": 1 } }),
+            ),
+            (
+                "sha256 a number",
+                serde_json::json!({ "artifact": { "sha256": 12345, "size": 1 } }),
+            ),
+            (
+                "sha256 empty",
+                serde_json::json!({ "artifact": { "sha256": "", "size": 1 } }),
+            ),
+            (
+                "sha256 whitespace",
+                serde_json::json!({ "artifact": { "sha256": "   ", "size": 1 } }),
+            ),
+        ];
+        for (label, upstream) in cases {
+            let err = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream)
+                .expect_err(&format!(
+                    "an upstream document with {label} must be refused, not \
+                     advertised with an empty sha256 the client reads as \
+                     'skip verification'"
+                ));
+            assert!(
+                err.contains("sha256"),
+                "the refusal must name the missing digest ({label}): {err}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3133,6 +3283,140 @@ mod tests {
             "112653d7e4e462827f1521130849c650e9dbc403f8b2e9dd5040f2ddabff33ed"
         );
         assert_eq!(doc["metadata"]["dependencies"]["testns.other"], ">=1.0.0");
+    }
+
+    /// End-to-end shape of the sha256 refusal: an upstream version document
+    /// with no usable digest must surface as a 502 from the route, not as a
+    /// 200 whose empty `artifact.sha256` disables the client's verification.
+    #[tokio::test]
+    async fn test_remote_version_info_refuses_an_upstream_without_a_sha256() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        let doc_without_sha = serde_json::json!({
+            "version": "1.5.1",
+            "artifact": { "filename": "testns-testcoll-1.5.1.tar.gz", "size": 175162 },
+            "metadata": { "dependencies": {} },
+        })
+        .to_string();
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/1.5.1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(doc_without_sha))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/v3/collections/testns/testcoll/versions/1.5.1/",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a version whose upstream document carries no sha256 must be refused \
+             (502), not served with an empty digest; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("sha256"),
+            "the refusal must say why: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// The hosted branch of the same fail-closed rule: a locally-held row
+    /// whose `checksum_sha256` is empty (or NULL, were the constraint ever
+    /// relaxed) must be refused, because advertising `""` makes
+    /// `ansible-galaxy` skip tarball verification exactly as an upstream
+    /// omission does.
+    #[tokio::test]
+    async fn test_local_version_info_refuses_a_row_without_a_checksum() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "hosted-collection-storage-key",
+            "testns-testcoll-1.0.0.tar.gz",
+            "testns-testcoll",
+            "1.0.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"collection-bytes"),
+            f.user_id,
+        )
+        .await;
+
+        let uri = format!(
+            "/{}/api/v3/collections/testns/testcoll/versions/1.0.0/",
+            f.repo_key
+        );
+        // A realistic full-width digest: the column is CHAR(64), so a shorter
+        // value comes back space-padded and would make this test assert the
+        // padding instead of the guard.
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE repository_id = $2")
+            .bind(digest)
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("set control checksum");
+
+        // Control: with a stored checksum the row is advertised, digest intact.
+        let app = tdh::router_anon(super::router(), f.state.clone());
+        let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "control: a row with a checksum must be served; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            doc["artifact"]["sha256"], digest,
+            "control: the stored checksum must be advertised verbatim"
+        );
+
+        // The column is NOT NULL, so the realizable bad state is an empty
+        // string (an out-of-band import or migration writing ''); the handler
+        // guards NULL and '' identically.
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = '' WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("blank out checksum");
+
+        let app = tdh::router_anon(super::router(), f.state.clone());
+        let (status, body) = tdh::send(app, tdh::get(uri)).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a stored row with no checksum must be refused, not advertised with \
+             an empty sha256 the client reads as 'skip verification'; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("sha256"),
+            "the refusal must say why: {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// A hosted repository must keep answering from its own rows and must not
