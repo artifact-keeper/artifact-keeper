@@ -1430,6 +1430,67 @@ pub(crate) fn hosted_upload_pin(
     Some(ExpectedComponent::new(ecosystem, name, version))
 }
 
+/// Whether `repository_format` is a format for which a hosted upload SHOULD
+/// carry a component pin (currently the npm handler family).
+///
+/// Distinct from [`hosted_upload_pin`] returning `Some`: a format can expect a
+/// pin yet fail to produce a usable one — an empty/missing version, or bytes
+/// that are not the tarball the coordinate claims. That case graded nothing
+/// gradeable, so it must be recorded as a PARTIAL scan rather than an
+/// authoritative complete clean (#3604 defects 2 and 4). This predicate is how
+/// the orchestrator tells "unpinned because the format never pins" (a generic
+/// blob — a complete scan) from "unpinned because the pin could not be trusted"
+/// (a partial scan).
+pub(crate) fn format_expects_pin(repository_format: &str) -> bool {
+    crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == repository_format)
+        .map(|f| f.handler_key() == "npm")
+        .unwrap_or(false)
+}
+
+/// Whether `content` is plausibly the npm tarball `pin` names — a gzip tar
+/// shipping a `package/package.json` whose own `name`+`version` AGREE with the
+/// pin (#3604 defect 2).
+///
+/// The hosted pin is trusted from the registry's `artifacts` row. On the
+/// generic artifact endpoint that row's name/version are derived from URL path
+/// segments and never cross-checked against the bytes, so a 30-byte text file
+/// uploaded to `.../handlebars/4.0.11/notes.txt` was pinned to
+/// `handlebars@4.0.11` and graded as that component — 17 findings for a file
+/// that ships no code. The proxy serve path already performs exactly this check
+/// (`npm_claimed_identity` / `npm_identity_agrees` in the npm handler) before it
+/// scans; the hosted path inherited the pin but not the check.
+///
+/// A mismatch, or bytes that are not a readable npm tarball at all, means the
+/// pin cannot be trusted: the caller drops it and records the scan as PARTIAL
+/// rather than pinning — and grading — the wrong component. Name comparison is
+/// ecosystem-normalized (npm names are case-insensitive); version is exact.
+fn npm_pin_agrees_with_tarball(content: &Bytes, pin: &ExpectedComponent) -> bool {
+    let body = match crate::util::bounded_archive::read_metadata_from_tar_gz(&content[..], |p| {
+        p == std::path::Path::new("package/package.json")
+    }) {
+        Ok(Some(body)) => body,
+        // Absent entry, unreadable/oversized archive, or not a gzip tar at all.
+        _ => return false,
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let name = match v.get("name").and_then(|x| x.as_str()) {
+        Some(n) => n.trim(),
+        None => return false,
+    };
+    let version = match v.get("version").and_then(|x| x.as_str()) {
+        Some(x) => x.trim(),
+        None => return false,
+    };
+    ExpectedComponent::normalize_name(pin.ecosystem, name)
+        == ExpectedComponent::normalize_name(pin.ecosystem, &pin.name)
+        && version == pin.version.trim()
+}
+
 /// The minimal PEP 566 `METADATA` body that pins one installed Python
 /// distribution. Written under `<name>-<version>.dist-info/` because syft
 /// catalogs that layout but not the root `PKG-INFO` an sdist ships (#3003).
@@ -2538,6 +2599,33 @@ impl ExpectedComponent {
         Self::normalize_name(self.ecosystem, &self.name)
             == Self::normalize_name(self.ecosystem, &cataloged.name)
             && self.version.trim() == cataloged.version.trim()
+    }
+
+    /// A stable, comparable string identity for this pin, persisted on the
+    /// `scan_results` row as `pin_identity` (#3604).
+    ///
+    /// #3442 made the npm verdict a function of the request coordinate, so the
+    /// cross-artifact reuse key can no longer be the bytes alone: byte-identical
+    /// uploads under different coordinates grade differently. Recording this
+    /// string on the row lets [`ScanResultService::find_reusable_scan`] refuse a
+    /// row whose pin differs from the current request's pin.
+    ///
+    /// The name is normalized exactly as [`ExpectedComponent::normalize_name`]
+    /// normalizes it for catalog matching, so two spellings that grade
+    /// identically also dedup identically; the version is compared verbatim
+    /// (trimmed), matching [`ExpectedComponent::matches`]. The ecosystem is a
+    /// prefix so the same name+version in two ecosystems cannot alias.
+    pub fn pin_identity(&self) -> String {
+        let eco = match self.ecosystem {
+            ComponentEcosystem::Npm => "npm",
+            ComponentEcosystem::Python => "python",
+        };
+        format!(
+            "{}|{}|{}",
+            eco,
+            Self::normalize_name(self.ecosystem, &self.name),
+            self.version.trim()
+        )
     }
 }
 
@@ -5040,11 +5128,33 @@ impl ScannerService {
 
         let checksum = &artifact.checksum_sha256;
         let mut prepared = prepared.unwrap_or_default();
+
+        // #3442 builds a component pin from the artifact's own registry row.
+        // #3604 hardens two things around it before it is used or cached:
+        //
+        //  * The pin must AGREE with what the bytes claim about themselves. The
+        //    hosted pin is trusted from the `artifacts` row, whose name/version
+        //    are derived from URL path segments on the generic endpoint; a file
+        //    that is not the tarball its coordinate names must not be graded as
+        //    that component (`npm_pin_agrees_with_tarball`, defect 2). A missing
+        //    version already yields `None` here (defect 4).
+        //  * Whatever pin survives is recorded as this scan's `pin_identity` so
+        //    the cross-artifact reuse key cannot serve a verdict graded for one
+        //    coordinate as the answer for a byte-identical upload under a
+        //    DIFFERENT coordinate (defect 1, the CRITICAL one).
+        let format_wants_pin = format_expects_pin(&repository_format);
         let upload_pin = hosted_upload_pin(
             &repository_format,
             &artifact.name,
             artifact.version.as_deref(),
-        );
+        )
+        .filter(|pin| npm_pin_agrees_with_tarball(&content, pin));
+
+        // A format that SHOULD pin but produced no trustworthy pin graded
+        // nothing gradeable, so its clean verdict is not authoritative: record
+        // it PARTIAL, never as a complete clean (#3604 defects 2 and 4).
+        let pin_downgraded = format_wants_pin && upload_pin.is_none();
+        let pin_identity: Option<String> = upload_pin.as_ref().map(ExpectedComponent::pin_identity);
         let target = ScanTarget {
             artifact: &artifact,
             repository_key: &repository_key,
@@ -5156,6 +5266,12 @@ impl ScannerService {
                         scanner.scan_type(),
                         DEDUP_TTL_DAYS,
                         ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                        // #3604: a reusable row must have graded the SAME pin
+                        // identity as this request. `IS NOT DISTINCT FROM` in
+                        // the query makes NULL (unpinned) match only NULL, so a
+                        // pinned npm verdict is never handed back for an
+                        // unpinned request and vice versa.
+                        pin_identity.as_deref(),
                     )
                     .await
                     .ok()
@@ -5206,7 +5322,12 @@ impl ScannerService {
                             // running row eventually.
                             if let Err(e) = self
                                 .scan_result_service
-                                .convert_to_reused(target_id, source_id, artifact_id)
+                                .convert_to_reused(
+                                    target_id,
+                                    source_id,
+                                    artifact_id,
+                                    pin_identity.as_deref(),
+                                )
                                 .await
                             {
                                 warn!(
@@ -5244,7 +5365,12 @@ impl ScannerService {
                 let copied = match prepared_action {
                     PreparedScanAction::Reuse(target_id) => {
                         self.scan_result_service
-                            .convert_to_reused(target_id, source_scan.id, artifact_id)
+                            .convert_to_reused(
+                                target_id,
+                                source_scan.id,
+                                artifact_id,
+                                pin_identity.as_deref(),
+                            )
                             .await
                     }
                     PreparedScanAction::InsertFresh => {
@@ -5255,6 +5381,10 @@ impl ScannerService {
                                 artifact.repository_id,
                                 scanner.scan_type(),
                                 checksum,
+                                // #3604: the reused row records THIS request's
+                                // pin so it cannot later be handed to a
+                                // byte-identical upload under a different pin.
+                                pin_identity.as_deref(),
                             )
                             .await
                     }
@@ -5438,6 +5568,19 @@ impl ScannerService {
                     // SBOM endpoint and downstream attestation tooling can
                     // distinguish "lockfile present but unparseable" from
                     // "no lockfile present".
+                    //
+                    // #3604: a pin-expecting format (npm) that could not produce
+                    // a trustworthy pin — missing version (defect 4) or bytes
+                    // that do not match the coordinate (defect 2) — graded
+                    // nothing gradeable. A zero-finding row from it is not an
+                    // authoritative clean, so downgrade its completeness to
+                    // PARTIAL. `pin_downgraded` is false for genuinely unpinned
+                    // formats, which keep their scanner-derived completeness.
+                    let effective_completeness = if pin_downgraded {
+                        ScanCompleteness::Partial
+                    } else {
+                        scan_completeness
+                    };
                     self.scan_result_service
                         .complete_scan(
                             scan_result.id,
@@ -5449,7 +5592,10 @@ impl ScannerService {
                             info,
                             scanner_version.as_deref(),
                             started_at,
-                            scan_completeness.as_str(),
+                            effective_completeness.as_str(),
+                            // #3604: persist the pin identity that produced this
+                            // verdict so future reuse can require a match.
+                            pin_identity.as_deref(),
                         )
                         .await?;
 
@@ -5461,7 +5607,7 @@ impl ScannerService {
                         critical,
                         high,
                         scanner_version,
-                        scan_completeness.as_str(),
+                        effective_completeness.as_str(),
                     );
 
                     // Update quarantine status
@@ -8719,6 +8865,95 @@ mod tests {
         assert_eq!(hosted_upload_pin("npm", "lodash", None), None);
         assert_eq!(hosted_upload_pin("npm", "lodash", Some("   ")), None);
         assert_eq!(hosted_upload_pin("npm", "   ", Some("4.17.11")), None);
+    }
+
+    /// #3604 defect 4: `format_expects_pin` tells "unpinned because the format
+    /// never pins" (a complete scan) from "unpinned because a pin could not be
+    /// produced" (a partial scan). It must be true for the npm handler family
+    /// and false for everything else.
+    #[test]
+    fn test_format_expects_pin_is_npm_family_only() {
+        for f in ["npm", "yarn", "bower", "pnpm"] {
+            assert!(format_expects_pin(f), "{f} is an npm-handler format");
+        }
+        for f in [
+            "maven",
+            "gradle",
+            "pypi",
+            "generic",
+            "docker",
+            "not-a-format",
+        ] {
+            assert!(!format_expects_pin(f), "{f} does not pin");
+        }
+    }
+
+    /// #3604 defect 1: the identity string persisted on the row and compared by
+    /// the reuse key. Normalized name (npm is case-insensitive), verbatim
+    /// version, ecosystem prefix so cross-ecosystem collisions cannot alias.
+    #[test]
+    fn test_pin_identity_is_stable_and_normalized() {
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Npm, "Lodash", "4.17.11").pin_identity(),
+            "npm|lodash|4.17.11"
+        );
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Npm, "@Acme/Widget", " 2.0.0 ")
+                .pin_identity(),
+            "npm|@acme/widget|2.0.0"
+        );
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Python, "PyYAML", "5.3.1").pin_identity(),
+            "python|pyyaml|5.3.1"
+        );
+        // Two coordinates that must NOT share a cached verdict.
+        assert_ne!(
+            ExpectedComponent::new(ComponentEcosystem::Npm, "safe-first", "1.0.0").pin_identity(),
+            ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11").pin_identity(),
+        );
+    }
+
+    /// #3604 defect 2: the pin is trusted from the coordinate only if the bytes
+    /// are the tarball that coordinate names.
+    #[test]
+    fn test_npm_pin_agrees_with_tarball() {
+        let lodash = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11");
+
+        // A real tarball whose manifest matches -> trusted.
+        let good = tests_tarball("lodash", "4.17.11");
+        assert!(npm_pin_agrees_with_tarball(&good, &lodash));
+
+        // Same bytes, wrong coordinate (the priming attack) -> not trusted.
+        let safe_first = ExpectedComponent::new(ComponentEcosystem::Npm, "safe-first", "1.0.0");
+        assert!(!npm_pin_agrees_with_tarball(&good, &safe_first));
+
+        // Right name, wrong version -> not trusted (version is exact).
+        let other_ver = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.20");
+        assert!(!npm_pin_agrees_with_tarball(&good, &other_ver));
+
+        // Bytes that are not a tarball at all -> not trusted.
+        let notes = Bytes::from_static(b"just some notes, not a tarball\n");
+        assert!(!npm_pin_agrees_with_tarball(&notes, &lodash));
+    }
+
+    /// Minimal npm `.tgz` claiming `name@version` for the pure-helper tests.
+    fn tests_tarball(name: &str, version: &str) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, manifest.as_bytes()).unwrap();
+        let gz = builder.into_inner().unwrap();
+        let mut out = gz.finish().unwrap();
+        out.flush().unwrap();
+        Bytes::from(out)
     }
 
     /// #3003: identity comparison is ecosystem-aware. Python normalizes per
@@ -17678,17 +17913,52 @@ mod tests {
     }
 
     /// Insert one scannable artifact into the fixture repository and return its id.
-    async fn insert_scannable_artifact(
+    /// Build an in-memory npm `.tgz` shipping a `package/package.json` that
+    /// claims `name@version` — the standalone manifest `npm pack` always
+    /// writes and the one #3604's cross-check (`npm_pin_agrees_with_tarball`)
+    /// reads. Tests that expect a pin to SURVIVE must give the artifact real
+    /// tarball bytes whose manifest matches the coordinate, otherwise the
+    /// cross-check now (correctly) drops the pin.
+    fn npm_tarball_bytes(name: &str, version: &str) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, manifest.as_bytes()).unwrap();
+        let gz = builder.into_inner().unwrap();
+        let mut out = gz.finish().unwrap();
+        out.flush().unwrap();
+        Bytes::from(out)
+    }
+
+    /// Insert one scannable artifact into the fixture repository with fully
+    /// controlled bytes + checksum, and return its id. The reuse tests need
+    /// two artifacts under DIFFERENT coordinates that share the SAME checksum
+    /// (byte-identical uploads), which the checksum-generating helper below
+    /// cannot express.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_artifact_with(
         fx: &crate::api::handlers::test_db_helpers::Fixture,
         name: &str,
         version: Option<&str>,
         tag: &str,
+        checksum: &str,
+        content: Bytes,
     ) -> Uuid {
         let artifact_id = Uuid::new_v4();
         let storage_key = format!("{tag}/{artifact_id}.bin");
+        let size = content.len() as i64;
         fx.state
             .storage
-            .put(&storage_key, Bytes::from_static(b"artifact-bytes"))
+            .put(&storage_key, content)
             .await
             .expect("store artifact bytes");
         sqlx::query(
@@ -17697,20 +17967,68 @@ mod tests {
                 id, repository_id, name, version, path, size_bytes,
                 checksum_sha256, content_type, storage_key, is_deleted
             )
-            VALUES ($1, $2, $3, $4, $5, 14, $6, 'application/gzip', $7, false)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'application/gzip', $8, false)
             "#,
         )
         .bind(artifact_id)
         .bind(fx.repo_id)
         .bind(name)
         .bind(version)
-        .bind(format!("{name}/{}/{name}.tgz", version.unwrap_or("0")))
-        .bind(fresh_checksum())
+        .bind(format!(
+            "{tag}/{name}/{}/{name}.tgz",
+            version.unwrap_or("0")
+        ))
+        .bind(size)
+        .bind(checksum)
         .bind(&storage_key)
         .execute(&fx.pool)
         .await
         .expect("insert artifact");
         artifact_id
+    }
+
+    /// Insert one scannable artifact into the fixture repository and return its
+    /// id. The stored bytes are a real npm `.tgz` whose manifest claims
+    /// `name@version`, so #3604's tarball cross-check keeps the pin; an
+    /// unversioned artifact ships neutral bytes because it never pins anyway.
+    async fn insert_scannable_artifact(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        name: &str,
+        version: Option<&str>,
+        tag: &str,
+    ) -> Uuid {
+        let content = match version {
+            Some(v) => npm_tarball_bytes(name, v),
+            None => Bytes::from_static(b"artifact-bytes"),
+        };
+        insert_artifact_with(fx, name, version, tag, &fresh_checksum(), content).await
+    }
+
+    /// Read `scan_completeness` for an artifact's scan row.
+    async fn read_scan_completeness(pool: &sqlx::PgPool, artifact_id: Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT scan_completeness FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("read scan_completeness")
+    }
+
+    /// Read `(findings_count, critical_count, is_reused, pin_identity,
+    /// scan_completeness)` for an artifact's scan row.
+    async fn read_reuse_row(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+    ) -> (i32, i32, bool, Option<String>, Option<String>) {
+        sqlx::query_as::<_, (i32, i32, bool, Option<String>, Option<String>)>(
+            "SELECT findings_count, critical_count, is_reused, pin_identity, scan_completeness \
+             FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("read scan row")
     }
 
     /// #3442: the hosted-upload orchestration must hand the leaf scanner the
@@ -17765,6 +18083,25 @@ mod tests {
             seen[1], None,
             "an artifact with no version has no coordinate to pin, and must not be \
              graded as some other component"
+        );
+
+        // #3604 defect 4: the unversioned npm artifact could not be pinned, so
+        // the engine graded nothing gradeable. Recording that as an
+        // authoritative `complete` clean is the hollow-test species (e) the PR
+        // originally blessed; it must be `partial`. The versioned one pinned
+        // fine and stays `complete`.
+        let versioned_completeness = read_scan_completeness(&fx.pool, versioned).await;
+        let unversioned_completeness = read_scan_completeness(&fx.pool, unversioned).await;
+        assert_eq!(
+            versioned_completeness.as_deref(),
+            Some("complete"),
+            "a pinned npm scan grades a real component and stays complete"
+        );
+        assert_eq!(
+            unversioned_completeness.as_deref(),
+            Some("partial"),
+            "an npm upload that could not be pinned graded nothing gradeable and \
+             must be recorded partial, not an authoritative complete clean"
         );
 
         cleanup_scan_state(&fx.pool, fx.repo_id).await;
@@ -17909,6 +18246,318 @@ mod tests {
         assert_eq!(
             findings_count, 3,
             "unpinned formats must be unaffected by this change"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// A leaf scanner that models `grype dir:` faithfully for the reuse tests:
+    /// it grades ONLY the component it was handed as a pin, returning the pin's
+    /// CVEs when the pin matches `vuln` and nothing otherwise (an unpinned or
+    /// mismatched scan catalogs nothing). It records every pin it saw so a test
+    /// can prove which scans actually ran versus were served from cache.
+    struct PinGradingScanner {
+        seen_pin: Arc<Mutex<Vec<Option<ExpectedComponent>>>>,
+        vuln: ExpectedComponent,
+        vuln_findings: Vec<RawFinding>,
+    }
+
+    #[async_trait]
+    impl Scanner for PinGradingScanner {
+        fn name(&self) -> &str {
+            "pin-grading"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+        fn is_applicable_for_target(&self, _target: &ScanTarget<'_>) -> bool {
+            true
+        }
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("orchestration must call scan_target so the pin is visible")
+        }
+        async fn scan_target(
+            &self,
+            target: &ScanTarget<'_>,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            let pin = target.expected_component.cloned();
+            self.seen_pin.lock().unwrap().push(pin.clone());
+            let findings = if pin.as_ref() == Some(&self.vuln) {
+                self.vuln_findings.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(ScanOutput::findings_only(findings))
+        }
+    }
+
+    /// #3604 defect 1 (the CRITICAL one) + defect 2, end to end.
+    ///
+    /// #3442 made the npm verdict a function of the request coordinate, but the
+    /// cross-artifact reuse key still matched only `(checksum, scan_type)`, and
+    /// reuse is consulted BEFORE the scan runs. So byte-identical uploads under
+    /// different coordinates collapsed onto one cached verdict: a publisher with
+    /// only `write:artifacts` could prime a clean verdict under a throwaway name
+    /// and have it served for the real, vulnerable coordinate (and the reverse,
+    /// priming a flag to block good content).
+    ///
+    /// The bytes here ARE the vulnerable `lodash@4.17.11` tarball (its manifest
+    /// claims that identity). Published FIRST as `safe-first@1.0.0`, the #3604
+    /// cross-check sees the coordinate disagree with the manifest and grades it
+    /// UNPINNED (0 findings, `pin_identity` NULL). Published then as its real
+    /// coordinate `lodash@4.17.11`, the reuse key must refuse the NULL-pin row
+    /// and run its own pinned scan — 7 findings. A THIRD identical
+    /// `lodash@4.17.11` upload MUST still reuse the second's verdict, or the fix
+    /// is a blanket reuse-disable (a performance regression, not a fix). This
+    /// asserts each coordinate gets its OWN correct verdict, that neither reuses
+    /// the other's, across the unpinned↔pinned AND pinned↔pinned directions.
+    #[tokio::test]
+    async fn test_reuse_key_is_pinned_to_the_coordinate_not_only_the_bytes() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        // 7 distinct CVEs so the pin-dedup collapse cannot mask a miscount.
+        let lodash_cves: Vec<RawFinding> = [
+            (Severity::Critical, "CVE-2019-10744"),
+            (Severity::High, "CVE-2018-16487"),
+            (Severity::High, "CVE-2019-1010266"),
+            (Severity::High, "CVE-2020-8203"),
+            (Severity::Medium, "CVE-2021-23337"),
+            (Severity::Medium, "CVE-2020-28500"),
+            (Severity::Medium, "CVE-2018-3721"),
+        ]
+        .into_iter()
+        .map(|(severity, cve)| RawFinding {
+            severity,
+            title: cve.to_string(),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4.17.11".to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+        })
+        .collect();
+
+        let scanner = Arc::new(PinGradingScanner {
+            seen_pin: Arc::new(Mutex::new(Vec::new())),
+            vuln: ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11"),
+            vuln_findings: lodash_cves,
+        });
+        let service = scanner_service_with(&fx, scanner.clone());
+
+        // Same bytes (real lodash tarball), same checksum, three coordinates.
+        let bytes = npm_tarball_bytes("lodash", "4.17.11");
+        // A fresh checksum per run: the reuse key is checksum-scoped GLOBALLY
+        // (not per repository), so a constant would collide with rows left by a
+        // prior run of this test under a different repo id.
+        let shared_ck = fresh_checksum();
+
+        // 1) Prime under a throwaway name. The coordinate disagrees with the
+        //    tarball manifest, so #3604 grades it unpinned -> 0 findings.
+        let primed = insert_artifact_with(
+            &fx,
+            "safe-first",
+            Some("1.0.0"),
+            "prime",
+            &shared_ck,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(primed, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        // 2) The real coordinate, same bytes. Must NOT be served the primed
+        //    clean verdict; must run its own pinned scan.
+        let real = insert_artifact_with(
+            &fx,
+            "lodash",
+            Some("4.17.11"),
+            "real",
+            &shared_ck,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(real, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        // 3) A genuinely identical re-publish of the real coordinate. Legit
+        //    reuse: MUST be served #2's verdict (not a fresh scan).
+        let repeat = insert_artifact_with(
+            &fx,
+            "lodash",
+            Some("4.17.11"),
+            "repeat",
+            &shared_ck,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(repeat, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let (p_find, _p_crit, p_reused, p_pin, p_complete) = read_reuse_row(&fx.pool, primed).await;
+        assert_eq!(
+            (p_find, p_reused),
+            (0, false),
+            "the primed throwaway coordinate disagrees with the tarball, so it is \
+             graded unpinned and clean on its own bytes"
+        );
+        assert_eq!(p_pin, None, "an unpinned scan records a NULL pin_identity");
+        assert_eq!(
+            p_complete.as_deref(),
+            Some("partial"),
+            "an npm upload whose coordinate the bytes do not back is not an \
+             authoritative complete clean"
+        );
+
+        let (r_find, r_crit, r_reused, r_pin, _r_complete) = read_reuse_row(&fx.pool, real).await;
+        assert_eq!(
+            r_find, 7,
+            "the real coordinate must earn its OWN verdict; being handed the primed \
+             clean row is the attacker-controlled false clean #3604 closes"
+        );
+        assert_eq!(
+            r_crit, 1,
+            "the real coordinate's own Critical must be recorded"
+        );
+        assert!(
+            !r_reused,
+            "the real coordinate must NOT reuse the differently-pinned primed row"
+        );
+        assert_eq!(
+            r_pin.as_deref(),
+            Some("npm|lodash|4.17.11"),
+            "the real scan records the pin identity that produced it"
+        );
+
+        let (rep_find, _rep_crit, rep_reused, rep_pin, _c) = read_reuse_row(&fx.pool, repeat).await;
+        assert_eq!(
+            rep_find, 7,
+            "a genuinely identical re-publish gets the same verdict"
+        );
+        assert!(
+            rep_reused,
+            "legitimate reuse of a byte-AND-pin-identical scan must still work; \
+             disabling reuse entirely would be a performance regression, not a fix"
+        );
+        assert_eq!(rep_pin.as_deref(), Some("npm|lodash|4.17.11"));
+
+        // Exactly two scans actually ran (primed + real); the third was served
+        // from cache, so the scanner saw only two pins.
+        let seen = scanner.seen_pin.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "only the two distinct (bytes,pin) combinations run a scan; the \
+             identical re-publish is served from cache"
+        );
+        assert_eq!(
+            seen[0], None,
+            "the primed coordinate was graded unpinned (cross-check mismatch)"
+        );
+        assert_eq!(
+            seen[1],
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            )),
+            "the real coordinate was graded with its own pin"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// #3604 defect 2, isolated: a file whose bytes are NOT the tarball its
+    /// coordinate names must not be graded as that component. Uploading a plain
+    /// text file to `handlebars/4.0.11/notes.txt` (an npm repo) used to pin —
+    /// and grade — it as `handlebars@4.0.11`, yielding findings for a file that
+    /// ships no code. The pin must be dropped and the scan recorded partial.
+    #[tokio::test]
+    async fn test_hosted_npm_pin_requires_the_bytes_to_back_the_coordinate() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let scanner = Arc::new(PinGradingScanner {
+            seen_pin: Arc::new(Mutex::new(Vec::new())),
+            vuln: ExpectedComponent::new(ComponentEcosystem::Npm, "handlebars", "4.0.11"),
+            // If the pin were (wrongly) kept, these would be recorded.
+            vuln_findings: vec![RawFinding {
+                severity: Severity::Critical,
+                title: "CVE-2019-19919".to_string(),
+                description: None,
+                cve_id: Some("CVE-2019-19919".to_string()),
+                affected_component: Some("handlebars".to_string()),
+                affected_version: Some("4.0.11".to_string()),
+                fixed_version: None,
+                source: Some("grype".to_string()),
+                source_url: None,
+            }],
+        });
+        let service = scanner_service_with(&fx, scanner.clone());
+
+        // A 30-byte text file, NOT an npm tarball, at an npm coordinate.
+        let notes = Bytes::from_static(b"these are just some release notes\n");
+        let aid = insert_artifact_with(
+            &fx,
+            "handlebars",
+            Some("4.0.11"),
+            "notes",
+            &fresh_checksum(),
+            notes,
+        )
+        .await;
+        service
+            .scan_artifact_with_options(aid, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().as_slice(),
+            [None],
+            "bytes that are not the tarball the coordinate names must be scanned \
+             UNPINNED, never graded as that component"
+        );
+        let (findings, complete): (i32, Option<String>) = sqlx::query_as(
+            "SELECT findings_count, scan_completeness FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(aid)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read scan row");
+        assert_eq!(
+            findings, 0,
+            "a non-tarball file must not inherit the pinned component's CVEs"
+        );
+        assert_eq!(
+            complete.as_deref(),
+            Some("partial"),
+            "dropping an untrustworthy pin means the scan graded nothing gradeable"
         );
 
         cleanup_scan_state(&fx.pool, fx.repo_id).await;

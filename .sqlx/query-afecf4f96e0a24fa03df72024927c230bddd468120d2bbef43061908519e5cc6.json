@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id\n            FROM scan_results\n            WHERE checksum_sha256 = $1\n              AND scan_type = $2\n              AND status = 'completed'\n              AND completed_at > NOW() - (\n                  CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'\n              )::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id\n            FROM scan_results\n            WHERE checksum_sha256 = $1\n              AND scan_type = $2\n              AND status = 'completed'\n              AND pin_identity IS NOT DISTINCT FROM $5\n              AND completed_at > NOW() - (\n                  CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'\n              )::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -99,6 +99,7 @@
         "Bpchar",
         "Text",
         "Text",
+        "Text",
         "Text"
       ]
     },
@@ -123,5 +124,5 @@
       true
     ]
   },
-  "hash": "ed379d747d009b0b496a3002cf1b10f97fc2838334e06e029e3ed6edbbf80dc2"
+  "hash": "afecf4f96e0a24fa03df72024927c230bddd468120d2bbef43061908519e5cc6"
 }

@@ -7755,9 +7755,40 @@ async fn authorize_generic_upload(
 ///
 /// The raw-`PUT` and multipart entry points authorize the request and stream the
 /// body to a bounded scratch file (computing the content digests in one pass);
-/// this shared tail verifies declared checksums, runs any WASM format plugin,
-/// derives the artifact coordinates, and persists via the streaming service
-/// method — never buffering the whole artifact in memory.
+/// Derive `(name, version)` from a generic-upload path's `/`-separated
+/// segments.
+///
+/// The flat convention is `{name}/{version}/{filename...}`. #3604 defect 3: an
+/// npm SCOPED package's name is itself `@scope/name` and so spans TWO segments
+/// before the version — `@babel/traverse/7.23.0/x.tgz` is
+/// `@babel/traverse@7.23.0`. The flat parse reads that as `@babel@traverse`,
+/// and once #3442 turns the coordinate into a scan pin that pins a component
+/// which does not exist, so a genuinely vulnerable scoped package reads clean.
+/// Only npm-family repos use the `@scope/` convention (`is_npm_format`); every
+/// other format keeps the flat parse byte for byte. `fallback_name` is returned
+/// when the path is too short to carry a coordinate.
+fn derive_generic_path_coordinate(
+    path: &str,
+    is_npm_format: bool,
+    fallback_name: String,
+) -> (String, Option<String>) {
+    let segments: Vec<&str> = path.split('/').collect();
+    let npm_scoped = is_npm_format && segments.first().is_some_and(|s| s.starts_with('@'));
+    if npm_scoped && segments.len() >= 4 {
+        (
+            format!("{}/{}", segments[0], segments[1]),
+            Some(segments[2].to_string()),
+        )
+    } else if segments.len() >= 3 {
+        (segments[0].to_string(), Some(segments[1].to_string()))
+    } else {
+        (fallback_name, None)
+    }
+}
+
+/// After verifying declared checksums and running any WASM format plugin,
+/// this shared tail derives the artifact coordinates and persists via the
+/// streaming service method — never buffering the whole artifact in memory.
 #[allow(clippy::too_many_arguments)]
 async fn persist_generic_staged_upload(
     state: &SharedState,
@@ -7846,13 +7877,7 @@ async fn persist_generic_staged_upload(
     let (name, version) = if let Some(ref meta) = wasm_metadata {
         (name, meta.version.clone())
     } else {
-        let segments: Vec<&str> = path.split('/').collect();
-        if segments.len() >= 3 {
-            // Path follows {package_name}/{version}/{filename...} convention
-            (segments[0].to_string(), Some(segments[1].to_string()))
-        } else {
-            (name, None)
-        }
+        derive_generic_path_coordinate(&path, repo.format.handler_key() == "npm", name)
     };
 
     // #2367: on versioning-enabled Generic/Mlmodel repos an explicit
@@ -23535,6 +23560,63 @@ mod tests {
 // --------------------------------------------------------------------------
 // Unit tests: APT field validation helpers
 // --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod generic_path_coordinate_tests {
+    use super::derive_generic_path_coordinate;
+
+    #[test]
+    fn flat_coordinate_is_name_then_version() {
+        let (name, version) =
+            derive_generic_path_coordinate("lodash/4.17.11/lodash.tgz", true, "fallback".into());
+        assert_eq!(name, "lodash");
+        assert_eq!(version.as_deref(), Some("4.17.11"));
+    }
+
+    #[test]
+    fn npm_scoped_package_keeps_scope_with_name() {
+        // #3604 defect 3: the scope is PART of the name; the flat parse would
+        // read name=`@babel`, version=`traverse` and pin a component that does
+        // not exist, letting a vulnerable scoped package read clean.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/babel-traverse-7.23.0.tgz",
+            true,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel/traverse");
+        assert_eq!(version.as_deref(), Some("7.23.0"));
+    }
+
+    #[test]
+    fn scope_prefix_is_only_special_for_npm_formats() {
+        // A non-npm format never uses the `@scope/` convention, so the leading
+        // `@` segment is treated as an ordinary name and behavior is unchanged.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/x.tgz",
+            false,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel");
+        assert_eq!(version.as_deref(), Some("traverse"));
+    }
+
+    #[test]
+    fn too_short_path_falls_back() {
+        let (name, version) = derive_generic_path_coordinate("just-a-file.txt", true, "fb".into());
+        assert_eq!(name, "fb");
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn scoped_without_a_version_segment_falls_back_to_flat() {
+        // `@scope/name/file` has only three segments: not enough for a scoped
+        // coordinate, so the flat parse applies rather than mis-reading.
+        let (name, version) =
+            derive_generic_path_coordinate("@scope/name/file.tgz", true, "fb".into());
+        assert_eq!(name, "@scope");
+        assert_eq!(version.as_deref(), Some("name"));
+    }
+}
 
 #[cfg(test)]
 mod docker_tag_search_escape_tests {
