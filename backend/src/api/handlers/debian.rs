@@ -2110,7 +2110,7 @@ async fn maybe_invalidate_by_epoch(
         return;
     }
 
-    let metadata_key = match ProxyService::cache_metadata_key(repo_key, path) {
+    let metadata_key = match ProxyService::cache_metadata_key(proxy.cache_scope(), repo_key, path) {
         Ok(k) => k,
         Err(_) => return,
     };

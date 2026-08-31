@@ -1685,6 +1685,7 @@ pub fn build_proxy_service_with_fs(
     Arc::new(crate::services::proxy_service::ProxyService::new(
         pool,
         Arc::new(StorageService::new(backend)),
+        crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
     ))
 }
 

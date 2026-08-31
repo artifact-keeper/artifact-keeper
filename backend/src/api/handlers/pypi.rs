@@ -3558,9 +3558,12 @@ async fn pypi_proxy_cache_redirect(
     if !proxy.is_cache_fresh(repo_key, cache_path).await {
         return None;
     }
-    let cache_key =
-        crate::services::proxy_service::ProxyService::cache_storage_key(repo_key, cache_path)
-            .ok()?;
+    let cache_key = crate::services::proxy_service::ProxyService::cache_storage_key(
+        proxy.cache_scope(),
+        repo_key,
+        cache_path,
+    )
+    .ok()?;
     let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
     proxy_helpers::try_proxy_cache_redirect(
         storage.as_ref(),
@@ -9529,6 +9532,7 @@ mod tests {
         let cache_path = build_pypi_proxy_cache_path(&project, filename);
 
         let derived = crate::services::proxy_service::ProxyService::cache_storage_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
             "pypi-remote",
             &cache_path,
         )
@@ -12207,7 +12211,11 @@ mod tests {
         let storage_svc = std::sync::Arc::new(StorageService::new(storage));
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy");
-        crate::services::proxy_service::ProxyService::new(pool, storage_svc)
+        crate::services::proxy_service::ProxyService::new(
+            pool,
+            storage_svc,
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -12270,6 +12278,7 @@ mod tests {
         crate::services::proxy_service::ProxyService::new(
             pool,
             std::sync::Arc::new(StorageService::new(storage)),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         )
     }
 
@@ -12450,6 +12459,7 @@ mod tests {
         tdh::wait_for_cache_commit(&tmp, wheel_body.len() as u64).await;
         let cache_path = "simple/numpy/numpy-2.0.0-py3-none-any.whl";
         let metadata_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
             "pypi-remote",
             cache_path,
         )

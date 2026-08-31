@@ -1104,7 +1104,7 @@ async fn try_member_cache_redirect(
         return None;
     }
     let storage = proxy.cache_storage_backend();
-    let cache_key = ProxyService::cache_storage_key(&member.key, path).ok()?;
+    let cache_key = ProxyService::cache_storage_key(proxy.cache_scope(), &member.key, path).ok()?;
     if !(storage.supports_redirect() && proxy.is_cache_fresh(&member.key, path).await) {
         return None;
     }
@@ -1248,7 +1248,7 @@ pub async fn proxy_fetch_or_redirect(
     path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let cache_key = ProxyService::cache_storage_key(repo_key, path)
+    let cache_key = ProxyService::cache_storage_key(proxy_service.cache_scope(), repo_key, path)
         .map_err(|e| map_proxy_error(repo_key, path, e))?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     // #3209 (sibling of #3181): a presigned URL is signed for ONE HTTP method —
@@ -4997,9 +4997,16 @@ pub(crate) async fn record_proxy_download(
     // later authoritative upsert refines the same `(repo, path)` row in place.
     // A path whose key exceeds the object-store limit can never be cached, so
     // there is nothing to count — skip.
+    // The scope must come from the live `ProxyService` (#3454): a placeholder
+    // row keyed under a different scope than the tee writes would never be
+    // refined in place, leaving a permanently orphaned catalog row.
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return;
+    };
+    let scope = proxy.cache_scope();
     let (storage_key, metadata_key) = match (
-        crate::services::proxy_service::ProxyService::cache_storage_key(repo_key, path),
-        crate::services::proxy_service::ProxyService::cache_metadata_key(repo_key, path),
+        crate::services::proxy_service::ProxyService::cache_storage_key(scope, repo_key, path),
+        crate::services::proxy_service::ProxyService::cache_metadata_key(scope, repo_key, path),
     ) {
         (Ok(s), Ok(m)) => (s, m),
         _ => return,
@@ -12529,6 +12536,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 StdArc::new(FreshProxyCacheStorage),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
 
         let resp = resolve_virtual_download_streaming(
@@ -12634,6 +12642,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 cache.clone(),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
         // Per-test coordinate isolates the process-global metadata LRU (#2758).
         let path = format!("pkg/pkg-{}-py3-none-any.whl", Uuid::new_v4());
@@ -12801,6 +12810,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 backend,
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         )
     }
 
@@ -12917,6 +12927,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 fresh.clone(),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
         let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
         let state = db_helpers::build_state_presigned(pool, "s3-test", registry_storage.clone());
@@ -13012,6 +13023,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 held.clone(),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
 
         let err = resolve_virtual_download_streaming(
@@ -13184,6 +13196,7 @@ mod tests {
             let proxy = StdArc::new(crate::services::proxy_service::ProxyService::new(
                 fx.pool.clone(),
                 service,
+                crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
             ));
             let state =
                 tdh::build_state_with_proxy_presigned(fx.pool.clone(), &storage_path, proxy);

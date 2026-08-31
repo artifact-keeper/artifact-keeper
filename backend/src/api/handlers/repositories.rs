@@ -17901,8 +17901,18 @@ mod tests {
         let mut cached_files = Vec::new();
         for path in [html_path, json_path] {
             for key in [
-                ProxyService::cache_storage_key(&fx.repo_key, path).unwrap(),
-                ProxyService::cache_metadata_key(&fx.repo_key, path).unwrap(),
+                ProxyService::cache_storage_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
+                ProxyService::cache_metadata_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
             ] {
                 let file = fx.storage_dir.join(&key);
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();
