@@ -3864,6 +3864,105 @@ async fn cache_manifest_reference_locally(
         }
     }
 
+    // #3441: surface a pulled-through image in the packages catalog.
+    //
+    // NOTE: the proxy service's type name is deliberately spelled around in
+    // this comment. `cache_manifest_reference_locally_does_not_call_proxy_cache_artifact`
+    // greps this function's SOURCE for that literal, so writing it here fails
+    // that test on a comment alone (#1278's guard, and it caught this one).
+    //
+    // The Packages page reads `packages`/`package_versions` (via
+    // /api/v1/packages), NOT `artifacts`. `handle_put_manifest` learned to
+    // populate the catalog so a PUSHED image stopped being "pullable yet
+    // invisible"; the PROXY path never did, so an image pulled through a
+    // Remote (or through a Virtual repository with a Remote member) showed up
+    // only as manifest/blob rows in the flat artifact view and never as a
+    // package. The rows written above are what the artifact listing and the
+    // docker-tag grouping read; they are not what the Packages page reads.
+    //
+    // This is a direct call rather than a new arm in
+    // `catalog_indexable_format`. That allow-list gates
+    // `index_cached_package`, which only ever sees paths that flow through the
+    // shared proxy-fetch layer -- for OCI that is BLOBS. Manifests are cached here, by
+    // this function, deliberately outside that layer
+    // (`cache_manifest_reference_locally_does_not_call_proxy_cache_artifact`
+    // pins that: routing them through it reintroduces the #1278
+    // doubled-prefix bug, because manifests live in the per-repo location and
+    // the proxy cache writes to the global `proxy-cache/` backend). Widening
+    // the allow-list would therefore have indexed layer blobs -- digest-named,
+    // versionless, dozens per image -- and still not the image. The identity a
+    // user recognises exists only here.
+    //
+    // # Why tags only, and why that is the whole answer to the duplicate
+    // # question
+    //
+    // Gating on `oci_reference_is_tag` is what keeps a multi-manifest format
+    // from turning into catalog noise, and it is the SAME rule the push path
+    // already applies rather than a new policy invented here:
+    //
+    //   * `docker pull nginx:1.27` fetches the index by TAG (one package row,
+    //     `nginx` @ `1.27`) and then each architecture's child manifest BY
+    //     DIGEST -- those are not user-facing versions and produce no rows.
+    //   * `docker pull nginx@sha256:...` names no version a person chose, so
+    //     it produces no row either, exactly as a digest-only push does not.
+    //   * A re-pull of the same tag upserts the one row instead of adding to
+    //     it, so a busy proxy converges on one row per image per tag.
+    //
+    // The catalog row is therefore per (image, tag) -- one row for what the
+    // user actually asked for -- while the manifests and blobs stay in the
+    // artifact view where they belong.
+    //
+    // Size: the same pair of helpers the push path sizes with, and the two
+    // manifest classes land in genuinely different places -- measured, not
+    // assumed.
+    //
+    // An IMAGE manifest is sized exactly: `manifest_total_size` reads
+    // `config.size + layers[].size` out of the manifest body, so it is right
+    // WITHOUT its layers having been pulled, which matters here because on a
+    // proxy the manifest arrives before any blob.
+    //
+    // An image INDEX carries no config or layers of its own, so its size is the
+    // sum over the child manifests already cached -- and on a proxy that is 0
+    // on the first pull, because the children are fetched AFTER the index.
+    // It is not the case that an ordinary re-pull fixes it: a warm proxy cache
+    // serves the tag without re-entering this function, so the row is only
+    // recomputed once the cached tag has expired and the tag is re-fetched
+    // from upstream. Even then the sum is over the children's RECORDED
+    // artifact sizes, and the rows this function writes for a proxied child
+    // record the manifest body length rather than the image size -- so the
+    // number for a proxied multi-arch tag is not the image's download size.
+    // Verified live: a hosted push of a single-arch image records 54 bytes for
+    // a 37-byte config plus a 17-byte layer, while a proxied `alpine:3.19`
+    // index records 0. Correcting it means teaching the proxied
+    // child-manifest artifact rows to carry image sizes, which changes a
+    // shared pre-existing path that the docker-tag grouping also reads; that
+    // is filed on its own rather than smuggled in here. Showing the image at
+    // all is what #3441 is about, and a size that is honest about being a
+    // lower bound beats an invented one.
+    //
+    // Best-effort, like every other write in this function after the manifest
+    // body: a catalog failure must not fail the client's pull. The
+    // fire-and-forget wrapper logs it.
+    if oci_reference_is_tag(reference) {
+        let child_size = match class {
+            ManifestClass::Index => {
+                index_child_artifact_size_sum(&state.db, repo.id, &digest).await
+            }
+            _ => 0,
+        };
+        crate::services::package_service::PackageService::new(state.db.clone())
+            .try_create_or_update_from_artifact(
+                repo.id,
+                &repo.image,
+                reference,
+                manifest_total_size(content).saturating_add(child_size),
+                checksum,
+                None,
+                Some(serde_json::json!({ "format": "docker" })),
+            )
+            .await;
+    }
+
     Ok(digest)
 }
 
@@ -29838,6 +29937,228 @@ mod proxy_scan_block_tests {
             StatusCode::OK,
             "positive control: a clean image's layer still serves on a fail-closed repo"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3441: a pulled-through image must appear in the packages catalog
+    // -----------------------------------------------------------------------
+
+    /// Read the packages-catalog rows this repository holds, as
+    /// `(name, version, size_bytes)`. The Packages page reads this table via
+    /// `/api/v1/packages`; the `artifacts` table it does NOT read is asserted
+    /// separately, so a test can tell "the catalog gate skipped it" from
+    /// "the pull cached nothing at all".
+    async fn package_rows(pool: &sqlx::PgPool, repo_id: Uuid) -> Vec<(String, String, i64)> {
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT name, version, size_bytes FROM packages
+             WHERE repository_id = $1 ORDER BY name, version",
+        )
+        .bind(repo_id)
+        .fetch_all(pool)
+        .await
+        .expect("read packages")
+    }
+
+    async fn artifact_path_count(pool: &sqlx::PgPool, repo_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("count artifacts")
+    }
+
+    /// #3441: pulling an image THROUGH a Remote repository must surface it on
+    /// the Packages page. Before this, a proxied pull wrote `artifacts` and
+    /// `oci_tags` rows -- so the image showed in the flat artifact view and in
+    /// the Docker tag panel -- but never a `packages` row, which is the table
+    /// `/api/v1/packages` actually reads.
+    #[tokio::test]
+    async fn test_proxied_tag_pull_creates_a_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3441");
+        let layer = unique_fixture_bytes("layer-3441");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.27", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, "1.27").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the proxied pull itself must succeed"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "a tag pulled through a proxy must produce exactly one packages row; \
+             an empty catalog is #3441 -- the image is pullable and appears under \
+             artifacts, but never on the Packages page. Got {rows:?}"
+        );
+        assert_eq!(
+            rows[0].0, "app",
+            "the package is identified by the IMAGE name, not by the tag or the \
+             manifest path"
+        );
+        assert_eq!(rows[0].1, "1.27", "the tag is the package version");
+        // Sized from the FIXTURE's own bytes, not from anything the handler
+        // computed: config.size + layers[].size, which the manifest body
+        // carries even though no blob has been pulled yet.
+        assert_eq!(
+            rows[0].2,
+            (config.len() + layer.len()) as i64,
+            "an image manifest must be sized from its own config+layers, which is \
+             available on a proxy before any blob is fetched"
+        );
+    }
+
+    /// #3441, the noise control: a multi-manifest format must not turn one
+    /// `docker pull` into a pile of catalog rows. `docker pull image:tag`
+    /// fetches the index by TAG and then each architecture's child manifest BY
+    /// DIGEST; only the tag is a version a person chose.
+    ///
+    /// The assertion is deliberately two-sided -- the artifacts row MUST exist
+    /// while the packages row must not -- so this cannot pass because the pull
+    /// silently failed and cached nothing.
+    #[tokio::test]
+    async fn test_proxied_digest_pull_creates_no_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3441-digest");
+        let layer = unique_fixture_bytes("layer-3441-digest");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+        let reference = format!("sha256:{digest}");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            &reference,
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, &reference)
+            .await
+            .status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "the digest pull must succeed");
+        assert!(
+            artifacts > 0,
+            "the digest pull must still have cached the manifest as an artifact -- \
+             otherwise the packages assertion below proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "a digest-addressed pull names no version a user chose (it is how the \
+             child manifests of a multi-arch index are fetched), so it must add \
+             nothing to the catalog. Got {rows:?}"
+        );
+    }
+
+    /// #3441: re-pulling the same tag upserts the single row rather than
+    /// accumulating one per pull, so a busy proxy converges on one row per
+    /// image per tag instead of growing without bound.
+    #[tokio::test]
+    async fn test_proxied_tag_repull_keeps_one_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3441-repull");
+        let layer = unique_fixture_bytes("layer-3441-repull");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "stable",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let first = pull_manifest(&state, &fx.repo_key, "stable").await.status();
+        let second = pull_manifest(&state, &fx.repo_key, "stable").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(second, StatusCode::OK);
+        assert_eq!(
+            rows.len(),
+            1,
+            "two pulls of one tag must leave ONE catalog row, not one per pull: {rows:?}"
+        );
+        assert_eq!(rows[0].1, "stable");
+    }
+
+    /// #3441: an image INDEX pulled by tag is the common multi-arch case and
+    /// must produce the one row for the tag. Its children are referenced by
+    /// digest and contribute no rows of their own.
+    #[tokio::test]
+    async fn test_proxied_index_tag_pull_creates_one_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let index = index_manifest();
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "multi", &index, INDEX_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, "multi").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a multi-arch tag must produce exactly one catalog row -- one per \
+             architecture would be exactly the duplicate noise this gate exists \
+             to prevent. Got {rows:?}"
+        );
+        assert_eq!(rows[0].0, "app");
+        assert_eq!(rows[0].1, "multi");
     }
 }
 
