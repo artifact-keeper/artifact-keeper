@@ -1379,6 +1379,57 @@ pub(crate) fn npm_package_lock_pin_json(name: &str, version: &str) -> String {
     .to_string()
 }
 
+/// The component identity a NATIVELY PUBLISHED (hosted-upload) artifact must
+/// be graded as, or `None` when this format has no pin to write (#3442).
+///
+/// The proxy serve paths derive an [`ExpectedComponent`] from the REQUEST
+/// coordinate; a hosted upload has no request coordinate to derive one from,
+/// but it has something at least as trustworthy: the registry's own
+/// `artifacts` row, written by the format handler from the publish payload it
+/// already validated. That is what this turns into a pin.
+///
+/// Without it, `grype dir:` over an extracted npm tarball catalogs NOTHING —
+/// the directory-source cataloger set reads `package-lock.json` but not the
+/// standalone `package/package.json` a published tarball ships — so every
+/// natively-published npm package scanned as "0 findings, complete", which is
+/// indistinguishable from clean and silently voided every npm severity gate.
+///
+/// Deliberately narrow, because turning a pin on for a format CHANGES THE
+/// RESULTS operators already gate on:
+///
+/// * npm and its aliases (`yarn`/`bower`/`pnpm` all resolve to the npm handler
+///   and store the same `name`/`version` shape) get the lockfile pin.
+/// * Every other format — including PyPI, whose hosted **sdists** have the
+///   same blindness — returns `None` and keeps today's behavior byte for byte.
+///   PyPI is NOT folded in here: a hosted wheel already catalogs itself from
+///   its `.dist-info/METADATA`, so adding a pin there double-counts every
+///   top-level finding and needs the dedup the proxy path carries. Tracked in
+///   #3603, together with RubyGems/Cargo/NuGet — which have the same blindness
+///   but need new [`ComponentEcosystem`] variants — rather than widened into
+///   this fix.
+/// * An unknown/unparseable format key, an empty name, or a missing version
+///   also return `None`: a pin we cannot name correctly would grade the wrong
+///   component, which is worse than the gap it closes.
+pub(crate) fn hosted_upload_pin(
+    repository_format: &str,
+    name: &str,
+    version: Option<&str>,
+) -> Option<ExpectedComponent> {
+    let format = crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == repository_format)?;
+    let ecosystem = match format.handler_key() {
+        "npm" => ComponentEcosystem::Npm,
+        _ => return None,
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let version = version.map(str::trim).filter(|v| !v.is_empty())?;
+    Some(ExpectedComponent::new(ecosystem, name, version))
+}
+
 /// The minimal PEP 566 `METADATA` body that pins one installed Python
 /// distribution. Written under `<name>-<version>.dist-info/` because syft
 /// catalogs that layout but not the root `PKG-INFO` an sdist ships (#3003).
@@ -4908,9 +4959,12 @@ impl ScannerService {
         // externally routable identity (Grype's OCI `registry:` mode) require
         // the owning repository's key and type. Fetch those separately so the
         // artifact load stays compile-time column-checked via `query_as!`.
+        // `format` comes along for the ride because it selects the component
+        // pin this upload is graded against (#3442).
         let repo_routing = sqlx::query!(
             r#"
-            SELECT key AS repository_key, repo_type::text AS repository_type
+            SELECT key AS repository_key, repo_type::text AS repository_type,
+                   format::text AS repository_format
             FROM repositories
             WHERE id = $1
             "#,
@@ -4923,6 +4977,9 @@ impl ScannerService {
         let repository_type = repo_routing
             .repository_type
             .ok_or_else(|| AppError::Database("repository repo_type was NULL".to_string()))?;
+        let repository_format = repo_routing
+            .repository_format
+            .ok_or_else(|| AppError::Database("repository format was NULL".to_string()))?;
 
         // Check if scanning is enabled for this repo (skip check if forced)
         if !force
@@ -4983,6 +5040,11 @@ impl ScannerService {
 
         let checksum = &artifact.checksum_sha256;
         let mut prepared = prepared.unwrap_or_default();
+        let upload_pin = hosted_upload_pin(
+            &repository_format,
+            &artifact.name,
+            artifact.version.as_deref(),
+        );
         let target = ScanTarget {
             artifact: &artifact,
             repository_key: &repository_key,
@@ -4995,7 +5057,15 @@ impl ScannerService {
             // share the image manifest mediaType. Only meaningful for OCI
             // manifest artifacts; the gate ignores it for everything else.
             manifest_body: is_oci_image_artifact(&artifact).then(|| content.as_ref()),
-            expected_component: None,
+            // #3442: hosted uploads used to pass `None` here, so
+            // `ScanWorkspace::prepare_pinned` wrote no ecosystem-native
+            // metadata file and the CVE engine had nothing to catalog for a
+            // natively-published npm tarball -- it reported "0 findings,
+            // complete" for a package with known Critical CVEs. The pin comes
+            // from the registry's own artifacts row (see
+            // [`hosted_upload_pin`]), so it needs no network call and is
+            // `None` for every format that is not pinned.
+            expected_component: upload_pin.as_ref(),
             require_nonempty_catalog: false,
         };
 
@@ -5246,19 +5316,31 @@ impl ScannerService {
                     scan_completeness,
                     cataloged: _,
                 }) => {
-                    // Deliberately NOT deduped with `dedupe_findings`
-                    // (see its docs): this is one scanner's own output for
-                    // one hosted artifact scan, not the proxy path's
-                    // multi-scanner fold over an in-memory pin+archive. The
-                    // proxy inflation comes from `prepare_pinned` cataloging
-                    // one component twice; the hosted upload flow never
-                    // builds an `expected_component` pin (`expected_component:
-                    // None` at every hosted call site), so there is no
-                    // synthetic second copy for a single scanner to double
-                    // here. `findings` is also persisted verbatim via
-                    // `create_findings` below, so deduping only the count
-                    // without deduping the persisted rows would desync the
-                    // two — a larger change than this fix's scope.
+                    // Dedup ONLY when this upload carried a component pin
+                    // (#3442). The inflation is caused by the pin itself:
+                    // `prepare_pinned` writes a synthetic `package-lock.json`
+                    // naming the uploaded component and also stages any
+                    // shipped `npm-shrinkwrap.json` at a catalogable path, so
+                    // a tarball that ships a lockfile naming ITSELF is
+                    // cataloged up to three times and every one of its
+                    // findings is persisted (and counted) three times.
+                    // Measured on a hosted `lodash@4.17.11` that ships both
+                    // files: 21 findings / 3 critical for 7 real CVEs.
+                    //
+                    // Unpinned formats keep the previous behavior exactly:
+                    // there is no synthetic second copy for a single scanner
+                    // to double, and collapsing genuine duplicates they may
+                    // report is a separate decision. Deduping HERE (before
+                    // `total`) rather than at the count keeps the persisted
+                    // rows and the counts in sync, since `create_findings`
+                    // below writes this same vec. Dedup can never turn a
+                    // vulnerable result clean: every merge group keeps its
+                    // maximum-severity member, so a positive count only ever
+                    // shrinks toward the true distinct count.
+                    let findings = match upload_pin.as_ref() {
+                        Some(pin) => dedupe_findings(findings, Some(pin.ecosystem)),
+                        None => findings,
+                    };
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
                         findings.iter().filter(|f| f.severity == sev).count() as i32
@@ -8566,6 +8648,77 @@ mod tests {
         assert!(meta.contains("Name: PyYAML"), "{meta}");
         assert!(meta.contains("Version: 5.3.1"), "{meta}");
         assert!(meta.starts_with("Metadata-Version:"), "{meta}");
+    }
+
+    /// #3442: a hosted (natively published) upload gets its component pin from
+    /// the registry's own `artifacts` row. Before this, every hosted upload
+    /// passed `expected_component: None`, so `grype dir:` over an extracted
+    /// npm tarball cataloged nothing and reported "0 findings, complete" for
+    /// a package with known Critical CVEs.
+    ///
+    /// The expected values here are literals, never derived from the function
+    /// under test, and the negative arms use formats where `None` is the
+    /// CORRECT answer rather than a known gap: `maven` jars and PyPI wheels
+    /// are cataloged natively in directory mode (verified live: 4 and 1
+    /// matches respectively on vulnerable fixtures), and `generic` has no
+    /// package ecosystem at all.
+    #[test]
+    fn test_hosted_upload_pin_selects_the_npm_ecosystem() {
+        assert_eq!(
+            hosted_upload_pin("npm", "lodash", Some("4.17.11")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            )),
+            "a hosted npm upload must be pinned so the CVE engine has something to grade"
+        );
+
+        // Scoped names travel verbatim into the pin; the lockfile body keys
+        // `node_modules/@scope/name` off exactly this string.
+        assert_eq!(
+            hosted_upload_pin("npm", "@acme/widget", Some("2.0.0")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "@acme/widget",
+                "2.0.0"
+            )),
+        );
+
+        // The npm aliases are served by the npm handler and store the same
+        // name/version shape, so they pin identically.
+        for alias in ["yarn", "bower", "pnpm"] {
+            assert_eq!(
+                hosted_upload_pin(alias, "left-pad", Some("1.3.0")),
+                Some(ExpectedComponent::new(
+                    ComponentEcosystem::Npm,
+                    "left-pad",
+                    "1.3.0"
+                )),
+                "{alias} is an npm-handler format and must pin like npm"
+            );
+        }
+
+        // Formats the engine already catalogs on its own, and formats with no
+        // ecosystem, must stay exactly as they are today.
+        for format in ["maven", "gradle", "generic", "docker"] {
+            assert_eq!(
+                hosted_upload_pin(format, "commons-collections", Some("3.2.1")),
+                None,
+                "{format} is not pinned by this change"
+            );
+        }
+
+        // An unrecognised format label must fail safe rather than guess.
+        assert_eq!(
+            hosted_upload_pin("not-a-real-format", "lodash", Some("4.17.11")),
+            None,
+        );
+
+        // A pin we cannot name correctly would grade the wrong component.
+        assert_eq!(hosted_upload_pin("npm", "lodash", None), None);
+        assert_eq!(hosted_upload_pin("npm", "lodash", Some("   ")), None);
+        assert_eq!(hosted_upload_pin("npm", "   ", Some("4.17.11")), None);
     }
 
     /// #3003: identity comparison is ecosystem-aware. Python normalizes per
@@ -17434,6 +17587,328 @@ mod tests {
                 .unwrap_or_default()
                 .contains("does not apply"),
             "reason text must be preserved for display"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// Records the [`ScanTarget::expected_component`] the orchestration hands
+    /// each scanner, and replays a caller-supplied finding list. Both halves
+    /// are needed by the #3442 tests: one asserts WHICH component the hosted
+    /// upload path pins, the other asserts what happens to the findings a
+    /// pinned scan produces.
+    struct PinRecordingScanner {
+        seen_pin: Arc<Mutex<Vec<Option<ExpectedComponent>>>>,
+        findings: Vec<RawFinding>,
+    }
+
+    impl PinRecordingScanner {
+        fn new(findings: Vec<RawFinding>) -> Self {
+            Self {
+                seen_pin: Arc::new(Mutex::new(Vec::new())),
+                findings,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Scanner for PinRecordingScanner {
+        fn name(&self) -> &str {
+            "pin-recording"
+        }
+
+        fn scan_type(&self) -> &str {
+            // Must satisfy scan_results_scan_type_check against the real DB.
+            "grype"
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+
+        fn is_applicable_for_target(&self, _target: &ScanTarget<'_>) -> bool {
+            true
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("orchestration must call scan_target so the component pin is visible")
+        }
+
+        async fn scan_target(
+            &self,
+            target: &ScanTarget<'_>,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            self.seen_pin
+                .lock()
+                .unwrap()
+                .push(target.expected_component.cloned());
+            Ok(ScanOutput::findings_only(self.findings.clone()))
+        }
+    }
+
+    /// Build the `ScannerService` the orchestration tests drive, with one
+    /// injected leaf scanner.
+    fn scanner_service_with(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        scanner: Arc<dyn Scanner>,
+    ) -> ScannerService {
+        ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![scanner],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        }
+    }
+
+    /// Insert one scannable artifact into the fixture repository and return its id.
+    async fn insert_scannable_artifact(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        name: &str,
+        version: Option<&str>,
+        tag: &str,
+    ) -> Uuid {
+        let artifact_id = Uuid::new_v4();
+        let storage_key = format!("{tag}/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"artifact-bytes"))
+            .await
+            .expect("store artifact bytes");
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, version, path, size_bytes,
+                checksum_sha256, content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, $3, $4, $5, 14, $6, 'application/gzip', $7, false)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(name)
+        .bind(version)
+        .bind(format!("{name}/{}/{name}.tgz", version.unwrap_or("0")))
+        .bind(fresh_checksum())
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+        artifact_id
+    }
+
+    /// #3442: the hosted-upload orchestration must hand the leaf scanner the
+    /// component pin derived from the artifact's own registry row.
+    ///
+    /// Before the fix this call site passed `expected_component: None`
+    /// unconditionally, so `ScanWorkspace::prepare_pinned` wrote no
+    /// `package-lock.json` and `grype dir:` over the extracted tarball
+    /// cataloged zero components — a natively-published `lodash@4.17.11`
+    /// (1 Critical + 3 High) scanned `completed, findings_count = 0`.
+    ///
+    /// The negative arm is the SAME npm repository with an artifact that has
+    /// no version: the pin is unavailable there for a reason unrelated to the
+    /// format, which is what proves the call site forwards the helper's
+    /// decision instead of hard-coding one.
+    #[tokio::test]
+    async fn test_hosted_npm_scan_target_carries_the_component_pin() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let scanner = Arc::new(PinRecordingScanner::new(Vec::new()));
+        let service = scanner_service_with(&fx, scanner.clone());
+
+        let versioned = insert_scannable_artifact(&fx, "lodash", Some("4.17.11"), "pinned").await;
+        service
+            .scan_artifact_with_options(versioned, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let unversioned = insert_scannable_artifact(&fx, "lodash", None, "unpinned").await;
+        service
+            .scan_artifact_with_options(unversioned, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let seen = scanner.seen_pin.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "both artifacts must reach the scanner");
+        assert_eq!(
+            seen[0],
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            )),
+            "a hosted npm upload must be scanned with its own name@version pinned; \
+             without it the CVE engine catalogs nothing and reports a false clean"
+        );
+        assert_eq!(
+            seen[1], None,
+            "an artifact with no version has no coordinate to pin, and must not be \
+             graded as some other component"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// #3442: the pin makes the engine catalog the SAME identity more than
+    /// once whenever the archive also ships a lockfile naming itself — the
+    /// synthetic pin, the shipped `package-lock.json`, and the staged
+    /// `npm-shrinkwrap.json` copy are three catalog entries for one component.
+    /// Measured live on a hosted `lodash@4.17.11` shipping both files: 21
+    /// findings / 3 critical for 7 distinct CVEs.
+    ///
+    /// So a pinned scan collapses duplicates before the counts are taken AND
+    /// before the rows are persisted (the two must not desync). Distinct
+    /// component VERSIONS of the same CVE are real transitives and must
+    /// survive, which is what stops this from over-collapsing.
+    #[tokio::test]
+    async fn test_pinned_hosted_scan_collapses_pin_duplicated_findings() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let dup = |version: &str| RawFinding {
+            severity: Severity::Critical,
+            title: "Prototype pollution".to_string(),
+            description: None,
+            cve_id: Some("CVE-2019-10744".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some(version.to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+        };
+        // Three catalog entries for the uploaded component (pin + shipped
+        // lockfile + staged shrinkwrap) plus one genuine transitive at a
+        // different version.
+        let replay = vec![
+            dup("4.17.11"),
+            dup("4.17.11"),
+            dup("4.17.11"),
+            dup("3.10.1"),
+        ];
+
+        let scanner = Arc::new(PinRecordingScanner::new(replay));
+        let service = scanner_service_with(&fx, scanner.clone());
+        let artifact_id = insert_scannable_artifact(&fx, "lodash", Some("4.17.11"), "dedup").await;
+        service
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().as_slice(),
+            [Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            ))],
+            "this case is only meaningful for a PINNED scan"
+        );
+
+        let (findings_count, critical_count): (i32, i32) = sqlx::query_as(
+            "SELECT findings_count, critical_count FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read scan row");
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count findings");
+
+        assert_eq!(
+            findings_count, 2,
+            "the pin's own duplicate catalog entries must not inflate the count a \
+             promotion gate reads; the distinct transitive must survive"
+        );
+        assert_eq!(critical_count, 2, "severity counts follow the deduped list");
+        assert_eq!(
+            persisted, 2,
+            "the persisted rows must match the counts exactly, or the finding list \
+             and the summary disagree"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// The dedup above is driven BY THE PIN, not applied to every hosted scan:
+    /// an unpinned format keeps its previous behavior byte for byte. Without
+    /// this arm the same test would pass if the dedup were applied blindly to
+    /// every format, which would be a silent behaviour change well outside
+    /// #3442's scope.
+    #[tokio::test]
+    async fn test_unpinned_hosted_scan_findings_are_left_untouched() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "generic").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let dup = || RawFinding {
+            severity: Severity::High,
+            title: "Duplicated by the scanner itself".to_string(),
+            description: None,
+            cve_id: Some("CVE-2021-23337".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4.17.11".to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+        };
+
+        let scanner = Arc::new(PinRecordingScanner::new(vec![dup(), dup(), dup()]));
+        let service = scanner_service_with(&fx, scanner.clone());
+        let artifact_id =
+            insert_scannable_artifact(&fx, "blob", Some("1.0.0"), "unpinned-generic").await;
+        service
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().as_slice(),
+            [None],
+            "a generic repository has no package ecosystem and must stay unpinned"
+        );
+
+        let findings_count: i32 =
+            sqlx::query_scalar("SELECT findings_count FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read scan row");
+        assert_eq!(
+            findings_count, 3,
+            "unpinned formats must be unaffected by this change"
         );
 
         cleanup_scan_state(&fx.pool, fx.repo_id).await;

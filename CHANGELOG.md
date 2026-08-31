@@ -295,6 +295,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Reconciliation depends on a convention that is now written down: every CHANGELOG bullet names the issue it closes, and dependency bumps and `chore(release):` commits are the only commit shapes exempt from needing an entry. `### Sponsors` and `### Thank You` bullets credit whoever filed an issue and are not entries. Each new assertion has a self-test that constructs the bad state and proves it red, wired into the `shell-tests` job — including one that extracts the `Resolve release notes` block out of `release.yml` and executes it, so a revert to the silent fallback fails a test rather than passing review.
 
+- **Natively-published npm packages are actually scanned** (#3442). Grype scans of npm packages published directly to a hosted repository returned `0 findings` regardless of what the package contained. The hosted-upload scan path extracts the tarball into a workspace and runs the CVE engine in directory mode, and directory-source cataloging reads `package-lock.json` but not the standalone `package/package.json` that a published npm tarball ships — so the engine cataloged nothing, matched nothing, and reported a `completed` scan with zero findings and no error. "Nothing was assessed" and "the artifact is clean" were the same result. Verified on a hosted `lodash@4.17.11` (1 Critical + 3 High): `completed, findings_count = 0`, `0 cataloged`, against a current CVE database.
+
+  The machinery to fix this already existed and was simply not reachable from this path. The inline proxy gate (#3003/#3004) derives an `ExpectedComponent` from the request coordinate and materializes an ecosystem-native metadata file into the scan workspace so the engine has something to grade; every hosted call site passed `None`. A hosted upload has no request coordinate, but it has the registry's own `artifacts` row, written by the format handler from the publish payload it already validated — so the pin is now built from that. It costs no network call and reuses code already under test. The same `lodash@4.17.11` now reports 7 findings (1 Critical, 3 High, 3 Medium), matching what the engine reports for that coordinate directly; a genuinely clean package still reports zero.
+
+  Scoped deliberately to npm and its handler aliases (`yarn`, `bower`, `pnpm`). Formats the engine already catalogs on its own — Maven jars, PyPI wheels — are untouched, as is every format with no pin defined; PyPI sdists, RubyGems, Cargo and NuGet have the same blindness on the same path and are tracked in #3603 rather than widened into this fix, because each needs either a dedup design decision or a new pin ecosystem, and each carries its own upgrade note. Because the pin is a second catalog entry for the uploaded component, a tarball that also ships a `package-lock.json` or `npm-shrinkwrap.json` naming itself was cataloged up to three times and had each of its findings counted three times (measured: 21 findings / 3 Critical for 7 real CVEs); pinned scans now collapse those duplicates before the counts are taken and before the rows are persisted, so the summary and the finding list cannot disagree. Distinct component versions survive, and unpinned formats keep their previous behavior exactly.
+
 ### Security
 
 - **`wasmtime` is bumped to 36.0.14, closing RUSTSEC-2026-0269 (filesystem sandbox escape on trailing slashes)** (#3608). The advisory (`GHSA-vqjp-4c8c-hfgg`, CVSS v4 8.8 high) is a `cap-std` symlink-resolution bug reached through `wasmtime-wasi`: a guest given write access to any directory inside its sandbox can reach any filesystem location the host process can, and a guest with read-only access can do the same where a symlink already exists. wasmtime is not incidental here — it is the engine for the **WASM plugin system**, the one place this product deliberately executes code it did not build, so a broken filesystem sandbox is a failure of the exact control that system's threat model rests on. Both workspace pins move together, `wasmtime` and `wasmtime-wasi`, because the two crates must be compiled against each other; a lone `wasmtime-wasi` bump has failed CI here before on a version split. Staying inside 36.x is deliberate: it is the smallest version that satisfies the advisory, while the other patched lines (46.x, 47.x, 48.x) are ten-plus majors of `WasiView`/`WasiCtxView` and component-linker churn — a migration, not a patch. No source change was needed and no API moved.
@@ -302,6 +308,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **This was not a live escape on a deployed instance, and saying so is the point.** The advisory's precondition is a directory preopened into the guest sandbox, and there is no `preopened_dir` call in the backend: `PluginContext::new` builds the only WASI context in the codebase as `WasiCtxBuilder::new().inherit_stdio().build()`, so a plugin gets `wasi:filesystem` over an empty preopen set and has no descriptor to walk out of. Upstream also notes the specific `cap-std` bug does not affect a Linux kernel after 5.6 with `openat2`, which is a normal container host. **Plugin operators need take no action beyond upgrading, and no plugin needs to be re-reviewed for this.** What the bump buys is that the guarantee is real *before* someone needs it: granting a plugin a scratch directory or a staging path is a one-line, entirely reasonable future change, and on 36.0.13 that line would silently re-arm an 8.8 with no advisory left to notice it. Every released version — `v1.7.0` on 36.0.12 through `v1.8.1` on 36.0.13 — carries an affected pin.
 
   Lockfile and manifest only; the `wasmtime`, `cranelift`, `pulley`, `wiggle` and `winch` families move as one 36.0.13 to 36.0.14 set and no other crate changes. It also unblocks the repository: `🔒 Security Audit` runs a bare `cargo audit` and `✅ CI Complete` needs it, so this single advisory was failing every open pull request. The remaining `cargo audit` output — `fxhash` and `paste` unmaintained, `anyhow` and `event-listener` unsound, a `chacha20` yank — are warnings that do not fail the job and are deliberately untouched here rather than swept in or suppressed.
+
+### Upgrade note — npm scan results change, and npm promotion gates may start blocking
+
+This is a behavior change with a blast radius outside this repository, so read it before upgrading a deployment that gates on npm scan results.
+
+**Before this release, npm packages published directly to a hosted repository were not being scanned.** They were reported as scanned — `completed`, zero findings, no error — but the CVE engine had nothing to look at and graded nothing. Any promotion rule, quarantine policy, or severity threshold configured against npm has therefore been passing not because the packages were clean but because nothing was examined. **After upgrading, those same packages return their real findings**, and gates that have always passed will begin to fail for artifacts that have not changed. That is the correct outcome — a control that silently passes everything is worse than no control — but it will arrive as a blocked promotion if you are not expecting it.
+
+The change takes effect **at the next scan**, not at upgrade. Stored results are not rewritten, so previously-scanned artifacts keep their zero-finding rows until they are rescanned; newly published packages are graded correctly immediately. Note that a completed zero-finding row is reusable by checksum for 24 hours, so a rescan issued right after upgrading should pass `bypass_dedup: true` to avoid being handed the stale result it is trying to escape.
+
+**To size the blast radius before you upgrade**, list the hosted npm artifacts whose current clean verdict was never actually earned:
+
+```sql
+SELECT r.key AS repository, a.name, a.version, s.completed_at
+FROM scan_results s
+JOIN artifacts a ON a.id = s.artifact_id
+JOIN repositories r ON r.id = a.repository_id
+WHERE r.format IN ('npm', 'yarn', 'bower', 'pnpm')
+  AND r.repo_type IN ('local', 'staging')
+  AND s.scan_type = 'grype'
+  AND s.status = 'completed'
+  AND s.findings_count = 0
+  AND a.is_deleted = false
+ORDER BY r.key, a.name, a.version;
+```
+
+Every row is a package that will be graded for the first time on its next scan. Check those coordinates against your advisory source of choice, or upgrade a staging instance and rescan there, before you decide whether to upgrade with npm gates enabled. If you need to land the upgrade before you have triaged the list, raise the affected repositories' `max_severity` threshold or disable the npm promotion rule for the duration of triage rather than leaving a gate that blocks releases you have not looked at yet — and put the threshold back once you have.
+
 
 ## [1.8.1] - 2026-08-21
 
