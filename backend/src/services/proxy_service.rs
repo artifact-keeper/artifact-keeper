@@ -8474,10 +8474,16 @@ mod tests {
 
     #[test]
     fn test_catalog_indexable_format_other_formats_not_indexed() {
+        // These formats stay OUT of the shared proxy-fetch allow-list. For
+        // docker that does NOT mean "not catalog-indexed": proxied images ARE
+        // indexed (#3441), but at the manifest seam
+        // (`oci_v2::index_proxied_manifest_package`), after the inline scan
+        // gate -- the paths that flow through THIS layer for OCI are blobs,
+        // which must never become catalog rows.
         for f in ["npm", "pypi", "docker", "generic", "cargo", "nuget"] {
             assert!(
                 catalog_indexable_format(Some(f)).is_none(),
-                "{f} must not be catalog-indexed yet"
+                "{f} must not be indexed through the shared proxy-fetch layer"
             );
         }
     }

@@ -3864,104 +3864,16 @@ async fn cache_manifest_reference_locally(
         }
     }
 
-    // #3441: surface a pulled-through image in the packages catalog.
-    //
-    // NOTE: the proxy service's type name is deliberately spelled around in
-    // this comment. `cache_manifest_reference_locally_does_not_call_proxy_cache_artifact`
-    // greps this function's SOURCE for that literal, so writing it here fails
-    // that test on a comment alone (#1278's guard, and it caught this one).
-    //
-    // The Packages page reads `packages`/`package_versions` (via
-    // /api/v1/packages), NOT `artifacts`. `handle_put_manifest` learned to
-    // populate the catalog so a PUSHED image stopped being "pullable yet
-    // invisible"; the PROXY path never did, so an image pulled through a
-    // Remote (or through a Virtual repository with a Remote member) showed up
-    // only as manifest/blob rows in the flat artifact view and never as a
-    // package. The rows written above are what the artifact listing and the
-    // docker-tag grouping read; they are not what the Packages page reads.
-    //
-    // This is a direct call rather than a new arm in
-    // `catalog_indexable_format`. That allow-list gates
-    // `index_cached_package`, which only ever sees paths that flow through the
-    // shared proxy-fetch layer -- for OCI that is BLOBS. Manifests are cached here, by
-    // this function, deliberately outside that layer
-    // (`cache_manifest_reference_locally_does_not_call_proxy_cache_artifact`
-    // pins that: routing them through it reintroduces the #1278
-    // doubled-prefix bug, because manifests live in the per-repo location and
-    // the proxy cache writes to the global `proxy-cache/` backend). Widening
-    // the allow-list would therefore have indexed layer blobs -- digest-named,
-    // versionless, dozens per image -- and still not the image. The identity a
-    // user recognises exists only here.
-    //
-    // # Why tags only, and why that is the whole answer to the duplicate
-    // # question
-    //
-    // Gating on `oci_reference_is_tag` is what keeps a multi-manifest format
-    // from turning into catalog noise, and it is the SAME rule the push path
-    // already applies rather than a new policy invented here:
-    //
-    //   * `docker pull nginx:1.27` fetches the index by TAG (one package row,
-    //     `nginx` @ `1.27`) and then each architecture's child manifest BY
-    //     DIGEST -- those are not user-facing versions and produce no rows.
-    //   * `docker pull nginx@sha256:...` names no version a person chose, so
-    //     it produces no row either, exactly as a digest-only push does not.
-    //   * A re-pull of the same tag upserts the one row instead of adding to
-    //     it, so a busy proxy converges on one row per image per tag.
-    //
-    // The catalog row is therefore per (image, tag) -- one row for what the
-    // user actually asked for -- while the manifests and blobs stay in the
-    // artifact view where they belong.
-    //
-    // Size: the same pair of helpers the push path sizes with, and the two
-    // manifest classes land in genuinely different places -- measured, not
-    // assumed.
-    //
-    // An IMAGE manifest is sized exactly: `manifest_total_size` reads
-    // `config.size + layers[].size` out of the manifest body, so it is right
-    // WITHOUT its layers having been pulled, which matters here because on a
-    // proxy the manifest arrives before any blob.
-    //
-    // An image INDEX carries no config or layers of its own, so its size is the
-    // sum over the child manifests already cached -- and on a proxy that is 0
-    // on the first pull, because the children are fetched AFTER the index.
-    // It is not the case that an ordinary re-pull fixes it: a warm proxy cache
-    // serves the tag without re-entering this function, so the row is only
-    // recomputed once the cached tag has expired and the tag is re-fetched
-    // from upstream. Even then the sum is over the children's RECORDED
-    // artifact sizes, and the rows this function writes for a proxied child
-    // record the manifest body length rather than the image size -- so the
-    // number for a proxied multi-arch tag is not the image's download size.
-    // Verified live: a hosted push of a single-arch image records 54 bytes for
-    // a 37-byte config plus a 17-byte layer, while a proxied `alpine:3.19`
-    // index records 0. Correcting it means teaching the proxied
-    // child-manifest artifact rows to carry image sizes, which changes a
-    // shared pre-existing path that the docker-tag grouping also reads; that
-    // is filed on its own rather than smuggled in here. Showing the image at
-    // all is what #3441 is about, and a size that is honest about being a
-    // lower bound beats an invented one.
-    //
-    // Best-effort, like every other write in this function after the manifest
-    // body: a catalog failure must not fail the client's pull. The
-    // fire-and-forget wrapper logs it.
-    if oci_reference_is_tag(reference) {
-        let child_size = match class {
-            ManifestClass::Index => {
-                index_child_artifact_size_sum(&state.db, repo.id, &digest).await
-            }
-            _ => 0,
-        };
-        crate::services::package_service::PackageService::new(state.db.clone())
-            .try_create_or_update_from_artifact(
-                repo.id,
-                &repo.image,
-                reference,
-                manifest_total_size(content).saturating_add(child_size),
-                checksum,
-                None,
-                Some(serde_json::json!({ "format": "docker" })),
-            )
-            .await;
-    }
+    // #3441/#3611: the packages-catalog write does NOT happen here. This
+    // function runs BEFORE `maybe_gate_remote_manifest_scan` on the cold GET
+    // path (deliberately -- caching first is what gives the gate
+    // `manifest_blob_refs` to reassemble a layout from) and is also reached
+    // from the ungated HEAD handler, so a write here advertised scan-blocked
+    // content in the packages catalog and let a bare HEAD publish rows
+    // (#3611). The GET handler indexes via `index_proxied_manifest_package`
+    // only after the scan gate has agreed to serve, the same ordering
+    // `record_oci_manifest_pull` already follows for download counting
+    // (#3446).
 
     Ok(digest)
 }
@@ -3989,6 +3901,119 @@ async fn cache_manifest_or_compute_digest(
             compute_sha256(content)
         }
     }
+}
+
+/// #3441: surface a pulled-through image in the packages catalog.
+///
+/// The Packages page reads `packages`/`package_versions` (via
+/// /api/v1/packages), NOT `artifacts`. `handle_put_manifest` learned to
+/// populate the catalog so a PUSHED image stopped being "pullable yet
+/// invisible"; the PROXY path never did. The rows
+/// `cache_manifest_reference_locally` writes are what the artifact listing
+/// and the docker-tag grouping read; they are not what the Packages page
+/// reads.
+///
+/// This is a direct call rather than a new arm in `catalog_indexable_format`.
+/// That allow-list gates `index_cached_package`, which only ever sees paths
+/// that flow through the shared proxy-fetch layer -- for OCI that is BLOBS.
+/// Manifests are cached outside that layer on purpose (#1278's guard,
+/// `cache_manifest_reference_locally_does_not_call_proxy_cache_artifact`).
+/// Widening the allow-list would therefore have indexed layer blobs --
+/// digest-named, versionless, dozens per image -- and still not the image.
+/// The identity a user recognises exists only at the manifest seam.
+///
+/// # Ordering (#3611)
+///
+/// Called by `handle_get_manifest` strictly AFTER
+/// `maybe_gate_remote_manifest_scan` has agreed to serve, next to
+/// `record_oci_manifest_pull` and for the same reason (#3446): an image the
+/// gate refuses to serve must be neither counted as a download nor
+/// advertised in the packages catalog. It is NOT called from
+/// `handle_head_manifest` -- HEAD stays ungated (parity with the
+/// direct-Remote HEAD path), so a bare HEAD must not publish catalog rows
+/// either. A manifest cached by a refused pull is indexed by the next
+/// upstream re-fetch that passes the gate (the cached tag expires and the
+/// cold path re-enters).
+///
+/// # Why tags only, and why that is the whole answer to the duplicate
+/// # question
+///
+/// Gating on `oci_reference_is_tag` is what keeps a multi-manifest format
+/// from turning into catalog noise, and it is the SAME rule the push path
+/// already applies rather than a new policy invented here:
+///
+///   * `docker pull nginx:1.27` fetches the index by TAG (one package row,
+///     `nginx` @ `1.27`) and then each architecture's child manifest BY
+///     DIGEST -- those are not user-facing versions and produce no rows.
+///   * `docker pull nginx@sha256:...` names no version a person chose, so
+///     it produces no row either, exactly as a digest-only push does not.
+///   * A re-pull of the same tag upserts the one row instead of adding to
+///     it, so a busy proxy converges on one row per image per tag.
+///
+/// # Size
+///
+/// The same pair of helpers the push path sizes with, and the two manifest
+/// classes land in genuinely different places -- measured, not assumed.
+///
+/// An IMAGE manifest is sized exactly: `manifest_total_size` reads
+/// `config.size + layers[].size` out of the manifest body, so it is right
+/// WITHOUT its layers having been pulled, which matters here because on a
+/// proxy the manifest arrives before any blob.
+///
+/// An image INDEX carries no config or layers of its own, so its size is the
+/// sum over the child manifests already cached -- and on a proxy that is 0
+/// on the first pull, because the children are fetched AFTER the index.
+/// It is not the case that an ordinary re-pull fixes it: a warm proxy cache
+/// serves the tag without re-entering the cold path, so the row is only
+/// recomputed once the cached tag has expired and the tag is re-fetched
+/// from upstream. Even then the sum is over the children's RECORDED
+/// artifact sizes, and the rows the cache function writes for a proxied
+/// child record the manifest body length rather than the image size -- so
+/// the number for a proxied multi-arch tag is not the image's download size.
+/// Verified live: a hosted push of a single-arch image records 54 bytes for
+/// a 37-byte config plus a 17-byte layer, while a proxied `alpine:3.19`
+/// index records 0. Correcting it means teaching the proxied child-manifest
+/// artifact rows to carry image sizes, which changes a shared pre-existing
+/// path that the docker-tag grouping also reads; that is filed on its own
+/// rather than smuggled in here. Showing the image at all is what #3441 is
+/// about, and a size that is honest about being a lower bound beats an
+/// invented one.
+///
+/// Best-effort: a catalog failure must not fail the client's pull. The
+/// fire-and-forget wrapper logs it.
+async fn index_proxied_manifest_package(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    reference: &str,
+    content: &Bytes,
+    digest: &str,
+) {
+    if !oci_reference_is_tag(reference) {
+        return;
+    }
+    let class = classify_manifest(content);
+    if matches!(class, ManifestClass::Malformed) {
+        // Not a real manifest: the cache function kept the body for the
+        // client but recorded no tag row (#1409 C1); the catalog mirrors
+        // that and records nothing.
+        return;
+    }
+    let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
+    let child_size = match class {
+        ManifestClass::Index => index_child_artifact_size_sum(&state.db, repo.id, digest).await,
+        _ => 0,
+    };
+    crate::services::package_service::PackageService::new(state.db.clone())
+        .try_create_or_update_from_artifact(
+            repo.id,
+            &repo.image,
+            reference,
+            manifest_total_size(content).saturating_add(child_size),
+            checksum,
+            None,
+            Some(serde_json::json!({ "format": "docker" })),
+        )
+        .await;
 }
 
 /// Try to fetch an OCI resource from the upstream registry for a remote repo.
@@ -8059,6 +8084,10 @@ async fn handle_head_manifest(
             ct.as_deref(),
         )
         .await;
+        // #3611: deliberately NO `index_proxied_manifest_package` here. HEAD
+        // is ungated (see above), so publishing catalog rows from it let a
+        // bare HEAD advertise content the scan gate refuses to serve. The
+        // catalog write lives on the GET path, after its scan gate.
         return build_oci_proxy_response(
             &content,
             ct,
@@ -9370,6 +9399,11 @@ async fn handle_get_manifest(
         // the gate refuses to serve is not counted as a download, and using the
         // same manifest path the fetch above cached under so the cold pull and
         // every subsequent warm pull accumulate on one catalog row.
+        //
+        // #3611: the packages-catalog write obeys the same ordering, and for
+        // the same reason -- a pull the gate refused must not advertise the
+        // image on the Packages page or in /v2/_catalog.
+        index_proxied_manifest_package(state, &repo, reference, &content, &digest).await;
         record_oci_manifest_pull(state, &repo, reference, &digest, ctx).await;
         return with_scan_pending_header(
             build_oci_proxy_response(
@@ -30159,6 +30193,260 @@ mod proxy_scan_block_tests {
         );
         assert_eq!(rows[0].0, "app");
         assert_eq!(rows[0].1, "multi");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3611: the catalog write sits on the SERVE side of the scan gate
+    // -----------------------------------------------------------------------
+
+    /// HEAD through the real router (the same anonymous auth as
+    /// `pull_manifest`). HEAD is deliberately ungated, which is exactly why it
+    /// must not publish catalog rows.
+    async fn head_manifest(state: &SharedState, repo_key: &str, reference: &str) -> Response {
+        let app = tdh::router_anon(router(), state.clone());
+        let req = Request::builder()
+            .method("HEAD")
+            .uri(format!("/{repo_key}/app/manifests/{reference}"))
+            .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.expect("oneshot")
+    }
+
+    /// #3611 defect 1: a scan-BLOCKED cold pull must leave the packages
+    /// catalog EMPTY. Before the fix the catalog write ran inside
+    /// `cache_manifest_reference_locally`, i.e. before
+    /// `maybe_gate_remote_manifest_scan`, so a 403'd pull still advertised
+    /// the image on the Packages page and in /v2/_catalog.
+    ///
+    /// The assertion is two-sided: the `artifacts` cache rows MUST exist
+    /// (caching before the gate is deliberate -- it is what gives the gate
+    /// `manifest_blob_refs` to reassemble a layout from), so an empty
+    /// `packages` cannot be explained by the pull having cached nothing.
+    #[tokio::test]
+    async fn test_scan_blocked_pull_does_not_index_package_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-blocked");
+        let layer = unique_fixture_bytes("layer-3611-blocked");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                2,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "precondition: the gate must refuse this pull"
+        );
+        assert!(
+            artifacts > 0,
+            "the refused pull still caches the manifest (deliberate; the gate \
+             needs the refs) -- without this the packages assertion below \
+             proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "an image the scan gate refuses to serve must NOT be advertised in \
+             the packages catalog; a row here means the catalog write ran on \
+             the wrong side of `maybe_gate_remote_manifest_scan`. Got {rows:?}"
+        );
+    }
+
+    /// #3611 positive control for the ordering: with the SAME fail_closed
+    /// policy, a pull the gate agrees to serve (fresh clean verdict, matching
+    /// live scanner) must still index exactly one catalog row. Together with
+    /// the blocked case above this pins the ordering, not merely the
+    /// existence, of the write.
+    #[tokio::test]
+    async fn test_scan_allowed_pull_still_indexes_package_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-allowed");
+        let layer = unique_fixture_bytes("layer-3611-allowed");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            storage_path.as_str(),
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-1.0.0-test"),
+                rescan: MockCveRescan::Error,
+            })],
+        );
+
+        let status = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "precondition: the gate must agree to serve this pull"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "an ALLOWED pull on the same fail_closed repo must still index -- \
+             moving the write behind the gate must not lose the #3441 fix. \
+             Got {rows:?}"
+        );
+        assert_eq!(rows[0].0, "app");
+        assert_eq!(rows[0].1, "1.0");
+    }
+
+    /// #3611 defect 2 (catalog half): a bare HEAD -- no prior GET -- must not
+    /// publish catalog rows. HEAD is deliberately ungated (parity with the
+    /// direct-Remote HEAD path), so before the fix it both bypassed the scan
+    /// gate's catalog ordering AND let an existence probe mutate the catalog.
+    /// The two-sided artifact assertion again keeps the empty-catalog check
+    /// falsifiable: the HEAD really did reach the cache path.
+    #[tokio::test]
+    async fn test_head_manifest_publishes_no_package_row_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-head");
+        let layer = unique_fixture_bytes("layer-3611-head");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = head_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "precondition: HEAD is ungated and must succeed with no prior GET"
+        );
+        assert!(
+            artifacts > 0,
+            "the HEAD must have cached the manifest -- otherwise the packages \
+             assertion below proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "a bare HEAD must not publish the image into the packages catalog; \
+             a row here means `handle_head_manifest`'s cache write still \
+             indexes packages. Got {rows:?}"
+        );
+    }
+
+    /// #3611 defect 3: a valid tag at the OCI grammar's 128-character bound
+    /// must index. `packages.version`/`package_versions.version` were
+    /// VARCHAR(100) (019_builds_packages.sql), so a 101-128 char tag -- CI
+    /// schemes like `v1.2.3-nightly-<date>-<sha>-<platform>-<branch>` cross
+    /// 100 routinely -- failed the best-effort upsert into a swallowed warn:
+    /// 200 on the pull, nothing on the Packages page. Migration 211 widens
+    /// the columns; this pins it end-to-end through the pull path.
+    #[tokio::test]
+    async fn test_proxied_max_length_tag_indexes_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-longtag");
+        let layer = unique_fixture_bytes("layer-3611-longtag");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        // 128 chars, valid OCI tag grammar: [a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}
+        let tag = format!("v1.2.3-nightly-20260831-{}", "a".repeat(104));
+        assert_eq!(tag.len(), 128, "fixture must sit exactly at the bound");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", &tag, &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, &tag).await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "the pull itself always succeeded");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a 128-char tag is valid per the OCI grammar and must index; an \
+             empty catalog here is the VARCHAR(100) truncation failure being \
+             swallowed into a warn. Got {} rows",
+            rows.len()
+        );
+        assert_eq!(rows[0].1, tag, "the full 128-char tag is the version");
     }
 }
 
