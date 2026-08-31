@@ -97,6 +97,8 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::ansible::AnsibleHandler;
+use crate::models::repository::RepositoryType;
+use crate::services::proxy_service::ProxyService;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -245,6 +247,497 @@ fn collection_download_url(
 }
 
 // ---------------------------------------------------------------------------
+// Remote (proxy) upstream discovery (#3365)
+// ---------------------------------------------------------------------------
+
+/// Page size requested from an upstream Galaxy v3 `versions/` endpoint.
+///
+/// Galaxy NG paginates with DRF limit/offset and clamps `limit` server-side:
+/// verified live against `galaxy.ansible.com`, a request for `limit=1000` on a
+/// 239-version collection returns 100 items plus a `links.next`, so asking for
+/// more does not save a round trip.
+const UPSTREAM_VERSIONS_PAGE_SIZE: usize = 100;
+
+/// Hard ceiling on upstream pages walked while answering one version list.
+///
+/// A version list has to be COMPLETE to be useful — `ansible-galaxy` resolves a
+/// pinned version by membership in this list, and the largest real collections
+/// run past a single page (`community.general` is 239 versions today) — so the
+/// walk cannot stop at page one. It also cannot be unbounded: the page count is
+/// driven by an upstream's own `meta.count`, and a hostile or broken upstream
+/// that always reports a full page would otherwise spin this request forever.
+/// Twenty pages is 2000 versions, an order of magnitude above the largest
+/// collection published today, and the truncation is logged rather than silent.
+const UPSTREAM_VERSIONS_MAX_PAGES: usize = 20;
+
+/// Whether a Galaxy coordinate can be interpolated into a single path segment
+/// of an upstream request and of the URLs this repository advertises back.
+///
+/// Two different strings reach this function and both are untrusted. The
+/// `namespace`/`name` come from the client's own URL and are pushed OUT into an
+/// upstream request path; the `version` strings come from a third party's
+/// response and are pushed back into `href`/`download_url` values this server
+/// publishes. Neither is a place for a separator: `..` walks the upstream path
+/// out of the configured `upstream_url` prefix, and `?`/`#` truncate it into a
+/// query or fragment, which would make the repository fetch — or advertise — a
+/// resource other than the one it just named.
+///
+/// `%` is refused with the separators because axum percent-decodes a captured
+/// parameter before the handler sees it and the `url` crate decodes again when
+/// the upstream URL is parsed, so `%2F` is a `/` arriving one step later. This
+/// is the same rule, and the same reasoning, as the Helm proxied index's
+/// `upstream_chart_is_advertisable` (#3448); encoding rather than rejecting was
+/// rejected there because an encoder covering `%` also rewrites `+`, which is
+/// legal semver build metadata.
+///
+/// Rejecting costs nothing real: Galaxy's own namespace/name grammar is
+/// `[a-z0-9_]+`, and a version that cannot be addressed could not have been
+/// downloaded through this repository anyway.
+fn galaxy_coordinate_is_addressable(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && !part
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '?' | '#' | '%') || c.is_control())
+}
+
+/// The `href` this repository advertises for one collection version.
+fn version_href(repo_key: &str, namespace: &str, name: &str, version: &str) -> String {
+    format!(
+        "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
+        repo_key, namespace, name, version
+    )
+}
+
+/// Fetch every version an upstream Galaxy server publishes for one collection.
+///
+/// # Why offset paging rather than following `links.next`
+///
+/// Galaxy's `links.next` is a **root-relative** path — live, `galaxy.ansible.com`
+/// answers `/api/v3/collections/{ns}/{name}/versions/` with a 302 to
+/// `/api/v3/plugin/ansible/content/published/collections/index/...` and its
+/// `links.next` is spelled against the origin, not against the configured
+/// `upstream_url`. Following it would mean reconstructing the upstream ORIGIN
+/// and issuing a request outside the configured `upstream_url` prefix, which
+/// widens what a repository is allowed to fetch on the say-so of the upstream's
+/// own response body — the shape of an SSRF, not a paging strategy. A private
+/// Automation Hub makes the same point without any malice: it serves Galaxy
+/// under a `/api/galaxy/` prefix, so a root-relative `next` resolved against
+/// the origin drops the prefix and 404s.
+///
+/// Re-requesting the SAME path with a growing `offset` keeps every request
+/// underneath the configured prefix, needs nothing from the upstream but a
+/// count of rows, and is the standard DRF limit/offset paging both
+/// galaxy.ansible.com and Galaxy NG implement (verified live: `offset=0/100/200`
+/// walk a 239-version collection with no gaps or repeats).
+async fn fetch_upstream_versions(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<Vec<String>, Response> {
+    let mut versions: Vec<String> = Vec::new();
+
+    for page in 0..UPSTREAM_VERSIONS_MAX_PAGES {
+        let upstream_path = format!(
+            "api/v3/collections/{}/{}/versions/?limit={}&offset={}",
+            namespace,
+            name,
+            UPSTREAM_VERSIONS_PAGE_SIZE,
+            page * UPSTREAM_VERSIONS_PAGE_SIZE
+        );
+
+        // Buffered and byte-capped by design: a version list is a small
+        // metadata document that has to be parsed in-process before anything
+        // can be merged out of it. Only the version STRINGS survive this
+        // scope, so unlike the Helm proxied index (#3448) there is no derived
+        // working set to hold a budget reservation open for.
+        let (body, _content_type) = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            &upstream_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await?;
+
+        let doc: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Failed to parse upstream collection version list",
+            )
+                .into_response()
+        })?;
+
+        let page_versions: Vec<String> = doc
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|e| e.get("version").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let page_len = page_versions.len();
+        versions.extend(page_versions);
+
+        // A short page is the last page. `links.next` is consulted only as a
+        // stop signal, never as a URL to fetch (see the note above), so a
+        // server that omits it simply falls back to the length check.
+        let has_next = doc
+            .pointer("/links/next")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        if page_len < UPSTREAM_VERSIONS_PAGE_SIZE || !has_next {
+            return Ok(versions);
+        }
+    }
+
+    tracing::warn!(
+        repository = %repo_key,
+        collection = %format!("{}.{}", namespace, name),
+        pages = UPSTREAM_VERSIONS_MAX_PAGES,
+        collected = versions.len(),
+        "upstream collection has more versions than the per-request page ceiling; \
+         the advertised version list is truncated"
+    );
+    Ok(versions)
+}
+
+/// Merge upstream version strings into the version list being built, appending
+/// only those the repository does not already hold.
+///
+/// Locally-held versions win their version string and keep their position: the
+/// local row is the one `download_collection` resolves before it ever consults
+/// upstream, and it carries the artifact's real stored filename. Re-advertising
+/// the same version from upstream would produce a duplicate entry for a single
+/// resolvable artifact, which `ansible-galaxy` would present as two candidates
+/// for one version.
+///
+/// Upstream versions that cannot form a single path segment are dropped with a
+/// warning rather than advertised: every entry here becomes an `href` under
+/// this repository's own route, and an entry that cannot be addressed is a
+/// promise the download route could not keep.
+fn merge_upstream_versions(
+    repo_key: &str,
+    namespace: &str,
+    name: &str,
+    upstream: Vec<String>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    let held: std::collections::HashSet<String> = out
+        .iter()
+        .filter_map(|v| v.get("version").and_then(|s| s.as_str()))
+        .map(str::to_string)
+        .collect();
+    let mut seen = held.clone();
+
+    for version in upstream {
+        if seen.contains(&version) {
+            continue;
+        }
+        if !galaxy_coordinate_is_addressable(&version) {
+            tracing::warn!(
+                repository = %repo_key,
+                collection = %format!("{}.{}", namespace, name),
+                version = %version,
+                "upstream collection version cannot be addressed as a single path \
+                 segment; omitting it from the proxied version list"
+            );
+            continue;
+        }
+        out.push(serde_json::json!({
+            "version": version,
+            "href": version_href(repo_key, namespace, name, &version),
+        }));
+        seen.insert(version);
+    }
+}
+
+/// Build the version-metadata document `ansible-galaxy` reads, for both a
+/// locally-held collection version and one resolved from an upstream (#3365).
+///
+/// # The document shape is a hard client contract, not a convention
+///
+/// `GalaxyAPI.get_collection_version_metadata`
+/// (`lib/ansible/galaxy/api.py`, identical on `stable-2.17`..`devel`) ends in
+/// an unconditional index into five fields:
+///
+/// ```text
+/// CollectionVersionMetadata(data['namespace']['name'], data['collection']['name'],
+///                           data['version'], download_url,
+///                           data['artifact']['sha256'],
+///                           data['metadata']['dependencies'], data['href'], signatures)
+/// ```
+///
+/// So `namespace` must be an OBJECT carrying `name` (a bare string raises
+/// `TypeError: string indices must be integers`), `collection` must carry
+/// `name` as well as its `href`, and `href` and `metadata.dependencies` must
+/// both be present. `requires_ansible` and `signatures` are read with `.get`
+/// and are genuinely optional. This is also the shape `galaxy.ansible.com`
+/// itself serves, verified live.
+///
+/// One builder serves both branches deliberately. A Remote repository can hold
+/// a version locally (promotion, peer replication, migration import) and proxy
+/// its neighbours, so emitting a different document per branch would make the
+/// contract depend on which copy happened to answer.
+///
+/// # `download_url`
+///
+/// The client accepts an absolute URL or a root-absolute path and resolves the
+/// latter with `urljoin(self.api_server, ...)`; a bare relative path is a hard
+/// error. Every URL emitted here is root-absolute and points at THIS
+/// repository's own `download/` route, never at the upstream, so the tarball is
+/// fetched back through the proxy -- which is what makes the cache, the
+/// download accounting and the repository's own authorization apply to it.
+#[allow(clippy::too_many_arguments)]
+fn version_info_document(
+    repo_key: &str,
+    namespace: &str,
+    name: &str,
+    version: &str,
+    filename: &str,
+    download_url: &str,
+    size_bytes: i64,
+    sha256: &str,
+    dependencies: serde_json::Value,
+    metadata: serde_json::Value,
+    requires_ansible: Option<&str>,
+    downloads: i64,
+) -> serde_json::Value {
+    let mut metadata = match metadata {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    metadata.insert("dependencies".to_string(), dependencies);
+
+    let mut doc = serde_json::json!({
+        "version": version,
+        "href": version_href(repo_key, namespace, name, version),
+        // Object, not a bare string: the client indexes `['name']` into it.
+        "namespace": { "name": namespace },
+        "name": name,
+        "collection": {
+            "name": name,
+            "href": format!(
+                "/ansible/{}/api/v3/collections/{}/{}/",
+                repo_key, namespace, name
+            ),
+        },
+        "download_url": download_url,
+        "artifact": {
+            "filename": filename,
+            "size": size_bytes,
+            "sha256": sha256,
+        },
+        "downloads": downloads,
+        "metadata": serde_json::Value::Object(metadata),
+    });
+    if let Some(req) = requires_ansible {
+        doc["requires_ansible"] = serde_json::json!(req);
+    }
+    doc
+}
+
+/// Fetch one collection version's metadata from the upstream Galaxy server and
+/// re-express it as this repository's own document (#3365).
+///
+/// Nothing is forwarded verbatim. The upstream's `download_url` points at the
+/// upstream (`https://galaxy.ansible.com/api/v3/plugin/.../artifacts/...`), and
+/// serving it as-is would send the client straight past this repository: no
+/// cache, no download accounting, and none of this repository's authorization
+/// applied to the bytes. The advertised URL is rebuilt against this
+/// repository's own `download/` route, which already resolves a Remote miss
+/// upstream.
+///
+/// The filename is taken from the upstream's own `artifact.filename` when it is
+/// addressable, because that is the name the download route will ask the
+/// upstream for; it falls back to the canonical
+/// `{namespace}-{name}-{version}.tar.gz` that Galaxy uses when the upstream
+/// omits or mangles it. `sha256` and `dependencies` are carried across
+/// unchanged -- the client verifies the tarball against that digest, so
+/// inventing one would be worse than passing none.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_upstream_version_info(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    namespace: &str,
+    name: &str,
+    version: &str,
+) -> Result<serde_json::Value, Response> {
+    let upstream_path = format!(
+        "api/v3/collections/{}/{}/versions/{}/",
+        namespace, name, version
+    );
+    let (body, _content_type) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
+
+    let doc: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Failed to parse upstream collection version metadata",
+        )
+            .into_response()
+    })?;
+
+    Ok(rewrite_upstream_version_info(
+        repo_key, namespace, name, version, &doc,
+    ))
+}
+
+/// Fetch a collection's detail document from the upstream Galaxy server and
+/// re-express it as this repository's own (#3365).
+///
+/// The upstream's `href`, `versions_url` and `highest_version.href` all point
+/// into the upstream's own URL space (`/api/content/published/v3/plugin/...`
+/// on galaxy.ansible.com), so they are rebuilt against this repository's
+/// routes rather than forwarded -- a client that followed one would leave the
+/// proxy. `created_at`/`updated_at` are carried across because the client reads
+/// `updated_at` as its response-cache key; both are read with `.get`, so an
+/// upstream that omits them is fine and nothing is invented for them.
+async fn fetch_upstream_collection_info(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<serde_json::Value, Response> {
+    let upstream_path = format!("api/v3/collections/{}/{}/", namespace, name);
+    let (body, _content_type) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
+
+    let doc: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Failed to parse upstream collection metadata",
+        )
+            .into_response()
+    })?;
+
+    Ok(rewrite_upstream_collection_info(
+        repo_key, namespace, name, &doc,
+    ))
+}
+
+/// Pure half of [`fetch_upstream_collection_info`].
+fn rewrite_upstream_collection_info(
+    repo_key: &str,
+    namespace: &str,
+    name: &str,
+    upstream: &serde_json::Value,
+) -> serde_json::Value {
+    let highest = upstream
+        .pointer("/highest_version/version")
+        .and_then(|v| v.as_str())
+        .filter(|v| galaxy_coordinate_is_addressable(v))
+        .unwrap_or_default()
+        .to_string();
+
+    let mut doc = serde_json::json!({
+        "namespace": namespace,
+        "name": name,
+        "description": upstream.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+        "deprecated": upstream.get("deprecated").and_then(|v| v.as_bool()).unwrap_or(false),
+        "href": format!("/ansible/{}/api/v3/collections/{}/{}/", repo_key, namespace, name),
+        "versions_url": format!(
+            "/ansible/{}/api/v3/collections/{}/{}/versions/",
+            repo_key, namespace, name
+        ),
+        "highest_version": {
+            "version": highest,
+            "href": version_href(repo_key, namespace, name, &highest),
+        },
+    });
+    // Read by the client as its response-cache key; forwarded when present and
+    // omitted when not, rather than filled in with a value this server made up.
+    for field in ["created_at", "updated_at"] {
+        if let Some(v) = upstream.get(field) {
+            doc[field] = v.clone();
+        }
+    }
+    doc
+}
+
+/// Pure half of [`fetch_upstream_version_info`]: turn an upstream Galaxy
+/// version document into this repository's own.
+fn rewrite_upstream_version_info(
+    repo_key: &str,
+    namespace: &str,
+    name: &str,
+    version: &str,
+    upstream: &serde_json::Value,
+) -> serde_json::Value {
+    let canonical = collection_filename(namespace, name, version);
+    // An upstream-supplied filename is interpolated into a URL this server
+    // publishes, so an unaddressable one is replaced by the canonical name
+    // rather than advertised: every `download_url` emitted here has to resolve
+    // back through this repository's own route to the version it names.
+    let filename = upstream
+        .pointer("/artifact/filename")
+        .and_then(|v| v.as_str())
+        .filter(|f| galaxy_coordinate_is_addressable(f))
+        .unwrap_or(&canonical)
+        .to_string();
+
+    let size_bytes = upstream
+        .pointer("/artifact/size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let sha256 = upstream
+        .pointer("/artifact/sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let dependencies = upstream
+        .pointer("/metadata/dependencies")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let metadata = upstream
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let requires_ansible = upstream.get("requires_ansible").and_then(|v| v.as_str());
+
+    version_info_document(
+        repo_key,
+        namespace,
+        name,
+        version,
+        &filename,
+        &format!("/ansible/{}/download/{}", repo_key, filename),
+        size_bytes,
+        sha256,
+        dependencies,
+        metadata,
+        requires_ansible,
+        0,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // GET /ansible/{repo_key}/api/v3/collections/ — List collections (paginated)
 // ---------------------------------------------------------------------------
 
@@ -328,10 +821,54 @@ async fn collection_info(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     let collection_name = format!("{}-{}", namespace, name);
-    let artifact =
+    let local =
         proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, &collection_name)
-            .await?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Collection not found").into_response())?;
+            .await?;
+
+    // Remote (proxy) repository: answering 404 here does not merely omit a
+    // detail page, it silently empties the VERSION LIST. When the client has a
+    // response cache configured -- which it does whenever the server is declared
+    // in `ansible.cfg` under `[galaxy_server.*]`, the ordinary enterprise setup
+    // -- `GalaxyAPI.get_collection_versions` first calls
+    // `get_collection_metadata` to read the collection's `updated_at` as a
+    // cache key, and treats a 404 from it as "no collection found" by
+    // `return []`. So a proxy that served a complete version list still ended
+    // up reporting no versions, and the install failed with the same
+    // "Could not satisfy the following requirements" as before (#3365).
+    // Reproduced live: identical requirements file, install succeeds against an
+    // ad-hoc `source:` (cache off) and fails against a configured
+    // `[galaxy_server.*]` (cache on) until this branch exists.
+    if local.is_none() && repo.repo_type == RepositoryType::Remote {
+        if let (Some(proxy), Some(upstream_url)) =
+            (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
+        {
+            if !galaxy_coordinate_is_addressable(&namespace)
+                || !galaxy_coordinate_is_addressable(&name)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid collection namespace or name",
+                )
+                    .into_response());
+            }
+            // Nothing is held locally on this path, so as in `version_info`
+            // there is nothing to degrade to and the upstream's own error is
+            // surfaced as `map_proxy_error` classifies it.
+            let upstream = fetch_upstream_collection_info(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &namespace,
+                &name,
+            )
+            .await?;
+            return Ok(super::json_response(&upstream));
+        }
+    }
+
+    let artifact =
+        local.ok_or_else(|| (StatusCode::NOT_FOUND, "Collection not found").into_response())?;
 
     let latest_version = artifact.version.clone().unwrap_or_default();
     let description = artifact
@@ -384,19 +921,82 @@ async fn version_list(
         proxy_helpers::list_artifacts_by_name_lowercase(&state.db, repo.id, &collection_name)
             .await?;
 
-    let versions: Vec<serde_json::Value> = artifacts
+    let mut versions: Vec<serde_json::Value> = artifacts
         .iter()
         .map(|a| {
             let version = a.version.clone().unwrap_or_default();
             serde_json::json!({
                 "version": version,
-                "href": format!(
-                    "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
-                    repo_key, namespace, name, version
-                ),
+                "href": version_href(&repo_key, &namespace, &name, &version),
             })
         })
         .collect();
+
+    // Remote (proxy) repository: this list is the DISCOVERY half of a
+    // collection install. `ansible-galaxy` resolves a version out of it before
+    // it requests any tarball -- a pinned requirement has to appear here or the
+    // resolver reports "Could not satisfy the following requirements" -- so
+    // building it from locally-catalogued rows alone answered an empty `data`
+    // with HTTP 200 and made a proxy repository unusable for install, even
+    // though `download_collection` could already serve the tarball by name
+    // (#3365). Serve what the upstream publishes, merged over whatever is held
+    // locally, which is the same set the download route can actually resolve.
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(proxy), Some(upstream_url)) =
+            (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
+        {
+            // The coordinates are interpolated into an upstream request path,
+            // so they are checked before they leave this process rather than
+            // trusted to the cache-path validator downstream.
+            if !galaxy_coordinate_is_addressable(&namespace)
+                || !galaxy_coordinate_is_addressable(&name)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid collection namespace or name",
+                )
+                    .into_response());
+            }
+            match fetch_upstream_versions(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &namespace,
+                &name,
+            )
+            .await
+            {
+                Ok(upstream) => {
+                    merge_upstream_versions(&repo_key, &namespace, &name, upstream, &mut versions)
+                }
+                // Upstream is unreachable or unparseable. With nothing held
+                // locally there is no honest list to serve: an empty `data` is
+                // indistinguishable from "this collection has no versions",
+                // which is exactly the silent failure this issue is about, so
+                // the upstream's own error is surfaced (`map_proxy_error`
+                // classifies an upstream 5xx as 503, a definitive 404 as 404
+                // and a connect failure as 502) and the install fails loudly
+                // and legibly instead of reporting an unsatisfiable pin. With
+                // versions held locally those are still served -- an upstream
+                // outage must not stop a collection this repository already
+                // has from resolving, which is the point of a cache. The proxy
+                // cache applies RFC 5861 stale-if-error to the version
+                // document itself, so a warm proxy keeps serving the last good
+                // upstream list before this fallback is reached at all.
+                Err(err) if versions.is_empty() => return Err(err),
+                Err(err) => {
+                    tracing::warn!(
+                        repository = %repo_key,
+                        collection = %format!("{}.{}", namespace, name),
+                        status = %err.status(),
+                        "upstream collection version list unavailable; serving \
+                         locally-held versions only"
+                    );
+                }
+            }
+        }
+    }
 
     let json = serde_json::json!({
         "meta": {
@@ -433,48 +1033,97 @@ async fn version_info(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     let collection_name = format!("{}-{}", namespace, name);
-    let artifact = proxy_helpers::find_artifact_by_name_version(
+    let local = proxy_helpers::find_artifact_by_name_version(
         &state.db,
         repo.id,
         &collection_name,
         &version,
     )
-    .await?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Collection version not found").into_response())?;
+    .await?;
 
-    let download_count: i64 = sqlx::query_scalar!(
-        "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
-        artifact.id
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(Some(0))
-    .unwrap_or(0);
+    if let Some(artifact) = local {
+        let download_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+            artifact.id
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
 
-    let json = serde_json::json!({
-        "namespace": namespace,
-        "name": name,
-        "version": version,
-        "download_url": collection_download_url(&repo_key, &artifact.path, &namespace, &name, &version),
-        "artifact": {
-            "filename": proxy_helpers::advertised_download_filename(
+        let metadata = artifact.metadata.unwrap_or_else(|| serde_json::json!({}));
+        // A collection published through the native upload carries no
+        // dependency map on the wire (`ansible-galaxy collection publish`
+        // sends only `file` and `sha256`), so `collection_json` is populated
+        // only by clients that send the optional metadata part. An absent map
+        // is emitted as `{}` -- "declares no dependencies" -- rather than
+        // omitted, because the client indexes the key unconditionally. Reading
+        // the real map out of the uploaded tarball's `MANIFEST.json` is a
+        // separate gap in the UPLOAD path and is filed on its own.
+        let dependencies = metadata
+            .pointer("/collection_json/dependencies")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let json = version_info_document(
+            &repo_key,
+            &namespace,
+            &name,
+            &version,
+            &proxy_helpers::advertised_download_filename(
                 &artifact.path,
                 &collection_filename(&namespace, &name, &version),
             ),
-            "size": artifact.size_bytes,
-            "sha256": artifact.checksum_sha256,
-        },
-        "collection": {
-            "href": format!(
-                "/ansible/{}/api/v3/collections/{}/{}/",
-                repo_key, namespace, name
-            ),
-        },
-        "downloads": download_count,
-        "metadata": artifact.metadata.unwrap_or(serde_json::json!({})),
-    });
+            &collection_download_url(&repo_key, &artifact.path, &namespace, &name, &version),
+            artifact.size_bytes.unwrap_or(0),
+            artifact.checksum_sha256.as_deref().unwrap_or_default(),
+            dependencies,
+            metadata,
+            None,
+            download_count,
+        );
+        return Ok(super::json_response(&json));
+    }
 
-    Ok(super::json_response(&json))
+    // Remote (proxy) repository: the version this metadata describes is not
+    // held locally, so ask the upstream that publishes it. Without this the
+    // route 404s for every collection a proxy has not already cached, which
+    // fails the install one step after the version list resolved it (#3365).
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(proxy), Some(upstream_url)) =
+            (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
+        {
+            if !galaxy_coordinate_is_addressable(&namespace)
+                || !galaxy_coordinate_is_addressable(&name)
+                || !galaxy_coordinate_is_addressable(&version)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid collection namespace, name, or version",
+                )
+                    .into_response());
+            }
+            // No local row exists on this path, so there is nothing to degrade
+            // to: an upstream error is the only honest answer and is surfaced
+            // as `map_proxy_error` classifies it (404 for a definitive
+            // upstream 404, 503 for an upstream 5xx, 502 for a connect
+            // failure). The locally-held case returned above and is therefore
+            // unaffected by an upstream outage.
+            let upstream = fetch_upstream_version_info(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &namespace,
+                &name,
+                &version,
+            )
+            .await?;
+            return Ok(super::json_response(&upstream));
+        }
+    }
+
+    Err((StatusCode::NOT_FOUND, "Collection version not found").into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1885,5 +2534,744 @@ mod tests {
         );
 
         f.teardown().await;
+    }
+    // -----------------------------------------------------------------------
+    // #3365: a Remote repository must serve the upstream's collection versions
+    // -----------------------------------------------------------------------
+
+    /// One page of a Galaxy v3 `versions/` response. `next` is spelled the way
+    /// galaxy.ansible.com spells it -- root-relative, against the ORIGIN and
+    /// not against the configured `upstream_url` -- so a test that accidentally
+    /// started following it would go somewhere the mock does not serve.
+    fn upstream_versions_page(versions: &[&str], count: usize, next: Option<&str>) -> String {
+        let data: Vec<serde_json::Value> = versions
+            .iter()
+            .map(|v| {
+                serde_json::json!({
+                    "version": v,
+                    "href": format!("/api/v3/plugin/ansible/content/published/collections/index/testns/testcoll/versions/{v}/"),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "meta": { "count": count },
+            "links": {
+                "first": "/api/v3/plugin/ansible/content/published/collections/index/testns/testcoll/versions/?limit=100&offset=0",
+                "previous": null,
+                "next": next,
+                "last": null,
+            },
+            "data": data,
+        })
+        .to_string()
+    }
+
+    /// An upstream version-metadata document in the shape galaxy.ansible.com
+    /// actually serves, captured live: `download_url` is an ABSOLUTE upstream
+    /// URL, so a test can tell a rewritten document from a forwarded one.
+    fn upstream_version_info_doc() -> String {
+        serde_json::json!({
+            "version": "1.5.1",
+            "href": "/api/content/published/v3/plugin/ansible/content/published/collections/index/testns/testcoll/versions/1.5.1/",
+            "namespace": { "name": "testns", "metadata_sha256": "abc" },
+            "name": "testcoll",
+            "collection": { "name": "testcoll", "href": "/api/v3/.../testns/testcoll/" },
+            "download_url": "https://upstream.invalid/api/v3/plugin/ansible/content/published/collections/artifacts/testns-testcoll-1.5.1.tar.gz",
+            "artifact": {
+                "filename": "testns-testcoll-1.5.1.tar.gz",
+                "sha256": "112653d7e4e462827f1521130849c650e9dbc403f8b2e9dd5040f2ddabff33ed",
+                "size": 175162,
+            },
+            "requires_ansible": ">=2.9.10",
+            "metadata": {
+                "description": "a collection",
+                "dependencies": { "testns.other": ">=1.0.0" },
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_merge_upstream_versions_advertises_them_under_this_repo_3365() {
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        merge_upstream_versions(
+            "gx",
+            "testns",
+            "testcoll",
+            vec!["2.0.0".to_string(), "1.5.1".to_string()],
+            &mut out,
+        );
+
+        assert_eq!(
+            out.len(),
+            2,
+            "every upstream version must be merged: {out:?}"
+        );
+        // Literal expectations, not `version_href(..)` -- an href computed by
+        // the code under test would agree with itself no matter what it emits.
+        assert_eq!(out[0]["version"], "2.0.0");
+        assert_eq!(
+            out[0]["href"], "/ansible/gx/api/v3/collections/testns/testcoll/versions/2.0.0/",
+            "the advertised href must point back at THIS repository's route; an \
+             upstream href would send the client past the proxy"
+        );
+        assert_eq!(out[1]["version"], "1.5.1");
+        assert_eq!(
+            out[1]["href"],
+            "/ansible/gx/api/v3/collections/testns/testcoll/versions/1.5.1/"
+        );
+    }
+
+    #[test]
+    fn test_merge_upstream_versions_keeps_the_locally_held_version_3365() {
+        // The held version is deliberately one the upstream ALSO publishes, so
+        // a merge that failed to dedup would be visible as a second entry; the
+        // upstream's other version is one the fixture does NOT hold, so the
+        // "still merged" assertion cannot pass by accident.
+        let mut out = vec![serde_json::json!({
+            "version": "1.5.1",
+            "href": "/ansible/gx/api/v3/collections/testns/testcoll/versions/1.5.1/",
+            "local_marker": true,
+        })];
+
+        merge_upstream_versions(
+            "gx",
+            "testns",
+            "testcoll",
+            vec!["1.5.1".to_string(), "2.0.0".to_string()],
+            &mut out,
+        );
+
+        let same: Vec<_> = out.iter().filter(|v| v["version"] == "1.5.1").collect();
+        assert_eq!(
+            same.len(),
+            1,
+            "a version held locally must not gain a duplicate upstream entry: {out:?}"
+        );
+        assert_eq!(
+            same[0]["local_marker"], true,
+            "the locally-held entry must survive the merge, not be replaced"
+        );
+        assert_eq!(out.len(), 2, "the other upstream version is still merged");
+        assert_eq!(out[1]["version"], "2.0.0");
+    }
+
+    /// #3365: upstream version strings are interpolated into `href` values this
+    /// server publishes, so one that cannot form a single path segment is
+    /// dropped rather than advertised.
+    #[test]
+    fn test_merge_drops_upstream_versions_that_cannot_be_addressed_3365() {
+        for bad in [
+            "../../../../etc/passwd",
+            "1.0.0/../../etc",
+            "q?x=1#frag",
+            "a/b",
+            "pct%2Fescape",
+            "..",
+            "",
+        ] {
+            assert!(
+                !galaxy_coordinate_is_addressable(bad),
+                "{bad:?} cannot form one path segment and must not be advertised"
+            );
+            let mut out: Vec<serde_json::Value> = Vec::new();
+            merge_upstream_versions("gx", "testns", "testcoll", vec![bad.to_string()], &mut out);
+            assert!(
+                out.is_empty(),
+                "the unaddressable version must be omitted, got {out:?}"
+            );
+        }
+    }
+
+    /// The negative control for the filter above: the version strings real
+    /// collections publish -- including semver build metadata, the reason an
+    /// encoder was rejected -- must be untouched. These are deliberately
+    /// different strings from the rejection fixtures, so the control cannot
+    /// collapse onto its own boundary.
+    #[test]
+    fn test_ordinary_collection_versions_stay_advertisable_3365() {
+        for good in [
+            "1.5.1",
+            "2.0.0-rc.1",
+            "1.0.0+build.5",
+            "0.0.1-alpha.1+sha.abcdef",
+            "10.20.30",
+        ] {
+            assert!(
+                galaxy_coordinate_is_addressable(good),
+                "{good:?} is a legitimate collection version and must stay advertisable"
+            );
+            let mut out: Vec<serde_json::Value> = Vec::new();
+            merge_upstream_versions("gx", "testns", "testcoll", vec![good.to_string()], &mut out);
+            assert_eq!(out.len(), 1, "{good:?} must be advertised");
+            assert_eq!(out[0]["version"], good);
+        }
+    }
+
+    /// #3365: `GalaxyAPI.get_collection_version_metadata` indexes five fields
+    /// unconditionally. A bare-string `namespace` raises
+    /// `TypeError: string indices must be integers` inside the client, which
+    /// surfaces as "Unexpected Exception, this is probably a bug" and kills the
+    /// install -- so the shape is a hard contract, not a preference.
+    #[test]
+    fn test_version_info_document_satisfies_the_client_contract_3365() {
+        let doc = version_info_document(
+            "gx",
+            "testns",
+            "testcoll",
+            "1.5.1",
+            "testns-testcoll-1.5.1.tar.gz",
+            "/ansible/gx/download/testns-testcoll-1.5.1.tar.gz",
+            175162,
+            "deadbeef",
+            serde_json::json!({ "testns.other": ">=1.0.0" }),
+            serde_json::json!({ "description": "a collection" }),
+            Some(">=2.9.10"),
+            7,
+        );
+
+        // The exact five hard indexes the client performs.
+        assert_eq!(
+            doc["namespace"]["name"], "testns",
+            "`namespace` must be an OBJECT carrying `name`; a bare string makes \
+             the client raise TypeError before the install starts"
+        );
+        assert_eq!(doc["collection"]["name"], "testcoll");
+        assert_eq!(doc["version"], "1.5.1");
+        assert_eq!(doc["artifact"]["sha256"], "deadbeef");
+        assert_eq!(doc["metadata"]["dependencies"]["testns.other"], ">=1.0.0");
+        assert_eq!(
+            doc["href"], "/ansible/gx/api/v3/collections/testns/testcoll/versions/1.5.1/",
+            "`href` is read unconditionally and was absent entirely"
+        );
+        // Pre-existing metadata is preserved alongside the injected map.
+        assert_eq!(doc["metadata"]["description"], "a collection");
+        assert_eq!(doc["requires_ansible"], ">=2.9.10");
+        assert_eq!(doc["downloads"], 7);
+    }
+
+    /// `metadata.dependencies` is indexed unconditionally, so it must exist
+    /// even when nothing is known about the collection's dependencies.
+    #[test]
+    fn test_version_info_document_always_carries_a_dependency_map_3365() {
+        let doc = version_info_document(
+            "gx",
+            "testns",
+            "testcoll",
+            "1.0.0",
+            "testns-testcoll-1.0.0.tar.gz",
+            "/ansible/gx/download/testns-testcoll-1.0.0.tar.gz",
+            10,
+            "abc",
+            serde_json::json!({}),
+            // A non-object metadata value must not be able to erase the key.
+            serde_json::json!("not-an-object"),
+            None,
+            0,
+        );
+        assert!(
+            doc["metadata"]["dependencies"].is_object(),
+            "dependencies must be an object even when unknown: {doc}"
+        );
+        assert!(
+            doc.get("requires_ansible").is_none(),
+            "an absent requires_ansible must be omitted, not invented"
+        );
+    }
+
+    /// #3365: the upstream's `download_url` is an ABSOLUTE upstream URL.
+    /// Forwarding it would send the client straight to the upstream, past the
+    /// cache, the download accounting and this repository's authorization.
+    #[test]
+    fn test_rewrite_upstream_version_info_points_download_at_this_repo_3365() {
+        let upstream: serde_json::Value =
+            serde_json::from_str(&upstream_version_info_doc()).unwrap();
+        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream);
+
+        assert_eq!(
+            doc["download_url"], "/ansible/gx/download/testns-testcoll-1.5.1.tar.gz",
+            "the advertised download_url must be this repository's own route"
+        );
+        assert!(
+            !doc["download_url"]
+                .as_str()
+                .unwrap()
+                .contains("upstream.invalid"),
+            "the upstream host must not survive the rewrite: {doc}"
+        );
+        // The parts that must be carried across unchanged.
+        assert_eq!(
+            doc["artifact"]["sha256"],
+            "112653d7e4e462827f1521130849c650e9dbc403f8b2e9dd5040f2ddabff33ed",
+            "the client verifies the tarball against this digest"
+        );
+        assert_eq!(doc["artifact"]["size"], 175162);
+        assert_eq!(doc["metadata"]["dependencies"]["testns.other"], ">=1.0.0");
+        assert_eq!(doc["requires_ansible"], ">=2.9.10");
+        // And the parts that must be re-expressed as ours.
+        assert_eq!(
+            doc["href"],
+            "/ansible/gx/api/v3/collections/testns/testcoll/versions/1.5.1/"
+        );
+        assert_eq!(doc["namespace"]["name"], "testns");
+    }
+
+    /// An upstream filename that cannot be addressed must not reach a URL this
+    /// server publishes; the canonical Galaxy filename is used instead.
+    #[test]
+    fn test_rewrite_upstream_version_info_rejects_an_unaddressable_filename_3365() {
+        let upstream = serde_json::json!({
+            "artifact": { "filename": "../../../../etc/passwd", "sha256": "abc", "size": 1 },
+        });
+        let doc = rewrite_upstream_version_info("gx", "testns", "testcoll", "1.5.1", &upstream);
+        assert_eq!(
+            doc["download_url"], "/ansible/gx/download/testns-testcoll-1.5.1.tar.gz",
+            "an unaddressable upstream filename must fall back to the canonical \
+             name, never be interpolated into an advertised URL: {doc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_version_list_serves_upstream_versions_3365() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(upstream_versions_page(
+                    &["2.0.0", "1.5.1"],
+                    2,
+                    None,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/v3/collections/testns/testcoll/versions/",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let data = doc["data"].as_array().expect("data array");
+        assert!(
+            !data.is_empty(),
+            "a Remote repository must advertise the upstream's versions; an empty \
+             `data` is what makes `ansible-galaxy` report 'Could not satisfy the \
+             following requirements' (#3365)"
+        );
+        let versions: Vec<&str> = data.iter().filter_map(|v| v["version"].as_str()).collect();
+        assert_eq!(versions, vec!["2.0.0", "1.5.1"]);
+        assert_eq!(doc["meta"]["count"], 2);
+        assert_eq!(
+            data[1]["href"],
+            format!(
+                "/ansible/{}/api/v3/collections/testns/testcoll/versions/1.5.1/",
+                f.repo_key
+            ),
+            "hrefs must point at this repository, not the upstream"
+        );
+    }
+
+    /// #3365: the version list is walked to completion. Galaxy clamps `limit`
+    /// to 100 server-side and the largest real collections run past one page,
+    /// so a pinned version living on page two must still resolve.
+    #[tokio::test]
+    async fn test_remote_version_list_walks_every_upstream_page_3365() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+
+        // A full first page (100 entries) plus a `next`, then a short second
+        // page carrying the version the caller actually wants.
+        let first: Vec<String> = (0..UPSTREAM_VERSIONS_PAGE_SIZE)
+            .map(|i| format!("9.0.{i}"))
+            .collect();
+        let first_refs: Vec<&str> = first.iter().map(String::as_str).collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_versions_page(
+                &first_refs,
+                UPSTREAM_VERSIONS_PAGE_SIZE + 1,
+                Some("/api/v3/plugin/ansible/content/published/collections/index/testns/testcoll/versions/?limit=100&offset=100"),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/"))
+            .and(query_param("offset", "100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(upstream_versions_page(
+                    &["1.5.1"],
+                    UPSTREAM_VERSIONS_PAGE_SIZE + 1,
+                    None,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/v3/collections/testns/testcoll/versions/",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let versions: Vec<&str> = doc["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .filter_map(|v| v["version"].as_str())
+            .collect();
+        assert_eq!(
+            versions.len(),
+            UPSTREAM_VERSIONS_PAGE_SIZE + 1,
+            "both pages must be collected, not just the first"
+        );
+        assert!(
+            versions.contains(&"1.5.1"),
+            "a version living on the SECOND upstream page must still be \
+             advertised, or a pinned requirement on it is unsatisfiable"
+        );
+    }
+
+    /// #3365: the two upstream failures an operator actually hits -- the
+    /// upstream is down (5xx) and the upstream URL is wrong so the collection
+    /// 404s. Neither may answer 200 with an empty `data`, which is
+    /// indistinguishable from "this collection has no versions" and leaves
+    /// `ansible-galaxy` blaming the requirement instead of the server.
+    #[tokio::test]
+    async fn test_remote_version_list_surfaces_an_upstream_failure_when_nothing_is_held_3365() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for (upstream_status, expected) in [
+            (503u16, StatusCode::SERVICE_UNAVAILABLE),
+            (404, StatusCode::NOT_FOUND),
+        ] {
+            let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+                return;
+            };
+            let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v3/collections/testns/testcoll/versions/"))
+                .respond_with(ResponseTemplate::new(upstream_status))
+                .mount(&server)
+                .await;
+            let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+            let app = tdh::router_anon(super::router(), state);
+            let (status, body) = tdh::send(
+                app,
+                tdh::get(format!(
+                    "/{}/api/v3/collections/testns/testcoll/versions/",
+                    f.repo_key
+                )),
+            )
+            .await;
+
+            f.teardown().await;
+
+            assert_ne!(
+                status,
+                StatusCode::OK,
+                "upstream {upstream_status} with nothing held locally must not answer \
+                 200: an empty `data` reads as 'this collection has no versions' and \
+                 the install fails blaming the requirement (#3365)"
+            );
+            assert_eq!(
+                status,
+                expected,
+                "upstream {upstream_status} must be reported as {expected}, so an \
+                 operator can tell an outage from a wrong upstream URL; body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_version_list_still_serves_held_versions_when_upstream_is_down_3365() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        // A Remote repository acquires local rows by promotion, peer
+        // replication or migration import -- direct upload is refused.
+        let repo = f.repo_info("remote", Some(&server.uri()));
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "held-collection-storage-key",
+            "testns-testcoll-3.3.3.tar.gz",
+            "testns-testcoll",
+            "3.3.3",
+            "application/gzip",
+            bytes::Bytes::from_static(b"collection-bytes"),
+            f.user_id,
+        )
+        .await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/v3/collections/testns/testcoll/versions/",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an upstream outage must not stop a collection this repository already \
+             holds from resolving (#3365)"
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let versions: Vec<&str> = doc["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .filter_map(|v| v["version"].as_str())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["3.3.3"],
+            "the locally-held version must still be advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_version_info_serves_upstream_metadata_3365() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/versions/1.5.1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_version_info_doc()))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/v3/collections/testns/testcoll/versions/1.5.1/",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a Remote repository must answer for a version it does not hold; a 404 \
+             here fails the install one step after the version list resolved it \
+             (#3365); body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            doc["download_url"],
+            format!(
+                "/ansible/{}/download/testns-testcoll-1.5.1.tar.gz",
+                f.repo_key
+            ),
+            "the tarball must be fetched back through this repository"
+        );
+        assert_eq!(doc["namespace"]["name"], "testns");
+        assert_eq!(doc["collection"]["name"], "testcoll");
+        assert_eq!(
+            doc["artifact"]["sha256"],
+            "112653d7e4e462827f1521130849c650e9dbc403f8b2e9dd5040f2ddabff33ed"
+        );
+        assert_eq!(doc["metadata"]["dependencies"]["testns.other"], ">=1.0.0");
+    }
+
+    /// A hosted repository must keep answering from its own rows and must not
+    /// acquire an upstream branch -- the no-regression control for the Remote
+    /// change above.
+    #[tokio::test]
+    async fn test_local_version_list_is_unchanged_by_the_remote_branch_3365() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "hosted-collection-storage-key",
+            "testns-testcoll-1.0.0.tar.gz",
+            "testns-testcoll",
+            "1.0.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"collection-bytes"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/v3/collections/testns/testcoll/versions/",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let versions: Vec<&str> = doc["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .filter_map(|v| v["version"].as_str())
+            .collect();
+        assert_eq!(versions, vec!["1.0.0"]);
+    }
+    /// #3365: a Remote repository must answer the collection DETAIL route, not
+    /// just the version list.
+    ///
+    /// A 404 here does not merely omit a detail page -- when the client has a
+    /// response cache configured (which it does whenever the server is declared
+    /// under `[galaxy_server.*]` in `ansible.cfg`, the ordinary enterprise
+    /// setup) `get_collection_versions` reads this route first for the
+    /// collection's `updated_at`, and treats a 404 as "no collection found" by
+    /// `return []`. The complete version list served by the route next door is
+    /// then discarded and the install fails exactly as it did before.
+    #[tokio::test]
+    async fn test_remote_collection_info_serves_upstream_metadata_3365() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/collections/testns/testcoll/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                serde_json::json!({
+                    // Upstream-namespaced links, so a forwarded document is
+                    // distinguishable from a rewritten one.
+                    "href": "/api/content/published/v3/plugin/ansible/content/published/collections/index/testns/testcoll/",
+                    "versions_url": "/api/content/published/v3/plugin/.../versions/",
+                    "namespace": "testns",
+                    "name": "testcoll",
+                    "deprecated": false,
+                    "highest_version": { "version": "2.2.2", "href": "/api/content/published/v3/plugin/.../versions/2.2.2/" },
+                    "created_at": "2023-05-08T20:27:28.415377Z",
+                    "updated_at": "2026-07-13T02:34:05.009743Z",
+                })
+                .to_string(),
+            ))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/v3/collections/testns/testcoll/",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a Remote repository must answer the collection detail route; a 404 \
+             makes a cache-enabled client discard the whole version list (#3365); \
+             body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            doc["updated_at"], "2026-07-13T02:34:05.009743Z",
+            "the client reads `updated_at` as its response-cache key"
+        );
+        assert_eq!(doc["highest_version"]["version"], "2.2.2");
+        // Every advertised link must be this repository's, not the upstream's.
+        for pointer in ["/href", "/versions_url", "/highest_version/href"] {
+            let link = doc.pointer(pointer).and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                link.starts_with(&format!("/ansible/{}/", f.repo_key)),
+                "{pointer} must be rewritten to this repository's route, got {link:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_upstream_collection_info_drops_an_unaddressable_highest_version_3365() {
+        let upstream = serde_json::json!({
+            "highest_version": { "version": "../../../../etc/passwd" },
+        });
+        let doc = rewrite_upstream_collection_info("gx", "testns", "testcoll", &upstream);
+        assert_eq!(
+            doc["highest_version"]["version"], "",
+            "an unaddressable version must not be advertised: {doc}"
+        );
+        assert!(
+            !doc["highest_version"]["href"]
+                .as_str()
+                .unwrap()
+                .contains(".."),
+            "and must not reach the href either: {doc}"
+        );
     }
 }
