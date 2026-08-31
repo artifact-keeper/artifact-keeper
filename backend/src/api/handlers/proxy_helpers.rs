@@ -8002,6 +8002,164 @@ mod tests {
         r
     }
 
+    // =====================================================================
+    // #3454 revert-proofs: the presigned-redirect + download-record paths
+    // must derive their cache key from the LIVE `proxy.cache_scope()`, not a
+    // hardcoded `ProxyCacheScope::unscoped()`. Each seeds a fresh cache entry
+    // at the SCOPED key over a presign-capable in-memory backend and asserts
+    // the signed 302 Location (or the persisted catalog row) carries the scope
+    // segment. Reverting the hunk to `unscoped()` makes the freshness probe
+    // miss (no object at the unscoped key) or sign the wrong key -> the test
+    // fails, which is what the previous coverage did not do.
+    // =====================================================================
+
+    fn scoped_test_scope() -> crate::services::proxy_cache_scope::ProxyCacheScope {
+        crate::services::proxy_cache_scope::ProxyCacheScope::from_env_and_identity(
+            Some("prod-eu"),
+            Uuid::from_u128(0x3454_0000_0000_0000_0000_0000_0000_0001),
+        )
+        .unwrap()
+    }
+
+    fn get_ctx() -> crate::api::middleware::download_telemetry::DownloadContext {
+        crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        }
+    }
+
+    /// `try_member_cache_redirect` (proxy_helpers.rs virtual-member fast path).
+    #[tokio::test]
+    async fn try_member_cache_redirect_signs_the_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let member = test_local_member("maven-proxy");
+        let path = "org/example/lib/1.0/lib-1.0.jar";
+        let content_key = ProxyService::cache_storage_key(&scope, &member.key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, &member.key, path).unwrap();
+        assert!(content_key.contains("proxy-cache/prod-eu/maven-proxy/"));
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("mcr-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+        let ctx = get_ctx();
+
+        let resp = try_member_cache_redirect(state.as_ref(), proxy.as_ref(), &member, path, &ctx)
+            .await
+            .expect("a fresh presign-capable member cache hit must 302-redirect");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("proxy-cache/prod-eu/maven-proxy/"),
+            "member redirect signed a non-scoped key (a revert to unscoped drops the \
+             scope segment): {loc}"
+        );
+    }
+
+    /// `proxy_fetch_or_redirect` (proxy_helpers.rs generic presign fast path).
+    #[tokio::test]
+    async fn proxy_fetch_or_redirect_signs_the_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let repo_key = "npm-proxy";
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let content_key = ProxyService::cache_storage_key(&scope, repo_key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, repo_key, path).unwrap();
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("pfor-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+        let ctx = get_ctx();
+
+        let resp = proxy_fetch_or_redirect(
+            proxy.as_ref(),
+            state.as_ref(),
+            Uuid::new_v4(),
+            repo_key,
+            "https://unused.example.com",
+            path,
+            &ctx,
+        )
+        .await
+        .expect("a fresh cache hit must take the redirect fast path, not fetch upstream");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("proxy-cache/prod-eu/npm-proxy/"),
+            "generic redirect signed a non-scoped key (a revert to unscoped drops the \
+             scope segment): {loc}"
+        );
+    }
+
+    /// `record_proxy_download` (proxy_helpers.rs) persists a catalog placeholder
+    /// keyed under the LIVE scope, so the streaming tee's later upsert refines
+    /// the same row. A revert to unscoped keys the placeholder under
+    /// `proxy-cache/<repo>/...`, orphaning it. DB-backed.
+    #[tokio::test]
+    async fn record_proxy_download_persists_scoped_storage_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let storage_path = std::env::temp_dir()
+            .join(format!("rpd-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state = tdh::build_state_with_proxy(pool.clone(), &storage_path, proxy.clone());
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let ctx = get_ctx();
+
+        record_proxy_download(&state, repo_id, &repo_key, path, &ctx).await;
+
+        let storage_key: Option<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(&pool)
+        .await
+        .expect("query catalog row");
+        let storage_key = storage_key.expect("record_proxy_download must persist a catalog row");
+        assert!(
+            storage_key.starts_with("proxy-cache/prod-eu/"),
+            "placeholder catalog row keyed under a non-scoped key (a revert to unscoped): {storage_key}"
+        );
+        // cleanup
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
     #[tokio::test]
     async fn resolve_from_members_empty_is_404() {
         let res = resolve_virtual_download_from_members(

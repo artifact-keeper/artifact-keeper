@@ -5684,9 +5684,23 @@ impl ProxyService {
         // legacy tree does. It deletes only; it can never serve bytes.
         let mut deleted = 0usize;
         let mut prefixes = vec![self.cache_scope.repo_root(repo_key)];
-        let legacy = ProxyCacheScope::unscoped().repo_root(repo_key);
-        if !prefixes.contains(&legacy) {
-            prefixes.push(legacy);
+        // The legacy unscoped sweep (`proxy-cache/<repo_key>/`) reclaims objects
+        // this deployment cached before #3454. But `proxy-cache/<repo_key>/` is
+        // ALSO the shape of a scope root: when `repo_key` equals THIS
+        // deployment's own scope segment the legacy prefix collapses to
+        // `proxy-cache/<scope>/` — the root of the ENTIRE deployment's cache —
+        // and sweeping it would delete every other repository's cached content.
+        // A repository key can legally equal the scope segment (both are drawn
+        // from `[A-Za-z0-9._-]`, so a UUID or a token like `prod-eu` is a valid
+        // key), so guard the collision explicitly and sweep only the scoped
+        // subtree in that case. Repository creation/rename rejects the collision
+        // too (`repositories::validate_key_not_scope_collision`); this guard is
+        // the half that still holds for a repository that predates that check.
+        if self.cache_scope.segment() != Some(repo_key) {
+            let legacy = ProxyCacheScope::unscoped().repo_root(repo_key);
+            if !prefixes.contains(&legacy) {
+                prefixes.push(legacy);
+            }
         }
         let mut keys = Vec::new();
         for prefix in &prefixes {
@@ -18793,6 +18807,87 @@ mod tests {
             "purge reached into another deployment's cache"
         );
         assert!(storage.exists(&other_repo).await.unwrap());
+    }
+
+    /// #3454 follow-up (the destructive-collision defect). A repository key is
+    /// drawn from the same `[A-Za-z0-9._-]` alphabet as the scope segment, so a
+    /// repository can be created keyed EXACTLY as this deployment's scope
+    /// segment (`prod-eu`, or the default peer-instance UUID). For such a
+    /// repository the legacy unscoped sweep prefix
+    /// `ProxyCacheScope::unscoped().repo_root("prod-eu")` == `proxy-cache/prod-eu/`
+    /// collapses onto the deployment's WHOLE scoped cache root
+    /// `proxy-cache/<scope=prod-eu>/`. Before the guard, deleting that one
+    /// repository listed and deleted every other repository's cached objects in
+    /// this deployment.
+    ///
+    /// This is the real, live-reproduced blast radius, so it asserts on
+    /// before/after object COUNTS of an unrelated victim repository — not that
+    /// two scopes merely produce different keys.
+    #[tokio::test]
+    async fn purge_of_repo_keyed_as_scope_segment_spares_other_repos_3454() {
+        let bucket = SharedBucket::new("purge-collision");
+        // A legible, operator-set scope (`PROXY_CACHE_SCOPE=prod-eu`) — the
+        // trivially-guessable configuration the finding calls out.
+        let scope = ProxyCacheScope::from_env_and_identity(Some("prod-eu"), SCOPE_3454_A).unwrap();
+        assert_eq!(scope.segment(), Some("prod-eu"));
+        let proxy = bucket.deployment(scope.clone());
+        let storage = bucket.storage();
+
+        // The victim: a DIFFERENT repository in the SAME deployment, with two
+        // cached objects.
+        let victim_prefix = scope.repo_root("victim-proxy"); // proxy-cache/prod-eu/victim-proxy/
+        let victim_a = format!("{victim_prefix}org/a/1.0/a.jar/__content__");
+        let victim_b = format!("{victim_prefix}org/b/2.0/b.jar/__cache_meta__.json");
+        // The attacker-controlled repository, keyed EXACTLY as the scope
+        // segment, with its own single cached object.
+        let colliding_own = format!("{}pkg/__content__", scope.repo_root("prod-eu"));
+        // A third deployment's object at the true unscoped root, owned by nobody
+        // here — must also survive (the guard must not widen the sweep either).
+        let foreign = "proxy-cache/some-other-repo/x/__content__".to_string();
+
+        for key in [&victim_a, &victim_b, &colliding_own, &foreign] {
+            storage
+                .put(key, Bytes::from_static(b"x"))
+                .await
+                .expect("seed object");
+        }
+
+        // Before: the victim holds exactly its two objects.
+        let victim_before = storage.list(Some(&victim_prefix)).await.unwrap().len();
+        assert_eq!(
+            victim_before, 2,
+            "fixture: victim must start with 2 objects"
+        );
+
+        // Delete the repository that is keyed as the scope segment. This is the
+        // exact call a `repository:admin`-on-that-repo, non-admin caller drives.
+        let deleted = proxy
+            .purge_repo_cache("prod-eu")
+            .await
+            .expect("purge must not error");
+
+        // Only the colliding repository's OWN object is reclaimed.
+        assert_eq!(
+            deleted, 1,
+            "purge of the scope-keyed repo must delete only its own object, not the              whole deployment cache"
+        );
+        assert!(
+            !storage.exists(&colliding_own).await.unwrap(),
+            "the scope-keyed repository's own cache must still be purged"
+        );
+
+        // After: the victim's objects are INTACT — same count as before.
+        let victim_after = storage.list(Some(&victim_prefix)).await.unwrap().len();
+        assert_eq!(
+            victim_after, victim_before,
+            "deleting a repository keyed as the scope segment destroyed another              repository's cached objects ({victim_before} -> {victim_after})"
+        );
+        assert!(storage.exists(&victim_a).await.unwrap());
+        assert!(storage.exists(&victim_b).await.unwrap());
+        assert!(
+            storage.exists(&foreign).await.unwrap(),
+            "the guard must not reach unrelated root-level objects"
+        );
     }
 
     /// The repository "cached artifacts" listing and the PyPI root simple

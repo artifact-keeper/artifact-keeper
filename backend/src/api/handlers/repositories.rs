@@ -1348,6 +1348,30 @@ fn validate_repository_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a repository key that collides with this deployment's active
+/// proxy-cache scope segment (#3454 follow-up).
+///
+/// `proxy-cache/<segment>/` is the root of this deployment's ENTIRE proxy
+/// cache, and it is also the exact shape of the legacy per-repository purge
+/// prefix `proxy-cache/<repo_key>/`. A repository whose key equals the scope
+/// segment makes those two namespaces ambiguous, so deleting that repository
+/// would otherwise sweep every other repository's cached content. Refusing the
+/// key at creation and rename removes the ambiguity structurally — it survives
+/// a future refactor of the purge path, whereas the guard in
+/// `ProxyService::purge_repo_cache` alone leaves the ambiguity in place.
+///
+/// Kept scope-aware and side-effect free (`scope_segment` is the resolved
+/// segment or `None` for the unscoped/legacy layout, in which nothing can
+/// collide) so it is unit-testable without a live `ProxyService`.
+fn validate_key_not_scope_collision(key: &str, scope_segment: Option<&str>) -> Result<()> {
+    if scope_segment == Some(key) {
+        return Err(AppError::Validation(format!(
+            "Repository key '{key}' collides with this deployment's proxy-cache scope segment and is reserved"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a custom outbound User-Agent string for a remote repository.
 ///
 /// Enforces a pragmatic 256-character cap and rejects control characters per
@@ -2674,6 +2698,13 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
+    validate_key_not_scope_collision(
+        &payload.key,
+        state
+            .proxy_service
+            .as_ref()
+            .and_then(|p| p.cache_scope().segment()),
+    )?;
     // Resolve the format string via the service. The service owns both the
     // built-in enum mapping and the `format_handlers` fallback for WASM
     // plugin formats, so the handler keeps no business logic of its own here.
@@ -3624,6 +3655,13 @@ pub async fn update_repository(
     // Validate new key if provided
     if let Some(ref new_key) = payload.key {
         validate_repository_key(new_key)?;
+        validate_key_not_scope_collision(
+            new_key,
+            state
+                .proxy_service
+                .as_ref()
+                .and_then(|p| p.cache_scope().segment()),
+        )?;
     }
 
     // Validate quota_bytes is within a reasonable range (max 100 TiB)
@@ -12410,6 +12448,44 @@ mod tests {
     #[test]
     fn test_validate_repository_key_valid_simple() {
         assert!(validate_repository_key("my-repo").is_ok());
+    }
+
+    // ---- #3454 follow-up: a key equal to the proxy-cache scope segment is
+    // reserved. `proxy-cache/<segment>/` is the whole deployment's cache root
+    // AND the legacy per-repository purge prefix `proxy-cache/<repo_key>/`, so
+    // a repository keyed as the segment makes deleting it sweep every other
+    // repository's cached content. Refusing it at creation/rename is the half
+    // of the fix that survives a refactor of the purge path.
+    #[test]
+    fn test_reject_repository_key_equal_to_scope_segment() {
+        let err = validate_key_not_scope_collision("prod-eu", Some("prod-eu"))
+            .expect_err("a key equal to the scope segment must be rejected");
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("proxy-cache scope segment"),
+                    "unexpected: {msg}"
+                );
+                assert!(msg.contains("prod-eu"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The UUID default segment is a legal repository key too, and equally
+        // reserved.
+        let uuid = "7ff7c6bf-e184-4d77-a541-0b23b208b3b4";
+        assert!(validate_key_not_scope_collision(uuid, Some(uuid)).is_err());
+    }
+
+    #[test]
+    fn test_scope_collision_permits_non_colliding_and_unscoped() {
+        // A different key under the same scope is fine.
+        assert!(validate_key_not_scope_collision("maven-proxy", Some("prod-eu")).is_ok());
+        // An unscoped/legacy deployment (no segment) can never collide.
+        assert!(validate_key_not_scope_collision("prod-eu", None).is_ok());
+        // The colliding key is still a well-formed key by the base validator —
+        // i.e. the base validator does NOT already reject it, so this check is
+        // load-bearing.
+        assert!(validate_repository_key("prod-eu").is_ok());
     }
 
     #[test]

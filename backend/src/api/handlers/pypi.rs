@@ -13906,6 +13906,57 @@ mod tests {
         );
     }
 
+    /// #3454 revert-proof: `pypi_proxy_cache_redirect` must sign through the
+    /// LIVE scope. Seeds a fresh entry at the SCOPED key over a presign-capable
+    /// backend and asserts the 302 Location carries the scope segment; a revert
+    /// to `unscoped()` makes the freshness probe miss the unscoped key (no
+    /// redirect) or sign the wrong key.
+    #[tokio::test]
+    async fn test_pypi_proxy_cache_redirect_signs_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = crate::services::proxy_cache_scope::ProxyCacheScope::from_env_and_identity(
+            Some("prod-eu"),
+            uuid::Uuid::from_u128(0x3454_0000_0000_0000_0000_0000_0000_0001),
+        )
+        .unwrap();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let repo_key = "pypi-remote";
+        let cache_path = "simple/click/click-8.1.7-py3-none-any.whl";
+        let content_key = crate::services::proxy_service::ProxyService::cache_storage_key(
+            &scope, repo_key, cache_path,
+        )
+        .unwrap();
+        let meta_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
+            &scope, repo_key, cache_path,
+        )
+        .unwrap();
+        assert!(content_key.contains("proxy-cache/prod-eu/pypi-remote/"));
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("pypi-scoped-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+
+        let resp = super::pypi_proxy_cache_redirect(&state, proxy.as_ref(), repo_key, cache_path)
+            .await
+            .expect("a fresh presign-capable pypi cache hit must 302-redirect");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("proxy-cache/prod-eu/pypi-remote/"),
+            "pypi redirect signed a non-scoped key (a revert to unscoped drops the scope): {loc}"
+        );
+    }
+
     #[tokio::test]
     async fn test_pypi_proxy_cache_redirect_none_when_backend_no_redirect_support() {
         use crate::api::handlers::test_db_helpers as tdh;

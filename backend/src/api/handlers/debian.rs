@@ -3355,6 +3355,84 @@ async fn upload_raw(
 mod tests {
     use super::*;
 
+    /// #3454 revert-proof: `maybe_invalidate_by_epoch` derives its metadata key
+    /// from the LIVE `proxy.cache_scope()`. Seeds a stale scoped cache entry and
+    /// a newer release epoch, then asserts the SCOPED entry is invalidated. A
+    /// revert of the debian hunk to `unscoped()` derives the unscoped metadata
+    /// key, finds no sidecar there, returns early, and the scoped entry
+    /// survives — so this test fails.
+    #[tokio::test]
+    async fn maybe_invalidate_by_epoch_uses_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_service::CacheKeys;
+        use crate::services::storage_service::StorageBackend;
+        let pool = tdh::lazy_pool();
+        let scope = crate::services::proxy_cache_scope::ProxyCacheScope::from_env_and_identity(
+            Some("prod-eu"),
+            uuid::Uuid::from_u128(0x3454_0000_0000_0000_0000_0000_0000_0001),
+        )
+        .unwrap();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let repo_key = "apt-remote";
+        let distribution = "bookworm";
+        // A mutable dists index (Packages), so the immutable short-circuit does
+        // not skip invalidation.
+        let path = "dists/bookworm/main/binary-amd64/Packages";
+
+        // Seed a STALE cache entry (cached_at well in the past) at the SCOPED
+        // keys the proxy will derive.
+        let keys = CacheKeys::derive(&scope, repo_key, path).unwrap();
+        assert!(keys.content.contains("proxy-cache/prod-eu/apt-remote/"));
+        let stale = crate::services::proxy_service::CacheMetadata {
+            cached_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            content_type: Some("text/plain".to_string()),
+            content_encoding: None,
+            upstream_commit_sha: None,
+            size_bytes: 3,
+            checksum_sha256: String::new(),
+        };
+        backend
+            .put(&keys.content, bytes::Bytes::from_static(b"idx"))
+            .await
+            .unwrap();
+        backend
+            .put(
+                &keys.metadata,
+                bytes::Bytes::from(serde_json::to_vec(&stale).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        // The Release changed AFTER our entry was cached -> epoch is newer.
+        proxy
+            .write_release_epoch(repo_key, distribution, chrono::Utc::now())
+            .await;
+
+        assert!(
+            backend.exists(&keys.content).await.unwrap(),
+            "fixture: the stale entry must exist before invalidation"
+        );
+
+        maybe_invalidate_by_epoch(proxy.as_ref(), repo_key, distribution, path).await;
+
+        assert!(
+            !backend.exists(&keys.content).await.unwrap(),
+            "epoch invalidation missed the scoped cache entry (a revert to unscoped \
+             derives a different key and leaves it stale)"
+        );
+        assert!(
+            !backend.exists(&keys.metadata).await.unwrap(),
+            "the scoped sidecar must be evicted with its body"
+        );
+    }
+
     fn package_entry(
         name: &str,
         version: &str,
