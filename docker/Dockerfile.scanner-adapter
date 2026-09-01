@@ -125,13 +125,48 @@ FROM ghcr.io/artifact-keeper/trivy@sha256:37317c08e42f6202ea5087f800739d0943cf8f
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security
 # errata. The stage is named so CI can cache-bust it (`no-cache-filters`),
-# forcing `apk add --no-cache` to re-resolve current package errata on every
-# publish instead of reusing a stale cached layer.
+# forcing the apk layer to re-resolve current package errata on every publish
+# instead of reusing a stale cached layer.
 FROM alpine:3.24 AS runtime
 
+# Refresh the whole base FIRST, then install the runtime deps.
+#
+# The cache-bust above is necessary but was not sufficient, and #3612 is the
+# proof. `apk add` only resolves the packages NAMED on its command line; it
+# leaves an already-installed package alone as long as the installed version
+# still satisfies the dependency constraint. libcrypto3/libssl3 are not named
+# here — they arrive inside the `alpine:3.24` base layer itself — so no amount
+# of cache-busting an `apk add` line could ever move them. The layer re-ran on
+# every publish exactly as designed and still shipped whatever openssl the
+# base image happened to be baked with.
+#
+# What that shipped: Docker Publish on main went red on 2026-09-01 with
+# CVE-2026-14456 (HIGH, openssl unbounded memory growth in the QUIC server)
+# against libcrypto3/libssl3 3.5.7-r0, the version in the current alpine:3.24
+# layer, fixed in 3.5.8-r0 and available in the v3.24/main repo at the time of
+# the failure. Both bundled Go binaries — /usr/local/bin/trivy and
+# /usr/local/bin/scanner-adapter — scanned CLEAN in that same run. The finding
+# was entirely base-OS, so neither the artifact-keeper/trivy digest below nor
+# the GO_MIN_PATCH floor above had anything to do with it, and re-pinning
+# either would have been motion without a fix.
+#
+# `apk upgrade --no-cache` rebuilds the base against current errata on every
+# image build; the targeted `add --upgrade` keeps the install set explicit and
+# pulls those three forward too. This is the same two-step
+# docker/Dockerfile.backend.alpine has used since #2391 — that image was
+# already immune to this class, and the asymmetry was the whole bug. Keep the
+# two files in step: an errata mechanism that only one of two Alpine runtimes
+# has is a gap waiting for the next advisory.
+#
+# NOTE: /.trivyignore is not an option for this class and says so explicitly —
+# base OS package CVEs are "deliberately NOT suppressed" there, and the bar for
+# any entry is "no fixed version we can BUILD AGAINST exists". A fixed apk
+# existed in the distro repo, so this is a rebuild, not a suppression.
+#
 # ca-certificates: TLS to the trivy vuln-DB registry / HTTPS registries.
 # git + rpm: trivy uses them for certain package/source scanners.
-RUN apk add --no-cache ca-certificates git rpm \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache --upgrade ca-certificates git rpm \
     && adduser -D -u 1001 scanner \
     && mkdir -p /home/scanner/.cache/trivy \
     && chown -R scanner:scanner /home/scanner
