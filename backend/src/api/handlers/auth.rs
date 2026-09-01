@@ -23,8 +23,8 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::audit_service::{
-    api_token_audit_entry, audit_fire_and_forget, AuditAction, AuditEntry, AuditService,
-    ResourceType,
+    api_token_audit_entry, api_token_mint_audit_entry, audit_fire_and_forget, AuditAction,
+    AuditEntry, AuditService, ResourceType,
 };
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_service::AuthService;
@@ -590,6 +590,12 @@ pub struct CreateApiTokenResponse {
     pub id: Uuid,
     pub token: String,
     pub name: String,
+    /// When the token expires (`None` = never). Authoritative from the mint,
+    /// including any expiration the instance policy applied (#3460).
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when the instance token expiration policy shaped this mint
+    /// (applied a default or enforced the permitted range).
+    pub policy_applied: bool,
 }
 
 /// Create a new API token for the current user
@@ -625,8 +631,8 @@ pub async fn create_api_token(
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let (token, id) = auth_service
-        .generate_api_token(
+    let minted = auth_service
+        .generate_api_token_with_policy(
             auth.user_id,
             &payload.name,
             payload.scopes,
@@ -636,20 +642,23 @@ pub async fn create_api_token(
 
     audit_fire_and_forget(
         state.db.clone(),
-        api_token_audit_entry(
-            AuditAction::ApiTokenCreated,
+        api_token_mint_audit_entry(
             auth.user_id,
-            id,
+            minted.id,
             Some(&payload.name),
             "user_self",
+            minted.expires_at,
+            minted.policy_applied,
         ),
     )
     .await;
 
     Ok(Json(CreateApiTokenResponse {
-        id,
-        token,
+        id: minted.id,
+        token: minted.token,
         name: payload.name,
+        expires_at: minted.expires_at,
+        policy_applied: minted.policy_applied,
     }))
 }
 
@@ -1486,6 +1495,8 @@ mod tests {
             id,
             token: "ak_token_abc123".to_string(),
             name: "ci-key".to_string(),
+            expires_at: None,
+            policy_applied: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["token"], "ak_token_abc123");

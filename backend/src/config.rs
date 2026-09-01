@@ -567,6 +567,18 @@ pub struct Config {
     /// that is already stored in the database.
     pub totp_policy: Option<crate::services::totp_policy::TotpPolicy>,
 
+    /// Optional pin for the API token expiration policy (#3460).
+    ///
+    /// When `API_TOKEN_EXPIRATION_REQUIRED` is set to a boolean, the policy is
+    /// built from the `API_TOKEN_EXPIRATION_*` env vars, overrides the
+    /// `security.api_token_expiry_policy` row in `system_settings`, and the
+    /// admin API refuses to change it. `API_TOKEN_EXPIRATION_REQUIRED=false`
+    /// plus a restart is the offline break-glass. An unparseable or internally
+    /// inconsistent pin is ignored (with a warning) so a typo can neither
+    /// reject every token mint nor silently disable enforcement that is
+    /// already stored in the database.
+    pub api_token_expiry_policy: Option<crate::services::token_expiry_policy::ApiTokenExpiryPolicy>,
+
     /// Port for the unauthenticated Prometheus metrics-only listener.
     ///
     /// When set, a second TCP listener is started on this port serving only
@@ -946,6 +958,7 @@ redacted_debug!(Config {
     show sso_disable_admin_break_glass,
     show oidc_silent_sso_enabled,
     show totp_policy,
+    show api_token_expiry_policy,
     show metrics_port,
     show database_max_connections,
     show database_min_connections,
@@ -1064,6 +1077,7 @@ impl Default for Config {
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
             totp_policy: None,
+            api_token_expiry_policy: None,
             metrics_port: None,
             database_max_connections: 50,
             database_min_connections: 5,
@@ -1314,6 +1328,16 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            api_token_expiry_policy: {
+                use crate::services::token_expiry_policy as tep;
+                tep::ApiTokenExpiryPolicy::from_env_values(
+                    env::var(tep::ENV_REQUIRED).ok().as_deref(),
+                    env::var(tep::ENV_DAYS_MIN).ok().as_deref(),
+                    env::var(tep::ENV_DAYS_MAX).ok().as_deref(),
+                    env::var(tep::ENV_DAYS_DEFAULT).ok().as_deref(),
+                    env::var(tep::ENV_INCLUDE_SERVICE_ACCOUNTS).ok().as_deref(),
+                )
+            },
             metrics_port: match env::var("METRICS_PORT") {
                 Ok(val) => match val.parse::<u16>() {
                     Ok(port) => Some(port),

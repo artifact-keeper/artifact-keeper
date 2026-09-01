@@ -88,6 +88,7 @@ fn test_config(storage_path: &str) -> Config {
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
         totp_policy: None,
+        api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
         database_max_connections: 20,

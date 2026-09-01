@@ -3,6 +3,7 @@
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
+use crate::services::token_expiry_policy::{self, ApiTokenExpiryPolicy, TokenPolicySource};
 use crate::services::totp_policy::{self, check_policy_activation, TotpPolicy, TotpPolicySource};
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -36,6 +37,10 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/settings/totp-policy",
             get(get_totp_policy).put(update_totp_policy),
+        )
+        .route(
+            "/settings/token-policy",
+            get(get_token_policy).put(update_token_policy),
         )
         .route("/stats", get(get_system_stats))
         .route("/downloads", get(list_downloads))
@@ -1025,6 +1030,148 @@ pub async fn update_totp_policy(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// API token expiration policy (#3460)
+// ---------------------------------------------------------------------------
+
+/// Current API token expiration policy plus the inventory an operator needs
+/// before (or after) tightening it: how many live tokens already exist with
+/// no expiration. Enabling the policy never touches those rows — they are
+/// surfaced here so an administrator can rotate them deliberately.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TokenPolicyResponse {
+    /// The policy in force.
+    pub policy: ApiTokenExpiryPolicy,
+    /// Whether it comes from the `API_TOKEN_EXPIRATION_*` environment
+    /// variables (in which case `PUT` is refused) or from the database.
+    pub source: TokenPolicySource,
+    /// Whether `PUT` can change the policy at all right now.
+    pub editable: bool,
+    /// Live (unrevoked, active-owner) never-expiring tokens held by regular
+    /// users. These predate or bypass the policy and are unaffected by it;
+    /// rotate them via the existing token-revocation endpoints.
+    pub non_expiring_user_tokens: i64,
+    /// Live never-expiring tokens held by service accounts (CI credentials —
+    /// exempt from enforcement unless `apply_to_service_accounts` is set).
+    pub non_expiring_service_account_tokens: i64,
+}
+
+/// Request body for `PUT /admin/settings/token-policy`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateTokenPolicyRequest {
+    pub policy: ApiTokenExpiryPolicy,
+}
+
+/// Live never-expiring tokens, split by holder class (users vs service
+/// accounts), counting only tokens that can still authenticate (unrevoked,
+/// owner active).
+async fn live_non_expiring_token_counts(db: &sqlx::PgPool) -> Result<(i64, i64)> {
+    let row: (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE NOT u.is_service_account),
+            COUNT(*) FILTER (WHERE u.is_service_account)
+        FROM api_tokens at
+        JOIN users u ON u.id = at.user_id
+        WHERE at.expires_at IS NULL
+          AND at.revoked_at IS NULL
+          AND u.is_active
+        "#,
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(row)
+}
+
+async fn build_token_policy_response(state: &SharedState) -> Result<TokenPolicyResponse> {
+    let (policy, source) =
+        token_expiry_policy::effective_policy(&state.db, state.config.api_token_expiry_policy)
+            .await;
+    let (users, service_accounts) = live_non_expiring_token_counts(&state.db).await?;
+    Ok(TokenPolicyResponse {
+        policy,
+        source,
+        editable: source == TokenPolicySource::Database,
+        non_expiring_user_tokens: users,
+        non_expiring_service_account_tokens: service_accounts,
+    })
+}
+
+/// Read the API token expiration policy.
+#[utoipa::path(
+    get,
+    path = "/settings/token-policy",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Current API token expiration policy", body = TokenPolicyResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_token_policy(
+    State(state): State<SharedState>,
+) -> Result<Json<TokenPolicyResponse>> {
+    Ok(Json(build_token_policy_response(&state).await?))
+}
+
+/// Change the API token expiration policy.
+///
+/// Takes effect immediately for NEW token mints only; tokens that already
+/// exist keep whatever `expires_at` (including none) they were minted with,
+/// so enabling enforcement can never invalidate a credential a pipeline is
+/// already running on. The response's `non_expiring_*` counts are the
+/// inventory to rotate manually if the security posture requires it.
+#[utoipa::path(
+    put,
+    path = "/settings/token-policy",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = UpdateTokenPolicyRequest,
+    responses(
+        (status = 200, description = "Policy updated", body = TokenPolicyResponse),
+        (status = 400, description = "Inconsistent policy (range/default contradiction)", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Refused: policy pinned by API_TOKEN_EXPIRATION_* environment variables", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_token_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<UpdateTokenPolicyRequest>,
+) -> Result<Json<TokenPolicyResponse>> {
+    let current = build_token_policy_response(&state).await?;
+    if current.source == TokenPolicySource::Environment {
+        return Err(AppError::Conflict(
+            "The API token expiration policy is pinned by the API_TOKEN_EXPIRATION_*              environment variables and cannot be changed through the API. Unset              API_TOKEN_EXPIRATION_REQUIRED and restart to manage it here."
+                .to_string(),
+        ));
+    }
+    payload.policy.validate().map_err(AppError::Validation)?;
+
+    token_expiry_policy::store_policy(&state.db, &payload.policy, auth.user_id).await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::ApiTokenPolicyChanged, ResourceType::User)
+            .user(auth.user_id)
+            .resource(auth.user_id)
+            .actor_name(&auth.username)
+            .details(serde_json::json!({
+                "from": current.policy,
+                "to": payload.policy,
+                "non_expiring_user_tokens": current.non_expiring_user_tokens,
+                "non_expiring_service_account_tokens":
+                    current.non_expiring_service_account_tokens,
+            })),
+    )
+    .await;
+
+    Ok(Json(build_token_policy_response(&state).await?))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SystemStats {
     pub total_repositories: i64,
@@ -1883,6 +2030,8 @@ pub async fn delete_proxy_scan_verdicts(
         update_settings,
         get_totp_policy,
         update_totp_policy,
+        get_token_policy,
+        update_token_policy,
         get_system_stats,
         list_downloads,
         list_downloads_by_ip,
@@ -1907,6 +2056,10 @@ pub async fn delete_proxy_scan_verdicts(
         UpdateTotpPolicyRequest,
         TotpPolicy,
         TotpPolicySource,
+        TokenPolicyResponse,
+        UpdateTokenPolicyRequest,
+        ApiTokenExpiryPolicy,
+        TokenPolicySource,
         SystemStats,
         ListDownloadsQuery,
         DownloadRecord,
@@ -2350,6 +2503,179 @@ mod tests {
         // admin subset can never exceed the whole.
         assert!(read.local_users >= 1);
         assert!(read.local_admins <= read.local_users);
+    }
+
+    // -----------------------------------------------------------------------
+    // API token expiration policy endpoint (#3460)
+    // -----------------------------------------------------------------------
+
+    /// PUT stores a consistent policy and GET reflects it; an inconsistent
+    /// policy is refused with 400 BEFORE it is stored (a bad range would make
+    /// every defaulted mint fail); the non-expiring inventory counts live,
+    /// unrevoked tokens split by holder class.
+    #[tokio::test]
+    async fn test_token_policy_put_round_trips_and_surfaces_non_expiring_tokens() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::token_expiry_policy as tep;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::token_policy_serial_lock().await;
+        let before = tep::stored_policy(&pool).await;
+
+        // `is_admin` deliberately left alone — the admin check is route
+        // middleware (see the sibling TOTP-policy test's rationale).
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (sa_id, _sa_name) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_service_account = true WHERE id = $1")
+            .bind(sa_id)
+            .execute(&pool)
+            .await
+            .expect("flag service account");
+
+        // Seed inert so the never-expiring mints below are accepted.
+        tep::store_policy(&pool, &tep::ApiTokenExpiryPolicy::default(), user_id)
+            .await
+            .expect("seed inert");
+
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-token-policy");
+        let auth_service = crate::services::auth_service::AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        );
+        let user_tok = auth_service
+            .generate_api_token(user_id, "never-user", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint user token");
+        let _sa_tok = auth_service
+            .generate_api_token(sa_id, "never-sa", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint SA token");
+
+        let auth = admin_auth(user_id, &username);
+
+        // GET: database-sourced, editable, and the inventory sees both tokens.
+        let read = get_token_policy(State(state.clone()))
+            .await
+            .expect("read policy")
+            .0;
+        assert_eq!(read.source, TokenPolicySource::Database);
+        assert!(read.editable);
+        assert!(
+            read.non_expiring_user_tokens >= 1,
+            "user-held never-expiring token must be surfaced: {}",
+            read.non_expiring_user_tokens
+        );
+        assert!(
+            read.non_expiring_service_account_tokens >= 1,
+            "SA-held never-expiring token must be surfaced: {}",
+            read.non_expiring_service_account_tokens
+        );
+
+        // PUT an inconsistent policy -> 400, nothing stored.
+        let bad = update_token_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTokenPolicyRequest {
+                policy: ApiTokenExpiryPolicy {
+                    require_expiration: true,
+                    min_days: 30,
+                    max_days: 7,
+                    default_days: None,
+                    apply_to_service_accounts: false,
+                },
+            }),
+        )
+        .await;
+        assert!(
+            matches!(bad, Err(AppError::Validation(_))),
+            "min > max must be refused: {bad:?}"
+        );
+        assert_eq!(
+            tep::stored_policy(&pool).await,
+            tep::ApiTokenExpiryPolicy::default(),
+            "a refused PUT must not have stored anything"
+        );
+
+        // PUT a valid enforcing policy -> stored, and GET reflects it.
+        let good = ApiTokenExpiryPolicy {
+            require_expiration: true,
+            min_days: 1,
+            max_days: 60,
+            default_days: Some(30),
+            apply_to_service_accounts: false,
+        };
+        let updated = update_token_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTokenPolicyRequest { policy: good }),
+        )
+        .await
+        .expect("valid policy accepted")
+        .0;
+        assert_eq!(updated.policy, good);
+        assert_eq!(tep::stored_policy(&pool).await, good);
+
+        // The pre-existing never-expiring token STILL authenticates — the
+        // endpoint's contract says enabling enforcement is mint-time only.
+        auth_service
+            .validate_api_token(&user_tok.0)
+            .await
+            .expect("existing token must survive the policy change");
+
+        tep::store_policy(&pool, &before, user_id)
+            .await
+            .expect("restore");
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, sa_id).await;
+    }
+
+    /// While `API_TOKEN_EXPIRATION_*` pins the policy, GET reports the pin as
+    /// environment-sourced/read-only and PUT is refused with 409.
+    #[tokio::test]
+    async fn test_token_policy_put_is_refused_while_pinned_by_env() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::token_policy_serial_lock().await;
+
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let pinned = ApiTokenExpiryPolicy {
+            require_expiration: true,
+            min_days: 1,
+            max_days: 90,
+            default_days: Some(90),
+            apply_to_service_accounts: false,
+        };
+        let state = tdh::build_state_with(pool.clone(), "/tmp/admin-token-pinned", |cfg| {
+            cfg.api_token_expiry_policy = Some(pinned);
+        });
+        let auth = admin_auth(user_id, &username);
+
+        let read = get_token_policy(State(state.clone())).await;
+        let write = update_token_policy(
+            State(state),
+            Extension(auth),
+            Json(UpdateTokenPolicyRequest {
+                policy: ApiTokenExpiryPolicy::default(),
+            }),
+        )
+        .await;
+        let write_err = write.err();
+
+        tdh::cleanup_user(&pool, user_id).await;
+
+        let read = read.expect("read policy").0;
+        assert_eq!(read.policy, pinned);
+        assert_eq!(read.source, TokenPolicySource::Environment);
+        assert!(!read.editable);
+        assert!(
+            matches!(write_err, Some(AppError::Conflict(_))),
+            "a pinned policy must refuse writes: {write_err:?}"
+        );
     }
 
     /// While `TOTP_POLICY` pins the policy, the API reports it as
