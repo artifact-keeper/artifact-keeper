@@ -52,6 +52,171 @@ fn jittered_startup_delay(base_secs: u64) -> Duration {
     Duration::from_secs(base_secs.saturating_add(jitter))
 }
 
+/// The remainder of the scheduled storage-GC tick (#3503): the blob-GC
+/// mark + sweep behind their dry-run/readiness gates, then the post-GC
+/// storage-stats recompute.
+///
+/// Runs UNDER the tick's singleton lease — `spawn_all`'s GC loop passes this
+/// as `run_scheduled_tick`'s follow-on, so exactly one replica per occurrence
+/// executes it. Extracted as a free function so the leased tick body is
+/// directly testable: the discriminating observable is that a call really
+/// performs the work (stats `computed_at` advances; blob GC scans run), while
+/// `blob_gc_enabled = false` (the shipped default) keeps both blob-GC phases
+/// dry-run — reporting, never deleting or marking.
+pub(crate) async fn run_storage_gc_tick_follow_on(
+    service: &crate::services::storage_gc_service::StorageGcService,
+    gate_db: &PgPool,
+    stats_service: &crate::services::storage_stats_service::StorageStatsService,
+    blob_gc_enabled: bool,
+    blob_gc_sweep_grace_secs: i64,
+) {
+    // Blob deletion is opt-in (#1408): unset/false means every pass below is
+    // dry-run. Bias to leaking storage over losing data.
+    let blob_gc_dry_run = !blob_gc_enabled;
+    // Blob layer GC runs in the same tick: the manifest GC pass
+    // above frees `oci-manifests/...` storage keys, this pass
+    // frees `oci-blobs/...` ones that no live manifest references
+    // (via `manifest_blob_refs`). Both passes are independent —
+    // blob GC reads its own snapshot from `oci_blobs` and does
+    // not depend on the artifact-level GC having run first.
+    //
+    // SAFETY (#1408): blob deletion is irreversible, so two
+    // safeguards gate the destructive path here, in addition to
+    // the grace window and locked per-row re-check inside
+    // `run_blob_gc`:
+    //
+    //  1. Readiness gate (design from #1409 review, finding 3):
+    //     blob GC trusts `manifest_blob_refs` as the live blob
+    //     set, so it must not delete until a successful backfill
+    //     has populated refs for every live image manifest.
+    //     Otherwise a partial or failed startup backfill (e.g.
+    //     object storage briefly unreachable when bodies were
+    //     read) would make live layers look orphaned and GC would
+    //     delete them. We skip the *live* pass while refs are
+    //     incomplete or the readiness query itself fails; the
+    //     next tick re-checks and resumes once refs are complete.
+    //
+    //  2. Dry-run default: unless BLOB_GC_ENABLED is set, the
+    //     pass runs in dry-run mode and never deletes. A dry-run
+    //     pass is always safe to run, even when the readiness
+    //     gate is not yet satisfied, so we only enforce the gate
+    //     when about to delete for real.
+    let mut blob_gc_dry_run_this_tick = blob_gc_dry_run;
+    if !blob_gc_dry_run_this_tick {
+        match crate::services::manifest_blob_refs_backfill::any_live_manifest_missing_refs(gate_db)
+            .await
+        {
+            Ok(true) => {
+                // #3285: name the offending digests. Without this,
+                // diagnosing a stuck gate meant reconstructing the
+                // gate query by hand against the database.
+                let blockers =
+                    crate::services::manifest_blob_refs_backfill::list_live_manifests_missing_refs(
+                        gate_db,
+                        crate::services::manifest_blob_refs_backfill::GATE_BLOCKER_SAMPLE_LIMIT,
+                    )
+                    .await
+                    .unwrap_or_default();
+                tracing::warn!(
+                    blocking_manifests = %crate::services::manifest_blob_refs_backfill::describe_gate_blockers(&blockers),
+                    "Blob GC: manifest_blob_refs is incomplete for one or more live \
+                     image manifests (startup backfill unfinished or partially \
+                     failed); forcing dry-run this tick and retrying next tick"
+                );
+                blob_gc_dry_run_this_tick = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Blob GC: could not verify manifest_blob_refs readiness ({}); \
+                     forcing dry-run this tick",
+                    e
+                );
+                blob_gc_dry_run_this_tick = true;
+            }
+            Ok(false) => {}
+        }
+    }
+
+    // Two-phase mark-and-sweep (#1660). Phase A marks aged orphan
+    // candidates (`pending_delete_at`, a pure row update with no
+    // storage I/O) every tick; Phase B sweeps blobs marked at
+    // least `blob_gc_sweep_grace_secs` ago that are still orphan,
+    // deleting storage then row under the same push-path row lock.
+    // Splitting the phases keeps storage deletion out of the
+    // commit-then-delete TOCTOU: a re-push in the mark->sweep
+    // window resurrects the blob (clears the marker under the lock)
+    // so the sweep skips it. Both phases honour the dry-run /
+    // readiness gate above — in dry-run neither writes nor clears a
+    // marker and nothing is deleted.
+    match service.run_blob_gc_mark(blob_gc_dry_run_this_tick).await {
+        Ok(result) => {
+            if result.dry_run && result.storage_keys_deleted > 0 {
+                tracing::info!(
+                    "Blob GC (dry-run): would mark {} orphan blobs pending deletion \
+                     (set BLOB_GC_ENABLED=true to enable mark-and-sweep)",
+                    result.storage_keys_deleted,
+                );
+            } else if !result.dry_run && result.storage_keys_deleted > 0 {
+                tracing::info!(
+                    "Blob GC: marked {} orphan blobs pending deletion",
+                    result.storage_keys_deleted,
+                );
+            }
+            if !result.errors.is_empty() {
+                tracing::warn!("Blob GC mark completed with {} errors", result.errors.len());
+                for err in &result.errors {
+                    tracing::warn!(gc_error = %err, "Blob GC mark error");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Blob GC mark pass failed: {}", e);
+        }
+    }
+
+    match service
+        .run_blob_gc_sweep(blob_gc_dry_run_this_tick, blob_gc_sweep_grace_secs)
+        .await
+    {
+        Ok(result) => {
+            if result.dry_run && result.storage_keys_deleted > 0 {
+                tracing::info!(
+                    "Blob GC (dry-run): would sweep {} marked blob objects, {} bytes \
+                     (set BLOB_GC_ENABLED=true to delete)",
+                    result.storage_keys_deleted,
+                    result.bytes_freed
+                );
+            } else if !result.dry_run && result.storage_keys_deleted > 0 {
+                tracing::info!(
+                    "Blob GC: swept {} blob objects, freed {} bytes",
+                    result.storage_keys_deleted,
+                    result.bytes_freed
+                );
+                metrics_service::record_cleanup("blob_gc", result.storage_keys_deleted as u64);
+            }
+            if !result.errors.is_empty() {
+                tracing::warn!(
+                    "Blob GC sweep completed with {} errors",
+                    result.errors.len()
+                );
+                for err in &result.errors {
+                    tracing::warn!(gc_error = %err, "Blob GC sweep error");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Blob GC sweep pass failed: {}", e);
+        }
+    }
+
+    // Post-GC refresh (#2056): recompute deduplicated storage stats
+    // now that this tick's reclaim has settled so the materialized
+    // table reflects the post-GC footprint. Reporting-only.
+    if let Err(e) = stats_service.recompute_all().await {
+        tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
+    }
+}
+
 /// Spawn all background scheduler tasks.
 /// Returns join handles for graceful shutdown (not currently used, fire-and-forget).
 pub fn spawn_all(
@@ -347,10 +512,6 @@ pub fn spawn_all(
                 db.clone(),
                 &config_clone.storage_backend,
             );
-            // Blob deletion is opt-in (#1408). When BLOB_GC_ENABLED is unset
-            // the scheduled pass runs DRY-RUN: it logs what it would reclaim
-            // but deletes nothing. Bias to leaking storage over losing data.
-            let blob_gc_dry_run = !config_clone.blob_gc_enabled;
             // The orphaned row-less Maven flat-object sweep is opt-in for the
             // same reason blob deletion is (#3431): its candidates are keys
             // the catalog cannot see, which on a migrated instance is the
@@ -402,159 +563,14 @@ pub fn spawn_all(
                 // working even while a scheduled tick holds this lease. See
                 // `StorageGcService::run_scheduled_tick`.
                 let follow_on = || async {
-                    // Blob layer GC runs in the same tick: the manifest GC pass
-                    // above frees `oci-manifests/...` storage keys, this pass
-                    // frees `oci-blobs/...` ones that no live manifest references
-                    // (via `manifest_blob_refs`). Both passes are independent —
-                    // blob GC reads its own snapshot from `oci_blobs` and does
-                    // not depend on the artifact-level GC having run first.
-                    //
-                    // SAFETY (#1408): blob deletion is irreversible, so two
-                    // safeguards gate the destructive path here, in addition to
-                    // the grace window and locked per-row re-check inside
-                    // `run_blob_gc`:
-                    //
-                    //  1. Readiness gate (design from #1409 review, finding 3):
-                    //     blob GC trusts `manifest_blob_refs` as the live blob
-                    //     set, so it must not delete until a successful backfill
-                    //     has populated refs for every live image manifest.
-                    //     Otherwise a partial or failed startup backfill (e.g.
-                    //     object storage briefly unreachable when bodies were
-                    //     read) would make live layers look orphaned and GC would
-                    //     delete them. We skip the *live* pass while refs are
-                    //     incomplete or the readiness query itself fails; the
-                    //     next tick re-checks and resumes once refs are complete.
-                    //
-                    //  2. Dry-run default: unless BLOB_GC_ENABLED is set, the
-                    //     pass runs in dry-run mode and never deletes. A dry-run
-                    //     pass is always safe to run, even when the readiness
-                    //     gate is not yet satisfied, so we only enforce the gate
-                    //     when about to delete for real.
-                    let mut blob_gc_dry_run_this_tick = blob_gc_dry_run;
-                    if !blob_gc_dry_run_this_tick {
-                        match crate::services::manifest_blob_refs_backfill::any_live_manifest_missing_refs(
-                            &gate_db,
-                        )
-                        .await
-                        {
-                            Ok(true) => {
-                                // #3285: name the offending digests. Without this,
-                                // diagnosing a stuck gate meant reconstructing the
-                                // gate query by hand against the database.
-                                let blockers =
-                                    crate::services::manifest_blob_refs_backfill::list_live_manifests_missing_refs(
-                                        &gate_db,
-                                        crate::services::manifest_blob_refs_backfill::GATE_BLOCKER_SAMPLE_LIMIT,
-                                    )
-                                    .await
-                                    .unwrap_or_default();
-                                tracing::warn!(
-                                    blocking_manifests = %crate::services::manifest_blob_refs_backfill::describe_gate_blockers(&blockers),
-                                    "Blob GC: manifest_blob_refs is incomplete for one or more live \
-                                     image manifests (startup backfill unfinished or partially \
-                                     failed); forcing dry-run this tick and retrying next tick"
-                                );
-                                blob_gc_dry_run_this_tick = true;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Blob GC: could not verify manifest_blob_refs readiness ({}); \
-                                     forcing dry-run this tick",
-                                    e
-                                );
-                                blob_gc_dry_run_this_tick = true;
-                            }
-                            Ok(false) => {}
-                        }
-                    }
-
-                    // Two-phase mark-and-sweep (#1660). Phase A marks aged orphan
-                    // candidates (`pending_delete_at`, a pure row update with no
-                    // storage I/O) every tick; Phase B sweeps blobs marked at
-                    // least `blob_gc_sweep_grace_secs` ago that are still orphan,
-                    // deleting storage then row under the same push-path row lock.
-                    // Splitting the phases keeps storage deletion out of the
-                    // commit-then-delete TOCTOU: a re-push in the mark->sweep
-                    // window resurrects the blob (clears the marker under the lock)
-                    // so the sweep skips it. Both phases honour the dry-run /
-                    // readiness gate above — in dry-run neither writes nor clears a
-                    // marker and nothing is deleted.
-                    match service.run_blob_gc_mark(blob_gc_dry_run_this_tick).await {
-                        Ok(result) => {
-                            if result.dry_run && result.storage_keys_deleted > 0 {
-                                tracing::info!(
-                                    "Blob GC (dry-run): would mark {} orphan blobs pending deletion \
-                                     (set BLOB_GC_ENABLED=true to enable mark-and-sweep)",
-                                    result.storage_keys_deleted,
-                                );
-                            } else if !result.dry_run && result.storage_keys_deleted > 0 {
-                                tracing::info!(
-                                    "Blob GC: marked {} orphan blobs pending deletion",
-                                    result.storage_keys_deleted,
-                                );
-                            }
-                            if !result.errors.is_empty() {
-                                tracing::warn!(
-                                    "Blob GC mark completed with {} errors",
-                                    result.errors.len()
-                                );
-                                for err in &result.errors {
-                                    tracing::warn!(gc_error = %err, "Blob GC mark error");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Blob GC mark pass failed: {}", e);
-                        }
-                    }
-
-                    match service
-                        .run_blob_gc_sweep(
-                            blob_gc_dry_run_this_tick,
-                            config_clone.blob_gc_sweep_grace_secs as i64,
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            if result.dry_run && result.storage_keys_deleted > 0 {
-                                tracing::info!(
-                                    "Blob GC (dry-run): would sweep {} marked blob objects, {} bytes \
-                                     (set BLOB_GC_ENABLED=true to delete)",
-                                    result.storage_keys_deleted,
-                                    result.bytes_freed
-                                );
-                            } else if !result.dry_run && result.storage_keys_deleted > 0 {
-                                tracing::info!(
-                                    "Blob GC: swept {} blob objects, freed {} bytes",
-                                    result.storage_keys_deleted,
-                                    result.bytes_freed
-                                );
-                                metrics_service::record_cleanup(
-                                    "blob_gc",
-                                    result.storage_keys_deleted as u64,
-                                );
-                            }
-                            if !result.errors.is_empty() {
-                                tracing::warn!(
-                                    "Blob GC sweep completed with {} errors",
-                                    result.errors.len()
-                                );
-                                for err in &result.errors {
-                                    tracing::warn!(gc_error = %err, "Blob GC sweep error");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Blob GC sweep pass failed: {}", e);
-                        }
-                    }
-
-                    // Post-GC refresh (#2056): recompute deduplicated storage stats
-                    // now that this tick's reclaim has settled so the materialized
-                    // table reflects the post-GC footprint. Reporting-only.
-                    if let Err(e) = stats_service.recompute_all().await {
-                        tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
-                    }
+                    run_storage_gc_tick_follow_on(
+                        &service,
+                        &gate_db,
+                        &stats_service,
+                        config_clone.blob_gc_enabled,
+                        config_clone.blob_gc_sweep_grace_secs as i64,
+                    )
+                    .await
                 };
                 service
                     .run_scheduled_tick(
@@ -2360,6 +2376,75 @@ fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #3503 — the leased GC-tick follow-on really performs the work
+    // -----------------------------------------------------------------------
+
+    /// The follow-on is the half of the scheduled tick that used to run
+    /// un-leased on every replica; after #3503 it runs exactly once, on the
+    /// tick owner, via `run_scheduled_tick`'s closure. This pins that a call
+    /// OBSERVABLY does the work (a scheduler that skipped it would leave the
+    /// stats recompute and blob GC dormant cluster-wide):
+    ///
+    ///  * `instance_storage_stats.computed_at` advances — the post-GC
+    ///    recompute really ran;
+    ///  * with `blob_gc_enabled = false` (the shipped default) no blob is
+    ///    marked `pending_delete_at` — both blob-GC phases stay dry-run.
+    #[tokio::test]
+    async fn storage_gc_tick_follow_on_recomputes_stats_and_keeps_blob_gc_dry_run_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+
+        // Filesystem locations are constructed lazily by the registry, so an
+        // empty backend map with a "filesystem" default suffices here.
+        let registry = std::sync::Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let gc = crate::services::storage_gc_service::StorageGcService::new(pool.clone(), registry);
+        let stats = crate::services::storage_stats_service::StorageStatsService::new(
+            pool.clone(),
+            "filesystem",
+        );
+
+        let marked_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE pending_delete_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count marked blobs");
+
+        run_storage_gc_tick_follow_on(&gc, &pool, &stats, false, 3600).await;
+
+        let computed_at: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT computed_at FROM instance_storage_stats WHERE id = true")
+                .fetch_optional(&pool)
+                .await
+                .expect("query instance stats");
+        let computed_at = computed_at
+            .expect("the follow-on must have recomputed storage stats (computed_at stamped)");
+        assert!(
+            (Utc::now() - computed_at).num_seconds() < 60,
+            "computed_at must be fresh — stamped by THIS follow-on run, not a leftover: {computed_at}"
+        );
+
+        let marked_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE pending_delete_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count marked blobs");
+        assert_eq!(
+            marked_before, marked_after,
+            "blob_gc_enabled=false must keep the mark phase dry-run: no new \
+             pending_delete_at markers"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // #3011 — the `since` anchor scheduled backups run with
