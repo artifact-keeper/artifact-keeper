@@ -307,6 +307,12 @@ pub struct StorageStatsService {
     scope: DedupScope,
 }
 
+/// `scheduler_leases.job_name` claimed by the independent (cron) storage-
+/// stats refresh (#3503). Operator-visible wire value, like
+/// `storage_gc_service::SCHEDULED_GC_JOB_NAME`:
+/// `SELECT * FROM scheduler_leases WHERE job_name = 'storage_stats_refresh'`.
+pub(crate) const SCHEDULED_STORAGE_STATS_JOB_NAME: &str = "storage_stats_refresh";
+
 impl StorageStatsService {
     /// Construct from the live pool and the configured storage backend string
     /// (`config.storage_backend`).
@@ -378,6 +384,49 @@ impl StorageStatsService {
     /// Full refresh: recompute every repository's footprint + the instance
     /// total and upsert them, then refresh the per-path-prefix tree rollup
     /// (#2601). Run on the scheduler cadence and after GC.
+    /// TTL for the [`Self::run_scheduled_refresh`] singleton lease. A full
+    /// recompute is set-based in Postgres and normally finishes in seconds;
+    /// the renewal heartbeat covers a slow instance, and a crashed holder's
+    /// lease lapses well before the next 4-hourly occurrence.
+    const SCHEDULED_REFRESH_LEASE_TTL_SECS: f64 = 600.0;
+
+    /// One scheduled (cron) stats refresh, gated by a cluster-wide singleton
+    /// lease (#3503).
+    ///
+    /// Every replica's scheduler computes the same cron occurrence for the
+    /// independent 4-hourly refresh, so without a lease N replicas rebuilt
+    /// the same materialized tables concurrently every occurrence — pure
+    /// duplicated load on the same rows (the rebuild itself is idempotent
+    /// and advisory-locked, so this changes WHO recomputes, never the
+    /// result). Job name is operator-visible in `scheduler_leases`.
+    ///
+    /// Returns `true` if this replica won the lease and ran the refresh.
+    /// Only the scheduler's cron tick should call this; the post-GC refresh
+    /// runs inside the storage-GC tick's own lease and calls
+    /// [`Self::recompute_all`] directly.
+    pub(crate) async fn run_scheduled_refresh(&self, job_name: &str) -> bool {
+        let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+            &self.db,
+            job_name,
+            Self::SCHEDULED_REFRESH_LEASE_TTL_SECS,
+        )
+        .await
+        else {
+            tracing::debug!("Another replica owns the storage-stats refresh lease; skipping tick");
+            return false;
+        };
+        let lease_renewal =
+            lease.spawn_renewal(self.db.clone(), Self::SCHEDULED_REFRESH_LEASE_TTL_SECS);
+
+        if let Err(e) = self.recompute_all().await {
+            tracing::warn!("Scheduled storage-stats refresh failed: {}", e);
+        }
+
+        drop(lease_renewal);
+        lease.release(&self.db).await;
+        true
+    }
+
     pub async fn recompute_all(&self) -> Result<()> {
         let rows = self.load_repo_object_rows().await?;
         let computed = compute_stats(&rows, self.scope);
@@ -933,6 +982,86 @@ mod db_tests {
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo)
             .execute(pool)
+            .await;
+    }
+
+    /// #3503: the independent (cron) stats refresh is a cluster singleton.
+    ///
+    /// Every replica fires the same 4-hourly occurrence; the lease decides
+    /// WHO recomputes. Discriminating observable: `instance_storage_stats.
+    /// computed_at` is written unconditionally (now()) by every real
+    /// recompute, so "skipped" and "ran" are distinguishable states — a
+    /// losing replica must leave it untouched, a winning replica must
+    /// advance it (a lease that skipped the work entirely would leave the
+    /// refresh dormant cluster-wide and fail the second half).
+    #[tokio::test]
+    async fn scheduled_refresh_respects_the_singleton_lease_db() {
+        use crate::services::cluster_work;
+
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let svc = StorageStatsService::new(pool.clone(), "filesystem");
+        let job = SCHEDULED_STORAGE_STATS_JOB_NAME;
+
+        // Defensive: a crashed earlier run could have left the lease behind.
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(job)
+            .execute(&pool)
+            .await;
+
+        // Baseline: a real recompute stamps computed_at.
+        svc.recompute_all().await.expect("baseline recompute");
+        let computed_at = || async {
+            sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                "SELECT computed_at FROM instance_storage_stats WHERE id = true",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("instance_storage_stats row exists after a recompute")
+        };
+        let before = computed_at().await;
+
+        // Another replica owns the occurrence: this one must skip, and must
+        // NOT have recomputed (computed_at untouched).
+        let other_replica_lease =
+            cluster_work::try_acquire_scheduler_lease(&pool, job, "other-replica", 60.0)
+                .await
+                .expect("query ok")
+                .expect("first claim wins");
+        assert!(
+            !svc.run_scheduled_refresh(job).await,
+            "refresh must skip while another replica holds the lease"
+        );
+        assert_eq!(
+            before,
+            computed_at().await,
+            "a losing replica must not recompute: computed_at must not advance"
+        );
+
+        // Lease freed: the next occurrence must win, actually recompute, and
+        // release the lease.
+        other_replica_lease.release(&pool).await;
+        assert!(
+            svc.run_scheduled_refresh(job).await,
+            "refresh must run once the lease is free"
+        );
+        assert!(
+            computed_at().await > before,
+            "the winning replica must actually recompute: computed_at advances"
+        );
+        let reclaimable =
+            cluster_work::try_acquire_scheduler_lease(&pool, job, "post-run-checker", 60.0)
+                .await
+                .expect("query ok");
+        assert!(
+            reclaimable.is_some(),
+            "a completed refresh must release the lease, not hold it forever"
+        );
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(job)
+            .execute(&pool)
             .await;
     }
 

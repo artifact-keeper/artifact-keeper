@@ -567,25 +567,38 @@ impl StorageGcService {
     /// Maven flat-object orphan scan running concurrently for 20+ minutes,
     /// sharing one `xact_start` (artifact-keeper#3384).
     ///
-    /// Returns `true` if this replica won the lease and ran GC, `false` if
-    /// another replica currently holds it (a no-op tick).
+    /// Returns `true` if this replica won the lease and ran the tick,
+    /// `false` if another replica currently holds it (a no-op tick).
     ///
     /// Only the scheduler's automatic tick should call this — the on-demand
     /// admin/per-repo GC endpoints (`storage_gc.rs`) call
     /// `run_gc`/`run_gc_for_repository` directly and must keep working even
     /// while a scheduled tick holds this lease.
     ///
-    /// SCOPE: this gates `run_gc` only. The blob-GC mark/sweep and the
-    /// storage-stats recompute that share the same scheduler tick are NOT
-    /// under this lease and still run on every replica — #3384 is only
-    /// partially closed by this method. See the scope note at the call site
-    /// in `scheduler_service::spawn_all` and issue #3503.
+    /// SCOPE (#3503): the lease covers the WHOLE scheduled tick, not just
+    /// `run_gc`. `follow_on` is the remainder of the tick — the blob-GC
+    /// mark/sweep and the post-GC storage-stats recompute, supplied by the
+    /// scheduler — and runs under the same held lease, after `run_gc`,
+    /// before release. A replica that loses the lease therefore skips the
+    /// tick ENTIRELY instead of skipping `run_gc` and then running the rest
+    /// concurrently on every replica (the residual N-times duplication
+    /// #3384/#3503 measured). One lease for the whole tick also avoids the
+    /// gap where a replica could lose the job between workloads and silently
+    /// continue. Observing lease LOSS mid-run is #3502 and deliberately not
+    /// attempted here.
     ///
     /// This method changes WHO runs the sweep, never WHAT it deletes. The
     /// `MAVEN_FLAT_GC_ENABLED` opt-in gate (#3431) lives further in, in
     /// `cleanup_orphan_maven_flat_objects`, and is reached through
-    /// `run_gc(false)` exactly as it is from the on-demand endpoints.
-    pub(crate) async fn run_scheduled_tick(&self, job_name: &str) -> bool {
+    /// `run_gc(false)` exactly as it is from the on-demand endpoints. The
+    /// blob-GC dry-run/readiness gating likewise stays where it was, inside
+    /// the scheduler's `follow_on` closure — the lease decides who runs,
+    /// never whether deletion is enabled.
+    pub(crate) async fn run_scheduled_tick<F, Fut>(&self, job_name: &str, follow_on: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
             &self.db,
             job_name,
@@ -629,6 +642,11 @@ impl StorageGcService {
                 tracing::warn!("Storage garbage collection failed: {}", e);
             }
         }
+
+        // #3503: the rest of the scheduled tick (blob-GC mark + sweep and the
+        // post-GC storage-stats recompute) runs under the SAME lease so the
+        // whole tick has exactly one owner per occurrence.
+        follow_on().await;
 
         drop(lease_renewal);
         lease.release(&self.db).await;
@@ -2063,18 +2081,31 @@ impl StorageGcService {
         &self,
         repo_scope: Option<Uuid>,
     ) -> Result<Vec<OciUploadCleanupKey>> {
+        self.claim_oci_upload_cleanup_keys(repo_scope, OciCleanupKeyFamily::Unreferenced)
+            .await
+    }
+
+    /// Shared claim body for both cleanup-key families. The FOR UPDATE
+    /// SKIP LOCKED candidate CTE, the claim stamp, and the RETURNING shape
+    /// were byte-identical between the pending and unreferenced claims; only
+    /// the family predicates differ (see [`OciCleanupKeyFamily`]). Collapsed
+    /// in #3503's PR so the two destructive claim paths cannot drift apart.
+    async fn claim_oci_upload_cleanup_keys(
+        &self,
+        repo_scope: Option<Uuid>,
+        family: OciCleanupKeyFamily,
+    ) -> Result<Vec<OciUploadCleanupKey>> {
         let sql = format!(
             r#"
             WITH candidate AS (
                 SELECT c.id
                 FROM oci_upload_cleanup_keys c
-                WHERE c.storage_write_completed_at IS NOT NULL
-                  AND c.storage_write_completed_at < NOW() - {ttl}
+                WHERE {age}
                   AND (c.claim_expires_at IS NULL OR c.claim_expires_at <= NOW())
                   {scope}
                   AND NOT EXISTS (
                     SELECT 1 FROM oci_upload_sessions s
-                    WHERE s.storage_temp_key = c.storage_key
+                    WHERE {session}
                   )
                   AND NOT EXISTS (
                     SELECT 1 FROM oci_upload_parts p
@@ -2098,7 +2129,8 @@ impl StorageGcService {
             RETURNING u.id, u.storage_key, u.claim_token,
                       r.storage_backend, r.storage_path
             "#,
-            ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            age = family.age_predicate_sql(),
+            session = family.session_predicate_sql(),
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 3, repo_scope),
         );
@@ -2679,60 +2711,51 @@ impl StorageGcService {
         &self,
         repo_scope: Option<Uuid>,
     ) -> Result<Vec<OciUploadCleanupKey>> {
-        let sql = format!(
-            r#"
-            WITH candidate AS (
-                SELECT c.id
-                FROM oci_upload_cleanup_keys c
-                WHERE c.storage_write_completed_at IS NULL
-                  AND c.created_at < NOW() - {ttl}
-                  AND (c.claim_expires_at IS NULL OR c.claim_expires_at <= NOW())
-                  {scope}
-                  AND NOT EXISTS (
-                    SELECT 1 FROM oci_upload_sessions s
-                    WHERE s.id = c.upload_session_id
-                       OR s.storage_temp_key = c.storage_key
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM oci_upload_parts p
-                    WHERE p.storage_key = c.storage_key
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM oci_blobs b
-                    WHERE b.storage_key = c.storage_key
-                  )
-                ORDER BY c.created_at ASC
-                LIMIT $1
-                FOR UPDATE OF c SKIP LOCKED
-            )
-            UPDATE oci_upload_cleanup_keys u
-            SET claimed_by = $2,
-                claim_token = gen_random_uuid(),
-                claim_expires_at = NOW() + {claim_ttl}
-            FROM candidate, repositories r
-            WHERE u.id = candidate.id
-              AND r.id = u.repository_id
-            RETURNING u.id, u.storage_key, u.claim_token,
-                      r.storage_backend, r.storage_path
-            "#,
-            ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
-            claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
-            scope = repo_scope_clause("c.repository_id", 3, repo_scope),
-        );
-        let mut query = sqlx::query(&sql)
-            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
-            .bind(crate::services::cluster_work::WorkerIdentity::for_process().as_str());
-        if let Some(id) = repo_scope {
-            query = query.bind(id);
-        }
-        let rows = query
-            .fetch_all(&self.db)
+        self.claim_oci_upload_cleanup_keys(repo_scope, OciCleanupKeyFamily::Pending)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+}
 
-        rows.into_iter()
-            .map(|row| decode_oci_cleanup_key_row(&row))
-            .collect()
+/// Which cleanup-key family a claim sweep drains (#3503 PR dedup): aged
+/// PENDING rows (never marked storage-write-complete) or UNREFERENCED
+/// completed rows. The two destructive claims shared their entire SQL
+/// scaffolding; only these predicates differ. Each `*_sql` body is verbatim
+/// the text of the former per-family query, so the generated SQL is
+/// unchanged.
+#[derive(Clone, Copy)]
+enum OciCleanupKeyFamily {
+    Pending,
+    Unreferenced,
+}
+
+impl OciCleanupKeyFamily {
+    /// Family age/eligibility predicate over the candidate row alias `c`.
+    fn age_predicate_sql(self) -> String {
+        match self {
+            OciCleanupKeyFamily::Pending => format!(
+                "c.storage_write_completed_at IS NULL\n                  \
+                 AND c.created_at < NOW() - {}",
+                ABANDONED_OCI_UPLOAD_TTL_SQL
+            ),
+            OciCleanupKeyFamily::Unreferenced => format!(
+                "c.storage_write_completed_at IS NOT NULL\n                  \
+                 AND c.storage_write_completed_at < NOW() - {}",
+                ABANDONED_OCI_UPLOAD_TTL_SQL
+            ),
+        }
+    }
+
+    /// Family live-session guard over aliases `s` (sessions) and `c`.
+    /// Pending keys are also anchored to their own session id; committed
+    /// (part/final/completion temp) keys are intentionally reapable even
+    /// while their session lives — see the SELECT-side comments.
+    fn session_predicate_sql(self) -> &'static str {
+        match self {
+            OciCleanupKeyFamily::Pending => {
+                "s.id = c.upload_session_id\n                       OR s.storage_temp_key = c.storage_key"
+            }
+            OciCleanupKeyFamily::Unreferenced => "s.storage_temp_key = c.storage_key",
+        }
     }
 }
 
@@ -4241,9 +4264,23 @@ mod tests {
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        // #3503: the whole tick — run_gc AND the follow-on (blob-GC +
+        // stats in production) — must skip while another replica owns the
+        // lease. Before #3503 the follow-on ran on every replica regardless,
+        // which is exactly what this flag would have observed.
+        let follow_on_ran = std::sync::atomic::AtomicBool::new(false);
         assert!(
-            !service.run_scheduled_tick(job).await,
+            !service
+                .run_scheduled_tick(job, || async {
+                    follow_on_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await,
             "tick must skip while another replica holds the lease"
+        );
+        assert!(
+            !follow_on_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the follow-on half of the tick (blob GC + stats recompute) must \
+             NOT run on a replica that failed to win the lease (#3503)"
         );
 
         // The on-demand admin endpoint shares the service but NOT the lease:
@@ -4279,8 +4316,18 @@ mod tests {
         // Free the lease; the next tick must win it, run, and release it.
         other_replica_lease.release(&fixture.pool).await;
         assert!(
-            service.run_scheduled_tick(job).await,
+            service
+                .run_scheduled_tick(job, || async {
+                    follow_on_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await,
             "tick must run once the lease is free"
+        );
+        assert!(
+            follow_on_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the follow-on half of the tick must run (under the lease) on the \
+             replica that won it — a lease that silently skips the work would \
+             leave blob GC and the stats recompute dormant cluster-wide"
         );
 
         let held_after = cluster_work::try_acquire_scheduler_lease(
@@ -4357,7 +4404,7 @@ mod tests {
         let gated =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
         assert!(
-            gated.run_scheduled_tick(&job).await,
+            gated.run_scheduled_tick(&job, || async {}).await,
             "the gated tick must still WIN the lease — the gate is about \
              deleting, not about running"
         );
@@ -4369,7 +4416,7 @@ mod tests {
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
                 .with_maven_flat_gc_enabled(true);
         assert!(
-            enabled.run_scheduled_tick(&job).await,
+            enabled.run_scheduled_tick(&job, || async {}).await,
             "the second tick must win the lease the first one released"
         );
         let after_enabled = objects_left(&storage, &[&system_key, &operator_key]).await;
