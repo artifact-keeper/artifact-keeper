@@ -21,6 +21,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::str::FromStr;
+use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -974,14 +975,48 @@ impl LifecycleService {
 
     /// Execute only those enabled policies that are currently due, based on each
     /// policy's `cron_schedule` (or a default 6-hour cadence when unset).
-    pub async fn execute_due_policies(&self) -> Result<Vec<PolicyExecutionResult>> {
+    ///
+    /// `abort` is the scheduler-lease loss token (#3502): the scheduled
+    /// caller heartbeats the `lifecycle_policy_execution` singleton lease
+    /// while this cycle runs, and the token fires when a renewal reports the
+    /// lease lost — another replica may already be running its own cycle.
+    /// Retention is destructive (it deletes artifacts and frees bytes), so
+    /// the cycle stops between policies instead of finishing a sweep a
+    /// second owner is redoing.
+    pub async fn execute_due_policies(
+        &self,
+        abort: &CancellationToken,
+    ) -> Result<Vec<PolicyExecutionResult>> {
         let policies = self.load_enabled_policies().await?;
+        self.execute_due_from(policies, abort).await
+    }
 
+    /// The per-policy loop of [`Self::execute_due_policies`], over an
+    /// explicit policy list so tests can drive it without executing every
+    /// enabled policy in the database.
+    async fn execute_due_from(
+        &self,
+        policies: Vec<LifecyclePolicy>,
+        abort: &CancellationToken,
+    ) -> Result<Vec<PolicyExecutionResult>> {
         let now = Utc::now();
         let default_cadence = chrono::Duration::hours(6);
         let mut results = Vec::new();
 
         for policy in policies {
+            // Lease lost mid-cycle (#3502): stop before starting another
+            // destructive policy run; whatever owner now holds the lease
+            // runs its own full cycle.
+            if abort.is_cancelled() {
+                tracing::warn!(
+                    "Lifecycle policy cycle aborted: scheduler lease lost \
+                     (another replica may own the job); '{}' and any later \
+                     due policies were not run",
+                    policy.name
+                );
+                break;
+            }
+
             let is_due = Self::is_policy_due(
                 policy.cron_schedule.as_deref(),
                 policy.last_run_at,
@@ -4156,5 +4191,123 @@ mod tests {
                 "PolicyType variant {v:?} has no matching create_policy whitelist entry"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #3502 — the scheduled cycle observes the scheduler-lease loss token
+    // -----------------------------------------------------------------------
+
+    /// Seed one repository with an enabled, due (never-run) policy and return
+    /// `(service, repository_id, policy)`.
+    async fn seed_due_policy(
+        pool: &sqlx::PgPool,
+        prefix: &str,
+    ) -> (LifecycleService, Uuid, LifecyclePolicy) {
+        let repository_id = Uuid::new_v4();
+        let repository_key = format!("{prefix}-{}", repository_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'local', 'generic'::repository_format)",
+        )
+        .bind(repository_id)
+        .bind(&repository_key)
+        .bind(format!("/tmp/{repository_key}"))
+        .execute(pool)
+        .await
+        .expect("insert repository");
+
+        let service = LifecycleService::new(pool.clone());
+        let policy = service
+            .create_policy(CreateLifecyclePolicyRequest {
+                repository_id: Some(repository_id),
+                name: format!("{prefix}-policy-{}", repository_id.simple()),
+                description: None,
+                policy_type: "max_versions".to_string(),
+                config: json!({"keep": 1}),
+                priority: None,
+                // No cron + never run => due on the default cadence.
+                cron_schedule: None,
+            })
+            .await
+            .expect("create policy");
+        (service, repository_id, policy)
+    }
+
+    async fn policy_last_run_at(pool: &sqlx::PgPool, id: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar("SELECT last_run_at FROM lifecycle_policies WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read last_run_at")
+    }
+
+    /// #3502 boundary: when the scheduler-lease loss token has fired, the
+    /// cycle must not start another policy run. Before the fix the token was
+    /// discarded, so a due policy executed anyway — this is the assertion
+    /// that fails on the parent commit (the policy runs and `last_run_at`
+    /// is stamped).
+    #[tokio::test]
+    async fn test_execute_due_policies_stops_when_lease_loss_token_fired_3502() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, repository_id, policy) = seed_due_policy(&pool, "lease-loss").await;
+        let policy_id = policy.id;
+
+        let lost = CancellationToken::new();
+        lost.cancel();
+        let results = service
+            .execute_due_from(vec![policy], &lost)
+            .await
+            .expect("aborted cycle still returns Ok");
+
+        assert!(
+            results.is_empty(),
+            "a cycle whose lease is lost must not execute due policies: {results:?}"
+        );
+        assert!(
+            policy_last_run_at(&pool, policy_id).await.is_none(),
+            "the due policy must not have been run (last_run_at stamped) after lease loss"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #3502 control: with the loss token alive, the same due policy still
+    /// runs — what stops a "fix" that simply never executes anything from
+    /// passing the boundary test above.
+    #[tokio::test]
+    async fn test_execute_due_policies_runs_while_lease_held_3502() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (service, repository_id, policy) = seed_due_policy(&pool, "lease-held").await;
+        let policy_id = policy.id;
+
+        let lost = CancellationToken::new();
+        let results = service
+            .execute_due_from(vec![policy], &lost)
+            .await
+            .expect("cycle runs");
+
+        assert_eq!(
+            results.len(),
+            1,
+            "a due policy must run while the lease is held: {results:?}"
+        );
+        assert!(
+            policy_last_run_at(&pool, policy_id).await.is_some(),
+            "the executed policy must be stamped last_run_at"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .execute(&pool)
+            .await;
     }
 }

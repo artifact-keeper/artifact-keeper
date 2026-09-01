@@ -251,10 +251,14 @@ pub fn spawn_all(
                 };
                 // A cycle over many policies can outlive the fixed TTL, which
                 // would let a second replica start a duplicate cycle. Keep the
-                // lease alive for as long as this one runs.
-                let lease_renewal = lease.spawn_renewal(db.clone(), LIFECYCLE_LEASE_TTL_SECS);
+                // lease alive for as long as this one runs, and hand the
+                // lease-loss token to the cycle so a lost lease stops the
+                // destructive sweep instead of letting it finish concurrently
+                // with the new owner's (#3502).
+                let (lease_renewal, lease_lost) =
+                    lease.spawn_renewal_with_cancellation(db.clone(), LIFECYCLE_LEASE_TTL_SECS);
 
-                match service.execute_due_policies().await {
+                match service.execute_due_policies(&lease_lost).await {
                     Ok(results) => {
                         let total_removed: i64 = results.iter().map(|r| r.artifacts_removed).sum();
                         let total_freed: i64 = results.iter().map(|r| r.bytes_freed).sum();
@@ -748,12 +752,17 @@ pub fn spawn_all(
                 // A sweep over many staging repos can outlive the TTL (each
                 // repo is an upstream fetch + evaluate), which would let a
                 // second replica start a duplicate cycle while this one is
-                // still running. Heartbeat the lease for the whole cycle.
-                let renewal = lease
-                    .as_ref()
-                    .map(|l| l.spawn_renewal(db.clone(), CURATION_SYNC_LEASE_TTL_SECS));
+                // still running. Heartbeat the lease for the whole cycle,
+                // and hand the lease-loss token to the sweep so a lost lease
+                // stops it between repos instead of letting it finish
+                // concurrently with the new owner's cycle (#3502).
+                let renewal = lease.as_ref().map(|l| {
+                    l.spawn_renewal_with_cancellation(db.clone(), CURATION_SYNC_LEASE_TTL_SECS)
+                });
 
-                if let Err(e) = run_curation_sync_cycle(&db, None).await {
+                if let Err(e) =
+                    run_curation_sync_cycle(&db, None, renewal.as_ref().map(|(_, lost)| lost)).await
+                {
                     tracing::warn!("Curation sync cycle failed: {}", e);
                 }
 
@@ -1539,9 +1548,16 @@ fn keyless_sync_decision(allow_unverified: bool) -> KeylessSync {
 /// trigger (#2357) uses; when `None` it sweeps every due repo (the scheduled
 /// path). The scheduled invocation is cluster-leased by its caller so only one
 /// replica sweeps per tick.
+/// `abort` is the scheduler-lease loss token (#3502): the scheduled caller
+/// heartbeats the `curation_sync` singleton lease while the sweep runs, and
+/// the token fires when a renewal reports the lease lost — another replica
+/// may already be running its own sweep. The per-repo loop stops between
+/// repos when it fires. The manual single-repo trigger passes `None`: it is
+/// operator-invoked and not lease-guarded, so there is no lease to lose.
 pub(crate) async fn run_curation_sync_cycle(
     db: &PgPool,
     only_repo: Option<uuid::Uuid>,
+    abort: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::services::curation_service::CurationService;
     use crate::services::curation_sync;
@@ -1605,6 +1621,18 @@ pub(crate) async fn run_curation_sync_cycle(
         allow_unverified,
     ) in &repos
     {
+        // Lease lost mid-sweep (#3502): stop before touching another repo's
+        // upstream; whatever replica now holds the lease runs its own sweep.
+        if abort.is_some_and(|lost| lost.is_cancelled()) {
+            tracing::warn!(
+                "Curation sync sweep aborted: scheduler lease lost (another \
+                 replica may own the job); staging repo {} and any later due \
+                 repos were not synced",
+                staging_id
+            );
+            break;
+        }
+
         let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, *remote_id)
             .await
             .unwrap_or(None);
@@ -3214,5 +3242,113 @@ mod tests {
         assert_eq!(after, rescheduled_for, "the administrator's schedule wins");
 
         cleanup_test_backup_schedule(&pool, schedule_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3502 — the curation sweep observes the scheduler-lease loss token
+    // -----------------------------------------------------------------------
+
+    /// Seed a remote + curation-enabled staging repo pair (npm: the on-demand
+    /// arm, which touches no upstream when there are no pending packages) and
+    /// return `(staging_id, remote_id)`.
+    async fn seed_curation_pair(pool: &sqlx::PgPool, prefix: &str) -> (uuid::Uuid, uuid::Uuid) {
+        let remote_id = uuid::Uuid::new_v4();
+        let staging_id = uuid::Uuid::new_v4();
+        let remote_key = format!("{prefix}-remote-{}", remote_id.simple());
+        let staging_key = format!("{prefix}-staging-{}", staging_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url) \
+             VALUES ($1, $2, $2, $3, 'remote', 'npm'::repository_format, 'https://registry.npmjs.org')",
+        )
+        .bind(remote_id)
+        .bind(&remote_key)
+        .bind(format!("/tmp/{remote_key}"))
+        .execute(pool)
+        .await
+        .expect("insert remote repo");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, \
+                                       curation_enabled, curation_source_repo_id) \
+             VALUES ($1, $2, $2, $3, 'staging', 'npm'::repository_format, true, $4)",
+        )
+        .bind(staging_id)
+        .bind(&staging_key)
+        .bind(format!("/tmp/{staging_key}"))
+        .bind(remote_id)
+        .execute(pool)
+        .await
+        .expect("insert staging repo");
+        (staging_id, remote_id)
+    }
+
+    async fn curation_last_synced_at(
+        pool: &sqlx::PgPool,
+        id: uuid::Uuid,
+    ) -> Option<chrono::DateTime<Utc>> {
+        sqlx::query_scalar("SELECT curation_last_synced_at FROM repositories WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read curation_last_synced_at")
+    }
+
+    /// #3502 boundary: when the scheduler-lease loss token has fired, the
+    /// sweep must stop before touching another staging repo. Before the fix
+    /// the token was discarded, so the repo was processed and stamped
+    /// `curation_last_synced_at` anyway — the assertion that fails on the
+    /// parent commit.
+    #[tokio::test]
+    async fn test_curation_sync_cycle_stops_when_lease_loss_token_fired_3502() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging_id, remote_id) = seed_curation_pair(&pool, "lease-loss").await;
+
+        let lost = tokio_util::sync::CancellationToken::new();
+        lost.cancel();
+        run_curation_sync_cycle(&pool, Some(staging_id), Some(&lost))
+            .await
+            .expect("aborted sweep still returns Ok");
+
+        assert!(
+            curation_last_synced_at(&pool, staging_id).await.is_none(),
+            "a sweep whose lease is lost must not process (stamp) the staging repo"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id IN ($1, $2)")
+            .bind(staging_id)
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #3502 control: the same repo IS processed while the loss token is
+    /// alive — what stops a "fix" that never syncs anything from passing the
+    /// boundary test above. Scoped via `only_repo` so the test never sweeps
+    /// repos other tests may have seeded.
+    #[tokio::test]
+    async fn test_curation_sync_cycle_processes_while_lease_held_3502() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging_id, remote_id) = seed_curation_pair(&pool, "lease-held").await;
+
+        let lost = tokio_util::sync::CancellationToken::new();
+        run_curation_sync_cycle(&pool, Some(staging_id), Some(&lost))
+            .await
+            .expect("sweep runs");
+
+        assert!(
+            curation_last_synced_at(&pool, staging_id).await.is_some(),
+            "a swept staging repo must be stamped curation_last_synced_at while the lease is held"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id IN ($1, $2)")
+            .bind(staging_id)
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
     }
 }

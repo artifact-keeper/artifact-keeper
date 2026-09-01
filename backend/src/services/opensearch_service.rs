@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::HashMap;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -420,7 +421,14 @@ impl OpenSearchService {
     ///
     /// Refresh is disabled for the duration of the bulk import and forced
     /// once at the end, which significantly improves indexing throughput.
-    pub async fn full_reindex_artifacts(&self, db: &PgPool) -> Result<usize> {
+    ///
+    /// `abort` is the bootstrap-reindex scheduler-lease loss token (#3502);
+    /// see [`Self::full_reindex`]. Manual admin reindexes pass `None`.
+    pub async fn full_reindex_artifacts(
+        &self,
+        db: &PgPool,
+        abort: Option<&CancellationToken>,
+    ) -> Result<usize> {
         tracing::info!("Starting full artifact reindex");
 
         self.set_refresh_interval(ARTIFACTS_INDEX, "-1").await?;
@@ -430,6 +438,18 @@ impl OpenSearchService {
         let mut total = 0usize;
 
         loop {
+            // Lease lost mid-reindex (#3502): another replica may already be
+            // running its own full reindex. Stop issuing bulk writes, restore
+            // the refresh interval, and surface the abort to the caller.
+            if abort.is_some_and(|lost| lost.is_cancelled()) {
+                self.set_refresh_interval(ARTIFACTS_INDEX, "1s").await?;
+                return Err(AppError::Internal(format!(
+                    "full artifact reindex aborted after {} documents: \
+                     singleton lease lost (another replica may own the job)",
+                    total
+                )));
+            }
+
             let rows = sqlx::query_as::<_, ArtifactRow>(
                 r#"
                 SELECT
@@ -524,7 +544,14 @@ impl OpenSearchService {
     /// Uses cursor-based pagination to avoid loading all rows into memory.
     /// Repositories inserted concurrently during a reindex may be skipped;
     /// they are indexed individually via [`index_repository`] on creation.
-    pub async fn full_reindex_repositories(&self, db: &PgPool) -> Result<usize> {
+    ///
+    /// `abort` is the bootstrap-reindex scheduler-lease loss token (#3502);
+    /// see [`Self::full_reindex`]. Manual admin reindexes pass `None`.
+    pub async fn full_reindex_repositories(
+        &self,
+        db: &PgPool,
+        abort: Option<&CancellationToken>,
+    ) -> Result<usize> {
         tracing::info!("Starting full repository reindex");
 
         self.set_refresh_interval(REPOSITORIES_INDEX, "-1").await?;
@@ -534,6 +561,17 @@ impl OpenSearchService {
         let mut total = 0usize;
 
         loop {
+            // Lease lost mid-reindex (#3502): stop issuing bulk writes,
+            // restore the refresh interval, and surface the abort.
+            if abort.is_some_and(|lost| lost.is_cancelled()) {
+                self.set_refresh_interval(REPOSITORIES_INDEX, "1s").await?;
+                return Err(AppError::Internal(format!(
+                    "full repository reindex aborted after {} documents: \
+                     singleton lease lost (another replica may own the job)",
+                    total
+                )));
+            }
+
             let rows = sqlx::query_as::<_, RepositoryRow>(
                 r#"
                 SELECT
@@ -597,10 +635,23 @@ impl OpenSearchService {
     /// Run a full reindex of both artifacts and repositories.
     ///
     /// Returns the count of (artifacts, repositories) indexed.
-    pub async fn full_reindex(&self, db: &PgPool) -> Result<(usize, usize)> {
-        let artifacts = self.full_reindex_artifacts(db).await?;
+    ///
+    /// `abort` is the `opensearch_bootstrap_reindex` scheduler-lease loss
+    /// token (#3502): the bootstrap caller heartbeats the singleton lease
+    /// while the reindex runs, and the token fires when a renewal reports
+    /// the lease lost — another replica may already be running its own full
+    /// reindex. Both page loops observe it between batches and abort with an
+    /// error instead of racing the new owner's bulk writes. The manual admin
+    /// reindex endpoints pass `None`: they are operator-invoked and not
+    /// lease-guarded.
+    pub async fn full_reindex(
+        &self,
+        db: &PgPool,
+        abort: Option<&CancellationToken>,
+    ) -> Result<(usize, usize)> {
+        let artifacts = self.full_reindex_artifacts(db, abort).await?;
         tracing::info!("Artifact reindex phase complete, proceeding to repositories");
-        let repositories = self.full_reindex_repositories(db).await?;
+        let repositories = self.full_reindex_repositories(db, abort).await?;
         tracing::info!("Full reindex complete");
         Ok((artifacts, repositories))
     }
@@ -3766,5 +3817,42 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(doc.doc_id(), uuid.as_str());
+    }
+
+    // -----------------------------------------------------------------------
+    // #3502 — bootstrap reindex observes the scheduler-lease loss token
+    // -----------------------------------------------------------------------
+    // OpenSearch is not available to unit tests, so these are wiring pins in
+    // this module's source-inspection style; the behavioural coverage for the
+    // "stop between items on lease loss" mechanism lives in the DB-backed
+    // lifecycle/curation twins (lifecycle_service.rs / scheduler_service.rs)
+    // and in the deployment-test tier for #3502.
+
+    #[test]
+    fn test_full_reindex_threads_the_lease_loss_token_to_both_phases() {
+        let source = function_source(opensearch_service_source(), "full_reindex");
+        assert!(
+            source.contains("full_reindex_artifacts(db, abort)"),
+            "full_reindex must pass the lease-loss token to the artifact phase (#3502)"
+        );
+        assert!(
+            source.contains("full_reindex_repositories(db, abort)"),
+            "full_reindex must pass the lease-loss token to the repository phase (#3502)"
+        );
+    }
+
+    #[test]
+    fn test_reindex_page_loops_abort_on_lease_loss() {
+        for fn_name in ["full_reindex_artifacts", "full_reindex_repositories"] {
+            let source = function_source(opensearch_service_source(), fn_name);
+            assert!(
+                source.contains("abort.is_some_and(|lost| lost.is_cancelled())"),
+                "{fn_name} must observe the lease-loss token between batches (#3502)"
+            );
+            assert!(
+                source.contains("singleton lease lost"),
+                "{fn_name} must surface the abort as an error, not a clean finish (#3502)"
+            );
+        }
     }
 }

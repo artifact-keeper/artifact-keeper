@@ -309,19 +309,43 @@ impl SchedulerLease {
     /// fixed TTL (large lifecycle cycles, curation syncs, bootstrap
     /// reindexes). The guard aborts the heartbeat on drop; the caller still
     /// releases (or lets the TTL lapse) through its own path.
+    ///
+    /// A caller that uses this variant deliberately ignores lease-loss
+    /// cancellation; prefer [`Self::spawn_renewal_with_cancellation`] and
+    /// document at the call site why ignoring the token is acceptable
+    /// (#3502).
     pub fn spawn_renewal(&self, db: PgPool, ttl_secs: f64) -> RenewalGuard {
+        self.spawn_renewal_with_cancellation(db, ttl_secs).0
+    }
+
+    /// Like [`Self::spawn_renewal`], but also hands back the lease-loss
+    /// [`CancellationToken`] from
+    /// [`spawn_renewal_loop_with_cancellation`]: it is cancelled the moment a
+    /// heartbeat reports the lease was lost (`Ok(false)`), meaning another
+    /// replica may already own the job and be doing the same work. The
+    /// long-running worker must observe the token between items and abort
+    /// rather than finish a cycle a second owner is redoing (#3084, #3502).
+    pub fn spawn_renewal_with_cancellation(
+        &self,
+        db: PgPool,
+        ttl_secs: f64,
+    ) -> (RenewalGuard, CancellationToken) {
         let job_name = self.job_name.clone();
         let claim_token = self.claim_token;
-        spawn_renewal_loop(format!("scheduler lease {job_name}"), ttl_secs, move || {
-            let db = db.clone();
-            let job_name = job_name.clone();
-            async move {
-                renew_scheduler_lease_by_token(&db, &job_name, claim_token, ttl_secs)
-                    .await
-                    .map(|expires| expires.is_some())
-                    .map_err(|e| e.to_string())
-            }
-        })
+        spawn_renewal_loop_with_cancellation(
+            format!("scheduler lease {job_name}"),
+            ttl_secs,
+            move || {
+                let db = db.clone();
+                let job_name = job_name.clone();
+                async move {
+                    renew_scheduler_lease_by_token(&db, &job_name, claim_token, ttl_secs)
+                        .await
+                        .map(|expires| expires.is_some())
+                        .map_err(|e| e.to_string())
+                }
+            },
+        )
     }
 
     /// Extend the lease by `ttl_secs` from now. Returns `false` (and stops
@@ -681,6 +705,66 @@ mod tests {
             reclaimed.is_some(),
             "expired lease must be reclaimable by a new owner"
         );
+
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(&job)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #3502: a `SchedulerLease` heartbeat that discovers the lease was
+    /// stolen (another replica reclaimed the job) must fire the lease-loss
+    /// token so the guarded worker can stop its side effects. Before the
+    /// fix, `SchedulerLease::spawn_renewal` discarded the token, so no
+    /// consumer could observe the loss.
+    ///
+    /// Real-time (not `start_paused`): the renewal closure performs real
+    /// database I/O, and the pre-steal negative control below depends on a
+    /// renewal actually succeeding against the row. TTL 15s puts the
+    /// heartbeat at its 5s floor, so the test runs ~6s + one poll window.
+    #[tokio::test]
+    async fn scheduler_lease_stolen_mid_work_cancels_the_loss_token() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let job = format!("test-lease-loss-{}", Uuid::new_v4());
+
+        let lease = try_acquire_scheduler_lease(&pool, &job, "owner-a", 15.0)
+            .await
+            .expect("query ok")
+            .expect("claim");
+        let (guard, lost) = lease.spawn_renewal_with_cancellation(pool.clone(), 15.0);
+
+        // Negative control: while the lease is still ours, a successful
+        // renewal (first heartbeat at ~5s) must NOT cancel the token.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !lost.is_cancelled(),
+            "a held lease that renews successfully must leave the loss token alive"
+        );
+
+        // Another replica takes the job: overwrite the claim token, exactly
+        // what an expired-and-reclaimed row looks like to the old holder.
+        sqlx::query(
+            "UPDATE scheduler_leases SET claim_token = gen_random_uuid() WHERE job_name = $1",
+        )
+        .bind(&job)
+        .execute(&pool)
+        .await
+        .expect("steal lease");
+
+        // The next heartbeat (<=5s away, plus DB latency slack) must observe
+        // Ok(false) and cancel the token.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !lost.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            lost.is_cancelled(),
+            "losing the scheduler lease to another replica must cancel the loss token"
+        );
+        drop(guard);
 
         let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
             .bind(&job)
