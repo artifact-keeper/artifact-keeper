@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-09-01
+
 ### Added
 
 - **Silent SSO auto-login support (OIDC `prompt=none` check-sso)** (#3546). Users with a live IdP session (e.g. Keycloak next to other SSO-protected apps) had to click "Sign in with Keycloak" on every fresh visit, while the obvious fix — auto-redirecting to the sole provider — would bounce every *anonymous* visitor to a visible IdP login page they never asked for, and anonymous browsing is a first-class registry state. The backend now supports the invisible middle path the web UI drives (artifact-keeper-web#812): `GET /api/v1/auth/sso/oidc/{id}/login` accepts an optional `prompt=none` forwarded to the authorize URL (only `none` is accepted — anything else is a 400 before any SSO session is created; the explicit sign-in flow without `prompt` is unchanged byte-for-byte), and the OIDC callbacks map the OIDC Core 3.1.2.6 interaction-required error family (`login_required`, `interaction_required`, `consent_required`, `account_selection_required`) — the IdP's expected "no live session" answer to a silent probe — to a clean 307 to `/callback?silent_denied=1` with no error payload, burning the single-use SSO session so the state cannot be replayed. Every other callback error keeps its existing 400/401 behavior, and the CSRF replay defense, provider binding, PKCE, and SSRF posture are untouched. **Operator kill switch:** `OIDC_SILENT_SSO=false` (or `0`) disables the web UI's silent attempt fleet-wide; the flag is advertised as `auth.silent_sso_enabled` in `GET /api/v1/system/config` (default on, display-only — it gates no endpoint, so flipping it can never lock anyone out).
