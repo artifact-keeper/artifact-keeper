@@ -171,8 +171,11 @@ jobs:
   # docker-publish.yml runs INDEPENDENTLY on the same tag push and publishes
   # ghcr.io/.../artifact-keeper-backend:${VERSION} as a manifest list. A
   # cross-workflow `needs:` is impossible, so this job is the explicit gate:
-  # it follows the docker-publish RUN for this exact commit+tag to completion
-  # via the Actions API, then resolves the published digest from the registry.
+  # it waits, via the Actions API, for a SUCCESSFUL docker-publish run for
+  # this exact commit+tag -- the tag push's own run, or the documented
+  # `promote_version` recovery dispatch (#2698), which a re-tagged version
+  # needs because immutability correctly fails the push run forever (#3640) --
+  # then resolves the published digest from the registry.
   # Once merge-backend has pushed the tag, the digest-aware republish guard
   # (`assert-version-digest-consistent`) in docker-publish.yml guarantees it can
   # never be re-pointed to DIFFERENT content -- only re-applied to the same
@@ -214,7 +217,14 @@ jobs:
       backend_digest: ${{ steps.resolve.outputs.backend_digest }}   # sha256:...
       version: ${{ steps.resolve.outputs.version }}
     steps:
-      - name: Wait for the docker-publish run for this commit to complete
+      # The resolver script is the only thing needed from the tree; this job
+      # otherwise reads the Actions API and the registry, not the repository.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: Wait for a successful docker-publish run for this commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -222,47 +232,65 @@ jobs:
           echo "Locating the docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA}"
 
           # The same tag push triggers docker-publish.yml independently; find
-          # ITS run for this exact commit+tag. Webhook fan-out can lag, so
-          # allow up to 15 minutes for the run to appear before declaring
-          # docker-publish dead (a dead publish must fail this job RED rather
-          # than let a skipped gate slip the release through).
+          # a SUCCESSFUL run of it for this exact commit+tag. Selection lives
+          # in scripts/ci/resolve-candidate-publish-run.sh (self-tested by its
+          # sibling test-*.sh): it accepts `push` OR `workflow_dispatch` runs,
+          # because on a RE-TAGGED version the push run fails permanently on
+          # image immutability and the documented recovery is a
+          # `promote_version` dispatch (#2698) -- which re-points tags at the
+          # digest :$VERSION already names, rebuilding nothing, so the digest
+          # captured below is still the digest the gate then tests (#3640).
+          # It stays fail-closed: no successful run of either kind for this
+          # sha+ref blocks the release RED.
+          #
+          # Webhook fan-out can lag, so allow up to 15 minutes for a run to
+          # appear before declaring docker-publish dead. Once a run has been
+          # seen, there is deliberately NO fixed clock -- the job-level
+          # timeout-minutes above is the only ceiling, sized for the
+          # cold-cache amd64 build (issue #2711) -- and transient API errors
+          # just keep the loop polling.
           APPEAR_DEADLINE=$(($(date +%s) + 15*60))
-          RUN_ID=""
+          SEEN=0
           while true; do
-            RUN_ID=$(gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/runs?event=push&head_sha=${GITHUB_SHA}&per_page=20" \
-              --jq '.workflow_runs' 2>/dev/null \
-              | jq -r --arg ref "${GITHUB_REF_NAME}" \
-                  '[.[] | select(.head_branch == $ref)][0].id // empty' || true)
-            [ -n "${RUN_ID}" ] && break
-            if [ "$(date +%s)" -ge "${APPEAR_DEADLINE}" ]; then
-              echo "::error title=docker-publish never started::No docker-publish.yml run found for ${GITHUB_REF_NAME}@${GITHUB_SHA} after 15m. Release blocked."
-              exit 1
-            fi
-            echo "  no docker-publish run visible yet, waiting 30s..."
-            sleep 30
-          done
-          echo "  following docker-publish run ${RUN_ID}"
-
-          # Follow the run to completion. Deliberately NO fixed clock here --
-          # the job-level timeout-minutes above is the only ceiling, sized for
-          # the cold-cache amd64 build (issue #2711). Transient API errors
-          # yield STATUS=unknown and the loop just keeps polling.
-          while true; do
-            STATE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
-              --jq '.status + " " + (.conclusion // "-")' 2>/dev/null || echo "unknown -")
-            STATUS="${STATE%% *}"
-            CONCLUSION="${STATE#* }"
-            if [ "${STATUS}" = "completed" ]; then
-              if [ "${CONCLUSION}" = "success" ]; then
-                echo "  docker-publish run ${RUN_ID} completed successfully."
+            rc=0
+            RESOLVE_REPO="${GITHUB_REPOSITORY}" \
+            RESOLVE_SHA="${GITHUB_SHA}" \
+            RESOLVE_REF="${GITHUB_REF_NAME}" \
+              bash scripts/ci/resolve-candidate-publish-run.sh || rc=$?
+            case "${rc}" in
+              0)
+                echo "  a docker-publish run for this commit completed successfully."
                 break
-              fi
-              echo "::error title=docker-publish failed::docker-publish run ${RUN_ID} completed with conclusion '${CONCLUSION}'. Release blocked; fix and re-run docker-publish, then re-run this workflow."
-              exit 1
-            fi
-            echo "  docker-publish run ${RUN_ID}: ${STATUS}; waiting 60s..."
-            sleep 60
+                ;;
+              10)
+                SEEN=1
+                echo "  docker-publish still running; waiting 60s..."
+                sleep 60
+                ;;
+              20)
+                echo "::error title=docker-publish failed::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success. Release blocked; fix and re-run docker-publish (or dispatch it with promote_version=${GITHUB_REF_NAME#v} if the version is already published), then re-run this workflow."
+                exit 1
+                ;;
+              21|30)
+                # none-yet / API blip: before any run is seen these count
+                # against the appear deadline; after one was seen they are
+                # transient and the job timeout is the ceiling.
+                if [ "${SEEN}" = "0" ] && [ "$(date +%s)" -ge "${APPEAR_DEADLINE}" ]; then
+                  if [ "${rc}" = "30" ]; then
+                    echo "::error title=Cannot query docker-publish runs::The Actions API query kept failing for 15m; whether docker-publish ran for ${GITHUB_REF_NAME}@${GITHUB_SHA} is unknown. Release blocked; re-run this workflow."
+                  else
+                    echo "::error title=docker-publish never started::No docker-publish.yml run found for ${GITHUB_REF_NAME}@${GITHUB_SHA} after 15m. Release blocked."
+                  fi
+                  exit 1
+                fi
+                echo "  no verdict yet (state ${rc}); waiting 30s..."
+                sleep 30
+                ;;
+              *)
+                echo "::error title=resolver error::resolve-candidate-publish-run.sh exited ${rc} unexpectedly. Release blocked."
+                exit 1
+                ;;
+            esac
           done
 
       - name: Capture the published :$VERSION digest

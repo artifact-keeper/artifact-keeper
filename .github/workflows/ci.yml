@@ -660,6 +660,16 @@ jobs:
       - name: Check the preflight-evidence gate blocks what it must
         run: bash scripts/ci/test-assert-preflight-evidence.sh
 
+      # release.yml's resolve-candidate-digest job picks WHICH docker-publish
+      # run vouches for the commit being released (#3640). Both directions are
+      # dangerous: accepting a success for another sha/ref is fail-open, and
+      # accepting only event=push deadlocks a re-tagged release forever (the
+      # v1.8.2 shape: the push run fails permanently on image immutability
+      # while the documented promote dispatch succeeded). Stubs `gh`; offline,
+      # ~1s.
+      - name: Check the candidate publish-run resolver selects and blocks correctly
+        run: bash scripts/ci/test-resolve-candidate-publish-run.sh
+
       # Duplicate sqlx migration versions merge CLEAN and abort the backend at
       # startup (#3313, #1128). The live gate runs in test-backend-unit against
       # the merge result; this exercises the script's failure modes (numeric
