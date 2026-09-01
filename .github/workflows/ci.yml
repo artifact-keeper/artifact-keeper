@@ -562,7 +562,13 @@ jobs:
         # previous single-threaded `cargo test -- --test-threads=1` run was
         # protecting. The coverage job already executes this exact suite
         # under nextest at 8 threads.
-        run: cargo nextest run --workspace --lib --test-threads 8
+        #
+        # `--bins` because backend/src/main.rs is a second compilation target
+        # with its own #[cfg(test)] tests; plain `--lib` silently excludes
+        # them, and no other job ran them at all (#3494). The
+        # `nextest_lib_invocations_include_bins` gate in
+        # backend/src/ci_test_surface.rs pins this flag.
+        run: cargo nextest run --workspace --lib --bins --test-threads 8
 
       # `workflow_scan_gate_tests` is the #2609 contract guard: it asserts that
       # docker-publish.yml's Trivy enforcement pass still gates (exit-code '1',
@@ -586,10 +592,49 @@ jobs:
       #
       # `--no-tests=fail` so a rename or deletion of the target is a red job
       # instead of a silent zero-test pass.
-      - name: Run workflow contract tests
+      #
+      # #3494 widened this step from workflow_scan_gate_tests alone to every
+      # integration target whose tests are NOT #[ignore]d — those tests can
+      # never run in the Tier 2 integration job (it invokes `-- --ignored`,
+      # under which they are filtered out), and until #3494 they ran NOWHERE:
+      #
+      #   * security_tests (13) — request-smuggling/traversal/injection
+      #     regression checks, pure.
+      #   * security_regression_tests (8 of 12) — GHSA regression pins; its 4
+      #     #[ignore]d DB cases run in the Tier 2 job, which also names this
+      #     target.
+      #   * streaming_invariant (2) — the #1608 full-body-buffering ratchet
+      #     (#3607: it had drifted stale because it never ran; reconciled).
+      #   * pypi_filename_parse / pypi_name_normalization / pypi_path_parse /
+      #     pypi_version_conformance (24) — PyPI conformance-corpus checks.
+      #   * scan_dedup_short_circuit_tests (1 of 8) — the pure helper check;
+      #     its 7 #[ignore]d DB cases run in the Tier 2 job.
+      #
+      # The `every_integration_target_is_wired_into_ci_or_exempt` gate in
+      # backend/src/ci_test_surface.rs fails if a target with non-#[ignore]d
+      # tests is missing from a default-set step like this one.
+      #
+      # The DB env matches the unit-test step above: security_regression's
+      # and scan_dedup_short_circuit's default-set cases open the Tier 1
+      # Postgres when present, and AK_TESTS_REQUIRE_DB makes a connect
+      # failure loud instead of a silent skip (#2924).
+      - name: Run workflow contract and pure integration targets
         env:
           SQLX_OFFLINE: true
-        run: cargo nextest run --workspace --test workflow_scan_gate_tests --no-tests=fail
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          AK_TESTS_REQUIRE_DB: "1"
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        run: |
+          cargo nextest run --workspace --no-tests=fail --test-threads 8 \
+            --test workflow_scan_gate_tests \
+            --test security_tests \
+            --test security_regression_tests \
+            --test streaming_invariant \
+            --test pypi_filename_parse \
+            --test pypi_name_normalization \
+            --test pypi_path_parse \
+            --test pypi_version_conformance \
+            --test scan_dedup_short_circuit_tests
 
       # Hit-rate data to evaluate dropping the Swatinem rust-cache step once sccache sustains >80% hits.
       - name: sccache stats
@@ -976,7 +1021,7 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          if ! cargo nextest run --workspace --lib --no-run; then
+          if ! cargo nextest run --workspace --lib --bins --no-run; then
             echo "::error title=Coverage BUILD failed — not a coverage-gate failure::cargo could not build the instrumented test binaries, so no coverage was measured; the 70% new-code gate, the 50% floor, and the jscpd duplication gate never ran. A genuine compile error will also fail Check Rust / Backend Unit Tests on this commit; if those are green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job."
             exit 1
           fi
@@ -1017,7 +1062,9 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --sh)
           export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
-          cargo nextest run --workspace --lib --test-threads 8
+          # `--bins` matches the unit-test job: the backend/src/main.rs
+          # bin-target tests execute (and are measured) here too (#3494).
+          cargo nextest run --workspace --lib --bins --test-threads 8
           cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Coverage summary and gate
@@ -1612,7 +1659,21 @@ jobs:
       # `backend/tests/` that were silently skipped before (#1031). The job
       # provisions postgres but NOT a running HTTP backend, Meilisearch,
       # Trivy, or live cloud credentials, so the suite list below is
-      # restricted to tests that need only a Postgres connection:
+      # restricted to tests that need only a Postgres connection.
+      #
+      # #3494 extended the allowlist from 15 targets to every DB-only suite
+      # (27 more): the allowlist model had quietly left 44 of 61 integration
+      # targets running in NO job on ANY trigger. The
+      # `every_integration_target_is_wired_into_ci_or_exempt` gate in
+      # backend/src/ci_test_surface.rs now fails the unit-test job if a
+      # backend/tests/*.rs file is neither named in a `--test` invocation nor
+      # explicitly exempted there with a justification, so a new suite can no
+      # longer be silently dead. Targets with non-#[ignore]d tests run in the
+      # Tier 1 "pure integration targets" step instead (this job's
+      # `-- --ignored` filter would skip them); security_regression_tests and
+      # scan_dedup_short_circuit_tests are mixed and correctly appear in BOTH.
+      #
+      # The original 15-target list:
       #
       #   - lifecycle_policy_tests, api_token_cache_flush_tests,
       #     search_reindex_tests, scan_convert_to_reused_tests,
@@ -1628,12 +1689,15 @@ jobs:
       #     assertions — no outbound fetch, so no wiremock/SSRF dance).
       #
       # Deliberately excluded (would panic on first .expect() without
-      # extra infra, so `--ignored` stays the right gate):
+      # extra infra, so `--ignored` stays the right gate). These are the
+      # EXEMPT entries in backend/src/ci_test_surface.rs — the gate fails if
+      # this set and that list drift apart:
       #
       #   - azure_rbac_live_test, azure_shared_key_live_test, s3_integration
       #     (live cloud creds via std::env::var().expect)
       #   - integration_tests, replication_integration,
-      #     tag_filtered_replication_tests, storage_backend_tests
+      #     tag_filtered_replication_tests, storage_backend_tests,
+      #     download_ticket_tests
       #     (read TEST_BASE_URL, need a running HTTP backend)
       #   - incus_upload_tests (most cases construct the router without the
       #     optional_auth middleware, so handler `Extension<AuthExtension>`
@@ -1646,10 +1710,16 @@ jobs:
       # `--test-threads=1` because the DB-backed suites share schema state
       # through global DELETEs in their cleanup helpers and would race under
       # parallel execution.
+      #
+      # AK_TESTS_REQUIRE_DB: this job provisions Postgres, so a connect
+      # failure must be a loud failure, not a silent skip-and-PASS (#2924).
+      # It was set on the two `--lib` jobs but never here.
       - name: Run integration tests
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
+          AK_TESTS_REQUIRE_DB: "1"
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
           cargo test --workspace --verbose \
             --test lifecycle_policy_tests \
@@ -1667,7 +1737,68 @@ jobs:
             --test age_gate_tests \
             --test scan_policy_validation_tests \
             --test ansible_galaxy_tests \
+            --test admin_middleware_fresh_user_tests \
+            --test backup_cleanup_reclaims_storage_tests \
+            --test catalog_keyset_tests \
+            --test composer_packages_index_tests \
+            --test gitlfs_locks_tests \
+            --test grouped_listing_keyset_tests \
+            --test manifest_blob_refs_tests \
+            --test maven_virtual_groupid_shadowing_test \
+            --test migration_storage_path_tests \
+            --test oci_packages_index_tests \
+            --test oci_upload_range_test \
+            --test oci_virtual_resolution_tests \
+            --test optional_auth_deactivation_tests \
+            --test promotion_block_unscanned_tests \
+            --test promotion_open_cve_gating_tests \
+            --test pypi_proxy_upload_time_tests \
+            --test rpm_generic_upload_metadata_tests \
+            --test sbom_cached_artifact_not_analyzable_tests \
+            --test scan_dashboard_aggregation_tests \
+            --test scan_dedup_short_circuit_tests \
+            --test scan_dedup_zero_findings_ttl_tests \
+            --test scan_latest_per_artifact_tests \
+            --test search_sort_size_tests \
+            --test security_regression_tests \
+            --test setup_replica_unlock_tests \
+            --test swift_virtual_lookup_tests \
+            --test users_password_routing_tests \
             -- --ignored --test-threads=1
+
+      # Suites that are green EXCEPT for individually quarantined cases.
+      # Each `--skip` names one failing test, with a tracking issue; the
+      # quarantine is explicit and visible here rather than the whole suite
+      # staying silently dead (#3494). Remove the `--skip` when the issue is
+      # resolved.
+      #
+      #   - conan_error_paths_tests: 7/8 green.
+      #     `test_1046_unknown_repo_no_auth_returns_404` — unauthenticated
+      #     GET on an unknown Conan repo now returns 401, the test pins the
+      #     #1046 contract of 404 (#3616).
+      #   - search_checksum_sha1_md5_tests: 4/5 green.
+      #     `test_reupload_refreshes_all_three_checksums` — re-upload is now
+      #     rejected as an immutable-version Conflict; the test predates
+      #     version immutability (#3617).
+      #   - storage_stats_tests: 6/7 green.
+      #     `oci_layer_bytes_are_counted` — storage stats count 4096 of the
+      #     expected 4608 bytes: the OCI layer blob or manifest is missing
+      #     from the aggregate (#3618).
+      - name: Run quarantined-case integration suites
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          SQLX_OFFLINE: true
+          AK_TESTS_REQUIRE_DB: "1"
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        run: |
+          cargo test --workspace --verbose \
+            --test conan_error_paths_tests \
+            --test search_checksum_sha1_md5_tests \
+            --test storage_stats_tests \
+            -- --ignored --test-threads=1 \
+            --skip test_1046_unknown_repo_no_auth_returns_404 \
+            --skip test_reupload_refreshes_all_three_checksums \
+            --skip oci_layer_bytes_are_counted
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
       # is the only case in that file currently wired to run without an HTTP
@@ -1677,6 +1808,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
+          AK_TESTS_REQUIRE_DB: "1"
         run: |
           cargo test --workspace --verbose \
             --test incus_upload_tests \
