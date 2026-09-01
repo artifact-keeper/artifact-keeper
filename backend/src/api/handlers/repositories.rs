@@ -1348,6 +1348,30 @@ fn validate_repository_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a repository key that collides with this deployment's active
+/// proxy-cache scope segment (#3454 follow-up).
+///
+/// `proxy-cache/<segment>/` is the root of this deployment's ENTIRE proxy
+/// cache, and it is also the exact shape of the legacy per-repository purge
+/// prefix `proxy-cache/<repo_key>/`. A repository whose key equals the scope
+/// segment makes those two namespaces ambiguous, so deleting that repository
+/// would otherwise sweep every other repository's cached content. Refusing the
+/// key at creation and rename removes the ambiguity structurally — it survives
+/// a future refactor of the purge path, whereas the guard in
+/// `ProxyService::purge_repo_cache` alone leaves the ambiguity in place.
+///
+/// Kept scope-aware and side-effect free (`scope_segment` is the resolved
+/// segment or `None` for the unscoped/legacy layout, in which nothing can
+/// collide) so it is unit-testable without a live `ProxyService`.
+fn validate_key_not_scope_collision(key: &str, scope_segment: Option<&str>) -> Result<()> {
+    if scope_segment == Some(key) {
+        return Err(AppError::Validation(format!(
+            "Repository key '{key}' collides with this deployment's proxy-cache scope segment and is reserved"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a custom outbound User-Agent string for a remote repository.
 ///
 /// Enforces a pragmatic 256-character cap and rejects control characters per
@@ -2674,6 +2698,13 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
+    validate_key_not_scope_collision(
+        &payload.key,
+        state
+            .proxy_service
+            .as_ref()
+            .and_then(|p| p.cache_scope().segment()),
+    )?;
     // Resolve the format string via the service. The service owns both the
     // built-in enum mapping and the `format_handlers` fallback for WASM
     // plugin formats, so the handler keeps no business logic of its own here.
@@ -3624,6 +3655,13 @@ pub async fn update_repository(
     // Validate new key if provided
     if let Some(ref new_key) = payload.key {
         validate_repository_key(new_key)?;
+        validate_key_not_scope_collision(
+            new_key,
+            state
+                .proxy_service
+                .as_ref()
+                .and_then(|p| p.cache_scope().segment()),
+        )?;
     }
 
     // Validate quota_bytes is within a reasonable range (max 100 TiB)
@@ -7755,9 +7793,40 @@ async fn authorize_generic_upload(
 ///
 /// The raw-`PUT` and multipart entry points authorize the request and stream the
 /// body to a bounded scratch file (computing the content digests in one pass);
-/// this shared tail verifies declared checksums, runs any WASM format plugin,
-/// derives the artifact coordinates, and persists via the streaming service
-/// method — never buffering the whole artifact in memory.
+/// Derive `(name, version)` from a generic-upload path's `/`-separated
+/// segments.
+///
+/// The flat convention is `{name}/{version}/{filename...}`. #3604 defect 3: an
+/// npm SCOPED package's name is itself `@scope/name` and so spans TWO segments
+/// before the version — `@babel/traverse/7.23.0/x.tgz` is
+/// `@babel/traverse@7.23.0`. The flat parse reads that as `@babel@traverse`,
+/// and once #3442 turns the coordinate into a scan pin that pins a component
+/// which does not exist, so a genuinely vulnerable scoped package reads clean.
+/// Only npm-family repos use the `@scope/` convention (`is_npm_format`); every
+/// other format keeps the flat parse byte for byte. `fallback_name` is returned
+/// when the path is too short to carry a coordinate.
+fn derive_generic_path_coordinate(
+    path: &str,
+    is_npm_format: bool,
+    fallback_name: String,
+) -> (String, Option<String>) {
+    let segments: Vec<&str> = path.split('/').collect();
+    let npm_scoped = is_npm_format && segments.first().is_some_and(|s| s.starts_with('@'));
+    if npm_scoped && segments.len() >= 4 {
+        (
+            format!("{}/{}", segments[0], segments[1]),
+            Some(segments[2].to_string()),
+        )
+    } else if segments.len() >= 3 {
+        (segments[0].to_string(), Some(segments[1].to_string()))
+    } else {
+        (fallback_name, None)
+    }
+}
+
+/// After verifying declared checksums and running any WASM format plugin,
+/// this shared tail derives the artifact coordinates and persists via the
+/// streaming service method — never buffering the whole artifact in memory.
 #[allow(clippy::too_many_arguments)]
 async fn persist_generic_staged_upload(
     state: &SharedState,
@@ -7846,13 +7915,7 @@ async fn persist_generic_staged_upload(
     let (name, version) = if let Some(ref meta) = wasm_metadata {
         (name, meta.version.clone())
     } else {
-        let segments: Vec<&str> = path.split('/').collect();
-        if segments.len() >= 3 {
-            // Path follows {package_name}/{version}/{filename...} convention
-            (segments[0].to_string(), Some(segments[1].to_string()))
-        } else {
-            (name, None)
-        }
+        derive_generic_path_coordinate(&path, repo.format.handler_key() == "npm", name)
     };
 
     // #2367: on versioning-enabled Generic/Mlmodel repos an explicit
@@ -12385,6 +12448,44 @@ mod tests {
     #[test]
     fn test_validate_repository_key_valid_simple() {
         assert!(validate_repository_key("my-repo").is_ok());
+    }
+
+    // ---- #3454 follow-up: a key equal to the proxy-cache scope segment is
+    // reserved. `proxy-cache/<segment>/` is the whole deployment's cache root
+    // AND the legacy per-repository purge prefix `proxy-cache/<repo_key>/`, so
+    // a repository keyed as the segment makes deleting it sweep every other
+    // repository's cached content. Refusing it at creation/rename is the half
+    // of the fix that survives a refactor of the purge path.
+    #[test]
+    fn test_reject_repository_key_equal_to_scope_segment() {
+        let err = validate_key_not_scope_collision("prod-eu", Some("prod-eu"))
+            .expect_err("a key equal to the scope segment must be rejected");
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("proxy-cache scope segment"),
+                    "unexpected: {msg}"
+                );
+                assert!(msg.contains("prod-eu"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The UUID default segment is a legal repository key too, and equally
+        // reserved.
+        let uuid = "7ff7c6bf-e184-4d77-a541-0b23b208b3b4";
+        assert!(validate_key_not_scope_collision(uuid, Some(uuid)).is_err());
+    }
+
+    #[test]
+    fn test_scope_collision_permits_non_colliding_and_unscoped() {
+        // A different key under the same scope is fine.
+        assert!(validate_key_not_scope_collision("maven-proxy", Some("prod-eu")).is_ok());
+        // An unscoped/legacy deployment (no segment) can never collide.
+        assert!(validate_key_not_scope_collision("prod-eu", None).is_ok());
+        // The colliding key is still a well-formed key by the base validator —
+        // i.e. the base validator does NOT already reject it, so this check is
+        // load-bearing.
+        assert!(validate_repository_key("prod-eu").is_ok());
     }
 
     #[test]
@@ -17876,8 +17977,18 @@ mod tests {
         let mut cached_files = Vec::new();
         for path in [html_path, json_path] {
             for key in [
-                ProxyService::cache_storage_key(&fx.repo_key, path).unwrap(),
-                ProxyService::cache_metadata_key(&fx.repo_key, path).unwrap(),
+                ProxyService::cache_storage_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
+                ProxyService::cache_metadata_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
             ] {
                 let file = fx.storage_dir.join(&key);
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -23535,6 +23646,63 @@ mod tests {
 // --------------------------------------------------------------------------
 // Unit tests: APT field validation helpers
 // --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod generic_path_coordinate_tests {
+    use super::derive_generic_path_coordinate;
+
+    #[test]
+    fn flat_coordinate_is_name_then_version() {
+        let (name, version) =
+            derive_generic_path_coordinate("lodash/4.17.11/lodash.tgz", true, "fallback".into());
+        assert_eq!(name, "lodash");
+        assert_eq!(version.as_deref(), Some("4.17.11"));
+    }
+
+    #[test]
+    fn npm_scoped_package_keeps_scope_with_name() {
+        // #3604 defect 3: the scope is PART of the name; the flat parse would
+        // read name=`@babel`, version=`traverse` and pin a component that does
+        // not exist, letting a vulnerable scoped package read clean.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/babel-traverse-7.23.0.tgz",
+            true,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel/traverse");
+        assert_eq!(version.as_deref(), Some("7.23.0"));
+    }
+
+    #[test]
+    fn scope_prefix_is_only_special_for_npm_formats() {
+        // A non-npm format never uses the `@scope/` convention, so the leading
+        // `@` segment is treated as an ordinary name and behavior is unchanged.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/x.tgz",
+            false,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel");
+        assert_eq!(version.as_deref(), Some("traverse"));
+    }
+
+    #[test]
+    fn too_short_path_falls_back() {
+        let (name, version) = derive_generic_path_coordinate("just-a-file.txt", true, "fb".into());
+        assert_eq!(name, "fb");
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn scoped_without_a_version_segment_falls_back_to_flat() {
+        // `@scope/name/file` has only three segments: not enough for a scoped
+        // coordinate, so the flat parse applies rather than mis-reading.
+        let (name, version) =
+            derive_generic_path_coordinate("@scope/name/file.tgz", true, "fb".into());
+        assert_eq!(name, "@scope");
+        assert_eq!(version.as_deref(), Some("name"));
+    }
+}
 
 #[cfg(test)]
 mod docker_tag_search_escape_tests {

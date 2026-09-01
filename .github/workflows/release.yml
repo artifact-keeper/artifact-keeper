@@ -464,6 +464,18 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Same installer ci.yml uses for cargo-audit: prebuilt binaries, no
+      # compile on the release path. All three tools are published for Linux,
+      # macOS and Windows, which is what makes the five-target matrix viable.
+      #   cargo-auditable  embeds the dependency graph IN the binary
+      #   cargo-cyclonedx  emits the per-target SBOM shipped as a release asset
+      #   cargo-audit      reads the embedded graph back out, so the claim is
+      #                    checked here rather than asserted in a doc
+      - name: Install SBOM tooling
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-auditable,cargo-cyclonedx,cargo-audit
+
       - name: Set version from tag
         run: |
           VERSION=${GITHUB_REF_NAME#v}
@@ -482,7 +494,27 @@ jobs:
           SQLX_OFFLINE: true
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+        # `cargo auditable build` is a thin wrapper around `cargo build`: it
+        # wraps rustc to collect the resolved dependency versions and links
+        # them into the binary (`.dep-v0` on ELF, the equivalent section on
+        # Mach-O and PE). The compiled code is unchanged.
+        #
+        # This is what makes the SBOM verifiable FROM THE ARTIFACT. A .cdx.json
+        # shipped next to a tarball is a claim about a pairing the consumer
+        # cannot check; `cargo audit bin artifact-keeper-linux-amd64` asks the
+        # binary itself. It also survives the release profile's `strip = true`
+        # (Cargo.toml), which was measured rather than assumed: a release build
+        # of a throwaway crate carrying the same `strip = true` reports
+        # `stripped` to file(1), still carries a `.dep-v0` section, and
+        # `cargo audit bin` reads its dependency graph back out.
+        #
+        # The cross legs were rehearsed too, because they are the ones with no
+        # upstream CI coverage. Linux host -> mingw-w64
+        # `--target x86_64-pc-windows-gnu` with `strip = true` produced a PE32+
+        # that `cargo audit bin` read a complete graph out of. cargo-auditable's
+        # own CI covers native macOS and an ELF cross with a GCC cross-toolchain
+        # (i686), which is the shape of the aarch64-unknown-linux-gnu leg.
+        run: cargo auditable build --release --target ${{ matrix.target }} --features vendored-openssl
 
       - name: Package binary (Unix)
         if: "!contains(matrix.target, 'windows')"
@@ -506,6 +538,42 @@ jobs:
           cd dist
           sha256sum ${{ matrix.name }}.exe > ${{ matrix.name }}.exe.sha256
 
+      # A CycloneDX SBOM per target, from the Cargo dependency graph.
+      # `--target` is load-bearing and not decoration: the dependency graph is
+      # platform-filtered, so all five targets genuinely differ. Measured on
+      # this tree at 1.8.1 with cargo-cyclonedx 0.5.9 -- linux-amd64 724,
+      # linux-arm64 720, darwin-amd64 733, darwin-arm64 729, windows-amd64 744
+      # components. `--features vendored-openssl` matches the build above for
+      # the same reason: it pulls in openssl-src, which would otherwise be
+      # missing from the SBOM of a binary that contains it.
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          cargo cyclonedx \
+            --format json \
+            --spec-version 1.5 \
+            --all \
+            --target ${{ matrix.target }} \
+            --features vendored-openssl \
+            --override-filename "${{ matrix.name }}"
+          mkdir -p dist
+          # cargo-cyclonedx writes beside the CRATE manifest (backend/), not the
+          # workspace root, and appends only `.json` to --override-filename.
+          mv "backend/${{ matrix.name }}.json" "dist/${{ matrix.name }}.cdx.json"
+          ls -la "dist/${{ matrix.name }}.cdx.json"
+
+      # An embedded SBOM nobody checked is not an SBOM. `cargo audit bin`
+      # EXITS 0 on a binary with no embedded data -- it scrapes a partial list
+      # out of panic messages and warns -- so this step asserts on its OUTPUT.
+      # Without that, deleting `auditable` from the build command above leaves
+      # CI green and every shipped binary hollow.
+      # Failure legs exercised offline by scripts/ci/test-assert-binary-sbom.sh.
+      - name: Verify the shipped binary carries its dependency graph
+        env:
+          BINARY: dist/${{ matrix.name }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+          SBOM: dist/${{ matrix.name }}.cdx.json
+        run: ./scripts/ci/assert-binary-sbom.sh
+
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -513,6 +581,7 @@ jobs:
           path: |
             dist/${{ matrix.name }}.tar.gz*
             dist/${{ matrix.name }}.exe*
+            dist/${{ matrix.name }}.cdx.json
 
   # ════════════════════════════════════════════════════════════════════════════
   # VERIFY REQUIRED IMAGES PUBLISHED ON GHCR.IO
@@ -753,6 +822,20 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     needs: [preflight-evidence, build-binaries, release-gate, verify-images-published]
+    # DECLARED, not inherited (#3558). This job used to take the workflow-level
+    # set, which gave it `packages: write` it has never used and -- more to the
+    # point -- gave it no `id-token` and no `attestations`, so it could not have
+    # signed or attested anything even if it had tried. Signing needs the OIDC
+    # token; provenance needs the attestations scope; and stating the set here
+    # means the next person adding a step to this job sees what it is allowed
+    # to do without cross-referencing the top of the file.
+    permissions:
+      contents: write       # create the Release, upload its assets, read the tree
+      id-token: write       # GitHub OIDC -> Fulcio, for cosign keyless signing
+      attestations: write   # actions/attest-build-provenance (and read, to verify it)
+      actions: read         # download this run's build-binaries artifacts
+      # `packages:` is deliberately absent: this job touches no registry. The
+      # image work is done and verified by the time it runs.
     # Every named gate is now required, but the condition stays explicit rather
     # than falling back to the default `success()`. `!cancelled()` rather than
     # `always()`: with `always()`, cancelling the run does not stop the
@@ -802,10 +885,161 @@ jobs:
 
       - name: Collect release assets
         run: |
+          set -euo pipefail
           mkdir -p release-assets
           find artifacts -name "*.tar.gz*" -exec cp {} release-assets/ \;
           find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
+          find artifacts -name "*.cdx.json" -exec cp {} release-assets/ \;
           ls -la release-assets/
+
+      # ══════════════════════════════════════════════════════════════════════
+      # SIGN, ATTEST, THEN VERIFY -- ALL BEFORE `Create Release` (#3558)
+      #
+      # Until now the binaries shipped with a `<name>.sha256` next to them and
+      # nothing else. That file is served from the same place, by the same
+      # authority, as the artifact it describes: whoever can replace
+      # `artifact-keeper-linux-amd64.tar.gz` on the release can replace its
+      # `.sha256` in the same action. It detects a corrupted download. It is
+      # routinely read as detecting a substituted one.
+      #
+      # The ORDER is the point. `.github/scripts/assert-release-absent.sh`
+      # refuses to run against a tag that already has a release, and
+      # `overwrite_files: false` refuses to replace an asset, so a PARTIAL
+      # publish is not recoverable by re-running -- it burns an immutable tag.
+      # Everything that can fail therefore fails while this job has produced
+      # nothing public.
+      # ══════════════════════════════════════════════════════════════════════
+
+      # ONE manifest over the whole asset set, so ONE signature covers all of
+      # it. The per-file `.sha256` files stay: they are published today and
+      # people script against them, so removing them would be a silent break.
+      # They are now themselves listed in checksums.txt, which is the file that
+      # gets signed.
+      - name: Generate checksums.txt
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          # Written outside the directory first: `> checksums.txt` would create
+          # the file before `find` runs and the manifest would list itself.
+          # `-r` so an empty directory produces no manifest rather than
+          # `sha256sum` with no arguments, which reads stdin; `-d '\n'` so the
+          # split is on lines and not on whitespace inside a filename.
+          find . -maxdepth 1 -type f -printf '%P\n' | sort \
+            | xargs -r -d '\n' sha256sum > ../checksums.txt
+          mv ../checksums.txt checksums.txt
+          cat checksums.txt
+          # An empty or one-line manifest means the collect step found nothing.
+          # The verification step refuses it, but say so where it happened.
+          echo "checksums.txt lists $(wc -l < checksums.txt) file(s)"
+
+      # Version-pinned, unlike the docker-publish.yml installs, deliberately.
+      # `cosign verify-blob`'s `--signature`/`--certificate` pair is deprecated
+      # in v3 in favour of `--bundle` (v3.1.3 still accepts it, with a
+      # deprecation notice, and hides it from `--help`), so the exact CLI
+      # surface this job depends on is already mid-migration. This is the one
+      # job that cannot be rehearsed without cutting a tag, so it should not
+      # also be the place a silent CLI bump lands.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      # Keyless: GitHub OIDC -> Fulcio short-lived certificate -> Rekor. No key
+      # material exists to leak or rotate, and the certificate records WHICH
+      # workflow, in WHICH repository, at WHICH ref did the signing -- which is
+      # the property the verification step below pins against.
+      #
+      # ONE `.cosign.bundle` rather than a `.sig` + `.pem` pair: it carries the
+      # signature, the certificate and the transparency-log proof together, and
+      # it is what cosign v3 accepts.
+      #
+      # No `continue-on-error`, here or below. #2824: a failed cosign step let
+      # 1.6.1 ship unsigned and a human found it later. #3496 turned that into
+      # a rule, and scripts/ci/check-supply-chain-soft-fail.sh enforces it.
+      - name: Sign checksums.txt with cosign (keyless)
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle release-assets/checksums.txt.cosign.bundle \
+            release-assets/checksums.txt
+
+      # The images have carried build provenance since #3496; the binaries have
+      # not. This is what makes
+      # `gh attestation verify <file> --repo artifact-keeper/artifact-keeper`
+      # -- the command SECURITY.md now tells users to run -- return an answer.
+      # Same pinned SHA docker-publish.yml uses.
+      - name: Generate build provenance for the release assets
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        with:
+          subject-path: |
+            release-assets/*.tar.gz
+            release-assets/*.exe
+            release-assets/*.cdx.json
+            release-assets/checksums.txt
+
+      # THE POINT OF ALL OF IT. Signing without verifying is a ritual: nothing
+      # so far has checked that the signature covers these bytes, that it came
+      # from THIS workflow, or that checksums.txt describes what is actually in
+      # the directory.
+      #
+      # The identity is pinned to this repository's release workflow at THIS
+      # tag. Fulcio is a public CA -- `--certificate-identity-regexp '.*'`
+      # satisfies cosign and accepts a certificate minted by anyone's workflow
+      # -- so the gate inspects the pattern it was handed and refuses a
+      # permissive one before it verifies anything.
+      #
+      # Every failure leg is exercised offline by
+      # scripts/ci/test-verify-release-assets.sh, including the one that
+      # matters most: a real, valid signature carrying the WRONG certificate
+      # identity.
+      - name: Verify the release assets before publishing
+        env:
+          ASSETS_DIR: release-assets
+          ATTEST_REPO: ${{ github.repository }}
+          # `gh attestation verify --repo X` alone accepts an attestation from
+          # ANY workflow in X that holds `attestations: write`, and
+          # docker-publish.yml writes four per publish. Pin the signer, the
+          # same way the cosign certificate identity is pinned below.
+          ATTEST_SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release.yml
+          GH_TOKEN: ${{ github.token }}
+          # Deliberately spelled out rather than derived from the matrix. The
+          # matrix lives in another job and cannot be read from here, and an
+          # explicit list is what makes "a target silently stopped building"
+          # a refusal instead of a shorter release. The cross-check below
+          # catches drift in the other direction.
+          EXPECT_NAMES: |
+            artifact-keeper-linux-amd64
+            artifact-keeper-linux-arm64
+            artifact-keeper-darwin-amd64
+            artifact-keeper-darwin-arm64
+            artifact-keeper-windows-amd64
+        run: |
+          set -euo pipefail
+
+          # build-binaries uploads one artifact per matrix leg, named exactly
+          # `matrix.name`, so the downloaded directory names ARE the matrix.
+          # If it and EXPECT_NAMES disagree, one of them is stale.
+          downloaded="$(cd artifacts && ls -1d */ | sed 's#/##' | sort | tr '\n' ' ')"
+          expected="$(printf '%s\n' $EXPECT_NAMES | sed '/^$/d' | sort | tr '\n' ' ')"
+          if [ "$downloaded" != "$expected" ]; then
+            echo "::error title=Release asset expectation is stale::build-binaries produced [${downloaded}] but this step expects [${expected}]. Update EXPECT_NAMES in release.yml to match the build-binaries matrix."
+            exit 1
+          fi
+
+          # The Fulcio SAN for a job running directly in this workflow is
+          # `https://github.com/<repo>/.github/workflows/<file>@<ref>`. Pin all
+          # three. Built by a script rather than inline because the inline
+          # version was WRONG and silently so: its escaper never escaped
+          # anything, so every `.` in the "pinned" identity was a wildcard.
+          # scripts/ci/test-verify-release-assets.sh now asserts on the
+          # pattern's text and on what it accepts.
+          EXPECT_IDENTITY_REGEXP="$(./scripts/ci/release-identity-regexp.sh \
+            "${GITHUB_REPOSITORY}" release.yml "${GITHUB_REF}")"
+          export EXPECT_IDENTITY_REGEXP
+          export EXPECT_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+          echo "pinned certificate identity: ${EXPECT_IDENTITY_REGEXP}"
+
+          ./scripts/ci/verify-release-assets.sh
 
       - name: Resolve release notes
         id: notes

@@ -3205,7 +3205,12 @@ mod tests {
 
         let archive_url = "https://releases.hashicorp.com/terraform-provider-null/3.2.3/terraform-provider-null_3.2.3_linux_arm64.zip";
 
-        let raw_err = ProxyService::cache_storage_key("tf-mirror", archive_url).unwrap_err();
+        let raw_err = ProxyService::cache_storage_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+            "tf-mirror",
+            archive_url,
+        )
+        .unwrap_err();
         assert!(
             raw_err.to_string().contains("empty segments"),
             "raw absolute archive URL must be rejected as a cache path, got: {}",
@@ -3214,8 +3219,12 @@ mod tests {
 
         let cache_path =
             mirror_archive_cache_path("hashicorp", "null", "3.2.3", "linux", "arm64", archive_url);
-        ProxyService::cache_storage_key("tf-mirror", &cache_path)
-            .expect("derived cache path must be a valid proxy-cache path");
+        ProxyService::cache_storage_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+            "tf-mirror",
+            &cache_path,
+        )
+        .expect("derived cache path must be a valid proxy-cache path");
     }
 
     #[test]

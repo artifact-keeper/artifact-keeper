@@ -222,6 +222,89 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    or any pinned environments are updated intentionally (see
    "Infrastructure & Cost Rules" in CLAUDE.md).
 
+   Then verify the release the way an operator would, from a clean directory —
+   the `release` job already did this before publishing, but running it from
+   outside proves the assets a downloader actually receives are the ones that
+   were verified:
+
+   ```bash
+   REPO_DIR="$PWD"                       # your artifact-keeper checkout
+   IDENTITY="$("$REPO_DIR"/scripts/ci/release-identity-regexp.sh \
+     artifact-keeper/artifact-keeper release.yml refs/tags/vX.Y.Z)"
+
+   cd "$(mktemp -d)"
+   gh release download vX.Y.Z --repo artifact-keeper/artifact-keeper
+
+   cosign verify-blob \
+     --bundle checksums.txt.cosign.bundle \
+     --certificate-identity-regexp "$IDENTITY" \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     checksums.txt
+   sha256sum -c checksums.txt
+   gh attestation verify artifact-keeper-linux-amd64.tar.gz \
+     --repo artifact-keeper/artifact-keeper \
+     --signer-workflow artifact-keeper/artifact-keeper/.github/workflows/release.yml
+   ```
+
+   `scripts/ci/release-identity-regexp.sh` is the same script the release job
+   uses to build its pin, so this checks the release against exactly the
+   identity the job required — not a hand-typed approximation of it.
+
+   `SECURITY.md` carries the same commands written out for a user who does
+   not have the repository checked out; keep the two in step.
+
+## Supply chain: what the release job signs, and what it refuses
+
+Release binaries used to ship with a `<name>.sha256` beside them and nothing
+else, which is a corruption check routinely read as an authenticity check: it
+is served from the same place, by the same authority, as the artifact it
+describes. Since #3558 the `release` job does four things between "Collect
+release assets" and "Create Release", **in this order**:
+
+1. writes one `checksums.txt` covering every asset (the per-file `.sha256`
+   files stay, and are themselves listed in it);
+2. signs `checksums.txt` with **cosign keyless** — GitHub OIDC to Fulcio to
+   Rekor, no key material to hold or rotate — producing
+   `checksums.txt.cosign.bundle`;
+3. attaches **build provenance** to every archive, SBOM and the manifest with
+   `actions/attest-build-provenance`;
+4. **verifies all of it** with `scripts/ci/verify-release-assets.sh` before
+   anything is published.
+
+The order is the point, and it is not stylistic. `assert-release-absent.sh`
+refuses to run against a tag that already has a release and
+`softprops/action-gh-release` runs with `overwrite_files: false`, so a
+*partial* publish is not recoverable by re-running — it burns an immutable
+version number. Everything that can fail therefore fails while the job has
+produced nothing public, and the recovery is "re-run the job".
+
+The verification refuses, among other things: an asset missing from
+`checksums.txt` (an unlisted asset is an unsigned asset), digests that do not
+match the bytes on disk, a missing signature, a valid signature carrying the
+**wrong certificate identity**, a certificate-identity pattern permissive
+enough to accept one, provenance signed by a different workflow, and a missing
+`.cdx.json`. It separates a Sigstore or GitHub API outage (exit 2, INFRA,
+"retry") from a genuine mismatch (exit 1, BLOCKED, "something replaced your
+bytes"); both stop the release. Every one of those legs is exercised offline
+by `scripts/ci/test-verify-release-assets.sh` in CI's shell-tests job, because
+this code path runs once per release and cannot be rehearsed without cutting a
+tag.
+
+Binaries are built with `cargo auditable`, so the dependency graph is embedded
+in the shipped executable and a `.cdx.json` CycloneDX SBOM ships per target.
+`scripts/ci/assert-binary-sbom.sh` asserts the embedding actually happened,
+which is necessary rather than belt-and-braces: `cargo audit bin` **exits 0**
+on a binary with no embedded data, printing a warning and falling back to a
+partial list scraped from panic messages. Without an assertion on its output,
+dropping `auditable` from the build command leaves CI green and every shipped
+binary hollow.
+
+**Do not add `continue-on-error` to any of these steps.**
+`scripts/ci/check-supply-chain-soft-fail.sh` blocks it, for the reason #2824
+exists: a soft-failed cosign step let 1.6.1 ship unsigned and a human found it
+later.
+
+
 ## Rolling `:latest` back
 
 There is no separate rollback path, because there is nothing to roll back in
@@ -279,6 +362,17 @@ scanned bytes; deleting it breaks every chart that pins it.
   `.github/scripts/floating-tag-plan.sh` and pinned by
   `scripts/ci/check-floating-tag-promotion.sh` in CI's shell-tests job.
   Prereleases never take a floating tag.
+- Release binaries are signed and verified before publication, never after:
+  one `checksums.txt` over every asset, a cosign keyless signature over it, and
+  build provenance on the assets — all three VERIFIED by
+  `scripts/ci/verify-release-assets.sh` before `Create Release` runs, because
+  `overwrite_files: false` plus `assert-release-absent.sh` make a partial
+  publish unrecoverable. The certificate identity is pinned to this repository,
+  this workflow file and this tag; a permissive pattern is refused by the gate
+  rather than passed to cosign (#3558).
+- Binaries embed their dependency graph (`cargo auditable`) and ship a
+  per-target CycloneDX SBOM, and the embedding is ASSERTED at build time —
+  `cargo audit bin` exits 0 on a binary that has none (#3558).
 - No change reaches a tag that touches a versioned component's source set
   (`docker/*/VERSION` and its sibling Dockerfile) without bumping that
   component's `VERSION` — step 5. Exact version tags are never republished,

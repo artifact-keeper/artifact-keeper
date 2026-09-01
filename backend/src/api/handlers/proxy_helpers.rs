@@ -1104,7 +1104,7 @@ async fn try_member_cache_redirect(
         return None;
     }
     let storage = proxy.cache_storage_backend();
-    let cache_key = ProxyService::cache_storage_key(&member.key, path).ok()?;
+    let cache_key = ProxyService::cache_storage_key(proxy.cache_scope(), &member.key, path).ok()?;
     if !(storage.supports_redirect() && proxy.is_cache_fresh(&member.key, path).await) {
         return None;
     }
@@ -1248,7 +1248,7 @@ pub async fn proxy_fetch_or_redirect(
     path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let cache_key = ProxyService::cache_storage_key(repo_key, path)
+    let cache_key = ProxyService::cache_storage_key(proxy_service.cache_scope(), repo_key, path)
         .map_err(|e| map_proxy_error(repo_key, path, e))?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     // #3209 (sibling of #3181): a presigned URL is signed for ONE HTTP method —
@@ -4997,9 +4997,16 @@ pub(crate) async fn record_proxy_download(
     // later authoritative upsert refines the same `(repo, path)` row in place.
     // A path whose key exceeds the object-store limit can never be cached, so
     // there is nothing to count — skip.
+    // The scope must come from the live `ProxyService` (#3454): a placeholder
+    // row keyed under a different scope than the tee writes would never be
+    // refined in place, leaving a permanently orphaned catalog row.
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return;
+    };
+    let scope = proxy.cache_scope();
     let (storage_key, metadata_key) = match (
-        crate::services::proxy_service::ProxyService::cache_storage_key(repo_key, path),
-        crate::services::proxy_service::ProxyService::cache_metadata_key(repo_key, path),
+        crate::services::proxy_service::ProxyService::cache_storage_key(scope, repo_key, path),
+        crate::services::proxy_service::ProxyService::cache_metadata_key(scope, repo_key, path),
     ) {
         (Ok(s), Ok(m)) => (s, m),
         _ => return,
@@ -6791,14 +6798,82 @@ pub(crate) fn proxy_rescan_synthetic_artifact(
     }
 }
 
-/// Run the leaf scanners over the buffered bytes within the inline budget and
-/// persist the digest-keyed verdict. The caller supplies the format-specific
+/// Why [`proxy_scan_and_record`] could not produce a verdict (#3455).
+///
+/// Exactly three things make a scan inconclusive, and they collapse to this
+/// one discriminated result instead of `Option`'s single `None` so a caller
+/// that cares WHICH one fired -- currently only the rescan endpoint (#3396) --
+/// can say so. The inline download gate's two call sites do not care: they
+/// map every arm back onto the SAME fail-open/fail-closed handling they had
+/// before this change (`.ok()`-shaped), because that posture is #2954's and
+/// is explicitly out of scope here.
+#[derive(Debug)]
+pub(crate) enum ProxyScanInconclusive {
+    /// No scanner is configured for this instance.
+    NoScanner,
+    /// The scan ran and returned an error. This also covers an OCI
+    /// blob-staging failure (#3003 PR-2): staging surfaces as an `Err` from
+    /// the scan future, not as a distinct arm -- there is no separate
+    /// "staging failed" case to discriminate.
+    ScanFailed,
+    /// The scan did not finish inside its budget.
+    BudgetExceeded,
+}
+
+/// Outcome of racing `scan_fut` against `budget`, before any logging or
+/// verdict-recording side effects.
+///
+/// Pulled out of [`proxy_scan_and_record`] (#3455) so the ScanFailed /
+/// BudgetExceeded split is unit-testable with millisecond-scale budgets and
+/// stub futures -- no scanner service, no DB, no grype subprocess. The error
+/// value is carried through rather than discarded so the caller can still log
+/// it before collapsing to [`ProxyScanInconclusive`].
+enum ScanTimeoutOutcome<E> {
+    Failed(E),
+    TimedOut,
+}
+
+async fn run_scan_within_budget<T, E>(
+    budget: std::time::Duration,
+    scan_fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, ScanTimeoutOutcome<E>> {
+    match tokio::time::timeout(budget, scan_fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(ScanTimeoutOutcome::Failed(e)),
+        Err(_) => Err(ScanTimeoutOutcome::TimedOut),
+    }
+}
+
+/// The inline scan budget for `mode` (#3455).
+///
+/// Kept as one function rather than inlined at each of [`proxy_scan_and_record`]'s
+/// callers so the File-vs-OCI rationale (blob staging happens inside the OCI
+/// budget; file bytes are already in hand before the gate) lives in exactly
+/// ONE place. `proxy_scan_and_record` itself no longer chooses a budget --
+/// every caller, including the rescan endpoint with its own derived
+/// [`proxy_rescan_budget`](crate::services::scanner_service::proxy_rescan_budget),
+/// passes one in explicitly.
+pub(crate) fn proxy_scan_mode_budget(mode: &ProxyScanMode) -> std::time::Duration {
+    match mode {
+        ProxyScanMode::File => crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
+        ProxyScanMode::OciImage(_) => {
+            crate::services::scanner_service::OCI_PROXY_SCAN_INLINE_BUDGET
+        }
+    }
+}
+
+/// Run the leaf scanners over the buffered bytes within `budget` and persist
+/// the digest-keyed verdict. The caller supplies the format-specific
 /// `synthetic` [`Artifact`](crate::models::artifact::Artifact) (filename /
-/// content-type drive scanner applicability + archive extraction) and the
-/// [`ProxyScanMode`] selecting the scan invocation. Returns the verdict, or
-/// `None` when the scan was inconclusive (no scanner configured, budget
-/// exceeded, blob staging failed, or scanner error) — the caller maps `None`
-/// onto the fail-open/closed decision.
+/// content-type drive scanner applicability + archive extraction), the
+/// [`ProxyScanMode`] selecting the scan invocation, and the wall-clock
+/// `budget` itself -- the inline gate call sites derive theirs from `mode`
+/// via [`proxy_scan_mode_budget`]; the rescan endpoint (#3396, #3455) passes
+/// its own wider, context-specific budget. Returns the verdict, or a
+/// [`ProxyScanInconclusive`] reason -- the inline gate callers map every
+/// reason onto the fail-open/closed decision exactly as they mapped `None`
+/// before this change.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_scan_and_record(
     state: &crate::api::SharedState,
     repo_id: Uuid,
@@ -6807,17 +6882,14 @@ pub(crate) async fn proxy_scan_and_record(
     bytes: &Bytes,
     expected: Option<&crate::services::scanner_service::ExpectedComponent>,
     mode: &ProxyScanMode,
-) -> Option<crate::services::scanner_service::ProxyScanVerdict> {
-    let scanner = state.scanner_service.as_ref()?;
+    budget: std::time::Duration,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
+    let scanner = state
+        .scanner_service
+        .as_ref()
+        .ok_or(ProxyScanInconclusive::NoScanner)?;
     let filename = synthetic.name.clone();
-    // The OCI budget is wider: blob staging (an upstream fetch the file
-    // formats pay BEFORE the gate) happens inside it.
-    let budget = match mode {
-        ProxyScanMode::File => crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
-        ProxyScanMode::OciImage(_) => {
-            crate::services::scanner_service::OCI_PROXY_SCAN_INLINE_BUDGET
-        }
-    };
     let scan_fut = async {
         match mode {
             ProxyScanMode::File => {
@@ -6831,21 +6903,21 @@ pub(crate) async fn proxy_scan_and_record(
             }
         }
     };
-    let verdict = match tokio::time::timeout(budget, scan_fut).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
+    let verdict = match run_scan_within_budget(budget, scan_fut).await {
+        Ok(v) => v,
+        Err(ScanTimeoutOutcome::Failed(e)) => {
             tracing::warn!(
                 repo_id = %repo_id, file = %filename, error = %e,
                 "inline proxy scan failed; treating as inconclusive"
             );
-            return None;
+            return Err(ProxyScanInconclusive::ScanFailed);
         }
-        Err(_) => {
+        Err(ScanTimeoutOutcome::TimedOut) => {
             tracing::warn!(
                 repo_id = %repo_id, file = %filename,
                 "inline proxy scan exceeded the budget; treating as inconclusive"
             );
-            return None;
+            return Err(ProxyScanInconclusive::BudgetExceeded);
         }
     };
 
@@ -6904,7 +6976,7 @@ pub(crate) async fn proxy_scan_and_record(
         }
     }
 
-    Some(verdict)
+    Ok(verdict)
 }
 
 /// What the serve path was able to establish about WHAT these bytes are being
@@ -6976,6 +7048,38 @@ pub(crate) fn stored_verdict_blocks_under_gate(
     match row {
         None => true,
         Some(_) => severity_gate.blocks(row_max_severity),
+    }
+}
+
+/// Pure decision for the `ScanInline` (fail-closed) arm of
+/// [`gate_proxy_scan_serve`]: given the outcome of one
+/// [`proxy_scan_and_record`] call, decide serve vs. deny.
+///
+/// Pulled out (#3455) so this decision is provable WITHOUT a DB or a scanner
+/// subprocess -- including for [`ProxyScanInconclusive::BudgetExceeded`],
+/// which is otherwise only reachable by actually exceeding a 30s+ budget.
+/// The `Err(_)` arm is a wildcard on purpose and must stay one: every one of
+/// [`ProxyScanInconclusive`]'s three reasons (NoScanner / ScanFailed /
+/// BudgetExceeded) maps here identically -- this gate does not discriminate,
+/// see the type's own doc comment.
+fn scan_inline_serve_decision(
+    result: std::result::Result<
+        crate::services::scanner_service::ProxyScanVerdict,
+        ProxyScanInconclusive,
+    >,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    repo_id: Uuid,
+    filename: &str,
+    digest: &str,
+) -> ProxyScanServeOutcome {
+    match result {
+        Ok(verdict) if verdict.is_vulnerable() && severity_gate.blocks(verdict.max_severity) => {
+            tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
+            ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
+        }
+        Ok(_) => ProxyScanServeOutcome::Serve { pending: false },
+        // Inconclusive under fail-closed => 423, never unscanned bytes.
+        Err(_) => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
     }
 }
 
@@ -7051,19 +7155,12 @@ pub(crate) async fn gate_proxy_scan_serve(
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
-            match proxy_scan_and_record(state, repo_id, digest, &synthetic, bytes, expected, &mode)
-                .await
-            {
-                Some(verdict)
-                    if verdict.is_vulnerable() && severity_gate.blocks(verdict.max_severity) =>
-                {
-                    tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
-                    ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
-                }
-                Some(_) => ProxyScanServeOutcome::Serve { pending: false },
-                // Inconclusive under fail-closed => 423, never unscanned bytes.
-                None => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
-            }
+            let budget = proxy_scan_mode_budget(&mode);
+            let result = proxy_scan_and_record(
+                state, repo_id, digest, &synthetic, bytes, expected, &mode, budget,
+            )
+            .await;
+            scan_inline_serve_decision(result, severity_gate, repo_id, filename, digest)
         }
         ServeDecision::ServePendingScanAsync => {
             // Fail-open: serve immediately (loud: X-AK-Scan pending) and scan
@@ -7100,6 +7197,7 @@ pub(crate) async fn gate_proxy_scan_serve(
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
+            let budget = proxy_scan_mode_budget(&mode);
             tokio::spawn(async move {
                 let _ = proxy_scan_and_record(
                     &state_bg,
@@ -7109,6 +7207,7 @@ pub(crate) async fn gate_proxy_scan_serve(
                     &bytes_bg,
                     expected.as_ref(),
                     &mode,
+                    budget,
                 )
                 .await;
             });
@@ -7178,6 +7277,267 @@ mod tests {
         let b = proxy_rescan_synthetic_artifact(repo, "x/y.tgz", "d", 1, None);
         assert_eq!(b.content_type, "application/octet-stream");
         assert_eq!(b.name, "y.tgz");
+    }
+
+    // ── #3455: proxy_scan_and_record's Option -> discriminated Result ──
+    //
+    // Part 1 changed `proxy_scan_and_record`'s return type from `Option` to
+    // `Result<_, ProxyScanInconclusive>` so the rescan endpoint (security.rs)
+    // can tell NoScanner / ScanFailed / BudgetExceeded apart. The inline
+    // download gate must NOT change behavior: both its call sites (the
+    // fail-closed `ScanInline` match and the fail-open `ServePendingScanAsync`
+    // spawn) still collapse every arm through a `Err(_)` wildcard, exactly as
+    // they collapsed every `None` before. The tests below prove that for all
+    // three arms.
+
+    /// [`run_scan_within_budget`] was pulled out of `proxy_scan_and_record`
+    /// specifically so the ScanFailed/BudgetExceeded split is testable with
+    /// millisecond-scale budgets and stub futures -- no scanner service, no
+    /// DB, no grype subprocess. It is a NEW helper: there is no pre-existing
+    /// behavior to run it against, so there is no meaningful red baseline for
+    /// it in isolation. The conflation bug itself (all three arms producing
+    /// the SAME response) is what the handler-mapping tests in security.rs
+    /// prove red -> green.
+    #[tokio::test]
+    async fn run_scan_within_budget_classifies_ok_failed_and_timed_out() {
+        // A future that resolves Ok passes the value through untouched.
+        let ok = run_scan_within_budget(std::time::Duration::from_secs(5), async {
+            Ok::<i32, &str>(42)
+        })
+        .await;
+        assert!(matches!(ok, Ok(42)));
+
+        // A future that resolves Err classifies as Failed, carrying the
+        // original error through for the caller to log before mapping it to
+        // ProxyScanInconclusive::ScanFailed.
+        let failed = run_scan_within_budget(std::time::Duration::from_secs(5), async {
+            Err::<i32, &str>("boom")
+        })
+        .await;
+        assert!(matches!(failed, Err(ScanTimeoutOutcome::Failed("boom"))));
+
+        // A future that never resolves classifies as TimedOut once the
+        // budget elapses -- millisecond-scale here, proving the
+        // BudgetExceeded trigger without waiting out a real 30s/120s budget.
+        let timed_out = run_scan_within_budget(
+            std::time::Duration::from_millis(5),
+            std::future::pending::<std::result::Result<i32, &str>>(),
+        )
+        .await;
+        assert!(matches!(timed_out, Err(ScanTimeoutOutcome::TimedOut)));
+    }
+
+    /// `proxy_scan_and_record` must short-circuit to `NoScanner` BEFORE
+    /// touching the database or constructing a scan future. Provable with a
+    /// pool that never actually connects (`lazy_pool`): if the function
+    /// touched the DB on this path the test would hang or error instead of
+    /// returning promptly.
+    #[tokio::test]
+    async fn proxy_scan_and_record_short_circuits_to_no_scanner_without_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let dir = std::env::temp_dir().join(format!("ph-no-scanner-{}", Uuid::new_v4()));
+        let state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        assert!(state.scanner_service.is_none());
+
+        let repo_id = Uuid::new_v4();
+        let digest = format!("{:0>64}", Uuid::new_v4().simple());
+        let bytes = Bytes::from_static(b"stub content");
+        let synthetic = proxy_rescan_synthetic_artifact(
+            repo_id,
+            "pkg/pkg-1.0.tgz",
+            &digest,
+            bytes.len() as i64,
+            None,
+        );
+
+        let result = proxy_scan_and_record(
+            &state,
+            repo_id,
+            &digest,
+            &synthetic,
+            &bytes,
+            None,
+            &ProxyScanMode::File,
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert!(matches!(result, Err(ProxyScanInconclusive::NoScanner)));
+    }
+
+    /// Drive [`gate_proxy_scan_serve`] once with a fresh (unseeded) digest so
+    /// `decide_serve` always lands on `ScanInline` / `ServePendingScanAsync`
+    /// for the given `action`, and return its outcome. Shared by the three
+    /// #3455 inline-gate regression tests below so each carries only its own
+    /// scanner-state setup and assertions.
+    async fn run_gate(
+        state: &crate::api::SharedState,
+        action: crate::services::proxy_scan_service::ProxyScanAction,
+    ) -> ProxyScanServeOutcome {
+        let repo_id = Uuid::new_v4();
+        let digest = format!("{:0>64}", Uuid::new_v4().simple());
+        let bytes = Bytes::from_static(b"stub content");
+        let synthetic = proxy_rescan_synthetic_artifact(
+            repo_id,
+            "pkg/pkg-1.0.tgz",
+            &digest,
+            bytes.len() as i64,
+            None,
+        );
+        gate_proxy_scan_serve(
+            state,
+            repo_id,
+            "pkg-1.0.tgz",
+            &digest,
+            synthetic,
+            &bytes,
+            action,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+            ProxyScanIdentity::NotApplicable,
+            ProxyScanMode::File,
+        )
+        .await
+    }
+
+    /// NoScanner arm: fail-closed still 423s and fail-open still serves
+    /// pending, exactly as when the gate saw `None` pre-#3455.
+    #[tokio::test]
+    async fn inline_gate_no_scanner_arm_is_byte_identical_fail_closed_and_fail_open() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        assert!(
+            fx.state.scanner_service.is_none(),
+            "the default test state has no scanner wired -- exactly the NoScanner arm"
+        );
+
+        match run_gate(&fx.state, ProxyScanAction::FailClosed).await {
+            ProxyScanServeOutcome::Deny(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::LOCKED,
+                "inconclusive under fail-closed must 423, never serve unscanned bytes"
+            ),
+            ProxyScanServeOutcome::Serve { .. } => {
+                panic!("fail-closed must never serve on an inconclusive scan")
+            }
+        }
+
+        assert!(
+            matches!(
+                run_gate(&fx.state, ProxyScanAction::FailOpen).await,
+                ProxyScanServeOutcome::Serve { pending: true }
+            ),
+            "inconclusive under fail-open must still serve loudly pending"
+        );
+    }
+
+    /// ScanFailed arm: a CVE-authoritative scanner that hard-errors is
+    /// exactly the pre-#3455 `Ok(Err(e))` branch. Same 423 / pending contract.
+    #[tokio::test]
+    async fn inline_gate_scan_failed_arm_is_byte_identical_fail_closed_and_fail_open() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let scanner = || {
+            std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-test"),
+                rescan: MockCveRescan::Error,
+            }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>
+        };
+
+        let fail_closed_state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
+        match run_gate(&fail_closed_state, ProxyScanAction::FailClosed).await {
+            ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
+            ProxyScanServeOutcome::Serve { .. } => {
+                panic!("fail-closed must never serve when the scan errored")
+            }
+        }
+
+        let fail_open_state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
+        assert!(matches!(
+            run_gate(&fail_open_state, ProxyScanAction::FailOpen).await,
+            ProxyScanServeOutcome::Serve { pending: true }
+        ));
+    }
+
+    // BudgetExceeded arm (#3455). Split in two rather than driven end-to-end
+    // through an actually-hung scanner under a paused clock (#2974 follow-up):
+    // genuinely exceeding the 30s inline File-mode budget needs either a real
+    // 30s wait or a paused tokio clock, and the fail-closed half of this gate
+    // does real Postgres I/O (`ProxyScanService::lookup_verdict`, inside
+    // `gate_proxy_scan_serve`) before the scan future is even polled. Pairing
+    // that DB round trip with a paused virtual clock is exactly the hazard
+    // documented at `http_client.rs:884` (#2974): `pool.acquire()` arms
+    // sqlx's own acquire-timeout in virtual time across a real socket await,
+    // so tokio's auto-advance can fire it early -- a spurious `PoolTimedOut`
+    // that either panics the test or makes `Fixture::setup` return `None`,
+    // which this test module's `let Some(fx) = ... else { return; }` idiom
+    // turns into a SILENT no-op reported as green. This repo has hit
+    // `PoolTimedOut` flakes from exactly this shape before.
+    //
+    // fail-closed is proven against `scan_inline_serve_decision` directly --
+    // the very function `gate_proxy_scan_serve`'s `ScanInline` arm now calls
+    // -- with zero DB, zero clock, zero scanner subprocess.
+    //
+    // fail-open is proven end-to-end with a real, UNPAUSED clock and is safe
+    // to do so: `ServePendingScanAsync` fires the scan in a background
+    // `tokio::spawn` and returns `Serve { pending: true }` without ever
+    // looking at its outcome (see that arm in `gate_proxy_scan_serve`), so
+    // the assertion below returns long before the mock's hang could matter --
+    // there is no timer this test needs to wait out, paused or otherwise.
+
+    /// Pure fail-closed half: `BudgetExceeded` denies via the SAME decision
+    /// function `gate_proxy_scan_serve` calls, byte-identical to the
+    /// NoScanner/ScanFailed arms proven end-to-end below and above.
+    #[test]
+    fn inline_gate_budget_exceeded_arm_fail_closed_denies_via_shared_decision() {
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        match scan_inline_serve_decision(
+            Err(ProxyScanInconclusive::BudgetExceeded),
+            ProxySeverityGate::BlockOnAny,
+            Uuid::new_v4(),
+            "pkg-1.0.tgz",
+            "deadbeef",
+        ) {
+            ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
+            ProxyScanServeOutcome::Serve { .. } => {
+                panic!("fail-closed must never serve on a budget-exceeded scan")
+            }
+        }
+    }
+
+    /// Fail-open half: `ServePendingScanAsync` ignores the scan outcome
+    /// entirely, so this proves the gate returns immediately without waiting
+    /// on the mock's (arbitrarily long) hang -- see the module comment above.
+    #[tokio::test]
+    async fn inline_gate_budget_exceeded_arm_fail_open_serves_pending_without_waiting() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let scanner = std::sync::Arc::new(VersionedCveScanner {
+            live_version: Some("grype-test"),
+            // Far longer than any budget in this suite: irrelevant, since
+            // fail-open never awaits the scan before answering.
+            rescan: MockCveRescan::Hang(std::time::Duration::from_secs(3600)),
+        }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+
+        let fail_open_state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner]);
+        assert!(matches!(
+            run_gate(&fail_open_state, ProxyScanAction::FailOpen).await,
+            ProxyScanServeOutcome::Serve { pending: true }
+        ));
     }
 
     // ── #3243 stage 3 / #3246: severity gate over a stored verdict ──
@@ -7993,6 +8353,164 @@ mod tests {
         r.repo_type = RepositoryType::Local;
         r.upstream_url = None;
         r
+    }
+
+    // =====================================================================
+    // #3454 revert-proofs: the presigned-redirect + download-record paths
+    // must derive their cache key from the LIVE `proxy.cache_scope()`, not a
+    // hardcoded `ProxyCacheScope::unscoped()`. Each seeds a fresh cache entry
+    // at the SCOPED key over a presign-capable in-memory backend and asserts
+    // the signed 302 Location (or the persisted catalog row) carries the scope
+    // segment. Reverting the hunk to `unscoped()` makes the freshness probe
+    // miss (no object at the unscoped key) or sign the wrong key -> the test
+    // fails, which is what the previous coverage did not do.
+    // =====================================================================
+
+    fn scoped_test_scope() -> crate::services::proxy_cache_scope::ProxyCacheScope {
+        crate::services::proxy_cache_scope::ProxyCacheScope::from_env_and_identity(
+            Some("prod-eu"),
+            Uuid::from_u128(0x3454_0000_0000_0000_0000_0000_0000_0001),
+        )
+        .unwrap()
+    }
+
+    fn get_ctx() -> crate::api::middleware::download_telemetry::DownloadContext {
+        crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        }
+    }
+
+    /// `try_member_cache_redirect` (proxy_helpers.rs virtual-member fast path).
+    #[tokio::test]
+    async fn try_member_cache_redirect_signs_the_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let member = test_local_member("maven-proxy");
+        let path = "org/example/lib/1.0/lib-1.0.jar";
+        let content_key = ProxyService::cache_storage_key(&scope, &member.key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, &member.key, path).unwrap();
+        assert!(content_key.contains("proxy-cache/prod-eu/maven-proxy/"));
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("mcr-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+        let ctx = get_ctx();
+
+        let resp = try_member_cache_redirect(state.as_ref(), proxy.as_ref(), &member, path, &ctx)
+            .await
+            .expect("a fresh presign-capable member cache hit must 302-redirect");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("proxy-cache/prod-eu/maven-proxy/"),
+            "member redirect signed a non-scoped key (a revert to unscoped drops the \
+             scope segment): {loc}"
+        );
+    }
+
+    /// `proxy_fetch_or_redirect` (proxy_helpers.rs generic presign fast path).
+    #[tokio::test]
+    async fn proxy_fetch_or_redirect_signs_the_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let repo_key = "npm-proxy";
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let content_key = ProxyService::cache_storage_key(&scope, repo_key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, repo_key, path).unwrap();
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("pfor-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+        let ctx = get_ctx();
+
+        let resp = proxy_fetch_or_redirect(
+            proxy.as_ref(),
+            state.as_ref(),
+            Uuid::new_v4(),
+            repo_key,
+            "https://unused.example.com",
+            path,
+            &ctx,
+        )
+        .await
+        .expect("a fresh cache hit must take the redirect fast path, not fetch upstream");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("proxy-cache/prod-eu/npm-proxy/"),
+            "generic redirect signed a non-scoped key (a revert to unscoped drops the \
+             scope segment): {loc}"
+        );
+    }
+
+    /// `record_proxy_download` (proxy_helpers.rs) persists a catalog placeholder
+    /// keyed under the LIVE scope, so the streaming tee's later upsert refines
+    /// the same row. A revert to unscoped keys the placeholder under
+    /// `proxy-cache/<repo>/...`, orphaning it. DB-backed.
+    #[tokio::test]
+    async fn record_proxy_download_persists_scoped_storage_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let storage_path = std::env::temp_dir()
+            .join(format!("rpd-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state = tdh::build_state_with_proxy(pool.clone(), &storage_path, proxy.clone());
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let ctx = get_ctx();
+
+        record_proxy_download(&state, repo_id, &repo_key, path, &ctx).await;
+
+        let storage_key: Option<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(&pool)
+        .await
+        .expect("query catalog row");
+        let storage_key = storage_key.expect("record_proxy_download must persist a catalog row");
+        assert!(
+            storage_key.starts_with("proxy-cache/prod-eu/"),
+            "placeholder catalog row keyed under a non-scoped key (a revert to unscoped): {storage_key}"
+        );
+        // cleanup
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
     }
 
     #[tokio::test]
@@ -12529,6 +13047,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 StdArc::new(FreshProxyCacheStorage),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
 
         let resp = resolve_virtual_download_streaming(
@@ -12634,6 +13153,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 cache.clone(),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
         // Per-test coordinate isolates the process-global metadata LRU (#2758).
         let path = format!("pkg/pkg-{}-py3-none-any.whl", Uuid::new_v4());
@@ -12801,6 +13321,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 backend,
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         )
     }
 
@@ -12917,6 +13438,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 fresh.clone(),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
         let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
         let state = db_helpers::build_state_presigned(pool, "s3-test", registry_storage.clone());
@@ -13012,6 +13534,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 held.clone(),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
 
         let err = resolve_virtual_download_streaming(
@@ -13184,6 +13707,7 @@ mod tests {
             let proxy = StdArc::new(crate::services::proxy_service::ProxyService::new(
                 fx.pool.clone(),
                 service,
+                crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
             ));
             let state =
                 tdh::build_state_with_proxy_presigned(fx.pool.clone(), &storage_path, proxy);

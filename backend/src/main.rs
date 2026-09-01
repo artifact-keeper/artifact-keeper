@@ -754,10 +754,37 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     app_state.set_metrics_handle(metrics_handle);
 
+    // Per-deployment proxy-cache scope (#3454). Proxy-cache content is
+    // anchored at the storage ROOT rather than under `S3_PREFIX` (#3368), so
+    // before this segment existed two deployments sharing a bucket wrote the
+    // same `proxy-cache/<repo_key>/<path>` keys and served each other's cached
+    // upstream bytes. The scope defaults to this deployment's persistent peer
+    // instance id — the value seeded by `init_peer_identity` above, which is
+    // stable across restarts and upgrades, shared by every replica, and not
+    // rewritten when unrelated config (`PEER_INSTANCE_NAME`, endpoints) changes.
+    let proxy_cache_scope =
+        artifact_keeper_backend::services::proxy_cache_scope::ProxyCacheScope::from_env_and_identity(
+            std::env::var(
+                artifact_keeper_backend::services::proxy_cache_scope::PROXY_CACHE_SCOPE_ENV,
+            )
+            .ok()
+            .as_deref(),
+            peer_id,
+        )?;
+    tracing::info!(
+        "Proxy cache scope: {} (key root {})",
+        proxy_cache_scope.segment().unwrap_or("<unscoped>"),
+        proxy_cache_scope.root()
+    );
+
     // Initialize proxy service for remote repository caching
     match StorageService::from_config(&config).await {
         Ok(storage_svc) => {
-            let proxy_service = Arc::new(ProxyService::new(db_pool.clone(), Arc::new(storage_svc)));
+            let proxy_service = Arc::new(ProxyService::new(
+                db_pool.clone(),
+                Arc::new(storage_svc),
+                proxy_cache_scope,
+            ));
             app_state.set_proxy_service(proxy_service);
             tracing::info!("Proxy service initialized for remote repositories");
         }

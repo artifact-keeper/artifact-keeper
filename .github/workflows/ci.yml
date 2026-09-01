@@ -751,6 +751,21 @@ jobs:
       - name: Check the published-signature gate catches what it must
         run: bash scripts/ci/test-check-published-image-signature.sh
 
+      # The runtime gate above asserts about the refs it is HANDED, so it
+      # cannot see a registry nobody passed it. That is not hypothetical: the
+      # Docker Hub mirrors of every published image shipped unsigned for the
+      # project's entire history because `cosign sign` was only ever given the
+      # ghcr ref (#3562). Nothing was broken — a whole distribution channel was
+      # simply absent from the controls, and absence is invisible to a runtime
+      # check. This reads docker-publish.yml and requires that every registry a
+      # publish job mirrors to is also one it signs on and verifies. Pure YAML
+      # inspection, no network, ~1s.
+      - name: Check every published registry is signed and verified
+        run: ./scripts/ci/check-registry-publish-parity.sh
+
+      - name: Check the registry-parity gate catches what it must
+        run: bash scripts/ci/test-check-registry-publish-parity.sh
+
       # Four of the last eight releases shipped with wrong release bookkeeping
       # — a missing curated notes file, bullets filed under an already-released
       # heading, an [Unreleased] heading renamed without a fresh one being
@@ -788,6 +803,29 @@ jobs:
       # about once per release and never on a normal one.
       - name: Check the floating-tag promotion rule
         run: bash scripts/ci/test-floating-tag-plan.sh
+
+      # Release binaries shipped with only a `<name>.sha256` beside them, which
+      # is served from the same place, by the same authority, as the artifact it
+      # describes -- so whoever can replace the tarball can replace the checksum
+      # (#3558). They are now covered by a cosign keyless signature over a
+      # `checksums.txt` manifest and by build provenance, and release.yml
+      # VERIFIES both before `Create Release`. That verification runs once per
+      # release, on a path nobody can rehearse without cutting a tag, so its
+      # failure legs are exercised here instead -- including the one that
+      # matters most: a real, valid signature carrying the WRONG certificate
+      # identity, which a permissive `--certificate-identity-regexp` would wave
+      # through. Stubs `cosign` and `gh`; offline, ~2s.
+      - name: Check the release-asset verification gate refuses what it must
+        run: bash scripts/ci/test-verify-release-assets.sh
+
+      # The other half of #3558: the release binaries now embed their own
+      # dependency graph (`cargo auditable`) and ship a CycloneDX SBOM. The
+      # tool that reads the embedding back out FAILS OPEN -- measured, cargo-audit
+      # 0.22.2 prints "was not built with 'cargo auditable', the report will be
+      # incomplete" and exits 0 -- so "we run cargo audit bin in CI" cannot fail
+      # for the reason it was added. This exercises the assertion that can.
+      - name: Check the embedded-SBOM gate refuses what it must
+        run: bash scripts/ci/test-assert-binary-sbom.sh
 
       # The duplication gate measures whatever jscpd-prepare-sources.py hands
       # it, so a bug there silently changes the gate's verdict (#3495). The

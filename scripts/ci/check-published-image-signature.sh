@@ -80,7 +80,12 @@
 #   PUBLISHED_SIG_ATTEMPTS         attempts per infra-class failure (default 3).
 #   PUBLISHED_SIG_BASIC_AUTH       optional "user:password" used ONLY to obtain
 #                                  a read token when resolving a tag on a
-#                                  private registry. Never logged.
+#                                  private registry. Never logged, and never
+#                                  sent to a registry other than
+#                                  PUBLISHED_SIG_BASIC_AUTH_HOST.
+#   PUBLISHED_SIG_BASIC_AUTH_HOST  the ONE registry host the credential above
+#                                  belongs to (default ghcr.io). Refs on any
+#                                  other host resolve anonymously.
 #   COSIGN                         cosign binary (default: cosign).
 #
 set -uo pipefail
@@ -89,6 +94,16 @@ COSIGN_BIN="${COSIGN:-cosign}"
 ATTEMPTS="${PUBLISHED_SIG_ATTEMPTS:-3}"
 OIDC_ISSUER="${PUBLISHED_SIG_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 IDENTITY_REGEXP="${PUBLISHED_SIG_IDENTITY_REGEXP:-^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$}"
+# The single registry host PUBLISHED_SIG_BASIC_AUTH is valid for. A registry
+# credential is scoped to the registry that issued it; the token endpoint it
+# gets presented to is chosen by a WWW-Authenticate header the REGISTRY sends,
+# so an unscoped credential is a credential the far end can redirect to itself.
+# ghcr's realm is on ghcr.io, but Docker Hub's is auth.docker.io -- a different
+# origin entirely -- so without this scope, adding one docker.io ref to an
+# invocation carrying ghcr credentials would hand a GITHUB_TOKEN to Docker's
+# auth server. Refs on any other host resolve anonymously, which is all a
+# public mirror needs.
+BASIC_AUTH_HOST="${PUBLISHED_SIG_BASIC_AUTH_HOST:-ghcr.io}"
 
 # The payload type cosign itself stamps on a `cosign sign` signature. An
 # attestation bundle carries its predicate type here instead, which is how the
@@ -191,7 +206,7 @@ resolve_digest() {
     if [ -n "$realm" ]; then
       local token_url="${realm}?scope=${scope}"
       [ -n "$service" ] && token_url="${token_url}&service=${service}"
-      if [ -n "${PUBLISHED_SIG_BASIC_AUTH-}" ]; then
+      if [ -n "${PUBLISHED_SIG_BASIC_AUTH-}" ] && [ "$host" = "$BASIC_AUTH_HOST" ]; then
         token="$(curl -sSL --max-time 30 -u "${PUBLISHED_SIG_BASIC_AUTH}" "$token_url" 2>/dev/null | jq -r '.token // .access_token // empty')"
       else
         token="$(curl -sSL --max-time 30 "$token_url" 2>/dev/null | jq -r '.token // .access_token // empty')"

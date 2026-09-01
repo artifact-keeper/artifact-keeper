@@ -41,6 +41,7 @@ pass() { printf '  \033[32mPASS\033[0m  %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fails=$((fails + 1)); }
 
 REF=ghcr.io/artifact-keeper/artifact-keeper-backend:1.9.9
+HUB_REF=docker.io/artifactkeeper/backend:1.9.9
 DIGEST=sha256:44e433bc856b5e8dceb63b803e5ff1d96b0584fbfe3ea676d5d52592555ca333
 OTHER=sha256:0f73b18c0c4a9b431474dd9ab93aa7a05eaeb9392bd0b82873133a2f2654fda5
 IDENTITY='^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$'
@@ -52,6 +53,24 @@ STUB="$WORK/bin"; mkdir -p "$STUB"
 # space-separated list, consumed one entry per call, so a retry can be tested.
 cat > "$STUB/curl" <<'STUBCURL'
 #!/usr/bin/env bash
+# Two shapes are replayed, told apart the way the gate calls them:
+#   -sSI <manifest-url>   the manifest HEAD (advances the status sequence)
+#   -sSL <token-url>      the WWW-Authenticate token dance (does NOT advance
+#                         it, so a "401 200" sequence means HEAD -> token ->
+#                         HEAD). Records whether a credential was offered and
+#                         to which URL, which is what the auth-scoping cases
+#                         assert on.
+case " $* " in
+  *" -sSI "*) : ;;
+  *)
+    creds=none
+    case " $* " in *" -u "*) creds=sent ;; esac
+    url="${@: -1}"
+    echo "${creds} ${url}" >> "$FAKE_STATE/token.calls"
+    echo '{"token":"stub-read-token"}'
+    exit 0
+    ;;
+esac
 statuses=(${FAKE_STATUS:-200})
 n=0
 [ -f "$FAKE_STATE/curl.n" ] && n=$(cat "$FAKE_STATE/curl.n")
@@ -61,6 +80,9 @@ echo $((n + 1)) > "$FAKE_STATE/curl.n"
 status="${statuses[$idx]}"
 [ "$status" = "000" ] && exit 6
 echo "HTTP/2 ${status} "
+if [ "$status" = "401" ]; then
+  echo "www-authenticate: Bearer realm=\"${FAKE_REALM:-https://auth.example.test/token}\",service=\"svc\",scope=\"repository:x:pull\""
+fi
 if [ "$status" = "200" ] && [ "${FAKE_NO_DIGEST_HEADER:-0}" != "1" ]; then
   echo "docker-content-digest: ${FAKE_DIGEST}"
 fi
@@ -95,7 +117,7 @@ JSON
 # The scenario comes from the FAKE_* / CASE_* variables the caller set.
 expect() {
   local label="$1" want="$2" needle="$3" got=0
-  rm -f "$WORK/curl.n" "$WORK/cosign.calls"
+  rm -f "$WORK/curl.n" "$WORK/cosign.calls" "$WORK/token.calls"
 
   # Deliberate word split: a case may pass no refs at all (" ") or several,
   # and they must reach the gate as separate arguments.
@@ -113,6 +135,9 @@ expect() {
     export PUBLISHED_SIG_ATTEMPTS="${CASE_ATTEMPTS:-1}"
     export PUBLISHED_SIG_IDENTITY_REGEXP="${CASE_IDENTITY:-$IDENTITY}"
     export COSIGN="${CASE_COSIGN:-cosign}"
+    export PUBLISHED_SIG_BASIC_AUTH="${CASE_BASIC_AUTH-}"
+    export PUBLISHED_SIG_BASIC_AUTH_HOST="${CASE_BASIC_AUTH_HOST:-ghcr.io}"
+    export FAKE_REALM="${FAKE_REALM:-https://auth.example.test/token}"
     bash "$GATE" "${refs[@]}" >"$WORK/out.txt" 2>&1
   ) || got=$?
 
@@ -132,6 +157,7 @@ expect() {
 reset() {
   unset FAKE_STATUS FAKE_DIGEST FAKE_NO_DIGEST_HEADER FAKE_COSIGN_RC FAKE_COSIGN_OUT
   unset CASE_ATTEMPTS CASE_IDENTITY CASE_COSIGN CASE_REFS
+  unset CASE_BASIC_AUTH CASE_BASIC_AUTH_HOST FAKE_REALM
 }
 
 echo "check-published-image-signature.sh"
@@ -254,6 +280,64 @@ FAKE_COSIGN_OUT='
 Verification for ghcr.io/artifact-keeper/artifact-keeper-backend:1.8.1 --
 [{"critical":{"identity":{"docker-reference":"ghcr.io/artifact-keeper/artifact-keeper-backend:1.8.1"},"image":{"docker-manifest-digest":"sha256:44e433bc856b5e8dceb63b803e5ff1d96b0584fbfe3ea676d5d52592555ca333"},"type":"https://slsa.dev/provenance/v1"},"optional":{}}]'
 expect "real output minus the signature BLOCKS" 1 "has no cosign signature"
+
+# ---------------------------------------------------------------------------
+# 20..23. DOCKER HUB (#3562). The Hub mirrors carry the same bytes as ghcr and
+#         must carry the same signature; the gate is what makes that
+#         falsifiable, so it has to behave identically on a docker.io ref.
+# ---------------------------------------------------------------------------
+
+# 20. THE #3562 FIXTURE SHAPE. A published Docker Hub tag that resolves fine
+#     and has no signature at all. This is what `docker.io/artifactkeeper/
+#     backend:1.8.1` really is today, and the gate must go red on it.
+reset
+CASE_REFS="$HUB_REF"
+FAKE_COSIGN_RC=1
+FAKE_COSIGN_OUT="Error: no signatures found
+error during command execution: no signatures found"
+expect "unsigned Docker Hub mirror BLOCKS" 1 "not verifiably signed"
+
+# 21. And passes once it is signed, on the same digest ghcr publishes.
+reset
+CASE_REFS="$HUB_REF"
+FAKE_COSIGN_OUT="$(signed_json 'https://sigstore.dev/cosign/sign/v1' "$DIGEST")"
+expect "signed Docker Hub mirror passes" 0 "signed: 1 cosign signature(s) over ${DIGEST}"
+
+# 22. CREDENTIAL SCOPE, the ghcr half. The token realm a registry names in its
+#     WWW-Authenticate header is chosen by the REGISTRY, so a credential that
+#     is not scoped to a host is a credential the far end can redirect to
+#     itself. On the host it belongs to, it must still be offered -- otherwise
+#     a private ghcr package stops resolving and the gate turns into an INFRA
+#     failure on every run.
+reset
+FAKE_STATUS="401 200"
+CASE_BASIC_AUTH="ci-user:ghcr-secret"
+FAKE_COSIGN_OUT="$(signed_json 'https://sigstore.dev/cosign/sign/v1' "$DIGEST")"
+expect "ghcr ref offers the credential to ghcr's own realm" 0 "signed: 1 cosign signature"
+if [ -f "$WORK/token.calls" ] && grep -q '^sent ' "$WORK/token.calls"; then
+  pass "credential IS used for the host it belongs to"
+else
+  fail "credential was not offered on its own host: $(cat "$WORK/token.calls" 2>/dev/null)"
+fi
+
+# 23. CREDENTIAL SCOPE, the Docker Hub half -- the regression this scoping
+#     exists to prevent. Adding a docker.io ref to an invocation that carries
+#     ghcr credentials must NOT send those credentials to auth.docker.io.
+#     Docker Hub's realm is a different origin from its registry endpoint, so
+#     "same registry" is not the same question as "same host", and the
+#     credential is pinned to the one host it was issued for.
+reset
+CASE_REFS="$HUB_REF"
+FAKE_STATUS="401 200"
+CASE_BASIC_AUTH="ci-user:ghcr-secret"
+FAKE_REALM="https://auth.docker.io/token"
+FAKE_COSIGN_OUT="$(signed_json 'https://sigstore.dev/cosign/sign/v1' "$DIGEST")"
+expect "Docker Hub ref still resolves anonymously" 0 "signed: 1 cosign signature"
+if [ -f "$WORK/token.calls" ] && grep -q '^sent ' "$WORK/token.calls"; then
+  fail "ghcr credential was sent off-origin to $(grep '^sent ' "$WORK/token.calls" | head -1)"
+else
+  pass "ghcr credential is NOT sent to Docker Hub's token endpoint"
+fi
 
 echo ""
 if [ "$fails" -gt 0 ]; then

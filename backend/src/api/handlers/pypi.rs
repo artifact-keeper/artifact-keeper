@@ -3558,9 +3558,12 @@ async fn pypi_proxy_cache_redirect(
     if !proxy.is_cache_fresh(repo_key, cache_path).await {
         return None;
     }
-    let cache_key =
-        crate::services::proxy_service::ProxyService::cache_storage_key(repo_key, cache_path)
-            .ok()?;
+    let cache_key = crate::services::proxy_service::ProxyService::cache_storage_key(
+        proxy.cache_scope(),
+        repo_key,
+        cache_path,
+    )
+    .ok()?;
     let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
     proxy_helpers::try_proxy_cache_redirect(
         storage.as_ref(),
@@ -9529,6 +9532,7 @@ mod tests {
         let cache_path = build_pypi_proxy_cache_path(&project, filename);
 
         let derived = crate::services::proxy_service::ProxyService::cache_storage_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
             "pypi-remote",
             &cache_path,
         )
@@ -12207,7 +12211,11 @@ mod tests {
         let storage_svc = std::sync::Arc::new(StorageService::new(storage));
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy");
-        crate::services::proxy_service::ProxyService::new(pool, storage_svc)
+        crate::services::proxy_service::ProxyService::new(
+            pool,
+            storage_svc,
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -12270,6 +12278,7 @@ mod tests {
         crate::services::proxy_service::ProxyService::new(
             pool,
             std::sync::Arc::new(StorageService::new(storage)),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         )
     }
 
@@ -12450,6 +12459,7 @@ mod tests {
         tdh::wait_for_cache_commit(&tmp, wheel_body.len() as u64).await;
         let cache_path = "simple/numpy/numpy-2.0.0-py3-none-any.whl";
         let metadata_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
             "pypi-remote",
             cache_path,
         )
@@ -13893,6 +13903,57 @@ mod tests {
         assert!(
             result.is_none(),
             "presigned disabled must short-circuit before any redirect"
+        );
+    }
+
+    /// #3454 revert-proof: `pypi_proxy_cache_redirect` must sign through the
+    /// LIVE scope. Seeds a fresh entry at the SCOPED key over a presign-capable
+    /// backend and asserts the 302 Location carries the scope segment; a revert
+    /// to `unscoped()` makes the freshness probe miss the unscoped key (no
+    /// redirect) or sign the wrong key.
+    #[tokio::test]
+    async fn test_pypi_proxy_cache_redirect_signs_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = crate::services::proxy_cache_scope::ProxyCacheScope::from_env_and_identity(
+            Some("prod-eu"),
+            uuid::Uuid::from_u128(0x3454_0000_0000_0000_0000_0000_0000_0001),
+        )
+        .unwrap();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let repo_key = "pypi-remote";
+        let cache_path = "simple/click/click-8.1.7-py3-none-any.whl";
+        let content_key = crate::services::proxy_service::ProxyService::cache_storage_key(
+            &scope, repo_key, cache_path,
+        )
+        .unwrap();
+        let meta_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
+            &scope, repo_key, cache_path,
+        )
+        .unwrap();
+        assert!(content_key.contains("proxy-cache/prod-eu/pypi-remote/"));
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("pypi-scoped-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+
+        let resp = super::pypi_proxy_cache_redirect(&state, proxy.as_ref(), repo_key, cache_path)
+            .await
+            .expect("a fresh presign-capable pypi cache hit must 302-redirect");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("proxy-cache/prod-eu/pypi-remote/"),
+            "pypi redirect signed a non-scoped key (a revert to unscoped drops the scope): {loc}"
         );
     }
 

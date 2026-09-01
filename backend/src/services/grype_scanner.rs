@@ -1328,6 +1328,16 @@ impl GrypeScanner {
         auth_env: &[(&'static str, String)],
     ) -> Result<GrypeRun> {
         let mut command = tokio::process::Command::new("grype");
+        // `tokio::process::Command` defaults `kill_on_drop` to `false`. This
+        // spawn runs inside a caller-supplied `tokio::time::timeout` (the
+        // inline proxy gate's PROXY_SCAN_INLINE_BUDGET /
+        // OCI_PROXY_SCAN_INLINE_BUDGET, or the rescan endpoint's wider
+        // proxy_rescan_budget, #3455): when the timeout fires it drops the
+        // scan future, and without this the grype child is ORPHANED and runs
+        // to completion unsupervised. Widening the rescan budget without this
+        // would let timed-out rescans stack orphaned grype processes on
+        // exactly the resource-constrained boxes #3455 targets.
+        command.kill_on_drop(true);
         // `-o json` on stdout is the findings contract and never changes. The
         // second `-o` MUST carry `=<path>`: two stdout presenters conflict and
         // grype refuses the run.
@@ -4250,6 +4260,24 @@ mod tests {
             spawns, 1,
             "grype must be spawned from exactly ONE place, so the report and \
              the BOM cannot drift into two scans of the same artifact"
+        );
+    }
+
+    /// The grype child must be killed if the caller's `tokio::time::timeout`
+    /// drops the scan future (#3455): `tokio::process::Command` defaults
+    /// `kill_on_drop` to `false`, so without this a timed-out inline proxy
+    /// scan -- or a timed-out rescan under the wider proxy_rescan_budget --
+    /// leaves an orphaned grype process running to completion, unsupervised,
+    /// on exactly the resource-constrained box that timed out in the first
+    /// place.
+    #[test]
+    fn test_grype_spawn_sets_kill_on_drop() {
+        let body = grype_spawn_body();
+        assert!(
+            body.contains("kill_on_drop(true)"),
+            "the grype Command must set kill_on_drop(true) so a timed-out \
+             scan's child process is killed, not orphaned. Body: {}",
+            body
         );
     }
 

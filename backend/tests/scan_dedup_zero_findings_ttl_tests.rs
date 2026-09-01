@@ -196,7 +196,7 @@ async fn test_find_reusable_skips_zero_finding_row_older_than_short_ttl() {
     let svc = ScanResultService::new(pool.clone());
 
     let found_reusable = svc
-        .find_reusable_scan(&checksum, "dependency", STANDARD_TTL, ZERO_TTL)
+        .find_reusable_scan(&checksum, "dependency", STANDARD_TTL, ZERO_TTL, None)
         .await
         .expect("query must not error");
     assert!(
@@ -255,7 +255,7 @@ async fn test_find_reusable_keeps_zero_finding_row_inside_short_ttl() {
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_reusable_scan(&checksum, "dependency", STANDARD_TTL, ZERO_TTL)
+        .find_reusable_scan(&checksum, "dependency", STANDARD_TTL, ZERO_TTL, None)
         .await
         .expect("query must not error")
         .expect(
@@ -301,7 +301,7 @@ async fn test_find_reusable_keeps_non_zero_finding_row_inside_standard_ttl() {
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_reusable_scan(&checksum, "dependency", STANDARD_TTL, ZERO_TTL)
+        .find_reusable_scan(&checksum, "dependency", STANDARD_TTL, ZERO_TTL, None)
         .await
         .expect("query must not error")
         .expect(
@@ -360,7 +360,7 @@ async fn test_find_reusable_prefers_real_finding_when_newer_zero_is_stale() {
 
     let svc = ScanResultService::new(pool.clone());
     let found = svc
-        .find_reusable_scan(&checksum, "dependency", STANDARD_TTL, ZERO_TTL)
+        .find_reusable_scan(&checksum, "dependency", STANDARD_TTL, ZERO_TTL, None)
         .await
         .expect("query must not error")
         .expect("must still surface the older real-finding scan, not return None");
