@@ -567,25 +567,38 @@ impl StorageGcService {
     /// Maven flat-object orphan scan running concurrently for 20+ minutes,
     /// sharing one `xact_start` (artifact-keeper#3384).
     ///
-    /// Returns `true` if this replica won the lease and ran GC, `false` if
-    /// another replica currently holds it (a no-op tick).
+    /// Returns `true` if this replica won the lease and ran the tick,
+    /// `false` if another replica currently holds it (a no-op tick).
     ///
     /// Only the scheduler's automatic tick should call this — the on-demand
     /// admin/per-repo GC endpoints (`storage_gc.rs`) call
     /// `run_gc`/`run_gc_for_repository` directly and must keep working even
     /// while a scheduled tick holds this lease.
     ///
-    /// SCOPE: this gates `run_gc` only. The blob-GC mark/sweep and the
-    /// storage-stats recompute that share the same scheduler tick are NOT
-    /// under this lease and still run on every replica — #3384 is only
-    /// partially closed by this method. See the scope note at the call site
-    /// in `scheduler_service::spawn_all` and issue #3503.
+    /// SCOPE (#3503): the lease covers the WHOLE scheduled tick, not just
+    /// `run_gc`. `follow_on` is the remainder of the tick — the blob-GC
+    /// mark/sweep and the post-GC storage-stats recompute, supplied by the
+    /// scheduler — and runs under the same held lease, after `run_gc`,
+    /// before release. A replica that loses the lease therefore skips the
+    /// tick ENTIRELY instead of skipping `run_gc` and then running the rest
+    /// concurrently on every replica (the residual N-times duplication
+    /// #3384/#3503 measured). One lease for the whole tick also avoids the
+    /// gap where a replica could lose the job between workloads and silently
+    /// continue. Observing lease LOSS mid-run is #3502 and deliberately not
+    /// attempted here.
     ///
     /// This method changes WHO runs the sweep, never WHAT it deletes. The
     /// `MAVEN_FLAT_GC_ENABLED` opt-in gate (#3431) lives further in, in
     /// `cleanup_orphan_maven_flat_objects`, and is reached through
-    /// `run_gc(false)` exactly as it is from the on-demand endpoints.
-    pub(crate) async fn run_scheduled_tick(&self, job_name: &str) -> bool {
+    /// `run_gc(false)` exactly as it is from the on-demand endpoints. The
+    /// blob-GC dry-run/readiness gating likewise stays where it was, inside
+    /// the scheduler's `follow_on` closure — the lease decides who runs,
+    /// never whether deletion is enabled.
+    pub(crate) async fn run_scheduled_tick<F, Fut>(&self, job_name: &str, follow_on: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
             &self.db,
             job_name,
@@ -629,6 +642,11 @@ impl StorageGcService {
                 tracing::warn!("Storage garbage collection failed: {}", e);
             }
         }
+
+        // #3503: the rest of the scheduled tick (blob-GC mark + sweep and the
+        // post-GC storage-stats recompute) runs under the SAME lease so the
+        // whole tick has exactly one owner per occurrence.
+        follow_on().await;
 
         drop(lease_renewal);
         lease.release(&self.db).await;
@@ -4241,9 +4259,23 @@ mod tests {
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        // #3503: the whole tick — run_gc AND the follow-on (blob-GC +
+        // stats in production) — must skip while another replica owns the
+        // lease. Before #3503 the follow-on ran on every replica regardless,
+        // which is exactly what this flag would have observed.
+        let follow_on_ran = std::sync::atomic::AtomicBool::new(false);
         assert!(
-            !service.run_scheduled_tick(job).await,
+            !service
+                .run_scheduled_tick(job, || async {
+                    follow_on_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await,
             "tick must skip while another replica holds the lease"
+        );
+        assert!(
+            !follow_on_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the follow-on half of the tick (blob GC + stats recompute) must \
+             NOT run on a replica that failed to win the lease (#3503)"
         );
 
         // The on-demand admin endpoint shares the service but NOT the lease:
@@ -4279,8 +4311,18 @@ mod tests {
         // Free the lease; the next tick must win it, run, and release it.
         other_replica_lease.release(&fixture.pool).await;
         assert!(
-            service.run_scheduled_tick(job).await,
+            service
+                .run_scheduled_tick(job, || async {
+                    follow_on_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await,
             "tick must run once the lease is free"
+        );
+        assert!(
+            follow_on_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the follow-on half of the tick must run (under the lease) on the \
+             replica that won it — a lease that silently skips the work would \
+             leave blob GC and the stats recompute dormant cluster-wide"
         );
 
         let held_after = cluster_work::try_acquire_scheduler_lease(
@@ -4357,7 +4399,7 @@ mod tests {
         let gated =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
         assert!(
-            gated.run_scheduled_tick(&job).await,
+            gated.run_scheduled_tick(&job, || async {}).await,
             "the gated tick must still WIN the lease — the gate is about \
              deleting, not about running"
         );
@@ -4369,7 +4411,7 @@ mod tests {
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
                 .with_maven_flat_gc_enabled(true);
         assert!(
-            enabled.run_scheduled_tick(&job).await,
+            enabled.run_scheduled_tick(&job, || async {}).await,
             "the second tick must win the lease the first one released"
         );
         let after_enabled = objects_left(&storage, &[&system_key, &operator_key]).await;
