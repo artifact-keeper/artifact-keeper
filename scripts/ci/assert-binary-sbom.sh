@@ -184,7 +184,14 @@ echo "      size: ${bin_bytes} bytes (ceiling ${MAX_BINARY_SIZE})"
 # installed as `@latest`, so the flag is not guaranteed to be there. Detect it
 # rather than discover its absence as an unparseable answer: a tool that cannot
 # be driven is a measurement that did not happen, which is INFRA, not a pass.
-if ! cargo audit bin --help 2>&1 | grep -qF -- "--max-binary-size"; then
+help_out="$(cargo audit bin --help 2>&1)" || true
+if ! printf '%s' "$help_out" | grep -qF -- "--max-binary-size"; then
+  # Distinguish "no cargo-audit" from "a cargo-audit that lost the flag".
+  # Both are INFRA, but they are different things to go and fix, and the
+  # not-installed case would otherwise be reported as a flag problem.
+  if printf '%s' "$help_out" | grep -qiE "no such (file or directory|subcommand)|is not installed|Unrecognized|command not found"; then
+    infra "\`cargo audit bin\` is unavailable (is cargo-audit installed in this job?). The embedded data was not inspected."
+  fi
   infra "this cargo-audit's \`bin\` subcommand has no --max-binary-size flag, so the ${bin_bytes}-byte binary cannot be submitted to it. Pin a cargo-audit that has it, or update this gate to the flag's new name. Nothing was measured."
 fi
 

@@ -57,6 +57,13 @@ shift
 # `cargo audit bin --help`, used by the gate to feature-detect the flag.
 # FAKE_HELP=noflag replays a cargo-audit that does not have it.
 if [ "${1:-}" = "bin" ] && [ "${2:-}" = "--help" ]; then
+  # A cargo without the audit subcommand fails the same way here as it does
+  # for the scan itself. The gate must still name THAT as the problem, not
+  # the missing flag, so this arm is reachable from --help too.
+  if [ "${FAKE_AUDIT:-auditable}" = "notinstalled" ]; then
+    echo "error: no such subcommand: \`audit\`" >&2
+    exit 101
+  fi
   echo "Scan compiled binaries for known vulnerabilities."
   echo "Usage: cargo audit bin [OPTIONS] <BINARY_PATHS>..."
   echo "Options:"
