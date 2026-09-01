@@ -2328,9 +2328,24 @@ jobs:
   apply-floating-tags:
     name: Apply Floating Tags
     runs-on: ubuntu-latest
-    # No `if:` and no `always()`: the default `success()` on all three merge
-    # jobs IS the control. Adding `!cancelled()` here would re-open exactly the
-    # partial-publish hole this job exists to close.
+    # The sibling barrier, stated over DIRECT results (#3652). The intent has
+    # always been "all three merges succeeded, or no floating tag moves"; the
+    # first version expressed it as the implicit default `success()`, which
+    # GitHub evaluates over the TRANSITIVE dependency chain -- and in PROMOTE
+    # mode the build/scan grandparents are skipped by design, so this job was
+    # skipped on every promote dispatch and the post-gate floating promotion
+    # (#3540) never actually executed (v1.8.2 was the first release to hit
+    # it: runs 33541126375/33532902112/33522347257 all concluded success with
+    # this job skipped). `!cancelled()` alone would re-open the v1.7.2
+    # partial-publish hole, so each merge's result is required to be exactly
+    # 'success': a failed OR SKIPPED sibling still means no floating tag
+    # moves, while skipped grandparents no longer veto the job.
+    if: >-
+      ${{ !cancelled()
+          && needs.publish-preflight.result == 'success'
+          && needs.merge-backend.result == 'success'
+          && needs.merge-openscap.result == 'success'
+          && needs.merge-scanner-adapter.result == 'success' }}
     needs: [publish-preflight, merge-backend, merge-openscap, merge-scanner-adapter]
     permissions:
       contents: read   # read published GitHub Releases (the floating-tag rule)
