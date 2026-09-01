@@ -826,7 +826,8 @@ pub async fn trigger_reindex(
     let db = state.db.clone();
     let search = search.clone();
     tokio::spawn(async move {
-        match search.full_reindex(&db).await {
+        // `abort: None` — operator-invoked, not lease-guarded (#3502).
+        match search.full_reindex(&db, None).await {
             Ok((a, r)) => {
                 tracing::info!(
                     "Search reindex complete: {} artifacts, {} repositories",

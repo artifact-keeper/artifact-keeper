@@ -788,8 +788,12 @@ async fn trigger_sync(
     // (#2556) and GPG-verify-before-ingest (#2357 S4) hardening. Upstream errors
     // are logged and surfaced as `succeeded = false`, not propagated, so the
     // trigger's own outcome (accepted + audited) is deterministic.
+    // `abort: None` — this operator-invoked single-repo pass is not guarded
+    // by the `curation_sync` scheduler lease, so there is no lease-loss token
+    // to observe (#3502).
     let sync_result =
-        crate::services::scheduler_service::run_curation_sync_cycle(&state.db, Some(repo.id)).await;
+        crate::services::scheduler_service::run_curation_sync_cycle(&state.db, Some(repo.id), None)
+            .await;
     let succeeded = sync_result.is_ok();
     if let Err(ref e) = sync_result {
         tracing::warn!("Manual curation sync for repo {} failed: {}", repo.key, e);
