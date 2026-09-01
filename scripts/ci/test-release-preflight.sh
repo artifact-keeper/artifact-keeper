@@ -588,8 +588,10 @@ git5 tag v9.9.8
 git5 commit -q --allow-empty -m "fix(a): alpha (#101)"
 git5 commit -q --allow-empty -m "fix(b): beta (#102)"
 git5 commit -q --allow-empty -m "chore: bump dep from 1.0 to 1.1 (#103)"
-# PR 101 closes issue 201, PR 102 closes issue 202, the bump closes nothing.
-CLOSES_MAP=$'101:201\n102:202\n103:'
+git5 commit -q --allow-empty -m "docs(changelog): record the late fix (#104)"
+# PR 101 closes issue 201, PR 102 closes issue 202; the bump and the changelog
+# commit close nothing.
+CLOSES_MAP=$'101:201\n102:202\n103:\n104:'
 
 expect5() { # <label> <expected-exit> <expected-substring> <changelog on stdin>
   local label="$1" want="$2" needle="$3" got
@@ -660,6 +662,23 @@ expect5 "commit in range with no pending entry -> NOT READY" 1 "are not describe
 ## [9.9.8] - 2026-01-01
 - older work
 - **beta is fixed** (#202). filed under the RELEASED section, after the tag.
+EOF
+
+# 3b. THE RECURSION. A `docs(changelog):` commit cannot describe itself: its
+#     entire content IS the changelog entry, so demanding an entry for it
+#     produces another such commit, and so on. Real occurrence: cutting 1.8.2,
+#     #3613 merged after the pending section was written and this check
+#     correctly blocked; the fix added the missing entry and then blocked the
+#     cut itself. Drop the `docs(changelog)` arm from the exemption and this
+#     goes red.
+expect5 "docs(changelog) commit is exempt -> READY" 0 "" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
 EOF
 
 # 4. THE COUNTERWEIGHT. Run after the CHANGELOG promotion and before the tag,

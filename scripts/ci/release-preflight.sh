@@ -753,9 +753,19 @@ else
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
       subj="$(printf '%s\n' "$subjects" | grep -m1 -F "(#${p})" || true)"
-      # Deliberately narrow: dependency bumps and the release prep itself are
-      # the only commit shapes that legitimately carry no user-facing entry.
-      if [[ "$subj" =~ ^chore(\([^\)]*\))?!?:\ bump\  || "$subj" =~ ^chore\(release\) ]]; then
+      # Deliberately narrow: dependency bumps, the release prep itself, and a
+      # commit whose entire content IS a CHANGELOG edit are the only commit
+      # shapes that legitimately carry no user-facing entry.
+      #
+      # `docs(changelog):` is exempt because it cannot satisfy this check even
+      # in principle. Cutting 1.8.2, #3613 merged after the pending section was
+      # written, so this check correctly blocked; the fix (#3624) added the
+      # missing entry -- and then blocked the cut itself, because a commit that
+      # adds a CHANGELOG entry is a commit in range with no entry describing
+      # it. Writing one produces another such commit, and so on. The exemption
+      # is safe for the same reason `chore(release)` is: the commit's content
+      # is the changelog, so there is nothing it could omit.
+      if [[ "$subj" =~ ^chore(\([^\)]*\))?!?:\ bump\  || "$subj" =~ ^chore\(release\) || "$subj" =~ ^docs\(changelog\) ]]; then
         exempted=$((exempted + 1))
         continue
       fi
@@ -777,7 +787,7 @@ else
       note "  -> add an entry under '## [Unreleased]', or check whether the entry"
       note "     was filed under an ALREADY RELEASED heading (the post-1.7.3 shape:"
       note "     a PR merged after the tag anchored on the released section)."
-      note "  -> dependency bumps and 'chore(release):' commits are exempt; nothing else is."
+      note "  -> dependency bumps, 'chore(release):' and 'docs(changelog):' commits are exempt; nothing else is."
     fi
 
     if [[ -z "$unresolved" && "$undocumented" -eq 0 ]]; then
