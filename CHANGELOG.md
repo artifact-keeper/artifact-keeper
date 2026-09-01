@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Container images and build toolchain updated across the board.** Base images, CI service images and e2e client images move to current releases: PostgreSQL 16 → 18, Alpine 3.19/3.23 → 3.24, Debian bookworm → trixie, Python 3.12 → 3.14, Node 20 → 26, Go 1.22 → 1.27, Rust 1.75 → 1.98 (test client), Keycloak 24.0 → 26.7.3, Trivy 0.69.3 → 0.74.0, OpenSearch 2.19.1 → 2.19.6, Dependency-Track 4.14.2 → 4.14.3, Helm 3.16 → 3.21, Terraform 1.13.0 → 1.16.0. The published backend image's build toolchain moves with them: Rust 1.93.0 → **1.98.0**, matching `rust-toolchain.toml`'s `channel` — the two had drifted, and because rustup reads that file at build time and it outranks the toolchain the Dockerfile installs, the old pin was not the version that actually compiled the binary. protoc 29.3 → 36.1, and its download is now checksum-verified per architecture rather than trusted on HTTPS alone.
+
+  **Upgrade note — PostgreSQL 18 is not an in-place upgrade.** `docker-compose.yml` binds a *named* volume (`postgres_data`) to the database's data directory. PostgreSQL refuses to start against a data directory initialised by an older major, so on an existing deployment `docker compose pull && docker compose up` will fail with `FATAL: database files are incompatible with server`, and the backend will never start because its `depends_on` health condition is never satisfied. **No data is lost** — the volume is untouched — but the stack stays down until you act. Either dump and restore:
+
+  ```
+  docker compose exec postgres pg_dumpall -U registry > backup.sql
+  docker compose down && docker volume rm <project>_postgres_data
+  docker compose up -d postgres
+  docker compose exec -T postgres psql -U registry < backup.sql
+  ```
+
+  or run `pg_upgrade`, or pin `postgres:16-alpine` in your own override file and upgrade on your own schedule. Deployments using a managed database service are unaffected — this only concerns the bundled evaluation stack. The CI and e2e stacks all use `tmpfs` or anonymous mounts and re-`initdb` on every run, so they need no migration.
+
+  Two versions deliberately do not track "latest". `scripts/migration-e2e/docker-compose.yml`'s `artifactory-db` stays on PostgreSQL 16 because it backs `jfrog/artifactory-oss`, whose supported-database matrix is JFrog's to set, not ours. Helm, OpenSearch and Dependency-Track take the latest release *within their current major* — Helm 4.x, OpenSearch 3.x and Dependency-Track 5.x are migrations with their own configuration and API changes, not version bumps, and each is tracked separately.
+
 ### Fixed
 
 - **A re-tagged release version could never pass `resolve-candidate-digest`** (#3640, #3641). The release workflow located the Docker Publish run vouching for the tagged commit with a query hard-filtered to push events, so on a re-cut of an already-published version it could only ever see the push run that image immutability had (correctly, and permanently) refused — while the documented `promote_version` recovery dispatch succeeded invisibly beside it. The resolver now accepts a successful run for the same commit and ref from either a tag push or a promote dispatch, and adoption of already-published bytes is verified rather than assumed: the release hard-refuses unless the commit the published image was built from and the commit being tagged are byte-identical across every input the backend image is built from (`Cargo.toml`, `Cargo.lock`, `backend/`, `.sqlx/`, the Dockerfile and `.dockerignore`). Nothing changes for a normal cut; a missing or failed publish still blocks the release, and a stale success for a different commit or branch can never vouch for a tag.
