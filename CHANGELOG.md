@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`GET /api/v1/users` returned service accounts with no way to identify or exclude them, so no client could build a working permission picker** (#3634). Service accounts are rows in `users`, so the admin user listing returned them mixed in with people — while `POST /api/v1/permissions` rejects exactly those rows when they are submitted as `principal_type: "user"`, with `400 principal_id <uuid> does not exist as a user`. The two endpoints contradicted each other and gave clients nothing to reconcile them with: `list_users` read `is_service_account` out of the database and then dropped it in `AdminUserResponse`, and `ListUsersQuery` offered no filter, so a caller could neither tell the two kinds of principal apart nor ask the server for one of them. The practical result was that granting a service account repository access — the documented remedy when its token gets `403 You do not have permission to perform this action on this repository`, since token scopes only narrow and never grant — could not be driven from the user list at all. `AdminUserResponse` now carries `is_service_account`, and `ListUsersQuery` accepts an optional `is_service_account` filter applied with the same NULL-passthrough shape as the existing `is_active` / `is_admin` filters. The `validate_principal` guard from #2503 is unchanged and still authoritative; what changed is that clients can now see what it will accept.
+
+  The filter is deliberately opt-in rather than a blanket server-side exclusion: filtering the audit actor list by a service account is legitimate (CI is often the actor under investigation) and so is group membership for one, so an absent filter keeps the historical unfiltered listing and only a caller that asks gets people-only. It is applied to **both** statements `list_users` runs — the page query and the pagination count — because filtering one and not the other makes `total` count rows that `items` excludes, overshooting `total_pages` and growing a phantom trailing page; the two `WHERE` clauses are held byte-identical and a unit test compares them, since that drift cannot be caught without a database otherwise. Note the three filters are all `Option<bool>` and therefore type-identical at the bind site, so a transposed bind would compile silently and filter the wrong column.
+
+  Consumers still have to opt in. In artifact-keeper-web five admin screens read this endpoint — the permissions principal picker, the users list, the group member picker, the audit actor filter and the age-gate approver picker — and four of them have no other source for the distinction; the picker is fixed page-locally in artifact-keeper-web#823, the rest wait on an SDK release carrying this field.
+
 ## [1.8.2] - 2026-09-01
 
 ### Added

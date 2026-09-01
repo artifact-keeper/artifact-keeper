@@ -135,6 +135,16 @@ pub struct ListUsersQuery {
     pub search: Option<String>,
     pub is_active: Option<bool>,
     pub is_admin: Option<bool>,
+    /// Filter on the service-account discriminator (#3634).
+    ///
+    /// Service accounts are rows in `users`, so an unfiltered listing mixes
+    /// them in with people. A client building a principal picker for
+    /// `POST /api/v1/permissions` must be able to exclude them: that endpoint's
+    /// `validate_principal` requires `principal_type = "service_account"` for
+    /// such a row and rejects it as `"user"`, so offering one under `user` is a
+    /// guaranteed 400. `None` keeps the historical unfiltered behavior, which
+    /// the audit actor filter and the group member picker both want.
+    pub is_service_account: Option<bool>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -187,6 +197,11 @@ pub struct AdminUserResponse {
     pub auth_provider: String,
     pub is_active: bool,
     pub is_admin: bool,
+    /// Whether this row is a service account rather than a person (#3634).
+    ///
+    /// `list_users` already read this column; it was dropped here, leaving
+    /// clients no way to tell the two kinds of principal apart.
+    pub is_service_account: bool,
     pub must_change_password: bool,
     pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -213,6 +228,7 @@ pub(crate) fn user_to_response(user: User) -> AdminUserResponse {
         auth_provider: format!("{:?}", user.auth_provider).to_lowercase(),
         is_active: user.is_active,
         is_admin: user.is_admin,
+        is_service_account: user.is_service_account,
         must_change_password: user.must_change_password,
         last_login_at: user.last_login_at,
         created_at: user.created_at,
@@ -262,13 +278,15 @@ pub async fn list_users(
         WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
           AND ($2::boolean IS NULL OR is_active = $2)
           AND ($3::boolean IS NULL OR is_admin = $3)
+          AND ($4::boolean IS NULL OR is_service_account = $4)
         ORDER BY username
-        OFFSET $4
-        LIMIT $5
+        OFFSET $5
+        LIMIT $6
         "#,
         search_pattern,
         query.is_active,
         query.is_admin,
+        query.is_service_account,
         offset,
         per_page as i64
     )
@@ -276,6 +294,12 @@ pub async fn list_users(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // The pagination total is a SECOND statement over the same table, so every
+    // filter added above must be added here too (#3634). Filtering only the page
+    // query makes `total` count rows `items` excludes: `total_pages` overshoots
+    // and the listing grows a phantom trailing page. The WHERE clauses are kept
+    // byte-identical (same predicates, same bind order) so
+    // `list_users_page_and_count_queries_filter_identically` can compare them.
     let total = sqlx::query_scalar!(
         r#"
         SELECT COUNT(*) as "count!"
@@ -283,10 +307,12 @@ pub async fn list_users(
         WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
           AND ($2::boolean IS NULL OR is_active = $2)
           AND ($3::boolean IS NULL OR is_admin = $3)
+          AND ($4::boolean IS NULL OR is_service_account = $4)
         "#,
         search_pattern,
         query.is_active,
-        query.is_admin
+        query.is_admin,
+        query.is_service_account
     )
     .fetch_one(&state.db)
     .await
@@ -2100,6 +2126,29 @@ mod tests {
         }
     }
 
+    /// #3634: `list_users` already SELECTed `is_service_account`, but
+    /// `user_to_response` dropped it — leaving every client (five admin
+    /// screens in artifact-keeper-web) unable to tell a person from a service
+    /// account, while `POST /api/v1/permissions` rejects one submitted as
+    /// `principal_type: "user"`. Dropping the field again reopens that.
+    #[test]
+    fn user_to_response_exposes_the_service_account_discriminator() {
+        let human = user_to_response(make_test_user());
+        assert!(
+            !human.is_service_account,
+            "#3634: a person must not be reported as a service account"
+        );
+
+        let mut svc_user = make_test_user();
+        svc_user.is_service_account = true;
+        svc_user.username = "svc-raw-ci-write".to_string();
+        let svc = user_to_response(svc_user);
+        assert!(
+            svc.is_service_account,
+            "#3634: a service account must be identifiable in the response"
+        );
+    }
+
     #[test]
     fn test_user_to_response_basic_fields() {
         let user = make_test_user();
@@ -2246,6 +2295,7 @@ mod tests {
             auth_provider: "local".to_string(),
             is_active: true,
             is_admin: true,
+            is_service_account: false,
             must_change_password: false,
             last_login_at: None,
             created_at: now,
@@ -2269,6 +2319,7 @@ mod tests {
                 auth_provider: "local".to_string(),
                 is_active: true,
                 is_admin: false,
+                is_service_account: false,
                 must_change_password: true,
                 last_login_at: None,
                 created_at: now,
@@ -2292,6 +2343,7 @@ mod tests {
                 auth_provider: "local".to_string(),
                 is_active: true,
                 is_admin: false,
+                is_service_account: false,
                 must_change_password: false,
                 last_login_at: None,
                 created_at: now,
@@ -2321,13 +2373,63 @@ mod tests {
 
     #[test]
     fn test_list_users_query_deserialize() {
-        let json = r#"{"search":"admin","is_active":true,"is_admin":true,"page":2,"per_page":50}"#;
+        let json = r#"{"search":"admin","is_active":true,"is_admin":true,"is_service_account":false,"page":2,"per_page":50}"#;
         let q: ListUsersQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.search.as_deref(), Some("admin"));
         assert_eq!(q.is_active, Some(true));
         assert_eq!(q.is_admin, Some(true));
+        assert_eq!(q.is_service_account, Some(false));
         assert_eq!(q.page, Some(2));
         assert_eq!(q.per_page, Some(50));
+    }
+
+    /// #3634: omitting the filter must keep the historical unfiltered listing.
+    /// The audit actor filter and the group member picker both want service
+    /// accounts in the results, so the default cannot be "exclude".
+    #[test]
+    fn list_users_query_service_account_filter_is_optional() {
+        let q: ListUsersQuery = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            q.is_service_account, None,
+            "#3634: an absent filter must mean unfiltered, not `false`"
+        );
+    }
+
+    /// #3634 regression: `list_users` filters through TWO statements — the page
+    /// query and the pagination count. A filter added to one but not the other
+    /// makes `total` count rows that `items` excludes, so `total_pages`
+    /// overshoots and the listing grows a phantom trailing page. Both clauses
+    /// are held byte-identical; with no database reachable from a unit test,
+    /// reading the source is what makes the invariant enforceable at all.
+    #[test]
+    fn list_users_page_and_count_queries_filter_identically() {
+        let src = include_str!("users.rs");
+
+        fn where_clause(src: &str, marker: &str, terminator: &str) -> String {
+            let at = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} must exist in list_users"));
+            let rest = &src[at..];
+            let start = rest.find("WHERE ").expect("statement must have a WHERE");
+            let end = rest[start..]
+                .find(terminator)
+                .expect("the WHERE clause must terminate");
+            rest[start..start + end].trim_end().to_string()
+        }
+
+        let page = where_clause(src, "let users = sqlx::query_as!(", "ORDER BY");
+        let count = where_clause(src, "let total = sqlx::query_scalar!(", "\"#");
+
+        assert_eq!(
+            page, count,
+            "#3634: the page query and the pagination count query must apply \
+             the SAME filters, or `total` disagrees with `items`"
+        );
+        assert!(
+            page.contains("is_service_account = $4"),
+            "#3634: the service-account filter must be APPLIED by the query, \
+             not merely accepted by `ListUsersQuery`"
+        );
     }
 
     #[test]
