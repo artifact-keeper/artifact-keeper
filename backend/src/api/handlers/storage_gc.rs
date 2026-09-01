@@ -49,10 +49,21 @@ pub fn repo_router() -> Router<SharedState> {
 }
 
 /// Request body for storage GC.
+///
+/// `dry_run` is **required** and unknown fields are **rejected** (#3501): a
+/// live GC pass is irreversible (no tombstone, no restore path short of a
+/// backup), so an ambiguous request must fail loudly instead of selecting the
+/// destructive branch. Before this, `{}` and any typo'd key
+/// (`{"dryRun": true}`, `{"dry_Run": true}`) silently deserialized to
+/// `dry_run: false` and performed a real deletion. Callers now say which pass
+/// they mean: `{"dry_run": true}` to estimate, `{"dry_run": false}` to
+/// delete; anything else is refused with an error naming the missing or
+/// unknown field (axum's `Json` rejection, HTTP 422), and nothing is deleted.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StorageGcRequest {
     /// When true, report what would be deleted without actually deleting.
-    #[serde(default)]
+    /// Required: an absent field is a rejected request, never a live delete.
     pub dry_run: bool,
 }
 
@@ -84,19 +95,28 @@ pub async fn run_storage_gc(
     // already recomputes the materialized repository/path storage stats right
     // after reclaim (scheduler_service), but the admin-triggered pass left
     // them stale until the next cron tick. Mirror the scheduler here so an
-    // operator-initiated GC settles the reported numbers too. Best-effort:
-    // a refresh failure must not fail the GC that already ran.
-    if !payload.dry_run {
-        let stats_service = crate::services::storage_stats_service::StorageStatsService::new(
-            state.db.clone(),
-            &state.config.storage_backend,
-        );
-        if let Err(e) = stats_service.recompute_all().await {
-            tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
-        }
-    }
+    // operator-initiated GC settles the reported numbers too.
+    refresh_stats_after_live_gc(&state, payload.dry_run).await;
 
     Ok(Json(result))
+}
+
+/// Best-effort post-GC storage-stats refresh shared by both GC endpoints
+/// (#2056/#2601): settle the materialized repository/path storage stats after
+/// a LIVE pass instead of leaving them stale until the next cron tick. A
+/// refresh failure must not fail the GC that already ran, so errors are
+/// logged and swallowed. A dry run reclaims nothing and refreshes nothing.
+async fn refresh_stats_after_live_gc(state: &SharedState, dry_run: bool) {
+    if dry_run {
+        return;
+    }
+    let stats_service = crate::services::storage_stats_service::StorageStatsService::new(
+        state.db.clone(),
+        &state.config.storage_backend,
+    );
+    if let Err(e) = stats_service.recompute_all().await {
+        tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
+    }
 }
 
 /// Gate an admin-only endpoint.
@@ -182,15 +202,7 @@ pub async fn run_repository_storage_gc(
     // Mirror the admin endpoint (#2056/#2601): settle the materialized
     // storage stats after a live pass instead of leaving them stale until
     // the next cron tick. Best-effort — the GC already ran.
-    if !payload.dry_run {
-        let stats_service = crate::services::storage_stats_service::StorageStatsService::new(
-            state.db.clone(),
-            &state.config.storage_backend,
-        );
-        if let Err(e) = stats_service.recompute_all().await {
-            tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
-        }
-    }
+    refresh_stats_after_live_gc(&state, payload.dry_run).await;
 
     Ok(Json(result))
 }
@@ -255,10 +267,19 @@ mod tests {
 
     // -- StorageGcRequest deserialization tests --
 
+    /// #3501: `{}` must never reach the handler — before this fix an empty
+    /// body deserialized to `dry_run: false` and performed a live, irreversible
+    /// delete. The request must be refused with an error that names the
+    /// missing field, so the caller learns what to say rather than what
+    /// happened to their data.
     #[test]
-    fn test_storage_gc_request_default_dry_run() {
-        let req: StorageGcRequest = serde_json::from_str("{}").unwrap();
-        assert!(!req.dry_run);
+    fn test_storage_gc_request_empty_body_rejected() {
+        let result = serde_json::from_str::<StorageGcRequest>("{}");
+        let err = result.expect_err("`{}` must not deserialize into a live-delete request");
+        assert!(
+            err.to_string().contains("dry_run"),
+            "rejection must name the missing field so the caller can fix it, got: {err}"
+        );
     }
 
     #[test]
@@ -273,11 +294,37 @@ mod tests {
         assert!(!req.dry_run);
     }
 
+    /// #3501 (inverts the former `test_storage_gc_request_extra_fields_ignored`,
+    /// which pinned the lenient parse): an unknown field is now a hard error.
+    /// The lenient parse meant a typo'd key silently fell through to the
+    /// destructive default — during 1.8.2 verification a typo'd key deleted a
+    /// batch of attribution rows this way.
     #[test]
-    fn test_storage_gc_request_extra_fields_ignored() {
-        let req: StorageGcRequest =
-            serde_json::from_str(r#"{"dry_run": true, "unknown_field": 42}"#).unwrap();
-        assert!(req.dry_run);
+    fn test_storage_gc_request_unknown_field_rejected() {
+        let result =
+            serde_json::from_str::<StorageGcRequest>(r#"{"dry_run": true, "unknown_field": 42}"#);
+        let err = result.expect_err("unknown fields must be rejected, not ignored");
+        assert!(
+            err.to_string().contains("unknown_field"),
+            "rejection must name the unknown field, got: {err}"
+        );
+    }
+
+    /// #3501: the exact incident shape — the caller *asked for a dry run* with
+    /// the wrong key casing, and the old contract answered with a live delete.
+    /// `{"dryRun": true}` must be a 400-shaped rejection, and the negative
+    /// control is deliberately a payload whose author's INTENT was
+    /// non-destructive: if this ever deserializes again, it must not be
+    /// allowed to mean `dry_run: false`.
+    #[test]
+    fn test_storage_gc_request_camel_case_key_rejected() {
+        let result = serde_json::from_str::<StorageGcRequest>(r#"{"dryRun": true}"#);
+        let err =
+            result.expect_err("a typo'd/camelCase key must not select the live-delete branch");
+        assert!(
+            err.to_string().contains("dryRun"),
+            "rejection must name the offending key, got: {err}"
+        );
     }
 
     #[test]
@@ -292,6 +339,164 @@ mod tests {
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("StorageGcRequest"));
         assert!(debug_str.contains("dry_run"));
+    }
+
+    /// #3501 end-to-end through the REAL admin route (`router()`), not just
+    /// the serde layer: an ambiguous request must be REFUSED and must leave
+    /// the data untouched, while an explicit `{"dry_run": false}` must still
+    /// perform the live pass. Seeds a genuinely orphaned soft-deleted
+    /// artifact (row + object) that a live GC pass deletes, so "nothing was
+    /// deleted" is observable in storage and in the database — not inferred
+    /// from the status code.
+    ///
+    /// Revert-proofs, per hunk:
+    /// - re-add `#[serde(default)]` on `dry_run` → `{}` performs a live
+    ///   delete → 200 + the probe object disappears → this test fails;
+    /// - drop `#[serde(deny_unknown_fields)]` → `{"dryRun": true}` (the
+    ///   1.8.2 incident shape: the caller ASKED for a dry run) deserializes
+    ///   to `dry_run: false` and deletes → fails.
+    #[tokio::test]
+    // Bounded (64 KiB) body reads on an in-process test router (#1608 exempts
+    // bounded test-side collection; same pattern as the auth.rs router tests).
+    #[allow(clippy::disallowed_methods)]
+    async fn storage_gc_route_refuses_ambiguous_requests_without_deleting() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let _gc_guard = crate::services::storage_gc_service::storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fixture.storage_dir.to_string_lossy().to_string(),
+            })
+            .expect("filesystem backend");
+        let uid = uuid::Uuid::new_v4().simple().to_string();
+
+        // One orphaned, soft-deleted artifact a live pass WILL reclaim: the
+        // positive control (explicit live run deletes it) is what keeps the
+        // negative controls (ambiguous requests delete nothing) honest.
+        let probe_key = format!("generic/gc3501/{uid}/probe.bin");
+        storage
+            .put(&probe_key, bytes::Bytes::from_static(b"payload"))
+            .await
+            .expect("seed probe object");
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by, is_deleted) \
+             VALUES ($1, $2, 'probe', '1.0', 7, 'cafe', 'application/octet-stream', $2, $3, \
+                 true)",
+        )
+        .bind(fixture.repo_id)
+        .bind(&probe_key)
+        .bind(fixture.user_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert soft-deleted probe row");
+
+        let admin = AuthExtension {
+            user_id: fixture.user_id,
+            username: fixture.username.clone(),
+            is_admin: true,
+            ..Default::default()
+        };
+        let app = router()
+            .layer(axum::extract::Extension(admin))
+            .with_state(fixture.state.clone());
+
+        let post = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let probe_rows = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND storage_key = $2",
+            )
+            .bind(fixture.repo_id)
+            .bind(&probe_key)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count probe rows")
+        };
+
+        // -- `{}`: the pre-fix silent live delete. Must be refused with the
+        //    axum Json rejection (422) whose body names the missing field,
+        //    and the probe must survive.
+        let resp = app.clone().oneshot(post("{}")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "`{{}}` must be refused, not treated as a live delete"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 65_536)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            body.contains("dry_run"),
+            "the refusal must name the missing field so the caller can fix it, got: {body}"
+        );
+
+        // -- `{"dryRun": true}`: the 1.8.2 incident shape — the caller asked
+        //    for a dry run with the wrong key casing, and the old contract
+        //    answered with a live delete. Must be refused, naming the key.
+        let resp = app
+            .clone()
+            .oneshot(post(r#"{"dryRun": true}"#))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a typo'd key must not fall through to the destructive default"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 65_536)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            body.contains("dryRun"),
+            "the refusal must name the unknown key, got: {body}"
+        );
+
+        // Observable outcome of both refusals: NOTHING was deleted.
+        assert!(
+            storage.exists(&probe_key).await.expect("probe object"),
+            "an ambiguous request must not delete storage objects"
+        );
+        assert_eq!(
+            probe_rows().await,
+            1,
+            "an ambiguous request must not delete artifact rows"
+        );
+
+        // -- Positive control: the explicit destructive request still works,
+        //    which also proves the seeded probe was genuinely reclaimable
+        //    (i.e. the two assertions above did not pass vacuously).
+        let resp = app
+            .clone()
+            .oneshot(post(r#"{"dry_run": false}"#))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the explicit live pass must keep working"
+        );
+        assert!(
+            !storage.exists(&probe_key).await.expect("probe object"),
+            "the explicit live pass must reclaim the orphaned probe object"
+        );
     }
 
     // -- StorageGcApiDoc OpenAPI tests --
