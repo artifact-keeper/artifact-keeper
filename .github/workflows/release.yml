@@ -217,12 +217,17 @@ jobs:
       backend_digest: ${{ steps.resolve.outputs.backend_digest }}   # sha256:...
       version: ${{ steps.resolve.outputs.version }}
     steps:
-      # The resolver script is the only thing needed from the tree; this job
-      # otherwise reads the Actions API and the registry, not the repository.
+      # scripts/ci for the resolver + adoption gate, .github/scripts for the
+      # registry probes, and full history so the adoption gate can diff the
+      # published image's source revision against the tag (the sparse worktree
+      # does not limit object-level `git diff <rev> <sha>`).
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: scripts/ci
+          fetch-depth: 0
+          sparse-checkout: |
+            scripts/ci
+            .github/scripts
 
       - name: Wait for a successful docker-publish run for this commit
         env:
@@ -268,7 +273,25 @@ jobs:
                 sleep 60
                 ;;
               20)
-                echo "::error title=docker-publish failed::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success. Release blocked; fix and re-run docker-publish (or dispatch it with promote_version=${GITHUB_REF_NAME#v} if the version is already published), then re-run this workflow."
+                # Say something that can actually succeed. On a re-cut of an
+                # already-published version, "fix and re-run docker-publish"
+                # is impossible advice: every push-path rebuild is refused by
+                # the immutability guard, forever. Name the promote dispatch
+                # instead (#3640).
+                V="${GITHUB_REF_NAME#v}"
+                STATE=$(GHCR_TOKEN="${GH_TOKEN}" bash .github/scripts/registry-tag-state.sh \
+                  ghcr.io artifact-keeper/artifact-keeper-backend "${V}" 2>/dev/null || true)
+                case "${STATE}" in
+                  present)
+                    echo "::error title=docker-publish failed (version already published)::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success -- and backend:${V} is ALREADY PUBLISHED, so a push-path rebuild will be refused by the immutability guard every time. Recovery: gh workflow run docker-publish.yml --ref ${GITHUB_REF_NAME} -f promote_version=${V} ; when it succeeds, re-run this workflow (the promote re-points tags at the published digest and the next job verifies its sources against this tag)."
+                    ;;
+                  absent)
+                    echo "::error title=docker-publish failed::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success and backend:${V} is not published. Release blocked; fix the cause, re-run docker-publish, then re-run this workflow."
+                    ;;
+                  *)
+                    echo "::error title=docker-publish failed::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success (and whether backend:${V} is already published could not be read). Release blocked; if the version is already published, dispatch docker-publish with promote_version=${V}; otherwise fix the cause and re-run docker-publish. Then re-run this workflow."
+                    ;;
+                esac
                 exit 1
                 ;;
               21|30)
@@ -383,6 +406,39 @@ jobs:
           echo "backend_digest=${BACKEND_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}"               >> "$GITHUB_OUTPUT"
           echo "Candidate resolved: backend ${VERSION}@${BACKEND_DIGEST}"
+
+      # ── Adoption gate (#3640) ───────────────────────────────────────────────
+      # The run accepted above may be a promote dispatch, i.e. the published
+      # bytes may have been BUILT from a different commit than this tag (a
+      # re-tag after a non-image fix; rebuilds can never match because GIT_SHA
+      # is a build-arg and provenance embeds the revision). Adoption is
+      # verified, never assumed: read the revision the published index was
+      # built from and require it to be byte-identical to this tag across
+      # every input docker/Dockerfile.backend consumes. Any difference inside
+      # that set is a hard refusal -- those bytes are stale for this tag.
+      # Selection + refusal legs are self-tested offline in
+      # scripts/ci/test-assert-adopted-image-sources.sh.
+      - name: Assert the published image was built from this tag's sources
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          REV=$(GHCR_TOKEN="${GH_TOKEN}" bash .github/scripts/registry-tag-revision.sh \
+            ghcr.io artifact-keeper/artifact-keeper-backend "${VERSION}" || true)
+          echo "backend:${VERSION} reports source revision: ${REV}"
+          rc=0
+          ADOPT_TAG_SHA="${GITHUB_SHA}" \
+          ADOPT_PUBLISHED_REV="${REV}" \
+          ADOPT_LABEL="backend:${VERSION}" \
+            bash scripts/ci/assert-adopted-image-sources.sh || rc=$?
+          if [ "${rc}" = "1" ]; then
+            echo "::error title=Published image refused for this tag::backend:${VERSION} was built from ${REV}, which differs from ${GITHUB_SHA} inside the image input set. Adopting it would release stale bytes. Bump the version instead of re-tagging, or revert the input change."
+            exit 1
+          elif [ "${rc}" != "0" ]; then
+            echo "::error title=Image provenance unreadable::Could not verify what backend:${VERSION} was built from (see log). Indeterminate is not a pass; re-run this workflow."
+            exit 1
+          fi
 
   # ════════════════════════════════════════════════════════════════════════════
   # E2E GATE - Must pass before release proceeds

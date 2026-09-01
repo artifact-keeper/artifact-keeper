@@ -670,6 +670,16 @@ jobs:
       - name: Check the candidate publish-run resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-publish-run.sh
 
+      # The other half of #3640: when the accepted run is a promote dispatch,
+      # the published bytes were built from a DIFFERENT commit than the tag,
+      # and adoption must be verified against the image's actual input set --
+      # fail-open here certifies stale bytes for a tag they were not built
+      # from. Real git commits in a scratch repo; the refusal legs (backend
+      # source, Dockerfile, .dockerignore, missing provenance) are the point.
+      # Offline, ~1s.
+      - name: Check the image-adoption gate refuses what it must
+        run: bash scripts/ci/test-assert-adopted-image-sources.sh
+
       # Duplicate sqlx migration versions merge CLEAN and abort the backend at
       # startup (#3313, #1128). The live gate runs in test-backend-unit against
       # the merge result; this exercises the script's failure modes (numeric
