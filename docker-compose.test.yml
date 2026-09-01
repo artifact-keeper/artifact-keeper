@@ -37,7 +37,7 @@ services:
       POSTGRES_PASSWORD: registry
       POSTGRES_DB: artifact_registry
     tmpfs:
-      - /var/lib/postgresql/data
+      - /var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
       interval: 2s

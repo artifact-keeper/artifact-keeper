@@ -12,7 +12,7 @@ services:
       timeout: 3s
       retries: 10
     tmpfs:
-      - /var/lib/postgresql/data
+      - /var/lib/postgresql
 
   # Artifactory OSS requires its own PostgreSQL since v7.x latest
   artifactory-db:

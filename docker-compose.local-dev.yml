@@ -33,7 +33,7 @@ services:
       POSTGRES_PASSWORD: registry
       POSTGRES_DB: artifact_registry
     volumes:
-      - dev_postgres_data:/var/lib/postgresql/data
+      - dev_postgres_data:/var/lib/postgresql
       - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
     ports:
       - "30432:5432"

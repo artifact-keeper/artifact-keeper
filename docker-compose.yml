@@ -85,7 +85,11 @@ services:
       POSTGRES_PASSWORD: registry
       POSTGRES_DB: artifact_registry
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # PostgreSQL 18+ places PGDATA in a subdirectory and expects the mount at
+      # /var/lib/postgresql, not /var/lib/postgresql/data. Mounting the old path
+      # makes the image refuse to start ('unused mount/volume'). See
+      # https://github.com/docker-library/postgres/issues/37
+      - postgres_data:/var/lib/postgresql
       - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro,z
       - ./docker/init-pg-ssl.sh:/docker-entrypoint-initdb.d/init-pg-ssl.sh:ro,z
       - pg_certs:/var/lib/postgresql/certs:ro

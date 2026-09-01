@@ -54,7 +54,7 @@ services:
       POSTGRES_PASSWORD: registry
       POSTGRES_DB: artifact_registry
     volumes:
-      - s3_test_postgres_data:/var/lib/postgresql/data
+      - s3_test_postgres_data:/var/lib/postgresql
     ports:
       - "30433:5432"
     healthcheck:
