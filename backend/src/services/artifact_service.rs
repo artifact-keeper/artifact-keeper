@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::api::handlers::escape_like_literal;
@@ -17,7 +17,6 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata, ArtifactVersion};
 use crate::models::repository::RepositoryFormat;
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
-use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::scanner_service::ScannerService;
@@ -213,12 +212,48 @@ struct PriorHeadRow {
     uploaded_by: Option<Uuid>,
 }
 
+/// Compact artifact value struct shared by the download / delete epilogues
+/// (audit entries, download events).
+///
+/// Historically this was the payload handed to the classic `PluginService`
+/// lifecycle hooks; that hook dispatcher was never constructed in production
+/// and was removed (#3499). Extension points on artifact operations are the
+/// WASM plugin service (format handlers) and the webhook subsystem
+/// (`webhook_producer` / `event_bus`), not this struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactInfo {
+    pub id: Uuid,
+    pub repository_id: Uuid,
+    pub path: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub size_bytes: i64,
+    pub checksum_sha256: String,
+    pub content_type: String,
+    pub uploaded_by: Option<Uuid>,
+}
+
+impl From<&Artifact> for ArtifactInfo {
+    fn from(artifact: &Artifact) -> Self {
+        Self {
+            id: artifact.id,
+            repository_id: artifact.repository_id,
+            path: artifact.path.clone(),
+            name: artifact.name.clone(),
+            version: artifact.version.clone(),
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: artifact.checksum_sha256.clone(),
+            content_type: artifact.content_type.clone(),
+            uploaded_by: artifact.uploaded_by,
+        }
+    }
+}
+
 /// Artifact service
 pub struct ArtifactService {
     db: PgPool,
     storage: Arc<dyn StorageBackend>,
     repo_service: RepositoryService,
-    plugin_service: Option<Arc<PluginService>>,
     scanner_service: Option<Arc<ScannerService>>,
     quality_check_service: Option<Arc<QualityCheckService>>,
     search_service: Option<Arc<OpenSearchService>>,
@@ -232,7 +267,6 @@ impl ArtifactService {
             db,
             storage,
             repo_service,
-            plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
             search_service: None,
@@ -250,34 +284,10 @@ impl ArtifactService {
             db,
             storage,
             repo_service,
-            plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
             search_service,
         }
-    }
-
-    /// Create a new artifact service with plugin support.
-    pub fn with_plugins(
-        db: PgPool,
-        storage: Arc<dyn StorageBackend>,
-        plugin_service: Arc<PluginService>,
-    ) -> Self {
-        let repo_service = RepositoryService::new(db.clone());
-        Self {
-            db,
-            storage,
-            repo_service,
-            plugin_service: Some(plugin_service),
-            scanner_service: None,
-            quality_check_service: None,
-            search_service: None,
-        }
-    }
-
-    /// Set the plugin service for hook triggering.
-    pub fn set_plugin_service(&mut self, plugin_service: Arc<PluginService>) {
-        self.plugin_service = Some(plugin_service);
     }
 
     /// Set the scanner service for scan-on-upload.
@@ -293,33 +303,6 @@ impl ArtifactService {
     /// Set the search service for search indexing.
     pub fn set_search_service(&mut self, search_service: Arc<OpenSearchService>) {
         self.search_service = Some(search_service);
-    }
-
-    /// Trigger a plugin hook, logging but not failing if plugin service is unavailable.
-    async fn trigger_hook(
-        &self,
-        event: PluginEventType,
-        artifact_info: &ArtifactInfo,
-    ) -> Result<()> {
-        if let Some(ref plugin_service) = self.plugin_service {
-            plugin_service.trigger_hooks(event, artifact_info).await
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Trigger a plugin hook, logging errors but not blocking operations.
-    /// Used for "after" events where we don't want to fail the main operation.
-    async fn trigger_hook_non_blocking(
-        &self,
-        event: PluginEventType,
-        artifact_info: &ArtifactInfo,
-    ) {
-        if let Some(ref plugin_service) = self.plugin_service {
-            if let Err(e) = plugin_service.trigger_hooks(event, artifact_info).await {
-                warn!("Plugin hook {:?} failed (non-blocking): {}", event, e);
-            }
-        }
     }
 
     /// Calculate SHA-256 checksum of data
@@ -487,19 +470,10 @@ impl ArtifactService {
         let checksum_md5 = Self::calculate_md5(&data);
         let storage_key = Self::storage_key_from_checksum(&checksum_sha256);
 
-        // Quota, plugin BeforeUpload hook, live-overwrite check, and the
-        // release-immutability backstop — shared with the streaming path.
-        self.preflight_upload(
-            repository_id,
-            path,
-            name,
-            version,
-            content_type,
-            size_bytes,
-            &checksum_sha256,
-            uploaded_by,
-        )
-        .await?;
+        // Quota, live-overwrite check, and the release-immutability
+        // backstop — shared with the streaming path.
+        self.preflight_upload(repository_id, path, version, size_bytes, &checksum_sha256)
+            .await?;
 
         // Check if content already exists (deduplication)
         let content_exists = self.storage.exists(&storage_key).await?;
@@ -556,17 +530,8 @@ impl ArtifactService {
     ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
-        self.preflight_upload(
-            repository_id,
-            path,
-            name,
-            version,
-            content_type,
-            size_bytes,
-            &digests.sha256,
-            uploaded_by,
-        )
-        .await?;
+        self.preflight_upload(repository_id, path, version, size_bytes, &digests.sha256)
+            .await?;
 
         // Dedup check FIRST: skip `put_stream` on a warm blob so we never
         // rewrite content that is already present under its content-addressed
@@ -603,21 +568,20 @@ impl ArtifactService {
         .await
     }
 
-    /// Pre-storage validation shared by the buffered and streaming upload paths:
-    /// quota enforcement, the plugin `BeforeUpload` hook (which may reject the
-    /// upload), the live-overwrite immutability check, and the
-    /// soft-delete-aware release-immutability backstop.
-    #[allow(clippy::too_many_arguments)]
+    /// Pre-storage validation shared by the buffered and streaming upload
+    /// paths: quota enforcement, the live-overwrite immutability check, and
+    /// the soft-delete-aware release-immutability backstop.
+    ///
+    /// (The plugin `BeforeUpload` veto that used to run here was dead code —
+    /// its dispatcher was never constructed in production — and was removed
+    /// in #3499.)
     async fn preflight_upload(
         &self,
         repository_id: Uuid,
         path: &str,
-        name: &str,
         version: Option<&str>,
-        content_type: &str,
         size_bytes: i64,
         checksum_sha256: &str,
-        uploaded_by: Option<Uuid>,
     ) -> Result<()> {
         // Check quota
         if !self
@@ -629,23 +593,6 @@ impl ArtifactService {
                 "Repository storage quota exceeded".to_string(),
             ));
         }
-
-        // Build artifact info for plugin hooks (before artifact is created)
-        let pre_artifact_info = ArtifactInfo {
-            id: Uuid::nil(), // Will be set after creation
-            repository_id,
-            path: path.to_string(),
-            name: name.to_string(),
-            version: version.map(String::from),
-            size_bytes,
-            checksum_sha256: checksum_sha256.to_string(),
-            content_type: content_type.to_string(),
-            uploaded_by,
-        };
-
-        // Trigger BeforeUpload hooks - validators can reject the upload
-        self.trigger_hook(PluginEventType::BeforeUpload, &pre_artifact_info)
-            .await?;
 
         // Check if artifact with same path already exists
         let existing = sqlx::query!(
@@ -960,11 +907,6 @@ impl ArtifactService {
                 )
                 .await;
         }
-
-        // Trigger AfterUpload hooks (non-blocking - don't fail upload if hooks fail)
-        let artifact_info = ArtifactInfo::from(&artifact);
-        self.trigger_hook_non_blocking(PluginEventType::AfterUpload, &artifact_info)
-            .await;
 
         // Queue sync tasks for peer replication (non-blocking)
         if enqueue_sync_tasks {
@@ -1455,11 +1397,7 @@ impl ArtifactService {
         // returns `allowed` when no policy matches.
         crate::services::quarantine_service::enforce_download_gate(&self.db, artifact.id).await?;
 
-        // Trigger BeforeDownload hooks - validators can reject the download
         let artifact_info = ArtifactInfo::from(&artifact);
-        self.trigger_hook(PluginEventType::BeforeDownload, &artifact_info)
-            .await?;
-
         Ok((artifact, artifact_info))
     }
 
@@ -1518,10 +1456,6 @@ impl ArtifactService {
             }
             let _ = try_enqueue(DownloadEvent::Audit(Box::new(entry)));
         }
-
-        // Trigger AfterDownload hooks (non-blocking)
-        self.trigger_hook_non_blocking(PluginEventType::AfterDownload, artifact_info)
-            .await;
     }
 
     /// Download an artifact, buffering the full body into memory.
@@ -2043,22 +1977,17 @@ impl ArtifactService {
         Ok(())
     }
 
-    /// Delete pre-flight: load the row and run the `BeforeDelete` veto.
+    /// Delete pre-flight: load the row before the caller opens its
+    /// transaction.
     ///
-    /// Performs NO writes, and deliberately runs BEFORE the caller opens its
-    /// transaction. A plugin hook is arbitrary, potentially networked work;
-    /// holding an open Postgres transaction across it is exactly the pool
-    /// pressure that makes a mid-delete failure likely. Running it first also
-    /// means a veto aborts before any index row has been touched.
+    /// Performs NO writes. This used to also run a `BeforeDelete` plugin
+    /// veto, but that hook dispatcher (`PluginService`) was never constructed
+    /// in production, so the veto could not fire; the dead hook plumbing was
+    /// removed in #3499. There is deliberately no plugin veto on any delete
+    /// path — do not reintroduce one without a design issue covering hook
+    /// registration and request-path latency.
     pub async fn prepare_delete(&self, id: Uuid) -> Result<Artifact> {
-        let artifact = self.get_by_id(id).await?;
-        let artifact_info = ArtifactInfo::from(&artifact);
-
-        // Trigger BeforeDelete hooks - validators can reject the deletion
-        self.trigger_hook(PluginEventType::BeforeDelete, &artifact_info)
-            .await?;
-
-        Ok(artifact)
+        self.get_by_id(id).await
     }
 
     /// The delete's single durable state change, inside a caller-owned
@@ -2157,11 +2086,6 @@ impl ArtifactService {
                 });
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
-
-        // Trigger AfterDelete hooks (non-blocking)
-        let artifact_info = ArtifactInfo::from(artifact);
-        self.trigger_hook_non_blocking(PluginEventType::AfterDelete, &artifact_info)
-            .await;
 
         // Remove artifact from search index (non-blocking)
         if let Some(ref search) = self.search_service {
@@ -2672,6 +2596,82 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed artifact");
+    }
+
+    /// #3499 decision fence: classic `plugins` / `plugin_hooks` rows are
+    /// inert catalog data — they must NOT gate artifact operations.
+    ///
+    /// The classic `PluginService` hook dispatcher was dead code: nothing in
+    /// production ever constructed one, so its BeforeUpload / BeforeDownload /
+    /// BeforeDelete "vetoes" could never fire. #3499 removed the plumbing
+    /// rather than wiring it up (there is not even an API that writes
+    /// `plugin_hooks` rows). This pins that decision at the service layer: an
+    /// active `custom` plugin row with an enabled `before_delete` hook and an
+    /// always-unreachable validator URL must not block the delete. If hook
+    /// dispatch is ever reintroduced on the delete path without revisiting
+    /// #3499, the unreachable validator (blocking veto semantics) fails this
+    /// delete and the test goes red.
+    #[tokio::test]
+    async fn test_3499_classic_plugin_hook_rows_do_not_gate_delete() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        // A classic catalog row in its most "armed" state: active, custom
+        // (validator) type, an always-reject validator target, plus an
+        // enabled before_delete hook row.
+        let plugin_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO plugins (name, version, display_name, status, plugin_type, config) \
+             VALUES ($1, '1.0.0', 'reject-all', 'active', 'custom', $2) RETURNING id",
+        )
+        .bind(format!("reject-all-{}", Uuid::new_v4().simple()))
+        .bind(serde_json::json!({"validator_url": "http://127.0.0.1:9/reject"}))
+        .fetch_one(&pool)
+        .await
+        .expect("seed plugin row");
+        sqlx::query(
+            "INSERT INTO plugin_hooks (plugin_id, hook_type, handler_name) \
+             VALUES ($1, 'before_delete', 'reject_all')",
+        )
+        .bind(plugin_id)
+        .execute(&pool)
+        .await
+        .expect("seed hook row");
+
+        let path = format!("fence3499/{}.bin", Uuid::new_v4().simple());
+        seed_artifact(
+            &pool,
+            repo_id,
+            &path,
+            &format!("generic/{}", Uuid::new_v4()),
+        )
+        .await;
+        let artifact_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo_id)
+                .bind(&path)
+                .fetch_one(&pool)
+                .await
+                .expect("artifact id");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+
+        service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .expect("delete must succeed: classic plugin hook rows are inert (#3499)");
+
+        let deleted: bool = sqlx::query_scalar("SELECT is_deleted FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read row");
+        assert!(deleted, "delete must have actually soft-deleted the row");
     }
 
     /// #2940: `list_page` must keep selecting the quarantine columns so the
@@ -3541,7 +3541,6 @@ mod tests {
     #[test]
     fn test_artifact_info_from_artifact_all_fields() {
         use crate::models::artifact::Artifact;
-        use crate::services::plugin_service::ArtifactInfo;
         use chrono::Utc;
 
         let user_id = Uuid::new_v4();
@@ -3580,7 +3579,6 @@ mod tests {
     #[test]
     fn test_artifact_info_from_artifact_no_version_no_uploader() {
         use crate::models::artifact::Artifact;
-        use crate::services::plugin_service::ArtifactInfo;
         use chrono::Utc;
 
         let artifact = Artifact {
