@@ -2081,18 +2081,31 @@ impl StorageGcService {
         &self,
         repo_scope: Option<Uuid>,
     ) -> Result<Vec<OciUploadCleanupKey>> {
+        self.claim_oci_upload_cleanup_keys(repo_scope, OciCleanupKeyFamily::Unreferenced)
+            .await
+    }
+
+    /// Shared claim body for both cleanup-key families. The FOR UPDATE
+    /// SKIP LOCKED candidate CTE, the claim stamp, and the RETURNING shape
+    /// were byte-identical between the pending and unreferenced claims; only
+    /// the family predicates differ (see [`OciCleanupKeyFamily`]). Collapsed
+    /// in #3503's PR so the two destructive claim paths cannot drift apart.
+    async fn claim_oci_upload_cleanup_keys(
+        &self,
+        repo_scope: Option<Uuid>,
+        family: OciCleanupKeyFamily,
+    ) -> Result<Vec<OciUploadCleanupKey>> {
         let sql = format!(
             r#"
             WITH candidate AS (
                 SELECT c.id
                 FROM oci_upload_cleanup_keys c
-                WHERE c.storage_write_completed_at IS NOT NULL
-                  AND c.storage_write_completed_at < NOW() - {ttl}
+                WHERE {age}
                   AND (c.claim_expires_at IS NULL OR c.claim_expires_at <= NOW())
                   {scope}
                   AND NOT EXISTS (
                     SELECT 1 FROM oci_upload_sessions s
-                    WHERE s.storage_temp_key = c.storage_key
+                    WHERE {session}
                   )
                   AND NOT EXISTS (
                     SELECT 1 FROM oci_upload_parts p
@@ -2116,7 +2129,8 @@ impl StorageGcService {
             RETURNING u.id, u.storage_key, u.claim_token,
                       r.storage_backend, r.storage_path
             "#,
-            ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            age = family.age_predicate_sql(),
+            session = family.session_predicate_sql(),
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 3, repo_scope),
         );
@@ -2697,60 +2711,51 @@ impl StorageGcService {
         &self,
         repo_scope: Option<Uuid>,
     ) -> Result<Vec<OciUploadCleanupKey>> {
-        let sql = format!(
-            r#"
-            WITH candidate AS (
-                SELECT c.id
-                FROM oci_upload_cleanup_keys c
-                WHERE c.storage_write_completed_at IS NULL
-                  AND c.created_at < NOW() - {ttl}
-                  AND (c.claim_expires_at IS NULL OR c.claim_expires_at <= NOW())
-                  {scope}
-                  AND NOT EXISTS (
-                    SELECT 1 FROM oci_upload_sessions s
-                    WHERE s.id = c.upload_session_id
-                       OR s.storage_temp_key = c.storage_key
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM oci_upload_parts p
-                    WHERE p.storage_key = c.storage_key
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM oci_blobs b
-                    WHERE b.storage_key = c.storage_key
-                  )
-                ORDER BY c.created_at ASC
-                LIMIT $1
-                FOR UPDATE OF c SKIP LOCKED
-            )
-            UPDATE oci_upload_cleanup_keys u
-            SET claimed_by = $2,
-                claim_token = gen_random_uuid(),
-                claim_expires_at = NOW() + {claim_ttl}
-            FROM candidate, repositories r
-            WHERE u.id = candidate.id
-              AND r.id = u.repository_id
-            RETURNING u.id, u.storage_key, u.claim_token,
-                      r.storage_backend, r.storage_path
-            "#,
-            ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
-            claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
-            scope = repo_scope_clause("c.repository_id", 3, repo_scope),
-        );
-        let mut query = sqlx::query(&sql)
-            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
-            .bind(crate::services::cluster_work::WorkerIdentity::for_process().as_str());
-        if let Some(id) = repo_scope {
-            query = query.bind(id);
-        }
-        let rows = query
-            .fetch_all(&self.db)
+        self.claim_oci_upload_cleanup_keys(repo_scope, OciCleanupKeyFamily::Pending)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+}
 
-        rows.into_iter()
-            .map(|row| decode_oci_cleanup_key_row(&row))
-            .collect()
+/// Which cleanup-key family a claim sweep drains (#3503 PR dedup): aged
+/// PENDING rows (never marked storage-write-complete) or UNREFERENCED
+/// completed rows. The two destructive claims shared their entire SQL
+/// scaffolding; only these predicates differ. Each `*_sql` body is verbatim
+/// the text of the former per-family query, so the generated SQL is
+/// unchanged.
+#[derive(Clone, Copy)]
+enum OciCleanupKeyFamily {
+    Pending,
+    Unreferenced,
+}
+
+impl OciCleanupKeyFamily {
+    /// Family age/eligibility predicate over the candidate row alias `c`.
+    fn age_predicate_sql(self) -> String {
+        match self {
+            OciCleanupKeyFamily::Pending => format!(
+                "c.storage_write_completed_at IS NULL\n                  \
+                 AND c.created_at < NOW() - {}",
+                ABANDONED_OCI_UPLOAD_TTL_SQL
+            ),
+            OciCleanupKeyFamily::Unreferenced => format!(
+                "c.storage_write_completed_at IS NOT NULL\n                  \
+                 AND c.storage_write_completed_at < NOW() - {}",
+                ABANDONED_OCI_UPLOAD_TTL_SQL
+            ),
+        }
+    }
+
+    /// Family live-session guard over aliases `s` (sessions) and `c`.
+    /// Pending keys are also anchored to their own session id; committed
+    /// (part/final/completion temp) keys are intentionally reapable even
+    /// while their session lives — see the SELECT-side comments.
+    fn session_predicate_sql(self) -> &'static str {
+        match self {
+            OciCleanupKeyFamily::Pending => {
+                "s.id = c.upload_session_id\n                       OR s.storage_temp_key = c.storage_key"
+            }
+            OciCleanupKeyFamily::Unreferenced => "s.storage_temp_key = c.storage_key",
+        }
     }
 }
 
