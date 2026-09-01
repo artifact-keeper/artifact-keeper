@@ -222,7 +222,7 @@ prost-build.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
-axum-test = "18"
+axum-test = "19"
 wiremock = "0.6"
 metrics-util = "0.20"
 # Mint self-signed / non-Fulcio leaf certificates for the attestation red-team
