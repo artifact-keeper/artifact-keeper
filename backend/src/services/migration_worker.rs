@@ -795,7 +795,25 @@ impl MigrationWorker {
             .finalize_job_status(job_id, final_status)
             .await?
         {
-            tracing::info!(job_id = %job_id, "Migration paused or cancelled before finalization");
+            // `rows_affected == 0` covers two distinct causes: the guard
+            // skipped a row the operator already paused/cancelled, or the
+            // job row was deleted mid-run. Name the one that happened
+            // (#3498) — a stopped migration is diagnosed from these lines.
+            match self.job_status(job_id).await?.as_deref() {
+                Some(status) => {
+                    tracing::info!(
+                        job_id = %job_id,
+                        status = %status,
+                        "Migration stopped before finalization; leaving the operator's status in place"
+                    );
+                }
+                None => {
+                    tracing::info!(
+                        job_id = %job_id,
+                        "Migration job row deleted before finalization; nothing to finalize"
+                    );
+                }
+            }
             return Ok(());
         }
 
@@ -869,7 +887,11 @@ impl MigrationWorker {
     /// own check, the per-artifact check inside
     /// `process_repository_artifacts` (via `RepoProcessOutcome::Interrupted`,
     /// issue #3380) and a fired cancellation token — all end the same way, so
-    /// they share this exit. Publishing first matters here for the same reason
+    /// they share this exit. Which of pause/cancel stopped the run is decided
+    /// by re-reading the job row, not by the in-process token: production
+    /// never retains a handle to the token (#3498), so the operator's cancel
+    /// reaches this worker only as the `cancelled` status `is_paused` matched
+    /// on. Publishing first matters here for the same reason
     /// it matters at the end of a clean run: a run whose last items were skips
     /// or dry-run reports never reached the per-artifact flush, and a job the
     /// operator can resume should not show fewer items done than were done.
@@ -903,12 +925,37 @@ impl MigrationWorker {
         .await?;
 
         if self.cancel_token.is_cancelled() {
+            // An in-process token cancel leaves no trace in the database (the
+            // row still reads `running`), so the worker is the only writer of
+            // the terminal state.
             tracing::info!(job_id = %job_id, "Migration cancelled by user");
             self.migration_service
                 .update_job_status(job_id, MigrationJobStatus::Cancelled)
                 .await?;
-        } else {
-            tracing::info!(job_id = %job_id, "Migration paused by user");
+            return Ok(());
+        }
+
+        // The operator's pause/cancel is a status write this worker observed
+        // through `is_paused`; nothing in production retains a handle to the
+        // cancellation token (#3498), so the arm above cannot tell the two
+        // apart. Re-read the row and log the transition that actually
+        // happened instead of calling every database-driven stop a pause.
+        // The terminal status itself was already written by the API handler
+        // (`cancel_migration` / `pause_migration`), so there is nothing to
+        // write here.
+        match self.job_status(job_id).await?.as_deref() {
+            Some("cancelled") => {
+                tracing::info!(job_id = %job_id, "Migration cancelled by user");
+            }
+            Some(_) => {
+                tracing::info!(job_id = %job_id, "Migration paused by user");
+            }
+            None => {
+                tracing::info!(
+                    job_id = %job_id,
+                    "Migration job row deleted mid-run; stopping without a terminal write"
+                );
+            }
         }
 
         Ok(())
@@ -2588,6 +2635,22 @@ impl MigrationWorker {
             .fetch_one(&self.db)
             .await?;
         Ok(status.0 == "paused" || status.0 == "cancelled")
+    }
+
+    /// The job row's current status, or `None` when the row is gone.
+    ///
+    /// The interruption/finalization exits read this to name what actually
+    /// stopped the run (#3498): the operator's pause and cancel are both
+    /// status writes the worker observes through the database, and the row
+    /// being deleted mid-run is a third cause that previously hid behind the
+    /// other two in the logs.
+    async fn job_status(&self, job_id: Uuid) -> Result<Option<String>, MigrationError> {
+        let status: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM migration_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_optional(&self.db)
+                .await?;
+        Ok(status.map(|s| s.0))
     }
 
     /// Resume a paused migration job
@@ -5512,6 +5575,12 @@ mod tests {
         /// guard matches and only the `RepoProcessOutcome::Interrupted`
         /// propagation can stop the terminal write.
         CancelToken,
+        /// The operator pauses/cancels AFTER the last per-artifact check: the
+        /// mock flips the job row to this status while returning an EMPTY
+        /// listing, so the repository completes cleanly and the run walks all
+        /// the way to `finalize_job_status`, whose guard then matches zero
+        /// rows (#3498's second log site).
+        JobStatusOnDrain(&'static str),
     }
 
     /// Mock source registry whose artifact listing interrupts the job as a
@@ -5581,6 +5650,25 @@ mod tests {
                         .expect("flip job status mid-listing");
                 }
                 MockInterrupt::CancelToken => self.cancel_token.cancel(),
+                MockInterrupt::JobStatusOnDrain(status) => {
+                    sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
+                        .bind(status)
+                        .bind(self.job_id)
+                        .execute(&self.pool)
+                        .await
+                        .expect("flip job status while draining");
+                    // Empty page: the repository completes with no artifact
+                    // for the per-artifact check to interrupt on, so the run
+                    // reaches finalize_job_status with the flipped status.
+                    return Ok(AqlResponse {
+                        results: vec![],
+                        range: AqlRange {
+                            start_pos: offset,
+                            end_pos: offset,
+                            total: 0,
+                        },
+                    });
+                }
             }
             Ok(AqlResponse {
                 results: vec![AqlResult {
@@ -9072,5 +9160,199 @@ mod tests {
         );
 
         cleanup_repo(&pool, repo_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3498: the interruption/finalization exits name what actually stopped
+    // the run (DB-gated via try_pool)
+    // -----------------------------------------------------------------------
+
+    /// Per-test log capture: a thread-local subscriber collecting every
+    /// event's fields as `name=value` lines. The observable #3498 fixes is a
+    /// LOG LINE (a real user cancel was logged "Migration paused by user"),
+    /// so the tests must assert on what was logged, not only on row state —
+    /// the row state was already correct before the fix.
+    ///
+    /// Thread-local (`set_default`) + the default current-thread
+    /// `#[tokio::test]` runtime keeps capture scoped to one test even when
+    /// the suite runs in parallel.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl LogCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+        fn contains(&self, needle: &str) -> bool {
+            self.0.lock().unwrap().iter().any(|l| l.contains(needle))
+        }
+        fn dump(&self) -> String {
+            self.0.lock().unwrap().join("\n")
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields<'a>(&'a mut String);
+            impl tracing::field::Visit for Fields<'_> {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{}={} ", field.name(), value);
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            let mut line = String::new();
+            event.record(&mut Fields(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+    }
+
+    /// #3498 boundary: a job the operator CANCELLED through the API (a pure
+    /// status write — production retains no handle to the worker's token)
+    /// must be logged as a cancel. Pre-fix, `halt_on_interrupt` keyed the log
+    /// on the never-cancelled token and every real cancel was logged
+    /// "Migration paused by user" — both assertions here fail on the parent
+    /// commit.
+    #[tokio::test]
+    async fn test_api_cancel_is_logged_as_cancel_not_pause_3498() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let capture = LogCapture::default();
+        let _guard = capture.install();
+
+        let (job_id, conn_id, status, _finished) = run_single_repo_job(
+            &pool,
+            "cancel-log-src",
+            MockInterrupt::JobStatus("cancelled"),
+        )
+        .await;
+
+        assert_eq!(status, "cancelled", "sanity: the row keeps the cancel");
+        assert!(
+            capture.contains("Migration cancelled by user"),
+            "a real (API) cancel must be logged as a cancel; got:\n{}",
+            capture.dump()
+        );
+        assert!(
+            !capture.contains("Migration paused by user"),
+            "a real (API) cancel must not be logged as a pause; got:\n{}",
+            capture.dump()
+        );
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// #3498 control: a job the operator PAUSED is still logged as a pause —
+    /// what stops a fix that logs every interruption as a cancel from
+    /// passing the boundary test above.
+    #[tokio::test]
+    async fn test_api_pause_is_still_logged_as_pause_3498() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let capture = LogCapture::default();
+        let _guard = capture.install();
+
+        let (job_id, conn_id, status, _finished) =
+            run_single_repo_job(&pool, "pause-log-src", MockInterrupt::JobStatus("paused")).await;
+
+        assert_eq!(status, "paused", "sanity: the row keeps the pause");
+        assert!(
+            capture.contains("Migration paused by user"),
+            "a pause must still be logged as a pause; got:\n{}",
+            capture.dump()
+        );
+        assert!(
+            !capture.contains("Migration cancelled by user"),
+            "a pause must not be logged as a cancel; got:\n{}",
+            capture.dump()
+        );
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// #3498's second log site: a pause that lands AFTER the last
+    /// per-artifact check is only caught by `finalize_job_status`'s guard
+    /// (`rows_affected == 0`), which also covers a deleted job row. The exit
+    /// must name the observed status rather than guessing "paused or
+    /// cancelled". Pre-fix this logged the ambiguous line; the specific
+    /// assertion fails on the parent commit.
+    #[tokio::test]
+    async fn test_finalize_guard_skip_names_the_observed_status_3498() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let capture = LogCapture::default();
+        let _guard = capture.install();
+
+        let (job_id, conn_id, status, finished) = run_single_repo_job(
+            &pool,
+            "drain-pause-src",
+            MockInterrupt::JobStatusOnDrain("paused"),
+        )
+        .await;
+
+        assert_eq!(status, "paused", "the guard must leave the pause in place");
+        assert!(!finished, "a paused job must not be stamped finished");
+        assert!(
+            capture.contains("Migration stopped before finalization"),
+            "the finalize-guard exit must log with the observed status; got:\n{}",
+            capture.dump()
+        );
+        assert!(
+            capture.contains("status=paused"),
+            "the log line must carry the status the worker re-read; got:\n{}",
+            capture.dump()
+        );
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// The load-bearing shape change under the deleted-row log lines:
+    /// `job_status` reads with `fetch_optional`, so a missing row is `None`
+    /// rather than the `RowNotFound` error `is_paused`'s `fetch_one` raises.
+    #[tokio::test]
+    async fn test_job_status_returns_none_for_a_missing_row_3498() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let staging = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig {
+                staging_path: staging.path().to_str().unwrap().to_string(),
+                ..WorkerConfig::default()
+            },
+            CancellationToken::new(),
+        );
+
+        let status = worker
+            .job_status(Uuid::new_v4())
+            .await
+            .expect("a missing row is not an error");
+        assert_eq!(status, None, "a deleted/missing job row must read as None");
     }
 }
