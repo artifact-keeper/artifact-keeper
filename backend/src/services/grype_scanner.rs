@@ -1332,7 +1332,7 @@ impl GrypeScanner {
         // spawn runs inside a caller-supplied `tokio::time::timeout` (the
         // inline proxy gate's PROXY_SCAN_INLINE_BUDGET /
         // OCI_PROXY_SCAN_INLINE_BUDGET, or the rescan endpoint's wider
-        // PROXY_RESCAN_BUDGET, #3455): when the timeout fires it drops the
+        // proxy_rescan_budget, #3455): when the timeout fires it drops the
         // scan future, and without this the grype child is ORPHANED and runs
         // to completion unsupervised. Widening the rescan budget without this
         // would let timed-out rescans stack orphaned grype processes on
@@ -4266,7 +4266,7 @@ mod tests {
     /// The grype child must be killed if the caller's `tokio::time::timeout`
     /// drops the scan future (#3455): `tokio::process::Command` defaults
     /// `kill_on_drop` to `false`, so without this a timed-out inline proxy
-    /// scan -- or a timed-out rescan under the wider PROXY_RESCAN_BUDGET --
+    /// scan -- or a timed-out rescan under the wider proxy_rescan_budget --
     /// leaves an orphaned grype process running to completion, unsupervised,
     /// on exactly the resource-constrained box that timed out in the first
     /// place.

@@ -110,7 +110,8 @@ pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
 /// pending, fail-closed 423) — never an unscanned serve.
 pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
 
-/// Wall-clock budget for the on-demand proxy-cache rescan endpoint (#3455).
+/// Ceiling for the on-demand proxy-cache rescan budget (#3455). The actual
+/// per-request budget is [`proxy_rescan_budget`]; this constant only caps it.
 ///
 /// [`PROXY_SCAN_INLINE_BUDGET`] exists to bound the latency a scan adds to a
 /// client's `pip install` (#2954) -- a request with a real client waiting on
@@ -122,7 +123,39 @@ pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
 /// rescan. 120s matches [`OCI_PROXY_SCAN_INLINE_BUDGET`], the in-tree
 /// precedent for a context that can legitimately take longer than the file
 /// gate's 30s.
-pub const PROXY_RESCAN_BUDGET: Duration = Duration::from_secs(120);
+pub const PROXY_RESCAN_BUDGET_CEILING: Duration = Duration::from_secs(120);
+
+/// The scan budget an individual rescan request actually runs under (#3455
+/// review, F2).
+///
+/// The rescan route is NOT exempt from the router-wide request timeout
+/// ([`Config::global_request_timeout_secs`](crate::config::Config::global_request_timeout_secs),
+/// default 120s -- `is_byte_transfer_path` exempts only artifact byte
+/// transfers), and that outer clock starts at request arrival, while this
+/// budget's clock starts only after auth, the repository and catalog lookups,
+/// the full cached-object read, and the SHA-256 -- with the verdict/SBOM/CVE
+/// writes still to come after the scan. A budget equal to the outer timeout
+/// therefore always loses the race: the backstop kills the request first,
+/// the operator gets the undifferentiated `SERVICE_UNAVAILABLE` 503 this
+/// endpoint exists to replace, no verdict is recorded, and
+/// `RESCAN_BUDGET_EXCEEDED` becomes dead code.
+///
+/// So the budget is derived from the configured outer timeout with real
+/// headroom -- a quarter of the outer window (at least one second) is
+/// reserved for the pre- and post-scan work above -- and capped at
+/// [`PROXY_RESCAN_BUDGET_CEILING`]. A `0` outer timeout is the config
+/// sentinel for "timeout layer disabled", in which case nothing races the
+/// budget and the ceiling is used directly.
+pub fn proxy_rescan_budget(global_request_timeout_secs: u64) -> Duration {
+    if global_request_timeout_secs == 0 {
+        return PROXY_RESCAN_BUDGET_CEILING;
+    }
+    let outer = Duration::from_secs(global_request_timeout_secs);
+    let headroom = (outer / 4).max(Duration::from_secs(1));
+    outer
+        .saturating_sub(headroom)
+        .min(PROXY_RESCAN_BUDGET_CEILING)
+}
 
 /// Below this size we keep the scan input in heap (`Bytes`) and skip the
 /// tempfile + mmap machinery entirely. The mmap path exists to keep
@@ -6807,6 +6840,47 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    /// Validates the budget/outer-timeout relation (#3455 review, F2): for
+    /// every enabled outer timeout the derived budget must be STRICTLY inside
+    /// it, or the router backstop fires first and `RESCAN_BUDGET_EXCEEDED`
+    /// is unreachable. This is the pure-function half; the router-level
+    /// regression lives with the rescan endpoint in `security.rs`.
+    #[test]
+    fn proxy_rescan_budget_always_fits_inside_the_global_request_timeout() {
+        for outer_secs in [1u64, 2, 3, 5, 8, 30, 60, 119, 120, 121, 300, 86_400] {
+            let budget = proxy_rescan_budget(outer_secs);
+            assert!(
+                budget < Duration::from_secs(outer_secs),
+                "budget {budget:?} must be strictly under the {outer_secs}s outer timeout, \
+                 or the generic timeout 503 always wins the race"
+            );
+            assert!(
+                budget <= PROXY_RESCAN_BUDGET_CEILING,
+                "budget {budget:?} must never exceed the ceiling"
+            );
+        }
+    }
+
+    /// The default deployment (`GLOBAL_REQUEST_TIMEOUT_SECS` unset = 120s)
+    /// must leave real headroom for the work outside the budget clock: auth,
+    /// two DB lookups, up to a 200 MiB object read + SHA-256 before the scan,
+    /// and the verdict/SBOM/CVE writes after it. A quarter of the window is
+    /// reserved, so the default budget is 90s.
+    #[test]
+    fn proxy_rescan_budget_reserves_headroom_at_the_default_timeout() {
+        assert_eq!(proxy_rescan_budget(120), Duration::from_secs(90));
+    }
+
+    /// `0` disables the router timeout layer entirely (see
+    /// `apply_global_backstop`), so nothing races the budget and the full
+    /// ceiling applies. And a very large outer timeout must not inflate the
+    /// budget past the ceiling.
+    #[test]
+    fn proxy_rescan_budget_uses_the_ceiling_when_nothing_races_it() {
+        assert_eq!(proxy_rescan_budget(0), PROXY_RESCAN_BUDGET_CEILING);
+        assert_eq!(proxy_rescan_budget(1_000_000), PROXY_RESCAN_BUDGET_CEILING);
+    }
 
     /// Extract the cancellation-owned `chmod` invocation from
     /// [`ScanWorkspace::cleanup_path`]. A source-shape pin is intentionally

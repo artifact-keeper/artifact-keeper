@@ -6843,8 +6843,8 @@ async fn run_scan_within_budget<T, E>(
 /// callers so the File-vs-OCI rationale (blob staging happens inside the OCI
 /// budget; file bytes are already in hand before the gate) lives in exactly
 /// ONE place. `proxy_scan_and_record` itself no longer chooses a budget --
-/// every caller, including the rescan endpoint with its own
-/// [`PROXY_RESCAN_BUDGET`](crate::services::scanner_service::PROXY_RESCAN_BUDGET),
+/// every caller, including the rescan endpoint with its own derived
+/// [`proxy_rescan_budget`](crate::services::scanner_service::proxy_rescan_budget),
 /// passes one in explicitly.
 pub(crate) fn proxy_scan_mode_budget(mode: &ProxyScanMode) -> std::time::Duration {
     match mode {
