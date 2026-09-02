@@ -1120,7 +1120,7 @@ async fn upload_chart(
             chart_version,
             size_bytes,
             &computed_sha256,
-            None,
+            chart_yaml.description.as_deref(),
             Some(serde_json::json!({ "format": "helm" })),
         )
         .await;
