@@ -26,7 +26,11 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
+/// Base name of the artifacts index, before any configured prefix is applied.
+/// The effective name lives on [`OpenSearchService::artifacts_index`].
 const ARTIFACTS_INDEX: &str = "artifacts";
+/// Base name of the repositories index, before any configured prefix is
+/// applied. See [`OpenSearchService::repositories_index`].
 const REPOSITORIES_INDEX: &str = "repositories";
 const BATCH_SIZE: usize = 1000;
 
@@ -78,31 +82,114 @@ pub struct SearchResults<T> {
 // OpenSearch service
 // ---------------------------------------------------------------------------
 
+/// Characters OpenSearch forbids anywhere in an index name.
+const FORBIDDEN_INDEX_CHARS: [char; 9] = ['\\', '/', '*', '?', '"', '<', '>', '|', ','];
+
+/// Validate a configured index-name prefix.
+///
+/// OpenSearch index names must be lowercase, must not contain whitespace or
+/// any of [`FORBIDDEN_INDEX_CHARS`] (plus `#`), and must not begin with `-`,
+/// `_` or `+`. Because the prefix is prepended to a fixed base name, the
+/// leading-character rule applies to the prefix and every other rule applies
+/// character-wise; validating here turns a deployment typo into a clear
+/// startup error rather than an opaque rejection on the first index write.
+///
+/// An empty prefix is valid and preserves the historical unprefixed names.
+pub(crate) fn validate_index_prefix(prefix: &str) -> Result<()> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+
+    if prefix.chars().any(|c| c.is_whitespace()) {
+        return Err(AppError::Config(format!(
+            "OpenSearch index prefix '{}' must not contain whitespace",
+            prefix
+        )));
+    }
+
+    if prefix.chars().any(|c| c.is_uppercase()) {
+        return Err(AppError::Config(format!(
+            "OpenSearch index prefix '{}' must be lowercase",
+            prefix
+        )));
+    }
+
+    if let Some(bad) = prefix
+        .chars()
+        .find(|c| FORBIDDEN_INDEX_CHARS.contains(c) || *c == '#')
+    {
+        return Err(AppError::Config(format!(
+            "OpenSearch index prefix '{}' must not contain '{}'",
+            prefix, bad
+        )));
+    }
+
+    if prefix.starts_with('-') || prefix.starts_with('_') || prefix.starts_with('+') {
+        return Err(AppError::Config(format!(
+            "OpenSearch index prefix '{}' must not start with '-', '_' or '+'",
+            prefix
+        )));
+    }
+
+    Ok(())
+}
+
 /// OpenSearch service for indexing and searching artifacts and repositories.
 pub struct OpenSearchService {
     client: OpenSearch,
+    /// Effective artifacts index name: the configured prefix followed by
+    /// [`ARTIFACTS_INDEX`]. Resolved once at construction so every operation
+    /// targets the same index.
+    artifacts_index: String,
+    /// Effective repositories index name: the configured prefix followed by
+    /// [`REPOSITORIES_INDEX`].
+    repositories_index: String,
 }
 
 impl std::fmt::Debug for OpenSearchService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenSearchService")
             .field("client", &"<OpenSearch>")
+            .field("artifacts_index", &self.artifacts_index)
+            .field("repositories_index", &self.repositories_index)
             .finish()
     }
 }
 
 impl OpenSearchService {
-    /// Create a new OpenSearchService connected to the given OpenSearch cluster.
+    /// Create a new OpenSearchService with unprefixed index names.
     ///
-    /// When `username` and `password` are provided the client authenticates
-    /// with HTTP basic auth. Set `allow_invalid_certs` to `true` when running
-    /// against a development cluster with self-signed certificates.
+    /// Equivalent to [`Self::new_with_prefix`] with an empty prefix, i.e. the
+    /// indexes are exactly `artifacts` and `repositories`.
     pub fn new(
         url: &str,
         username: Option<&str>,
         password: Option<&str>,
         allow_invalid_certs: bool,
     ) -> Result<Self> {
+        Self::new_with_prefix(url, username, password, allow_invalid_certs, "")
+    }
+
+    /// Create a new OpenSearchService connected to the given OpenSearch cluster,
+    /// namespacing both indexes with `prefix`.
+    ///
+    /// When `username` and `password` are provided the client authenticates
+    /// with HTTP basic auth. Set `allow_invalid_certs` to `true` when running
+    /// against a development cluster with self-signed certificates.
+    ///
+    /// `prefix` is prepended verbatim to both base index names, so `ak-prod-`
+    /// yields `ak-prod-artifacts` and `ak-prod-repositories`. An empty prefix
+    /// preserves the historical unprefixed names. The prefix is validated here
+    /// rather than at first use, so a typo surfaces as a startup configuration
+    /// error instead of an opaque OpenSearch rejection on the first write.
+    pub fn new_with_prefix(
+        url: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+        allow_invalid_certs: bool,
+        prefix: &str,
+    ) -> Result<Self> {
+        validate_index_prefix(prefix)?;
         let parsed = Url::parse(url)
             .map_err(|e| AppError::Config(format!("Invalid OpenSearch URL '{}': {}", url, e)))?;
 
@@ -123,7 +210,19 @@ impl OpenSearchService {
 
         Ok(Self {
             client: OpenSearch::new(transport),
+            artifacts_index: format!("{}{}", prefix, ARTIFACTS_INDEX),
+            repositories_index: format!("{}{}", prefix, REPOSITORIES_INDEX),
         })
+    }
+
+    /// The effective artifacts index name (configured prefix + base name).
+    pub fn artifacts_index(&self) -> &str {
+        &self.artifacts_index
+    }
+
+    /// The effective repositories index name (configured prefix + base name).
+    pub fn repositories_index(&self) -> &str {
+        &self.repositories_index
     }
 
     /// Configure indexes with explicit mappings and custom analyzers.
@@ -134,9 +233,9 @@ impl OpenSearchService {
     /// - `edge_ngram` filter on the `name` field for prefix / typeahead queries
     /// - text + keyword multi-fields so the same field can be searched and filtered
     pub async fn configure_indexes(&self) -> Result<()> {
-        self.ensure_index(ARTIFACTS_INDEX, Self::artifacts_index_body())
+        self.ensure_index(&self.artifacts_index, Self::artifacts_index_body())
             .await?;
-        self.ensure_index(REPOSITORIES_INDEX, Self::repositories_index_body())
+        self.ensure_index(&self.repositories_index, Self::repositories_index_body())
             .await?;
 
         tracing::info!("OpenSearch indexes configured successfully");
@@ -150,7 +249,7 @@ impl OpenSearchService {
 
         let response = self
             .client
-            .index(IndexParts::IndexId(ARTIFACTS_INDEX, &doc.id))
+            .index(IndexParts::IndexId(&self.artifacts_index, &doc.id))
             .body(body)
             .send()
             .await
@@ -175,7 +274,7 @@ impl OpenSearchService {
 
         let response = self
             .client
-            .index(IndexParts::IndexId(REPOSITORIES_INDEX, &doc.id))
+            .index(IndexParts::IndexId(&self.repositories_index, &doc.id))
             .body(body)
             .send()
             .await
@@ -198,7 +297,7 @@ impl OpenSearchService {
     pub async fn remove_artifact(&self, artifact_id: &str) -> Result<()> {
         let response = self
             .client
-            .delete(DeleteParts::IndexId(ARTIFACTS_INDEX, artifact_id))
+            .delete(DeleteParts::IndexId(&self.artifacts_index, artifact_id))
             .send()
             .await
             .map_err(|e| {
@@ -222,7 +321,7 @@ impl OpenSearchService {
     pub async fn remove_repository(&self, repo_id: &str) -> Result<()> {
         let response = self
             .client
-            .delete(DeleteParts::IndexId(REPOSITORIES_INDEX, repo_id))
+            .delete(DeleteParts::IndexId(&self.repositories_index, repo_id))
             .send()
             .await
             .map_err(|e| {
@@ -294,7 +393,7 @@ impl OpenSearchService {
 
         let response = self
             .client
-            .search(SearchParts::Index(&[ARTIFACTS_INDEX]))
+            .search(SearchParts::Index(&[self.artifacts_index.as_str()]))
             .body(body)
             .send()
             .await
@@ -353,7 +452,7 @@ impl OpenSearchService {
 
         let response = self
             .client
-            .search(SearchParts::Index(&[REPOSITORIES_INDEX]))
+            .search(SearchParts::Index(&[self.repositories_index.as_str()]))
             .body(body)
             .send()
             .await
@@ -382,7 +481,7 @@ impl OpenSearchService {
     pub async fn is_index_empty(&self) -> Result<bool> {
         let response = self
             .client
-            .count(CountParts::Index(&[ARTIFACTS_INDEX]))
+            .count(CountParts::Index(&[self.artifacts_index.as_str()]))
             .send()
             .await;
 
@@ -423,7 +522,8 @@ impl OpenSearchService {
     pub async fn full_reindex_artifacts(&self, db: &PgPool) -> Result<usize> {
         tracing::info!("Starting full artifact reindex");
 
-        self.set_refresh_interval(ARTIFACTS_INDEX, "-1").await?;
+        self.set_refresh_interval(&self.artifacts_index, "-1")
+            .await?;
 
         let page_size: i64 = BATCH_SIZE as i64;
         let mut last_id: Option<Uuid> = None;
@@ -495,7 +595,7 @@ impl OpenSearchService {
             let documents = build_artifact_batch(rows, &download_counts);
             let batch_len = documents.len();
 
-            self.bulk_index(ARTIFACTS_INDEX, &documents)
+            self.bulk_index(&self.artifacts_index, &documents)
                 .await
                 .map_err(|e| {
                     AppError::Internal(format!(
@@ -512,8 +612,9 @@ impl OpenSearchService {
             );
         }
 
-        self.set_refresh_interval(ARTIFACTS_INDEX, "1s").await?;
-        self.force_refresh(ARTIFACTS_INDEX).await?;
+        self.set_refresh_interval(&self.artifacts_index, "1s")
+            .await?;
+        self.force_refresh(&self.artifacts_index).await?;
 
         tracing::info!("Artifact reindex complete: {} documents indexed", total);
         Ok(total)
@@ -527,7 +628,8 @@ impl OpenSearchService {
     pub async fn full_reindex_repositories(&self, db: &PgPool) -> Result<usize> {
         tracing::info!("Starting full repository reindex");
 
-        self.set_refresh_interval(REPOSITORIES_INDEX, "-1").await?;
+        self.set_refresh_interval(&self.repositories_index, "-1")
+            .await?;
 
         let page_size: i64 = BATCH_SIZE as i64;
         let mut last_id: Option<Uuid> = None;
@@ -570,7 +672,7 @@ impl OpenSearchService {
             let documents = build_repository_batch(rows);
             let batch_len = documents.len();
 
-            self.bulk_index(REPOSITORIES_INDEX, &documents)
+            self.bulk_index(&self.repositories_index, &documents)
                 .await
                 .map_err(|e| {
                     AppError::Internal(format!(
@@ -587,8 +689,9 @@ impl OpenSearchService {
             );
         }
 
-        self.set_refresh_interval(REPOSITORIES_INDEX, "1s").await?;
-        self.force_refresh(REPOSITORIES_INDEX).await?;
+        self.set_refresh_interval(&self.repositories_index, "1s")
+            .await?;
+        self.force_refresh(&self.repositories_index).await?;
 
         tracing::info!("Repository reindex complete: {} documents indexed", total);
         Ok(total)
@@ -1305,6 +1408,120 @@ mod tests {
     // -----------------------------------------------------------------------
     // Constants tests
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Index prefix (#3669)
+    // -----------------------------------------------------------------------
+
+    /// The default constructor must keep the historical unprefixed names, so
+    /// an existing deployment sees no change on upgrade.
+    #[test]
+    fn test_new_without_prefix_keeps_historical_index_names() {
+        let svc = OpenSearchService::new("http://localhost:9200", None, None, false)
+            .expect("construction should succeed");
+        assert_eq!(svc.artifacts_index(), "artifacts");
+        assert_eq!(svc.repositories_index(), "repositories");
+    }
+
+    /// An explicit empty prefix is equivalent to no prefix.
+    #[test]
+    fn test_empty_prefix_matches_default() {
+        let svc =
+            OpenSearchService::new_with_prefix("http://localhost:9200", None, None, false, "")
+                .expect("empty prefix is valid");
+        assert_eq!(svc.artifacts_index(), "artifacts");
+        assert_eq!(svc.repositories_index(), "repositories");
+    }
+
+    /// A configured prefix namespaces both indexes.
+    #[test]
+    fn test_prefix_namespaces_both_indexes() {
+        let svc = OpenSearchService::new_with_prefix(
+            "http://localhost:9200",
+            None,
+            None,
+            false,
+            "ak-prod-",
+        )
+        .expect("valid prefix");
+        assert_eq!(svc.artifacts_index(), "ak-prod-artifacts");
+        assert_eq!(svc.repositories_index(), "ak-prod-repositories");
+    }
+
+    /// Two instances with different prefixes must not share an index — the
+    /// whole point of #3669.
+    #[test]
+    fn test_distinct_prefixes_do_not_collide() {
+        let a =
+            OpenSearchService::new_with_prefix("http://localhost:9200", None, None, false, "prod-")
+                .unwrap();
+        let b = OpenSearchService::new_with_prefix(
+            "http://localhost:9200",
+            None,
+            None,
+            false,
+            "staging-",
+        )
+        .unwrap();
+        assert_ne!(a.artifacts_index(), b.artifacts_index());
+        assert_ne!(a.repositories_index(), b.repositories_index());
+    }
+
+    #[test]
+    fn test_validate_index_prefix_accepts_empty_and_plain() {
+        assert!(validate_index_prefix("").is_ok());
+        assert!(validate_index_prefix("ak-prod-").is_ok());
+        assert!(validate_index_prefix("team.a-").is_ok());
+        assert!(
+            validate_index_prefix("ak_prod-").is_ok(),
+            "underscore is only barred as the FIRST char"
+        );
+    }
+
+    #[test]
+    fn test_validate_index_prefix_rejects_uppercase() {
+        let err = validate_index_prefix("AK-Prod-").expect_err("uppercase must be rejected");
+        assert!(
+            err.to_string().contains("lowercase"),
+            "error should name the rule, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_index_prefix_rejects_whitespace() {
+        assert!(validate_index_prefix("ak prod-").is_err());
+        assert!(validate_index_prefix("ak\tprod-").is_err());
+    }
+
+    #[test]
+    fn test_validate_index_prefix_rejects_forbidden_chars() {
+        for bad in [
+            "a/b-", "a\\b-", "a*b-", "a?b-", "a\"b-", "a<b-", "a>b-", "a|b-", "a,b-", "a#b-",
+        ] {
+            assert!(
+                validate_index_prefix(bad).is_err(),
+                "prefix {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_index_prefix_rejects_bad_leading_char() {
+        for bad in ["-ak-", "_ak-", "+ak-"] {
+            assert!(
+                validate_index_prefix(bad).is_err(),
+                "prefix {bad:?} should be rejected"
+            );
+        }
+    }
+
+    /// An invalid prefix must fail at construction, not silently at first use.
+    #[test]
+    fn test_new_with_invalid_prefix_fails_construction() {
+        let result =
+            OpenSearchService::new_with_prefix("http://localhost:9200", None, None, false, "BAD-");
+        assert!(result.is_err(), "invalid prefix must fail fast");
+    }
 
     #[test]
     fn test_constants() {
@@ -3707,12 +3924,14 @@ mod tests {
     #[test]
     fn test_configure_indexes_creates_both_indexes() {
         let source = function_source(opensearch_service_source(), "configure_indexes");
+        // Since #3669 the effective names are the resolved per-instance fields
+        // (configured prefix + base constant), not the bare constants.
         assert!(
-            source.contains("ARTIFACTS_INDEX"),
+            source.contains("self.artifacts_index"),
             "configure_indexes should create the artifacts index"
         );
         assert!(
-            source.contains("REPOSITORIES_INDEX"),
+            source.contains("self.repositories_index"),
             "configure_indexes should create the repositories index"
         );
     }
