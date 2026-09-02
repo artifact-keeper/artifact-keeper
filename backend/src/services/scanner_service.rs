@@ -38,6 +38,7 @@ use crate::services::scan_config_service::ScanConfigService;
 use crate::services::scan_result_service::ScanResultService;
 use crate::services::trivy_fs_scanner::TrivyFsScanner;
 use crate::storage::StorageBackend;
+use crate::util::bounded_archive;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -1811,7 +1812,9 @@ enum ArchiveKind {
     Zip,
 }
 
-/// Default ceiling on the cumulative uncompressed bytes written when extracting
+/// Default ceiling on the cumulative uncompressed bytes an extraction may consume:
+/// bytes read from the decoded tar stream (headers and padding included, so no
+/// record type can outrun it), and bytes written for zip. Applies when extracting
 /// a scan-workspace archive (2 GiB). Bounds decompression bombs that expand a
 /// small `.zip`/`.tar.gz`/`.jar`/`.whl` into a PVC-filling tree. Enforced
 /// *during* extraction so a bomb aborts mid-stream rather than after it has
@@ -2060,6 +2063,16 @@ async fn acquire_scan_extraction_permit(repository_id: Uuid) -> ScanExtractionPe
     .await
 }
 
+/// The cumulative-budget breach error, shared by the reader-level budget under
+/// the tar walk and the per-entry copy so a bomb reports identically wherever
+/// it is caught.
+fn extraction_budget_error() -> AppError {
+    AppError::Internal(
+        "Archive expands beyond the extraction budget; refusing to scan suspected decompression bomb"
+            .to_string(),
+    )
+}
+
 /// Copy a single archive entry into `writer`, enforcing the shared cumulative
 /// budget `*remaining`. At most `*remaining + 1` bytes are read (the `+1` lets
 /// an exactly-at-cap breach be detected rather than silently truncated); if the
@@ -2073,13 +2086,17 @@ fn copy_entry_bounded<R: std::io::Read, W: std::io::Write>(
     remaining: &mut u64,
 ) -> Result<()> {
     let mut limited = reader.take(*remaining + 1);
-    let written = std::io::copy(&mut limited, &mut writer)
-        .map_err(|e| AppError::Internal(format!("Failed to write archive entry: {}", e)))?;
+    let written = std::io::copy(&mut limited, &mut writer).map_err(|e| {
+        // The tar walk reads through the reader-level budget, so a breach can
+        // surface here as an `io::Error` rather than as an over-long copy.
+        if bounded_archive::is_decompression_budget_breach(&e) {
+            extraction_budget_error()
+        } else {
+            AppError::Internal(format!("Failed to write archive entry: {}", e))
+        }
+    })?;
     if written > *remaining {
-        return Err(AppError::Internal(
-            "Archive expands beyond the extraction budget; refusing to scan suspected decompression bomb"
-                .to_string(),
-        ));
+        return Err(extraction_budget_error());
     }
     *remaining -= written;
     Ok(())
@@ -2098,20 +2115,16 @@ fn extract_archive_blocking(
     match kind {
         ArchiveKind::TarGz => {
             let decoder = flate2::read::GzDecoder::new(file);
-            unpack_tar(tar::Archive::new(decoder), dst, cancel)
+            unpack_tar(decoder, dst, cancel)
         }
-        ArchiveKind::Tar => unpack_tar(tar::Archive::new(file), dst, cancel),
+        ArchiveKind::Tar => unpack_tar(file, dst, cancel),
         ArchiveKind::Zip => unpack_zip(file, dst, cancel),
     }
 }
 
-fn unpack_tar<R: std::io::Read>(
-    archive: tar::Archive<R>,
-    dst: &Path,
-    cancel: &AtomicBool,
-) -> Result<()> {
+fn unpack_tar<R: std::io::Read>(reader: R, dst: &Path, cancel: &AtomicBool) -> Result<()> {
     unpack_tar_limited(
-        archive,
+        reader,
         dst,
         max_scan_extracted_bytes(),
         MAX_SCAN_EXTRACTED_ENTRIES,
@@ -2120,33 +2133,55 @@ fn unpack_tar<R: std::io::Read>(
 }
 
 /// Bounded tar extraction. Iterates entries manually (rather than
-/// `archive.unpack`) so cumulative-byte, per-entry, and entry-count ceilings
-/// are enforced *during* extraction and a decompression/tar bomb aborts
-/// mid-stream. Traversal (`..`/absolute) entries and symlink/hardlink/special
-/// (device/fifo) entries are skipped; only regular files and directories are
-/// written. Archive permissions are not honoured. The `_limited` seam lets
-/// unit tests drive tiny caps without allocating gigabytes.
+/// `archive.unpack`) so per-entry and entry-count ceilings are enforced
+/// *during* extraction, and traversal (`..`/absolute) entries and
+/// symlink/hardlink/special (device/fifo) entries are skipped; only regular
+/// files and directories are written. Archive permissions are not honoured.
+/// The `_limited` seam lets unit tests drive tiny caps without allocating
+/// gigabytes.
+///
+/// **The cumulative-byte budget wraps the decoded stream BEFORE
+/// `tar::Archive::new`, and it has to** (#3528). A bound applied after the
+/// entry iterator yields cannot be complete: `tar` consumes GNU
+/// LongName/LongLink and PAX extended headers *inside* `entries().next()`, via
+/// `EntryFields::read_all`, which caps only its preallocation at 128 KiB and
+/// then reads the full declared size. The entry-count check, the path guard
+/// and the per-entry copy all run after that has already happened, so a
+/// multi-gigabyte extension record sailed past every one of them. Wrapping the
+/// reader is what `util::bounded_archive` already does for the other
+/// extractors here, and it charges entry bodies, extension records, the
+/// 512-byte header of every member and the padding between them alike. The
+/// per-entry accounting below is kept as defence in depth. Fixed the same way
+/// in `BackupService::extract_entries` (#3526).
 fn unpack_tar_limited<R: std::io::Read>(
-    mut archive: tar::Archive<R>,
+    reader: R,
     dst: &Path,
     max_bytes: u64,
     max_entries: u64,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    let mut archive = tar::Archive::new(bounded_archive::budgeted_to(reader, max_bytes));
     archive.set_overwrite(true);
     archive.set_preserve_permissions(false);
 
     let mut remaining = max_bytes;
     let mut entries_seen: u64 = 0;
 
-    let entries = archive
-        .entries()
-        .map_err(|e| AppError::Internal(format!("Tar extraction failed: {}", e)))?;
+    // A budget breach surfaces as an `io::Error` during the walk; tell it apart
+    // from a genuine format error so the bomb keeps its own message.
+    let walk_err = |e: &std::io::Error| -> AppError {
+        if bounded_archive::is_decompression_budget_breach(e) {
+            extraction_budget_error()
+        } else {
+            AppError::Internal(format!("Tar extraction failed: {}", e))
+        }
+    };
+
+    let entries = archive.entries().map_err(|e| walk_err(&e))?;
 
     for entry in entries {
         check_extraction_cancelled(cancel)?;
-        let mut entry =
-            entry.map_err(|e| AppError::Internal(format!("Tar extraction failed: {}", e)))?;
+        let mut entry = entry.map_err(|e| walk_err(&e))?;
 
         entries_seen += 1;
         if entries_seen > max_entries {
@@ -14815,14 +14850,8 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        let err = unpack_tar_limited(
-            tar::Archive::new(decoder),
-            out.path(),
-            128,
-            1000,
-            &AtomicBool::new(false),
-        )
-        .unwrap_err();
+        let err = unpack_tar_limited(decoder, out.path(), 128, 1000, &AtomicBool::new(false))
+            .unwrap_err();
         assert!(
             err.to_string().contains("decompression bomb"),
             "unexpected error: {err}"
@@ -14835,14 +14864,8 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        let err = unpack_tar_limited(
-            tar::Archive::new(decoder),
-            out.path(),
-            1_000_000,
-            2,
-            &AtomicBool::new(false),
-        )
-        .unwrap_err();
+        let err = unpack_tar_limited(decoder, out.path(), 1_000_000, 2, &AtomicBool::new(false))
+            .unwrap_err();
         assert!(
             err.to_string().contains("too many entries"),
             "unexpected error: {err}"
@@ -14859,7 +14882,7 @@ mod tests {
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
         unpack_tar_limited(
-            tar::Archive::new(decoder),
+            decoder,
             out.path(),
             1_000_000,
             1000,
@@ -14885,7 +14908,7 @@ mod tests {
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
         unpack_tar_limited(
-            tar::Archive::new(decoder),
+            decoder,
             out.path(),
             1_000_000,
             1000,
@@ -14894,6 +14917,205 @@ mod tests {
         .unwrap();
         assert!(out.path().join("legit.txt").exists());
         assert!(!out.path().join("evil_link").exists());
+    }
+
+    /// One raw ustar member: a hand-built 512-byte header with `typeflag`,
+    /// followed by `content` padded to a block boundary. Built by hand because
+    /// `tar::Builder` will not emit an extension record declaring a size it is
+    /// not actually going to write.
+    fn raw_tar_member(name: &str, typeflag: u8, content: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let name_bytes = name.as_bytes();
+        assert!(name_bytes.len() < 100, "test name must fit the ustar field");
+        header[..name_bytes.len()].copy_from_slice(name_bytes);
+        header[100..107].copy_from_slice(b"0000644"); // mode
+        header[108..115].copy_from_slice(b"0000000"); // uid
+        header[116..123].copy_from_slice(b"0000000"); // gid
+        header[124..135].copy_from_slice(format!("{:011o}", content.len()).as_bytes());
+        header[136..147].copy_from_slice(b"00000000000"); // mtime
+        header[156] = typeflag;
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        // Checksum is computed with the checksum field itself read as spaces.
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|b| *b as u32).sum();
+        let chk = format!("{:06o}\0 ", sum);
+        header[148..156].copy_from_slice(chk.as_bytes());
+
+        let mut out = header.to_vec();
+        out.extend_from_slice(content);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+        out
+    }
+
+    /// One PAX extended-header record: `"<len> <key>=<value>\n"`, where `<len>`
+    /// counts its own decimal digits. Solved by iterating to a fixed point.
+    fn pax_record(key: &str, value_len: usize) -> Vec<u8> {
+        let body = key.len() + 1 + value_len + 2; // key + '=' + value + ' ' + '\n'
+        let mut total = body + 1;
+        loop {
+            let next = body + total.to_string().len();
+            if next == total {
+                break;
+            }
+            total = next;
+        }
+        let mut out = format!("{} {}=", total, key).into_bytes();
+        out.extend(std::iter::repeat_n(b'a', value_len));
+        out.push(b'\n');
+        assert_eq!(
+            out.len(),
+            total,
+            "pax record length must be self-consistent"
+        );
+        out
+    }
+
+    /// Two zero blocks terminate a tar; gzip it as the extractor expects.
+    fn gzip_tar(mut members: Vec<u8>) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        members.extend_from_slice(&[0u8; 1024]);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&members).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Counts the bytes actually pulled from the decoded stream, so the test can
+    /// assert the extension record was refused *before* being read rather than
+    /// merely that an error came back afterwards.
+    struct CountingReader<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    /// #3528: the tar reader consumes GNU LongName / LongLink and PAX extended
+    /// headers **inside `entries().next()`**, via `EntryFields::read_all()`,
+    /// which caps only its *preallocation* at 128 KiB and then reads the full
+    /// declared size. Every bound this extractor used to apply — the entry
+    /// count, the path guard, `copy_entry_bounded` — runs after the iterator has
+    /// yielded, so none of them ever saw those bytes and a record declaring
+    /// gigabytes was decompressed in full while the call returned `Ok`.
+    ///
+    /// The budget therefore wraps the decoded stream before `tar::Archive::new`.
+    /// Same defect and same fix as `BackupService::extract_entries` (#3526).
+    #[test]
+    fn test_tar_extension_records_bounded_limited() {
+        // 1 MiB declared inside an extension record against a 1 KiB budget.
+        // Small enough to be cheap either way; the mechanism is the same at any
+        // size, and the counting reader is what proves it is not read.
+        const BOMB: usize = 1024 * 1024;
+        const BUDGET: u64 = 1024;
+
+        let long_name = vec![b'a'; BOMB];
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "GNU LongName",
+                [
+                    raw_tar_member("././@LongName", b'L', &long_name),
+                    raw_tar_member("short", b'0', b"payload"),
+                ]
+                .concat(),
+            ),
+            (
+                "GNU LongLink",
+                [
+                    raw_tar_member("././@LongLink", b'K', &long_name),
+                    raw_tar_member("short", b'0', b"payload"),
+                ]
+                .concat(),
+            ),
+            (
+                "PAX extended header",
+                [
+                    raw_tar_member("PaxHeader/short", b'x', &pax_record("comment", BOMB)),
+                    raw_tar_member("short", b'0', b"payload"),
+                ]
+                .concat(),
+            ),
+        ];
+
+        for (label, members) in cases {
+            let archive = gzip_tar(members);
+            let out = tempfile::tempdir().unwrap();
+            let read = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let decoder = CountingReader {
+                inner: flate2::read::GzDecoder::new(&archive[..]),
+                read: std::rc::Rc::clone(&read),
+            };
+
+            let err =
+                unpack_tar_limited(decoder, out.path(), BUDGET, 1000, &AtomicBool::new(false))
+                    .err()
+                    .unwrap_or_else(|| panic!("{label}: must be refused, not decompressed"));
+            assert!(
+                err.to_string().contains("decompression bomb"),
+                "{label}: unexpected error: {err}"
+            );
+            // The budget bounds the READER, so the record is never inflated: at
+            // most `BUDGET + 1` decoded bytes are pulled (the `+1` is the probe
+            // that distinguishes a clean EOF at the cap from further data).
+            assert!(
+                read.get() <= BUDGET + 1,
+                "{label}: read {} decoded bytes for a {BUDGET}-byte budget; the \
+                 {BOMB}-byte record was inflated",
+                read.get()
+            );
+        }
+    }
+
+    /// Control: the budget bounds extension records, it does not reject them.
+    /// A path over the 100-char ustar name field is written as a GNU LongName
+    /// record by `tar::Builder` (the repo's own `build_backup_tar` relies on
+    /// this, #758), so refusing the record type outright would break ordinary
+    /// archives.
+    #[test]
+    fn test_tar_long_path_extension_record_still_extracts_limited() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let long_path = format!("deep/{}leaf.txt", "nested/".repeat(20));
+        assert!(
+            long_path.len() > 100,
+            "the test path must exceed the 100-char ustar name field"
+        );
+
+        let mut buf = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut buf, Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(7);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            tar.append_data(&mut header, &long_path, &b"payload"[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        let out = tempfile::tempdir().unwrap();
+        let decoder = flate2::read::GzDecoder::new(&buf[..]);
+        unpack_tar_limited(
+            decoder,
+            out.path(),
+            1_000_000,
+            1000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join(&long_path)).unwrap(),
+            "payload"
+        );
     }
 
     /// Build a tar.gz whose single entry carries an attacker-controlled raw
@@ -14947,14 +15169,7 @@ mod tests {
             let archive = create_tar_gz_raw_name(raw, b"PWNED");
             let decoder = flate2::read::GzDecoder::new(&archive[..]);
             // Extraction itself succeeds (entry silently skipped), no error.
-            unpack_tar_limited(
-                tar::Archive::new(decoder),
-                &out,
-                1_000_000,
-                1000,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            unpack_tar_limited(decoder, &out, 1_000_000, 1000, &AtomicBool::new(false)).unwrap();
         }
 
         // Nothing was written anywhere under the tempdir root except the
