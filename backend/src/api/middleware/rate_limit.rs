@@ -311,6 +311,52 @@ impl RateLimiter {
         Ok(self.max_requests.saturating_sub(entry.0))
     }
 
+    /// Peek at `key`'s budget **without** consuming it.
+    ///
+    /// Returns `Ok(remaining)` when the bucket still has room, or
+    /// `Err(retry_after_secs)` when it is full. Paired with
+    /// [`Self::record_attempt`] for the failed-login-per-IP cap (#3504), which
+    /// must charge only attempts that actually failed: the check has to happen
+    /// before the handler runs and the charge only after it answers, so
+    /// [`Self::check_rate_limit`]'s check-and-consume shape does not fit.
+    pub async fn peek_rate_limit(&self, key: &str) -> Result<u32, u64> {
+        let now = Instant::now();
+        let requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(&(count, window_start)) = requests.get(key) else {
+            return Ok(self.max_requests);
+        };
+        // An expired window is as good as an absent one; the next
+        // `record_attempt` restarts it.
+        if now.duration_since(window_start) >= self.window {
+            return Ok(self.max_requests);
+        }
+        if count >= self.max_requests {
+            let retry_after = self.window.as_secs() - now.duration_since(window_start).as_secs();
+            return Err(retry_after.max(1));
+        }
+        Ok(self.max_requests - count)
+    }
+
+    /// Charge one unit against `key`'s budget, starting a fresh window when
+    /// the previous one has expired.
+    ///
+    /// Unlike [`Self::check_rate_limit`] this never refuses — it only records.
+    /// Refusal is [`Self::peek_rate_limit`]'s job on the *next* request, which
+    /// is what lets a limiter count outcomes rather than arrivals (#3504).
+    pub async fn record_attempt(&self, key: &str) {
+        let now = Instant::now();
+        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+
+        let entry = requests.entry(key.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) >= self.window {
+            entry.0 = 1;
+            entry.1 = now;
+            return;
+        }
+        entry.0 = entry.0.saturating_add(1);
+    }
+
     /// Clean up expired entries from the rate limiter.
     /// Call this periodically to prevent memory bloat.
     pub async fn cleanup_expired(&self) {
@@ -445,6 +491,12 @@ pub struct LoginRateLimitState {
     /// Global shedding backstop, keyed on a single constant bucket. Capacity is
     /// sized far above any legitimate concurrent-login volume.
     pub backstop: Arc<RateLimiter>,
+    /// Per-source-IP cap on *failed* logins, independent of the username
+    /// (#3504). The per-key bucket above is keyed `login:{username}|{ip}`, so
+    /// an attacker enumerating usernames gets a fresh bucket for every
+    /// candidate and only the global backstop is left. This one charges the
+    /// source IP for each failed attempt whatever username it named.
+    pub failed_by_ip: Arc<RateLimiter>,
 }
 
 /// Build the login rate-limit key from a username and the request's client IP.
@@ -456,6 +508,18 @@ pub struct LoginRateLimitState {
 /// identity 1:1.
 pub fn login_rate_limit_key(username: &str, client_ip: &str) -> String {
     format!("login:{}|{}", username, client_ip)
+}
+
+/// Build the failed-login key for a client IP (#3504).
+///
+/// Deliberately carries **no** username: [`login_rate_limit_key`] partitions
+/// per `(username, ip)` so that a flood against one identity cannot lock out
+/// others, which also means a caller who changes the username on every request
+/// never reuses a bucket. This key is the username-independent companion that
+/// bounds exactly that sweep. Prefixed so it cannot collide with a
+/// `login_rate_limit_key` value in a shared map.
+pub fn login_failed_ip_key(client_ip: &str) -> String {
+    format!("login-failed:{}", client_ip)
 }
 
 /// Login-only rate-limit middleware.
@@ -513,7 +577,7 @@ pub async fn login_rate_limit_middleware(
             // Body too large or unreadable: not a legitimate login. Reconstruct
             // an empty-bodied request keyed by IP and let the handler reject it.
             let request = Request::from_parts(parts, Body::empty());
-            return run_login_with_key(&state, &client_ip, request, next).await;
+            return run_login_with_key(&state, &client_ip.clone(), &client_ip, request, next).await;
         }
     };
 
@@ -535,7 +599,7 @@ pub async fn login_rate_limit_middleware(
     // Reattach the buffered body unchanged (Content-Type/headers in `parts`
     // are preserved) so the login handler's extractor sees the original body.
     let request = Request::from_parts(parts, Body::from(bytes));
-    run_login_with_key(&state, &key, request, next).await
+    run_login_with_key(&state, &key, &client_ip, request, next).await
 }
 
 /// Apply the global backstop, then the per-key login limiter, then run the
@@ -544,6 +608,7 @@ pub async fn login_rate_limit_middleware(
 async fn run_login_with_key(
     state: &LoginRateLimitState,
     key: &str,
+    client_ip: &str,
     request: Request,
     next: Next,
 ) -> Response {
@@ -553,12 +618,33 @@ async fn run_login_with_key(
         return too_many_requests(retry_after, state.backstop.max_requests);
     }
 
+    // Per-IP failed-login cap (#3504). Checked without consuming, and charged
+    // below only when the attempt actually failed, so a shared NAT egress
+    // logging in successfully is never throttled while a username sweep from
+    // one origin runs out of budget after `max_requests` failures.
+    let failed_key = login_failed_ip_key(client_ip);
+    if let Err(retry_after) = state.failed_by_ip.peek_rate_limit(&failed_key).await {
+        tracing::warn!(
+            target: "security",
+            client_ip = %client_ip,
+            retry_after,
+            "failed-login cap exceeded for source IP"
+        );
+        return too_many_requests(retry_after, state.failed_by_ip.max_requests);
+    }
+
     match state.inner.limiter.check_rate_limit(key).await {
-        Ok(remaining) => tag_allowed(
-            next.run(request).await,
-            state.inner.limiter.max_requests,
-            remaining,
-        ),
+        Ok(remaining) => {
+            let response = next.run(request).await;
+            // 401 is the only status the login handler produces for a rejected
+            // credential, and since #3504 it is the same 401 for every arm —
+            // which is exactly why the cap has to be counted here rather than
+            // inferred from the body.
+            if response.status() == StatusCode::UNAUTHORIZED {
+                state.failed_by_ip.record_attempt(&failed_key).await;
+            }
+            tag_allowed(response, state.inner.limiter.max_requests, remaining)
+        }
         Err(retry_after) => {
             tracing::debug!(key = %key, retry_after, "login rate limit exceeded");
             too_many_requests(retry_after, state.inner.limiter.max_requests)
@@ -1917,6 +2003,9 @@ mod tests {
                 trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(backstop, 60)),
+            // Generous: this helper's handler always answers 200, so the
+            // #3504 failed-login cap is never charged here.
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
         };
         axum::Router::new()
             .route("/login", post(|| async { "ok" }))
@@ -2011,6 +2100,103 @@ mod tests {
         );
     }
 
+    /// Build a login app whose handler always answers 401, with the #3504
+    /// per-IP failed-login cap set to `failed_per_ip`. The per-key bucket is
+    /// left generous so the only thing that can shed is the per-IP cap.
+    fn failing_login_app(failed_per_ip: u32) -> axum::Router {
+        use axum::routing::post;
+        let state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(10_000, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: true,
+                trusted_proxies: Arc::new(Vec::new()),
+            },
+            backstop: Arc::new(RateLimiter::new(10_000, 60)),
+            failed_by_ip: Arc::new(RateLimiter::new(failed_per_ip, 60)),
+        };
+        axum::Router::new()
+            .route(
+                "/login",
+                post(|| async { StatusCode::UNAUTHORIZED.into_response() }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                login_rate_limit_middleware,
+            ))
+    }
+
+    #[tokio::test]
+    async fn test_failed_logins_are_capped_per_ip_across_distinct_usernames() {
+        // #3504: `login_rate_limit_key` is `login:{username}|{ip}`, so an
+        // attacker who changes the username on every request never reuses a
+        // bucket and the per-(username, IP) budget never bites. The per-IP
+        // failed-login cap is what bounds that sweep.
+        const CAP: u32 = 5;
+        let app = failing_login_app(CAP);
+
+        // CAP failures, each naming a DIFFERENT username from one IP: every
+        // one reaches the handler and is rejected on its merits.
+        for i in 0..CAP {
+            assert_eq!(
+                login_once(&app, &format!("sweep-{i}"), "10.0.0.1").await,
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} must reach the handler"
+            );
+        }
+
+        // The next one — a fresh username again, so a fresh per-key bucket —
+        // is shed by the per-IP cap instead.
+        assert_eq!(
+            login_once(&app, "sweep-final", "10.0.0.1").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a username sweep from one IP must exhaust the per-IP failed-login cap"
+        );
+
+        // A different source IP is untouched: the cap bounds an origin, not
+        // the endpoint.
+        assert_eq!(
+            login_once(&app, "sweep-final", "10.0.0.2").await,
+            StatusCode::UNAUTHORIZED,
+            "a different source IP must have an independent failed-login budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_logins_are_not_charged_to_the_per_ip_cap() {
+        // Only failures are charged (#3504), so a shared NAT egress whose
+        // users log in successfully never reaches the cap. `login_app`'s
+        // handler answers 200.
+        let app = login_app(10_000, 10_000);
+        for i in 0..20 {
+            assert_eq!(
+                login_once(&app, &format!("user-{i}"), "10.0.0.1").await,
+                StatusCode::OK,
+                "successful login {i} must not be charged to the failed-login cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peek_rate_limit_does_not_consume_budget() {
+        // `peek_rate_limit` must report without charging, or the failed-login
+        // cap would count arrivals rather than failures (#3504).
+        let limiter = RateLimiter::new(2, 60);
+        assert_eq!(limiter.peek_rate_limit("k").await, Ok(2));
+        assert_eq!(limiter.peek_rate_limit("k").await, Ok(2));
+
+        limiter.record_attempt("k").await;
+        assert_eq!(limiter.peek_rate_limit("k").await, Ok(1));
+        limiter.record_attempt("k").await;
+        assert!(
+            limiter.peek_rate_limit("k").await.is_err(),
+            "a full bucket must refuse"
+        );
+        // Recording past the cap must not wrap or reopen the bucket.
+        limiter.record_attempt("k").await;
+        assert!(limiter.peek_rate_limit("k").await.is_err());
+    }
+
     #[tokio::test]
     async fn test_login_middleware_preserves_body_for_handler() {
         // A valid login through the middleware must reach the handler with its
@@ -2025,6 +2211,9 @@ mod tests {
                 trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
+            // Generous: these tests exercise the per-key and backstop
+            // buckets, not the #3504 failed-login cap.
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
         };
         let app = axum::Router::new()
             .route(
@@ -2075,6 +2264,9 @@ mod tests {
                 trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(1, 60)),
+            // Generous: these tests exercise the per-key and backstop
+            // buckets, not the #3504 failed-login cap.
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
         };
         let app = axum::Router::new()
             .route("/login", post(|| async { "ok" }))
@@ -2100,6 +2292,9 @@ mod tests {
                 trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
+            // Generous: these tests exercise the per-key and backstop
+            // buckets, not the #3504 failed-login cap.
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
         };
         let app = axum::Router::new()
             .route("/login", post(|| async { "ok" }))

@@ -317,12 +317,20 @@ pub async fn login(
     // 503s under moderate load.
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
+    // `authenticate_for_login`, not `authenticate`: this is the one
+    // unauthenticated credential surface, so it pays the bcrypt timing pad
+    // that the Basic-auth package-manager paths must not, and it hands back
+    // the server-side reason behind the deliberately uniform error (#3504).
     let (user, tokens) = match auth_service
-        .authenticate(&payload.username, &payload.password)
+        .authenticate_for_login(&payload.username, &payload.password)
         .await
     {
         Ok(result) => result,
-        Err(err) => {
+        Err(failure) => {
+            // The response no longer says which arm rejected the login, so the
+            // audit event carries it instead: a SIEM can still separate a
+            // username sweep (`unknown_or_inactive_user`) from a locked-out
+            // user (`account_locked`) without any of it reaching the client.
             audit_auth(
                 &state,
                 AuditAction::LoginFailed,
@@ -330,11 +338,11 @@ pub async fn login(
                 None,
                 crate::services::audit_export::details::AuthDetails::failed_login(
                     Some(&payload.username),
-                    None,
+                    failure.reason,
                 ),
             )
             .await;
-            return Err(err);
+            return Err(failure.error);
         }
     };
 

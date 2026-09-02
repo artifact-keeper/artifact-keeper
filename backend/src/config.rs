@@ -694,6 +694,26 @@ pub struct Config {
     /// longer, lockout-style window (default 15 minutes). Env var:
     /// `RATE_LIMIT_LOGIN_WINDOW_SECS`. Default: 900.
     pub rate_limit_login_window_secs: u64,
+    /// Maximum **failed** login attempts per source IP per
+    /// `rate_limit_login_failed_per_ip_window_secs`, counted regardless of
+    /// which username each attempt named (#3504).
+    ///
+    /// `rate_limit_login_per_window` is keyed per-`(username, IP)`, which is
+    /// what keeps a flood against one identity from locking out others — and
+    /// what leaves a caller who changes the username on every request with a
+    /// fresh bucket each time, bounded only by the global backstop. This
+    /// budget is the username-independent companion: it charges the source IP
+    /// for every failed attempt, so a username sweep from one origin stops
+    /// after this many failures. Only failures are charged, so a shared NAT
+    /// egress whose users log in successfully never reaches it. Env var:
+    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW`. Default: 30.
+    pub rate_limit_login_failed_per_ip_per_window: u32,
+    /// Window length for the per-IP failed-login cap, in seconds. Shorter than
+    /// `rate_limit_login_window_secs` because it bounds a sweep rather than
+    /// locking an account: a legitimate user who mistypes a password a few
+    /// times recovers in minutes. Env var:
+    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_WINDOW_SECS`. Default: 300.
+    pub rate_limit_login_failed_per_ip_window_secs: u64,
     /// Maximum self-password-change attempts per user per
     /// `rate_limit_password_change_window_secs`. Tighter than the global API
     /// bucket because `POST /users/:id/password` verifies the current
@@ -962,6 +982,8 @@ redacted_debug!(Config {
     show rate_limit_login_global_per_window,
     show rate_limit_login_per_window,
     show rate_limit_login_window_secs,
+    show rate_limit_login_failed_per_ip_per_window,
+    show rate_limit_login_failed_per_ip_window_secs,
     show rate_limit_password_change_per_window,
     show rate_limit_password_change_window_secs,
     show rate_limit_window_secs,
@@ -1081,6 +1103,8 @@ impl Default for Config {
             rate_limit_login_global_per_window: 8192,
             rate_limit_login_per_window: 10,
             rate_limit_login_window_secs: 900,
+            rate_limit_login_failed_per_ip_per_window: 30,
+            rate_limit_login_failed_per_ip_window_secs: 300,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -1347,6 +1371,14 @@ impl Config {
             ),
             rate_limit_login_per_window: env_parse("RATE_LIMIT_LOGIN_PER_WINDOW", 10),
             rate_limit_login_window_secs: env_parse("RATE_LIMIT_LOGIN_WINDOW_SECS", 900),
+            rate_limit_login_failed_per_ip_per_window: env_parse(
+                "RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW",
+                30,
+            ),
+            rate_limit_login_failed_per_ip_window_secs: env_parse(
+                "RATE_LIMIT_LOGIN_FAILED_PER_IP_WINDOW_SECS",
+                300,
+            ),
             rate_limit_password_change_per_window: env_parse(
                 "RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW",
                 5,

@@ -108,6 +108,8 @@ fn test_config(storage_path: &str) -> Config {
         rate_limit_login_global_per_window: 8192,
         rate_limit_login_per_window: 10,
         rate_limit_login_window_secs: 900,
+        rate_limit_login_failed_per_ip_per_window: 30,
+        rate_limit_login_failed_per_ip_window_secs: 300,
         rate_limit_window_secs: 60,
         rate_limit_exempt_usernames: Vec::new(),
         rate_limit_exempt_service_accounts: false,
