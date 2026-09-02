@@ -56,12 +56,44 @@
 #   Findings are printed in full and raised as a workflow warning, so the
 #   information is not lost -- it is just not the thing that stops the tag.
 #
+# THE SIZE CEILING (issue #3636)
+#   `cargo audit bin` refuses, before opening the file, any binary larger than
+#   a default 100 MiB:
+#
+#       error: bad parameter: binary dist/artifact-keeper-linux-amd64 exceeds
+#              max size limit of 104857600 bytes
+#       $ echo $?
+#       2
+#
+#   That is what happened on the v1.8.2 tag. Measured on the real published
+#   v1.8.1 assets and the real v1.8.2 build artifact:
+#
+#       linux-amd64    119,661,680  +14.1 MiB over  -> gate could not run
+#       linux-arm64    102,317,720    2.4 MiB under -> gate ran, 721 deps
+#       windows-amd64  139,272,192  +32.8 MiB over  -> gate could not run
+#
+#   The x86_64/aarch64 split is not a build-configuration difference. Both
+#   linux binaries are reported `stripped` by file(1) and `[profile.release]
+#   strip = true` is already set in Cargo.toml, so STRIPPING IS NOT AN
+#   AVAILABLE REMEDY HERE -- it is already applied. The architectures simply
+#   straddle the limit, and aarch64 clears it by 2.4 MiB, which is one
+#   dependency bump from failing too.
+#
+#   So the ceiling is raised explicitly, rather than passed `0` (unlimited).
+#   The point of a ceiling is that a multi-GB file packaged under the binary's
+#   name should be refused rather than read into the runner's memory; the point
+#   of raising it is that ~114 MiB is the size our binaries legitimately are.
+#   A binary over the RAISED ceiling still BLOCKS, at the named arm below --
+#   the gate does not stop failing closed just because the number moved.
+#
 # Env:
 #   BINARY                (required) path to the built binary to inspect
 #   SBOM                  (optional) path to the CycloneDX .cdx.json for the
 #                         same target; validated when set
 #   MIN_DEPS              default 50  -- floor on embedded dependency count
 #   MIN_SBOM_COMPONENTS   default 50  -- floor on CycloneDX component count
+#   MAX_BINARY_SIZE       default 512MiB -- ceiling handed to `cargo audit bin`
+#                         (see THE SIZE CEILING below)
 #   GITHUB_STEP_SUMMARY   appended to when set
 #
 # Exit codes:
@@ -80,6 +112,7 @@ BINARY="${BINARY:-}"
 SBOM="${SBOM:-}"
 MIN_DEPS="${MIN_DEPS:-50}"
 MIN_SBOM_COMPONENTS="${MIN_SBOM_COMPONENTS:-50}"
+MAX_BINARY_SIZE="${MAX_BINARY_SIZE:-536870912}"   # 512 MiB; see THE SIZE CEILING
 
 declare -a detail=()
 say() { detail+=("$1"); printf '  %s\n' "$1"; }
@@ -141,9 +174,30 @@ command -v cargo   >/dev/null 2>&1 || infra "cargo is not on PATH."
 # ---------------------------------------------------------------------------
 printf '\n1. cargo audit bin\n'
 
+# Reported unconditionally: the v1.8.2 failure was invisible until someone
+# measured the artifact, and the aarch64 headroom is small enough that the
+# number is worth having in every release log.
+bin_bytes="$(wc -c < "$BINARY" | tr -d '[:space:]')"
+echo "      size: ${bin_bytes} bytes (ceiling ${MAX_BINARY_SIZE})"
+
+# `--max-binary-size` is load-bearing (issue #3636), and cargo-audit is
+# installed as `@latest`, so the flag is not guaranteed to be there. Detect it
+# rather than discover its absence as an unparseable answer: a tool that cannot
+# be driven is a measurement that did not happen, which is INFRA, not a pass.
+help_out="$(cargo audit bin --help 2>&1)" || true
+if ! printf '%s' "$help_out" | grep -qF -- "--max-binary-size"; then
+  # Distinguish "no cargo-audit" from "a cargo-audit that lost the flag".
+  # Both are INFRA, but they are different things to go and fix, and the
+  # not-installed case would otherwise be reported as a flag problem.
+  if printf '%s' "$help_out" | grep -qiE "no such (file or directory|subcommand)|is not installed|Unrecognized|command not found"; then
+    infra "\`cargo audit bin\` is unavailable (is cargo-audit installed in this job?). The embedded data was not inspected."
+  fi
+  infra "this cargo-audit's \`bin\` subcommand has no --max-binary-size flag, so the ${bin_bytes}-byte binary cannot be submitted to it. Pin a cargo-audit that has it, or update this gate to the flag's new name. Nothing was measured."
+fi
+
 audit_out=""
 audit_rc=0
-audit_out="$(cargo audit --color never bin "$BINARY" 2>&1)" || audit_rc=$?
+audit_out="$(cargo audit --color never bin --max-binary-size "$MAX_BINARY_SIZE" "$BINARY" 2>&1)" || audit_rc=$?
 printf '%s\n' "$audit_out" | sed 's/^/      /'
 
 # `cargo audit` is installed via taiki-e/install-action in the same job; a
@@ -157,6 +211,18 @@ fi
 if printf '%s' "$audit_out" | grep -qiE "couldn't fetch|error fetching|unable to fetch|failed to fetch|connection refused|no such host|i/o timeout|TLS handshake|context deadline exceeded" \
    && ! printf '%s' "$audit_out" | grep -q "cargo auditable"; then
   infra "cargo-audit could not load its advisory database, so it never got as far as reading ${BINARY}."
+fi
+
+# Over even the RAISED ceiling. cargo-audit exits 2 here having never opened
+# the file, so nothing about the artifact was established. It is nonetheless
+# BLOCKED rather than INFRA: at 512 MiB this is not a transient condition a
+# retry clears, it is a binary that is either wrong or has grown far past what
+# this release ships, and either way a human has to look. The distinct message
+# exists so that person is told which knob moved, instead of being handed the
+# generic "unrecognised answer" verdict that made the v1.8.2 failure take a
+# log dive to understand.
+if printf '%s' "$audit_out" | grep -qE "exceeds max size limit"; then
+  block "${BINARY} is ${bin_bytes} bytes, over the ${MAX_BINARY_SIZE}-byte ceiling this gate hands \`cargo audit bin\`, so its embedded dependency graph was never read. Raise MAX_BINARY_SIZE if the release binary has legitimately grown; otherwise find out what got packaged under this name."
 fi
 
 # THE ARM THAT MATTERS. cargo-audit prints this and exits 0.

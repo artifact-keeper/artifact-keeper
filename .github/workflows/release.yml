@@ -171,8 +171,11 @@ jobs:
   # docker-publish.yml runs INDEPENDENTLY on the same tag push and publishes
   # ghcr.io/.../artifact-keeper-backend:${VERSION} as a manifest list. A
   # cross-workflow `needs:` is impossible, so this job is the explicit gate:
-  # it follows the docker-publish RUN for this exact commit+tag to completion
-  # via the Actions API, then resolves the published digest from the registry.
+  # it waits, via the Actions API, for a SUCCESSFUL docker-publish run for
+  # this exact commit+tag -- the tag push's own run, or the documented
+  # `promote_version` recovery dispatch (#2698), which a re-tagged version
+  # needs because immutability correctly fails the push run forever (#3640) --
+  # then resolves the published digest from the registry.
   # Once merge-backend has pushed the tag, the digest-aware republish guard
   # (`assert-version-digest-consistent`) in docker-publish.yml guarantees it can
   # never be re-pointed to DIFFERENT content -- only re-applied to the same
@@ -214,7 +217,19 @@ jobs:
       backend_digest: ${{ steps.resolve.outputs.backend_digest }}   # sha256:...
       version: ${{ steps.resolve.outputs.version }}
     steps:
-      - name: Wait for the docker-publish run for this commit to complete
+      # scripts/ci for the resolver + adoption gate, .github/scripts for the
+      # registry probes, and full history so the adoption gate can diff the
+      # published image's source revision against the tag (the sparse worktree
+      # does not limit object-level `git diff <rev> <sha>`).
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          sparse-checkout: |
+            scripts/ci
+            .github/scripts
+
+      - name: Wait for a successful docker-publish run for this commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -222,47 +237,83 @@ jobs:
           echo "Locating the docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA}"
 
           # The same tag push triggers docker-publish.yml independently; find
-          # ITS run for this exact commit+tag. Webhook fan-out can lag, so
-          # allow up to 15 minutes for the run to appear before declaring
-          # docker-publish dead (a dead publish must fail this job RED rather
-          # than let a skipped gate slip the release through).
+          # a SUCCESSFUL run of it for this exact commit+tag. Selection lives
+          # in scripts/ci/resolve-candidate-publish-run.sh (self-tested by its
+          # sibling test-*.sh): it accepts `push` OR `workflow_dispatch` runs,
+          # because on a RE-TAGGED version the push run fails permanently on
+          # image immutability and the documented recovery is a
+          # `promote_version` dispatch (#2698) -- which re-points tags at the
+          # digest :$VERSION already names, rebuilding nothing, so the digest
+          # captured below is still the digest the gate then tests (#3640).
+          # It stays fail-closed: no successful run of either kind for this
+          # sha+ref blocks the release RED.
+          #
+          # Webhook fan-out can lag, so allow up to 15 minutes for a run to
+          # appear before declaring docker-publish dead. Once a run has been
+          # seen, there is deliberately NO fixed clock -- the job-level
+          # timeout-minutes above is the only ceiling, sized for the
+          # cold-cache amd64 build (issue #2711) -- and transient API errors
+          # just keep the loop polling.
           APPEAR_DEADLINE=$(($(date +%s) + 15*60))
-          RUN_ID=""
+          SEEN=0
           while true; do
-            RUN_ID=$(gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/runs?event=push&head_sha=${GITHUB_SHA}&per_page=20" \
-              --jq '.workflow_runs' 2>/dev/null \
-              | jq -r --arg ref "${GITHUB_REF_NAME}" \
-                  '[.[] | select(.head_branch == $ref)][0].id // empty' || true)
-            [ -n "${RUN_ID}" ] && break
-            if [ "$(date +%s)" -ge "${APPEAR_DEADLINE}" ]; then
-              echo "::error title=docker-publish never started::No docker-publish.yml run found for ${GITHUB_REF_NAME}@${GITHUB_SHA} after 15m. Release blocked."
-              exit 1
-            fi
-            echo "  no docker-publish run visible yet, waiting 30s..."
-            sleep 30
-          done
-          echo "  following docker-publish run ${RUN_ID}"
-
-          # Follow the run to completion. Deliberately NO fixed clock here --
-          # the job-level timeout-minutes above is the only ceiling, sized for
-          # the cold-cache amd64 build (issue #2711). Transient API errors
-          # yield STATUS=unknown and the loop just keeps polling.
-          while true; do
-            STATE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
-              --jq '.status + " " + (.conclusion // "-")' 2>/dev/null || echo "unknown -")
-            STATUS="${STATE%% *}"
-            CONCLUSION="${STATE#* }"
-            if [ "${STATUS}" = "completed" ]; then
-              if [ "${CONCLUSION}" = "success" ]; then
-                echo "  docker-publish run ${RUN_ID} completed successfully."
+            rc=0
+            RESOLVE_REPO="${GITHUB_REPOSITORY}" \
+            RESOLVE_SHA="${GITHUB_SHA}" \
+            RESOLVE_REF="${GITHUB_REF_NAME}" \
+              bash scripts/ci/resolve-candidate-publish-run.sh || rc=$?
+            case "${rc}" in
+              0)
+                echo "  a docker-publish run for this commit completed successfully."
                 break
-              fi
-              echo "::error title=docker-publish failed::docker-publish run ${RUN_ID} completed with conclusion '${CONCLUSION}'. Release blocked; fix and re-run docker-publish, then re-run this workflow."
-              exit 1
-            fi
-            echo "  docker-publish run ${RUN_ID}: ${STATUS}; waiting 60s..."
-            sleep 60
+                ;;
+              10)
+                SEEN=1
+                echo "  docker-publish still running; waiting 60s..."
+                sleep 60
+                ;;
+              20)
+                # Say something that can actually succeed. On a re-cut of an
+                # already-published version, "fix and re-run docker-publish"
+                # is impossible advice: every push-path rebuild is refused by
+                # the immutability guard, forever. Name the promote dispatch
+                # instead (#3640).
+                V="${GITHUB_REF_NAME#v}"
+                STATE=$(GHCR_TOKEN="${GH_TOKEN}" bash .github/scripts/registry-tag-state.sh \
+                  ghcr.io artifact-keeper/artifact-keeper-backend "${V}" 2>/dev/null || true)
+                case "${STATE}" in
+                  present)
+                    echo "::error title=docker-publish failed (version already published)::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success -- and backend:${V} is ALREADY PUBLISHED, so a push-path rebuild will be refused by the immutability guard every time. Recovery: gh workflow run docker-publish.yml --ref ${GITHUB_REF_NAME} -f promote_version=${V} ; when it succeeds, re-run this workflow (the promote re-points tags at the published digest and the next job verifies its sources against this tag)."
+                    ;;
+                  absent)
+                    echo "::error title=docker-publish failed::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success and backend:${V} is not published. Release blocked; fix the cause, re-run docker-publish, then re-run this workflow."
+                    ;;
+                  *)
+                    echo "::error title=docker-publish failed::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success (and whether backend:${V} is already published could not be read). Release blocked; if the version is already published, dispatch docker-publish with promote_version=${V}; otherwise fix the cause and re-run docker-publish. Then re-run this workflow."
+                    ;;
+                esac
+                exit 1
+                ;;
+              21|30)
+                # none-yet / API blip: before any run is seen these count
+                # against the appear deadline; after one was seen they are
+                # transient and the job timeout is the ceiling.
+                if [ "${SEEN}" = "0" ] && [ "$(date +%s)" -ge "${APPEAR_DEADLINE}" ]; then
+                  if [ "${rc}" = "30" ]; then
+                    echo "::error title=Cannot query docker-publish runs::The Actions API query kept failing for 15m; whether docker-publish ran for ${GITHUB_REF_NAME}@${GITHUB_SHA} is unknown. Release blocked; re-run this workflow."
+                  else
+                    echo "::error title=docker-publish never started::No docker-publish.yml run found for ${GITHUB_REF_NAME}@${GITHUB_SHA} after 15m. Release blocked."
+                  fi
+                  exit 1
+                fi
+                echo "  no verdict yet (state ${rc}); waiting 30s..."
+                sleep 30
+                ;;
+              *)
+                echo "::error title=resolver error::resolve-candidate-publish-run.sh exited ${rc} unexpectedly. Release blocked."
+                exit 1
+                ;;
+            esac
           done
 
       - name: Capture the published :$VERSION digest
@@ -355,6 +406,39 @@ jobs:
           echo "backend_digest=${BACKEND_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}"               >> "$GITHUB_OUTPUT"
           echo "Candidate resolved: backend ${VERSION}@${BACKEND_DIGEST}"
+
+      # ── Adoption gate (#3640) ───────────────────────────────────────────────
+      # The run accepted above may be a promote dispatch, i.e. the published
+      # bytes may have been BUILT from a different commit than this tag (a
+      # re-tag after a non-image fix; rebuilds can never match because GIT_SHA
+      # is a build-arg and provenance embeds the revision). Adoption is
+      # verified, never assumed: read the revision the published index was
+      # built from and require it to be byte-identical to this tag across
+      # every input docker/Dockerfile.backend consumes. Any difference inside
+      # that set is a hard refusal -- those bytes are stale for this tag.
+      # Selection + refusal legs are self-tested offline in
+      # scripts/ci/test-assert-adopted-image-sources.sh.
+      - name: Assert the published image was built from this tag's sources
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          REV=$(GHCR_TOKEN="${GH_TOKEN}" bash .github/scripts/registry-tag-revision.sh \
+            ghcr.io artifact-keeper/artifact-keeper-backend "${VERSION}" || true)
+          echo "backend:${VERSION} reports source revision: ${REV}"
+          rc=0
+          ADOPT_TAG_SHA="${GITHUB_SHA}" \
+          ADOPT_PUBLISHED_REV="${REV}" \
+          ADOPT_LABEL="backend:${VERSION}" \
+            bash scripts/ci/assert-adopted-image-sources.sh || rc=$?
+          if [ "${rc}" = "1" ]; then
+            echo "::error title=Published image refused for this tag::backend:${VERSION} was built from ${REV}, which differs from ${GITHUB_SHA} inside the image input set. Adopting it would release stale bytes. Bump the version instead of re-tagging, or revert the input change."
+            exit 1
+          elif [ "${rc}" != "0" ]; then
+            echo "::error title=Image provenance unreadable::Could not verify what backend:${VERSION} was built from (see log). Indeterminate is not a pass; re-run this workflow."
+            exit 1
+          fi
 
   # ════════════════════════════════════════════════════════════════════════════
   # E2E GATE - Must pass before release proceeds

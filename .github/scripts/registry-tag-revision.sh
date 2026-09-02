@@ -15,6 +15,16 @@
 # It reads it with `docker buildx imagetools inspect`, which needs a docker
 # daemon and a registry login.
 #
+# The scanner-adapter is the only image whose INDEX is stamped that way. The
+# backend and openscap indexes are assembled by docker/build-push-action +
+# imagetools without index annotations, but every per-arch image CONFIG
+# carries the same fact as the `org.opencontainers.image.revision` LABEL,
+# stamped by docker/metadata-action from `github.sha`. So when the index has
+# no annotation, this walks index -> first real platform manifest (skipping
+# `vnd.docker.reference.type: attestation-manifest` entries) -> config blob,
+# and reads the label. Same source of truth, same three outcomes; `none` still
+# means "read everything fine, no revision recorded anywhere" (#3640).
+#
 # release-preflight.sh has to answer the same question BEFORE a tag exists, and
 # it runs on a maintainer's laptop and on a plain ubuntu runner. Requiring
 # docker + buildx + a registry login there would mean the check silently does
@@ -146,13 +156,76 @@ main() {
   fi
 
   if [[ "$rev" =~ ^[0-9a-f]{40}$ ]]; then
-    log "${registry}/${name}:${tag}: built from ${rev}"
+    log "${registry}/${name}:${tag}: built from ${rev} (index annotation)"
     echo "$rev"
     return 0
   fi
 
-  # Read fine, but there is no usable provenance. A measured answer.
-  log "${registry}/${name}:${tag}: no valid org.opencontainers.image.revision annotation"
+  # No index annotation (backend/openscap shape). Fall back to the per-arch
+  # image config's org.opencontainers.image.revision LABEL: walk to the first
+  # real platform manifest, skipping buildx attestation entries.
+  local media child_digest config_digest config_body
+  media=$(jq -r '.mediaType // empty' "$body" 2>/dev/null)
+  case "$media" in
+    application/vnd.oci.image.index.v1+json | application/vnd.docker.distribution.manifest.list.v2+json)
+      child_digest=$(jq -r '[.manifests[]
+          | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
+          | select((.platform.os // "unknown") != "unknown")][0].digest // empty' "$body" 2>/dev/null)
+      if [[ -z "$child_digest" ]]; then
+        log "${registry}/${name}:${tag}: index has no platform manifests to read a config from"
+        echo "$NONE"
+        return 1
+      fi
+      code=$(curl -sSL --proto '=https' --max-time 30 -o "$body" -w '%{http_code}' \
+        -H "Authorization: Bearer ${token}" \
+        "${MANIFEST_ACCEPT[@]}" \
+        "https://${host}/v2/${name}/manifests/${child_digest}" 2>/dev/null)
+      if [[ $? -ne 0 || "$code" != '200' ]]; then
+        log "${registry}/${name}:${tag}: could not read platform manifest ${child_digest} (HTTP ${code})"
+        echo "$INDETERMINATE"
+        return 1
+      fi
+      ;;
+    application/vnd.oci.image.manifest.v1+json | application/vnd.docker.distribution.manifest.v2+json)
+      : # single-arch: $body already is the image manifest
+      ;;
+    *)
+      log "${registry}/${name}:${tag}: unrecognised mediaType '${media}'"
+      echo "$INDETERMINATE"
+      return 1
+      ;;
+  esac
+
+  config_digest=$(jq -r '.config.digest // empty' "$body" 2>/dev/null)
+  if [[ -z "$config_digest" ]]; then
+    log "${registry}/${name}:${tag}: platform manifest has no config digest"
+    echo "$INDETERMINATE"
+    return 1
+  fi
+
+  config_body=$(curl -sSL --proto '=https' --max-time 30 \
+    -H "Authorization: Bearer ${token}" \
+    "https://${host}/v2/${name}/blobs/${config_digest}" 2>/dev/null)
+  if [[ $? -ne 0 || -z "$config_body" ]]; then
+    log "${registry}/${name}:${tag}: could not read config blob ${config_digest}"
+    echo "$INDETERMINATE"
+    return 1
+  fi
+
+  if ! rev=$(jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' <<<"$config_body" 2>/dev/null); then
+    log "${registry}/${name}:${tag}: config blob did not parse as JSON"
+    echo "$INDETERMINATE"
+    return 1
+  fi
+
+  if [[ "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+    log "${registry}/${name}:${tag}: built from ${rev} (config label)"
+    echo "$rev"
+    return 0
+  fi
+
+  # Read fine, but there is no usable provenance anywhere. A measured answer.
+  log "${registry}/${name}:${tag}: no valid org.opencontainers.image.revision annotation or config label"
   echo "$NONE"
   return 1
 }
