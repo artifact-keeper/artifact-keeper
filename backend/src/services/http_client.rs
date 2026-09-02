@@ -644,6 +644,96 @@ mod tests {
         );
     }
 
+    /// Pins the reqwest behavior the GitHub-Releases proxy path depends on
+    /// (mise/aqua mirroring, docs/mise-aqua.md): a followed redirect that
+    /// changes origin must NOT carry the `Authorization` header to the new
+    /// origin. GitHub 302s release-asset downloads to S3-signed
+    /// `objects.githubusercontent.com` URLs, which both reject requests that
+    /// carry `Authorization` and must never see a configured upstream GitHub
+    /// PAT. reqwest strips sensitive headers on cross-origin hops itself; this
+    /// test fails loudly if a future reqwest upgrade changes that, through the
+    /// same custom-policy code path production uses.
+    ///
+    /// The production policy hard-blocks loopback redirect hops (Upstream
+    /// trust class), so this test builds its client via
+    /// `ssrf_redirect_policy_with` with a no-block stub: the subject here is
+    /// header handling on a FOLLOWED hop, not hop admission. The two
+    /// listeners bind different ports, which reqwest treats as a different
+    /// origin — the same trigger as the github.com → S3 host change.
+    #[tokio::test]
+    async fn test_cross_origin_redirect_strips_authorization() {
+        use tokio::net::TcpListener;
+
+        async fn read_head(sock: &mut tokio::net::TcpStream) -> String {
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+        }
+
+        // Final hop: reports whether the request still carried Authorization.
+        let dest = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest_port = dest.local_addr().unwrap().port();
+        let (dest_tx, dest_rx) = tokio::sync::oneshot::channel::<bool>();
+        let dest_server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = dest.accept().await {
+                let head = read_head(&mut sock).await;
+                let _ = dest_tx.send(head.contains("authorization:"));
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Length: 5\r\n\
+                          Connection: close\r\n\r\nasset",
+                    )
+                    .await;
+            }
+        });
+
+        // Entry hop: must see the Authorization header, then 302 cross-port.
+        let entry = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entry_port = entry.local_addr().unwrap().port();
+        let (entry_tx, entry_rx) = tokio::sync::oneshot::channel::<bool>();
+        let entry_server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = entry.accept().await {
+                let head = read_head(&mut sock).await;
+                let _ = entry_tx.send(head.contains("authorization:"));
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\n\
+                     Location: http://127.0.0.1:{dest_port}/asset\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = loopback_client_from(
+            reqwest::Client::builder()
+                .redirect(super::ssrf_redirect_policy_with(|_| None, "test redirect")),
+        );
+        let response = client
+            .get(format!("http://127.0.0.1:{entry_port}/start"))
+            .header(reqwest::header::AUTHORIZATION, "Bearer test-pat")
+            .send()
+            .await
+            .expect("redirect chain should complete");
+        let body = response.text().await.expect("read final body");
+
+        join_loopback_server(entry_server).await;
+        join_loopback_server(dest_server).await;
+
+        assert_eq!(body, "asset", "final hop body must be served");
+        assert!(
+            entry_rx.await.expect("entry hop must report"),
+            "the entry hop must receive the Authorization header (otherwise \
+             this test proves nothing)"
+        );
+        assert!(
+            !dest_rx.await.expect("final hop must report"),
+            "Authorization leaked across a cross-origin redirect hop: a \
+             configured upstream PAT would reach objects.githubusercontent.com"
+        );
+    }
+
     /// A hostname resolving to a blocked IP must be refused at DNS time, not
     /// connected to. `localhost` resolves to 127.0.0.1/::1 (blocked).
     ///
