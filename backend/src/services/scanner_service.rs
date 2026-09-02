@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, RawPackage, Severity};
+use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::grype_scanner::GrypeScanner;
@@ -109,6 +109,53 @@ pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
 /// default), and budget-exceeded remains inconclusive (fail-open serves
 /// pending, fail-closed 423) — never an unscanned serve.
 pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
+
+/// Ceiling for the on-demand proxy-cache rescan budget (#3455). The actual
+/// per-request budget is [`proxy_rescan_budget`]; this constant only caps it.
+///
+/// [`PROXY_SCAN_INLINE_BUDGET`] exists to bound the latency a scan adds to a
+/// client's `pip install` (#2954) -- a request with a real client waiting on
+/// the other end. A rescan has no such client: it is an explicit,
+/// authenticated, write-gated, per-repository-throttled operator action
+/// (`POST .../security/proxy-scans/rescan`) whose only waiting party is the
+/// operator who asked for it. Reusing the 30s file budget there means an
+/// instance whose grype cold-start alone costs ~30s can NEVER complete a
+/// rescan. 120s matches [`OCI_PROXY_SCAN_INLINE_BUDGET`], the in-tree
+/// precedent for a context that can legitimately take longer than the file
+/// gate's 30s.
+pub const PROXY_RESCAN_BUDGET_CEILING: Duration = Duration::from_secs(120);
+
+/// The scan budget an individual rescan request actually runs under (#3455
+/// review, F2).
+///
+/// The rescan route is NOT exempt from the router-wide request timeout
+/// ([`Config::global_request_timeout_secs`](crate::config::Config::global_request_timeout_secs),
+/// default 120s -- `is_byte_transfer_path` exempts only artifact byte
+/// transfers), and that outer clock starts at request arrival, while this
+/// budget's clock starts only after auth, the repository and catalog lookups,
+/// the full cached-object read, and the SHA-256 -- with the verdict/SBOM/CVE
+/// writes still to come after the scan. A budget equal to the outer timeout
+/// therefore always loses the race: the backstop kills the request first,
+/// the operator gets the undifferentiated `SERVICE_UNAVAILABLE` 503 this
+/// endpoint exists to replace, no verdict is recorded, and
+/// `RESCAN_BUDGET_EXCEEDED` becomes dead code.
+///
+/// So the budget is derived from the configured outer timeout with real
+/// headroom -- a quarter of the outer window (at least one second) is
+/// reserved for the pre- and post-scan work above -- and capped at
+/// [`PROXY_RESCAN_BUDGET_CEILING`]. A `0` outer timeout is the config
+/// sentinel for "timeout layer disabled", in which case nothing races the
+/// budget and the ceiling is used directly.
+pub fn proxy_rescan_budget(global_request_timeout_secs: u64) -> Duration {
+    if global_request_timeout_secs == 0 {
+        return PROXY_RESCAN_BUDGET_CEILING;
+    }
+    let outer = Duration::from_secs(global_request_timeout_secs);
+    let headroom = (outer / 4).max(Duration::from_secs(1));
+    outer
+        .saturating_sub(headroom)
+        .min(PROXY_RESCAN_BUDGET_CEILING)
+}
 
 /// Below this size we keep the scan input in heap (`Bytes`) and skip the
 /// tempfile + mmap machinery entirely. The mmap path exists to keep
@@ -1244,11 +1291,13 @@ impl ScanWorkspace {
         // recursive delete actually succeeds; otherwise it fails with EACCES and
         // silently leaves the (often multi-GiB) tree on the PVC until it fills.
         let workspace_str = workspace.to_string_lossy().to_string();
-        if let Err(e) = tokio::process::Command::new("chmod")
-            .args(["-R", "u+rwX", &workspace_str])
-            .output()
-            .await
-        {
+        let mut chmod = tokio::process::Command::new("chmod");
+        // Cleanup itself remains inside the scanner future that an outer
+        // wall-clock timeout can drop. `Command` otherwise leaves chmod
+        // running against the workspace after that cancellation, so make this
+        // child cancellation-owned just like the scanner subprocesses (#3455).
+        chmod.kill_on_drop(true);
+        if let Err(e) = chmod.args(["-R", "u+rwX", &workspace_str]).output().await {
             warn!(
                 "Failed to pre-chmod scan workspace {} before cleanup: {}",
                 workspace.display(),
@@ -1377,6 +1426,118 @@ pub(crate) fn npm_package_lock_pin_json(name: &str, version: &str) -> String {
         "packages": packages,
     })
     .to_string()
+}
+
+/// The component identity a NATIVELY PUBLISHED (hosted-upload) artifact must
+/// be graded as, or `None` when this format has no pin to write (#3442).
+///
+/// The proxy serve paths derive an [`ExpectedComponent`] from the REQUEST
+/// coordinate; a hosted upload has no request coordinate to derive one from,
+/// but it has something at least as trustworthy: the registry's own
+/// `artifacts` row, written by the format handler from the publish payload it
+/// already validated. That is what this turns into a pin.
+///
+/// Without it, `grype dir:` over an extracted npm tarball catalogs NOTHING —
+/// the directory-source cataloger set reads `package-lock.json` but not the
+/// standalone `package/package.json` a published tarball ships — so every
+/// natively-published npm package scanned as "0 findings, complete", which is
+/// indistinguishable from clean and silently voided every npm severity gate.
+///
+/// Deliberately narrow, because turning a pin on for a format CHANGES THE
+/// RESULTS operators already gate on:
+///
+/// * npm and its aliases (`yarn`/`bower`/`pnpm` all resolve to the npm handler
+///   and store the same `name`/`version` shape) get the lockfile pin.
+/// * Every other format — including PyPI, whose hosted **sdists** have the
+///   same blindness — returns `None` and keeps today's behavior byte for byte.
+///   PyPI is NOT folded in here: a hosted wheel already catalogs itself from
+///   its `.dist-info/METADATA`, so adding a pin there double-counts every
+///   top-level finding and needs the dedup the proxy path carries. Tracked in
+///   #3603, together with RubyGems/Cargo/NuGet — which have the same blindness
+///   but need new [`ComponentEcosystem`] variants — rather than widened into
+///   this fix.
+/// * An unknown/unparseable format key, an empty name, or a missing version
+///   also return `None`: a pin we cannot name correctly would grade the wrong
+///   component, which is worse than the gap it closes.
+pub(crate) fn hosted_upload_pin(
+    repository_format: &str,
+    name: &str,
+    version: Option<&str>,
+) -> Option<ExpectedComponent> {
+    let format = crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == repository_format)?;
+    let ecosystem = match format.handler_key() {
+        "npm" => ComponentEcosystem::Npm,
+        _ => return None,
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let version = version.map(str::trim).filter(|v| !v.is_empty())?;
+    Some(ExpectedComponent::new(ecosystem, name, version))
+}
+
+/// Whether `repository_format` is a format for which a hosted upload SHOULD
+/// carry a component pin (currently the npm handler family).
+///
+/// Distinct from [`hosted_upload_pin`] returning `Some`: a format can expect a
+/// pin yet fail to produce a usable one — an empty/missing version, or bytes
+/// that are not the tarball the coordinate claims. That case graded nothing
+/// gradeable, so it must be recorded as a PARTIAL scan rather than an
+/// authoritative complete clean (#3604 defects 2 and 4). This predicate is how
+/// the orchestrator tells "unpinned because the format never pins" (a generic
+/// blob — a complete scan) from "unpinned because the pin could not be trusted"
+/// (a partial scan).
+pub(crate) fn format_expects_pin(repository_format: &str) -> bool {
+    crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == repository_format)
+        .map(|f| f.handler_key() == "npm")
+        .unwrap_or(false)
+}
+
+/// Whether `content` is plausibly the npm tarball `pin` names — a gzip tar
+/// shipping a `package/package.json` whose own `name`+`version` AGREE with the
+/// pin (#3604 defect 2).
+///
+/// The hosted pin is trusted from the registry's `artifacts` row. On the
+/// generic artifact endpoint that row's name/version are derived from URL path
+/// segments and never cross-checked against the bytes, so a 30-byte text file
+/// uploaded to `.../handlebars/4.0.11/notes.txt` was pinned to
+/// `handlebars@4.0.11` and graded as that component — 17 findings for a file
+/// that ships no code. The proxy serve path already performs exactly this check
+/// (`npm_claimed_identity` / `npm_identity_agrees` in the npm handler) before it
+/// scans; the hosted path inherited the pin but not the check.
+///
+/// A mismatch, or bytes that are not a readable npm tarball at all, means the
+/// pin cannot be trusted: the caller drops it and records the scan as PARTIAL
+/// rather than pinning — and grading — the wrong component. Name comparison is
+/// ecosystem-normalized (npm names are case-insensitive); version is exact.
+fn npm_pin_agrees_with_tarball(content: &Bytes, pin: &ExpectedComponent) -> bool {
+    let body = match crate::util::bounded_archive::read_metadata_from_tar_gz(&content[..], |p| {
+        p == std::path::Path::new("package/package.json")
+    }) {
+        Ok(Some(body)) => body,
+        // Absent entry, unreadable/oversized archive, or not a gzip tar at all.
+        _ => return false,
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let name = match v.get("name").and_then(|x| x.as_str()) {
+        Some(n) => n.trim(),
+        None => return false,
+    };
+    let version = match v.get("version").and_then(|x| x.as_str()) {
+        Some(x) => x.trim(),
+        None => return false,
+    };
+    ExpectedComponent::normalize_name(pin.ecosystem, name)
+        == ExpectedComponent::normalize_name(pin.ecosystem, &pin.name)
+        && version == pin.version.trim()
 }
 
 /// The minimal PEP 566 `METADATA` body that pins one installed Python
@@ -1943,6 +2104,16 @@ fn preserve_engine_unavailable(error: &AppError, msg: String) -> AppError {
 /// but consumers (SBOM, CVE-mapping lookup, UI) need the raw name to do
 /// cross-source joins — see #903. Callers that still need the target string
 /// can read it from the parallel `RawPackage` row's `source_target` field.
+/// Convert a Trivy-shaped report's vulnerabilities into [`RawFinding`]s.
+///
+/// Reachability note for the `UNKNOWN` arm of the classifier (#3296): all four
+/// Trivy producers now deliver ungraded findings here. The adapter image path
+/// always did (`SCANNER_TRIVY_SEVERITY` defaults to the full list and Harbor
+/// maps `UNKNOWN -> "Unknown"`); the local filesystem and incus invocations —
+/// and the adapter's fs mode — historically pinned a
+/// `CRITICAL,HIGH,MEDIUM,LOW` allowlist that filtered `UNKNOWN` out at the
+/// CLI, so the finding never reached this converter at all. They now share
+/// [`TRIVY_FS_SEVERITY_LIST`], which admits `UNKNOWN`.
 pub(crate) fn convert_trivy_findings(
     report: &crate::services::image_scanner::TrivyReport,
     source_label: &str,
@@ -1959,11 +2130,10 @@ pub(crate) fn convert_trivy_findings(
                 .map(move |vuln| RawFinding {
                     // #3294: shared classifier, replacing this call site's own
                     // `from_str_loose(..).unwrap_or(Severity::Info)`.
-                    // Behaviour is unchanged token for token: `Negligible`
-                    // (from proxied Harbor / distro reports) still maps to Info
-                    // and is now RECOGNISED rather than a parse miss, and an
-                    // ungraded `UNKNOWN` still maps to Info — that fail-open is
-                    // #3306, not this patch.
+                    // `Negligible` (from proxied Harbor / distro reports) is
+                    // RECOGNISED and maps to Info on purpose; an ungraded
+                    // `UNKNOWN` fails closed at High as of #3306, so it can no
+                    // longer slip past severity-aware gates at the floor.
                     severity: Severity::from_scanner_token(&vuln.severity),
                     title: vuln.title.clone().unwrap_or_else(|| {
                         format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name)
@@ -2479,6 +2649,33 @@ impl ExpectedComponent {
             == Self::normalize_name(self.ecosystem, &cataloged.name)
             && self.version.trim() == cataloged.version.trim()
     }
+
+    /// A stable, comparable string identity for this pin, persisted on the
+    /// `scan_results` row as `pin_identity` (#3604).
+    ///
+    /// #3442 made the npm verdict a function of the request coordinate, so the
+    /// cross-artifact reuse key can no longer be the bytes alone: byte-identical
+    /// uploads under different coordinates grade differently. Recording this
+    /// string on the row lets [`ScanResultService::find_reusable_scan`] refuse a
+    /// row whose pin differs from the current request's pin.
+    ///
+    /// The name is normalized exactly as [`ExpectedComponent::normalize_name`]
+    /// normalizes it for catalog matching, so two spellings that grade
+    /// identically also dedup identically; the version is compared verbatim
+    /// (trimmed), matching [`ExpectedComponent::matches`]. The ecosystem is a
+    /// prefix so the same name+version in two ecosystems cannot alias.
+    pub fn pin_identity(&self) -> String {
+        let eco = match self.ecosystem {
+            ComponentEcosystem::Npm => "npm",
+            ComponentEcosystem::Python => "python",
+        };
+        format!(
+            "{}|{}|{}",
+            eco,
+            Self::normalize_name(self.ecosystem, &self.name),
+            self.version.trim()
+        )
+    }
 }
 
 /// Aggregated verdict from an inline proxy scan over raw bytes (#2954).
@@ -2496,16 +2693,53 @@ pub struct ProxyScanVerdict {
     pub low_count: i32,
     /// Highest severity observed across all findings, for policy comparison.
     pub max_severity: Option<Severity>,
-    /// Scanner binary/DB version string (e.g. `grype-0.83.0`), for CVE-DB
-    /// freshness gating of a reused verdict.
+    /// Scanner binary + CVE-DB version string (e.g.
+    /// `grype-0.83.0+db-2026-08-10`, #3287), for CVE-DB freshness gating of a
+    /// reused verdict.
     pub scanner_version: Option<String>,
+    /// The full package inventory the CVE-authoritative scanner cataloged for
+    /// these bytes, retained so proxy-cached content can have an SBOM
+    /// generated from it without re-fetching or re-scanning.
+    ///
+    /// Distinct from the `cataloged` side channel used by the #3003 identity
+    /// gate, which carries only `{name, version}`. This carries `purl` and
+    /// `license` too, which is what an SBOM document actually needs.
+    ///
+    /// Empty for scanners that report no inventory. Never load-bearing for the
+    /// verdict itself: an empty inventory must not change whether content is
+    /// blocked, only whether an SBOM can be produced for it.
+    pub packages: Vec<RawPackage>,
+    /// Whether the scanner saw a target it could not parse (#1153). Threaded
+    /// into generated SBOMs so a partial inventory does not render as complete.
+    pub scan_completeness: Option<String>,
+    /// The CVE-identified findings behind the counts, retained so the operator
+    /// whose pull was just blocked can be told WHICH CVE did it (#3395).
+    ///
+    /// Exactly like `packages`: populated after aggregation, never load-bearing
+    /// for the verdict itself. The counts above are computed from the raw
+    /// finding list, which includes findings this projection drops (those with
+    /// no CVE id), so `findings.len()` is a LOWER BOUND on `findings_count` and
+    /// the two must not be asserted equal.
+    pub findings: Vec<ProxyFinding>,
 }
 
 impl ProxyScanVerdict {
-    /// A vulnerable verdict is any non-zero finding count. Whether that BLOCKS a
-    /// pull is a policy decision made by the caller against the repo's action.
+    /// A vulnerable verdict is any finding ABOVE `Info` (#3243 stage 2).
+    /// Whether that BLOCKS a pull is a policy decision made by the caller
+    /// against the repo's action.
+    ///
+    /// `Info` findings are deliberately excluded: that bucket holds Grype's
+    /// `Negligible` (a CVE the distro has triaged as not worth fixing) and
+    /// explicit `info`/`informational` grades. Counting them made fail-closed
+    /// OCI proxying unusable against ordinary Debian/Ubuntu base images —
+    /// every image carries a long tail of `Negligible` CVEs, each of which
+    /// produced a `vulnerable` verdict and a 403. This matches Harbor, which
+    /// documents `negligible` as never blocking a pull at any threshold. The
+    /// findings are still recorded (`findings_count`, the row, the report);
+    /// they just do not 403 the pull. Before #3243 this was
+    /// `findings_count > 0`, i.e. severity-blind.
     pub fn is_vulnerable(&self) -> bool {
-        self.findings_count > 0
+        self.critical_count + self.high_count + self.medium_count + self.low_count > 0
     }
 
     /// The stored `proxy_scan_results.verdict` token for this result.
@@ -2534,6 +2768,207 @@ pub fn severity_token(sev: Severity) -> &'static str {
     }
 }
 
+/// Identity component of a [`RawFinding`] dedup key: the vulnerability itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FindingVulnIdentity {
+    /// Keyed on `cve_id`. Grype always sets this (falling back to the primary
+    /// GHSA alias when no CVE alias exists), so grype findings are safe to
+    /// key this way.
+    Cve(String),
+    /// `DependencyScanner` leaves `cve_id` `None` for a GHSA/OSV-only advisory
+    /// with no CVE alias. Keying every such finding on the same `None` would
+    /// collapse two DIFFERENT CVE-less advisories on one component into a
+    /// single finding, so this falls back to the advisory's own native
+    /// identity — `(source, title)` — instead of `None` itself.
+    NativeAdvisory(Option<String>, String),
+}
+
+/// Component-name component of a [`RawFinding`] dedup key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FindingComponentKey {
+    Named(String),
+    /// `affected_component` is `None` or `""` (the latter produced by
+    /// `DependencyScanner` when its dependency list is empty —
+    /// `deps.first()...unwrap_or_default()`). Treat as ABSENT, not as a
+    /// shared `""` key: two findings that both lack a component are not
+    /// necessarily the same finding, and merging them would silently drop a
+    /// real one. Each gets a unique slot (`usize` = encounter order among
+    /// absent-component findings) so it can never merge with anything else.
+    Absent(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FindingDedupKey {
+    identity: FindingVulnIdentity,
+    component: FindingComponentKey,
+    affected_version: Option<String>,
+}
+
+/// Deduplicate findings that identify the SAME vulnerability against the SAME
+/// component before `aggregate_proxy_verdict` computes counts and severity
+/// buckets from them.
+///
+/// Why this exists (inflated `findings_count` on proxy scans, reproduced at
+/// exactly 2x on PyPI wheels): [`ScanWorkspace::prepare_pinned`] extracts a
+/// wheel archive into a subdirectory and ALSO writes the synthetic component
+/// pin (a `<name>-<version>.dist-info/METADATA`) into the workspace root —
+/// the same cataloger input shape as the wheel's own METADATA. syft catalogs
+/// the component twice and grype matches the same CVE against both copies.
+/// Scoped narrowly to that mechanism:
+/// - PyPI **wheels** double every top-level finding — this is what this
+///   function fixes.
+/// - PyPI **sdists** do NOT inflate: a bare root `PKG-INFO` is not cataloged
+///   by syft, so the pin is the only copy (that is why the pin exists at
+///   all). There is nothing to collapse there.
+/// - **npm** double-counting (overlapping `package-lock.json` /
+///   `npm-shrinkwrap.json` transitives) is a different bug in a different
+///   layer and is NOT addressed here.
+///
+/// Key: `(vuln identity, normalized component name, affected version)`. The
+/// component name is normalized with [`ExpectedComponent::normalize_name`]
+/// (ecosystem-aware: PEP 503 for Python, case-insensitive `@scope/name`-
+/// preserving for npm) so `PyYAML` merges with `pyyaml` and `zope.interface`
+/// merges with `zope-interface`, without mangling npm scoped names. When the
+/// ecosystem is not known (e.g. the OCI image serve path, which has no
+/// `name@version` coordinate to pin), names are compared case-insensitively.
+///
+/// Within a merged group, the finding with the MAXIMUM severity is retained
+/// (not the first). `aggregate_proxy_verdict` folds multiple scanners into
+/// one row, so keep-first would silently lower `critical_count`/
+/// `max_severity` when two scanners report the same vulnerability at
+/// different severities.
+///
+/// Bound: this can never flip a `vulnerable` verdict to `clean`. Every merge
+/// group retains at least one finding, and the proxy verdict token is
+/// `findings_count > 0` — dedup only ever reduces a strictly-positive count,
+/// never zeroes it.
+/// Collapse duplicate inventory entries before they are persisted for SBOM
+/// generation.
+///
+/// Same mechanism as the finding duplication [`dedupe_findings`] addresses: a
+/// PyPI wheel is scanned with its own `METADATA` plus the synthetic pin
+/// `prepare_pinned` writes into the workspace root, so the scanner catalogs the
+/// distribution twice. An SBOM listing the same component twice is visibly
+/// wrong to any consumer.
+///
+/// Keyed on `(name, version)` exactly — NOT normalized the way finding dedup
+/// normalizes, because a purl is ecosystem-qualified already and two entries
+/// that differ only in normalization are genuinely different rows worth
+/// keeping. The richer record wins: an entry carrying a `purl`/`license` is
+/// preferred over a bare one for the same coordinate, so merging never discards
+/// metadata the SBOM would otherwise carry.
+/// Deduplicate by `(name, version)`, filling gaps from later records.
+///
+/// Indexed rather than a linear scan per package. This used to be O(n²) over a
+/// list that was implicitly small — the CVE-MATCHED packages — but the CVE
+/// scanner now reports its full component catalogue, and this runs INLINE on
+/// the proxy download path inside a 30s budget. At the
+/// `grype_scanner::SCAN_INVENTORY_CAP` ceiling the quadratic form is 50M
+/// string comparisons; indexed it is linear. Output order and merge semantics
+/// are identical: first occurrence keeps its position, later ones only fill
+/// fields the first left empty.
+fn dedupe_packages(packages: Vec<RawPackage>) -> Vec<RawPackage> {
+    let mut out: Vec<RawPackage> = Vec::with_capacity(packages.len());
+    let mut index: std::collections::HashMap<(String, Option<String>), usize> =
+        std::collections::HashMap::with_capacity(packages.len());
+    for pkg in packages {
+        let key = (pkg.name.clone(), pkg.version.clone());
+        let existing = index.get(&key).map(|i| &mut out[*i]);
+        match existing {
+            Some(prev) => {
+                // Fill gaps rather than replace wholesale, so a pair of
+                // partial records merges into the most complete one.
+                if prev.purl.is_none() {
+                    prev.purl = pkg.purl;
+                }
+                if prev.license.is_none() {
+                    prev.license = pkg.license;
+                }
+                if prev.source_target.is_none() {
+                    prev.source_target = pkg.source_target;
+                }
+            }
+            None => {
+                index.insert(key, out.len());
+                out.push(pkg);
+            }
+        }
+    }
+    out
+}
+
+fn dedupe_findings(
+    findings: Vec<RawFinding>,
+    ecosystem: Option<ComponentEcosystem>,
+) -> Vec<RawFinding> {
+    let mut deduped: Vec<RawFinding> = Vec::with_capacity(findings.len());
+    let mut index_of: HashMap<FindingDedupKey, usize> = HashMap::with_capacity(findings.len());
+    let mut absent_component_ordinal: usize = 0;
+
+    for finding in findings {
+        let identity = match finding
+            .cve_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(id) => FindingVulnIdentity::Cve(id.to_string()),
+            None => {
+                FindingVulnIdentity::NativeAdvisory(finding.source.clone(), finding.title.clone())
+            }
+        };
+
+        let component = match finding
+            .affected_component
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) => {
+                let normalized = match ecosystem {
+                    Some(eco) => ExpectedComponent::normalize_name(eco, name),
+                    None => name.to_lowercase(),
+                };
+                FindingComponentKey::Named(normalized)
+            }
+            None => {
+                let key = FindingComponentKey::Absent(absent_component_ordinal);
+                absent_component_ordinal += 1;
+                key
+            }
+        };
+
+        let affected_version = finding
+            .affected_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let key = FindingDedupKey {
+            identity,
+            component,
+            affected_version,
+        };
+
+        match index_of.get(&key) {
+            // Severity is ordered Critical=0 .. Info=4 (see
+            // `aggregate_proxy_verdict`), so `<` means MORE severe — retain
+            // the max, not the first.
+            Some(&idx) if finding.severity < deduped[idx].severity => {
+                deduped[idx] = finding;
+            }
+            Some(_) => {}
+            None => {
+                index_of.insert(key, deduped.len());
+                deduped.push(finding);
+            }
+        }
+    }
+
+    deduped
+}
+
 /// Fold a flat list of [`RawFinding`]s (from one or more scanners run over the
 /// same bytes) into a [`ProxyScanVerdict`]. Pure: no DB, no I/O — the security-
 /// relevant verdict logic is unit-testable over a synthetic finding list.
@@ -2552,7 +2987,59 @@ pub fn aggregate_proxy_verdict(
         low_count: count(Severity::Low),
         max_severity,
         scanner_version,
+        // Populated by `run_inline_proxy_scanners_target` after aggregation.
+        // Kept out of this signature deliberately: the verdict contract
+        // (counts and severity) is what every existing caller and test
+        // depends on, and the inventory must never influence it.
+        packages: Vec::new(),
+        scan_completeness: None,
+        findings: Vec::new(),
     }
+}
+
+/// Project the raw finding list onto the rows `proxy_scan_findings` stores
+/// (#3395). Pure, so the two properties that make the write safe are testable
+/// without a database:
+///
+/// 1. **Findings with no CVE id are dropped.** The table's identity is the CVE;
+///    a finding without one has nothing an operator could look up, and NULL
+///    would break the uniqueness key. They still counted toward the verdict —
+///    `aggregate_proxy_verdict` runs over the raw list before this.
+/// 2. **The result is deduplicated on the table's uniqueness key.** Postgres
+///    rejects an `INSERT ... ON CONFLICT DO UPDATE` whose own tuple set hits
+///    the same row twice ("cannot affect row a second time"), which would fail
+///    the whole write. [`dedupe_findings`] already collapses the pin
+///    duplication, but it keys on the NORMALIZED component name, so two raw
+///    spellings of one component survive it and collide here.
+///
+/// First occurrence wins on a duplicate: `dedupe_findings` has already resolved
+/// severity to the most severe of a colliding group, so the survivors are the
+/// values this must preserve.
+pub fn retain_proxy_findings(findings: &[RawFinding]) -> Vec<ProxyFinding> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(findings.len());
+    for f in findings {
+        let Some(cve_id) = f.cve_id.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let key = (
+            cve_id.to_string(),
+            f.affected_component.clone().unwrap_or_default(),
+            f.affected_version.clone().unwrap_or_default(),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(ProxyFinding {
+            cve_id: cve_id.to_string(),
+            severity: severity_token(f.severity).to_string(),
+            package_name: f.affected_component.clone(),
+            package_version: f.affected_version.clone(),
+            fixed_version: f.fixed_version.clone(),
+            title: (!f.title.trim().is_empty()).then(|| f.title.clone()),
+        });
+    }
+    out
 }
 
 /// Run the applicable leaf scanners over raw proxy bytes and fold their output
@@ -2577,8 +3064,8 @@ pub fn aggregate_proxy_verdict(
 ///    scanner failing (an optional Trivy adapter that is down) still must NOT
 ///    abort the scan — only the CVE engine is load-bearing.
 /// 2. **The CVE engine cataloged something** (#3003), when the caller supplied
-///    an `expected_component`. `is_vulnerable()` is `findings_count > 0`, so an
-///    engine that ran but had nothing to grade reports "clean".
+///    an `expected_component`. `is_vulnerable()` counts findings above `Info`,
+///    so an engine that ran but had nothing to grade reports "clean".
 /// 3. **What it cataloged is what we are serving** (#3003). A clean grade of
 ///    some other identity says nothing about these bytes.
 ///
@@ -2593,6 +3080,9 @@ async fn run_inline_proxy_scanners_target(
     let synthetic = target.artifact;
     let mut findings: Vec<RawFinding> = Vec::new();
     let mut scanner_version: Option<String> = None;
+    // Full package inventory, retained for proxy SBOM generation.
+    let mut packages: Vec<RawPackage> = Vec::new();
+    let mut scan_completeness: Option<String> = None;
     // "did SOME applicable scanner run Ok" — necessary but NOT sufficient.
     let mut any_ran = false;
     // "was a CVE-authoritative scanner applicable" vs "did one complete Ok".
@@ -2628,6 +3118,17 @@ async fn run_inline_proxy_scanners_target(
                 if scanner_version.is_none() {
                     scanner_version = scanner.version().await;
                 }
+                // Retain the full inventory for SBOM generation. Only the
+                // CVE-authoritative scanner's inventory is kept: supplementary
+                // scanners can report overlapping package sets, and merging
+                // them would produce an SBOM that claims components no single
+                // engine actually cataloged.
+                if is_cve_authoritative {
+                    packages.extend(output.packages);
+                    if output.scan_completeness != ScanCompleteness::Complete {
+                        scan_completeness = Some(output.scan_completeness.as_str().to_string());
+                    }
+                }
                 findings.extend(output.findings);
             }
             Err(e) => {
@@ -2661,10 +3162,10 @@ async fn run_inline_proxy_scanners_target(
         ));
     }
 
-    // #3003: "the CVE engine ran Ok" is still not enough. `is_vulnerable()` is
-    // `findings_count > 0`, so an engine that RUNS but catalogs nothing to
-    // grade reports zero findings — indistinguishable from a genuinely clean
-    // artifact. That is not a hypothetical: syft/grype do not catalog a bare
+    // #3003: "the CVE engine ran Ok" is still not enough. `is_vulnerable()`
+    // counts findings above `Info`, so an engine that RUNS but catalogs
+    // nothing to grade reports zero findings — indistinguishable from a
+    // genuinely clean artifact. That is not a hypothetical: syft/grype do not catalog a bare
     // npm `package/package.json` or an sdist's root `PKG-INFO`, so a real
     // vulnerable npm tarball (identity stripped/rewritten, or a lockfile-shaped
     // decoy added) and an ordinary vulnerable PyPI sdist both scanned "clean"
@@ -2746,7 +3247,22 @@ async fn run_inline_proxy_scanners_target(
         ));
     }
 
-    Ok(aggregate_proxy_verdict(&findings, scanner_version))
+    // Dedup the SAME vulnerability cataloged twice against the SAME
+    // component (e.g. a PyPI wheel's own METADATA plus the synthetic pin
+    // `prepare_pinned` writes into the workspace root) before counts/severity
+    // buckets are computed. See `dedupe_findings` for the mechanism and scope.
+    let ecosystem = target.expected_component.map(|c| c.ecosystem);
+    let findings = dedupe_findings(findings, ecosystem);
+
+    let mut verdict = aggregate_proxy_verdict(&findings, scanner_version);
+    // Attach the retained inventory. Deliberately after aggregation so the
+    // counts/severity contract is computed from findings alone.
+    verdict.packages = dedupe_packages(packages);
+    verdict.scan_completeness = scan_completeness;
+    // Same contract as `packages`: attached after aggregation so the counts are
+    // computed from the raw findings and this projection cannot move them.
+    verdict.findings = retain_proxy_findings(&findings);
+    Ok(verdict)
 }
 
 /// Live version string of the CVE-authoritative scanner (Grype), e.g.
@@ -2916,8 +3432,34 @@ const CAPTURE_CLI_VERSION_STDOUT_CAP_BYTES: u64 = 64 * 1024;
 
 /// Inner implementation of [`capture_cli_version`] parameterized on the
 /// timeout so tests can exercise the elapsed-timeout branch in milliseconds
-/// rather than the full production five-second wait.
+/// rather than the full production five-second wait. Returns the FIRST stdout
+/// line; probes that need multi-line output (e.g. `grype db status`, #3287)
+/// use [`capture_cli_output`] instead.
 pub(crate) async fn capture_cli_version_with_timeout(
+    binary: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let full = capture_cli_output_with_timeout(binary, args, timeout).await?;
+    let line = full.lines().next()?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
+/// Capture the FULL (capped, bounded) stdout of a short metadata CLI
+/// invocation, e.g. `grype db status` or `trivy --version` (#3287). Same
+/// safety properties as [`capture_cli_version`]: 64 KiB stdout cap, wall-clock
+/// timeout, kill+reap on every failure path, `None` on a non-zero exit.
+pub(crate) async fn capture_cli_output(binary: &str, args: &[&str]) -> Option<String> {
+    capture_cli_output_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT).await
+}
+
+/// Shared child-process capture behind [`capture_cli_version_with_timeout`]
+/// (first line) and [`capture_cli_output`] (full text).
+pub(crate) async fn capture_cli_output_with_timeout(
     binary: &str,
     args: &[&str],
     timeout: Duration,
@@ -2933,7 +3475,14 @@ pub(crate) async fn capture_cli_version_with_timeout(
     // Spawn with stdout piped so we can bound the read. `Command::output`
     // would buffer the entire stdout into memory unconditionally; a
     // hostile binary printing 1 GiB to stdout would OOM the backend.
-    let mut child = match tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    // Callers can run scanner-version probes inside a wider scan timeout. If
+    // that outer timeout drops this future, Tokio otherwise leaves the probe
+    // child running. Version collection is best-effort and has no reason to
+    // outlive its caller, so cancellation must own the child just as it does
+    // for scanner and cleanup subprocesses (#3455).
+    command.kill_on_drop(true);
+    let mut child = match command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -3018,11 +3567,11 @@ pub(crate) async fn capture_cli_version_with_timeout(
     }
 
     let stdout_str = String::from_utf8_lossy(&buf);
-    let line = stdout_str.lines().next()?.trim();
-    if line.is_empty() {
+    let text = stdout_str.trim();
+    if text.is_empty() {
         None
     } else {
-        Some(line.to_string())
+        Some(text.to_string())
     }
 }
 
@@ -3134,15 +3683,34 @@ where
 }
 
 /// Convenience wrapper around [`cached_cli_version`] for scanners that probe
-/// the Trivy CLI. Returns `Some("trivy-<ver>")` once the CLI has been
+/// the Trivy CLI. Returns `Some("trivy-<ver>")` — composed with the
+/// vulnerability-DB build date (`trivy-<ver>+db-<date>`, #3287) when the
+/// probe's `Vulnerability DB:` block reports one — once the CLI has been
 /// probed, or `None` when the binary is missing or its output is unparseable.
+/// Probes the FULL `--version` output ([`capture_cli_output`]) because the DB
+/// block lives below the first line.
 pub(crate) async fn cached_trivy_cli_version(cell: &VersionCache) -> Option<String> {
     cached_cli_version(cell, || async {
-        let raw = capture_cli_version("trivy", &["--version"]).await?;
+        let raw = capture_cli_output("trivy", &["--version"]).await?;
         format_trivy_version(&raw)
     })
     .await
 }
+
+/// The `--severity` allowlist for every local `trivy filesystem` invocation
+/// (the hosted-artifact filesystem scanner and the incus rootfs scanner).
+///
+/// `UNKNOWN` is included deliberately (#3296): an ungraded CVE is an
+/// un-triaged one, not a harmless one. Before this constant existed, both call
+/// sites carried their own `"CRITICAL,HIGH,MEDIUM,LOW"` literal, so a Trivy
+/// `UNKNOWN` finding was filtered out by the CLI before the report was ever
+/// written — no `scan_findings` row, no count contribution, invisible to every
+/// gate and score, and unrecoverable by any operator-side policy because the
+/// data was discarded at the scanner invocation. One shared constant means the
+/// next divergence is a compile error rather than a silent drift; the adapter
+/// image path (`docker/scanner-adapter`) already defaults to the full list via
+/// `SCANNER_TRIVY_SEVERITY`.
+pub(crate) const TRIVY_FS_SEVERITY_LIST: &str = "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL";
 
 /// Classify a spawn failure from the `trivy` CLI into an [`AppError`].
 ///
@@ -3183,9 +3751,16 @@ pub(crate) fn classify_trivy_spawn_error(err: &std::io::Error) -> AppError {
     }
 }
 
-/// Parse a Trivy `--version` first stdout line into a `trivy-X.Y.Z` token.
-/// Trivy emits `Version: 0.62.1` (or `Version: 0.62.1\n...`). We normalize
-/// to `trivy-<version>` to make the field self-describing in the DB.
+/// Parse a Trivy `--version` first stdout line into a `trivy-X.Y.Z` token,
+/// composed with the vulnerability-DB build date when the output carries one
+/// (#3287). Trivy emits `Version: 0.62.1` followed, once a DB has been
+/// downloaded, by a `Vulnerability DB:` block whose `UpdatedAt:` line is the
+/// DB build timestamp. Folding that date into the token
+/// (`trivy-0.62.1+db-2026-08-10`) makes the stored `scanner_version` change
+/// when the CVE database moves, so `verdict_is_fresh` invalidates a cached
+/// verdict on a DB update — not only on a CLI upgrade. Output with no DB block
+/// keeps the bare `trivy-<version>` token (freshness falls back to the TTL,
+/// exactly as an unknown version always has).
 pub(crate) fn format_trivy_version(raw: &str) -> Option<String> {
     let v = raw
         .strip_prefix("Version:")
@@ -3195,10 +3770,62 @@ pub(crate) fn format_trivy_version(raw: &str) -> Option<String> {
         .trim();
     let token = v.split_whitespace().next()?;
     if token.is_empty() {
-        None
-    } else {
-        Some(format!("trivy-{}", token))
+        return None;
     }
+    let cli = format!("trivy-{}", token);
+    // The `Vulnerability DB:` block also carries `NextUpdate:`/`DownloadedAt:`
+    // lines; `UpdatedAt:` is the build timestamp of the DB content itself.
+    let db = raw
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("UpdatedAt:"))
+        .and_then(db_build_date_token);
+    Some(compose_scanner_version(cli, db))
+}
+
+/// Extract a compact `YYYY-MM-DD` build-date token from a scanner's DB
+/// metadata timestamp (#3287). Accepts both the space-separated shape
+/// (`2026-08-10 01:31:31 +0000 UTC`) and the ISO shape
+/// (`2026-08-10T01:31:31Z`), reducing either to the date. Day resolution
+/// matches the daily CVE-DB release cadence of both Grype and Trivy, and keeps
+/// the composed token within `scan_results.scanner_version`'s `VARCHAR(50)`.
+pub(crate) fn db_build_date_token(value: &str) -> Option<String> {
+    let first = value.split_whitespace().next()?;
+    let date = first.split('T').next().unwrap_or(first);
+    // A plausible build date starts with a digit; anything else (an error
+    // string, a "unknown" placeholder) is treated as no DB information.
+    if date.is_empty() || !date.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(date.to_string())
+}
+
+/// Compose the stored scanner-version token from the CLI version and the
+/// optional CVE-DB build token: `grype-0.83.0+db-2026-08-10` (#3287). The DB
+/// half is what makes daily vulnerability-database updates invalidate cached
+/// proxy verdicts via `verdict_is_fresh`'s exact-match comparison; without it
+/// the token changes only when the scanner BINARY is upgraded, and a withdrawn
+/// advisory keeps blocking (or a new one keeps serving) for the full TTL.
+pub(crate) fn compose_scanner_version(cli: String, db_build: Option<String>) -> String {
+    match db_build {
+        Some(db) => format!("{}+db-{}", cli, db),
+        None => cli,
+    }
+}
+
+/// Parse `grype db status` output into the DB build-date token (#3287).
+/// Grype prints a `Built:` line for the installed vulnerability DB, e.g.
+/// `Built:    2026-08-10 01:31:31 +0000 UTC` (schema v6 emits ISO:
+/// `Built: 2026-08-10T01:31:31Z`). Returns `None` when the output carries no
+/// parseable build date (no DB downloaded, unexpected format), in which case
+/// the caller stores the bare CLI token and freshness falls back to the TTL.
+pub(crate) fn format_grype_db_build(raw: &str) -> Option<String> {
+    raw.lines()
+        .find_map(|l| {
+            let t = l.trim();
+            t.strip_prefix("Built:")
+                .or_else(|| t.strip_prefix("built:"))
+        })
+        .and_then(db_build_date_token)
 }
 
 /// Parse a `grype --version` first stdout line into a `grype-X.Y.Z` token.
@@ -3984,6 +4611,11 @@ impl Scanner for DependencyScanner {
             seen_ids.insert(advisory_match.id.clone());
             seen_ids.extend(advisory_match.aliases.iter().cloned());
 
+            // Deliberately independent of `Severity::UNRECOGNIZED_SCANNER_SEVERITY`
+            // (#3306): advisory feeds (OSV/GHSA) are a graded vocabulary that
+            // rarely omits severity, so `Medium` is a neutral guess for a
+            // missing grade here — unlike a scanner's ungraded finding, which
+            // must fail closed at a configured gate.
             let severity =
                 Severity::from_str_loose(&advisory_match.severity).unwrap_or(Severity::Medium);
 
@@ -4471,9 +5103,12 @@ impl ScannerService {
         // externally routable identity (Grype's OCI `registry:` mode) require
         // the owning repository's key and type. Fetch those separately so the
         // artifact load stays compile-time column-checked via `query_as!`.
+        // `format` comes along for the ride because it selects the component
+        // pin this upload is graded against (#3442).
         let repo_routing = sqlx::query!(
             r#"
-            SELECT key AS repository_key, repo_type::text AS repository_type
+            SELECT key AS repository_key, repo_type::text AS repository_type,
+                   format::text AS repository_format
             FROM repositories
             WHERE id = $1
             "#,
@@ -4486,6 +5121,9 @@ impl ScannerService {
         let repository_type = repo_routing
             .repository_type
             .ok_or_else(|| AppError::Database("repository repo_type was NULL".to_string()))?;
+        let repository_format = repo_routing
+            .repository_format
+            .ok_or_else(|| AppError::Database("repository format was NULL".to_string()))?;
 
         // Check if scanning is enabled for this repo (skip check if forced)
         if !force
@@ -4546,6 +5184,33 @@ impl ScannerService {
 
         let checksum = &artifact.checksum_sha256;
         let mut prepared = prepared.unwrap_or_default();
+
+        // #3442 builds a component pin from the artifact's own registry row.
+        // #3604 hardens two things around it before it is used or cached:
+        //
+        //  * The pin must AGREE with what the bytes claim about themselves. The
+        //    hosted pin is trusted from the `artifacts` row, whose name/version
+        //    are derived from URL path segments on the generic endpoint; a file
+        //    that is not the tarball its coordinate names must not be graded as
+        //    that component (`npm_pin_agrees_with_tarball`, defect 2). A missing
+        //    version already yields `None` here (defect 4).
+        //  * Whatever pin survives is recorded as this scan's `pin_identity` so
+        //    the cross-artifact reuse key cannot serve a verdict graded for one
+        //    coordinate as the answer for a byte-identical upload under a
+        //    DIFFERENT coordinate (defect 1, the CRITICAL one).
+        let format_wants_pin = format_expects_pin(&repository_format);
+        let upload_pin = hosted_upload_pin(
+            &repository_format,
+            &artifact.name,
+            artifact.version.as_deref(),
+        )
+        .filter(|pin| npm_pin_agrees_with_tarball(&content, pin));
+
+        // A format that SHOULD pin but produced no trustworthy pin graded
+        // nothing gradeable, so its clean verdict is not authoritative: record
+        // it PARTIAL, never as a complete clean (#3604 defects 2 and 4).
+        let pin_downgraded = format_wants_pin && upload_pin.is_none();
+        let pin_identity: Option<String> = upload_pin.as_ref().map(ExpectedComponent::pin_identity);
         let target = ScanTarget {
             artifact: &artifact,
             repository_key: &repository_key,
@@ -4558,7 +5223,15 @@ impl ScannerService {
             // share the image manifest mediaType. Only meaningful for OCI
             // manifest artifacts; the gate ignores it for everything else.
             manifest_body: is_oci_image_artifact(&artifact).then(|| content.as_ref()),
-            expected_component: None,
+            // #3442: hosted uploads used to pass `None` here, so
+            // `ScanWorkspace::prepare_pinned` wrote no ecosystem-native
+            // metadata file and the CVE engine had nothing to catalog for a
+            // natively-published npm tarball -- it reported "0 findings,
+            // complete" for a package with known Critical CVEs. The pin comes
+            // from the registry's own artifacts row (see
+            // [`hosted_upload_pin`]), so it needs no network call and is
+            // `None` for every format that is not pinned.
+            expected_component: upload_pin.as_ref(),
             require_nonempty_catalog: false,
         };
 
@@ -4649,6 +5322,12 @@ impl ScannerService {
                         scanner.scan_type(),
                         DEDUP_TTL_DAYS,
                         ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                        // #3604: a reusable row must have graded the SAME pin
+                        // identity as this request. `IS NOT DISTINCT FROM` in
+                        // the query makes NULL (unpinned) match only NULL, so a
+                        // pinned npm verdict is never handed back for an
+                        // unpinned request and vice versa.
+                        pin_identity.as_deref(),
                     )
                     .await
                     .ok()
@@ -4699,7 +5378,12 @@ impl ScannerService {
                             // running row eventually.
                             if let Err(e) = self
                                 .scan_result_service
-                                .convert_to_reused(target_id, source_id, artifact_id)
+                                .convert_to_reused(
+                                    target_id,
+                                    source_id,
+                                    artifact_id,
+                                    pin_identity.as_deref(),
+                                )
                                 .await
                             {
                                 warn!(
@@ -4737,7 +5421,12 @@ impl ScannerService {
                 let copied = match prepared_action {
                     PreparedScanAction::Reuse(target_id) => {
                         self.scan_result_service
-                            .convert_to_reused(target_id, source_scan.id, artifact_id)
+                            .convert_to_reused(
+                                target_id,
+                                source_scan.id,
+                                artifact_id,
+                                pin_identity.as_deref(),
+                            )
                             .await
                     }
                     PreparedScanAction::InsertFresh => {
@@ -4748,6 +5437,10 @@ impl ScannerService {
                                 artifact.repository_id,
                                 scanner.scan_type(),
                                 checksum,
+                                // #3604: the reused row records THIS request's
+                                // pin so it cannot later be handed to a
+                                // byte-identical upload under a different pin.
+                                pin_identity.as_deref(),
                             )
                             .await
                     }
@@ -4809,6 +5502,31 @@ impl ScannerService {
                     scan_completeness,
                     cataloged: _,
                 }) => {
+                    // Dedup ONLY when this upload carried a component pin
+                    // (#3442). The inflation is caused by the pin itself:
+                    // `prepare_pinned` writes a synthetic `package-lock.json`
+                    // naming the uploaded component and also stages any
+                    // shipped `npm-shrinkwrap.json` at a catalogable path, so
+                    // a tarball that ships a lockfile naming ITSELF is
+                    // cataloged up to three times and every one of its
+                    // findings is persisted (and counted) three times.
+                    // Measured on a hosted `lodash@4.17.11` that ships both
+                    // files: 21 findings / 3 critical for 7 real CVEs.
+                    //
+                    // Unpinned formats keep the previous behavior exactly:
+                    // there is no synthetic second copy for a single scanner
+                    // to double, and collapsing genuine duplicates they may
+                    // report is a separate decision. Deduping HERE (before
+                    // `total`) rather than at the count keeps the persisted
+                    // rows and the counts in sync, since `create_findings`
+                    // below writes this same vec. Dedup can never turn a
+                    // vulnerable result clean: every merge group keeps its
+                    // maximum-severity member, so a positive count only ever
+                    // shrinks toward the true distinct count.
+                    let findings = match upload_pin.as_ref() {
+                        Some(pin) => dedupe_findings(findings, Some(pin.ecosystem)),
+                        None => findings,
+                    };
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
                         findings.iter().filter(|f| f.severity == sev).count() as i32
@@ -4906,6 +5624,19 @@ impl ScannerService {
                     // SBOM endpoint and downstream attestation tooling can
                     // distinguish "lockfile present but unparseable" from
                     // "no lockfile present".
+                    //
+                    // #3604: a pin-expecting format (npm) that could not produce
+                    // a trustworthy pin — missing version (defect 4) or bytes
+                    // that do not match the coordinate (defect 2) — graded
+                    // nothing gradeable. A zero-finding row from it is not an
+                    // authoritative clean, so downgrade its completeness to
+                    // PARTIAL. `pin_downgraded` is false for genuinely unpinned
+                    // formats, which keep their scanner-derived completeness.
+                    let effective_completeness = if pin_downgraded {
+                        ScanCompleteness::Partial
+                    } else {
+                        scan_completeness
+                    };
                     self.scan_result_service
                         .complete_scan(
                             scan_result.id,
@@ -4917,7 +5648,10 @@ impl ScannerService {
                             info,
                             scanner_version.as_deref(),
                             started_at,
-                            scan_completeness.as_str(),
+                            effective_completeness.as_str(),
+                            // #3604: persist the pin identity that produced this
+                            // verdict so future reuse can require a match.
+                            pin_identity.as_deref(),
                         )
                         .await?;
 
@@ -4929,7 +5663,7 @@ impl ScannerService {
                         critical,
                         high,
                         scanner_version,
-                        scan_completeness.as_str(),
+                        effective_completeness.as_str(),
                     );
 
                     // Update quarantine status
@@ -5984,12 +6718,19 @@ pub(crate) mod test_helpers {
     }
 
     /// Outcome of the mock CVE engine when a proxy serve path re-scans.
-    /// Shared by the #2976 verdict-freshness handler tests (PyPI, npm).
+    /// Shared by the #2976 verdict-freshness handler tests (PyPI, npm) and the
+    /// #3455 inline-gate / rescan-budget regression tests.
+    #[derive(Clone, Copy)]
     pub enum MockCveRescan {
         /// Re-scan against the bumped CVE-DB now flags the bytes.
         Vulnerable,
         /// Re-scan is inconclusive (scanner hard-error).
         Error,
+        /// Re-scan never finishes inside the caller's `tokio::time::timeout`
+        /// budget: sleeps for the given duration (longer than the budget
+        /// under test) before completing. Proves the BudgetExceeded arm
+        /// end-to-end (#3455) without a real grype subprocess.
+        Hang(std::time::Duration),
     }
 
     /// CVE-authoritative mock scanner reporting a fixed live version string.
@@ -6026,6 +6767,10 @@ pub(crate) mod test_helpers {
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
                 )),
+                MockCveRescan::Hang(d) => {
+                    tokio::time::sleep(d).await;
+                    Ok(crate::services::scanner_service::ScanOutput::default())
+                }
                 MockCveRescan::Vulnerable => {
                     Ok(crate::services::scanner_service::ScanOutput::findings_only(
                         vec![crate::models::security::RawFinding {
@@ -6095,6 +6840,126 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    /// Validates the budget/outer-timeout relation (#3455 review, F2): for
+    /// every enabled outer timeout the derived budget must be STRICTLY inside
+    /// it, or the router backstop fires first and `RESCAN_BUDGET_EXCEEDED`
+    /// is unreachable. This is the pure-function half; the router-level
+    /// regression lives with the rescan endpoint in `security.rs`.
+    #[test]
+    fn proxy_rescan_budget_always_fits_inside_the_global_request_timeout() {
+        for outer_secs in [1u64, 2, 3, 5, 8, 30, 60, 119, 120, 121, 300, 86_400] {
+            let budget = proxy_rescan_budget(outer_secs);
+            assert!(
+                budget < Duration::from_secs(outer_secs),
+                "budget {budget:?} must be strictly under the {outer_secs}s outer timeout, \
+                 or the generic timeout 503 always wins the race"
+            );
+            assert!(
+                budget <= PROXY_RESCAN_BUDGET_CEILING,
+                "budget {budget:?} must never exceed the ceiling"
+            );
+        }
+    }
+
+    /// The default deployment (`GLOBAL_REQUEST_TIMEOUT_SECS` unset = 120s)
+    /// must leave real headroom for the work outside the budget clock: auth,
+    /// two DB lookups, up to a 200 MiB object read + SHA-256 before the scan,
+    /// and the verdict/SBOM/CVE writes after it. A quarter of the window is
+    /// reserved, so the default budget is 90s.
+    #[test]
+    fn proxy_rescan_budget_reserves_headroom_at_the_default_timeout() {
+        assert_eq!(proxy_rescan_budget(120), Duration::from_secs(90));
+    }
+
+    /// `0` disables the router timeout layer entirely (see
+    /// `apply_global_backstop`), so nothing races the budget and the full
+    /// ceiling applies. And a very large outer timeout must not inflate the
+    /// budget past the ceiling.
+    #[test]
+    fn proxy_rescan_budget_uses_the_ceiling_when_nothing_races_it() {
+        assert_eq!(proxy_rescan_budget(0), PROXY_RESCAN_BUDGET_CEILING);
+        assert_eq!(proxy_rescan_budget(1_000_000), PROXY_RESCAN_BUDGET_CEILING);
+    }
+
+    /// Extract the cancellation-owned `chmod` invocation from
+    /// [`ScanWorkspace::cleanup_path`]. A source-shape pin is intentionally
+    /// cheap: exercising a dropped future while a recursive chmod races real
+    /// filesystem cleanup is not deterministic enough to be a useful runtime
+    /// regression.
+    fn cleanup_chmod_body() -> &'static str {
+        let src = include_str!("scanner_service.rs");
+        let marker = "pub async fn cleanup_path(workspace: &Path) {";
+        let start = src
+            .find(marker)
+            .expect("ScanWorkspace::cleanup_path must exist");
+        let rest = &src[start + marker.len()..];
+        &rest[..rest
+            .find("\n    }\n")
+            .expect("ScanWorkspace::cleanup_path must close")]
+    }
+
+    /// `chmod` runs inside the same timeout-owned scanner future as the
+    /// scanner processes. Pin its explicit command configuration so a future
+    /// cleanup refactor cannot reintroduce an orphaned child (#3455).
+    #[test]
+    fn cleanup_chmod_is_killed_when_the_scanner_future_is_dropped() {
+        let body = cleanup_chmod_body();
+        assert!(
+            body.contains("let mut chmod = tokio::process::Command::new(\"chmod\");"),
+            "cleanup must retain a distinct chmod Command so its cancellation ownership is explicit: {body}"
+        );
+        assert!(
+            body.contains("chmod.kill_on_drop(true);"),
+            "a timeout dropping cleanup must kill chmod rather than orphan it: {body}"
+        );
+        assert!(
+            body.contains(".args([\"-R\", \"u+rwX\", &workspace_str])"),
+            "the chmod pin must cover the recursive workspace cleanup command: {body}"
+        );
+    }
+
+    /// Source slice of the shared version-probe capture helper. This is a
+    /// deterministic cancellation-ownership regression: process-table timing
+    /// is host dependent, while the Tokio command configuration is the direct
+    /// behavior contract CI needs to preserve.
+    fn capture_cli_output_spawn_body() -> &'static str {
+        let src = include_str!("scanner_service.rs");
+        let marker = "pub(crate) async fn capture_cli_output_with_timeout(";
+        let start = src
+            .find(marker)
+            .expect("capture_cli_output_with_timeout must exist");
+        let rest = &src[start + marker.len()..];
+        &rest[..rest
+            .find("\n}\n\n/// TTL")
+            .expect("capture_cli_output_with_timeout must end before cache constants")]
+    }
+
+    /// A wider caller timeout can drop the shared version-probe future. Pin
+    /// the explicit command ownership that makes Tokio kill that child rather
+    /// than leaving a hung probe alive after its scan has timed out (#3455).
+    #[test]
+    fn capture_cli_output_spawn_is_cancellation_owned() {
+        let body = capture_cli_output_spawn_body();
+        let command = "let mut command = tokio::process::Command::new(binary);";
+        let ownership = "command.kill_on_drop(true);";
+        assert!(
+            body.contains(command),
+            "the shared CLI probe must construct one explicit Command: {body}"
+        );
+        assert!(
+            body.contains(ownership),
+            "a dropped outer timeout must kill the shared CLI probe child: {body}"
+        );
+        let ownership_at = body
+            .find(ownership)
+            .expect("the ownership assertion above found this text");
+        let spawn_at = body.find(".spawn()").expect("probe must spawn a child");
+        assert!(
+            ownership_at < spawn_at,
+            "kill_on_drop must be configured before spawning the probe: {body}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // post_scan_status_decision (pure post-scan quarantine decision)
@@ -6889,6 +7754,88 @@ mod tests {
             format_trivy_version("Version: 0.62.1"),
             Some("trivy-0.62.1".to_string())
         );
+    }
+
+    /// #3287: the stored token must change when the CVE DATABASE moves, not
+    /// only when the CLI is upgraded. Two probes with the same CLI version but
+    /// different DB builds must produce different tokens — asserting the token
+    /// merely "contains the version" would pass with the bug present.
+    #[test]
+    fn test_scanner_version_token_composes_db_build() {
+        // Trivy: full --version output carries the DB block below line 1.
+        let day1 = "Version: 0.62.1\nVulnerability DB:\n  Version: 2\n  UpdatedAt: 2026-08-10 12:07:04.16797355 +0000 UTC\n  NextUpdate: 2026-08-11 12:07:04 +0000 UTC";
+        let day2 = "Version: 0.62.1\nVulnerability DB:\n  Version: 2\n  UpdatedAt: 2026-08-11 12:07:04.16797355 +0000 UTC";
+        let t1 = format_trivy_version(day1).expect("day1 parses");
+        let t2 = format_trivy_version(day2).expect("day2 parses");
+        assert_eq!(t1, "trivy-0.62.1+db-2026-08-10");
+        assert_eq!(t2, "trivy-0.62.1+db-2026-08-11");
+        assert_ne!(
+            t1, t2,
+            "same CLI, different DB build => different token, so the second \
+             scan must NOT reuse the first verdict via verdict_is_fresh"
+        );
+        // ...and verdict_is_fresh actually treats them as a version mismatch.
+        assert!(
+            !crate::services::proxy_scan_service::verdict_is_fresh(
+                chrono::Utc::now(),
+                Some(&t1),
+                Some(&t2),
+                DEDUP_TTL_DAYS as i64,
+                chrono::Utc::now(),
+            ),
+            "a DB-build change must invalidate a stored verdict inside the TTL"
+        );
+
+        // Grype: db status Built line, both output shapes.
+        assert_eq!(
+            format_grype_db_build(
+                "Path:     /db/vulnerability.db\nSchema:   v5\nBuilt:    2026-08-10 01:31:31 +0000 UTC\nStatus: valid"
+            ),
+            Some("2026-08-10".to_string())
+        );
+        assert_eq!(
+            format_grype_db_build("Path: /db\nSchema: v6.0.2\nBuilt: 2026-08-10T01:31:31Z"),
+            Some("2026-08-10".to_string())
+        );
+        assert_eq!(
+            compose_scanner_version("grype-0.83.0".to_string(), Some("2026-08-10".to_string())),
+            "grype-0.83.0+db-2026-08-10"
+        );
+        // Failed DB probe degrades to the bare CLI token (TTL-only freshness),
+        // never to a probe failure.
+        assert_eq!(
+            compose_scanner_version("grype-0.83.0".to_string(), None),
+            "grype-0.83.0"
+        );
+        assert_eq!(format_grype_db_build("no such database"), None);
+        assert_eq!(db_build_date_token("  "), None);
+        assert_eq!(db_build_date_token("unknown"), None);
+        // The composed grype token stays within scan_results.scanner_version's
+        // VARCHAR(50).
+        assert!("grype-0.83.0+db-2026-08-10".len() <= 50);
+    }
+
+    /// #3296: the shared `trivy filesystem` severity allowlist must admit
+    /// UNKNOWN. A finding dropped at the CLI never becomes a RawFinding, a
+    /// scan_findings row, or a gate input — removing UNKNOWN from the list
+    /// reds this test (revert-proof for the fix).
+    #[test]
+    fn test_trivy_fs_severity_list_admits_unknown() {
+        let severities: Vec<&str> = TRIVY_FS_SEVERITY_LIST.split(',').collect();
+        assert!(
+            severities.contains(&"UNKNOWN"),
+            "ungraded CVEs must reach the report instead of being filtered \
+             out at the scanner invocation (#3296)"
+        );
+        for graded in ["LOW", "MEDIUM", "HIGH", "CRITICAL"] {
+            assert!(
+                severities.contains(&graded),
+                "positive control: the graded severities must all stay listed"
+            );
+        }
+        // Matches the adapter image path's default (SCANNER_TRIVY_SEVERITY in
+        // docker/scanner-adapter/config.go), so the four Trivy producers agree.
+        assert_eq!(TRIVY_FS_SEVERITY_LIST, "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL");
     }
 
     #[test]
@@ -8034,6 +8981,166 @@ mod tests {
         assert!(meta.contains("Name: PyYAML"), "{meta}");
         assert!(meta.contains("Version: 5.3.1"), "{meta}");
         assert!(meta.starts_with("Metadata-Version:"), "{meta}");
+    }
+
+    /// #3442: a hosted (natively published) upload gets its component pin from
+    /// the registry's own `artifacts` row. Before this, every hosted upload
+    /// passed `expected_component: None`, so `grype dir:` over an extracted
+    /// npm tarball cataloged nothing and reported "0 findings, complete" for
+    /// a package with known Critical CVEs.
+    ///
+    /// The expected values here are literals, never derived from the function
+    /// under test, and the negative arms use formats where `None` is the
+    /// CORRECT answer rather than a known gap: `maven` jars and PyPI wheels
+    /// are cataloged natively in directory mode (verified live: 4 and 1
+    /// matches respectively on vulnerable fixtures), and `generic` has no
+    /// package ecosystem at all.
+    #[test]
+    fn test_hosted_upload_pin_selects_the_npm_ecosystem() {
+        assert_eq!(
+            hosted_upload_pin("npm", "lodash", Some("4.17.11")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            )),
+            "a hosted npm upload must be pinned so the CVE engine has something to grade"
+        );
+
+        // Scoped names travel verbatim into the pin; the lockfile body keys
+        // `node_modules/@scope/name` off exactly this string.
+        assert_eq!(
+            hosted_upload_pin("npm", "@acme/widget", Some("2.0.0")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "@acme/widget",
+                "2.0.0"
+            )),
+        );
+
+        // The npm aliases are served by the npm handler and store the same
+        // name/version shape, so they pin identically.
+        for alias in ["yarn", "bower", "pnpm"] {
+            assert_eq!(
+                hosted_upload_pin(alias, "left-pad", Some("1.3.0")),
+                Some(ExpectedComponent::new(
+                    ComponentEcosystem::Npm,
+                    "left-pad",
+                    "1.3.0"
+                )),
+                "{alias} is an npm-handler format and must pin like npm"
+            );
+        }
+
+        // Formats the engine already catalogs on its own, and formats with no
+        // ecosystem, must stay exactly as they are today.
+        for format in ["maven", "gradle", "generic", "docker"] {
+            assert_eq!(
+                hosted_upload_pin(format, "commons-collections", Some("3.2.1")),
+                None,
+                "{format} is not pinned by this change"
+            );
+        }
+
+        // An unrecognised format label must fail safe rather than guess.
+        assert_eq!(
+            hosted_upload_pin("not-a-real-format", "lodash", Some("4.17.11")),
+            None,
+        );
+
+        // A pin we cannot name correctly would grade the wrong component.
+        assert_eq!(hosted_upload_pin("npm", "lodash", None), None);
+        assert_eq!(hosted_upload_pin("npm", "lodash", Some("   ")), None);
+        assert_eq!(hosted_upload_pin("npm", "   ", Some("4.17.11")), None);
+    }
+
+    /// #3604 defect 4: `format_expects_pin` tells "unpinned because the format
+    /// never pins" (a complete scan) from "unpinned because a pin could not be
+    /// produced" (a partial scan). It must be true for the npm handler family
+    /// and false for everything else.
+    #[test]
+    fn test_format_expects_pin_is_npm_family_only() {
+        for f in ["npm", "yarn", "bower", "pnpm"] {
+            assert!(format_expects_pin(f), "{f} is an npm-handler format");
+        }
+        for f in [
+            "maven",
+            "gradle",
+            "pypi",
+            "generic",
+            "docker",
+            "not-a-format",
+        ] {
+            assert!(!format_expects_pin(f), "{f} does not pin");
+        }
+    }
+
+    /// #3604 defect 1: the identity string persisted on the row and compared by
+    /// the reuse key. Normalized name (npm is case-insensitive), verbatim
+    /// version, ecosystem prefix so cross-ecosystem collisions cannot alias.
+    #[test]
+    fn test_pin_identity_is_stable_and_normalized() {
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Npm, "Lodash", "4.17.11").pin_identity(),
+            "npm|lodash|4.17.11"
+        );
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Npm, "@Acme/Widget", " 2.0.0 ")
+                .pin_identity(),
+            "npm|@acme/widget|2.0.0"
+        );
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Python, "PyYAML", "5.3.1").pin_identity(),
+            "python|pyyaml|5.3.1"
+        );
+        // Two coordinates that must NOT share a cached verdict.
+        assert_ne!(
+            ExpectedComponent::new(ComponentEcosystem::Npm, "safe-first", "1.0.0").pin_identity(),
+            ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11").pin_identity(),
+        );
+    }
+
+    /// #3604 defect 2: the pin is trusted from the coordinate only if the bytes
+    /// are the tarball that coordinate names.
+    #[test]
+    fn test_npm_pin_agrees_with_tarball() {
+        let lodash = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11");
+
+        // A real tarball whose manifest matches -> trusted.
+        let good = tests_tarball("lodash", "4.17.11");
+        assert!(npm_pin_agrees_with_tarball(&good, &lodash));
+
+        // Same bytes, wrong coordinate (the priming attack) -> not trusted.
+        let safe_first = ExpectedComponent::new(ComponentEcosystem::Npm, "safe-first", "1.0.0");
+        assert!(!npm_pin_agrees_with_tarball(&good, &safe_first));
+
+        // Right name, wrong version -> not trusted (version is exact).
+        let other_ver = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.20");
+        assert!(!npm_pin_agrees_with_tarball(&good, &other_ver));
+
+        // Bytes that are not a tarball at all -> not trusted.
+        let notes = Bytes::from_static(b"just some notes, not a tarball\n");
+        assert!(!npm_pin_agrees_with_tarball(&notes, &lodash));
+    }
+
+    /// Minimal npm `.tgz` claiming `name@version` for the pure-helper tests.
+    fn tests_tarball(name: &str, version: &str) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, manifest.as_bytes()).unwrap();
+        let gz = builder.into_inner().unwrap();
+        let mut out = gz.finish().unwrap();
+        out.flush().unwrap();
+        Bytes::from(out)
     }
 
     /// #3003: identity comparison is ecosystem-aware. Python normalizes per
@@ -10645,68 +11752,620 @@ mod tests {
         assert_eq!(verdict.max_severity_token(), Some("high"));
     }
 
-    /// #3294: re-bucketing a finding's severity must NOT change what the
-    /// proxy/OCI inline gate blocks. The gate is `findings_count > 0`
-    /// (`ProxyScanVerdict::is_vulnerable`) -> `verdict_token()` ->
-    /// `proxy_scan_service::verdict_blocks`, and consults no severity at any
-    /// step, so moving findings between buckets is enforcement-neutral here.
-    ///
-    /// This is a standing invariant, not just a claim about this change: it is
-    /// what makes #3306 (repointing `UNRECOGNIZED_SCANNER_SEVERITY`) provably
-    /// unable to change what the inline download gate blocks, and #3243 stage 2
-    /// proposes making `Info` non-blocking, which would break it deliberately.
-    /// Anyone doing either should have to delete this test on purpose.
+    /// #3243 stage 2: `Info` findings are recorded but NOT blocking. This
+    /// deliberately replaces the former standing invariant
+    /// `test_proxy_verdict_blocking_is_independent_of_severity` (#3294), which
+    /// pinned the severity-blind `findings_count > 0` gate; stage 2 makes the
+    /// `Info` bucket non-blocking on purpose (Harbor's `negligible` rule), so
+    /// the gate is now severity-aware at exactly one boundary: Info vs
+    /// everything above it.
     #[test]
-    fn test_proxy_verdict_blocking_is_independent_of_severity() {
-        // Same population, every finding re-bucketed off the lowest severity.
-        // Stated with literal severities rather than through
-        // `UNRECOGNIZED_SCANNER_SEVERITY`, because that constant sits AT the
-        // floor today (#3306 moves it) and the fixture must genuinely move.
-        let as_info = vec![
+    fn test_proxy_verdict_info_findings_do_not_block() {
+        // Info-only population: recorded, counted, NOT vulnerable.
+        let info_only = vec![
             make_finding(Severity::Info),
             make_finding(Severity::Info),
             make_finding(Severity::Info),
         ];
-        let as_rebucketed: Vec<_> = (0..3).map(|_| make_finding(Severity::Medium)).collect();
-
-        let before = aggregate_proxy_verdict(&as_info, None);
-        let after = aggregate_proxy_verdict(&as_rebucketed, None);
-
-        // The severity really did move — without this the equalities below are
-        // vacuous and would hold for two identical inputs.
-        assert_ne!(
-            before.max_severity, after.max_severity,
-            "fixture must actually re-bucket the findings"
+        let verdict = aggregate_proxy_verdict(&info_only, None);
+        assert_eq!(
+            verdict.findings_count, 3,
+            "info findings stay recorded in the verdict"
         );
-        // `Severity` is ordered Critical=0 .. Info=4, so "more severe" is "<".
-        // `Info` is a fixed endpoint of that order, so pinning it literally is
-        // safe; the re-bucketed side is stated against the ordering so the
-        // test survives a change to which bucket the fixture uses.
-        assert_eq!(before.max_severity, Some(Severity::Info));
+        assert_eq!(verdict.max_severity, Some(Severity::Info));
         assert!(
-            after.max_severity < Some(Severity::Info),
-            "fixture must re-bucket strictly above the floor"
+            !verdict.is_vulnerable(),
+            "#3243 stage 2: an info-only population must not produce a \
+             blocking verdict"
         );
-
-        // ...and the gate's inputs and output did not.
-        assert_eq!(before.findings_count, after.findings_count);
-        assert_eq!(before.is_vulnerable(), after.is_vulnerable());
-        assert_eq!(before.verdict_token(), after.verdict_token());
-        assert!(
-            crate::services::proxy_scan_service::verdict_blocks(before.verdict_token()),
-            "positive control: this population must actually BLOCK, otherwise \
-             the equality above is satisfied by two non-blocking verdicts"
-        );
-        assert!(crate::services::proxy_scan_service::verdict_blocks(
-            after.verdict_token()
+        assert_eq!(verdict.verdict_token(), "clean");
+        assert!(!crate::services::proxy_scan_service::verdict_blocks(
+            verdict.verdict_token()
         ));
 
-        // Negative control at the same call: no findings never blocks, at any
-        // severity, so the assertions above are not simply "everything blocks".
+        // Positive control: ONE finding above the floor flips the verdict,
+        // even buried in an info tail — so the exclusion is exactly Info, not
+        // "low severities" generally.
+        let mut with_low = info_only.clone();
+        with_low.push(make_finding(Severity::Low));
+        let verdict = aggregate_proxy_verdict(&with_low, None);
+        assert_eq!(verdict.findings_count, 4);
+        assert_eq!(verdict.low_count, 1);
+        assert_eq!(
+            verdict.max_severity,
+            Some(Severity::Low),
+            "max_severity still reads the highest across ALL findings"
+        );
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "vulnerable");
+        assert!(crate::services::proxy_scan_service::verdict_blocks(
+            verdict.verdict_token()
+        ));
+
+        // Above the floor, blocking is still independent of WHICH bucket a
+        // finding lands in (the #3294 half of the old invariant that #3306's
+        // re-bucketing relies on): low vs medium changes nothing.
+        let as_low: Vec<_> = (0..3).map(|_| make_finding(Severity::Low)).collect();
+        let as_medium: Vec<_> = (0..3).map(|_| make_finding(Severity::Medium)).collect();
+        let low_v = aggregate_proxy_verdict(&as_low, None);
+        let med_v = aggregate_proxy_verdict(&as_medium, None);
+        assert_ne!(low_v.max_severity, med_v.max_severity);
+        assert_eq!(low_v.is_vulnerable(), med_v.is_vulnerable());
+        assert_eq!(low_v.verdict_token(), med_v.verdict_token());
+
+        // Negative control: no findings never blocks.
         let empty = aggregate_proxy_verdict(&[], None);
         assert!(!crate::services::proxy_scan_service::verdict_blocks(
             empty.verdict_token()
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // dedupe_findings — proxy scan findings_count inflation fix
+    //
+    // Mechanism under test: `ScanWorkspace::prepare_pinned` catalogs a PyPI
+    // wheel's component twice (its own METADATA + the synthetic pin), so
+    // grype reports the same CVE against both copies and `findings.len()`
+    // doubles the true count. `dedupe_findings` runs before
+    // `aggregate_proxy_verdict` to collapse those duplicates.
+    // -----------------------------------------------------------------------
+
+    fn dedup_finding(
+        cve_id: Option<&str>,
+        component: Option<&str>,
+        version: Option<&str>,
+        severity: Severity,
+        source: Option<&str>,
+        title: &str,
+    ) -> RawFinding {
+        RawFinding {
+            severity,
+            title: title.to_string(),
+            description: None,
+            cve_id: cve_id.map(str::to_string),
+            affected_component: component.map(str::to_string),
+            affected_version: version.map(str::to_string),
+            fixed_version: None,
+            source: source.map(str::to_string),
+            source_url: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // retain_proxy_findings — per-CVE detail for proxy content (#3395)
+    // -----------------------------------------------------------------------
+
+    /// The projection must never move the verdict. A scanner that reports a
+    /// finding with no CVE id still contributed to `findings_count` (computed
+    /// from the raw list) but has nothing to persist, so the two numbers
+    /// legitimately differ — and the projection is the side that shrinks.
+    ///
+    /// This is the property that keeps #3395 safe to ship: an operator reading
+    /// "4 findings, 3 CVEs listed" is seeing an incomplete EXPLANATION, never
+    /// an under-reported verdict.
+    #[test]
+    fn retain_proxy_findings_drops_id_less_findings_without_touching_the_counts() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("werkzeug"),
+                Some("0.15.0"),
+                Severity::High,
+                None,
+                "high one",
+            ),
+            // No CVE id: nothing an operator could look up, and NULL would
+            // break the table's identity key.
+            dedup_finding(
+                None,
+                Some("werkzeug"),
+                Some("0.15.0"),
+                Severity::High,
+                None,
+                "unnamed",
+            ),
+            // Whitespace-only id is the same case wearing a disguise.
+            dedup_finding(
+                Some("   "),
+                Some("werkzeug"),
+                Some("0.15.0"),
+                Severity::Low,
+                None,
+                "blank id",
+            ),
+        ];
+
+        let verdict = aggregate_proxy_verdict(&findings, None);
+        assert_eq!(verdict.findings_count, 3, "the verdict counts all three");
+        assert_eq!(verdict.high_count, 2);
+
+        let retained = retain_proxy_findings(&findings);
+        assert_eq!(retained.len(), 1, "only the identified finding persists");
+        assert_eq!(retained[0].cve_id, "CVE-2021-1");
+        assert_eq!(retained[0].severity, "high");
+        assert_eq!(retained[0].package_name.as_deref(), Some("werkzeug"));
+        assert_eq!(retained[0].package_version.as_deref(), Some("0.15.0"));
+        assert!(
+            retained.len() < verdict.findings_count as usize,
+            "findings.len() is a LOWER BOUND on findings_count; asserting \
+             equality anywhere would encode the opposite"
+        );
+    }
+
+    /// Postgres rejects an `INSERT ... ON CONFLICT DO UPDATE` whose own tuple
+    /// set hits one row twice, which would fail the ENTIRE write and lose the
+    /// detail for every CVE in the batch. `dedupe_findings` collapses on the
+    /// NORMALIZED component name, so two raw spellings of one component reach
+    /// here intact and must be collapsed on the table's own key.
+    #[test]
+    fn retain_proxy_findings_dedupes_on_the_tables_uniqueness_key() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("Werkzeug"),
+                Some("0.15.0"),
+                Severity::High,
+                None,
+                "first",
+            ),
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("Werkzeug"),
+                Some("0.15.0"),
+                Severity::Medium,
+                Some("other-scanner"),
+                "second",
+            ),
+            // Same CVE, DIFFERENT component: legitimately two rows.
+            dedup_finding(
+                Some("CVE-2021-1"),
+                Some("jinja2"),
+                Some("2.0"),
+                Severity::High,
+                None,
+                "third",
+            ),
+        ];
+
+        let retained = retain_proxy_findings(&findings);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(
+            retained[0].title.as_deref(),
+            Some("first"),
+            "first occurrence wins: dedupe_findings already resolved severity"
+        );
+        assert_eq!(retained[0].severity, "high");
+        assert_eq!(retained[1].package_name.as_deref(), Some("jinja2"));
+
+        // The uniqueness key the write relies on, restated over the output.
+        let mut keys: Vec<_> = retained
+            .iter()
+            .map(|f| {
+                (
+                    f.cve_id.clone(),
+                    f.package_name.clone().unwrap_or_default(),
+                    f.package_version.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let before = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "output must be key-unique");
+    }
+
+    /// An empty title is dropped rather than persisted as `""`: the column is
+    /// nullable precisely so "the scanner said nothing" and "the scanner said
+    /// nothing useful" are the same state on read.
+    #[test]
+    fn retain_proxy_findings_normalizes_absent_metadata() {
+        let findings = vec![dedup_finding(
+            Some("CVE-2021-2"),
+            None,
+            None,
+            Severity::Info,
+            None,
+            "  ",
+        )];
+        let retained = retain_proxy_findings(&findings);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].severity, "info");
+        assert!(retained[0].title.is_none());
+        assert!(retained[0].package_name.is_none());
+        assert!(retained[0].package_version.is_none());
+    }
+
+    /// `dedupe_packages` was reimplemented from a per-package linear scan to
+    /// an index when the CVE scanner started reporting its full component
+    /// catalogue (the quadratic form ran inline on the proxy download path).
+    /// The observable contract must be identical: `(name, version)` identity,
+    /// FIRST occurrence keeps its position, later duplicates only fill fields
+    /// the first left empty — they never overwrite.
+    #[test]
+    fn test_dedupe_packages_merges_partial_records_without_reordering() {
+        let p = |name: &str,
+                 version: Option<&str>,
+                 purl: Option<&str>,
+                 license: Option<&str>,
+                 source: Option<&str>| RawPackage {
+            name: name.to_string(),
+            version: version.map(str::to_string),
+            purl: purl.map(str::to_string),
+            license: license.map(str::to_string),
+            source_target: source.map(str::to_string),
+        };
+
+        let deduped = dedupe_packages(vec![
+            p("zlib", Some("1.3"), None, Some("Zlib"), None),
+            p("acme", Some("1.0"), Some("pkg:pypi/acme@1.0"), None, None),
+            // Duplicate of `zlib`: fills purl and source_target, and must NOT
+            // overwrite the license the first record already carried.
+            p(
+                "zlib",
+                Some("1.3"),
+                Some("pkg:apk/zlib@1.3"),
+                Some("OVERWRITE-ME"),
+                Some("apk"),
+            ),
+            // Same name, different version: a distinct component.
+            p("zlib", Some("1.4"), None, None, None),
+            // Same name, NO version: distinct again (None is its own key).
+            p("zlib", None, None, None, None),
+        ]);
+
+        let identity: Vec<(&str, Option<&str>)> = deduped
+            .iter()
+            .map(|x| (x.name.as_str(), x.version.as_deref()))
+            .collect();
+        assert_eq!(
+            identity,
+            vec![
+                ("zlib", Some("1.3")),
+                ("acme", Some("1.0")),
+                ("zlib", Some("1.4")),
+                ("zlib", None),
+            ],
+            "first occurrence keeps its position; only exact (name, version) \
+             duplicates collapse"
+        );
+        assert_eq!(deduped[0].purl.as_deref(), Some("pkg:apk/zlib@1.3"));
+        assert_eq!(deduped[0].source_target.as_deref(), Some("apk"));
+        assert_eq!(
+            deduped[0].license.as_deref(),
+            Some("Zlib"),
+            "a later duplicate fills gaps, it never overwrites"
+        );
+        assert!(dedupe_packages(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn test_dedupe_findings_merges_the_pinned_wheel_duplicate() {
+        // The reproducer from the bug report: `requests 2.32.5`, one real
+        // CVE, cataloged twice (wheel METADATA + prepare_pinned's synthetic
+        // pin) so grype emits the identical finding twice.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "CVE-2026-25645 in requests",
+            ),
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "CVE-2026-25645 in requests",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].cve_id.as_deref(), Some("CVE-2026-25645"));
+
+        // And the fix is visible end-to-end through the verdict counts too.
+        let verdict = aggregate_proxy_verdict(&deduped, None);
+        assert_eq!(verdict.findings_count, 1);
+    }
+
+    /// Reproduces the exact shape `prepare_pinned` produces: the wheel's own
+    /// METADATA and the synthetic pin can disagree on name casing (syft's
+    /// own catalog entry vs. the literal `<name>-<version>.dist-info`
+    /// directory name we write), so this pins the dedup key on PEP 503
+    /// normalization rather than on the two copies happening to share an
+    /// identical string. Live symptom this fixes: `proxy_scan_results` for
+    /// `requests 2.32.5` (one real CVE, CVE-2026-25645) recorded
+    /// `findings_count: 2`.
+    #[test]
+    fn test_aggregate_proxy_verdict_collapses_pin_duplicate_with_non_canonical_name() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "CVE-2026-25645 in requests",
+            ),
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                // Non-canonical variant of the SAME package — this is what
+                // makes the test meaningful: a naive exact-string key would
+                // fail to merge this, and PEP 503 normalization is what
+                // `ExpectedComponent::normalize_name` provides.
+                Some("Requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "CVE-2026-25645 in requests",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        let verdict = aggregate_proxy_verdict(&deduped, None);
+        assert_eq!(verdict.findings_count, 1);
+        assert_eq!(verdict.medium_count, 1);
+    }
+
+    #[test]
+    fn test_dedupe_findings_merges_canonical_and_pep503_python_names() {
+        // syft reports `PyYAML` as `pyyaml`; the wheel copy and the pin copy
+        // can disagree on casing/separators for the SAME package.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-1111"),
+                Some("PyYAML"),
+                Some("6.0"),
+                Severity::High,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-1111"),
+                Some("pyyaml"),
+                Some("6.0"),
+                Severity::High,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+
+        // `zope.interface` / `zope-interface` — PEP 503 collapses `.`/`_`/`-`
+        // runs to a single `-`.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-2222"),
+                Some("zope.interface"),
+                Some("5.0"),
+                Severity::Low,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-2222"),
+                Some("zope-interface"),
+                Some("5.0"),
+                Severity::Low,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+    }
+
+    #[test]
+    fn test_dedupe_findings_npm_scoped_name_merges_case_insensitively_not_mangled() {
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-3333"),
+                Some("@scope/Name"),
+                Some("1.0.0"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-3333"),
+                Some("@scope/name"),
+                Some("1.0.0"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Npm));
+        assert_eq!(deduped.len(), 1);
+        // Not mangled: the `@scope/` structure survives normalization (npm
+        // normalization is a pure lowercase, not PEP 503 separator-folding).
+        assert_eq!(
+            deduped[0].affected_component.as_deref(),
+            Some("@scope/Name")
+        );
+
+        // A DIFFERENT scoped package under the same scope must NOT merge.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-3333"),
+                Some("@scope/name-a"),
+                Some("1.0.0"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-3333"),
+                Some("@scope/name-b"),
+                Some("1.0.0"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Npm));
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn test_dedupe_findings_none_cve_id_with_different_native_advisories_does_not_merge() {
+        // Two DIFFERENT GHSA/OSV-only advisories (no CVE alias) on the same
+        // component must NOT collapse under a shared `(None, ...)` key.
+        let findings = vec![
+            dedup_finding(
+                None,
+                Some("left-pad"),
+                Some("1.0.0"),
+                Severity::High,
+                Some("osv"),
+                "GHSA-aaaa-bbbb-cccc: something bad",
+            ),
+            dedup_finding(
+                None,
+                Some("left-pad"),
+                Some("1.0.0"),
+                Severity::High,
+                Some("osv"),
+                "GHSA-dddd-eeee-ffff: something else",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Npm));
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn test_dedupe_findings_empty_string_component_does_not_merge_unrelated_findings() {
+        // `affected_component: Some("")` (DependencyScanner's
+        // `deps.first()...unwrap_or_default()` when the dependency list is
+        // empty) must be treated as ABSENT — not as a shared "" key that
+        // merges two otherwise-unrelated findings.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-4444"),
+                Some(""),
+                None,
+                Severity::Medium,
+                Some("osv"),
+                "advisory one",
+            ),
+            dedup_finding(
+                Some("CVE-2024-4444"),
+                Some(""),
+                None,
+                Severity::Medium,
+                Some("osv"),
+                "advisory two",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        assert_eq!(
+            deduped.len(),
+            2,
+            "empty-string affected_component must not act as a mergeable key"
+        );
+    }
+
+    #[test]
+    fn test_dedupe_findings_retains_max_severity_within_a_merged_group() {
+        // Two scanners (or two catalog copies) reporting the SAME
+        // vulnerability at DIFFERENT severities: the merged finding must
+        // keep the worse (higher) one, not whichever came first.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2024-5555"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Low,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2024-5555"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Critical,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings.clone(), Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].severity, Severity::Critical);
+
+        // Order independence: the same population, reversed, must produce
+        // the same retained severity.
+        let mut reversed = findings;
+        reversed.reverse();
+        let deduped_reversed = dedupe_findings(reversed, Some(ComponentEcosystem::Python));
+        assert_eq!(deduped_reversed.len(), 1);
+        assert_eq!(deduped_reversed[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn test_dedupe_findings_single_finding_is_unchanged() {
+        let findings = vec![dedup_finding(
+            Some("CVE-2026-25645"),
+            Some("requests"),
+            Some("2.32.5"),
+            Severity::Medium,
+            Some("grype"),
+            "CVE-2026-25645 in requests",
+        )];
+        let deduped = dedupe_findings(findings.clone(), Some(ComponentEcosystem::Python));
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].cve_id, findings[0].cve_id);
+        assert_eq!(deduped[0].severity, findings[0].severity);
+    }
+
+    #[test]
+    fn test_dedupe_findings_never_zeroes_a_vulnerable_verdict() {
+        // Bound stated on `dedupe_findings`: it can only ever REDUCE a
+        // strictly-positive findings_count, never zero it, because every
+        // merge group retains at least one member.
+        let findings = vec![
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "t",
+            ),
+            dedup_finding(
+                Some("CVE-2026-25645"),
+                Some("requests"),
+                Some("2.32.5"),
+                Severity::Medium,
+                Some("grype"),
+                "t",
+            ),
+        ];
+        let deduped = dedupe_findings(findings, Some(ComponentEcosystem::Python));
+        let verdict = aggregate_proxy_verdict(&deduped, None);
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "vulnerable");
     }
 
     #[test]
@@ -11730,12 +13389,10 @@ mod tests {
     // .Severity`: UNKNOWN, LOW, MEDIUM, HIGH, CRITICAL (uppercase, per
     // aquasecurity/trivy `pkg/types`).
     //
-    // This adapter's classification is UNCHANGED by #3294 — it is a pure
-    // consolidation here, and these tests are the evidence: every one of them
-    // passes against the pre-#3294 expression
-    // `Severity::from_str_loose(&vuln.severity).unwrap_or(Severity::Info)` as
-    // well. Separating UNKNOWN — a CVE with no NVD/vendor grade yet — from an
-    // explicitly negligible one is #3306 (1.8.0).
+    // #3294 was a pure consolidation here; #3306 then moved the unrecognised
+    // bucket to `High`, so UNKNOWN — a CVE with no NVD/vendor grade yet — is
+    // now separated from an explicitly negligible one and fails closed at
+    // severity-aware gates instead of landing at the floor.
     // -----------------------------------------------------------------------
 
     fn trivy_report_with_severities(sevs: &[&str]) -> crate::services::image_scanner::TrivyReport {
@@ -11796,25 +13453,57 @@ mod tests {
         assert_eq!(findings[1].severity, Severity::Low);
     }
 
-    /// Neutrality pin: `UNKNOWN`, an empty string and an unheard-of token all
-    /// classify exactly where they did before #3294 — the lowest bucket, the
-    /// same one an explicitly-negligible finding lands in. That collapse is a
-    /// fail-open and it is deliberately left in place by this patch;
-    /// **#3306 must delete this test on purpose.**
+    /// #3306: `UNKNOWN`, an empty string and an unheard-of token — all
+    /// ungraded — fail closed at `High` through the real Trivy parse path,
+    /// instead of collapsing into the `Info` floor where no severity-aware
+    /// gate could see them. This is the deliberate rewrite of the stage-1a
+    /// pinning test (`..._is_unchanged_pending_3306`).
     #[test]
-    fn test_convert_trivy_findings_unrecognized_severity_is_unchanged_pending_3306() {
-        let report = trivy_report_with_severities(&["UNKNOWN", "", "SEVERE", "HIGH"]);
+    fn test_convert_trivy_findings_unrecognized_severity_fails_closed_3306() {
+        let report = trivy_report_with_severities(&["UNKNOWN", "", "SEVERE", "LOW"]);
         let findings = convert_trivy_findings(&report, "trivy");
         assert_eq!(findings.len(), 4);
         for f in &findings[..3] {
             assert_eq!(
                 f.severity,
-                Severity::Info,
-                "ungraded Trivy token must classify as it did before #3294"
+                Severity::High,
+                "ungraded Trivy token must fail closed at High (#3306)"
             );
         }
-        // Positive control in the same fixture.
-        assert_eq!(findings[3].severity, Severity::High);
+        // Positive control in the same fixture: a graded row below High is
+        // untouched, so a converter that raised everything cannot pass.
+        assert_eq!(findings[3].severity, Severity::Low);
+    }
+
+    /// #3296: an ungraded (`UNKNOWN`) finding must be PRESENT in the converted
+    /// set — the historical bug was that the fs/incus CLI invocations filtered
+    /// it out before the report was written, so no conversion, row, count, or
+    /// gate ever saw it. This pins the converter half (presence, identity
+    /// intact); [`test_trivy_fs_severity_list_admits_unknown`] pins the CLI
+    /// half. The BUCKET is deliberately asserted through
+    /// `UNRECOGNIZED_SCANNER_SEVERITY` so this test tracks #3306's repointing
+    /// rather than fighting it.
+    #[test]
+    fn test_convert_trivy_findings_unknown_finding_is_present() {
+        let report = trivy_report_with_severities(&["UNKNOWN", "HIGH"]);
+        let findings = convert_trivy_findings(&report, "trivy");
+        assert_eq!(
+            findings.len(),
+            2,
+            "the ungraded finding must be present, not dropped"
+        );
+        assert_eq!(
+            findings[0].cve_id.as_deref(),
+            Some("CVE-2026-0000"),
+            "identity of the ungraded finding survives conversion"
+        );
+        assert_eq!(
+            findings[0].severity,
+            Severity::UNRECOGNIZED_SCANNER_SEVERITY
+        );
+        // Positive control in the same fixture: a graded finding also
+        // converts, so an empty-converter regression cannot pass this test.
+        assert_eq!(findings[1].severity, Severity::High);
     }
 
     // -----------------------------------------------------------------------
@@ -16320,6 +18009,742 @@ mod tests {
                 .unwrap_or_default()
                 .contains("does not apply"),
             "reason text must be preserved for display"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// Records the [`ScanTarget::expected_component`] the orchestration hands
+    /// each scanner, and replays a caller-supplied finding list. Both halves
+    /// are needed by the #3442 tests: one asserts WHICH component the hosted
+    /// upload path pins, the other asserts what happens to the findings a
+    /// pinned scan produces.
+    struct PinRecordingScanner {
+        seen_pin: Arc<Mutex<Vec<Option<ExpectedComponent>>>>,
+        findings: Vec<RawFinding>,
+    }
+
+    impl PinRecordingScanner {
+        fn new(findings: Vec<RawFinding>) -> Self {
+            Self {
+                seen_pin: Arc::new(Mutex::new(Vec::new())),
+                findings,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Scanner for PinRecordingScanner {
+        fn name(&self) -> &str {
+            "pin-recording"
+        }
+
+        fn scan_type(&self) -> &str {
+            // Must satisfy scan_results_scan_type_check against the real DB.
+            "grype"
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+
+        fn is_applicable_for_target(&self, _target: &ScanTarget<'_>) -> bool {
+            true
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("orchestration must call scan_target so the component pin is visible")
+        }
+
+        async fn scan_target(
+            &self,
+            target: &ScanTarget<'_>,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            self.seen_pin
+                .lock()
+                .unwrap()
+                .push(target.expected_component.cloned());
+            Ok(ScanOutput::findings_only(self.findings.clone()))
+        }
+    }
+
+    /// Build the `ScannerService` the orchestration tests drive, with one
+    /// injected leaf scanner.
+    fn scanner_service_with(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        scanner: Arc<dyn Scanner>,
+    ) -> ScannerService {
+        ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![scanner],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        }
+    }
+
+    /// Insert one scannable artifact into the fixture repository and return its id.
+    /// Build an in-memory npm `.tgz` shipping a `package/package.json` that
+    /// claims `name@version` — the standalone manifest `npm pack` always
+    /// writes and the one #3604's cross-check (`npm_pin_agrees_with_tarball`)
+    /// reads. Tests that expect a pin to SURVIVE must give the artifact real
+    /// tarball bytes whose manifest matches the coordinate, otherwise the
+    /// cross-check now (correctly) drops the pin.
+    fn npm_tarball_bytes(name: &str, version: &str) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, manifest.as_bytes()).unwrap();
+        let gz = builder.into_inner().unwrap();
+        let mut out = gz.finish().unwrap();
+        out.flush().unwrap();
+        Bytes::from(out)
+    }
+
+    /// Insert one scannable artifact into the fixture repository with fully
+    /// controlled bytes + checksum, and return its id. The reuse tests need
+    /// two artifacts under DIFFERENT coordinates that share the SAME checksum
+    /// (byte-identical uploads), which the checksum-generating helper below
+    /// cannot express.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_artifact_with(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        name: &str,
+        version: Option<&str>,
+        tag: &str,
+        checksum: &str,
+        content: Bytes,
+    ) -> Uuid {
+        let artifact_id = Uuid::new_v4();
+        let storage_key = format!("{tag}/{artifact_id}.bin");
+        let size = content.len() as i64;
+        fx.state
+            .storage
+            .put(&storage_key, content)
+            .await
+            .expect("store artifact bytes");
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, version, path, size_bytes,
+                checksum_sha256, content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'application/gzip', $8, false)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(name)
+        .bind(version)
+        .bind(format!(
+            "{tag}/{name}/{}/{name}.tgz",
+            version.unwrap_or("0")
+        ))
+        .bind(size)
+        .bind(checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+        artifact_id
+    }
+
+    /// Insert one scannable artifact into the fixture repository and return its
+    /// id. The stored bytes are a real npm `.tgz` whose manifest claims
+    /// `name@version`, so #3604's tarball cross-check keeps the pin; an
+    /// unversioned artifact ships neutral bytes because it never pins anyway.
+    async fn insert_scannable_artifact(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        name: &str,
+        version: Option<&str>,
+        tag: &str,
+    ) -> Uuid {
+        let content = match version {
+            Some(v) => npm_tarball_bytes(name, v),
+            None => Bytes::from_static(b"artifact-bytes"),
+        };
+        insert_artifact_with(fx, name, version, tag, &fresh_checksum(), content).await
+    }
+
+    /// Read `scan_completeness` for an artifact's scan row.
+    async fn read_scan_completeness(pool: &sqlx::PgPool, artifact_id: Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT scan_completeness FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("read scan_completeness")
+    }
+
+    /// Read `(findings_count, critical_count, is_reused, pin_identity,
+    /// scan_completeness)` for an artifact's scan row.
+    async fn read_reuse_row(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+    ) -> (i32, i32, bool, Option<String>, Option<String>) {
+        sqlx::query_as::<_, (i32, i32, bool, Option<String>, Option<String>)>(
+            "SELECT findings_count, critical_count, is_reused, pin_identity, scan_completeness \
+             FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("read scan row")
+    }
+
+    /// #3442: the hosted-upload orchestration must hand the leaf scanner the
+    /// component pin derived from the artifact's own registry row.
+    ///
+    /// Before the fix this call site passed `expected_component: None`
+    /// unconditionally, so `ScanWorkspace::prepare_pinned` wrote no
+    /// `package-lock.json` and `grype dir:` over the extracted tarball
+    /// cataloged zero components — a natively-published `lodash@4.17.11`
+    /// (1 Critical + 3 High) scanned `completed, findings_count = 0`.
+    ///
+    /// The negative arm is the SAME npm repository with an artifact that has
+    /// no version: the pin is unavailable there for a reason unrelated to the
+    /// format, which is what proves the call site forwards the helper's
+    /// decision instead of hard-coding one.
+    #[tokio::test]
+    async fn test_hosted_npm_scan_target_carries_the_component_pin() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let scanner = Arc::new(PinRecordingScanner::new(Vec::new()));
+        let service = scanner_service_with(&fx, scanner.clone());
+
+        let versioned = insert_scannable_artifact(&fx, "lodash", Some("4.17.11"), "pinned").await;
+        service
+            .scan_artifact_with_options(versioned, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let unversioned = insert_scannable_artifact(&fx, "lodash", None, "unpinned").await;
+        service
+            .scan_artifact_with_options(unversioned, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let seen = scanner.seen_pin.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "both artifacts must reach the scanner");
+        assert_eq!(
+            seen[0],
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            )),
+            "a hosted npm upload must be scanned with its own name@version pinned; \
+             without it the CVE engine catalogs nothing and reports a false clean"
+        );
+        assert_eq!(
+            seen[1], None,
+            "an artifact with no version has no coordinate to pin, and must not be \
+             graded as some other component"
+        );
+
+        // #3604 defect 4: the unversioned npm artifact could not be pinned, so
+        // the engine graded nothing gradeable. Recording that as an
+        // authoritative `complete` clean is the hollow-test species (e) the PR
+        // originally blessed; it must be `partial`. The versioned one pinned
+        // fine and stays `complete`.
+        let versioned_completeness = read_scan_completeness(&fx.pool, versioned).await;
+        let unversioned_completeness = read_scan_completeness(&fx.pool, unversioned).await;
+        assert_eq!(
+            versioned_completeness.as_deref(),
+            Some("complete"),
+            "a pinned npm scan grades a real component and stays complete"
+        );
+        assert_eq!(
+            unversioned_completeness.as_deref(),
+            Some("partial"),
+            "an npm upload that could not be pinned graded nothing gradeable and \
+             must be recorded partial, not an authoritative complete clean"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// #3442: the pin makes the engine catalog the SAME identity more than
+    /// once whenever the archive also ships a lockfile naming itself — the
+    /// synthetic pin, the shipped `package-lock.json`, and the staged
+    /// `npm-shrinkwrap.json` copy are three catalog entries for one component.
+    /// Measured live on a hosted `lodash@4.17.11` shipping both files: 21
+    /// findings / 3 critical for 7 distinct CVEs.
+    ///
+    /// So a pinned scan collapses duplicates before the counts are taken AND
+    /// before the rows are persisted (the two must not desync). Distinct
+    /// component VERSIONS of the same CVE are real transitives and must
+    /// survive, which is what stops this from over-collapsing.
+    #[tokio::test]
+    async fn test_pinned_hosted_scan_collapses_pin_duplicated_findings() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let dup = |version: &str| RawFinding {
+            severity: Severity::Critical,
+            title: "Prototype pollution".to_string(),
+            description: None,
+            cve_id: Some("CVE-2019-10744".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some(version.to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+        };
+        // Three catalog entries for the uploaded component (pin + shipped
+        // lockfile + staged shrinkwrap) plus one genuine transitive at a
+        // different version.
+        let replay = vec![
+            dup("4.17.11"),
+            dup("4.17.11"),
+            dup("4.17.11"),
+            dup("3.10.1"),
+        ];
+
+        let scanner = Arc::new(PinRecordingScanner::new(replay));
+        let service = scanner_service_with(&fx, scanner.clone());
+        let artifact_id = insert_scannable_artifact(&fx, "lodash", Some("4.17.11"), "dedup").await;
+        service
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().as_slice(),
+            [Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            ))],
+            "this case is only meaningful for a PINNED scan"
+        );
+
+        let (findings_count, critical_count): (i32, i32) = sqlx::query_as(
+            "SELECT findings_count, critical_count FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read scan row");
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count findings");
+
+        assert_eq!(
+            findings_count, 2,
+            "the pin's own duplicate catalog entries must not inflate the count a \
+             promotion gate reads; the distinct transitive must survive"
+        );
+        assert_eq!(critical_count, 2, "severity counts follow the deduped list");
+        assert_eq!(
+            persisted, 2,
+            "the persisted rows must match the counts exactly, or the finding list \
+             and the summary disagree"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// The dedup above is driven BY THE PIN, not applied to every hosted scan:
+    /// an unpinned format keeps its previous behavior byte for byte. Without
+    /// this arm the same test would pass if the dedup were applied blindly to
+    /// every format, which would be a silent behaviour change well outside
+    /// #3442's scope.
+    #[tokio::test]
+    async fn test_unpinned_hosted_scan_findings_are_left_untouched() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "generic").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let dup = || RawFinding {
+            severity: Severity::High,
+            title: "Duplicated by the scanner itself".to_string(),
+            description: None,
+            cve_id: Some("CVE-2021-23337".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4.17.11".to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+        };
+
+        let scanner = Arc::new(PinRecordingScanner::new(vec![dup(), dup(), dup()]));
+        let service = scanner_service_with(&fx, scanner.clone());
+        let artifact_id =
+            insert_scannable_artifact(&fx, "blob", Some("1.0.0"), "unpinned-generic").await;
+        service
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().as_slice(),
+            [None],
+            "a generic repository has no package ecosystem and must stay unpinned"
+        );
+
+        let findings_count: i32 =
+            sqlx::query_scalar("SELECT findings_count FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read scan row");
+        assert_eq!(
+            findings_count, 3,
+            "unpinned formats must be unaffected by this change"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// A leaf scanner that models `grype dir:` faithfully for the reuse tests:
+    /// it grades ONLY the component it was handed as a pin, returning the pin's
+    /// CVEs when the pin matches `vuln` and nothing otherwise (an unpinned or
+    /// mismatched scan catalogs nothing). It records every pin it saw so a test
+    /// can prove which scans actually ran versus were served from cache.
+    struct PinGradingScanner {
+        seen_pin: Arc<Mutex<Vec<Option<ExpectedComponent>>>>,
+        vuln: ExpectedComponent,
+        vuln_findings: Vec<RawFinding>,
+    }
+
+    #[async_trait]
+    impl Scanner for PinGradingScanner {
+        fn name(&self) -> &str {
+            "pin-grading"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+        fn is_applicable_for_target(&self, _target: &ScanTarget<'_>) -> bool {
+            true
+        }
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("orchestration must call scan_target so the pin is visible")
+        }
+        async fn scan_target(
+            &self,
+            target: &ScanTarget<'_>,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            let pin = target.expected_component.cloned();
+            self.seen_pin.lock().unwrap().push(pin.clone());
+            let findings = if pin.as_ref() == Some(&self.vuln) {
+                self.vuln_findings.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(ScanOutput::findings_only(findings))
+        }
+    }
+
+    /// #3604 defect 1 (the CRITICAL one) + defect 2, end to end.
+    ///
+    /// #3442 made the npm verdict a function of the request coordinate, but the
+    /// cross-artifact reuse key still matched only `(checksum, scan_type)`, and
+    /// reuse is consulted BEFORE the scan runs. So byte-identical uploads under
+    /// different coordinates collapsed onto one cached verdict: a publisher with
+    /// only `write:artifacts` could prime a clean verdict under a throwaway name
+    /// and have it served for the real, vulnerable coordinate (and the reverse,
+    /// priming a flag to block good content).
+    ///
+    /// The bytes here ARE the vulnerable `lodash@4.17.11` tarball (its manifest
+    /// claims that identity). Published FIRST as `safe-first@1.0.0`, the #3604
+    /// cross-check sees the coordinate disagree with the manifest and grades it
+    /// UNPINNED (0 findings, `pin_identity` NULL). Published then as its real
+    /// coordinate `lodash@4.17.11`, the reuse key must refuse the NULL-pin row
+    /// and run its own pinned scan — 7 findings. A THIRD identical
+    /// `lodash@4.17.11` upload MUST still reuse the second's verdict, or the fix
+    /// is a blanket reuse-disable (a performance regression, not a fix). This
+    /// asserts each coordinate gets its OWN correct verdict, that neither reuses
+    /// the other's, across the unpinned↔pinned AND pinned↔pinned directions.
+    #[tokio::test]
+    async fn test_reuse_key_is_pinned_to_the_coordinate_not_only_the_bytes() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        // 7 distinct CVEs so the pin-dedup collapse cannot mask a miscount.
+        let lodash_cves: Vec<RawFinding> = [
+            (Severity::Critical, "CVE-2019-10744"),
+            (Severity::High, "CVE-2018-16487"),
+            (Severity::High, "CVE-2019-1010266"),
+            (Severity::High, "CVE-2020-8203"),
+            (Severity::Medium, "CVE-2021-23337"),
+            (Severity::Medium, "CVE-2020-28500"),
+            (Severity::Medium, "CVE-2018-3721"),
+        ]
+        .into_iter()
+        .map(|(severity, cve)| RawFinding {
+            severity,
+            title: cve.to_string(),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4.17.11".to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+        })
+        .collect();
+
+        let scanner = Arc::new(PinGradingScanner {
+            seen_pin: Arc::new(Mutex::new(Vec::new())),
+            vuln: ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11"),
+            vuln_findings: lodash_cves,
+        });
+        let service = scanner_service_with(&fx, scanner.clone());
+
+        // Same bytes (real lodash tarball), same checksum, three coordinates.
+        let bytes = npm_tarball_bytes("lodash", "4.17.11");
+        // A fresh checksum per run: the reuse key is checksum-scoped GLOBALLY
+        // (not per repository), so a constant would collide with rows left by a
+        // prior run of this test under a different repo id.
+        let shared_ck = fresh_checksum();
+
+        // 1) Prime under a throwaway name. The coordinate disagrees with the
+        //    tarball manifest, so #3604 grades it unpinned -> 0 findings.
+        let primed = insert_artifact_with(
+            &fx,
+            "safe-first",
+            Some("1.0.0"),
+            "prime",
+            &shared_ck,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(primed, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        // 2) The real coordinate, same bytes. Must NOT be served the primed
+        //    clean verdict; must run its own pinned scan.
+        let real = insert_artifact_with(
+            &fx,
+            "lodash",
+            Some("4.17.11"),
+            "real",
+            &shared_ck,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(real, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        // 3) A genuinely identical re-publish of the real coordinate. Legit
+        //    reuse: MUST be served #2's verdict (not a fresh scan).
+        let repeat = insert_artifact_with(
+            &fx,
+            "lodash",
+            Some("4.17.11"),
+            "repeat",
+            &shared_ck,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(repeat, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let (p_find, _p_crit, p_reused, p_pin, p_complete) = read_reuse_row(&fx.pool, primed).await;
+        assert_eq!(
+            (p_find, p_reused),
+            (0, false),
+            "the primed throwaway coordinate disagrees with the tarball, so it is \
+             graded unpinned and clean on its own bytes"
+        );
+        assert_eq!(p_pin, None, "an unpinned scan records a NULL pin_identity");
+        assert_eq!(
+            p_complete.as_deref(),
+            Some("partial"),
+            "an npm upload whose coordinate the bytes do not back is not an \
+             authoritative complete clean"
+        );
+
+        let (r_find, r_crit, r_reused, r_pin, _r_complete) = read_reuse_row(&fx.pool, real).await;
+        assert_eq!(
+            r_find, 7,
+            "the real coordinate must earn its OWN verdict; being handed the primed \
+             clean row is the attacker-controlled false clean #3604 closes"
+        );
+        assert_eq!(
+            r_crit, 1,
+            "the real coordinate's own Critical must be recorded"
+        );
+        assert!(
+            !r_reused,
+            "the real coordinate must NOT reuse the differently-pinned primed row"
+        );
+        assert_eq!(
+            r_pin.as_deref(),
+            Some("npm|lodash|4.17.11"),
+            "the real scan records the pin identity that produced it"
+        );
+
+        let (rep_find, _rep_crit, rep_reused, rep_pin, _c) = read_reuse_row(&fx.pool, repeat).await;
+        assert_eq!(
+            rep_find, 7,
+            "a genuinely identical re-publish gets the same verdict"
+        );
+        assert!(
+            rep_reused,
+            "legitimate reuse of a byte-AND-pin-identical scan must still work; \
+             disabling reuse entirely would be a performance regression, not a fix"
+        );
+        assert_eq!(rep_pin.as_deref(), Some("npm|lodash|4.17.11"));
+
+        // Exactly two scans actually ran (primed + real); the third was served
+        // from cache, so the scanner saw only two pins.
+        let seen = scanner.seen_pin.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "only the two distinct (bytes,pin) combinations run a scan; the \
+             identical re-publish is served from cache"
+        );
+        assert_eq!(
+            seen[0], None,
+            "the primed coordinate was graded unpinned (cross-check mismatch)"
+        );
+        assert_eq!(
+            seen[1],
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            )),
+            "the real coordinate was graded with its own pin"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// #3604 defect 2, isolated: a file whose bytes are NOT the tarball its
+    /// coordinate names must not be graded as that component. Uploading a plain
+    /// text file to `handlebars/4.0.11/notes.txt` (an npm repo) used to pin —
+    /// and grade — it as `handlebars@4.0.11`, yielding findings for a file that
+    /// ships no code. The pin must be dropped and the scan recorded partial.
+    #[tokio::test]
+    async fn test_hosted_npm_pin_requires_the_bytes_to_back_the_coordinate() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let scanner = Arc::new(PinGradingScanner {
+            seen_pin: Arc::new(Mutex::new(Vec::new())),
+            vuln: ExpectedComponent::new(ComponentEcosystem::Npm, "handlebars", "4.0.11"),
+            // If the pin were (wrongly) kept, these would be recorded.
+            vuln_findings: vec![RawFinding {
+                severity: Severity::Critical,
+                title: "CVE-2019-19919".to_string(),
+                description: None,
+                cve_id: Some("CVE-2019-19919".to_string()),
+                affected_component: Some("handlebars".to_string()),
+                affected_version: Some("4.0.11".to_string()),
+                fixed_version: None,
+                source: Some("grype".to_string()),
+                source_url: None,
+            }],
+        });
+        let service = scanner_service_with(&fx, scanner.clone());
+
+        // A 30-byte text file, NOT an npm tarball, at an npm coordinate.
+        let notes = Bytes::from_static(b"these are just some release notes\n");
+        let aid = insert_artifact_with(
+            &fx,
+            "handlebars",
+            Some("4.0.11"),
+            "notes",
+            &fresh_checksum(),
+            notes,
+        )
+        .await;
+        service
+            .scan_artifact_with_options(aid, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().as_slice(),
+            [None],
+            "bytes that are not the tarball the coordinate names must be scanned \
+             UNPINNED, never graded as that component"
+        );
+        let (findings, complete): (i32, Option<String>) = sqlx::query_as(
+            "SELECT findings_count, scan_completeness FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(aid)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read scan row");
+        assert_eq!(
+            findings, 0,
+            "a non-tarball file must not inherit the pinned component's CVEs"
+        );
+        assert_eq!(
+            complete.as_deref(),
+            Some("partial"),
+            "dropping an untrustworthy pin means the scan graded nothing gradeable"
         );
 
         cleanup_scan_state(&fx.pool, fx.repo_id).await;

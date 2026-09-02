@@ -29,10 +29,23 @@ pub struct StorageLocation {
 pub struct StorageRegistry {
     backends: HashMap<String, Arc<dyn StorageBackend>>,
     default_backend: String,
+    /// Global filesystem storage root (`STORAGE_PATH`), when known.
+    ///
+    /// Filesystem locations are rooted at the *repository's* directory
+    /// (`<STORAGE_PATH>/<repo_key>`), while the proxy cache writes through a
+    /// handle rooted at `<STORAGE_PATH>` itself. Handing the global root to
+    /// each `FilesystemStorage` lets reserved bucket-root namespaces resolve
+    /// to the same file through both handles (#3368) — the filesystem
+    /// counterpart of the `S3_PREFIX` split.
+    filesystem_bucket_root: Option<std::path::PathBuf>,
 }
 
 impl StorageRegistry {
     /// Create a new registry with the given named backends and default.
+    ///
+    /// Filesystem locations get no global root, so reserved bucket-root
+    /// namespaces resolve against the location path exactly as before. Use
+    /// [`Self::with_filesystem_bucket_root`] to supply `STORAGE_PATH`.
     pub fn new(
         backends: HashMap<String, Arc<dyn StorageBackend>>,
         default_backend: String,
@@ -40,7 +53,16 @@ impl StorageRegistry {
         Self {
             backends,
             default_backend,
+            filesystem_bucket_root: None,
         }
+    }
+
+    /// Anchor reserved bucket-root namespaces on filesystem locations at
+    /// `root` (the configured `STORAGE_PATH`) rather than at each
+    /// repository's own directory (#3368).
+    pub fn with_filesystem_bucket_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.filesystem_bucket_root = Some(root.into());
+        self
     }
 
     /// Resolve a `StorageLocation` to a concrete backend instance.
@@ -50,7 +72,11 @@ impl StorageRegistry {
     /// registry's map of shared instances.
     pub fn backend_for(&self, location: &StorageLocation) -> Result<Arc<dyn StorageBackend>> {
         if location.backend == "filesystem" {
-            return Ok(Arc::new(FilesystemStorage::new(&location.path)));
+            let fs = FilesystemStorage::new(&location.path);
+            return Ok(Arc::new(match &self.filesystem_bucket_root {
+                Some(root) => fs.with_bucket_root(root),
+                None => fs,
+            }));
         }
 
         self.backends
@@ -152,6 +178,188 @@ mod tests {
             Arc::new(MockBackend::new("gcs-archive")),
         );
         StorageRegistry::new(backends, "s3-primary".to_string())
+    }
+
+    /// #3368 on the FILESYSTEM backend — the default one.
+    ///
+    /// The two handles differ by ROOT rather than by key prefix, but the
+    /// consequence is identical:
+    ///
+    /// * the proxy cache writes through `FilesystemBackend::new(STORAGE_PATH)`
+    ///   (`StorageService::from_config`), so the object lands at
+    ///   `<STORAGE_PATH>/proxy-cache/...`;
+    /// * an `artifacts` row is read through `backend_for(location)`, and
+    ///   `repositories.rs` sets `location.path` to
+    ///   `<STORAGE_PATH>/<repo_key>`, so the read looked at
+    ///   `<STORAGE_PATH>/<repo_key>/proxy-cache/...`.
+    ///
+    /// Both `key_to_path` implementations are a bare `root.join(key)` for a
+    /// hierarchical key, so the read was a structurally guaranteed miss with
+    /// the file present on disk — the same failure the prefixed-S3 half
+    /// produces, on the default backend and with no `S3_PREFIX` involved.
+    ///
+    /// FAILS ON MAIN: the read resolves under the repository directory.
+    #[tokio::test]
+    async fn test_filesystem_proxy_cache_key_is_read_at_the_global_root_3368() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo_key = "pypi-remote";
+        let cache_key = "proxy-cache/pypi-remote/simple/six/six-1.17.0.whl/__content__";
+        let body = Bytes::from_static(b"wheel-bytes");
+
+        // The proxy cache's own handle: rooted at STORAGE_PATH.
+        let cache_handle = FilesystemStorage::new(root.path());
+        cache_handle
+            .put(cache_key, body.clone())
+            .await
+            .expect("cache write");
+
+        // The artifact handle the `artifacts`-row read paths resolve.
+        let registry = StorageRegistry::new(HashMap::new(), "filesystem".to_string())
+            .with_filesystem_bucket_root(root.path());
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: root.path().join(repo_key).to_string_lossy().into_owned(),
+        };
+        let artifact_handle = registry.backend_for(&location).expect("resolve backend");
+
+        let read = artifact_handle.get(cache_key).await;
+        assert!(
+            read.is_ok(),
+            "#3368: the artifacts-row read must address the object the proxy cache wrote; \
+             it resolved under <STORAGE_PATH>/{repo_key}/ instead of the global root"
+        );
+        assert_eq!(read.unwrap(), body, "and it must be the same bytes");
+
+        // Negative control: ordinary artifact bytes stay isolated per
+        // repository. Anchoring the reserved namespaces must not collapse the
+        // per-repo directory tree, or one repository could read another's
+        // objects by guessing a flat key.
+        let hosted_key = "pypi/six/1.17.0/six-1.17.0.whl";
+        artifact_handle
+            .put(hosted_key, Bytes::from_static(b"hosted"))
+            .await
+            .expect("hosted write");
+        assert!(
+            root.path().join(repo_key).join(hosted_key).exists(),
+            "hosted artifact bytes must stay under the repository directory"
+        );
+        assert!(
+            !root.path().join(hosted_key).exists(),
+            "hosted artifact bytes must NOT leak to the global root"
+        );
+        assert!(
+            cache_handle.get(hosted_key).await.is_err(),
+            "the global-root handle must not see another repository's hosted bytes"
+        );
+
+        // The OTHER direction, asserted because it is a deliberate design
+        // consequence rather than an oversight: within the reserved
+        // namespaces the isolation boundary is no longer the repository. A
+        // handle rooted at a DIFFERENT repository resolves the same
+        // `proxy-cache/...` key to the same object — that is the whole point,
+        // since the writer (the proxy cache) and the reader (an `artifacts`
+        // row on some repository) are rooted differently by construction.
+        //
+        // What keeps that safe is that no caller can put a
+        // `proxy-cache/`-prefixed `storage_key` on an `artifacts` row through
+        // any API: every format composes hosted keys as `<format>/...`, and
+        // the cache keys are derived server-side from `(repo_key, path)`. The
+        // boundary is therefore "who can write such a row", not "which
+        // repository is asking". Pinned here so a future change that starts
+        // accepting a caller-supplied storage key has to confront it.
+        let other_location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: root
+                .path()
+                .join("some-other-repo")
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let other_handle = registry
+            .backend_for(&other_location)
+            .expect("resolve backend");
+        assert_eq!(
+            other_handle.get(cache_key).await.ok(),
+            Some(body),
+            "a proxy-cache key resolves to one shared object regardless of which repository's \
+             handle asks; the reserved namespace is deliberately not repo-scoped"
+        );
+    }
+
+    /// #3368 hardening: the root and the path tail must be derived from the
+    /// SAME string.
+    ///
+    /// `key_to_path` builds the tail from the sanitized key (only
+    /// `Component::Normal` survives), so deciding the root from the raw key
+    /// let spellings that sanitize identically land in different places —
+    /// `proxy-cache/r/x` at the global root but `/proxy-cache/r/x` and
+    /// `../proxy-cache/r/x` under the repository directory. One logical
+    /// object, two physical locations: a miniature of the divergence this
+    /// anchoring removes.
+    ///
+    /// Not reachable through any caller today (`validate_cache_path` trims a
+    /// leading `/` and rejects dot segments), so this pins the property rather
+    /// than fixing a live bug.
+    #[tokio::test]
+    async fn test_filesystem_root_is_decided_from_the_sanitized_key_3368() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let registry = StorageRegistry::new(HashMap::new(), "filesystem".to_string())
+            .with_filesystem_bucket_root(root.path());
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: root.path().join("repoA").to_string_lossy().into_owned(),
+        };
+        let handle = registry.backend_for(&location).expect("resolve backend");
+
+        // All three sanitize to `proxy-cache/repoB/x/__content__`, so all three
+        // must address the one object at the global root.
+        let canonical = "proxy-cache/repoB/x/__content__";
+        handle
+            .put(canonical, Bytes::from_static(b"cache"))
+            .await
+            .expect("write");
+        for spelling in [
+            canonical,
+            "/proxy-cache/repoB/x/__content__",
+            "../proxy-cache/repoB/x/__content__",
+        ] {
+            assert_eq!(
+                handle.get(spelling).await.ok(),
+                Some(Bytes::from_static(b"cache")),
+                "{spelling} sanitizes to the canonical key and must resolve to the same object"
+            );
+        }
+        assert!(
+            root.path().join(canonical).exists(),
+            "and that object lives at the global root"
+        );
+        assert!(
+            !root.path().join("repoA").join(canonical).exists(),
+            "not a second copy under the repository directory"
+        );
+    }
+
+    /// Without a global root the registry keeps its historical single-root
+    /// behaviour, so the standalone constructions (and any caller that does
+    /// not know `STORAGE_PATH`) are unchanged.
+    #[tokio::test]
+    async fn test_filesystem_without_a_global_root_is_unchanged_3368() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let registry = StorageRegistry::new(HashMap::new(), "filesystem".to_string());
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: root.path().join("repo").to_string_lossy().into_owned(),
+        };
+        let handle = registry.backend_for(&location).expect("resolve backend");
+        let cache_key = "proxy-cache/repo/p/__content__";
+        handle
+            .put(cache_key, Bytes::from_static(b"x"))
+            .await
+            .expect("write");
+        assert!(
+            root.path().join("repo").join(cache_key).exists(),
+            "with no global root configured the key stays under the location path"
+        );
     }
 
     // -- StorageLocation tests ------------------------------------------------

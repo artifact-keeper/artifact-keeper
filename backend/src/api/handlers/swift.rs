@@ -203,6 +203,7 @@ fn swift_error_response(status: StatusCode, detail: &str) -> Response {
 
 async fn list_releases(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, name)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     // Validate the path via SwiftHandler
@@ -215,7 +216,7 @@ async fn list_releases(
 
     // Virtual repos own no artifacts: fan out across members (issue #1554).
     let versions = if repo.repo_type == RepositoryType::Virtual {
-        query_release_versions_virtual(&state.db, repo.id, &package_id).await?
+        query_release_versions_virtual(&state.db, auth.as_ref(), repo.id, &package_id).await?
     } else {
         query_release_versions(&state.db, repo.id, &package_id).await?
     };
@@ -295,10 +296,13 @@ async fn query_release_versions(
 /// format-specific; the `.zip`/metadata endpoints proxy them on demand.
 pub async fn query_release_versions_virtual(
     db: &PgPool,
+    auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     package_id: &str,
 ) -> Result<Vec<String>, Response> {
-    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+    // Caller-authorized member walk (#3323): the version list is content, and
+    // the sibling manifest/archive routes are already gated this way.
+    let members = proxy_helpers::authorized_virtual_members(db, auth, virtual_repo_id).await?;
     let mut aggregated: Vec<String> = Vec::new();
     let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
     for member in &members {
@@ -349,7 +353,7 @@ async fn version_path_handler(
     }
 
     // Release metadata: /:scope/:name/:version
-    get_release_metadata(state, &repo_key, &scope, &name, version_path).await
+    get_release_metadata(state, auth.as_ref(), &repo_key, &scope, &name, version_path).await
 }
 
 // ---------------------------------------------------------------------------
@@ -407,11 +411,13 @@ async fn query_release_metadata(
 /// virtual repo, returning the first hit in priority order (issue #1554).
 pub async fn query_release_metadata_virtual(
     db: &PgPool,
+    auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     package_id: &str,
     version: &str,
 ) -> Result<Option<ReleaseRow>, Response> {
-    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+    // Caller-authorized member walk (#3323).
+    let members = proxy_helpers::authorized_virtual_members(db, auth, virtual_repo_id).await?;
     for member in &members {
         if member.repo_type != RepositoryType::Local && member.repo_type != RepositoryType::Staging
         {
@@ -465,6 +471,7 @@ fn build_release_metadata_body(
 
 async fn get_release_metadata(
     state: SharedState,
+    auth: Option<&AuthExtension>,
     repo_key: &str,
     scope: &str,
     name: &str,
@@ -475,7 +482,7 @@ async fn get_release_metadata(
 
     // Virtual repos own no artifacts: fan out across members (issue #1554).
     let row = if repo.repo_type == RepositoryType::Virtual {
-        query_release_metadata_virtual(&state.db, repo.id, &package_id, version).await?
+        query_release_metadata_virtual(&state.db, auth, repo.id, &package_id, version).await?
     } else {
         query_release_metadata(&state.db, repo.id, &package_id, version).await?
     }
@@ -548,6 +555,15 @@ async fn download_archive(
                     // than the cap. Stream it (teed into the proxy cache) so a
                     // large release archive succeeds with 200 and subsequent
                     // requests are served warm.
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,

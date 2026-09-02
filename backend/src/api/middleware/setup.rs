@@ -31,6 +31,7 @@ pub async fn setup_guard(
 
     let path = request.uri().path();
 
+    let is_oci_v2 = super::oci_errors::is_oci_v2_path(path);
     let is_allowed = matches!(
         path,
         "/health"
@@ -59,6 +60,18 @@ pub async fn setup_guard(
         return next.run(request).await;
     }
 
+    // #3284: a refusal on the OCI surface must be the distribution-spec
+    // error envelope, not the REST body below — docker cannot render the
+    // REST shape, so an unconfigured instance reported a `docker login`
+    // failure with no usable message.
+    if is_oci_v2 {
+        return super::oci_errors::oci_denied_response(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "initial setup is required: change the admin password via the API to unlock the registry",
+        );
+    }
+
     // Block everything else
     (
         StatusCode::FORBIDDEN,
@@ -77,4 +90,80 @@ pub async fn setup_guard(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+
+    /// #3284: while setup is pending, a refusal on `/v2` must be the
+    /// distribution-spec error envelope so `docker login` renders a usable
+    /// message; REST routes keep the instructional SETUP_REQUIRED body.
+    #[tokio::test]
+    async fn setup_guard_emits_oci_envelope_on_v2_and_rest_shape_elsewhere() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        // Seed the DB-side condition `setup_still_required` re-checks: an
+        // admin account that must still change its password.
+        let admin = format!("setup-guard-admin-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO users (username, email, password_hash, is_admin, must_change_password) \
+             VALUES ($1, $2, 'x', true, true)",
+        )
+        .bind(&admin)
+        .bind(format!("{admin}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("seed admin");
+
+        let dir = std::env::temp_dir().join(format!("ak-setup-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state =
+            crate::api::handlers::test_db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
+        state
+            .setup_required
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = axum::Router::new()
+            .fallback(|| async { StatusCode::OK })
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                setup_guard,
+            ));
+
+        let send = |app: axum::Router, uri: &'static str| async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let (status, bytes) = crate::api::handlers::test_db_helpers::send(app, req).await;
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        };
+
+        let (status, body) = send(app.clone(), "/v2/").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["errors"][0]["code"], "DENIED",
+            "OCI surface must get the spec envelope, got: {body}"
+        );
+        assert!(body.get("error").is_none());
+
+        let (status, body) = send(app.clone(), "/api/v1/repositories").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["error"], "SETUP_REQUIRED",
+            "REST surface keeps the instructional body"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE username = $1")
+            .bind(&admin)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

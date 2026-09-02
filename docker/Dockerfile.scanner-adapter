@@ -18,13 +18,40 @@
 # to the requested TARGET arch (fast, no emulation for the compile step).
 # Go 1.26 toolchain: the adapter is stdlib-only, so every Go CVE reported
 # against the compiled binary is a stdlib CVE baked in by the builder
-# toolchain. Track the current patched Go minor here (>= 1.26.5 clears the
-# 2026-07 stdlib batch, issue #2391); the go.mod `go` directive stays at the
-# minimum language version.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+# toolchain. The floating `1.26` tag is deliberate — it always resolves to the
+# newest patch, which is what a security rebuild wants. Current floor is
+# **1.26.6**, not the 1.26.5 this comment used to name: the 2026-08 batch
+# (CVE-2026-33818/-56853/-56858/-56859/-56860/-56862, plus -39821/-46600)
+# needs 1.26.6, and that is the batch that blocked publishing in #3352.
+# Verified 2026-08-16: this image's `usr/local/bin/scanner-adapter` reports
+# stdlib v1.26.6 and scans clean. The go.mod `go` directive stays at the
+# minimum language version. See issues #2391 and #3352.
+#
+# The asymmetry with docker/Dockerfile.backend{,.alpine} is now closed. Those
+# build grype on the same floating tag and assert a `GO_MIN_PATCH` floor; the
+# comment here used to say to copy that assertion "if this adapter ever fails
+# a scan on the same class". That condition was met: release/1.7.x's adapter
+# binary (1.2.3) carries 8 Go-stdlib HIGHs, because a floating tag is only as
+# good as the last rebuild and that build predates go1.26.6. A floating tag
+# alone is a hope, not a guarantee — the floor below turns a lagging mirror or
+# a stale builder cache into a loud build failure instead of a silently
+# vulnerable stdlib. Raise GO_MIN_PATCH in lockstep with the backend
+# Dockerfiles when a new Go stdlib advisory lands.
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG GO_MIN_PATCH=1.26.6
+
+RUN set -eu; \
+    have="$(go env GOVERSION | sed 's/^go//')"; \
+    oldest="$(printf '%s\n%s\n' "${have}" "${GO_MIN_PATCH}" | sort -V | head -n1)"; \
+    if [ "${have}" != "${GO_MIN_PATCH}" ] && [ "${oldest}" != "${GO_MIN_PATCH}" ]; then \
+      echo "ERROR: Go toolchain go${have} is older than the required go${GO_MIN_PATCH}." >&2; \
+      echo "       Building the scanner adapter on it would ship known-vulnerable stdlib (#3352)." >&2; \
+      exit 1; \
+    fi; \
+    echo "scanner-adapter build: go${have} satisfies the go${GO_MIN_PATCH} floor"
 
 WORKDIR /src
 
@@ -39,18 +66,27 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/scanner-adapter .
 
 # ---------- Stage 2: pull the matching trivy binary ----------
-# Our own build of upstream trivy v0.73.0 (artifact-keeper/trivy): the same
+# Our own build of upstream trivy v0.74.0 (artifact-keeper/trivy): the same
 # upstream source tag, built with our pinned Go toolchain plus the documented
-# dependency overrides in that repo's overrides.yaml. Two of them now:
+# dependency overrides in that repo's overrides.yaml.
+#
+# What the 0.73.0-r2 -> 0.74.0-r1 rebuild fixes: the 0.73.0 binary was compiled
+# on go1.26.5 and carried 10 HIGHs — 8 Go-stdlib (CVE-2026-33818/-39821/
+# -46600/-56853/-56858/-56859/-56860/-56862) plus golang.org/x/mod
+# CVE-2026-56864/-56865. Upstream v0.74.0 is built here on go1.26.7 and picks
+# up x/mod v0.40.0, so all 10 clear at the source. Note the x/mod pair is the
+# same class #3469 addresses for grype in docker/Dockerfile.backend{,.alpine};
+# both had to move before Docker Publish could go green.
+#
+# The two dependency overrides that motivated the earlier r-builds:
 #
 #   oras.land/oras-go/v2        v2.6.1  -> v2.6.2   (CVE-2026-50163)
 #   github.com/go-git/go-git/v5 v5.19.1 -> v5.19.2  (CVE-2026-71556 HIGH,
 #                                                    CVE-2026-71557)
 #
-# In BOTH cases upstream merged the bump on main and has not released it, and
-# v0.73.0 is still the latest release, so no upstream tag carries the fix.
-# That is the whole reason this image is ours: there is nothing to bump to.
-# Leaving this on ghcr.io/aquasecurity/trivy:0.73.0 fails the Docker Publish
+# In BOTH cases upstream merged the bump on main and had not released it, so
+# no upstream tag carried the fix. That is the whole reason this image is
+# ours. Leaving this on ghcr.io/aquasecurity/trivy fails the Docker Publish
 # security gate, which skips every multi-arch manifest and blocks the release
 # chain.
 #
@@ -66,35 +102,71 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # Worth remembering: upstream 0.73.0 scanned clean when #3123 landed, and our
 # own v0.73.0-r1 scanned clean when it was published on 2026-08-07 and went red
 # on 2026-08-13 (#3307) without a byte changing — the go-git advisory was
-# published against a dependency it already shipped. A clean scan at merge time
-# does not stay clean, which is why the source repo rebuilds and re-gates on a
-# schedule rather than trusting a one-time result.
+# published against a dependency it already shipped. 0.73.0-r2 then went red
+# the same way. A clean scan at merge time does not stay clean, which is why
+# the source repo rebuilds and re-gates on a schedule rather than trusting a
+# one-time result — and why the digest below will need moving again.
 #
 # Pinned by DIGEST, not tag: that repo rebuilds weekly to pick up RPM errata,
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.73.0-r2 (note: no leading
+# This digest is the manifest-list digest of tag 0.74.0-r1 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
 # Nothing couples the backend to a specific trivy version: the 0.71.2 strings
 # in backend/scanner-adapter tests are mock/stub fixtures, and the adapter
-# probes the real version at startup (ProbeVersion). Confirmed unchanged across
-# this bump — the rebuilt binary still reports `Version: 0.73.0`, because the
-# upstream source tag did not move; only two dependencies did.
-FROM ghcr.io/artifact-keeper/trivy@sha256:d6c56ef94c05f0d3511d74ecdf131aa89e9f01eb53e3cfc110327a48abb8d0fa AS trivy
+# probes the real version at startup (ProbeVersion). The upstream source tag
+# DID move this time — the bundled binary now reports `Version: 0.74.0` — and
+# nothing in the backend reads that string, so no test or config follows it.
+FROM ghcr.io/artifact-keeper/trivy@sha256:37317c08e42f6202ea5087f800739d0943cf8f17749a0a14b86951c5986b0c39 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security
 # errata. The stage is named so CI can cache-bust it (`no-cache-filters`),
-# forcing `apk add --no-cache` to re-resolve current package errata on every
-# publish instead of reusing a stale cached layer.
+# forcing the apk layer to re-resolve current package errata on every publish
+# instead of reusing a stale cached layer.
 FROM alpine:3.24 AS runtime
 
+# Refresh the whole base FIRST, then install the runtime deps.
+#
+# The cache-bust above is necessary but was not sufficient, and #3612 is the
+# proof. `apk add` only resolves the packages NAMED on its command line; it
+# leaves an already-installed package alone as long as the installed version
+# still satisfies the dependency constraint. libcrypto3/libssl3 are not named
+# here — they arrive inside the `alpine:3.24` base layer itself — so no amount
+# of cache-busting an `apk add` line could ever move them. The layer re-ran on
+# every publish exactly as designed and still shipped whatever openssl the
+# base image happened to be baked with.
+#
+# What that shipped: Docker Publish on main went red on 2026-09-01 with
+# CVE-2026-14456 (HIGH, openssl unbounded memory growth in the QUIC server)
+# against libcrypto3/libssl3 3.5.7-r0, the version in the current alpine:3.24
+# layer, fixed in 3.5.8-r0 and available in the v3.24/main repo at the time of
+# the failure. Both bundled Go binaries — /usr/local/bin/trivy and
+# /usr/local/bin/scanner-adapter — scanned CLEAN in that same run. The finding
+# was entirely base-OS, so neither the artifact-keeper/trivy digest below nor
+# the GO_MIN_PATCH floor above had anything to do with it, and re-pinning
+# either would have been motion without a fix.
+#
+# `apk upgrade --no-cache` rebuilds the base against current errata on every
+# image build; the targeted `add --upgrade` keeps the install set explicit and
+# pulls those three forward too. This is the same two-step
+# docker/Dockerfile.backend.alpine has used since #2391 — that image was
+# already immune to this class, and the asymmetry was the whole bug. Keep the
+# two files in step: an errata mechanism that only one of two Alpine runtimes
+# has is a gap waiting for the next advisory.
+#
+# NOTE: /.trivyignore is not an option for this class and says so explicitly —
+# base OS package CVEs are "deliberately NOT suppressed" there, and the bar for
+# any entry is "no fixed version we can BUILD AGAINST exists". A fixed apk
+# existed in the distro repo, so this is a rebuild, not a suppression.
+#
 # ca-certificates: TLS to the trivy vuln-DB registry / HTTPS registries.
 # git + rpm: trivy uses them for certain package/source scanners.
-RUN apk add --no-cache ca-certificates git rpm \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache --upgrade ca-certificates git rpm \
     && adduser -D -u 1001 scanner \
     && mkdir -p /home/scanner/.cache/trivy \
     && chown -R scanner:scanner /home/scanner

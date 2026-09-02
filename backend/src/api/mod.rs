@@ -84,7 +84,24 @@ pub type IndexCache = Arc<RwLock<HashMap<String, (Bytes, Instant)>>>;
 /// distribution) -> set of cache keys` reverse index lets the revalidation
 /// path purge stale entries when an upstream Release flip is detected
 /// (mirroring the epoch-based lazy invalidation for #1147).
-pub type SignedReleaseCache = Arc<RwLock<HashMap<String, Bytes>>>;
+pub type SignedReleaseCache = Arc<RwLock<HashMap<String, SignedReleaseCacheEntry>>>;
+
+/// A cached signed-Release payload together with the instant it was signed.
+///
+/// The timestamp exists because content-keyed invalidation alone is not enough
+/// once signatures carry an expiration subpacket (#1327): a distribution whose
+/// Release content never changes would otherwise keep serving the same
+/// signature past its stated validity window. The eviction path compares
+/// `inserted_at` against the signature expiry minus a safety margin, so the
+/// cache stops serving an entry strictly before the signature inside it stops
+/// verifying.
+#[derive(Clone)]
+pub struct SignedReleaseCacheEntry {
+    /// The armored `InRelease` / `Release.gpg` bytes.
+    pub bytes: Bytes,
+    /// When the signature inside `bytes` was produced.
+    pub inserted_at: chrono::DateTime<chrono::Utc>,
+}
 
 /// Reverse index from (repo_key, distribution) to the set of cache keys
 /// installed under that scope. Lets the revalidation path drop just the

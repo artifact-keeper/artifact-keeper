@@ -4,7 +4,8 @@
 #
 # * Every entry below is a Go-dependency CVE compiled INTO one of the vendored
 #   scanner CLIs that AK images ship and invoke:
-#     - /usr/local/bin/grype  (ghcr.io/anchore/grype:v0.117.0, backend images)
+#     - /usr/local/bin/grype  (upstream tag v0.117.0, BUILT FROM SOURCE in
+#       docker/Dockerfile.backend{,.alpine} since #3352 — backend images)
 #     - /usr/local/bin/trivy  (ghcr.io/artifact-keeper/trivy, pinned by digest
 #       in docker/Dockerfile.scanner-adapter — scanner-adapter image only; the
 #       backend images do NOT bundle trivy)
@@ -22,33 +23,53 @@
 # * These are deliberately NOT suppressed in the backend service binary, the
 #   scanner-adapter binary (rebuilt from source with a patched Go toolchain on
 #   every build), or in the UBI/Alpine base OS packages. Only
-#   vendored-scanner-binary CVEs that have no fixed *tool release* are listed.
+#   bundled-scanner-binary CVEs are listed, and since #3352 the bar for
+#   listing one is no longer "no fixed *tool release* exists" — both binaries
+#   are now built by us, so that is nearly always true and stopped
+#   discriminating. The bar is "no fixed version we can BUILD AGAINST exists".
 #
-# * grype is pinned to the latest upstream release (v0.117.0, bumped for #3307).
-#   trivy is no longer taken from Aqua's release stream at all: since #3123 the
-#   scanner-adapter ships ghcr.io/artifact-keeper/trivy, our own build of the
-#   pinned upstream tag with declared dependency overrides. That means a trivy
-#   Go-dependency CVE with a fixed dependency version is now FIXABLE by us and
-#   must NOT be added here — file it as an override in that repo's
-#   overrides.yaml instead. This file is for findings with no fix available in
-#   the tool we can actually build.
+# * NEITHER scanner binary comes from an upstream release stream any more.
+#   trivy has been our own build of the pinned upstream tag since #3123
+#   (ghcr.io/artifact-keeper/trivy, dependency overrides declared in that
+#   repo's overrides.yaml). grype joined it at #3352: the backend Dockerfiles
+#   now COMPILE upstream v0.117.0 from source with a Go toolchain floored at
+#   go1.26.6, instead of copying the prebuilt binary out of
+#   ghcr.io/anchore/grype.
 #
-# * For the CVEs below the dependency fix exists upstream but no tagged grype
-#   release has been rebuilt against it yet (or, where noted, no upstream fix
-#   exists at all). They drop off when grype ships a release rebuilt against
-#   the fixed dependency — re-evaluate this whole file on every scanner bump.
+#   The consequence for this file is the point of both changes. A Go STDLIB
+#   CVE is now FIXABLE by us — it is a property of the compiler, and the fix
+#   is a one-line GO_MIN_PATCH bump in the Dockerfiles. It must NOT be added
+#   here. Likewise a trivy Go-dependency CVE with a fixed dependency version
+#   belongs in that repo's overrides.yaml, not here. What is left for this
+#   file is the genuinely unfixable: a dependency CVE where no consumable
+#   fixed version exists to build against.
 #
-# * ⚠ ENTRIES HERE CANNOT CURRENTLY BE DELETED, even once they are provably
-#   dead. scripts/ci/release-preflight.sh check 1 is a HARD gate that requires
-#   main's suppression set to be a SUPERSET of every active release/* branch's.
-#   release/1.5.x and release/1.6.x still carry the older set, so removing a
-#   retired token from main makes the pre-tag check fail with "main is MISSING
-#   suppressions". The rule was written to stop a hotfix suppression being lost
-#   on the way to main (#3039), and for that it is right — but it also ratchets
-#   the set monotonically upward, which is the wrong direction for a security
-#   gate. Entries that measurement shows are no longer present in any shipped
-#   image are therefore marked RETIRED below and kept in place rather than
-#   removed. Do not read a RETIRED entry as an active exception. See #3309.
+#   Before #3352 the argument for suppressing grype stdlib CVEs was that no
+#   rebuilt grype release existed, which was true and is now irrelevant — we
+#   are the ones doing the rebuilding. All seven stdlib tokens this file
+#   carried were retired on that basis (tombstones at the bottom). Measured
+#   with trivy 0.69.3 on 2026-08-16, rebuilt vs ghcr.io/anchore/grype:v0.117.0:
+#   13 stdlib findings disappear and nothing new appears — HIGH+fixed 12 -> 1,
+#   all severities 21 -> 8. The six that were failing Security Scan
+#   (CVE-2026-33818/-56853/-56858/-56859/-56860/-56862) were never in this
+#   file and deliberately never got here.
+#
+# * For the CVEs below the fix either does not exist upstream at all, or
+#   exists only in a version that cannot be built against (see the
+#   docker/docker note). Re-evaluate this whole file on every scanner bump.
+#
+# * DELETING an entry (#3309): scripts/ci/release-preflight.sh check 1 is a
+#   HARD gate requiring every suppression on every active release/* branch to
+#   be ACCOUNTED FOR here — either as a live token, or as an explicit
+#   `# RETIRED: <token>` tombstone line (see the block at the bottom of this
+#   file). To delete a suppression that a release branch still lists, first
+#   measure that the finding is absent from main's shipped images, then
+#   replace the token line with a tombstone. A tombstone is machine-read by
+#   the gate: it records that main removed the token DELIBERATELY, as opposed
+#   to never having received it (the #3039 forward-port miss, which the gate
+#   still hard-fails). Never tombstone a token that is still being suppressed
+#   — the gate fails a token listed both live and retired. Drop tombstones
+#   entirely once no active release branch lists their token.
 #
 # * The CI publish GATE scans with `ignore-unfixed: true` and
 #   `severity: CRITICAL,HIGH`, so the genuinely no-fix-available and
@@ -72,29 +93,50 @@
 #   upstream-watch workflow tracks new Aqua releases.
 
 # ---------------------------------------------------------------------------
-# grype v0.117.0 binary — Go stdlib @ go1.26.3
-# Fixed in Go 1.26.4/1.26.5 (1.25.11/1.25.12). grype v0.117.0 (latest) is
-# still built with go1.26.3 — the v0.116.0 -> v0.117.0 bump for #3307 did not
-# move the toolchain. Drops off when grype ships a release built on Go >=
-# 1.26.5. Re-measured against ghcr.io/anchore/grype:v0.117.0 on 2026-08-13:
-# all five still present, CVE-2026-27145 / -39822 / -42504 at HIGH+fixed (i.e.
-# these three are the ones actually holding the gate open), -42505 / -42507 at
-# MEDIUM.
-CVE-2026-27145
-CVE-2026-39822
-CVE-2026-42504
-CVE-2026-42505
-CVE-2026-42507
-
+# NO grype Go-stdlib block any more (#3352).
+#
+# There used to be one here, listing CVE-2026-27145 / -39821 / -39822 / -42504
+# / -42505 / -42507 and, separately, -46600, all justified as "grype v0.117.0
+# is built with go1.26.3 and Anchore has shipped no rebuilt release, so there
+# is no tool version to bump to". That was accurate and it was still the wrong
+# shape of answer: it made every new Go stdlib advisory a release blocker
+# resolved by editing this file. On 2026-08-16 six MORE stdlib CVEs
+# (CVE-2026-33818 encoding/asn1, -56853 net/http, -56858 html/template,
+# -56859 encoding/xml, -56860 net/url, -56862 crypto/tls) failed Security Scan
+# on main and release/1.7.x for five consecutive runs, blocking all image
+# publication and both the v1.7.5 and v1.8.0 tags.
+#
+# The Dockerfiles now build grype from source on a go1.26.6-floored toolchain,
+# so the entire class is fixed rather than suppressed, and the seven tokens it
+# listed are tombstoned at the bottom of this file. The next Go stdlib advisory
+# is a GO_MIN_PATCH bump in docker/Dockerfile.backend{,.alpine} — NOT a new
+# entry here. Adding one would re-create exactly the treadmill #3352 removed.
+#
+# The runtime-scope argument that block carried (GRYPE_DB_AUTO_UPDATE=false and
+# GRYPE_CHECK_FOR_APP_UPDATE=false against a DB pre-seeded at build time, #1001,
+# so grype makes no outbound HTTP at runtime) is still true and still not a
+# fix. It is deliberately not reproduced as a justification, because it is no
+# longer load-bearing: the vulnerable code is not linked in at all.
+#
 # ---------------------------------------------------------------------------
 # grype v0.117.0 binary — github.com/docker/docker @ v28.5.2+incompatible
 # CVE-2026-41567 / -41568 / -42306: NO upstream-fixed docker release exists yet
 # (FixedVersion=none). CVE-2026-33997 / -34040 are fixed in docker 29.3.1 but
-# grype v0.117.0 (latest) has not rebuilt against it — still v28.5.2. Of these,
-# only CVE-2026-34040 is HIGH+fixed and therefore actually gating; the rest are
-# unfixed (dropped by --ignore-unfixed) or MEDIUM. Code path: grype's
-# Docker engine client for `docker:` image sources; the backend invokes grype
-# against on-disk artifacts/SBOMs, not the Docker daemon.
+# grype v0.117.0 requires v28.5.2. Of these, only CVE-2026-34040 is HIGH+fixed
+# and therefore actually gating; the rest are unfixed (dropped by
+# --ignore-unfixed) or MEDIUM. Code path: grype's Docker engine client for
+# `docker:` image sources; the backend invokes grype against on-disk
+# artifacts/SBOMs, not the Docker daemon.
+#
+# These are the ONE case that survives #3352, and they survive it for a
+# measured reason rather than by inheritance. Building from source makes a
+# dependency override possible in principle — it is what artifact-keeper/trivy
+# does — but there is nothing to override to: with the grype v0.117.0 source
+# tree, `go mod edit -require=github.com/docker/docker@v29.3.1+incompatible`
+# fails module resolution ("unknown revision v29.3.1", tried 2026-08-16), so
+# the "fixed in 29.3.1" the DB reports is not a version this module path can
+# resolve. Suppress when there is no fix to build against; rebuild when there
+# is. Retry the override on the next grype bump.
 CVE-2026-33997
 CVE-2026-34040
 CVE-2026-41567
@@ -102,98 +144,93 @@ CVE-2026-41568
 CVE-2026-42306
 
 # ---------------------------------------------------------------------------
-# RETIRED 2026-08-13 (#3307) — grype binary, google.golang.org/grpc
-# GHSA-hrxh-6v49-42gf (gRPC-Go: xDS RBAC and HTTP/2 vulnerabilities) was
-# suppressed while grype v0.116.0 shipped grpc-go v1.80.0. grype v0.117.0
-# ships grpc-go v1.82.1, which IS the fixed version, and a scan of
-# ghcr.io/anchore/grype:v0.117.0 on 2026-08-13 does not report it at any
-# severity. This suppression is dead.
+# DELIBERATELY NOT SUPPRESSED (#3262) — go-git in the PUBLISHED images only.
 #
-# It is kept only because release/1.6.x still lists it and preflight check 1
-# hard-fails when main is not a superset (see the ⚠ note in the header).
-# Delete it, not re-justify it, once #3309 lands or 1.6.x is retired.
-GHSA-hrxh-6v49-42gf
+# The 2026-08-10 weekly scan reported two findings against
+# ghcr.io/.../artifact-keeper-backend:latest, both at usr/local/bin/grype:
+#
+#   CVE-2026-71556  HIGH    github.com/go-git/go-git/v5 v5.19.1 -> 5.19.2
+#   CVE-2026-71557  MEDIUM  github.com/go-git/go-git/v5 v5.19.1 -> 5.19.2
+#
+# Neither belongs in this file. Measured 2026-08-15 with trivy 0.69.3,
+# --ignore-unfixed:
+#
+#   * grype v0.117.0 — the upstream tag BOTH backend Dockerfiles build from
+#     today — does not contain the go-git package at all. No finding. Still
+#     true of the from-source build (#3352): same source tag, re-measured
+#     2026-08-16.
+#   * artifact-keeper-backend:latest is v1.6.3, built 2026-07-24, and
+#     :dev was built 2026-08-07. Both predate the v0.116.0 -> v0.117.0 bump
+#     (#3307), so both still carry the older grype that vendored go-git
+#     v5.19.1 (and grpc-go v1.80.0, which is why GHSA-hrxh-6v49-42gf still
+#     shows against those images while being correctly tombstoned below for
+#     main).
+#
+# So these findings are already fixed on main and clear on the next publish.
+# Suppressing them would record an exception for a build we no longer produce
+# — the precise failure mode this file's header warns about. If they ever
+# appear against a backend image whose version label matches current main,
+# that is a real regression: investigate, do not add a line here.
+# ---------------------------------------------------------------------------
 
 # ===========================================================================
-# RETIRED 2026-08-13 (#3307): everything below this line.
+# RETIRED tombstones (#3309) — deliberate removals, machine-read by
+# scripts/ci/release-preflight.sh check 1.
 #
-# All of it was written against ghcr.io/aquasecurity/trivy:0.72.0, which the
-# scanner-adapter image stopped shipping at #3123. It now ships
-# ghcr.io/artifact-keeper/trivy — our own build of the pinned upstream tag on a
-# UBI 9 base, with declared dependency overrides.
+# Each line below records a token main has REMOVED because the finding was
+# measured absent from every image main ships. The tokens still appear in
+# release/1.5.x and/or release/1.6.x's .trivyignore; without these tombstones
+# the pre-tag gate would (rightly) refuse the removal as a possible
+# forward-port miss. A tombstone is NOT an active exception — nothing is
+# suppressed by it. Delete a tombstone once no active release branch lists
+# its token.
 #
-# Measured on 2026-08-13 against the exact digest pinned in
-# docker/Dockerfile.scanner-adapter, with no ignorefile and all severities:
-# NOT ONE of the CVEs below appears in the image. Different base OS, different
-# Go toolchain, different (newer) upstream trivy tag, and oras-go already
-# overridden to 2.6.2 in the build itself. They are not suppressed findings —
-# they are absent findings.
+# Measurement record (2026-08-13, #3307):
+# * GHSA-hrxh-6v49-42gf — suppressed while grype v0.116.0 shipped grpc-go
+#   v1.80.0; grype v0.117.0 ships grpc-go v1.82.1 (the fixed version) and a
+#   scan of ghcr.io/anchore/grype:v0.117.0 reports it at no severity.
+# * The seven trivy tokens — all written against ghcr.io/aquasecurity/
+#   trivy:0.72.0, which the scanner-adapter stopped shipping at #3123. The
+#   replacement (ghcr.io/artifact-keeper/trivy, pinned by digest in
+#   docker/Dockerfile.scanner-adapter) was scanned with no ignorefile at all
+#   severities: none of them appears. Different base OS, different Go
+#   toolchain, newer upstream tag, oras-go already overridden to 2.6.2.
+#   (CVE-2026-46600 from that block was NOT retired then: it was re-measured on
+#   2026-08-14 as live in the grype v0.117.0 binary's Go stdlib. #3352 retired
+#   it below, on the second measurement record.)
 #
-# Kept in place, not deleted, purely because release/1.5.x and release/1.6.x
-# still list them and preflight check 1 hard-fails when main is not a superset
-# of every release branch (see the ⚠ note in the header). Deleting them is
-# #3309's job.
+# Measurement record (2026-08-16, #3352):
+# * The seven grype Go-stdlib tokens — CVE-2026-27145 / -39821 / -39822 /
+#   -42504 / -42505 / -42507 / -46600. All were suppressed because the binary
+#   was compiled with go1.26.3 and no rebuilt grype release existed. The
+#   backend Dockerfiles now compile upstream v0.117.0 themselves on a
+#   go1.26.6-floored toolchain, so the stdlib they were reported against is no
+#   longer shipped.
 #
-# Nothing below should be cited as precedent for a new suppression. A trivy
-# Go-dependency CVE with a fixed dependency version is now FIXABLE — it belongs
-# in artifact-keeper/trivy's overrides.yaml. That is exactly how CVE-2026-71556
-# (go-git, the finding that blocked this release) was handled: overridden and
-# rebuilt, not suppressed.
+#   Measured with trivy 0.69.3 against the rebuilt binary, all severities, no
+#   ignorefile: none of the seven appears, and neither do the six unsuppressed
+#   siblings that were failing Security Scan (CVE-2026-33818/-56853/-56858/
+#   -56859/-56860/-56862). Total findings against the grype binary go 21 -> 8
+#   at all severities and 12 -> 1 at HIGH+fixed, with ZERO findings added —
+#   the whole delta is stdlib, and the surviving 8 are the docker/docker and
+#   x/mod/x/crypto entries the upstream binary already had.
+#
+#   These seven are the reason to read the header before adding a stdlib token
+#   back: the class is now fixed at the source, and a new one belongs in
+#   GO_MIN_PATCH, not here.
 # ===========================================================================
-
-# ---------------------------------------------------------------------------
-# RETIRED — trivy 0.72.0 binary (scanner-adapter image) — oras.land/oras-go/v2 @ v2.6.0
-# Fixed in oras-go 2.6.1; trivy 0.72.0 (latest) has not rebuilt against it.
-# Code path: ORAS OCI-artifact client used for trivy's own DB/plugin
-# distribution; the adapter only points trivy at AK's registry for scans.
-CVE-2026-48978
-CVE-2026-50151
-CVE-2026-50162
-GHSA-vh4v-2xq2-g5cg
-
-# ---------------------------------------------------------------------------
-# RETIRED — trivy 0.72.0 binary (scanner-adapter image): golang.org/x/text @ v0.38.0
-# Fixed in x/text 0.39.0. trivy 0.72.0 is the latest upstream release and has
-# not been rebuilt against it, so there is no tool version to bump to. Drops
-# off when Aqua ships a trivy release built on x/text >= 0.39.0.
-#
-# Scope verified on 2026-07-29 (v1.6.4 scan): this CVE is present ONLY in the
-# vendored trivy CLI. The scanner-adapter's own binary cannot carry it, since
-# docker/scanner-adapter/go.mod declares no dependencies at all (stdlib only).
-# The backend and openscap images scan clean at 0 findings and do not bundle
-# trivy (#1544), so nothing in the network-reachable service surface is
-# affected. No reachability argument is claimed for the x/text code path
-# itself; the justification here is vendored-binary scope plus the absence of
-# any fixed tool release.
-CVE-2026-56852
-
-# ---------------------------------------------------------------------------
-# RETIRED — trivy 0.72.0 binary (scanner-adapter image): golang.org/x/net @ v0.55.0
-# Same vendored-binary scope as the x/text entry above: present only in the
-# bundled trivy CLI, not in the adapter's own binary (no dependencies) and not
-# in the backend or openscap images (0 findings, no bundled trivy, #1544).
-#
-# Note on severity: CORRECTED by #3122. The previous note here recorded that
-# this CVE exports to SARIF as UNKNOWN/note yet still failed the scan under
-# `severity: CRITICAL,HIGH`, and concluded that "Trivy filters on the vendor
-# severity, not the NVD one". That conclusion was wrong. The severity filter
-# was never applied at all: trivy-action ran `unset TRIVY_SEVERITY` because the
-# format was SARIF, so the scan gated on every severity and this UNKNOWN entry
-# failed it along with everything else.
-#
-# Verified directly while fixing #3122: with every other finding suppressed,
-# this CVE alone fails the old SARIF-format gate (exit 1) and passes the
-# corrected table-format gate carrying the same `severity: CRITICAL,HIGH`
-# (exit 0). It is UNKNOWN severity and does not gate. Kept here because it is
-# still a vendored-binary finding with no fixed tool release.
-CVE-2026-46600
-
-# ---------------------------------------------------------------------------
-# RETIRED — trivy 0.72.0 binary (scanner-adapter image) — sigstore verification stack
-# github.com/sigstore/sigstore-go @ v1.1.4 (fixed 1.2.0) and
-# github.com/sigstore/timestamp-authority/v2 @ v2.0.6 (fixed 2.1.0); trivy
-# 0.72.0 (latest) has not rebuilt against them. MEDIUM severity — listed for
-# completeness (CI alerts on CRITICAL/HIGH only). Code path: cosign/rekor
-# attestation verification, not exercised by AK's adapter scan flow.
-CVE-2026-49834
-CVE-2026-49835
+# RETIRED: GHSA-hrxh-6v49-42gf (2026-08-13, grype grpc-go fixed in v0.117.0, #3307/#3309)
+# RETIRED: CVE-2026-27145 (2026-08-16, grype stdlib cleared by go1.26.6 source build, #3352)
+# RETIRED: CVE-2026-39821 (2026-08-16, grype stdlib cleared by go1.26.6 source build, #3352)
+# RETIRED: CVE-2026-39822 (2026-08-16, grype stdlib cleared by go1.26.6 source build, #3352)
+# RETIRED: CVE-2026-42504 (2026-08-16, grype stdlib cleared by go1.26.6 source build, #3352)
+# RETIRED: CVE-2026-42505 (2026-08-16, grype stdlib cleared by go1.26.6 source build, #3352)
+# RETIRED: CVE-2026-42507 (2026-08-16, grype stdlib cleared by go1.26.6 source build, #3352)
+# RETIRED: CVE-2026-46600 (2026-08-16, grype stdlib cleared by go1.26.6 source build, #3352)
+# RETIRED: CVE-2026-48978 (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)
+# RETIRED: CVE-2026-50151 (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)
+# RETIRED: CVE-2026-50162 (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)
+# RETIRED: GHSA-vh4v-2xq2-g5cg (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)
+# RETIRED: CVE-2026-56852 (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)
+# RETIRED: CVE-2026-49834 (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)
+# RETIRED: CVE-2026-49835 (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)

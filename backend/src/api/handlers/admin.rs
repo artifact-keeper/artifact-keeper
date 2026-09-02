@@ -1,5 +1,9 @@
 //! Admin handlers (backups, system settings).
 
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
+use crate::services::totp_policy::{self, check_policy_activation, TotpPolicy, TotpPolicySource};
 use axum::{
     extract::{Extension, Path, Query, State},
     routing::{get, post},
@@ -29,6 +33,10 @@ pub fn router() -> Router<SharedState> {
         .route("/backups/:id/restore", post(restore_backup))
         .route("/backups/:id/cancel", post(cancel_backup))
         .route("/settings", get(get_settings).post(update_settings))
+        .route(
+            "/settings/totp-policy",
+            get(get_totp_policy).put(update_totp_policy),
+        )
         .route("/stats", get(get_system_stats))
         .route("/downloads", get(list_downloads))
         .route("/downloads/by-ip/:ip", get(list_downloads_by_ip))
@@ -38,6 +46,10 @@ pub fn router() -> Router<SharedState> {
         .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
         .route("/audit", get(list_audit_logs))
+        .route(
+            "/proxy-scan-verdicts/:digest",
+            get(get_proxy_scan_verdicts).delete(delete_proxy_scan_verdicts),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +540,17 @@ pub struct RestoreRequest {
     pub restore_database: Option<bool>,
     pub restore_artifacts: Option<bool>,
     pub target_repository_id: Option<Uuid>,
+    /// Accept an archive whose integrity cannot be established (#3373).
+    ///
+    /// A restore refuses an archive it cannot check: since #3373 every backup
+    /// records its payload checksum on the `backups` row, outside the archive,
+    /// and the archive's contents are verified against it before any row is
+    /// ingested. Archives captured before that column existed fall back to the
+    /// checksum in their own manifest; one carrying neither cannot be verified
+    /// at all, and this flag is the deliberate, audited way to restore it
+    /// anyway. It never waives a checksum that is present and does not match.
+    #[serde(default)]
+    pub allow_unverified_archive: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -535,6 +558,11 @@ pub struct RestoreResponse {
     pub tables_restored: Vec<String>,
     pub artifacts_restored: i32,
     pub errors: Vec<String>,
+    /// What the archive's contents were checked against (#3373):
+    /// `recorded` (the digest on the `backups` row, the strong case),
+    /// `manifest` (the archive's own checksum -- detects corruption, not
+    /// tampering), or `waived` (`allow_unverified_archive` was set).
+    pub integrity_anchor: String,
 }
 
 /// Restore from backup
@@ -549,6 +577,8 @@ pub struct RestoreResponse {
     request_body = RestoreRequest,
     responses(
         (status = 200, description = "Backup restored", body = RestoreResponse),
+        (status = 400, description = "Archive integrity could not be established, or an \
+                                      unsupported option was supplied"),
         (status = 404, description = "Backup not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -556,6 +586,7 @@ pub struct RestoreResponse {
 )]
 pub async fn restore_backup(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>> {
@@ -576,6 +607,8 @@ pub async fn restore_backup(
         restore_database: payload.restore_database.unwrap_or(true),
         restore_artifacts: payload.restore_artifacts.unwrap_or(true),
         target_repository_id: payload.target_repository_id,
+        allow_unverified_archive: payload.allow_unverified_archive,
+        actor: Some(auth.user_id),
     };
 
     let result = service.restore(id, options).await?;
@@ -584,6 +617,7 @@ pub async fn restore_backup(
         tables_restored: result.tables_restored,
         artifacts_restored: result.artifacts_restored,
         errors: result.errors,
+        integrity_anchor: result.integrity_anchor.to_string(),
     }))
 }
 
@@ -810,6 +844,185 @@ pub async fn update_settings(
     }
 
     Ok(Json(settings))
+}
+
+// ---------------------------------------------------------------------------
+// TOTP (2FA) enforcement policy (#2805)
+// ---------------------------------------------------------------------------
+
+/// Current 2FA enforcement policy plus the context an operator needs before
+/// tightening it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TotpPolicyResponse {
+    /// The policy in force.
+    pub policy: TotpPolicy,
+    /// Whether it comes from the `TOTP_POLICY` environment variable (in which
+    /// case `PUT` is refused) or from the database.
+    pub source: TotpPolicySource,
+    /// Whether `PUT` can change the policy at all right now.
+    pub editable: bool,
+    /// Local (password-authenticating, non-service) administrators.
+    pub local_admins: i64,
+    /// How many of those already have TOTP enabled. Under
+    /// `required_for_admins`, `local_admins - local_admins_with_totp` is the
+    /// number of administrators who will be sent through forced enrollment at
+    /// their next sign-in.
+    pub local_admins_with_totp: i64,
+    /// Local (password-authenticating, non-service) users, admins included.
+    pub local_users: i64,
+    /// How many of those already have TOTP enabled.
+    pub local_users_with_totp: i64,
+    /// Whether the *calling* administrator has TOTP enabled. Tightening the
+    /// policy requires this.
+    pub caller_totp_enabled: bool,
+}
+
+/// Request body for `PUT /admin/settings/totp-policy`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateTotpPolicyRequest {
+    pub policy: TotpPolicy,
+}
+
+/// Counts of local (password) accounts and how many have TOTP enrolled.
+struct LocalTotpCounts {
+    admins: i64,
+    admins_with_totp: i64,
+    users: i64,
+    users_with_totp: i64,
+}
+
+/// Population the policy can actually apply to: active, local-provider,
+/// non-service accounts. SSO/LDAP/CI users and service accounts are exempt, so
+/// counting them here would overstate the blast radius of a policy change.
+async fn local_totp_counts(db: &sqlx::PgPool) -> Result<LocalTotpCounts> {
+    let row = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE is_admin)                     as "admins!",
+            COUNT(*) FILTER (WHERE is_admin AND totp_enabled)    as "admins_with_totp!",
+            COUNT(*)                                             as "users!",
+            COUNT(*) FILTER (WHERE totp_enabled)                 as "users_with_totp!"
+        FROM users
+        WHERE is_active = true
+          AND is_service_account = false
+          AND auth_provider = 'local'
+        "#
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(LocalTotpCounts {
+        admins: row.admins,
+        admins_with_totp: row.admins_with_totp,
+        users: row.users,
+        users_with_totp: row.users_with_totp,
+    })
+}
+
+async fn build_totp_policy_response(
+    state: &SharedState,
+    caller_id: Uuid,
+) -> Result<TotpPolicyResponse> {
+    let (policy, source) = totp_policy::effective_policy(&state.db, state.config.totp_policy).await;
+    let counts = local_totp_counts(&state.db).await?;
+    let caller_totp_enabled =
+        sqlx::query_scalar!("SELECT totp_enabled FROM users WHERE id = $1", caller_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .unwrap_or(false);
+
+    Ok(TotpPolicyResponse {
+        policy,
+        source,
+        editable: source == TotpPolicySource::Database,
+        local_admins: counts.admins,
+        local_admins_with_totp: counts.admins_with_totp,
+        local_users: counts.users,
+        local_users_with_totp: counts.users_with_totp,
+        caller_totp_enabled,
+    })
+}
+
+/// Read the system-wide 2FA enforcement policy.
+#[utoipa::path(
+    get,
+    path = "/settings/totp-policy",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Current 2FA enforcement policy", body = TotpPolicyResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_totp_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<TotpPolicyResponse>> {
+    Ok(Json(
+        build_totp_policy_response(&state, auth.user_id).await?,
+    ))
+}
+
+/// Change the system-wide 2FA enforcement policy.
+///
+/// Tightening the policy requires the calling administrator to have TOTP
+/// enabled — that is the lockout-safety guard: it guarantees at least one
+/// administrator whose (pre-existing, already-working) sign-in path survives the
+/// change. Loosening is never refused. A policy change does **not** invalidate
+/// existing sessions or refresh tokens; it takes effect at the next interactive
+/// password login, so the administrator making the change keeps their session.
+#[utoipa::path(
+    put,
+    path = "/settings/totp-policy",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = UpdateTotpPolicyRequest,
+    responses(
+        (status = 200, description = "Policy updated", body = TotpPolicyResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Refused: policy pinned by TOTP_POLICY, or the calling admin has not enrolled in TOTP", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_totp_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<UpdateTotpPolicyRequest>,
+) -> Result<Json<TotpPolicyResponse>> {
+    let current = build_totp_policy_response(&state, auth.user_id).await?;
+
+    if let Err(refusal) = check_policy_activation(
+        current.policy,
+        payload.policy,
+        current.source == TotpPolicySource::Environment,
+        current.caller_totp_enabled,
+    ) {
+        return Err(AppError::Conflict(refusal.message().to_string()));
+    }
+
+    totp_policy::store_policy(&state.db, payload.policy, auth.user_id).await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::TotpPolicyChanged, ResourceType::User)
+            .user(auth.user_id)
+            .resource(auth.user_id)
+            .actor_name(&auth.username)
+            .details(serde_json::json!({
+                "from": current.policy.as_str(),
+                "to": payload.policy.as_str(),
+                "local_admins": current.local_admins,
+                "local_admins_with_totp": current.local_admins_with_totp,
+            })),
+    )
+    .await;
+
+    Ok(Json(
+        build_totp_policy_response(&state, auth.user_id).await?,
+    ))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1454,6 +1667,208 @@ pub async fn rescan_for_inventory(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Proxy scan verdict inspect / invalidate (#3244)
+// ---------------------------------------------------------------------------
+
+/// Normalize an operator-supplied content digest for the `proxy_scan_results`
+/// key: accepts either `sha256:<64 hex>` or the bare 64-hex form (the stored
+/// shape), lowercases it, and rejects anything else. Pure so the validation is
+/// unit-testable without a DB.
+pub(crate) fn normalize_verdict_digest(raw: &str) -> Option<String> {
+    let hex = raw.trim().strip_prefix("sha256:").unwrap_or(raw.trim());
+    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hex.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// One stored `proxy_scan_results` row, as returned by the admin
+/// inspect/invalidate endpoints (#3244).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyScanVerdictItem {
+    pub checksum_sha256: String,
+    pub scan_type: String,
+    pub verdict: String,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub max_severity: Option<String>,
+    pub scanner_version: Option<String>,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::services::proxy_scan_service::ProxyScanRow> for ProxyScanVerdictItem {
+    fn from(r: crate::services::proxy_scan_service::ProxyScanRow) -> Self {
+        Self {
+            checksum_sha256: r.checksum_sha256,
+            scan_type: r.scan_type,
+            verdict: r.verdict,
+            findings_count: r.findings_count,
+            critical_count: r.critical_count,
+            high_count: r.high_count,
+            medium_count: r.medium_count,
+            low_count: r.low_count,
+            max_severity: r.max_severity,
+            scanner_version: r.scanner_version,
+            scanned_at: r.scanned_at,
+        }
+    }
+}
+
+/// Response for the admin proxy-scan-verdict endpoints (#3244).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyScanVerdictListResponse {
+    /// The normalized (bare-hex) digest the verdicts are keyed on.
+    pub digest: String,
+    pub verdicts: Vec<ProxyScanVerdictItem>,
+}
+
+/// Inspect the stored proxy scan verdict(s) for a content digest (#3244).
+///
+/// The verdict store is content-addressed and GLOBAL across repositories and
+/// tenants (the same bytes are the same CVEs), which is why this surface is
+/// instance-admin only: no repo-scoped principal should read — let alone
+/// clear — a lever that spans every repo.
+#[utoipa::path(
+    get,
+    path = "/proxy-scan-verdicts/{digest}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(("digest" = String, Path, description = "Content digest: `sha256:<64 hex>` or bare 64-hex")),
+    responses(
+        (status = 200, description = "Stored verdict rows for the digest", body = ProxyScanVerdictListResponse),
+        (status = 400, description = "Malformed digest"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "No stored verdict for this digest"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_proxy_scan_verdicts(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(digest): Path<String>,
+) -> Result<Json<ProxyScanVerdictListResponse>> {
+    // Defense-in-depth behind the /admin nest's admin_middleware, with the
+    // RBAC-deny recorded (#2321 G-AUDIT convention).
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::ScanResult,
+        "/api/v1/admin/proxy-scan-verdicts",
+        "GET",
+    )
+    .await?;
+    let normalized = normalize_verdict_digest(&digest).ok_or_else(|| {
+        AppError::Validation("digest must be sha256:<64 hex> or bare 64-hex".to_string())
+    })?;
+    let rows = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone())
+        .list_verdicts_for_digest(&normalized)
+        .await?;
+    if rows.is_empty() {
+        return Err(AppError::NotFound(
+            "no stored proxy scan verdict for this digest".to_string(),
+        ));
+    }
+    Ok(Json(ProxyScanVerdictListResponse {
+        digest: normalized,
+        verdicts: rows.into_iter().map(Into::into).collect(),
+    }))
+}
+
+/// Invalidate (delete) the stored proxy scan verdict(s) for a content digest
+/// (#3244).
+///
+/// This forces RE-ASSESSMENT on the next pull — it is NOT a waiver. The next
+/// pull of the digest re-scans (inline under `fail_closed`, asynchronously
+/// under `fail_open`) and records a fresh verdict; a still-flagged image is
+/// immediately re-blocked. Only a stale verdict (advisory withdrawn, CVE-DB
+/// corrected) is durably cleared. Deleting by digest un-blocks that content
+/// EVERYWHERE (the store is global by design), hence instance-admin only.
+/// The deletion is audited with the removed rows' verdict summary.
+#[utoipa::path(
+    delete,
+    path = "/proxy-scan-verdicts/{digest}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(("digest" = String, Path, description = "Content digest: `sha256:<64 hex>` or bare 64-hex")),
+    responses(
+        (status = 200, description = "Deleted verdict rows (re-assessment forced on next pull)", body = ProxyScanVerdictListResponse),
+        (status = 400, description = "Malformed digest"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "No stored verdict for this digest"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_proxy_scan_verdicts(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(digest): Path<String>,
+) -> Result<Json<ProxyScanVerdictListResponse>> {
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::ScanResult,
+        "/api/v1/admin/proxy-scan-verdicts",
+        "DELETE",
+    )
+    .await?;
+    let normalized = normalize_verdict_digest(&digest).ok_or_else(|| {
+        AppError::Validation("digest must be sha256:<64 hex> or bare 64-hex".to_string())
+    })?;
+    let rows = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone())
+        .delete_verdicts_for_digest(&normalized)
+        .await?;
+    if rows.is_empty() {
+        return Err(AppError::NotFound(
+            "no stored proxy scan verdict for this digest".to_string(),
+        ));
+    }
+    // Audit the clear: who removed which verdicts for which digest. Details
+    // carry the verdict summary so the trail shows what protection state was
+    // discarded, never any credential material.
+    let audit = crate::services::audit_service::AuditService::new(state.db.clone());
+    let entry = crate::services::audit_service::AuditEntry::new(
+        crate::services::audit_service::AuditAction::ProxyScanVerdictDeleted,
+        crate::services::audit_service::ResourceType::ScanResult,
+    )
+    .user(auth.user_id)
+    .details(serde_json::json!({
+        "digest": normalized,
+        "deleted": rows
+            .iter()
+            .map(|r| serde_json::json!({
+                "scan_type": r.scan_type,
+                "verdict": r.verdict,
+                "findings_count": r.findings_count,
+                "max_severity": r.max_severity,
+                "scanner_version": r.scanner_version,
+                "scanned_at": r.scanned_at,
+            }))
+            .collect::<Vec<_>>(),
+    }));
+    if let Err(e) = audit.log(entry).await {
+        // Fire-and-forget posture: an audit-table outage must not turn a
+        // completed delete into a 500, but it must be loud.
+        tracing::error!(digest = %normalized, error = %e, "failed to audit proxy scan verdict deletion");
+    }
+    tracing::warn!(
+        actor_user_id = %auth.user_id,
+        digest = %normalized,
+        deleted = rows.len(),
+        "admin cleared proxy scan verdict(s); next pull re-assesses"
+    );
+    Ok(Json(ProxyScanVerdictListResponse {
+        digest: normalized,
+        verdicts: rows.into_iter().map(Into::into).collect(),
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -1466,6 +1881,8 @@ pub async fn rescan_for_inventory(
         delete_backup,
         get_settings,
         update_settings,
+        get_totp_policy,
+        update_totp_policy,
         get_system_stats,
         list_downloads,
         list_downloads_by_ip,
@@ -1475,6 +1892,8 @@ pub async fn rescan_for_inventory(
         rescan_for_inventory,
         list_storage_backends,
         list_audit_logs,
+        get_proxy_scan_verdicts,
+        delete_proxy_scan_verdicts,
     ),
     components(schemas(
         ListBackupsQuery,
@@ -1484,6 +1903,10 @@ pub async fn rescan_for_inventory(
         RestoreRequest,
         RestoreResponse,
         SystemSettings,
+        TotpPolicyResponse,
+        UpdateTotpPolicyRequest,
+        TotpPolicy,
+        TotpPolicySource,
         SystemStats,
         ListDownloadsQuery,
         DownloadRecord,
@@ -1495,6 +1918,8 @@ pub async fn rescan_for_inventory(
         RescanForInventoryResponse,
         AuditLogItem,
         AuditLogListResponse,
+        ProxyScanVerdictItem,
+        ProxyScanVerdictListResponse,
     ))
 )]
 pub struct AdminApiDoc;
@@ -1507,6 +1932,58 @@ mod tests {
     // audit_page_bounds (#2366) — pure pagination arithmetic, no DB required so
     // the coverage gate exercises it even without Postgres.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // normalize_verdict_digest (#3244) — pure digest validation, no DB.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_verdict_digest_accepts_both_forms() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            normalize_verdict_digest(&format!("sha256:{hex}")).as_deref(),
+            Some(hex.as_str()),
+            "prefixed digest normalizes to the stored bare-hex shape"
+        );
+        assert_eq!(
+            normalize_verdict_digest(&hex).as_deref(),
+            Some(hex.as_str())
+        );
+        // Uppercase hex lowercases (the store is lowercase hex).
+        let upper = "A".repeat(64);
+        assert_eq!(
+            normalize_verdict_digest(&upper).as_deref(),
+            Some(hex.as_str())
+        );
+        // Surrounding whitespace is tolerated.
+        assert_eq!(
+            normalize_verdict_digest(&format!("  sha256:{hex}  ")).as_deref(),
+            Some(hex.as_str())
+        );
+    }
+
+    #[test]
+    fn test_normalize_verdict_digest_rejects_malformed() {
+        assert_eq!(normalize_verdict_digest(""), None);
+        assert_eq!(normalize_verdict_digest("sha256:"), None);
+        assert_eq!(normalize_verdict_digest(&"a".repeat(63)), None, "too short");
+        assert_eq!(normalize_verdict_digest(&"a".repeat(65)), None, "too long");
+        assert_eq!(
+            normalize_verdict_digest(&format!("{}g", "a".repeat(63))),
+            None,
+            "non-hex"
+        );
+        assert_eq!(
+            normalize_verdict_digest(&format!("md5:{}", "a".repeat(64))),
+            None,
+            "unknown algorithm prefix must not silently pass through"
+        );
+        // SQL-shaped garbage can never reach the query.
+        assert_eq!(
+            normalize_verdict_digest("'; DROP TABLE proxy_scan_results;--"),
+            None
+        );
+    }
 
     #[test]
     fn test_audit_page_bounds_defaults() {
@@ -1758,6 +2235,170 @@ mod tests {
         let Json(settings) = get_settings(State(state)).await.unwrap();
 
         assert_eq!(settings.environment, "development");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2805 — 2FA enforcement policy endpoints (DB-backed; no-op without
+    // DATABASE_URL). Serialized on the shared policy-row advisory lock.
+    // -----------------------------------------------------------------------
+
+    /// Build an `AuthExtension` for `user_id` as an admin caller.
+    fn admin_auth(user_id: Uuid, username: &str) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{username}@test.local"),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
+        }
+    }
+
+    /// The lockout-safety guard, end to end: an admin who has not enrolled
+    /// cannot tighten the policy; the same admin, once enrolled, can; and
+    /// loosening never requires enrollment.
+    #[tokio::test]
+    async fn test_totp_policy_put_enforces_the_you_first_guard() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::totp_policy_serial_lock().await;
+        let restore = totp_policy::stored_policy(&pool).await;
+
+        // Deliberately NOT flagged `is_admin` in the database: the admin check
+        // is route middleware, and `admin_security`'s accessible-users test
+        // asserts a global count that every active admin enters. Creating one
+        // here would make that pre-existing race fire. Nothing under test reads
+        // the column -- `check_policy_activation` keys on the actor's TOTP
+        // state, not their role.
+        let (user_id, username) = tdh::create_user(&pool).await;
+        totp_policy::store_policy(&pool, TotpPolicy::Disabled, user_id)
+            .await
+            .expect("seed disabled");
+
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-totp-policy");
+        let auth = admin_auth(user_id, &username);
+
+        // 1. Not enrolled -> tightening is refused with 409.
+        let refused = update_totp_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::RequiredForAdmins,
+            }),
+        )
+        .await;
+        let refused_err = refused.err();
+
+        // 2. Enrol the caller, then the same change is accepted.
+        sqlx::query("UPDATE users SET totp_enabled = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("enrol caller");
+        let accepted = update_totp_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::RequiredForAll,
+            }),
+        )
+        .await;
+
+        // 3. Loosening never requires enrollment.
+        sqlx::query("UPDATE users SET totp_enabled = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("un-enrol caller");
+        let loosened = update_totp_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::Disabled,
+            }),
+        )
+        .await;
+
+        let read = get_totp_policy(State(state), Extension(auth)).await;
+
+        totp_policy::store_policy(&pool, restore, user_id)
+            .await
+            .expect("restore policy");
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            matches!(refused_err, Some(AppError::Conflict(_))),
+            "an unenrolled admin must not be able to tighten the policy: {refused_err:?}"
+        );
+        let accepted = accepted.expect("an enrolled admin may tighten").0;
+        assert_eq!(accepted.policy, TotpPolicy::RequiredForAll);
+        assert_eq!(accepted.source, TotpPolicySource::Database);
+        assert!(accepted.editable);
+
+        let loosened = loosened.expect("loosening must never be refused").0;
+        assert_eq!(loosened.policy, TotpPolicy::Disabled);
+
+        let read = read.expect("read policy").0;
+        assert_eq!(read.policy, TotpPolicy::Disabled);
+        // The blast-radius counts must see the local user we created, and the
+        // admin subset can never exceed the whole.
+        assert!(read.local_users >= 1);
+        assert!(read.local_admins <= read.local_users);
+    }
+
+    /// While `TOTP_POLICY` pins the policy, the API reports it as
+    /// non-editable and refuses every change — including a loosening one,
+    /// because the write would silently do nothing.
+    #[tokio::test]
+    async fn test_totp_policy_put_is_refused_while_pinned_by_env() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::totp_policy_serial_lock().await;
+
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // `is_admin` is deliberately left alone -- see the sibling test.
+        sqlx::query("UPDATE users SET totp_enabled = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("enrol caller");
+
+        let state = tdh::build_state_with(pool.clone(), "/tmp/admin-totp-pinned", |cfg| {
+            cfg.totp_policy = Some(TotpPolicy::RequiredForAll);
+        });
+        let auth = admin_auth(user_id, &username);
+
+        let read = get_totp_policy(State(state.clone()), Extension(auth.clone())).await;
+        let write = update_totp_policy(
+            State(state),
+            Extension(auth),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::Disabled,
+            }),
+        )
+        .await;
+        let write_err = write.err();
+
+        tdh::cleanup_user(&pool, user_id).await;
+
+        let read = read.expect("read policy").0;
+        assert_eq!(read.policy, TotpPolicy::RequiredForAll);
+        assert_eq!(read.source, TotpPolicySource::Environment);
+        assert!(!read.editable);
+        assert!(read.caller_totp_enabled);
+        assert!(
+            matches!(write_err, Some(AppError::Conflict(_))),
+            "a pinned policy must refuse writes: {write_err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2237,11 +2878,15 @@ mod tests {
             tables_restored: vec!["users".to_string(), "artifacts".to_string()],
             artifacts_restored: 42,
             errors: vec![],
+            integrity_anchor: "recorded".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["tables_restored"].as_array().unwrap().len(), 2);
         assert_eq!(json["artifacts_restored"], 42);
         assert!(json["errors"].as_array().unwrap().is_empty());
+        // The caller must be able to see WHAT the archive was checked against
+        // (#3373), not just that the restore returned 200.
+        assert_eq!(json["integrity_anchor"], "recorded");
     }
 
     // -----------------------------------------------------------------------

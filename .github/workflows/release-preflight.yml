@@ -4,36 +4,87 @@ name: Release Preflight
 #
 # Run this from the Actions UI (or `gh workflow run "Release Preflight"`)
 # BEFORE cutting a release/RC tag. It runs scripts/ci/release-preflight.sh,
-# which asserts `main` is actually releasable so a stale main does not cost a
-# full re-cut cycle (see #3039: v1.7.0-rc.1 stalled ~90 min at docker-publish's
-# Security Scan because two trivy-CLI CVE suppressions were never forward-ported
-# from release/1.6.x to main).
+# which asserts the ref being cut is actually releasable so a stale tree does
+# not cost a full re-cut cycle (see #3039: v1.7.0-rc.1 stalled ~90 min at
+# docker-publish's Security Scan because two trivy-CLI CVE suppressions were
+# never forward-ported from release/1.6.x to main).
 #
 # This publishes NOTHING. It only reads: the repo tree, the .trivyignore of
-# active release/* branches, and the latest main Docker Publish run status.
-# A red run means "do not tag yet"; a green run means main is safe to cut.
+# active release/* branches, the status of the Docker Publish run for the
+# exact commit being checked (selected by head_sha, not recency -- #3338),
+# the manifests of already-published component images (check 4, #3339), and
+# the PR -> closing-issue map for the commits since the last stable tag
+# (check 5, #3537).
+# A red run means "do not tag yet"; a green run means the audited ref is safe
+# to cut.
+#
+# IT AUDITS THE REF IT WAS DISPATCHED ON. The checkout used to hardcode
+# `ref: main`, so dispatching this workflow from `release/1.7.x` ran the
+# maintenance branch's copy of the workflow against MAIN's tree: v1.7.5,
+# v1.7.6 and v1.7.7 each got a READY verdict that was a statement about a
+# different branch, and there was no way to preflight the branch actually
+# being cut. The `ref` input defaults to whatever ref the dispatch was made
+# on, and the verdict line now names the ref and sha it evaluated so a
+# transcript can never again be mistaken for one about another branch.
+# (Fixed for release/1.7.x in v1.7.8; forward-ported to main by #3538.)
+#
+# A GREEN RUN LEAVES EVIDENCE (#3538). release.yml refuses to cut a tag unless
+# a green run of THIS workflow exists for the exact commit being released, and
+# the thing it looks for is the `release-preflight-<sha>` artifact uploaded
+# below. The artifact name carries the sha this run actually checked out --
+# `git rev-parse HEAD`, computed inside the run -- rather than the sha the
+# Actions API reports as `head_sha`, because those two are the same only when
+# no `ref` input was given and the branch did not move between dispatch and
+# checkout. Naming the audited tree is what makes "a verdict about a different
+# branch" impossible to launder into a release gate.
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ref to audit (branch, tag or sha). Defaults to the ref this workflow was dispatched on.'
+        required: false
+        type: string
+        default: ''
   # Also surface drift proactively on a schedule so a stale main is caught
   # before anyone even tries to cut. Advisory only -- never blocks a merge.
+  # A schedule always fires on the default branch, so this leg audits main.
   schedule:
     - cron: '17 13 * * 1-5'  # weekday mid-morning US, after the overnight merges
 
 permissions:
   contents: read
   actions: read
+  # Check 4 reads published component manifests from ghcr.io. These packages
+  # are public, so an anonymous pull token would usually do -- but "usually"
+  # is not a property to depend on: if one is ever made private the probe
+  # would report `indeterminate` and the preflight would exit 2 (INFRA)
+  # rather than silently degrade. Read scope keeps that from happening.
+  packages: read
 
 jobs:
   preflight:
     name: Pre-tag readiness
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout main
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # `inputs.ref || github.ref` rather than an input default: a
+      # workflow_dispatch `default:` is a literal string, so `${{ github.ref }}`
+      # written there would be checked out verbatim. The fallback expression is
+      # evaluated, so an unset input means "the ref I dispatched on" -- main
+      # from the Actions UI's default selection, release/1.7.x when the branch
+      # picker says release/1.7.x, and refs/heads/<default> on the schedule.
+      - name: Checkout the ref being audited
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
-          fetch-depth: 1
+          ref: ${{ inputs.ref || github.ref }}
+          # Full history and tags: check 5 bounds its commit range with
+          # `git describe` against the previous stable tag and then reads
+          # `git log <tag>..HEAD`. On a depth-1 checkout neither exists, and
+          # the check would report INFRA (exit 2) on every run -- an
+          # indeterminate verdict forever, which is the shape of gate this
+          # change exists to remove. Check 4 also stops needing its
+          # single-commit fetch for the revision a published tag names.
+          fetch-depth: 0
 
       # Runs first, and offline. If check 3 has regressed into a soft warn
       # again (#3308), this fails here rather than silently blessing a cut
@@ -43,8 +94,69 @@ jobs:
       - name: Self-test the preflight gate
         run: bash scripts/ci/test-release-preflight.sh
 
+      # The release-time half of the bookkeeping gates (#3537) never runs on
+      # this path -- it fires on a `v*` tag push -- so its self-test runs here
+      # too. A preflight that says "safe to cut" while the tag would be
+      # refused an hour later is the failure mode being removed, not a new one
+      # to introduce.
+      - name: Self-test the release-bookkeeping gates
+        run: bash scripts/ci/test-assert-release-bookkeeping.sh
+
       - name: Run release preflight
         env:
           GH_TOKEN: ${{ github.token }}
           PREFLIGHT_REPO: ${{ github.repository }}
+          # The ref this run is a statement about. It names the verdict line
+          # and it decides whether check 1 (a main-centric invariant) applies.
+          PREFLIGHT_REF: ${{ inputs.ref || github.ref }}
+          # Used by check 4's registry probes. The checkout is depth-1, so the
+          # commit a published tag was built from is not local; the check
+          # fetches just that commit when it needs it, and reports INFRA if it
+          # cannot get it rather than guessing.
+          GHCR_TOKEN: ${{ github.token }}
         run: bash scripts/ci/release-preflight.sh
+
+      # Only reached when the preflight exited 0 -- default `success()` step
+      # semantics, deliberately not `always()`. The presence of the artifact
+      # IS the verdict, so it must not exist for a NOT READY or an INFRA run.
+      - name: Record the audited commit
+        id: evidence
+        env:
+          AUDITED_REF: ${{ inputs.ref || github.ref }}
+        run: |
+          set -euo pipefail
+          audited_sha="$(git rev-parse HEAD)"
+          # NOT a dot-directory: actions/upload-artifact defaults
+          # `include-hidden-files: false`, so a `.preflight-evidence/` path
+          # uploads nothing at all. Caught by the falsifiability harness on
+          # #3538 -- the first run of it produced no artifact and the gate
+          # correctly refused the commit, which is the right failure but for
+          # the wrong reason.
+          mkdir -p preflight-evidence
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "audited_sha=${audited_sha}"
+            echo "audited_ref=${AUDITED_REF}"
+            echo "dispatch_head_sha=${GITHUB_SHA}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "verdict=READY"
+          } > preflight-evidence/verdict.txt
+          cat preflight-evidence/verdict.txt
+          echo "audited_sha=${audited_sha}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release Preflight: READY"
+            echo
+            echo "Audited \`${AUDITED_REF}\` at \`${audited_sha}\`."
+            echo
+            echo "\`release.yml\` will accept this run as evidence for a tag on"
+            echo "\`${audited_sha}\` and for no other commit."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the READY verdict as release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-preflight-${{ steps.evidence.outputs.audited_sha }}
+          path: preflight-evidence/
+          retention-days: 90
+          if-no-files-found: error

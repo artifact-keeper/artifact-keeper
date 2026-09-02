@@ -3,7 +3,7 @@ resolver = "2"
 members = ["backend"]
 
 [workspace.package]
-version = "1.7.2"
+version = "1.8.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
@@ -36,7 +36,10 @@ bcrypt = "0.19"
 # Checksums
 sha2 = "0.10"
 md-5 = "0.10"
-sha1 = "0.10"
+# `oid` exposes `AssociatedOid` for Sha1, which `rsa::pkcs1v15::SigningKey<Sha1>`
+# needs to build the PKCS#1 v1.5 DigestInfo prefix. Required by the apk
+# `.SIGN.RSA` index signature, whose digest algorithm apk fixes to SHA-1.
+sha1 = { version = "0.10", features = ["oid"] }
 hmac = "0.12"
 
 # Encryption
@@ -100,8 +103,8 @@ bytes = "1.5"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # WASM runtime
-wasmtime = { version = "36.0.13", features = ["component-model", "async"] }
-wasmtime-wasi = "36.0.13"
+wasmtime = { version = "36.0.14", features = ["component-model", "async"] }
+wasmtime-wasi = "36.0.14"
 
 # Git operations
 git2 = "0.21"

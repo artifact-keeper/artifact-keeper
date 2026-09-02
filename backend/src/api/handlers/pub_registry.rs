@@ -87,6 +87,7 @@ async fn resolve_pub_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 
 async fn package_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name)): Path<(String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -137,7 +138,11 @@ async fn package_info(
 
         // Virtual repo: resolve through members in priority order
         if repo.repo_type == RepositoryType::Virtual {
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            // Caller-authorized member walk (#3323): versions, sha256 digests
+            // and the pubspec are content.
+            let members =
+                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await?;
             for member in &members {
                 match member.repo_type {
                     RepositoryType::Local | RepositoryType::Staging => {
@@ -258,6 +263,7 @@ async fn package_info(
 
 async fn version_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version)): Path<(String, String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -308,7 +314,10 @@ async fn version_info(
 
             // Virtual repo: resolve through members in priority order
             if repo.repo_type == RepositoryType::Virtual {
-                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                // Caller-authorized member walk (#3323).
+                let members =
+                    proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                        .await?;
                 for member in &members {
                     match member.repo_type {
                         RepositoryType::Local | RepositoryType::Staging => {
@@ -488,6 +497,15 @@ async fn download_archive(
                     // client while teeing to the proxy cache, instead of
                     // buffering the whole package in memory. Single-flight via
                     // the merged coordinator (#1609).
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -925,35 +943,48 @@ async fn proxy_pub_meta_get(
 ) -> Option<Response> {
     let proxy = state.proxy_service.as_ref()?;
 
-    let result = proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, api_path).await;
+    // `proxy_fetch` with `fetch_path == cache_path`, widened to also report
+    // the upstream `Content-Encoding` (#3273): the non-JSON arm below forwards
+    // the buffered bytes VERBATIM, so the coding must travel with them.
+    let result = proxy_helpers::proxy_fetch_with_cache_key(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        api_path,
+        api_path,
+    )
+    .await;
 
-    let (content, content_type) = match result {
-        Ok((c, ct)) => (c, ct),
+    let (content, content_type, content_encoding) = match result {
+        Ok(triple) => triple,
         Err(_) => return None,
+    };
+
+    let mut json = match serde_json::from_slice::<serde_json::Value>(&content) {
+        Ok(j) => j,
+        Err(_) => {
+            // Non-JSON response — pass through verbatim: the upstream's
+            // `Content-Encoding` is re-declared when present (RFC 9110 §8.4,
+            // #3273) — nothing on this path decodes, so the coded bytes are
+            // the bytes being served.
+            return Some(proxy_helpers::forward_verbatim_metadata(
+                content,
+                content_type,
+                "application/vnd.pub.v2+json",
+                content_encoding,
+            ));
+        }
     };
 
     let ct = content_type
         .as_deref()
         .unwrap_or("application/vnd.pub.v2+json");
 
-    let mut json = match serde_json::from_slice::<serde_json::Value>(&content) {
-        Ok(j) => j,
-        Err(_) => {
-            // Non-JSON response — pass through verbatim
-            return Some(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, ct)
-                    .body(Body::from(content))
-                    .unwrap_or_else(|_| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
-                    }),
-            );
-        }
-    };
-
     rewrite_pub_archive_urls(&mut json, base_url, repo_key);
 
+    // JSON rewrite arm: the emitted bytes are built here, so the upstream
+    // coding no longer describes them and is deliberately dropped (#3273).
     Some(
         Response::builder()
             .status(StatusCode::OK)
@@ -1056,6 +1087,47 @@ mod tests {
         }
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
         teardown().await;
+    }
+
+    /// #3273: the non-JSON fallback arm of `proxy_pub_meta_get` forwards the
+    /// upstream bytes VERBATIM, so an upstream `Content-Encoding` must be
+    /// re-declared (RFC 9110 §8.4) and `Content-Length` must describe the
+    /// coded bytes actually sent (§8.6). Nothing on this path decodes
+    /// (`http_client::base_client_builder` disables every codec), so before
+    /// the fix a coded upstream body was served with no coding declared. The
+    /// coded fixture is deliberately NOT valid JSON — the deflate bytes fail
+    /// `serde_json::from_slice`, which is exactly what routes a coded
+    /// upstream response onto this arm; the uncoded control uses the same
+    /// non-JSON payload so both probes exercise the same arm.
+    #[tokio::test]
+    async fn test_pub_meta_non_json_passthrough_redeclares_content_encoding_3273_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pub").await else {
+            return;
+        };
+        let up = tdh::coded_and_plain_upstreams(
+            "deflate",
+            "application/vnd.pub.v2+json",
+            b"pub-meta-3273 not-json ",
+        )
+        .await;
+
+        // Coded upstream through the Remote metadata arm.
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.coded_mock.uri()).await;
+        let uri = format!("/{}/api/packages/pkg3273", fx.repo_key);
+        let (body, headers) = tdh::probe_ok(tdh::router_anon(super::router(), state), uri).await;
+        up.assert_coded_forward(&headers, &body, "pub remote meta (non-JSON pass-through)");
+
+        // Uncoded control through the same arm. A different package name
+        // keeps the probe clear of the process-global metadata LRU entry the
+        // coded probe just created for this repo key (#2758).
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.plain_mock.uri()).await;
+        let uri = format!("/{}/api/packages/pkg3273-plain", fx.repo_key);
+        let (body, headers) = tdh::probe_ok(tdh::router_anon(super::router(), state), uri).await;
+        up.assert_plain_forward(&headers, &body, "control pub remote meta");
+
+        fx.teardown().await;
     }
     use super::*;
 
@@ -1795,6 +1867,11 @@ dev_dependencies:
         .execute(&fx.pool)
         .await
         .expect("add member");
+        // The member is PRIVATE and this fixture probes ANONYMOUSLY, so publish
+        // it (#3323): a virtual repo now resolves only the members the caller
+        // may read directly, and the subject here is member resolution, not
+        // authorization.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
 
         // Also grant access to virtual repo for the fixture user
         tdh::grant_repo_access(&fx.pool, virtual_id, fx.user_id).await;
@@ -1894,6 +1971,11 @@ dev_dependencies:
         .execute(&fx.pool)
         .await
         .expect("add member");
+        // The member is PRIVATE and this fixture probes ANONYMOUSLY, so publish
+        // it (#3323): a virtual repo now resolves only the members the caller
+        // may read directly, and the subject here is member resolution, not
+        // authorization.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
 
         tdh::grant_repo_access(&fx.pool, virtual_id, fx.user_id).await;
 

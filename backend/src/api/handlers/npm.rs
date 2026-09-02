@@ -451,6 +451,41 @@ async fn age_gate_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo)
     }
 }
 
+/// Pure part of the packument cache-eligibility decision.
+///
+/// Two independent reasons to bypass the computed-packument cache are folded
+/// here:
+///
+/// * the age gate (see [`classify_packument_cache_age_gate`]), whose filtered
+///   view is time-dependent; and
+/// * member visibility (#3323): the virtual packument merge is now narrowed to
+///   the members the CALLER may read, so the merged document is
+///   caller-dependent unless every member is public — see
+///   [`proxy_helpers::virtual_aggregate_is_cacheable`] for why "all members
+///   public" is the exact condition. A virtual with a private member therefore
+///   computes per request; that is the only configuration that loses the #2162
+///   speedup, and it is exactly the configuration that was leaking.
+///
+/// Keeping this a pure function (rather than inlining the `&&` at the call
+/// site) is what lets the decision be unit-tested without a database.
+fn packument_cache_eligible(
+    repo_type: &str,
+    age_gate_bypasses: bool,
+    member_visibility_bypasses: bool,
+) -> bool {
+    // A Remote repo answers purely from its own upstream — it resolves no
+    // members, so member visibility cannot vary its packument.
+    if repo_type == RepositoryType::Remote {
+        return !age_gate_bypasses;
+    }
+    if repo_type == RepositoryType::Virtual {
+        return !age_gate_bypasses && !member_visibility_bypasses;
+    }
+    // Local/staging packuments are a cheap indexed DB read and are not cached
+    // at all (read-your-writes across replicas).
+    false
+}
+
 /// True when any member of a virtual repository has the age gate enabled.
 /// Errs on the side of `true` (bypass) if the lookup fails.
 pub(crate) async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: uuid::Uuid) -> bool {
@@ -483,6 +518,7 @@ pub(crate) async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: u
 /// upstream fetch.
 async fn get_package_metadata_cached(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo_key: &str,
     package_name: &str,
     base_url: &str,
@@ -492,9 +528,16 @@ async fn get_package_metadata_cached(
     // One indexed lookup to classify the repo before consulting the cache;
     // its cost is negligible next to the upstream round-trip a hit saves.
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
-    let cache_eligible = (repo.repo_type == RepositoryType::Remote
-        || repo.repo_type == RepositoryType::Virtual)
-        && !age_gate_bypasses_packument_cache(state, &repo).await;
+    let cache_eligible = packument_cache_eligible(
+        repo.repo_type.as_str(),
+        age_gate_bypasses_packument_cache(state, &repo).await,
+        !proxy_helpers::virtual_aggregate_cacheable(
+            &state.db,
+            repo.id,
+            repo.repo_type == RepositoryType::Virtual,
+        )
+        .await,
+    );
     // Server-side caching is safe for Remote AND Virtual, because #2490's
     // LISTEN/NOTIFY fanout (`invalidate_package_and_virtuals`, which explicitly
     // walks `virtual_repo_keys`) drops the entry on every replica the moment a
@@ -520,8 +563,17 @@ async fn get_package_metadata_cached(
     // and that is the change to re-check this directive against.
     let client_cache_control = client_cache_control_for(&repo.repo_type);
     let Some(cache) = state.npm_packument_cache.clone().filter(|_| cache_eligible) else {
-        let response =
-            get_package_metadata(state, repo_key, package_name, base_url, want_abbreviated).await?;
+        // Uncached path: the merge is narrowed to the members THIS caller may
+        // read (#3323).
+        let response = get_package_metadata(
+            state,
+            auth,
+            repo_key,
+            package_name,
+            base_url,
+            want_abbreviated,
+        )
+        .await?;
         return packument_response_with_cache_headers(response, headers).await;
     };
     let want_gzip = accepts_gzip(headers);
@@ -622,17 +674,30 @@ async fn compute_and_store_packument(
     // Capture the invalidation generation BEFORE computing, so a publish
     // that lands mid-compute wins over the data computed from before it.
     let store_guard = cache.begin_store(repo_key, package_name);
-    let response =
-        match get_package_metadata(state, repo_key, package_name, base_url, want_abbreviated).await
-        {
-            Ok(response) => response,
-            Err(error_response) => {
-                if is_definitive_missing_status(error_response.status()) {
-                    cache.invalidate_package(repo_key, package_name).await;
-                }
-                return Err(error_response);
+    // No caller is threaded here, deliberately (#3323). This computes the
+    // SHARED cache entry — including from the background stale-refresh task,
+    // which has no caller at all — so it must be the caller-independent
+    // document. `packument_cache_eligible` guarantees that: a virtual repo only
+    // reaches the cache when every member is public, and an all-public member
+    // set authorizes identically for every caller, anonymous included.
+    let response = match get_package_metadata(
+        state,
+        None,
+        repo_key,
+        package_name,
+        base_url,
+        want_abbreviated,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error_response) => {
+            if is_definitive_missing_status(error_response.status()) {
+                cache.invalidate_package(repo_key, package_name).await;
             }
-        };
+            return Err(error_response);
+        }
+    };
     if response.status() != StatusCode::OK {
         if is_definitive_missing_status(response.status()) {
             cache.invalidate_package(repo_key, package_name).await;
@@ -897,6 +962,159 @@ fn encode_package_name_for_upstream(name: &str) -> String {
 /// un-encoded for tarballs even though metadata requires `%2F`.
 fn build_tarball_upstream_path(package_name: &str, filename: &str) -> String {
     format!("{}/-/{}", package_name, filename)
+}
+
+// ---------------------------------------------------------------------------
+// Tarball integrity gating (GHSA-qxv7-p3mq-88fv)
+// ---------------------------------------------------------------------------
+
+/// Parse an npm `dist.integrity` SRI string into the strongest supported
+/// [`CacheCommitDigest`]. SRI permits several space-separated
+/// `algo-base64` tokens; SHA-512 wins over SHA-256 over SHA-1. SHA-384 has
+/// no tee-hasher support and is skipped (a weaker sibling token is used when
+/// present). Base64 payloads are decoded to the lowercase hex the gate
+/// compares; malformed tokens are ignored — an unusable integrity field
+/// degrades to the pre-existing unverified fetch, never to an error.
+fn parse_npm_sri(integrity: &str) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+    use crate::services::proxy_service::CacheCommitDigest;
+    use base64::Engine as _;
+
+    let mut best: Option<(u8, CacheCommitDigest)> = None;
+    for token in integrity.split_whitespace() {
+        let Some((algo, payload)) = token.split_once('-') else {
+            continue;
+        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .ok();
+        let candidate = match (algo, decoded) {
+            ("sha512", Some(bytes)) if bytes.len() == 64 => {
+                Some((3u8, CacheCommitDigest::Sha512Hex(hex::encode(bytes))))
+            }
+            ("sha256", Some(bytes)) if bytes.len() == 32 => {
+                Some((2u8, CacheCommitDigest::Sha256Hex(hex::encode(bytes))))
+            }
+            ("sha1", Some(bytes)) if bytes.len() == 20 => {
+                Some((1u8, CacheCommitDigest::Sha1Hex(hex::encode(bytes))))
+            }
+            _ => None,
+        };
+        if let Some((rank, digest)) = candidate {
+            // MSRV 1.75: `Option::is_none_or` is 1.82 — keep `map_or`.
+            if best.as_ref().map_or(true, |(r, _)| rank > *r) {
+                best = Some((rank, digest));
+            }
+        }
+    }
+    best.map(|(_, digest)| digest)
+}
+
+/// Validate a legacy npm `dist.shasum` as bare lowercase SHA-1 hex — the
+/// canonical form the commit gate compares. Same rationale as
+/// `proxy_helpers::normalize_expected_sha256`: a value not already in the
+/// comparison's canonical form did not come from this codebase's hashing
+/// path, so it is not treated as authoritative.
+fn normalize_npm_shasum(raw: &str) -> Option<String> {
+    let candidate = raw.trim();
+    if candidate.len() == 40
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Some(candidate.to_string());
+    }
+    None
+}
+
+/// Match a packument's `versions.*.dist` entries to a tarball request by the
+/// tarball URL's FILENAME — never by parsing a version out of the requested
+/// filename (hyphenated names and prerelease tags make that ambiguous; the
+/// curation gate refuses to for the same reason, #2930). `dist.integrity`
+/// (SRI) is preferred over the legacy `dist.shasum` (SHA-1 hex).
+fn npm_integrity_for_filename(
+    packument: &serde_json::Value,
+    filename: &str,
+) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+    use crate::services::proxy_service::CacheCommitDigest;
+
+    let versions = packument.get("versions")?.as_object()?;
+    for version in versions.values() {
+        let Some(dist) = version.get("dist") else {
+            continue;
+        };
+        let tarball = dist.get("tarball").and_then(|t| t.as_str()).unwrap_or("");
+        let tarball_name = tarball
+            .split(['#', '?'])
+            .next()
+            .unwrap_or(tarball)
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        if tarball_name.is_empty() || tarball_name != filename {
+            continue;
+        }
+        if let Some(digest) = dist
+            .get("integrity")
+            .and_then(|i| i.as_str())
+            .and_then(parse_npm_sri)
+        {
+            return Some(digest);
+        }
+        if let Some(digest) = dist
+            .get("shasum")
+            .and_then(|s| s.as_str())
+            .and_then(normalize_npm_shasum)
+        {
+            return Some(CacheCommitDigest::Sha1Hex(digest));
+        }
+    }
+    None
+}
+
+/// Resolve the registry-published integrity for the tarball `filename` of
+/// `package_name` from the packument, so the streamed tarball fetch can gate
+/// its proxy-cache commit on it — serve-but-don't-cache on a mismatch, the
+/// same posture as Cargo's #2929 `cksum` gate (GHSA-qxv7-p3mq-88fv). Before
+/// this, the tarball fetch hardcoded `expected_checksum: None`, so the
+/// `dist.integrity` the server itself served in the packument was decorative:
+/// a tarball whose bytes disagreed with it was committed to the cache and
+/// served warm from then on.
+///
+/// The packument is re-read through the same cache-keyed metadata helper the
+/// metadata handler uses, so an npm client — which always fetches the
+/// packument immediately before the tarball — finds it warm. The cached copy
+/// is the RAW upstream document (tarball-URL rewriting happens after the
+/// cache read), so the digests are the upstream's own values. Best-effort by
+/// construction: any failure (fetch/parse error, version entry missing, no
+/// usable digest) returns `None` and the download proceeds unverified,
+/// exactly as before.
+async fn resolve_npm_tarball_integrity(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    package_name: &str,
+    filename: &str,
+) -> Option<crate::services::proxy_service::CacheCommitDigest> {
+    // Fetch/cache split (#3297): `%2F`-encoded name upstream, decoded
+    // `@scope/name` as the local cache key — identical to the metadata
+    // handler, so this rides the same cache entry.
+    let encoded_name = encode_package_name_for_upstream(package_name);
+    let (content, _ct, _budget_permit) =
+        proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            &encoded_name,
+            package_name,
+            None,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
+        .ok()?;
+    let packument: serde_json::Value = serde_json::from_slice(&content).ok()?;
+    npm_integrity_for_filename(&packument, filename)
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,7 +1761,13 @@ async fn npm_meta_get(
     // Virtual: try the first Remote member whose upstream is reachable, applying
     // that member's scope policy (parity with the metadata/packument loops).
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323). `/-/*` forwards a member
+        // upstream's response body (search results, advisories) to the caller,
+        // and a Remote member may hold credentials for a private upstream feed,
+        // so the member set must be the one this caller may read directly. The
+        // handler already bound `auth`; it just never used it.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 continue;
@@ -1705,17 +1929,27 @@ async fn security_audits_quick(
 
 async fn get_metadata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package)): Path<(String, String)>,
     base_url: RequestBaseUrl,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    get_package_metadata_cached(&state, &repo_key, &package, base_url.as_str(), &headers).await
+    get_package_metadata_cached(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &package,
+        base_url.as_str(),
+        &headers,
+    )
+    .await
 }
 
 async fn get_scoped_metadata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, package)): Path<(String, String, String)>,
     base_url: RequestBaseUrl,
     headers: HeaderMap,
@@ -1724,21 +1958,39 @@ async fn get_scoped_metadata(
     let package = normalize_package_name(&package);
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
-    get_package_metadata_cached(&state, &repo_key, &full_name, base_url.as_str(), &headers).await
+    get_package_metadata_cached(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &full_name,
+        base_url.as_str(),
+        &headers,
+    )
+    .await
 }
 
 async fn get_version_metadata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package, version)): Path<(String, String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    get_package_version_metadata(&state, &repo_key, &package, &version, base_url.as_str()).await
+    get_package_version_metadata(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &package,
+        &version,
+        base_url.as_str(),
+    )
+    .await
 }
 
 async fn get_scoped_version_metadata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, package, version)): Path<(String, String, String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -1746,7 +1998,15 @@ async fn get_scoped_version_metadata(
     let package = normalize_package_name(&package);
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
-    get_package_version_metadata(&state, &repo_key, &full_name, &version, base_url.as_str()).await
+    get_package_version_metadata(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &full_name,
+        &version,
+        base_url.as_str(),
+    )
+    .await
 }
 
 /// Minimal artifact info needed to construct npm package metadata.
@@ -1770,6 +2030,29 @@ fn build_npm_metadata_response(
     stored_dist_tags: &serde_json::Map<String, serde_json::Value>,
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
+    Ok(respond_with_packument(
+        build_npm_metadata_value(
+            artifacts,
+            package_name,
+            base_url,
+            repo_key,
+            stored_dist_tags,
+        ),
+        want_abbreviated,
+    ))
+}
+
+/// Build the FULL packument JSON value from a set of stored artifacts — the
+/// value form of [`build_npm_metadata_response`], split out so the virtual
+/// member merge (#2844) can combine per-member contributions before a single
+/// response is emitted.
+fn build_npm_metadata_value(
+    artifacts: &[NpmMetadataArtifact],
+    package_name: &str,
+    base_url: &str,
+    repo_key: &str,
+    stored_dist_tags: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
     let mut versions = serde_json::Map::new();
     let mut version_list: Vec<String> = Vec::new();
 
@@ -1815,13 +2098,48 @@ fn build_npm_metadata_response(
         }
     }
 
-    let response = serde_json::json!({
+    serde_json::json!({
         "name": package_name,
         "versions": versions,
         "dist-tags": serde_json::Value::Object(dist_tags),
-    });
+    })
+}
 
-    Ok(respond_with_packument(response, want_abbreviated))
+/// Merge a lower-priority virtual member's packument into the accumulator
+/// (#2844).
+///
+/// Members are visited in priority order, so for the object-valued fields
+/// that federate across members — `versions`, `dist-tags` and `time` — a key
+/// the accumulator already holds wins, while keys only the later member
+/// knows about are added. Every other top-level field keeps the
+/// highest-priority member's value. This is what lets a project resolve the
+/// upstream `19.2.25` from a proxy member even when a hosted member holds
+/// only a fork build like `19.2.25-myorg.1` at higher priority.
+fn merge_packument_into(acc: &mut serde_json::Value, next: serde_json::Value) {
+    let (Some(acc_obj), serde_json::Value::Object(next_obj)) = (acc.as_object_mut(), next) else {
+        return;
+    };
+    for (field, next_value) in next_obj {
+        match field.as_str() {
+            "versions" | "dist-tags" | "time" => {
+                let serde_json::Value::Object(next_map) = next_value else {
+                    continue;
+                };
+                let slot = acc_obj
+                    .entry(field)
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                let Some(acc_map) = slot.as_object_mut() else {
+                    continue;
+                };
+                for (key, value) in next_map {
+                    acc_map.entry(key).or_insert(value);
+                }
+            }
+            _ => {
+                acc_obj.entry(field).or_insert(next_value);
+            }
+        }
+    }
 }
 
 /// Choose the `latest` dist-tag for a set of versions when none is recorded.
@@ -2200,6 +2518,7 @@ fn npm_member_eligible(
 /// when the client requests it.
 async fn get_package_metadata(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo_key: &str,
     package_name: &str,
     base_url: &str,
@@ -2259,118 +2578,17 @@ async fn get_package_metadata(
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
-    // For virtual repos, iterate through members in priority order.
-    // Local/Staging members are checked first (query DB for artifacts),
-    // then Remote members are proxied from upstream. First match wins.
+    // For virtual repos, merge every member's contribution in priority order
+    // (#2844). The old first-match-wins walk meant a hosted member holding
+    // only a fork build (e.g. `19.2.25-myorg.1`) masked the proxy member
+    // entirely, so `npm install pkg@19.2.25` failed even though the proxy
+    // member carried that version. Each Remote member's contribution is
+    // still filtered with that member's own age-gate params before merging.
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-
-        if members.is_empty() {
-            return Err(
-                AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
-            );
-        }
-
-        // Batch-load per-member npm scope policies once per request (#2327).
-        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
-            .await
-            .map_err(IntoResponse::into_response)?;
-
-        for member in &members {
-            // For Local/Staging members, query artifacts from the DB.
-            if member.repo_type == RepositoryType::Local
-                || member.repo_type == RepositoryType::Staging
-            {
-                let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
-                if !meta.is_empty() {
-                    let dist_tags = fetch_npm_dist_tags(&state.db, member.id, package_name).await;
-                    return build_npm_metadata_response(
-                        &meta,
-                        package_name,
-                        base_url,
-                        repo_key,
-                        &dist_tags,
-                        want_abbreviated,
-                    );
-                }
-                continue;
-            }
-
-            // For Remote members, proxy metadata from upstream.
-            if member.repo_type != RepositoryType::Remote {
-                continue;
-            }
-            // Honour the member's npm scope policy before proxying (#2327).
-            if !npm_member_eligible(
-                &member.repo_type,
-                scope_policies.get(&member.id),
-                package_name,
-            ) {
-                debug!(
-                    member_key = %member.key,
-                    package = %package_name,
-                    "npm virtual member skipped by scope policy"
-                );
-                continue;
-            }
-            let Some(ref upstream_url) = member.upstream_url else {
-                continue;
-            };
-            let Some(ref proxy) = state.proxy_service else {
-                continue;
-            };
-
-            let encoded_name = encode_package_name_for_upstream(package_name);
-            // Fetch/cache split (#3297): encoded name upstream, decoded
-            // `@scope/name` as the member's local cache key.
-            let result = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-                proxy,
-                member.id,
-                &member.key,
-                upstream_url,
-                &encoded_name,
-                package_name,
-                None,
-                proxy_helpers::LARGE_METADATA_MAX_BYTES,
-            )
-            .await;
-
-            match result {
-                Ok((content, content_type, _budget_permit)) => {
-                    // DB-resolve the member's gate policy: the Repository
-                    // model deliberately carries no `age_gate_mode`, and
-                    // policy inputs are read from the source of truth (#2264).
-                    let params = crate::services::age_gate_service::resolve_repo_params(
-                        &state.db, member.id,
-                    )
-                    .await
-                    .map_err(|e| e.into_response())?;
-                    return rewrite_and_respond_with_age_gate_params(
-                        state,
-                        &params,
-                        package_name,
-                        content,
-                        content_type,
-                        base_url,
-                        repo_key,
-                        want_abbreviated,
-                    )
-                    .await;
-                }
-                Err(_e) => {
-                    debug!(
-                        member_key = %member.key,
-                        "npm metadata proxy fetch missed for virtual member"
-                    );
-                }
-            }
-        }
-
-        return Err(
-            AppError::NotFound("Package not found in any member repository".to_string())
-                .into_response(),
-        );
+        let merged =
+            collect_virtual_packument(state, auth, &repo, repo_key, package_name, base_url, true)
+                .await?;
+        return Ok(respond_with_packument(merged, want_abbreviated));
     }
 
     // For local/staged repos, build metadata from stored artifacts
@@ -2400,6 +2618,7 @@ async fn get_package_metadata(
 /// the package exists but does not contain the requested version.
 async fn get_package_version_metadata(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo_key: &str,
     package_name: &str,
     version: &str,
@@ -2411,7 +2630,7 @@ async fn get_package_version_metadata(
     let packument: serde_json::Value = if repo.repo_type == RepositoryType::Remote {
         fetch_remote_packument(state, &repo, repo_key, package_name, base_url).await?
     } else if repo.repo_type == RepositoryType::Virtual {
-        fetch_virtual_packument(state, &repo, repo_key, package_name, base_url).await?
+        fetch_virtual_packument(state, auth, &repo, repo_key, package_name, base_url).await?
     } else {
         let artifacts = fetch_npm_artifacts(&state.db, repo.id, package_name).await?;
         if artifacts.is_empty() {
@@ -2527,19 +2746,87 @@ async fn fetch_remote_packument(
     Ok(json)
 }
 
-/// Fetch the full packument JSON by iterating virtual repo members.
+/// Fetch the full packument JSON by merging virtual repo members (#2844).
 async fn fetch_virtual_packument(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &proxy_helpers::RepoInfo,
     repo_key: &str,
     package_name: &str,
     base_url: &str,
 ) -> Result<serde_json::Value, Response> {
-    let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+    // This path never applied per-member age-gate filtering (the gate is
+    // enforced on the packument endpoint and again at download time), so the
+    // merge preserves that convention.
+    collect_virtual_packument(state, auth, repo, repo_key, package_name, base_url, false).await
+}
+
+/// Parse a remote member's packument body into a JSON value: optionally apply
+/// that member's age-gate filter, then rewrite tarball URLs to the virtual
+/// repo key. Returns `Ok(None)` for an unparseable body — the member is
+/// treated as a miss rather than failing the whole merge.
+async fn remote_member_packument_value(
+    state: &SharedState,
+    member_id: uuid::Uuid,
+    package_name: &str,
+    content: &Bytes,
+    base_url: &str,
+    repo_key: &str,
+    apply_age_gate: bool,
+) -> Result<Option<serde_json::Value>, Response> {
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(content) else {
+        return Ok(None);
+    };
+    if apply_age_gate {
+        if let Some(svc) = state.age_gate_service.as_ref() {
+            // DB-resolve the member's gate policy: the Repository model
+            // deliberately carries no `age_gate_mode`, and policy inputs are
+            // read from the source of truth (#2264).
+            let params =
+                crate::services::age_gate_service::resolve_repo_params(&state.db, member_id)
+                    .await
+                    .map_err(|e| e.into_response())?;
+            if AgeGateService::is_applicable(&params) {
+                svc.filter_npm_packument(&params, package_name, &mut json)
+                    .await
+                    .map_err(|e| e.into_response())?;
+            }
+        }
+    }
+    rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+    Ok(Some(json))
+}
+
+/// Collect every virtual member's contribution for `package_name` and merge
+/// them in priority order (#2844).
+///
+/// The previous behaviour was first-match-wins: as soon as ANY member knew
+/// the package, its packument was returned alone. A hosted member holding
+/// only a fork build (e.g. `19.2.25-myorg.1`) therefore masked the upstream
+/// proxy member entirely, and `npm install pkg@19.2.25` failed with "no
+/// matching version" even though the proxy member had it. Merging keeps the
+/// higher-priority member authoritative per version / dist-tag while still
+/// federating versions that only lower-priority members carry.
+///
+/// Always returns the FULL packument (abbreviation is the caller's concern).
+/// `apply_age_gate` filters each Remote member's contribution with that
+/// member's own age-gate params, matching the packument endpoint's existing
+/// convention; the version-metadata path passes `false` as before.
+async fn collect_virtual_packument(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &proxy_helpers::RepoInfo,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+    apply_age_gate: bool,
+) -> Result<serde_json::Value, Response> {
+    // Caller-authorized member walk (#3323): the merged packument is content,
+    // so a member this caller may not read directly must not contribute its
+    // versions, dist-tags, tarball URLs or shasums to it.
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
     if members.is_empty() {
-        return Err(
-            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
-        );
+        return Err(proxy_helpers::no_accessible_members_response());
     }
 
     // Batch-load per-member npm scope policies once per request (#2327).
@@ -2548,97 +2835,114 @@ async fn fetch_virtual_packument(
         .await
         .map_err(IntoResponse::into_response)?;
 
+    let mut merged: Option<serde_json::Value> = None;
     for member in &members {
-        if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
-        {
-            let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
-            if !meta.is_empty() {
-                // Always build the full packument here so the version can be extracted.
-                let resp = build_npm_metadata_response(
-                    &meta,
-                    package_name,
-                    base_url,
-                    repo_key,
-                    &serde_json::Map::new(),
-                    false,
-                )?;
-                #[allow(clippy::disallowed_methods)]
-                // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
-                let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
-                    .await
-                    .map_err(|e| {
-                        AppError::Internal(format!("Failed to read packument body: {}", e))
-                            .into_response()
-                    })?;
-                return serde_json::from_slice(&body_bytes).map_err(|e| {
-                    AppError::Internal(format!("Failed to parse packument JSON: {}", e))
-                        .into_response()
-                });
-            }
-            continue;
-        }
-
-        if member.repo_type != RepositoryType::Remote {
-            continue;
-        }
-        // Honour the member's npm scope policy before proxying (#2327).
-        if !npm_member_eligible(
-            &member.repo_type,
+        let contribution = virtual_member_packument_contribution(
+            state,
+            member,
             scope_policies.get(&member.id),
             package_name,
-        ) {
-            debug!(
-                member_key = %member.key,
-                package = %package_name,
-                "npm virtual member skipped by scope policy"
-            );
-            continue;
-        }
-        let Some(ref upstream_url) = member.upstream_url else {
-            continue;
-        };
-        let Some(ref proxy) = state.proxy_service else {
-            continue;
-        };
-
-        let encoded_name = encode_package_name_for_upstream(package_name);
-        // Fetch/cache split (#3297): encoded name upstream, decoded
-        // `@scope/name` as the member's local cache key.
-        let result = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-            proxy,
-            member.id,
-            &member.key,
-            upstream_url,
-            &encoded_name,
-            package_name,
-            None,
-            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            base_url,
+            repo_key,
+            apply_age_gate,
         )
-        .await;
-
-        match result {
-            Ok((content, _ct, _budget_permit)) => {
-                let mut json: serde_json::Value =
-                    serde_json::from_slice(&content).map_err(|e| {
-                        AppError::Internal(format!("Invalid JSON from upstream: {}", e))
-                            .into_response()
-                    })?;
-                rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
-                return Ok(json);
-            }
-            Err(_e) => {
-                debug!(
-                    member_key = %member.key,
-                    "npm metadata proxy fetch missed for virtual member"
-                );
+        .await?;
+        if let Some(value) = contribution {
+            match merged.as_mut() {
+                Some(acc) => merge_packument_into(acc, value),
+                None => merged = Some(value),
             }
         }
     }
 
-    Err(
-        AppError::NotFound("Package not found in any member repository".to_string())
-            .into_response(),
+    merged.ok_or_else(|| {
+        AppError::NotFound("Package not found in any member repository".to_string()).into_response()
+    })
+}
+
+/// A single member's packument contribution for the virtual merge, or `None`
+/// when the member does not know the package (or is skipped by policy /
+/// upstream failure — a member miss never fails the whole merge).
+async fn virtual_member_packument_contribution(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    scope_policy: Option<&NpmScopePolicy>,
+    package_name: &str,
+    base_url: &str,
+    repo_key: &str,
+    apply_age_gate: bool,
+) -> Result<Option<serde_json::Value>, Response> {
+    // Local/Staging members contribute from stored artifacts.
+    if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging {
+        let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
+        if meta.is_empty() {
+            return Ok(None);
+        }
+        let dist_tags = fetch_npm_dist_tags(&state.db, member.id, package_name).await;
+        return Ok(Some(build_npm_metadata_value(
+            &meta,
+            package_name,
+            base_url,
+            repo_key,
+            &dist_tags,
+        )));
+    }
+
+    if member.repo_type != RepositoryType::Remote {
+        return Ok(None);
+    }
+    // Honour the member's npm scope policy before proxying (#2327).
+    if !npm_member_eligible(&member.repo_type, scope_policy, package_name) {
+        debug!(
+            member_key = %member.key,
+            package = %package_name,
+            "npm virtual member skipped by scope policy"
+        );
+        return Ok(None);
+    }
+    let Some(ref upstream_url) = member.upstream_url else {
+        return Ok(None);
+    };
+    let Some(ref proxy) = state.proxy_service else {
+        return Ok(None);
+    };
+
+    let encoded_name = encode_package_name_for_upstream(package_name);
+    // Fetch/cache split (#3297): encoded name upstream, decoded
+    // `@scope/name` as the member's local cache key.
+    let result = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+        proxy,
+        member.id,
+        &member.key,
+        upstream_url,
+        &encoded_name,
+        package_name,
+        None,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
     )
+    .await;
+
+    match result {
+        Ok((content, _ct, _budget_permit)) => {
+            remote_member_packument_value(
+                state,
+                member.id,
+                package_name,
+                &content,
+                base_url,
+                repo_key,
+                apply_age_gate,
+            )
+            .await
+        }
+        Err(_e) => {
+            debug!(
+                member_key = %member.key,
+                "npm metadata proxy fetch missed for virtual member"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Content type for npm tarballs (.tgz). npm packages are always gzip-compressed
@@ -3116,11 +3420,8 @@ async fn serve_tarball(
                 .await
                 .unwrap_or(false)
             {
-                let action =
-                    crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-                        .proxy_scan_action(repo.id)
-                        .await
-                        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+                let (action, severity_gate) =
+                    proxy_helpers::direct_scan_policy(&state.db, repo.id).await;
                 return serve_scanned_npm_tarball(
                     state,
                     proxy,
@@ -3131,6 +3432,7 @@ async fn serve_tarball(
                     &fetch_path,
                     &response_filename,
                     action,
+                    severity_gate,
                     ctx,
                 )
                 .await;
@@ -3142,16 +3444,40 @@ async fn serve_tarball(
             // even though other download paths already stream. Stream it (teed
             // into the proxy cache under `fetch_path`) so a large tarball
             // succeeds with 200 and subsequent pulls are served warm.
-            let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+            //
+            // GHSA-qxv7-p3mq-88fv: gate the proxy-cache commit on the
+            // packument's `dist.integrity` (SRI) / `dist.shasum` for this
+            // exact tarball filename. Resolved AFTER the age gate so a
+            // last-known-good substitution is gated on its OWN integrity.
+            // npm's digests are SHA-512/SHA-1, which the storage layer never
+            // observes, so the fetch goes through the digest-flexible gated
+            // variant rather than the SHA-256-only proxy_helpers wrapper; a
+            // mismatch is served to the client (npm verifies the SRI itself)
+            // but never cached.
+            let expected_integrity = resolve_npm_tarball_integrity(
                 proxy,
                 repo.id,
                 repo_key,
                 upstream_url,
-                &fetch_path,
-                &fetch_path,
-                RepositoryFormat::Npm,
+                package_name,
+                &response_filename,
             )
-            .await?;
+            .await;
+            let gated_repo = proxy_helpers::build_remote_repo_with_format(
+                repo.id,
+                repo_key,
+                upstream_url,
+                RepositoryFormat::Npm,
+            );
+            let result = proxy
+                .fetch_artifact_streaming_with_cache_path_gated_digest(
+                    &gated_repo,
+                    &fetch_path,
+                    &fetch_path,
+                    expected_integrity,
+                )
+                .await
+                .map_err(IntoResponse::into_response)?;
 
             // The upstream registry may return application/octet-stream for
             // npm tarballs, which also gets persisted by the proxy cache.
@@ -3308,7 +3634,7 @@ async fn serve_tarball(
                 let Some(ref member_upstream) = member.upstream_url else {
                     continue;
                 };
-                let (enabled, action) =
+                let (enabled, action, severity_gate) =
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
                         .await;
                 if !enabled {
@@ -3324,6 +3650,7 @@ async fn serve_tarball(
                     &upstream_path,
                     filename,
                     action,
+                    severity_gate,
                     ctx,
                 )
                 .await
@@ -3621,6 +3948,7 @@ async fn serve_scanned_npm_tarball(
     fetch_path: &str,
     filename: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     // Buffered capped fetch (cache-first) under the SAME cache key as the
@@ -3751,6 +4079,7 @@ async fn serve_scanned_npm_tarball(
         synthetic,
         &bytes,
         action,
+        severity_gate,
         identity,
         proxy_helpers::ProxyScanMode::File,
     )
@@ -4128,6 +4457,7 @@ async fn publish_package(
 /// resolve consistently, then returns just its `dist-tags` object.
 async fn dist_tags_get(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, package)): Path<(String, String)>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
@@ -4137,7 +4467,15 @@ async fn dist_tags_get(
     // dist-tags are present in both the full and abbreviated packument, but we
     // parse the response body ourselves below; request the full packument so the
     // shape is stable regardless of any Accept header on the request.
-    let resp = get_package_metadata(&state, &repo_key, &package, base_url.as_str(), false).await?;
+    let resp = get_package_metadata(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &package,
+        base_url.as_str(),
+        false,
+    )
+    .await?;
     if !resp.status().is_success() {
         return Ok(resp);
     }
@@ -5456,6 +5794,111 @@ mod tests {
         assert_eq!(ok, vec!["@types"]);
     }
 
+    // -----------------------------------------------------------------------
+    // GHSA-qxv7-p3mq-88fv: tarball integrity gating (unit level)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_npm_sri_prefers_sha512_and_decodes_to_hex() {
+        use crate::services::proxy_service::CacheCommitDigest;
+        use base64::Engine as _;
+
+        let sha512_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"tarball"));
+        let sha1_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sha1::Sha1::digest(b"tarball"));
+        // Weakest-first ordering must not matter: sha512 wins.
+        let sri = format!("sha1-{sha1_b64} sha512-{sha512_b64}");
+        let digest = parse_npm_sri(&sri).expect("a sha512 token must parse");
+        assert_eq!(
+            digest,
+            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"tarball")))
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_sri_skips_malformed_and_unsupported_tokens() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        // Garbage and unsupported sha384 alone -> None (unverified fetch).
+        assert_eq!(parse_npm_sri("not-an-sri-token"), None);
+        assert_eq!(
+            parse_npm_sri(
+                "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBB="
+            ),
+            None
+        );
+        // A sha256 SRI decodes to the hex the storage-observed gate compares.
+        let sha256_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            sha2::Sha256::digest(b"tarball"),
+        );
+        assert_eq!(
+            parse_npm_sri(&format!("sha256-{sha256_b64}")),
+            Some(CacheCommitDigest::Sha256Hex(hex::encode(
+                sha2::Sha256::digest(b"tarball")
+            )))
+        );
+    }
+
+    #[test]
+    fn test_npm_integrity_for_filename_matches_by_tarball_basename() {
+        use crate::services::proxy_service::CacheCommitDigest;
+
+        let shasum = hex::encode(sha1::Sha1::digest(b"tarball-bytes"));
+        let packument = serde_json::json!({
+            "name": "my-pkg",
+            "versions": {
+                // Hyphenated name: a version parse of the filename would
+                // mis-split "my-pkg-1.0.0.tgz"; basename matching must not.
+                "1.0.0": {"dist": {"tarball": "https://reg.example/my-pkg/-/my-pkg-1.0.0.tgz",
+                                   "shasum": &shasum}},
+                "2.0.0": {"dist": {"tarball": "https://reg.example/my-pkg/-/my-pkg-2.0.0.tgz",
+                                   "shasum": "0000000000000000000000000000000000000000"}},
+            }
+        });
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "my-pkg-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum.clone()))
+        );
+        // A filename no version serves resolves to no gate.
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "my-pkg-9.9.9.tgz"),
+            None
+        );
+        // Scoped tarball URL shapes match by basename too.
+        let scoped = serde_json::json!({
+            "versions": {"1.0.0": {"dist": {
+                "tarball": "https://reg.example/@scope/pkg/-/pkg-1.0.0.tgz",
+                "shasum": &shasum}}}}
+        );
+        assert_eq!(
+            npm_integrity_for_filename(&scoped, "pkg-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha1Hex(shasum))
+        );
+    }
+
+    #[test]
+    fn test_npm_integrity_for_filename_prefers_sri_over_shasum() {
+        use crate::services::proxy_service::CacheCommitDigest;
+        use base64::Engine as _;
+
+        let sha512_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"real"));
+        let packument = serde_json::json!({
+            "versions": {"1.0.0": {"dist": {
+                "tarball": "https://reg.example/p/-/p-1.0.0.tgz",
+                "integrity": format!("sha512-{sha512_b64}"),
+                "shasum": "0000000000000000000000000000000000000000"}}}}
+        );
+        assert_eq!(
+            npm_integrity_for_filename(&packument, "p-1.0.0.tgz"),
+            Some(CacheCommitDigest::Sha512Hex(hex::encode(
+                sha2::Sha512::digest(b"real")
+            )))
+        );
+    }
+
     /// DB-backed (#2327 secondary): a virtual repo with two Remote members —
     /// the first carrying a scope policy that excludes the requested name,
     /// the second unrestricted — resolves both the metadata and the
@@ -5548,9 +5991,15 @@ mod tests {
         let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
 
         // Metadata loop: resolved via member B (member A skipped by policy).
-        let meta =
-            super::get_package_metadata(&state, &fx.repo_key, package, "http://localhost", false)
-                .await;
+        let meta = super::get_package_metadata(
+            &state,
+            None,
+            &fx.repo_key,
+            package,
+            "http://localhost",
+            false,
+        )
+        .await;
         match meta {
             Ok(resp) => assert_eq!(resp.status(), StatusCode::OK),
             Err(r) => panic!(
@@ -5563,6 +6012,7 @@ mod tests {
         let repo = fx.repo_info("virtual", None);
         let packument_json = super::fetch_virtual_packument(
             &state,
+            None,
             &repo,
             &fx.repo_key,
             package,
@@ -5593,6 +6043,137 @@ mod tests {
                 .await;
         }
         fx.teardown().await;
+    }
+
+    /// #2844: a hosted member holding only a fork build must not mask the
+    /// upstream release carried by a lower-priority proxy member. The merged
+    /// packument must contain BOTH versions so `npm install pkg@<upstream>`
+    /// resolves through the virtual repo.
+    #[tokio::test]
+    async fn test_virtual_packument_merges_fork_member_with_proxy_member_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "fork-mask-pkg";
+        let fork_version = "1.2.3-myorg.1";
+
+        // Priority-1 hosted member: holds ONLY the fork build.
+        let (local_id, _lkey, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let fork_path = format!("{package}/{fork_version}/{package}-{fork_version}.tgz");
+        proxy_helpers::insert_artifact(
+            &fx.pool,
+            proxy_helpers::NewArtifact {
+                repository_id: local_id,
+                path: &fork_path,
+                name: package,
+                version: fork_version,
+                size_bytes: 3,
+                checksum_sha256: "fork-checksum",
+                content_type: "application/gzip",
+                storage_key: &format!("npm/{fork_path}"),
+                uploaded_by: fx.user_id,
+            },
+        )
+        .await
+        .map_err(|r| r.status())
+        .expect("seed fork artifact");
+
+        // Priority-2 remote member: the upstream release.
+        let upstream = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": package,
+            "dist-tags": {"latest": "1.2.3"},
+            "versions": {
+                "1.2.3": {"name": package, "version": "1.2.3",
+                          "dist": {"tarball": format!(
+                              "{}/{}/-/{}-1.2.3.tgz", upstream.uri(), package, package)}},
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+            .mount(&upstream)
+            .await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        for (member_id, priority) in [(local_id, 1), (remote_id, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+            // Anonymous probe below; publish so the subject stays the #2844
+            // priority MERGE rather than the #3323 authorization filter.
+            tdh::publish_repo(&fx.pool, member_id).await;
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::get_package_metadata(
+            &state,
+            None,
+            &fx.repo_key,
+            package,
+            "http://localhost",
+            false,
+        )
+        .await;
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        for member_id in [local_id, remote_id] {
+            for sql in [
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sql).bind(member_id).execute(&fx.pool).await;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        fx.teardown().await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => panic!("virtual packument must resolve: HTTP {}", r.status()),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read packument body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse packument");
+        assert!(
+            json["versions"].get(fork_version).is_some(),
+            "the hosted member's fork build must be present"
+        );
+        assert!(
+            json["versions"].get("1.2.3").is_some(),
+            "the upstream release must federate from the proxy member instead \
+             of being masked by the fork-only member (#2844)"
+        );
+        // The proxied version's tarball is rewritten to the virtual repo key.
+        let tarball = json["versions"]["1.2.3"]["dist"]["tarball"]
+            .as_str()
+            .expect("tarball url");
+        assert!(
+            tarball.contains(&format!("/npm/{}/", fx.repo_key)),
+            "proxied tarball must be rewritten to the virtual repo: {tarball}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5989,6 +6570,7 @@ mod tests {
         );
         let abbreviated = super::get_package_metadata(
             &fx.state,
+            None,
             &fx.repo_key,
             "widget",
             "http://localhost",
@@ -5997,6 +6579,7 @@ mod tests {
         .await;
         let full = super::get_package_metadata(
             &fx.state,
+            None,
             &fx.repo_key,
             "widget",
             "http://localhost",
@@ -7680,6 +8263,7 @@ mod tests {
         // receives the canonical decoded name.
         let scoped_first = super::get_package_metadata(
             &state,
+            None,
             &fx.repo_key,
             "@e2escope/scopedpkg",
             "http://localhost",
@@ -7688,6 +8272,7 @@ mod tests {
         .await;
         let scoped_second = super::get_package_metadata(
             &state,
+            None,
             &fx.repo_key,
             "@e2escope/scopedpkg",
             "http://localhost",
@@ -7696,6 +8281,7 @@ mod tests {
         .await;
         let plain = super::get_package_metadata(
             &state,
+            None,
             &fx.repo_key,
             "plainpkg",
             "http://localhost",
@@ -7862,6 +8448,123 @@ mod tests {
         }
 
         // `.expect(1)` on the mock is verified on server drop.
+        drop(mock_server);
+        cleanup().await;
+    }
+
+    /// GHSA-qxv7-p3mq-88fv: a remote npm tarball whose bytes disagree with
+    /// the packument's `dist.integrity` must be SERVED (the client verifies
+    /// the SRI itself) but NEVER CACHED — a second pull refetches upstream
+    /// instead of serving the poisoned bytes warm. The matching-integrity
+    /// companion pull must cache normally. DB-backed; skips when no
+    /// `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn test_remote_tarball_integrity_mismatch_served_but_not_cached() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let tarball_bytes = b"pkged-up-tarball-bytes".to_vec();
+        // The packument pins an integrity that does NOT match the served
+        // bytes (here: the SRI of a different body entirely).
+        let mismatched_sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"other bytes"))
+        );
+        Mock::given(method("GET"))
+            .and(path("/intpkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "intpkg",
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": {"dist": {
+                    "tarball": format!("{}/intpkg/-/intpkg-1.0.0.tgz", mock_server.uri()),
+                    "integrity": mismatched_sri,
+                }}},
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/intpkg/-/intpkg-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(tarball_bytes.clone()),
+            )
+            // The integrity gate must refuse every cache commit, so BOTH
+            // pulls reach upstream.
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        for i in 0..2 {
+            let result = super::download_tarball(
+                axum::extract::State(state.clone()),
+                axum::Extension(tdh::admin_auth_ext()),
+                axum::extract::Path((
+                    fx.repo_key.clone(),
+                    "intpkg".to_string(),
+                    "intpkg-1.0.0.tgz".to_string(),
+                )),
+                Default::default(),
+            )
+            .await;
+
+            let response = match result {
+                Ok(r) => r,
+                Err(r) => {
+                    let status = r.status();
+                    cleanup().await;
+                    panic!(
+                        "pull {i}: mismatched-integrity tarball must still be served, got {status}"
+                    );
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read streamed body");
+            assert_eq!(
+                body_bytes.as_ref(),
+                tarball_bytes.as_slice(),
+                "pull {i}: the client receives the upstream bytes (it verifies the SRI itself)"
+            );
+            // Let the background tee writer settle (and, pre-fix, wrongly
+            // commit the mismatched bytes) before the next pull probes the
+            // cache. NOT `wait_for_cache_commit`: the whole point is that no
+            // commit may happen, and that helper panics in exactly that case.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+
+        // `.expect(2)` on the tarball mock is verified on server drop: had
+        // either pull committed the mismatched bytes, the second pull would
+        // have been served from cache and upstream would have seen ONE hit.
         drop(mock_server);
         cleanup().await;
     }
@@ -8180,6 +8883,80 @@ mod tests {
         assert_eq!(derive_latest_version(&[]), None);
     }
 
+    // -----------------------------------------------------------------------
+    // Virtual packument merge (#2844)
+    // -----------------------------------------------------------------------
+
+    /// The issue #2844 shape in miniature: a higher-priority member holds a
+    /// fork build, a lower-priority member holds the upstream release. The
+    /// merge must union `versions` so both resolve.
+    #[test]
+    fn test_merge_packument_unions_versions_across_members() {
+        let mut acc = serde_json::json!({
+            "name": "@angular/core",
+            "versions": {"19.2.25-myorg.1": {"version": "19.2.25-myorg.1"}},
+            "dist-tags": {"latest": "19.2.25-myorg.1"},
+        });
+        merge_packument_into(
+            &mut acc,
+            serde_json::json!({
+                "name": "@angular/core",
+                "versions": {"19.2.25": {"version": "19.2.25"}},
+                "dist-tags": {"latest": "19.2.25", "next": "20.0.0-rc.1"},
+                "time": {"19.2.25": "2026-01-01T00:00:00Z"},
+            }),
+        );
+        assert!(acc["versions"].get("19.2.25-myorg.1").is_some());
+        assert!(
+            acc["versions"].get("19.2.25").is_some(),
+            "the lower-priority member's version must federate into the merge"
+        );
+        // Priority order: the higher-priority member keeps its `latest`,
+        // while tags only the later member knows about are added.
+        assert_eq!(acc["dist-tags"]["latest"], "19.2.25-myorg.1");
+        assert_eq!(acc["dist-tags"]["next"], "20.0.0-rc.1");
+        assert_eq!(acc["time"]["19.2.25"], "2026-01-01T00:00:00Z");
+    }
+
+    /// Per-version conflicts resolve to the higher-priority member, and
+    /// non-object / missing fields never panic.
+    #[test]
+    fn test_merge_packument_priority_wins_and_tolerates_shapes() {
+        let mut acc = serde_json::json!({
+            "name": "pkg",
+            "versions": {"1.0.0": {"dist": {"tarball": "https://a/pkg-1.0.0.tgz"}}},
+        });
+        merge_packument_into(
+            &mut acc,
+            serde_json::json!({
+                "name": "pkg",
+                "versions": {"1.0.0": {"dist": {"tarball": "https://b/pkg-1.0.0.tgz"}},
+                             "2.0.0": {"dist": {"tarball": "https://b/pkg-2.0.0.tgz"}}},
+                "dist-tags": {"latest": "2.0.0"},
+                "description": "from the later member",
+            }),
+        );
+        assert_eq!(
+            acc["versions"]["1.0.0"]["dist"]["tarball"], "https://a/pkg-1.0.0.tgz",
+            "a version both members hold must keep the higher-priority body"
+        );
+        assert_eq!(
+            acc["versions"]["2.0.0"]["dist"]["tarball"],
+            "https://b/pkg-2.0.0.tgz"
+        );
+        // `dist-tags` was absent from the accumulator: created from the later
+        // member; other top-level fields fill in when missing.
+        assert_eq!(acc["dist-tags"]["latest"], "2.0.0");
+        assert_eq!(acc["description"], "from the later member");
+
+        // Non-object inputs are a no-op, not a panic.
+        let mut scalar = serde_json::json!("not an object");
+        merge_packument_into(&mut scalar, serde_json::json!({"versions": {}}));
+        assert_eq!(scalar, serde_json::json!("not an object"));
+        merge_packument_into(&mut acc, serde_json::json!(42));
+        assert!(acc["versions"].get("2.0.0").is_some());
+    }
+
     /// #1543 end-to-end: a custom dist-tag is served in the packument and
     /// `latest` is the highest non-prerelease version, not the most recently
     /// created one. Skips when no test database is configured.
@@ -8226,6 +9003,7 @@ mod tests {
 
         let result = super::get_package_metadata(
             &fx.state,
+            None,
             &fx.repo_key,
             "widget",
             "http://localhost",
@@ -8308,6 +9086,7 @@ mod tests {
         let stored = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
         let meta = super::get_package_metadata(
             &fx.state,
+            None,
             &fx.repo_key,
             "widget",
             "http://localhost",
@@ -8376,6 +9155,10 @@ mod tests {
         .execute(&fx.pool)
         .await
         .expect("insert virtual member");
+        // Publish the member (#3323): the reads below are anonymous, and only
+        // an all-public virtual uses the packument cache whose cross-replica
+        // invalidation this test is about.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
 
         // "Replica B": its own in-process packument cache over the same
         // database, with its cross-replica invalidation listener running.
@@ -8422,10 +9205,11 @@ mod tests {
             base_url: &str,
             headers: &HeaderMap,
         ) -> serde_json::Value {
-            let resp =
-                super::get_package_metadata_cached(state, repo_key, "widget", base_url, headers)
-                    .await
-                    .unwrap_or_else(|r| panic!("packument read failed: HTTP {}", r.status()));
+            let resp = super::get_package_metadata_cached(
+                state, None, repo_key, "widget", base_url, headers,
+            )
+            .await
+            .unwrap_or_else(|r| panic!("packument read failed: HTTP {}", r.status()));
             let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
                 .await
                 .expect("read packument body");
@@ -8666,6 +9450,7 @@ mod tests {
         // GET the dist-tags map.
         let get_tags = super::dist_tags_get(
             axum::extract::State(fx.state.clone()),
+            axum::Extension(None),
             axum::extract::Path((fx.repo_key.clone(), "widget".to_string())),
             RequestBaseUrl("http://localhost".to_string()),
         )
@@ -9682,6 +10467,7 @@ mod db_cov_tests {
     ) -> (axum::http::StatusCode, Option<String>, serde_json::Value) {
         let response = super::get_package_metadata_cached(
             state,
+            None,
             repo_key,
             package,
             "http://localhost",
@@ -9869,6 +10655,7 @@ mod db_cov_tests {
 
         let response = super::get_package_metadata_cached(
             &state,
+            None,
             &fx.repo_key,
             "derive-widget",
             "http://localhost",
@@ -9944,6 +10731,7 @@ mod db_cov_tests {
 
         let first = super::get_package_metadata_cached(
             &state,
+            None,
             &fx.repo_key,
             "etag-widget",
             "http://localhost",
@@ -9971,6 +10759,7 @@ mod db_cov_tests {
         }
         let second = super::get_package_metadata_cached(
             &state,
+            None,
             &fx.repo_key,
             "etag-widget",
             "http://localhost",
@@ -10134,6 +10923,12 @@ mod db_cov_tests {
         .await
         .expect("attach virtual member");
         tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        // Publish the member (#3323). Two reasons, both load-bearing for the
+        // cache fixtures below: the packument probes here are ANONYMOUS, and a
+        // virtual repo with a PRIVATE member is no longer packument-cache
+        // eligible at all (the merged document would be caller-dependent).
+        // Without this the cache tests would warm nothing and assert nothing.
+        tdh::publish_repo(&fx.pool, member_id).await;
         (member_id, member_key, member_dir)
     }
 
@@ -10695,6 +11490,7 @@ mod db_cov_tests {
         for pass in ["cold", "warm"] {
             let response = super::get_package_metadata_cached(
                 &state,
+                None,
                 &fx.repo_key,
                 "gzpkg",
                 "http://localhost",
@@ -10756,6 +11552,7 @@ mod db_cov_tests {
         // fires again for that client.
         let identity_response = super::get_package_metadata_cached(
             &state,
+            None,
             &fx.repo_key,
             "gzpkg",
             "http://localhost",
@@ -12178,5 +12975,134 @@ mod content_encoding_forwarding_tests {
              scan-pending) must pass the fetch result's content_encoding; \
              only the hosted arm passes None (#3149)",
         );
+    }
+}
+
+/// #3323 regression: the npm packument must not disclose a PRIVATE virtual
+/// member's versions to a caller who could not read that member directly.
+///
+/// The tarball download path was gated by #3178; the packument was not.
+/// `collect_virtual_packument` walked `fetch_virtual_members` unfiltered and the
+/// GET-metadata handlers bound no auth extractor, so a public virtual parent
+/// merged a private member's versions, dist-tags and shasums into the document
+/// it served anonymously.
+///
+/// The second half of the fix is the CACHE. `npm_packument_cache` is keyed by
+/// `(repo_key, package, abbreviated, gzip, base_url)` and not by caller, so
+/// simply narrowing the merge would have moved the leak rather than closed it:
+/// one authorized request would store the private member's versions and every
+/// later anonymous request would be served them from cache. A virtual repo with
+/// any non-public member is therefore no longer cache-eligible.
+#[cfg(test)]
+mod virtual_packument_member_authz_tests {
+    use super::*;
+
+    #[test]
+    fn a_virtual_with_a_private_member_is_not_packument_cache_eligible() {
+        // Remote: unaffected — it resolves no members.
+        assert!(packument_cache_eligible("remote", false, true));
+        assert!(!packument_cache_eligible("remote", true, false));
+
+        // Virtual: cacheable only when NEITHER the age gate nor member
+        // visibility can make the document request-dependent.
+        assert!(packument_cache_eligible("virtual", false, false));
+        assert!(
+            !packument_cache_eligible("virtual", false, true),
+            "#3323: a virtual repo with a private member produces a caller-dependent \
+             packument and must bypass the caller-independent cache"
+        );
+        assert!(!packument_cache_eligible("virtual", true, false));
+
+        // Hosted repos were never cached (read-your-writes across replicas).
+        assert!(!packument_cache_eligible("local", false, false));
+        assert!(!packument_cache_eligible("staging", false, false));
+    }
+
+    #[tokio::test]
+    async fn packument_hides_a_private_members_versions_from_an_anonymous_caller() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "authz-merge-pkg";
+
+        let (private_id, _prk, private_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (public_id, _puk, public_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(public_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish the public member");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, private_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, public_id, 2).await;
+
+        for (repo_id, version) in [(private_id, "9.9.9-private"), (public_id, "1.0.0")] {
+            let path = format!("{package}/{version}/{package}-{version}.tgz");
+            proxy_helpers::insert_artifact(
+                &fx.pool,
+                proxy_helpers::NewArtifact {
+                    repository_id: repo_id,
+                    path: &path,
+                    name: package,
+                    version,
+                    size_bytes: 3,
+                    checksum_sha256: "authz-merge-checksum",
+                    content_type: "application/gzip",
+                    storage_key: &format!("npm/{path}"),
+                    uploaded_by: fx.user_id,
+                },
+            )
+            .await
+            .map_err(|r| r.status())
+            .expect("seed member artifact");
+        }
+
+        let repo = fx.repo_info("virtual", None);
+
+        let anon = super::collect_virtual_packument(
+            &fx.state,
+            None,
+            &repo,
+            &fx.repo_key,
+            package,
+            "http://localhost",
+            false,
+        )
+        .await
+        .expect("anonymous packument merge");
+        assert!(
+            anon["versions"].get("1.0.0").is_some(),
+            "positive control: the PUBLIC member's version must still merge, got {anon}"
+        );
+        assert!(
+            anon["versions"].get("9.9.9-private").is_none(),
+            "#3323: the merged packument must not disclose a PRIVATE member's version \
+             to an anonymous caller, got {anon}"
+        );
+
+        // Positive control: an admin still sees both, so this is authorization
+        // rather than a break of the #2844 merge.
+        let admin = tdh::admin_auth(fx.user_id, &fx.username);
+        let privileged = super::collect_virtual_packument(
+            &fx.state,
+            Some(&admin),
+            &repo,
+            &fx.repo_key,
+            package,
+            "http://localhost",
+            false,
+        )
+        .await
+        .expect("admin packument merge");
+        assert!(
+            privileged["versions"].get("9.9.9-private").is_some()
+                && privileged["versions"].get("1.0.0").is_some(),
+            "an admin must still get the full merge, got {privileged}"
+        );
+
+        tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
+        fx.teardown().await;
     }
 }

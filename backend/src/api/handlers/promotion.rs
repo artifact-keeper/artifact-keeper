@@ -492,7 +492,20 @@ pub(crate) async fn require_promotion_tenant_access(
     target: &crate::models::repository::Repository,
 ) -> Result<()> {
     for repo in [source, target] {
-        let has_grant = repo_service.user_can_access_repo(repo.id, user_id).await?;
+        // TENANT-GATE-ONLY (#3331). The question here is literally tenant
+        // OWNERSHIP — "is this repository in a tenant this principal holds" —
+        // asked of the source and target of a promotion, and deliberately
+        // enforced independently of the `is_admin` capability flag (see this
+        // function's doc comment). It is not a capability check, so it carries
+        // no action: the promote capability itself is gated separately by the
+        // admin / `promote:artifacts` scope check above.
+        let has_grant = repo_service
+            .user_can_access_repo(
+                repo.id,
+                user_id,
+                crate::services::repository_service::RepoAccess::TenantOnly,
+            )
+            .await?;
         if !promotion_tenant_access_allowed(repo.is_public, has_grant) {
             return Err(AppError::Authorization(format!(
                 "You are not authorized to promote into the '{}' repository's tenant",
@@ -760,9 +773,10 @@ pub async fn promote_artifact(
     // it is skipped for repo-isolated (filesystem) backends where each repo has
     // its own directory tree. `require_promotion_tenant_access` above already
     // gates who may promote — this closes the residual write attribution hole.
-    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+    crate::services::artifact_service::guard_foreign_storage_key_for_promotion(
         &state.db,
         target_repo.id,
+        source_repo.id,
         &target_repo.storage_backend,
         &artifact.storage_key,
     )
@@ -1021,9 +1035,10 @@ pub async fn promote_artifacts_bulk(
         // repository on a shared-namespace cloud backend. Same guard the
         // per-format upload handlers apply; skipped for repo-isolated
         // (filesystem) backends. See the single-promote path for the rationale.
-        if let Err(e) = crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+        if let Err(e) = crate::services::artifact_service::guard_foreign_storage_key_for_promotion(
             &state.db,
             target_repo.id,
+            source_repo.id,
             &target_repo.storage_backend,
             &artifact.storage_key,
         )

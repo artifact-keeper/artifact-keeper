@@ -1,23 +1,24 @@
 //! Route definitions for the API.
 
 use axum::{
-    error_handling::HandleErrorLayer, extract::DefaultBodyLimit, middleware, routing::get,
+    error_handling::HandleErrorLayer,
+    extract::{DefaultBodyLimit, Request, State},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::get,
     BoxError, Router,
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tower::{
-    limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer, timeout::TimeoutLayer,
-    ServiceBuilder,
-};
+use tower::{limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer, ServiceBuilder};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::error::AppError;
 
 use super::handlers;
 use super::middleware::auth::{
-    admin_middleware, auth_middleware, optional_auth_middleware, repo_visibility_middleware,
-    RepoVisibilityState,
+    admin_middleware, auth_middleware, csrf_middleware, optional_auth_middleware,
+    repo_visibility_middleware, RepoVisibilityState,
 };
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
@@ -70,11 +71,25 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/nuget", handlers::nuget::router())
         .nest("/rpm", handlers::rpm::router())
         .nest("/cargo", handlers::cargo::router())
+        // `/api/cargo` alias (#3000): the documented / generated cargo client
+        // config points the sparse registry index at
+        // `sparse+{base}/api/cargo/{repo}/`, so cargo fetches
+        // `/api/cargo/{repo}/config.json` (and the sparse index files) under
+        // the `/api` prefix. Without this alias every such request 404s and
+        // `cargo publish` fails with "config.json not found".
+        .nest("/api/cargo", handlers::cargo::router())
         .nest("/gems", handlers::rubygems::router())
         .nest("/lfs", handlers::gitlfs::router())
         .nest("/pub", handlers::pub_registry::router())
         .nest("/go", handlers::goproxy::router())
         .nest("/helm", handlers::helm::router())
+        // `/api/helm` alias (#2941): the ChartMuseum `cm-push` plugin builds
+        // its push URL as `{host}/api{repo_path}/charts`, so for a repo URL of
+        // `{host}/helm/{repo}` it POSTs to `/api/helm/{repo}/charts` rather
+        // than this registry's native `/helm/{repo}/api/charts`. Mounting the
+        // upload/delete handlers under the plugin's shape makes a plain
+        // `helm cm-push chart.tgz <repo-url>` work without `--context-path`.
+        .nest("/api/helm", handlers::helm::cm_push_router())
         .nest("/composer", handlers::composer::router())
         .nest("/conan", handlers::conan::router())
         .nest("/alpine", handlers::alpine::router())
@@ -220,50 +235,131 @@ async fn handle_backstop_error(err: BoxError) -> AppError {
     AppError::ServiceUnavailable(format!("Server overloaded, please retry: {err}"))
 }
 
+/// Native-protocol path prefixes whose own routers already declare that they
+/// carry artifact-sized bodies (`DefaultBodyLimit::disable()` for incus/lxc,
+/// a 2 GB limit for Git LFS). See [`is_byte_transfer_path`].
+const BYTE_TRANSFER_PREFIXES: &[&str] = &["/incus/", "/lxc/", "/lfs/"];
+
+/// Whether `path` is an artifact **byte transfer** — a request whose duration is
+/// dominated by streaming artifact bytes over the network rather than by server
+/// work (#3263).
+///
+/// The global request timeout ([`Config::global_request_timeout_secs`]) is a
+/// wall-clock cap over the *whole* request, and `tower`'s timeout clock starts
+/// when the request arrives — so it also bounds the time the client spends
+/// uploading (or downloading) the body. On these routes that turns a duration
+/// cap into an effective *size* cap: a 90 MB upload over a 3 Mbit/s link takes
+/// longer than the 120 s default and is aborted mid-body, while the same upload
+/// on a fast link succeeds. Worse, the 503 is emitted while the client is still
+/// writing, so the connection is reset and the client never reads the status at
+/// all (`curl: (56) Recv failure: Connection was reset`) — the exact report in
+/// #3263. `MAX_UPLOAD_SIZE` does not help because the limit being hit is time,
+/// not bytes.
+///
+/// Byte-transfer routes are therefore exempted from the timeout. Their body size
+/// is still bounded by `MAX_UPLOAD_SIZE` (enforced mid-stream by the stager), and
+/// the load-shed + `GLOBAL_MAX_CONCURRENCY` limiter still bounds how many may run
+/// at once — so the "no path can pin every worker" backstop is preserved for the
+/// paths it was written for (bcrypt, decompression, and other server-side work).
+///
+/// Pure (`&str` in, `bool` out) so the whole route table is unit-testable
+/// without a router, a server, or a clock.
+pub(crate) fn is_byte_transfer_path(path: &str) -> bool {
+    // OCI blob / manifest transfer (`docker push` / `docker pull`).
+    if path.starts_with("/v2/") && (path.contains("/blobs/") || path.contains("/manifests/")) {
+        return true;
+    }
+
+    // Resumable chunked upload-session API (`/api/v1/uploads`, `.../{id}`,
+    // `.../{id}/complete`).
+    if path == "/api/v1/uploads" || path.starts_with("/api/v1/uploads/") {
+        return true;
+    }
+
+    // Native protocols that already opt out of (or far above) the body limit.
+    if BYTE_TRANSFER_PREFIXES.iter().any(|p| path.starts_with(p)) {
+        return true;
+    }
+
+    // Repo-scoped artifact bytes:
+    //   PUT/POST/GET/DELETE /api/v1/repositories/{key}/artifacts[/{path}]
+    //   GET                 /api/v1/repositories/{key}/download/{path}
+    // Repository keys never contain `/`, so the first segment after the prefix
+    // is the key and the remainder identifies the route.
+    if let Some(rest) = path.strip_prefix("/api/v1/repositories/") {
+        if let Some((_key, tail)) = rest.split_once('/') {
+            if tail == "artifacts"
+                || tail.starts_with("artifacts/")
+                || tail.starts_with("download/")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// The exact 503 body the timeout backstop has always produced. Kept as a
+/// helper so the hand-rolled timeout below is byte-for-byte compatible with
+/// the `HandleErrorLayer` mapping of `tower`'s `Elapsed` error.
+fn request_timed_out_response() -> Response {
+    AppError::ServiceUnavailable("Server overloaded, please retry: request timed out".to_string())
+        .into_response()
+}
+
+/// Router-wide request timeout that skips artifact byte transfers (#3263).
+///
+/// Replaces the previous `tower::timeout::TimeoutLayer`: `Timeout` cannot be
+/// made conditional on the request, and applying it to upload/download routes
+/// silently converts the duration cap into a size cap (see
+/// [`is_byte_transfer_path`]).
+async fn conditional_request_timeout(
+    State(timeout): State<Duration>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if is_byte_transfer_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+    match tokio::time::timeout(timeout, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => request_timed_out_response(),
+    }
+}
+
 /// Wrap `router` in the outermost defense-in-depth backstop. Each layer is
 /// applied only when its config value is non-zero (`0` disables it), so the
 /// behaviour is identical to the unpatched router when both are disabled.
 ///
-/// `HandleErrorLayer` requires the error type of the inner stack to be fixed,
-/// which `ServiceBuilder::option_layer` (its `Either`/`Infallible` branches)
-/// makes ambiguous — so the on/off combinations are spelled out explicitly,
-/// each building a homogeneous fallible stack before `HandleErrorLayer`
-/// collapses it back to an infallible axum service mapping shed/timeout
-/// errors to 503.
+/// The load-shed + concurrency limiter stays the outermost `tower` stack (a shed
+/// must happen before any work). The request timeout is applied just inside it
+/// as an axum middleware rather than a `TimeoutLayer` so it can skip artifact
+/// byte transfers — see [`is_byte_transfer_path`] and #3263.
 fn apply_global_backstop(
     router: Router,
     max_concurrency: usize,
     request_timeout_secs: u64,
 ) -> Router {
-    let concurrency_on = max_concurrency != 0;
-    let timeout_on = request_timeout_secs != 0;
-    let timeout = Duration::from_secs(request_timeout_secs);
+    let router = if request_timeout_secs == 0 {
+        router
+    } else {
+        router.layer(middleware::from_fn_with_state(
+            Duration::from_secs(request_timeout_secs),
+            conditional_request_timeout,
+        ))
+    };
 
-    match (concurrency_on, timeout_on) {
-        // Nothing enabled -> router untouched (no extra layer cost).
-        (false, false) => router,
-        // Concurrency limit + load-shed only.
-        (true, false) => router.layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(handle_backstop_error))
-                .layer(LoadShedLayer::new())
-                .layer(GlobalConcurrencyLimitLayer::new(max_concurrency)),
-        ),
-        // Request timeout only.
-        (false, true) => router.layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(handle_backstop_error))
-                .layer(TimeoutLayer::new(timeout)),
-        ),
-        // Full backstop: load-shed + concurrency limit + timeout.
-        (true, true) => router.layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(handle_backstop_error))
-                .layer(LoadShedLayer::new())
-                .layer(GlobalConcurrencyLimitLayer::new(max_concurrency))
-                .layer(TimeoutLayer::new(timeout)),
-        ),
+    if max_concurrency == 0 {
+        return router;
     }
+
+    router.layer(
+        ServiceBuilder::new()
+            .layer(HandleErrorLayer::new(handle_backstop_error))
+            .layer(LoadShedLayer::new())
+            .layer(GlobalConcurrencyLimitLayer::new(max_concurrency)),
+    )
 }
 
 /// API v1 routes
@@ -504,6 +600,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 // panel calls POST /repositories/{key}/storage-gc. Admin-gated
                 // inside the handler.
                 .merge(handlers::storage_gc::repo_router())
+                // Proxy-cache SBOM: GET /repositories/{key}/security/proxy-sbom.
+                // Lives in the sbom handler because it shares the document
+                // generators; mounted here because the path is repo-scoped.
+                .merge(handlers::sbom::proxy_repo_router())
                 .merge(handlers::repositories::download_router().layer(
                     middleware::from_fn_with_state(
                         presign_rate_limit_state,
@@ -961,6 +1061,13 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Web-UI CSRF contract (#3065): a state-changing request authenticated
+        // by the session cookie must carry the `X-Requested-With` header the
+        // web UI sends. Applied to the whole nest so it also covers the
+        // cookie-writing `/auth/*` routes, which mount no auth middleware.
+        // Token- and Basic-authenticated callers (every native package client)
+        // are exempt — see `violates_csrf_contract`.
+        .layer(middleware::from_fn(csrf_middleware))
         // General API rate limiting (100 req/min per IP/user)
         .layer(middleware::from_fn_with_state(
             api_rate_limit_state,
@@ -981,6 +1088,8 @@ mod tests {
     //! prefixes wired to the same handler until the `lxc` format is either
     //! folded into `incus` or given its own handler with prefix-aware URL
     //! construction (tracked as a follow-up to #1272).
+    use super::{is_byte_transfer_path, request_timed_out_response};
+
     const ROUTES_RS_SRC: &str = include_str!("routes.rs");
 
     #[test]
@@ -1120,5 +1229,125 @@ mod tests {
             ROUTES_RS_SRC.contains("\"/migrations\","),
             "/migrations nest registration missing"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #3263: the global request timeout must not bound artifact byte
+    // transfers. `tower`'s timeout clock covers the time the client spends
+    // streaming the body, so applying it to upload/download routes turns the
+    // duration cap into an effective size cap: uploads that take longer than
+    // GLOBAL_REQUEST_TIMEOUT_SECS (120 s default) are aborted mid-body and the
+    // client sees a connection reset instead of a status. Reproduced on 1.7.x
+    // by uploading at a rate that pushes the body past 120 s — 503 at exactly
+    // the timeout, with and without a Caddy reverse proxy in front.
+    // -----------------------------------------------------------------
+
+    /// The exact route from the #3263 report.
+    #[test]
+    fn generic_artifact_upload_is_a_byte_transfer() {
+        assert!(is_byte_transfer_path(
+            "/api/v1/repositories/generic-local/artifacts/test/big-file.zip"
+        ));
+    }
+
+    #[test]
+    fn every_artifact_byte_route_is_exempt() {
+        let exempt = [
+            // Repo-scoped artifact bytes: collection form (multipart upload /
+            // listing), nested paths of any depth, and the download sibling.
+            "/api/v1/repositories/generic-local/artifacts",
+            "/api/v1/repositories/generic-local/artifacts/a/b/c/d.bin",
+            "/api/v1/repositories/generic-local/download/a/b/c.bin",
+            // Resumable chunked upload-session API.
+            "/api/v1/uploads",
+            "/api/v1/uploads/0191d0f0-0000-7000-8000-000000000000",
+            "/api/v1/uploads/0191d0f0-0000-7000-8000-000000000000/complete",
+            // OCI blob / manifest transfer (docker push / pull).
+            "/v2/library/nginx/blobs/sha256:abc",
+            "/v2/library/nginx/blobs/uploads/0191d0f0",
+            "/v2/library/nginx/manifests/latest",
+            // Native protocols whose routers already declare multi-GB bodies.
+            "/incus/images-local/1.0/images/abc",
+            "/lxc/images-local/1.0/images/abc",
+            "/lfs/repo/objects/abc",
+        ];
+        for path in exempt {
+            assert!(
+                is_byte_transfer_path(path),
+                "{path} must be exempt from the global request timeout"
+            );
+        }
+    }
+
+    /// The exemption is a scalpel, not a switch: everything that is *not* an
+    /// artifact byte transfer keeps the defense-in-depth timeout, so a handler
+    /// running unbounded server-side work (bcrypt, decompression, a wedged
+    /// upstream call) is still aborted at the configured deadline.
+    #[test]
+    fn non_byte_transfer_routes_keep_the_timeout() {
+        for path in [
+            "/api/v1/auth/login",
+            "/api/v1/repositories",
+            "/api/v1/repositories/generic-local",
+            // Sibling repo sub-resources that are plain JSON, not bytes.
+            "/api/v1/repositories/generic-local/storage",
+            "/api/v1/repositories/generic-local/members",
+            "/api/v1/repositories/generic-local/routing-rules",
+            "/api/v1/users",
+            "/api/v1/search",
+            // `/v2/` itself (the auth challenge) is metadata, not a transfer.
+            "/v2/",
+            "/v2/_catalog",
+            "/health",
+            // Prefix look-alikes must not match by accident.
+            "/api/v1/uploadsomething",
+            "/incus-something/x",
+            "/lfsx/objects/abc",
+        ] {
+            assert!(
+                !is_byte_transfer_path(path),
+                "{path} must stay under the global request timeout"
+            );
+        }
+    }
+
+    /// Regression guard on the mechanism, not just the predicate: a
+    /// `tower::timeout::TimeoutLayer` cannot be made conditional on the
+    /// request, so re-introducing one over the whole router would silently
+    /// restore the #3263 size cap.
+    #[test]
+    fn global_timeout_is_not_an_unconditional_tower_layer() {
+        assert!(
+            // Split so this needle does not match its own source line.
+            !ROUTES_RS_SRC.contains(concat!("Timeout", "Layer::new")),
+            "the router-wide timeout must stay conditional \
+             (see is_byte_transfer_path / #3263); a blanket TimeoutLayer \
+             re-imposes a wall-clock cap on artifact uploads and downloads"
+        );
+        assert!(
+            ROUTES_RS_SRC.contains("conditional_request_timeout"),
+            "conditional timeout middleware missing"
+        );
+    }
+
+    /// The 503 emitted on a genuine timeout must stay byte-for-byte what the
+    /// `HandleErrorLayer` mapping produced, so clients and dashboards keying
+    /// off the message do not break.
+    #[test]
+    fn timeout_response_shape_is_unchanged() {
+        let response = request_timed_out_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let legacy = handle_backstop_error_message("request timed out");
+        assert_eq!(legacy, "Server overloaded, please retry: request timed out");
+    }
+
+    /// Mirror of `handle_backstop_error`'s formatting, exercised so the
+    /// message the conditional timeout hard-codes cannot drift from the
+    /// load-shed branch that still goes through `HandleErrorLayer`.
+    fn handle_backstop_error_message(err: &str) -> String {
+        format!("Server overloaded, please retry: {err}")
     }
 }

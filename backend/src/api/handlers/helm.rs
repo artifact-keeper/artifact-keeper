@@ -56,6 +56,23 @@ pub fn router() -> Router<SharedState> {
         .route("/:repo_key/api/charts/:name/:version", delete(delete_chart))
 }
 
+/// ChartMuseum `cm-push` compatibility router, mounted at `/api/helm` (#2941).
+///
+/// The `cm-push` plugin constructs its push URL as
+/// `{context_path}/api/{repo_path_minus_context}/charts`
+/// (<https://github.com/chartmuseum/helm-push/blob/main/pkg/chartmuseum/upload.go>).
+/// With a repository URL of `https://host/helm/{repo}` and no `--context-path`
+/// that resolves to `POST /api/helm/{repo}/charts` and
+/// `DELETE /api/helm/{repo}/charts/{name}/{version}` — not the native
+/// `/{repo}/api/charts` shape [`router`] serves. This router exposes the same
+/// upload/delete handlers under the plugin's default shape so `helm cm-push`
+/// works against a plain repo URL.
+pub fn cm_push_router() -> Router<SharedState> {
+    Router::new()
+        .route("/:repo_key/charts", post(upload_chart))
+        .route("/:repo_key/charts/:name/:version", delete(delete_chart))
+}
+
 // ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
@@ -190,7 +207,11 @@ fn upload_response_body(prov_stored: bool) -> serde_json::Value {
 ///
 /// `path` is `None` only for remote upstream entries, which have no local
 /// stored object; those fall back to the `{name}-{version}.tgz` convention the
-/// upstream index itself uses.
+/// upstream index itself uses. Third-party name/version pairs that cannot form
+/// one path segment never reach here — [`merge_upstream_index_entries`] drops
+/// them (see [`upstream_chart_is_advertisable`]) — so the interpolation below
+/// always yields a URL under this repository's own `charts/` route that
+/// resolves back to the entry it was built from.
 fn chart_download_url(repo_key: &str, path: Option<&str>, name: &str, version: &str) -> String {
     let filename = path
         .and_then(|p| p.rsplit('/').next())
@@ -198,6 +219,35 @@ fn chart_download_url(repo_key: &str, path: Option<&str>, name: &str, version: &
         .map(str::to_string)
         .unwrap_or_else(|| format!("{}-{}.tgz", name, version));
     format!("/helm/{}/charts/{}", repo_key, filename)
+}
+
+/// Whether a third-party index entry's `name`/`version` can be advertised as a
+/// `charts/{name}-{version}.tgz` URL that resolves back to that same entry
+/// (#3448).
+///
+/// The proxied index rebuilds every URL from the upstream entry's own name and
+/// version, and those are attacker-influenced strings interpolated into a path.
+/// A name of `../../../../etc/passwd` or `q?x=1#frag` produces an advertised URL
+/// that is still same-origin — the `/helm/{repo}/charts/` prefix is fixed, so a
+/// scheme-absolute or protocol-relative name cannot smuggle a host — but is no
+/// longer a URL for the chart the index just promised. Percent-encoding was the
+/// obvious alternative and was rejected: an encoder aggressive enough to cover
+/// `%` also rewrites `+`, which is legal semver build metadata, so every
+/// legitimate `1.0.0+build.5` chart URL would have moved.
+///
+/// Dropping the entry instead keeps the index's guarantee absolute — everything
+/// it advertises resolves — and costs nothing real, because an entry that
+/// cannot be addressed could not have been downloaded through this repository
+/// anyway. `%` is refused alongside the separators because the router
+/// percent-decodes before matching, so `%2F` is `/` arriving one step later.
+fn upstream_chart_is_advertisable(name: &str, version: &str) -> bool {
+    fn segment_safe(part: &str) -> bool {
+        !part.is_empty()
+            && !part
+                .chars()
+                .any(|c| matches!(c, '/' | '\\' | '?' | '#' | '%') || c.is_control())
+    }
+    segment_safe(name) && segment_safe(version) && name != "." && name != ".."
 }
 
 /// Query Helm chart artifacts from a repository and append chart entries to `out`.
@@ -288,10 +338,22 @@ async fn query_charts_from_repo(
     Ok(())
 }
 
-/// Generate index.yaml content and wrap in a YAML response.
+/// Generate index.yaml content and wrap it in a YAML response.
+///
+/// `budget_permit` is the buffered-metadata reservation taken by
+/// [`fetch_upstream_index`], threaded all the way here on the Remote path and
+/// then handed to the response body (#2665/#2684). Everything between the
+/// upstream read and this point — the parsed `HelmIndex`, the chart vector
+/// `generate_index_yaml` clones out of it, and the rendered document itself —
+/// is derived from that buffer and is larger than it, so releasing the
+/// reservation at the fetch's return would have left the biggest allocations
+/// unaccounted and bounded only the individual upstream read rather than the
+/// concurrent total. A Local or Virtual index has no such reservation and
+/// passes `None`, which serves the body exactly as before.
 #[allow(clippy::result_large_err)]
 fn build_index_response(
     charts: Vec<(ChartYaml, String, String, String)>,
+    budget_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Response, Response> {
     let index_content = generate_index_yaml(charts).map_err(|e| {
         (
@@ -301,11 +363,122 @@ fn build_index_response(
             .into_response()
     })?;
 
+    let body = match budget_permit {
+        Some(permit) => proxy_helpers::budgeted_body(bytes::Bytes::from(index_content), permit),
+        None => Body::from(index_content),
+    };
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/x-yaml; charset=utf-8")
-        .body(Body::from(index_content))
+        .body(body)
         .unwrap())
+}
+
+/// Fetch and parse a Remote repository's upstream `index.yaml`.
+///
+/// The `index.yaml` lookup stays buffered by design: helm's index is the
+/// discovery document and has to be parsed in-process before anything can be
+/// merged or resolved from it. It is therefore byte-capped and reserved
+/// against the shared buffered-metadata budget (#2665/#2684) so neither a
+/// single hostile upstream nor a concurrent fan-out can drive resident memory
+/// unbounded.
+///
+/// The reservation is RETURNED rather than dropped here, because the buffer is
+/// not the peak: the parsed tree, the chart vector cloned out of it and the
+/// rendered response are all derived from it and all larger. The caller must
+/// hold the permit for as long as any of that is resident — the index path
+/// hands it to the response body, and the chart-download path drops it once it
+/// has copied the one URL it needs out of the parsed index.
+///
+/// The cap is [`LARGE_METADATA_MAX_BYTES`], not the 8 MiB default: a Helm
+/// index is the whole-repository listing — the direct analogue of the PyPI
+/// simple-index and npm packument documents already on the larger ceiling —
+/// and real upstreams exceed 8 MiB (charts.bitnami.com's `index.yaml` is
+/// ~26 MiB), which the default cap would turn into a 502 for every request.
+///
+/// The request goes through the proxy cache, so the upstream round-trip is
+/// paid once per cache TTL and is shared with the chart download path, which
+/// resolves real chart URLs out of the same document.
+async fn fetch_upstream_index(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+) -> Result<(HelmIndex, tokio::sync::OwnedSemaphorePermit), Response> {
+    let (index_bytes, _content_type, budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        "index.yaml",
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Helm,
+    )
+    .await?;
+
+    let yaml_str = std::str::from_utf8(&index_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Invalid UTF-8 in upstream index.yaml",
+        )
+            .into_response()
+    })?;
+    let index: HelmIndex = serde_yaml::from_str(yaml_str).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Failed to parse upstream index.yaml",
+        )
+            .into_response()
+    })?;
+    Ok((index, budget_permit))
+}
+
+/// Merge an upstream `index.yaml`'s entries into the chart list an index
+/// response is being built from, rewriting every URL to this repository's own
+/// `charts/` route.
+///
+/// Entries already present in `out` win: a locally-held chart row carries the
+/// artifact's REAL stored filename in its advertised URL, which is what
+/// `download_chart` resolves before it ever consults upstream, so replacing it
+/// with the `{name}-{version}.tgz` convention could advertise a path the
+/// download route cannot resolve. An upstream entry for a `(name, version)`
+/// that is not held locally is added; a different version of the same chart is
+/// a different entry and is always added.
+///
+/// Remote upstream entries have no local stored path, so their URL is rebuilt
+/// from the chart's own name/version — the ChartMuseum convention the upstream
+/// index itself uses, and the shape `download_chart` parses back into a
+/// name/version before proxying.
+fn merge_upstream_index_entries(
+    repo_key: &str,
+    index: HelmIndex,
+    out: &mut Vec<(ChartYaml, String, String, String)>,
+) {
+    let held: std::collections::HashSet<(String, String)> = out
+        .iter()
+        .map(|(chart, _url, _created, _digest)| (chart.name.clone(), chart.version.clone()))
+        .collect();
+
+    for (_chart_name, entries) in index.entries {
+        for entry in entries {
+            if held.contains(&(entry.chart.name.clone(), entry.chart.version.clone())) {
+                continue;
+            }
+            if !upstream_chart_is_advertisable(&entry.chart.name, &entry.chart.version) {
+                tracing::warn!(
+                    repository = %repo_key,
+                    chart = %entry.chart.name,
+                    version = %entry.chart.version,
+                    "upstream index entry cannot be addressed as a single path segment; \
+                     omitting it from the proxied index"
+                );
+                continue;
+            }
+            let url = chart_download_url(repo_key, None, &entry.chart.name, &entry.chart.version);
+            out.push((entry.chart, url, entry.created, entry.digest));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -314,18 +487,25 @@ fn build_index_response(
 
 async fn index_yaml(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
 
     // Virtual repository: merge index.yaml from all member repositories
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): index.yaml is the discovery
+        // half of the chart download — names, versions, digests and the URLs
+        // the client then fetches — so a member this caller may not read
+        // directly must not contribute entries to it.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut all_charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
 
         // Collect index.yaml from remote members and parse chart entries
         let remote_indexes = proxy_helpers::collect_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             "index.yaml",
@@ -342,20 +522,7 @@ async fn index_yaml(
         .await?;
 
         for (_member_key, index) in remote_indexes {
-            for (_chart_name, entries) in index.entries {
-                for entry in entries {
-                    // Remote upstream entries have no local stored path; rebuild
-                    // the proxied URL from the chart's own name/version (the
-                    // ChartMuseum convention the upstream index already used).
-                    let url = chart_download_url(
-                        &repo_key,
-                        None,
-                        &entry.chart.name,
-                        &entry.chart.version,
-                    );
-                    all_charts.push((entry.chart, url, entry.created, entry.digest));
-                }
-            }
+            merge_upstream_index_entries(&repo_key, index, &mut all_charts);
         }
 
         // Query artifacts from local/hosted members
@@ -365,12 +532,58 @@ async fn index_yaml(
             }
         }
 
-        return build_index_response(all_charts);
+        return build_index_response(all_charts, None);
     }
 
     let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
     query_charts_from_repo(&state.db, repo.id, &repo_key, &mut charts).await?;
-    build_index_response(charts)
+
+    // Remote (proxy) repository: the index is the DISCOVERY half of a chart
+    // pull — `helm pull`/`install`/`upgrade` resolve a name and version out of
+    // it before requesting any tarball — so building it from locally-catalogued
+    // rows alone answered `entries: {}` and made a proxy repository unusable
+    // for everything except a pinned, full-path fetch (#3448). Serve what the
+    // upstream advertises, merged over whatever is held locally, which is the
+    // same set `download_chart` can actually serve: it resolves a local
+    // artifact row first and falls through to the upstream index otherwise.
+    let mut budget_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(proxy), Some(upstream_url)) =
+            (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
+        {
+            match fetch_upstream_index(proxy, repo.id, &repo_key, upstream_url).await {
+                Ok((index, permit)) => {
+                    merge_upstream_index_entries(&repo_key, index, &mut charts);
+                    // Held across the merge above and handed to the response
+                    // body below, so the budget stays debited for the rendered
+                    // document's whole resident lifetime (#2665).
+                    budget_permit = Some(permit);
+                }
+                // Upstream is unreachable or unparseable. With nothing held
+                // locally there is no honest index to serve: an empty
+                // `entries: {}` is indistinguishable from "upstream publishes
+                // no charts", which is precisely the silent failure this issue
+                // is about, so the upstream's own error is surfaced and
+                // `helm repo update` fails loudly. With charts held locally the
+                // local set is still served (the handler half of
+                // stale-if-error), so an upstream outage cannot break
+                // resolution of a chart this repository already has. The proxy
+                // cache applies RFC 5861 stale-if-error to the `index.yaml`
+                // object itself, so a warm proxy keeps serving the last good
+                // upstream index before this fallback is ever reached.
+                Err(err) if charts.is_empty() => return Err(err),
+                Err(err) => {
+                    tracing::warn!(
+                        repository = %repo_key,
+                        status = %err.status(),
+                        "upstream helm index unavailable; serving locally-held charts only"
+                    );
+                }
+            }
+        }
+    }
+
+    build_index_response(charts, budget_permit)
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +612,9 @@ fn resolve_chart_url(upstream_url: &str, chart_url: &str) -> String {
 /// is typically free after the first virtual-index request. The chart content is
 /// cached under the stable key `charts/{filename}` regardless of where the actual
 /// bytes come from, so subsequent downloads are served from cache.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_chart_via_index(
+    state: &SharedState,
     proxy: &ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
@@ -407,33 +622,12 @@ async fn fetch_chart_via_index(
     name: &str,
     version: &str,
     filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    // The `index.yaml` lookup stays buffered/capped by design: it is a small
-    // metadata document that must be parsed in-process.
-    let (index_bytes, _) = proxy_helpers::proxy_fetch_capped(
-        proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
-        "index.yaml",
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-    )
-    .await?;
-
-    let yaml_str = String::from_utf8(index_bytes.to_vec()).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Invalid UTF-8 in upstream index.yaml",
-        )
-            .into_response()
-    })?;
-    let index: HelmIndex = serde_yaml::from_str(&yaml_str).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Failed to parse upstream index.yaml",
-        )
-            .into_response()
-    })?;
+    // The reservation covers the buffered document AND the parsed tree; it is
+    // dropped below, once the single URL this path needs has been copied out.
+    let (index, index_budget_permit) =
+        fetch_upstream_index(proxy, repo_id, repo_key, upstream_url).await?;
 
     let chart_url = index
         .entries
@@ -444,6 +638,8 @@ async fn fetch_chart_via_index(
         .ok_or_else(|| {
             (StatusCode::NOT_FOUND, "Chart not found in upstream index").into_response()
         })?;
+    drop(index);
+    drop(index_budget_permit);
 
     // A `.prov` provenance file is not its own `index.yaml` entry: helm derives
     // its URL by string-appending `.prov` to the chart URL it resolved from the
@@ -480,6 +676,12 @@ async fn fetch_chart_via_index(
         RepositoryFormat::Helm,
     )
     .await?;
+    // #3446: count the proxied chart (or its `.prov`). `cache_path` is the
+    // stable `charts/{filename}` key this fetch is teed into, so the recorded
+    // (repo, path) is exactly the catalog row the artifact listing renders.
+    // Recorded after the fetch resolves, so a 404/502 from upstream does not
+    // count as a download.
+    proxy_helpers::record_proxy_download(state, repo_id, repo_key, &cache_path, ctx).await;
     proxy_helpers::stream_fetch_result(result, content_type, Some(filename))
 }
 
@@ -496,6 +698,7 @@ async fn fetch_chart_via_index(
 /// directly, the same `authorize_virtual_members` filter the OCI virtual
 /// walkers and `resolve_virtual_download` apply. Without it a public virtual
 /// parent laundered a PRIVATE member's chart bytes to anonymous callers.
+#[allow(clippy::too_many_arguments)]
 async fn download_chart_via_index(
     state: &SharedState,
     repo: &RepoInfo,
@@ -503,6 +706,7 @@ async fn download_chart_via_index(
     name: &str,
     version: &str,
     filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Option<Response>, Response> {
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
@@ -522,6 +726,7 @@ async fn download_chart_via_index(
             return Ok(None);
         };
         let response = fetch_chart_via_index(
+            state,
             proxy,
             repo.id,
             &repo.key,
@@ -529,6 +734,7 @@ async fn download_chart_via_index(
             name,
             version,
             filename,
+            ctx,
         )
         .await?;
         return Ok(Some(response));
@@ -581,7 +787,11 @@ async fn download_chart_via_index(
             let Some(upstream_url) = member.upstream_url.as_deref() else {
                 continue;
             };
+            // #3446: a Remote MEMBER's serve is recorded against the member,
+            // not the virtual parent — the member owns the proxy cache the
+            // bytes came from and the catalog row that carries the count.
             match fetch_chart_via_index(
+                state,
                 proxy,
                 member.id,
                 &member.key,
@@ -589,6 +799,7 @@ async fn download_chart_via_index(
                 name,
                 version,
                 filename,
+                ctx,
             )
             .await
             {
@@ -654,6 +865,7 @@ async fn download_chart(
                         &name,
                         &version,
                         &filename,
+                        &ctx,
                     )
                     .await?
                     {
@@ -1985,6 +2197,60 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         tdh::send(app, req).await
     }
 
+    // -----------------------------------------------------------------------
+    // cm-push default URL shape (#2941)
+    // -----------------------------------------------------------------------
+
+    /// `helm cm-push` POSTs to `{host}/api/helm/{repo}/charts` (the
+    /// ChartMuseum context-path shape), not this registry's native
+    /// `/{repo}/api/charts`. The `/api/helm` alias router must accept the
+    /// plugin's default upload and delete URLs.
+    #[tokio::test]
+    async fn test_cm_push_default_url_shape_uploads_and_deletes() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = build_tgz(
+            "cmpushchart/Chart.yaml",
+            b"apiVersion: v2\nname: cmpushchart\nversion: 0.1.0\n",
+        );
+
+        // POST the exact URL cm-push constructs for repo URL {host}/helm/{repo}.
+        let app = f.router_with_auth(Router::new().nest("/api/helm", super::cm_push_router()));
+        let req = tdh::post(
+            format!("/api/helm/{}/charts", f.repo_key),
+            "multipart/form-data; boundary=BOUNDARY",
+            multipart_body("BOUNDARY", &[("chart", "cmpushchart-0.1.0.tgz", &tgz)]),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "cm-push's default push URL must be accepted; got body {:?}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // The chart is downloadable at the native path.
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/charts/cmpushchart-0.1.0.tgz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // DELETE via the same ChartMuseum shape.
+        let app = f.router_with_auth(Router::new().nest("/api/helm", super::cm_push_router()));
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/helm/{}/charts/cmpushchart/0.1.0", f.repo_key))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        f.teardown().await;
+    }
+
     /// The core of #2635: a `.prov` uploaded next to its chart must be
     /// PERSISTED and served back byte-for-byte at the URL helm derives.
     #[tokio::test]
@@ -2352,6 +2618,433 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
     }
 
     // -----------------------------------------------------------------------
+    // #3448: a Remote repository's index.yaml must reflect the upstream
+    // -----------------------------------------------------------------------
+
+    /// Build a two-chart upstream index whose URLs are upstream-absolute, so a
+    /// test can tell a merged entry (rewritten to this repo's `charts/` route)
+    /// from a verbatim copy of the upstream document.
+    fn upstream_two_chart_index() -> String {
+        r#"apiVersion: v1
+generated: "2024-01-01T00:00:00Z"
+entries:
+  cert-manager:
+    - apiVersion: v2
+      name: cert-manager
+      version: v1.16.2
+      appVersion: v1.16.2
+      urls:
+        - https://upstream.invalid/charts/cert-manager-v1.16.2.tgz
+      created: "2024-01-01T00:00:00Z"
+      digest: aaaa1111
+    - apiVersion: v2
+      name: cert-manager
+      version: v1.16.1
+      urls:
+        - https://upstream.invalid/charts/cert-manager-v1.16.1.tgz
+      created: "2023-12-01T00:00:00Z"
+      digest: bbbb2222
+  trust-manager:
+    - apiVersion: v2
+      name: trust-manager
+      version: v0.12.0
+      urls:
+        - https://upstream.invalid/charts/trust-manager-v0.12.0.tgz
+      created: "2024-02-01T00:00:00Z"
+      digest: cccc3333
+"#
+        .to_string()
+    }
+
+    fn parse_index(body: &[u8]) -> HelmIndex {
+        serde_yaml::from_slice(body).expect("response body must be a parseable index.yaml")
+    }
+
+    #[test]
+    fn test_merge_upstream_index_entries_rewrites_urls_to_this_repo() {
+        let index: HelmIndex = serde_yaml::from_str(&upstream_two_chart_index()).unwrap();
+        let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
+
+        merge_upstream_index_entries("helm-remote", index, &mut out);
+
+        assert_eq!(out.len(), 3, "every upstream entry must be merged: {out:?}");
+        for (chart, url, _created, _digest) in &out {
+            assert_eq!(
+                url,
+                &format!(
+                    "/helm/helm-remote/charts/{}-{}.tgz",
+                    chart.name, chart.version
+                ),
+                "an upstream URL must be rewritten to this repository's own charts/ \
+                 route, or the client would be sent straight to the upstream and the \
+                 proxy would serve nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_upstream_index_entries_keeps_the_locally_held_entry() {
+        let index: HelmIndex = serde_yaml::from_str(&upstream_two_chart_index()).unwrap();
+        let local_chart = ChartYaml {
+            api_version: "v2".to_string(),
+            name: "cert-manager".to_string(),
+            version: "v1.16.2".to_string(),
+            kube_version: None,
+            description: None,
+            chart_type: None,
+            keywords: None,
+            home: None,
+            sources: None,
+            dependencies: None,
+            maintainers: None,
+            icon: None,
+            app_version: None,
+            deprecated: None,
+            annotations: None,
+        };
+        // A stored chart whose real filename is NOT the {name}-{version}.tgz
+        // convention, so a merge that overwrote it would be visible.
+        let local_url = "/helm/helm-remote/charts/cert-manager-promoted.tgz".to_string();
+        let mut out = vec![(
+            local_chart,
+            local_url.clone(),
+            "2024-06-01T00:00:00Z".to_string(),
+            "local-digest".to_string(),
+        )];
+
+        merge_upstream_index_entries("helm-remote", index, &mut out);
+
+        let same_nv: Vec<_> = out
+            .iter()
+            .filter(|(c, ..)| c.name == "cert-manager" && c.version == "v1.16.2")
+            .collect();
+        assert_eq!(
+            same_nv.len(),
+            1,
+            "a (name, version) held locally must not gain a duplicate upstream entry"
+        );
+        assert_eq!(
+            same_nv[0].1, local_url,
+            "the locally-held entry keeps its real stored filename, which is what the \
+             download route resolves"
+        );
+        assert_eq!(
+            out.len(),
+            3,
+            "the other upstream versions are still merged: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_index_yaml_serves_upstream_entries_3448() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "helm").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(upstream_two_chart_index().as_bytes()),
+            )
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let index = parse_index(&body);
+        assert!(
+            !index.entries.is_empty(),
+            "a Remote repository's index must carry the upstream's charts; an empty \
+             `entries` is what makes `helm pull` unable to resolve anything (#3448)"
+        );
+        let cert_manager = index
+            .entries
+            .get("cert-manager")
+            .expect("upstream chart must be advertised by name");
+        assert_eq!(cert_manager.len(), 2, "both upstream versions must appear");
+        let latest = cert_manager
+            .iter()
+            .find(|e| e.chart.version == "v1.16.2")
+            .expect("upstream version must appear");
+        assert_eq!(
+            latest.urls,
+            vec![format!(
+                "/helm/{}/charts/cert-manager-v1.16.2.tgz",
+                f.repo_key
+            )],
+            "the advertised URL must point at this repository's charts/ route, which \
+             is the route that proxies the tarball"
+        );
+        assert_eq!(latest.digest, "aaaa1111", "upstream digest is preserved");
+        assert!(index.entries.contains_key("trust-manager"));
+    }
+
+    /// The two upstream failures an operator actually hits: the upstream is
+    /// down (5xx), and the upstream URL is wrong so `index.yaml` 404s — the
+    /// more common misconfiguration of the two. Neither may answer 200 with an
+    /// empty index, which is indistinguishable from "this upstream publishes no
+    /// charts" and leaves `helm repo update` reporting success (#3448).
+    ///
+    /// The exact status differs by cause and that is deliberate: `map_proxy_error`
+    /// classifies an upstream 5xx as 503 and a definitive upstream 404 as 404,
+    /// so the client is told which of the two it is rather than being given a
+    /// uniform 502.
+    #[tokio::test]
+    async fn test_remote_index_yaml_surfaces_an_upstream_failure_when_nothing_is_held_3448() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for (upstream_status, expected) in [
+            (503u16, StatusCode::SERVICE_UNAVAILABLE),
+            (404, StatusCode::NOT_FOUND),
+        ] {
+            let Some(f) = tdh::Fixture::setup("remote", "helm").await else {
+                return;
+            };
+            let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+            Mock::given(method("GET"))
+                .and(path("/index.yaml"))
+                .respond_with(ResponseTemplate::new(upstream_status))
+                .mount(&server)
+                .await;
+            let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+            let app = tdh::router_anon(super::router(), state);
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+
+            f.teardown().await;
+
+            assert_ne!(
+                status,
+                StatusCode::OK,
+                "upstream {upstream_status} with nothing held locally must not answer 200: \
+                 an empty `entries` reads as 'upstream publishes no charts' and \
+                 `helm repo update` reports success, which is the silent failure in #3448"
+            );
+            assert_eq!(
+                status,
+                expected,
+                "upstream {upstream_status} must be reported as {expected}, so the operator \
+                 can tell an outage from a wrong upstream URL; body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_index_yaml_still_serves_locally_held_charts_when_upstream_is_down_3448() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "helm").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let repo = f.repo_info("remote", Some(&server.uri()));
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "held-chart-storage-key",
+            "heldchart-2.0.0.tgz",
+            "heldchart",
+            "2.0.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"helm-chart-bytes"),
+            f.user_id,
+        )
+        .await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an upstream outage must not stop a chart this repository already holds \
+             from resolving (#3448)"
+        );
+        let index = parse_index(&body);
+        assert!(
+            index.entries.contains_key("heldchart"),
+            "the locally-held chart must still be advertised: {:?}",
+            index.entries.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// #2665/#2684 via #3448: the buffered-metadata reservation must stay
+    /// debited for the RENDERED response body's lifetime, not just the upstream
+    /// read's. Everything between the two — the parsed index, the chart vector
+    /// cloned out of it, and the rendered document — is derived from that buffer
+    /// and larger than it, so a permit released at the fetch's return bounds
+    /// each individual upstream read while leaving the concurrent total
+    /// unbounded: the next request piles its buffer on top of a body still
+    /// queued for the socket.
+    #[tokio::test]
+    async fn test_index_response_holds_the_budget_until_the_body_is_dropped_3448() {
+        let budget = proxy_helpers::ProxyMetadataBudget::new(4096);
+        let permit = budget.reserve(1000).await;
+        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
+
+        let index: HelmIndex = serde_yaml::from_str(&upstream_two_chart_index()).unwrap();
+        let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
+        merge_upstream_index_entries("helm-remote", index, &mut charts);
+
+        // The merge and the render both happen while the permit is held.
+        assert_eq!(
+            budget.available_bytes(),
+            3096,
+            "budget must stay debited across the merge"
+        );
+        let resp = build_index_response(charts, Some(permit)).expect("index response");
+        assert_eq!(
+            budget.available_bytes(),
+            3096,
+            "budget must stay debited while the rendered response body is alive"
+        );
+
+        drop(resp);
+        assert_eq!(
+            budget.available_bytes(),
+            4096,
+            "budget is released once the response body is dropped"
+        );
+    }
+
+    /// A Local or Virtual index takes no reservation, so it must still render.
+    #[test]
+    fn test_index_response_without_a_reservation_still_renders() {
+        let index: HelmIndex = serde_yaml::from_str(&upstream_two_chart_index()).unwrap();
+        let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
+        merge_upstream_index_entries("helm-local", index, &mut charts);
+        let resp = build_index_response(charts, None).expect("index response");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// #3448: an upstream index is parsed as ONE document, so a single
+    /// non-conforming entry must not take the whole repository's discovery with
+    /// it. `urls`, `created`, `digest` and `generated` default; `name` and
+    /// `version` remain required because there is nothing to advertise without
+    /// them.
+    #[test]
+    fn test_upstream_index_entry_missing_optional_fields_still_parses() {
+        let yaml = r#"apiVersion: v1
+entries:
+  sparse:
+    - apiVersion: v2
+      name: sparse
+      version: 1.0.0
+"#;
+        let index: HelmIndex = serde_yaml::from_str(yaml).expect(
+            "an upstream entry with no urls/created/digest, in an index with no \
+             `generated`, must still parse -- otherwise one malformed entry 502s the \
+             entire Remote index (#3448)",
+        );
+        let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
+        merge_upstream_index_entries("helm-remote", index, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "/helm/helm-remote/charts/sparse-1.0.0.tgz");
+        assert_eq!(
+            out[0].3, "",
+            "a missing digest defaults to empty, not invented"
+        );
+    }
+
+    #[test]
+    fn test_upstream_index_entry_without_a_name_is_still_rejected() {
+        let yaml = r#"apiVersion: v1
+entries:
+  nameless:
+    - apiVersion: v2
+      version: 1.0.0
+"#;
+        assert!(
+            serde_yaml::from_str::<HelmIndex>(yaml).is_err(),
+            "an entry with no chart name cannot be advertised and must stay a parse error"
+        );
+    }
+
+    /// #3448: the proxied index rebuilds every URL from a third party's
+    /// `name`/`version`. An entry that cannot be addressed as one path segment
+    /// is dropped rather than advertised, so the index keeps its guarantee that
+    /// everything it lists resolves back to the entry it came from.
+    #[test]
+    fn test_merge_drops_upstream_entries_that_cannot_be_addressed() {
+        for (name, version) in [
+            ("../../../../etc/passwd", "1.0.0"),
+            ("q?x=1#frag", "4.0"),
+            ("a/b", "1.0.0"),
+            ("https://evil.example/pwn", "1.0.0"),
+            ("//evil.example/pwn", "1.0.0"),
+            ("pct%2Fescape", "1.0.0"),
+            ("ok", "1.0.0/../../etc"),
+        ] {
+            assert!(
+                !upstream_chart_is_advertisable(name, version),
+                "{name:?}/{version:?} cannot form one path segment and must not be advertised"
+            );
+            let yaml = format!(
+                "apiVersion: v1\nentries:\n  k:\n    - apiVersion: v2\n      name: {name:?}\n      version: {version:?}\n"
+            );
+            let index: HelmIndex = serde_yaml::from_str(&yaml).expect("index parses");
+            let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
+            merge_upstream_index_entries("helm-remote", index, &mut out);
+            assert!(
+                out.is_empty(),
+                "the unaddressable entry must be omitted, got {out:?}"
+            );
+        }
+    }
+
+    /// The filter must not touch the names and versions real charts use,
+    /// including semver build metadata — the reason an encoder was rejected.
+    #[test]
+    fn test_ordinary_chart_names_and_versions_stay_advertisable() {
+        for (name, version) in [
+            ("cert-manager", "v1.16.2"),
+            ("my.chart_name", "1.0.0-rc.1+build.5"),
+            ("trust-manager", "v0.12.0"),
+        ] {
+            assert!(
+                upstream_chart_is_advertisable(name, version),
+                "{name}/{version} is an ordinary chart and must be advertised"
+            );
+        }
+    }
+
+    /// Advertised URLs for ordinary charts are byte-identical to what this
+    /// route served before, semver build metadata included.
+    #[test]
+    fn test_remote_chart_url_is_unchanged_for_ordinary_names() {
+        assert_eq!(
+            chart_download_url("helm-remote", None, "cert-manager", "v1.16.2"),
+            "/helm/helm-remote/charts/cert-manager-v1.16.2.tgz"
+        );
+        assert_eq!(
+            chart_download_url("helm-remote", None, "my.chart_name", "1.0.0-rc.1+build.5"),
+            "/helm/helm-remote/charts/my.chart_name-1.0.0-rc.1+build.5.tgz"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // fetch_chart_via_index — wiremock-backed unit tests
     // -----------------------------------------------------------------------
 
@@ -2410,17 +3103,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy",
             &upstream_url,
             "mychart",
             "1.0.0",
             "mychart-1.0.0.tgz",
+            &ctx,
         )
         .await;
 
@@ -2473,17 +3174,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy-abs",
             &upstream_url,
             "abs-chart",
             "1.0.0",
             "abs-chart-1.0.0.tgz",
+            &ctx,
         )
         .await;
 
@@ -2537,7 +3246,13 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         for i in 0..2 {
@@ -2547,13 +3262,15 @@ entries:
                 tdh::wait_for_cache_commit(&tmp, chart_bytes.len() as u64).await;
             }
             let result = fetch_chart_via_index(
-                &proxy,
+                &state,
+                proxy,
                 repo_id,
                 "helm-proxy-big",
                 &upstream_url,
                 "big",
                 "3.0.0",
                 "big-3.0.0.tgz",
+                &ctx,
             )
             .await;
             match result {
@@ -2632,17 +3349,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy-prov",
             &upstream_url,
             "mychart",
             "1.0.0",
             "mychart-1.0.0.tgz.prov",
+            &ctx,
         )
         .await;
 
@@ -2750,17 +3475,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy",
             &upstream_url,
             "nonexistent",
             "9.9.9",
             "nonexistent-9.9.9.tgz",
+            &ctx,
         )
         .await;
 
@@ -2793,17 +3526,25 @@ entries:
             .await;
 
         let tmp = proxy_tmp_dir();
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        // #3446: `fetch_chart_via_index` now records the proxied chart, so it
+        // needs the state (for the pool the recorder writes through) and a
+        // download context. A default context is an anonymous, non-HEAD GET.
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
         let repo_id = uuid::Uuid::new_v4();
 
         let result = fetch_chart_via_index(
-            &proxy,
+            &state,
+            proxy,
             repo_id,
             "helm-proxy",
             &upstream_url,
             "mychart",
             "1.0.0",
             "mychart-1.0.0.tgz",
+            &ctx,
         )
         .await;
 
@@ -2846,6 +3587,7 @@ entries:
         let tmp = proxy_tmp_dir();
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
@@ -2864,7 +3606,8 @@ entries:
         };
 
         let result =
-            download_chart_via_index(&state, &repo, None, "tc", "2.0.0", "tc-2.0.0.tgz").await;
+            download_chart_via_index(&state, &repo, None, "tc", "2.0.0", "tc-2.0.0.tgz", &ctx)
+                .await;
 
         let _ = std::fs::remove_dir_all(&tmp);
 
@@ -2885,6 +3628,7 @@ entries:
             .expect("connect_lazy");
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
@@ -2903,7 +3647,8 @@ entries:
         };
 
         let result =
-            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz", &ctx)
+                .await;
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(matches!(result, Ok(None)));
@@ -2916,6 +3661,7 @@ entries:
             .expect("connect_lazy");
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
@@ -2934,7 +3680,8 @@ entries:
         };
 
         let result =
-            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+            download_chart_via_index(&state, &repo, None, "ch", "1.0.0", "ch-1.0.0.tgz", &ctx)
+                .await;
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(matches!(result, Ok(None)));

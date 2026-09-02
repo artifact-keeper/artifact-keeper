@@ -23,6 +23,14 @@
 #     `claim_pending_sync_tasks` concurrency tests only touch their own unique
 #     peer's rows via `WHERE peer_instance_id = $1` and hold live-TTL claims the
 #     sweep cannot match, so they stay parallel.)
+#   * `repositories.rs`
+#     `rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db` (#3476) —
+#     proves the REST delete's OCI index unwind and the `artifacts` soft-delete
+#     are ONE transaction by injecting a `BEFORE UPDATE` trigger on `artifacts`.
+#     The trigger's `WHEN (NEW.id = '<uuid>')` clause makes it inert for every
+#     other row, but it is attached to the SHARED `artifacts` table for the
+#     duration of the test, so no other `artifacts`-mutating test may be
+#     mid-UPDATE while it exists.
 #   * `oci_migration_reindex.rs` `run_repair` (#2457) — the `test_run_repair_*`
 #     tests exercise the startup reindex, whose candidate scan, hollow-tag flag,
 #     and orphan-tag DELETE are all CLUSTER-WIDE (no repository scope) and which
@@ -36,13 +44,24 @@
 # Under nextest's process-per-test model those in-process mutexes do NOT
 # serialize across the suite, so the tests interfere nondeterministically, fail,
 # and abort the instrumented run before `lcov.info` is written — leaving the
-# Code Coverage gate red (#1753). The plain `cargo test --workspace --lib`
-# unit-test job runs every test in a single process, so the in-process mutexes
-# still work there — which is why that gate stays green while coverage fails.
+# Code Coverage gate red (#1753).
+#
+# There is no longer a single-process unit-test job to fall back on (#3479).
+# BOTH CI unit-test jobs — the Tier 1 unit tests and the coverage job — run
+# `cargo nextest run --workspace --lib --test-threads 8`, so the groups below
+# are the ONLY thing serializing these suites in CI. They are not a
+# coverage-specific workaround, and removing an entry breaks the unit-test gate
+# outright rather than degrading one job.
+#
+# An earlier revision of this comment claimed a plain single-process
+# `cargo test` job kept the in-process mutexes working there. That job no
+# longer exists, and the premise did not generalize anyway: the `sync_worker`
+# entries below have no in-process mutex at all — under a multi-threaded
+# single-process run they fail today — so for those the groups are the only
+# serialization that has ever existed.
 #
 # Pin every test that mutates this shared DB state to a single-threaded test
-# group so nextest never runs two of them at once, restoring the serialization
-# the in-process mutexes provide under `cargo test`. Add new tests that take
+# group so nextest never runs two of them at once. Add new tests that take
 # STUCK_SCAN_LOCK_ID or `storage_gc_test_guard()`, or that call
 # `recover_expired_sync_task_claims` or `run_repair` and assert on its global
 # result, to the matching filter below.
@@ -51,5 +70,5 @@
 db-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair)'
+filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db)'
 test-group = 'db-serial'

@@ -1074,6 +1074,178 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // #3306: ungraded scanner severities must fail closed at the max_severity
+    // gate (end-to-end vs Postgres)
+    // -----------------------------------------------------------------------
+
+    /// Persist findings for `artifact_id` through the REAL classification
+    /// path: a Trivy-shaped report carrying `severity_token` runs through
+    /// `convert_trivy_findings`, and `scan_findings.severity` is written from
+    /// the resulting `RawFinding.severity` — exactly as the scan pipeline
+    /// writes it. Also seeds the completed `scan_results` row the severity
+    /// gate keys on. Returns nothing; the caller asserts via
+    /// `evaluate_artifact`.
+    #[cfg(test)]
+    async fn seed_scanned_finding_3306(
+        pool: &PgPool,
+        artifact_id: Uuid,
+        repo_id: Uuid,
+        severity_token: &str,
+    ) {
+        let report = crate::services::image_scanner::TrivyReport {
+            results: vec![crate::services::image_scanner::TrivyResult {
+                target: "registry/app:latest".to_string(),
+                class: "os-pkgs".to_string(),
+                result_type: "debian".to_string(),
+                vulnerabilities: Some(vec![crate::services::image_scanner::TrivyVulnerability {
+                    vulnerability_id: format!("CVE-2026-3306-{severity_token}"),
+                    pkg_name: "libexample".to_string(),
+                    installed_version: "1.0.0".to_string(),
+                    fixed_version: None,
+                    severity: severity_token.to_string(),
+                    title: None,
+                    description: None,
+                    primary_url: None,
+                }]),
+                packages: None,
+            }],
+        };
+        let findings =
+            crate::services::scanner_service::convert_trivy_findings(&report, "trivy-image");
+        assert_eq!(findings.len(), 1, "fixture must yield exactly one finding");
+
+        let scan_result_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO scan_results (
+                id, artifact_id, repository_id, scan_type, status,
+                findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                completed_at, created_at
+            )
+            VALUES ($1, $2, $3, 'image', 'completed', 1, 0, 0, 0, 0, 0, NOW(), NOW())
+            RETURNING id
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(artifact_id)
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("insert completed scan_results row");
+
+        for finding in &findings {
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(scan_result_id)
+            .bind(artifact_id)
+            .bind(finding.severity.as_str())
+            .bind(&finding.title)
+            .execute(pool)
+            .await
+            .expect("insert scan_finding through the classified severity");
+        }
+    }
+
+    /// End-to-end regression test for the ungraded-severity fail-open
+    /// (#3306), driven through the real classifier AND the real gate SQL.
+    ///
+    /// A Trivy `UNKNOWN` finding — a CVE nobody has graded yet — used to
+    /// persist as `severity='info'`, which is in NO `max_severity` block set
+    /// at any threshold, so a `'high'` policy served it. With
+    /// `UNRECOGNIZED_SCANNER_SEVERITY` at `High` it persists as `'high'` and
+    /// the same policy blocks it. Pre-fix this test reds: `allowed == true`
+    /// with zero violations.
+    #[tokio::test]
+    async fn test_ungraded_finding_blocked_by_high_policy_3306() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        // block_unscanned/block_on_fail OFF so max_severity is provably the
+        // only gate that can block.
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'high', false, false, true)",
+        )
+        .bind(format!("gate-3306-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert max_severity='high' policy");
+
+        let svc = PolicyService::new(fx.pool.clone());
+
+        // (1) THE BUG: an ungraded (UNKNOWN) finding under a 'high' policy.
+        let ungraded = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "com/example/ungraded/1.0/ungraded-1.0.jar",
+            "com/example/ungraded/1.0/ungraded-1.0.jar",
+            "ungraded",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+        seed_scanned_finding_3306(&fx.pool, ungraded, fx.repo_id, "UNKNOWN").await;
+        let ungraded_result = svc.evaluate_artifact(ungraded, fx.repo_id).await;
+
+        // (2) Positive control — must NOT over-block: a graded 'low' finding
+        // under the same 'high' policy stays allowed.
+        let low = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "com/example/lowgraded/1.0/lowgraded-1.0.jar",
+            "com/example/lowgraded/1.0/lowgraded-1.0.jar",
+            "lowgraded",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+        seed_scanned_finding_3306(&fx.pool, low, fx.repo_id, "LOW").await;
+        let low_result = svc.evaluate_artifact(low, fx.repo_id).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        let ungraded_result = ungraded_result.expect("evaluate ungraded");
+        assert!(
+            !ungraded_result.allowed,
+            "#3306: an ungraded (UNKNOWN) finding must be blocked by a \
+             max_severity='high' policy — at 'info' it was invisible to every \
+             threshold, got allowed={} violations={:?}",
+            ungraded_result.allowed, ungraded_result.violations
+        );
+        assert!(
+            ungraded_result
+                .violations
+                .iter()
+                .any(|v| v.contains("at or above high")),
+            "the violation must come from the max_severity gate, got: {:?}",
+            ungraded_result.violations
+        );
+
+        let low_result = low_result.expect("evaluate low");
+        assert!(
+            low_result.allowed,
+            "positive control: a graded 'low' finding must still be served \
+             under a 'high' policy, got violations={:?}",
+            low_result.violations
+        );
+    }
+
     #[test]
     fn test_policy_result_serialization() {
         let result = PolicyResult {

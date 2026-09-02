@@ -129,6 +129,77 @@ pub(crate) fn metadata_files_name_key_sql(files_expr: &str, key_expr: &str) -> S
 pub(crate) const GUARDED_SIDECAR_SUFFIXES: [&str; 5] =
     [".md5", ".sha1", ".sha256", ".sha512", ".asc"];
 
+/// Every `maven_flat_object_owner.source` value the SYSTEM writes, and
+/// therefore the only rows storage GC may treat as reclaimable (#3431).
+///
+/// An owner row plays two roles, and they pull in opposite directions. Since
+/// #2574/#2585 the row is what makes a *row-less* legacy object READABLE
+/// (owner-table resolution, the last layer of [`attributed_owner`]) — for an
+/// object whose only catalog record is its owner row, that row is the primary
+/// record and nothing else can reconstruct it. But the orphan flat-object
+/// sweep enumerates its delete candidates from the same table, so without a
+/// source filter the row that makes an object servable is also the row that
+/// queues it for deletion: every catalog-anchor arm of the sweep's predicate
+/// is true by construction, and permanently, for exactly that class. An
+/// operator who repaired a fail-closed 404 by inserting an attribution row —
+/// the documented remediation for keys the migration-163/170 catalog-only
+/// backfill cannot see — got a 200 for one hour and then lost the bytes
+/// (#3431).
+///
+/// The invariant that separates safe from unsafe reclaim: GC may only delete
+/// keys whose attribution row the system itself WROTE and can RE-DERIVE.
+/// Those rows are caches over other catalog state, so once the anchors are
+/// gone the row is stale by definition. This list is that set, and it is
+/// exhaustive against the writers:
+///
+/// * `primary_row`, `metadata_files`, `metadata_rollup`, `derived_checksum` —
+///   migration 163 steps (1), (2), (4a/4b/4c) and (3)/(4d); migration 170
+///   re-runs (2') and (3') for the camelCase `files[]` spelling.
+/// * `write_claim` — [`insert_claim`] and [`claim_flat_key_for_write`], the
+///   only runtime writers.
+///
+/// `write_claim` stays reclaimable **deliberately**: an orphaned claim left by
+/// a crashed first publish is precisely the leftover the sweep exists to
+/// collect, and its row is re-derivable (the next publish re-claims the key).
+///
+/// This is an ALLOWLIST, not a denylist, so the failure direction is safe: any
+/// value written by a future code path, an external repair tool, or an
+/// operator's `INSERT ... 'manual'` is unknown here and therefore PROTECTED
+/// until someone deliberately adds it. A new system-written source that is
+/// forgotten here leaks storage; a hand-written source treated as system-owned
+/// destroys the only copy of an object.
+///
+/// Scope: this is a **sweep**-level invariant, not a table-level one. The
+/// other place that enumerates delete candidates from this table —
+/// `collect_repo_maven_flat_keys` in the repository-delete purge — is
+/// deliberately NOT filtered by source: there the trigger is an operator
+/// explicitly deleting the very repository the row names as owner, so an
+/// operator-written row saying "repo X owns this key" plus "delete repo X" is
+/// a coherent instruction, and the rows CASCADE away with the repository in
+/// any case (sparing the objects would leak them permanently, since nothing
+/// would be left to track them). What made GC different is that the row's
+/// mere existence past the one-hour age floor was the entire trigger.
+pub(crate) const SYSTEM_WRITTEN_ATTRIBUTION_SOURCES: [&str; 5] = [
+    "primary_row",
+    "metadata_files",
+    "derived_checksum",
+    "metadata_rollup",
+    "write_claim",
+];
+
+/// SQL predicate: was `source_expr` written by the system, i.e. is the row a
+/// re-derivable cache that GC may reclaim? Built from
+/// [`SYSTEM_WRITTEN_ATTRIBUTION_SOURCES`] so the list and the SQL cannot
+/// drift.
+pub(crate) fn system_written_source_sql(source_expr: &str) -> String {
+    let list = SYSTEM_WRITTEN_ATTRIBUTION_SOURCES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{source_expr} IN ({list})")
+}
+
 /// The `(md5|sha1|...)` regex alternation built from
 /// [`GUARDED_SIDECAR_SUFFIXES`], so the SQL and the list cannot drift.
 fn guarded_sidecar_alternation() -> String {
@@ -183,15 +254,65 @@ pub(crate) fn is_metadata_rollup_key_sql(key_expr: &str) -> String {
 /// left operand of a `LIKE ... || '%'` anchor test. Only meaningful for keys
 /// [`is_metadata_rollup_key_sql`] accepts — always gate on it.
 ///
+/// Do not build that anchor test by hand: use
+/// [`metadata_rollup_dir_anchor_sql`], which carries the `ESCAPE ''` clause
+/// described below.
+///
 /// The rollup is anchored (spared) while ANY live artifact remains under that
 /// prefix: the document describes the whole groupId/artifactId subtree, so it
-/// is still being served as long as one member of the subtree is. The `LIKE`
-/// operand is a stored key, so SQL wildcards inside it can only make the
-/// pattern match a SUPERSET — i.e. this test can only ever over-PROTECT, which
-/// is the safe direction for a `NOT EXISTS` delete guard.
+/// is still being served as long as one member of the subtree is.
+///
+/// **The anchor test MUST be written `LIKE <prefix> || '%' ESCAPE ''`.** The
+/// pattern operand is a stored key, so whatever characters it contains are
+/// interpreted as pattern syntax — and the direction differs by character:
+///
+/// * `%` and `_` widen the match, so the test matches a SUPERSET of the real
+///   directory. In a `NOT EXISTS` delete guard that is over-PROTECT: the safe
+///   direction, a recoverable leak rather than a loss. `ESCAPE ''` preserves
+///   this behavior deliberately.
+/// * `\` is Postgres's DEFAULT `LIKE` escape character, and it does the
+///   opposite. Without an `ESCAPE` clause, `maven/a\b/` becomes the pattern
+///   `maven/ab/`: the rollup's own live artifact at `maven/a\b/1.0/x.jar`
+///   NO LONGER MATCHES, the guard reads "nothing anchors this", and the
+///   document is DELETED while it is still being served. Verified on
+///   Postgres 16: `'maven/a\b/1.0/x.jar' LIKE 'maven/a\b/' || '%'` is FALSE
+///   without the clause and TRUE with `ESCAPE ''`.
+///
+/// So the pre-`ESCAPE` comment here — "can only ever over-PROTECT" — was true
+/// of `%`/`_` and false of `\`, and a Maven upload can put a literal backslash
+/// in a coordinate (`%5C` in the request path decodes to one). `ESCAPE ''`
+/// disables escape processing entirely, which makes the invariant hold as
+/// stated for every character.
+///
+/// `ESCAPE ''` and not [`crate::api::handlers::escape_like_literal`] +
+/// `ESCAPE '\'`: the prefix is derived in SQL (`substr`/`regexp_replace`),
+/// never in Rust, so the Rust helper cannot reach it; and a SQL-side escaper
+/// would make `%`/`_` match EXACTLY, converting today's harmless over-protect
+/// into a new class of delete on an unrecoverable path. Keeping the failure
+/// direction as leak-not-loss is worth more here than exactness.
+///
+/// `ESCAPE ''` does NOT cost a trigram index on the probed column: `LIKE ...
+/// ESCAPE` is planned as `~~ like_escape(pattern, '')`, still an indexable
+/// `~~`, and forced index-scan vs seq-scan produce identical row sets on a
+/// corpus containing `\`, `\\`, `%`, `_` and non-ASCII keys.
 pub(crate) fn metadata_rollup_dir_prefix_sql(key_expr: &str) -> String {
     let base = sidecar_base_key_sql(key_expr);
     format!("substr({base}, 1, length({base}) - length('{MAVEN_METADATA_FILENAME}'))")
+}
+
+/// SQL predicate: does `artifact_key_expr` name an artifact under the directory
+/// prefix that the rollup at `rollup_key_expr` summarises?
+///
+/// `ESCAPE ''` is load-bearing — see [`metadata_rollup_dir_prefix_sql`].
+/// Both delete paths (the GC sweep's guard 3 and the repository-delete
+/// collector) go through this one fragment so the escape mode cannot be
+/// applied to one and forgotten on the other.
+pub(crate) fn metadata_rollup_dir_anchor_sql(
+    artifact_key_expr: &str,
+    rollup_key_expr: &str,
+) -> String {
+    let prefix = metadata_rollup_dir_prefix_sql(rollup_key_expr);
+    format!("{artifact_key_expr} LIKE {prefix} || '%' ESCAPE ''")
 }
 
 /// Distinct owning repositories of a live parent artifact whose metadata

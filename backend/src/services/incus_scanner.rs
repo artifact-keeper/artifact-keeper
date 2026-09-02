@@ -142,8 +142,20 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 }
 
 /// Run an external command, returning an error with the given label on failure.
+///
+/// `kill_on_drop(true)`: both current callers (`tar` / `unsquashfs` archive
+/// extraction) run inside the incus scan's caller-supplied inline-proxy-gate
+/// timeout, so this future can be dropped mid-extraction when that timeout
+/// fires. `tokio::process::Command` defaults `kill_on_drop` to `false`, and
+/// without this the extractor child is ORPHANED and keeps running,
+/// unsupervised, on the box that just timed out -- same fix, same rationale,
+/// as the grype and trivy spawns (#3455). A future caller that needs a child
+/// to outlive this function (e.g. a detached background process) would need
+/// its own `Command`, not a reuse of this helper.
 async fn run_command(program: &str, args: &[&str], label: &str) -> Result<()> {
-    let output = tokio::process::Command::new(program)
+    let mut command = tokio::process::Command::new(program);
+    command.kill_on_drop(true);
+    let output = command
         .args(args)
         .output()
         .await
@@ -172,15 +184,22 @@ async fn run_trivy_scan(
     args.extend_from_slice(&[
         "--format",
         "json",
+        // #3296: the shared allowlist includes UNKNOWN so ungraded CVEs
+        // reach the report instead of being dropped at the CLI.
         "--severity",
-        "CRITICAL,HIGH,MEDIUM,LOW",
+        crate::services::scanner_service::TRIVY_FS_SEVERITY_LIST,
         "--quiet",
         "--timeout",
         "10m",
         &rootfs_str,
     ]);
 
-    let output = tokio::process::Command::new("trivy")
+    let mut command = tokio::process::Command::new("trivy");
+    // Same #3455 fix as `run_command` above and the grype/trivy-fs spawns:
+    // this scan runs inside the caller's inline-proxy-gate timeout, and a
+    // dropped-on-timeout future must not leave the trivy child running.
+    command.kill_on_drop(true);
+    let output = command
         .args(&args)
         .output()
         .await
@@ -1489,8 +1508,8 @@ mod tests {
         assert_eq!(findings[1].severity, Severity::High);
         assert_eq!(findings[2].severity, Severity::Medium);
         assert_eq!(findings[3].severity, Severity::Low);
-        // Unknown severity falls back to Info
-        assert_eq!(findings[4].severity, Severity::Info);
+        // Ungraded severity fails closed at High (#3306)
+        assert_eq!(findings[4].severity, Severity::High);
     }
 
     #[test]

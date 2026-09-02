@@ -221,6 +221,11 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // packages are version-pinned — both immutable.
         RepositoryFormat::Rpm => classify_rpm(&lower),
 
+        // The VS Code gateway owns this version- and target-platform-qualified
+        // cache layout. It is the only Vscode cache path safe to retain
+        // forever; hosted and future metadata paths stay mutable by default.
+        RepositoryFormat::Vscode => classify_vscode_gallery_asset(&lower),
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -294,10 +299,25 @@ fn classify_maven(lower: &str) -> Mutability {
     if leaf.starts_with("maven-metadata.xml") {
         return Mutability::mutable_default();
     }
-    // A SNAPSHOT path that is NOT a concrete timestamped artifact is mutable
-    // (the directory listing / metadata is republished). Concrete timestamped
-    // SNAPSHOT artifacts (e.g. `app-1.0-20240101.120000-3.jar`) are immutable.
-    if lower.contains("-snapshot/") && !has_artifact_extension(leaf) {
+    // Anything under a `-SNAPSHOT` version DIRECTORY is republished in place
+    // and is therefore mutable — UNLESS the filename itself proves it is a
+    // resolved unique (timestamped) snapshot, which has a one-shot name.
+    //
+    // The test is on the path COMPONENT, and the exemption is on the
+    // TIMESTAMP, because the version does not have to appear in the filename.
+    // Maven's layout embeds it (`app-1.0-SNAPSHOT.jar`), but Ivy's default
+    // pattern — `[organisation]/[module]/[revision]/[type]s/[artifact].[ext]`,
+    // what `Resolver.ivyStylePatterns` emits and a supported sbt setup — does
+    // NOT: `org.example/mylib/1.0.0-SNAPSHOT/jars/mylib.jar` carries the
+    // revision in the directory only. Keying the exemption off "the leaf says
+    // `-snapshot`" therefore read that jar as a released coordinate and cached
+    // it FOREVER — and [`evaluate`] short-circuits `Immutable` to `Fresh`
+    // without consulting `expires_at`, so a republished snapshot was never
+    // re-fetched. Mutable is the safe direction here: a needless
+    // revalidation costs one conditional request, serving a decade-old body
+    // for a coordinate whose whole purpose is to move cannot be recovered
+    // from.
+    if has_snapshot_component(lower) && !is_unique_snapshot_artifact(leaf) {
         return Mutability::mutable_default();
     }
     if has_artifact_extension(leaf) {
@@ -305,6 +325,61 @@ fn classify_maven(lower: &str) -> Mutability {
     }
     // Unknown Maven leaf (directory listing, unexpected file): be safe.
     Mutability::mutable_default()
+}
+
+/// Whether any `/`-separated component of `lower` is a `-SNAPSHOT` version
+/// directory (i.e. ENDS with `-snapshot`; already lowercased by the caller).
+///
+/// Component-wise rather than the old `lower.contains("-snapshot/")` so a
+/// trailing component with no slash after it (`…/app/1.0-SNAPSHOT`, a
+/// directory listing) is recognised too. A component that merely CONTAINS the
+/// token (`1.0-snapshot-rc1`) is not a snapshot directory and does not match,
+/// matching the previous substring test.
+fn has_snapshot_component(lower: &str) -> bool {
+    lower.split('/').any(|seg| seg.ends_with("-snapshot"))
+}
+
+/// Whether `leaf` is a RESOLVED unique-snapshot artifact filename — the only
+/// thing under a `-SNAPSHOT` directory that is safe to cache forever.
+///
+/// Maven replaces the `-SNAPSHOT` token with a deployment timestamp for a
+/// unique snapshot (`app-1.0-20240101.120000-3.jar`), so that filename names
+/// exactly one immutable deployment. All three conditions are required, and
+/// each one only ever moves a path towards MUTABLE relative to the pre-#3459
+/// rule:
+///
+/// * the leaf must not still carry the literal `-snapshot` token,
+/// * it must be a concrete artifact (or a checksum/signature sidecar of one),
+/// * and it must carry a `-YYYYMMDD.HHMMSS-<build>` stamp.
+///
+/// The third is the new one. Without it, every filename under a snapshot
+/// directory that does not happen to repeat the version — an Ivy-layout
+/// `mylib.jar` — was mistaken for a resolved unique snapshot.
+fn is_unique_snapshot_artifact(leaf: &str) -> bool {
+    !leaf.contains("-snapshot")
+        && has_artifact_extension(leaf)
+        && has_unique_snapshot_timestamp(leaf)
+}
+
+/// Whether `leaf` contains a Maven unique-snapshot stamp: `-YYYYMMDD.HHMMSS-`
+/// followed by at least one build-number digit.
+fn has_unique_snapshot_timestamp(leaf: &str) -> bool {
+    let bytes = leaf.as_bytes();
+    let digits = |from: usize, count: usize| -> bool {
+        from + count <= bytes.len() && bytes[from..from + count].iter().all(u8::is_ascii_digit)
+    };
+    leaf.match_indices('-').any(|(dash, _)| {
+        let date = dash + 1;
+        let dot = date + 8;
+        let time = dot + 1;
+        let build_dash = time + 6;
+        let build = build_dash + 1;
+        digits(date, 8)
+            && bytes.get(dot) == Some(&b'.')
+            && digits(time, 6)
+            && bytes.get(build_dash) == Some(&b'-')
+            && digits(build, 1)
+    })
 }
 
 /// PyPI §2.1: the simple index is mutable; package files are immutable.
@@ -430,6 +505,23 @@ fn classify_rpm(lower: &str) -> Mutability {
     Mutability::mutable_default()
 }
 
+/// Open VSX gallery assets are immutable only for the two exact AK-owned
+/// cache-key shapes. Every other VS Code path remains mutable conservatively.
+fn classify_vscode_gallery_asset(lower: &str) -> Mutability {
+    let segments: Vec<&str> = lower.split('/').collect();
+    let is_gallery_asset = segments.len() == 6
+        && segments[0] == "gallery"
+        && segments[..5].iter().all(|segment| !segment.is_empty())
+        && segments[3] != "latest"
+        && (segments[5] == "vspackage" || segments[5].starts_with("asset-"))
+        && !segments[5].trim_start_matches("asset-").is_empty();
+    if is_gallery_asset {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
 /// The final path segment (after the last `/`), or the whole string.
 fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -498,11 +590,18 @@ fn has_artifact_extension(leaf: &str) -> bool {
 }
 
 /// PyPI distribution files: wheels, sdists, eggs (immutable once published).
+///
+/// A PEP 658 `.metadata` sidecar (`<dist>.whl.metadata`) holds the `METADATA`
+/// entry of that distribution, so it is immutable on the same grounds: PyPI
+/// forbids republishing a version. The suffix is stripped before the extension
+/// test, as [`is_maven_artifact_file`] does for its checksum/signature
+/// sidecars (#3300).
 fn is_pypi_package_file(leaf: &str) -> bool {
     const EXTS: &[&str] = &[
         ".whl", ".tar.gz", ".tar.bz2", ".zip", ".egg", ".tgz", ".conda", ".tar.zst",
     ];
-    EXTS.iter().any(|e| leaf.ends_with(e))
+    let base = leaf.strip_suffix(".metadata").unwrap_or(leaf);
+    EXTS.iter().any(|e| base.ends_with(e))
 }
 
 #[cfg(test)]
@@ -525,6 +624,11 @@ mod tests {
         ));
         assert!(is_explicitly_mutable_index(&Pypi, "simple/requests/"));
         assert!(is_explicitly_mutable_index(&Npm, "left-pad"));
+        // A NON-UNIQUE SNAPSHOT artifact is redeployed in place -> true.
+        assert!(is_explicitly_mutable_index(
+            &Maven,
+            "com/x/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar"
+        ));
         // Versioned / content-addressed artifacts -> false (protected).
         assert!(!is_explicitly_mutable_index(
             &Maven,
@@ -567,6 +671,101 @@ mod tests {
 
     // ----- classify(): per-format immutable-vs-mutable table (#1611 §2.1) ---
 
+    /// #3459 F1. The SNAPSHOT guard keys off the path COMPONENT and exempts
+    /// only a RESOLVED unique snapshot, so both layouts are covered and the
+    /// timestamped exemption is not widened.
+    ///
+    /// Asserted in both directions on purpose: a rule that simply made
+    /// everything under a `-SNAPSHOT` directory mutable would pass the first
+    /// half and silently destroy the unique-snapshot behaviour Maven relies
+    /// on, and the timestamped rows below are what stops that.
+    #[test]
+    fn snapshot_directory_is_mutable_in_every_layout_but_a_resolved_one_is_not() {
+        // Mutable: the revision is in the directory, whatever the filename.
+        for path in [
+            // Ivy default pattern (`Resolver.ivyStylePatterns`).
+            "org.example/mylib/1.0.0-SNAPSHOT/jars/mylib.jar",
+            "org.example/mylib/1.0.0-SNAPSHOT/srcs/mylib-sources.jar",
+            "org.example/mylib/1.0.0-SNAPSHOT/docs/mylib-javadoc.jar",
+            // Ivy with the sbt cross-version segments.
+            "org.example/mylib/scala_2.13/sbt_1.0/1.0.0-SNAPSHOT/jars/mylib.jar",
+            // Maven layout, filename repeating the version (already covered
+            // before this change — kept so the old behaviour is pinned too).
+            "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar",
+            // A trailing snapshot directory with no slash after it.
+            "com/example/app/1.0-SNAPSHOT",
+            // Not an artifact at all, under a snapshot directory.
+            "com/example/app/1.0-SNAPSHOT/index.html",
+        ] {
+            assert!(
+                !classify(&RepositoryFormat::Sbt, path).is_immutable(),
+                "{path} lives under a -SNAPSHOT directory and is republished \
+                 in place, so it must never be cached as immutable"
+            );
+        }
+
+        // Immutable: a RESOLVED unique snapshot names one deployment.
+        for path in [
+            "com/example/app/1.0-SNAPSHOT/app-1.0-20240101.120000-3.jar",
+            "com/example/app/1.0-SNAPSHOT/app-1.0-20240101.120000-3.jar.sha1",
+            "com/example/app/1.0-SNAPSHOT/app-1.0-20240101.120000-3.pom.asc",
+            "org.example/mylib/1.0.0-SNAPSHOT/jars/mylib-20240101.120000-7.jar",
+        ] {
+            assert!(
+                classify(&RepositoryFormat::Maven, path).is_immutable(),
+                "{path} carries a resolved unique-snapshot timestamp, so it \
+                 names exactly one deployment and must stay immutable"
+            );
+        }
+
+        // A released coordinate is untouched by any of this.
+        assert!(classify(
+            &RepositoryFormat::Maven,
+            "com/example/app/1.0.0/app-1.0.0.jar"
+        )
+        .is_immutable());
+        // A component that merely CONTAINS the token is not a snapshot
+        // directory, exactly as the pre-#3459 substring test had it.
+        assert!(classify(
+            &RepositoryFormat::Maven,
+            "com/example/app/1.0-snapshot-rc1/app-1.0-rc1.jar"
+        )
+        .is_immutable());
+    }
+
+    /// The unique-snapshot stamp is `-YYYYMMDD.HHMMSS-<build>`. Near-misses
+    /// must NOT be read as one: each would otherwise re-open F1 for a filename
+    /// that happens to contain digits.
+    #[test]
+    fn unique_snapshot_timestamp_recognises_only_the_real_shape() {
+        for leaf in [
+            "app-1.0-20240101.120000-3.jar",
+            "app-1.0-20240101.120000-12.jar",
+            "mylib-20240101.120000-7.jar",
+        ] {
+            assert!(
+                has_unique_snapshot_timestamp(leaf),
+                "{leaf} carries a unique-snapshot stamp"
+            );
+        }
+        for leaf in [
+            "mylib.jar",
+            "app-1.0-SNAPSHOT.jar",
+            "app-2024010.120000-3.jar",  // 7 date digits
+            "app-20240101.12000-3.jar",  // 5 time digits
+            "app-20240101-120000-3.jar", // separator is not a dot
+            "app-20240101.120000.3.jar", // build separator is not a dash
+            "app-20240101.120000-.jar",  // no build number
+            "app-20240101.120000",       // truncated, no build part
+        ] {
+            assert!(
+                !has_unique_snapshot_timestamp(leaf),
+                "{leaf} is NOT a unique-snapshot stamp and must not exempt a \
+                 snapshot directory from the mutable rule"
+            );
+        }
+    }
+
     /// `(format, path, expected_immutable)` rows straight from the §2.1 table.
     fn classify_cases() -> Vec<(RepositoryFormat, &'static str, bool)> {
         use RepositoryFormat::*;
@@ -582,6 +781,61 @@ mod tests {
             (
                 Maven,
                 "com/example/app/1.0-SNAPSHOT/app-1.0-20240101.120000-3.jar",
+                true,
+            ),
+            // Non-unique SNAPSHOT artifacts keep the literal `-SNAPSHOT` token
+            // in the filename and are redeployed in place -> mutable, along
+            // with their checksum sidecars and secondary artifacts.
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar",
+                false,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.pom",
+                false,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT-sources.jar",
+                false,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar.sha1",
+                false,
+            ),
+            // #3459 F1: Ivy's default pattern keeps the revision in the
+            // DIRECTORY only, so the leaf carries no `-SNAPSHOT` token. Before
+            // the component-wise test these read as released coordinates and
+            // were cached forever, and `evaluate` short-circuits Immutable to
+            // Fresh without consulting `expires_at` — so a republished
+            // snapshot was never re-fetched.
+            (
+                Sbt,
+                "org.example/mylib/1.0.0-SNAPSHOT/jars/mylib.jar",
+                false,
+            ),
+            (
+                Sbt,
+                "org.example/mylib/scala_2.13/sbt_1.0/1.0.0-SNAPSHOT/jars/mylib.jar",
+                false,
+            ),
+            (Sbt, "org.example/mylib/1.0.0-SNAPSHOT/ivys/ivy.xml", false),
+            (Maven, "com/example/app/1.0-SNAPSHOT/lib/helper.jar", false),
+            // A RESOLVED unique snapshot still names exactly one deployment
+            // and MUST stay immutable — including in the Ivy layout, and
+            // including its sidecars. This is the direction the new rule must
+            // not over-correct.
+            (
+                Sbt,
+                "org.example/mylib/1.0.0-SNAPSHOT/jars/mylib-20240101.120000-7.jar",
+                true,
+            ),
+            (
+                Maven,
+                "com/example/app/1.0-SNAPSHOT/app-1.0-20240101.120000-3.jar.sha1",
                 true,
             ),
             (Gradle, "org/foo/bar/2.1/bar-2.1.jar", true),
@@ -600,6 +854,21 @@ mod tests {
                 "simple/requests/requests-2.31.0-py3-none-any.whl",
                 true,
             ),
+            // PEP 658 sidecar: immutable with the distribution it describes.
+            (
+                Pypi,
+                "simple/requests/requests-2.31.0-py3-none-any.whl.metadata",
+                true,
+            ),
+            (
+                Pypi,
+                "simple/requests/requests-2.31.0.tar.gz.metadata",
+                true,
+            ),
+            // `.metadata` on a non-distribution leaf stays mutable: the strip
+            // must not promote an arbitrary path to cache-forever.
+            (Pypi, "simple/requests/index.html.metadata", false),
+            (Pypi, "simple/requests/.metadata", false),
             (Poetry, "simple/black/", false),
             // npm: packument mutable, tarball immutable.
             (Npm, "lodash", false),
@@ -690,6 +959,26 @@ mod tests {
         // An unrecognized Maven leaf must NOT be misclassified immutable.
         assert!(!classify(&RepositoryFormat::Maven, "com/example/app/").is_immutable());
         assert!(!classify(&RepositoryFormat::Cargo, "weird/index/path").is_immutable());
+    }
+
+    #[test]
+    fn classify_vscode_only_immutable_for_versioned_platform_gallery_assets() {
+        use RepositoryFormat::Vscode;
+
+        for path in [
+            "gallery/publisher/extension/1.2.3/linux-x64/vspackage",
+            "gallery/publisher/extension/1.2.3/universal/asset-deadbeef",
+        ] {
+            assert!(classify(&Vscode, path).is_immutable(), "{path}");
+        }
+        for path in [
+            "gallery/publisher/extension/1.2.3/linux-x64",
+            "gallery/publisher/extension/1.2.3/linux-x64/other-asset",
+            "gallery/publisher/extension/latest/linux-x64/vspackage",
+            "extensions/publisher/extension/1.2.3/download",
+        ] {
+            assert!(!classify(&Vscode, path).is_immutable(), "{path}");
+        }
     }
 
     #[test]

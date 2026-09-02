@@ -77,6 +77,7 @@ async fn resolve_rubygems_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
 
 async fn gem_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
@@ -125,17 +126,20 @@ async fn gem_info(
 
     // Virtual repo: try remote members in priority order. The member's body
     // is forwarded VERBATIM, so its `Content-Encoding` is re-declared when
-    // present (RFC 9110 §8.4, #3260).
+    // present (RFC 9110 §8.4, #3260) and its own `Content-Type` is served
+    // (#3281), with the JSON literal only as the fallback for a member that
+    // declared none.
     if repo.repo_type == RepositoryType::Virtual {
         return proxy_helpers::resolve_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             &format!("api/v1/gems/{}.json", gem_name),
-            |bytes, content_encoding, _member_key| async move {
+            |bytes, content_type, content_encoding, _member_key| async move {
                 Ok(proxy_helpers::forward_verbatim_metadata(
                     bytes,
-                    None,
+                    content_type,
                     "application/json",
                     content_encoding,
                 ))
@@ -510,11 +514,13 @@ fn parse_upstream_specs(bytes: &[u8]) -> Result<Vec<serde_json::Value>, Response
 /// Collect remote specs from virtual members, decompress and parse each one.
 async fn collect_remote_specs(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     upstream_path: &str,
 ) -> Result<Vec<serde_json::Value>, Response> {
     let remote_specs = proxy_helpers::collect_virtual_metadata(
         &state.db,
+        auth,
         state.proxy_service.as_deref(),
         virtual_repo_id,
         upstream_path,
@@ -586,16 +592,19 @@ fn specs_to_gzip_response(specs: &[serde_json::Value]) -> Result<Response, Respo
 
 async fn specs_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
 
     // Virtual repo: merge specs from all local and remote members
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the spec index is content.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut all_specs = query_local_member_specs(&state.db, &members, SPECS_QUERY).await?;
 
-        let remote = collect_remote_specs(&state, repo.id, "specs.4.8.gz").await?;
+        let remote = collect_remote_specs(&state, auth.as_ref(), repo.id, "specs.4.8.gz").await?;
         all_specs.extend(remote);
 
         return specs_to_gzip_response(&all_specs);
@@ -611,6 +620,7 @@ async fn specs_index(
 
 async fn latest_specs_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
@@ -618,11 +628,14 @@ async fn latest_specs_index(
     // Virtual repo: merge latest specs from all local and remote members,
     // then deduplicate by gem name (keep the first occurrence per name).
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the spec index is content.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut all_specs =
             query_local_member_specs(&state.db, &members, LATEST_SPECS_QUERY).await?;
 
-        let remote = collect_remote_specs(&state, repo.id, "latest_specs.4.8.gz").await?;
+        let remote =
+            collect_remote_specs(&state, auth.as_ref(), repo.id, "latest_specs.4.8.gz").await?;
         all_specs.extend(remote);
 
         // Deduplicate by gem name, keeping the first occurrence (higher-priority member wins)
@@ -650,17 +663,21 @@ async fn latest_specs_index(
 
 async fn prerelease_specs_index(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
 
     // Virtual repo: merge prerelease specs from all local and remote members.
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the spec index is content.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut all_specs =
             query_local_member_specs(&state.db, &members, PRERELEASE_SPECS_QUERY).await?;
 
-        let remote = collect_remote_specs(&state, repo.id, "prerelease_specs.4.8.gz").await?;
+        let remote =
+            collect_remote_specs(&state, auth.as_ref(), repo.id, "prerelease_specs.4.8.gz").await?;
         all_specs.extend(remote);
 
         return specs_to_gzip_response(&all_specs);
@@ -683,6 +700,23 @@ async fn find_local_quick_spec(
 ) -> Result<Option<crate::formats::rubygems::GemSpec>, Response> {
     // Narrow to artifacts whose name is a prefix of the requested full name so
     // hyphenated gem names disambiguate correctly against the version suffix.
+    //
+    // #3500: the PATTERN operand is a stored column (`a.name`), so the Rust
+    // `escape_like_literal` helper cannot reach it — the same shape as the
+    // Maven rollup guards, and so the same answer #3492/#3493 chose:
+    // `ESCAPE ''`, which disables escape processing entirely.
+    //
+    // The two directions differ and only one of them is a defect here. `%` and
+    // `_` in a stored name WIDEN the pattern, which merely returns extra
+    // candidate rows — the loop below re-verifies every row exactly in Rust
+    // (`base == full_name`, or a `{base}-` platform prefix), so a widened match
+    // cannot select a wrong row. `\` is Postgres's DEFAULT `LIKE` escape
+    // character and does the opposite: for a stored name `foo\bar` the pattern
+    // became `foobar-%`, which does NOT match the request `foo\bar-1.0`, so
+    // the gem's own row was filtered out before the exact check could see it
+    // and the quick gemspec 404'd. Verified on Postgres 16:
+    // `'foo\bar-1.0' LIKE 'foo\bar' || '-%'` is FALSE without the clause and
+    // TRUE with `ESCAPE ''`.
     let rows = sqlx::query(
         r#"
         SELECT a.name, a.version, am.metadata AS metadata
@@ -690,7 +724,7 @@ async fn find_local_quick_spec(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND $2 LIKE a.name || '-%'
+          AND $2 LIKE a.name || '-%' ESCAPE ''
         "#,
     )
     .bind(repo_id)
@@ -780,6 +814,7 @@ fn quick_spec_response(spec: &crate::formats::rubygems::GemSpec) -> Result<Respo
 
 async fn quick_spec(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, spec_file)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
@@ -792,7 +827,9 @@ async fn quick_spec(
 
     if repo.repo_type == RepositoryType::Virtual {
         // Prefer a locally published member (mirrors the download shadowing rule).
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): the spec index is content.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 if let Some(spec) = find_local_quick_spec(&state.db, member.id, full_name).await? {
@@ -802,16 +839,19 @@ async fn quick_spec(
         }
         // Otherwise proxy the upstream quick spec verbatim (already Marshal),
         // re-declaring the member's `Content-Encoding` when present
-        // (RFC 9110 §8.4, #3260).
+        // (RFC 9110 §8.4, #3260) and serving the member's own `Content-Type`
+        // (#3281), with the octet-stream literal only as the fallback for a
+        // member that declared none.
         return proxy_helpers::resolve_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             &format!("quick/Marshal.4.8/{}", spec_file),
-            |bytes, content_encoding, _member_key| async move {
+            |bytes, content_type, content_encoding, _member_key| async move {
                 Ok(proxy_helpers::forward_verbatim_metadata(
                     bytes,
-                    None,
+                    content_type,
                     "application/octet-stream",
                     content_encoding,
                 ))
@@ -1313,6 +1353,112 @@ mod tests {
 
     use crate::api::handlers::test_db_helpers as tdh;
 
+    /// #3500. `find_local_quick_spec` narrows candidates with
+    /// `$2 LIKE a.name || '-%'`, whose PATTERN operand is a stored column.
+    /// Without an `ESCAPE` clause a backslash in the stored name — Postgres's
+    /// default `LIKE` escape character — quoted the character after it, so the
+    /// pattern for `foo\bar` became `foobar-%`, which does NOT match the
+    /// request `foo\bar-1.0`. The gem's own row was filtered out before the
+    /// exact Rust re-check could see it and the quick gemspec 404'd.
+    ///
+    /// The other direction is NOT a defect, and is pinned here by a case that
+    /// can only pass if the claim holds. `%` in the stored name `pct%gem`
+    /// widens its pattern to `pct%gem-%`, which the SQL matches against the
+    /// UNRELATED request `pctZZgem-1.0` — so the candidate set really is
+    /// widened — and the answer must still be `None`, because the loop
+    /// re-verifies every row exactly (`name-version == full_name`). A handler
+    /// that returned the first row the narrowing query produced would answer
+    /// `Some(pct%gem)` there. That is why over-matching is not the defect the
+    /// report describes, and why `ESCAPE ''` is the right clause here.
+    ///
+    /// The hyphenated-name case the helper exists for is the other control:
+    /// `foo-bar-1.0` must resolve to the gem named `foo-bar`, not `foo`.
+    #[tokio::test]
+    async fn test_find_local_quick_spec_matches_a_name_containing_a_backslash_3500() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        for (name, version) in [
+            (r"foo\bar", "1.0"),
+            ("foo", "1.0"),
+            ("foo-bar", "1.0"),
+            ("pct%gem", "1.0"),
+        ] {
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &repo,
+                &format!("gems/{name}-{version}.gem"),
+                &format!("gems/{name}-{version}.gem"),
+                name,
+                version,
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"gem"),
+                f.user_id,
+            )
+            .await;
+        }
+
+        let backslash = super::find_local_quick_spec(&f.pool, f.repo_id, r"foo\bar-1.0").await;
+        let hyphenated = super::find_local_quick_spec(&f.pool, f.repo_id, "foo-bar-1.0").await;
+        let plain = super::find_local_quick_spec(&f.pool, f.repo_id, "foo-1.0").await;
+        let percent = super::find_local_quick_spec(&f.pool, f.repo_id, "pct%gem-1.0").await;
+        // The widened pattern `pct%gem-%` MATCHES this request in SQL; only
+        // the exact Rust re-check rejects it.
+        let widened = super::find_local_quick_spec(&f.pool, f.repo_id, "pctZZgem-1.0").await;
+        let absent = super::find_local_quick_spec(&f.pool, f.repo_id, "nosuchgem-9.9").await;
+        f.teardown().await;
+
+        assert_eq!(
+            backslash
+                .expect("lookup must not error")
+                .map(|spec| (spec.name, spec.version)),
+            Some((r"foo\bar".to_string(), "1.0".to_string())),
+            r"a stored gem name containing a backslash must still match its own \
+              quick-gemspec request; without `ESCAPE ''` the pattern \
+              `foo\bar-%` is read as `foobar-%` and the row is filtered out \
+              before the exact check runs"
+        );
+        assert_eq!(
+            hyphenated
+                .expect("lookup must not error")
+                .map(|spec| (spec.name, spec.version)),
+            Some(("foo-bar".to_string(), "1.0".to_string())),
+            "control: the hyphenated-name disambiguation this helper exists \
+             for must still pick `foo-bar` over `foo`"
+        );
+        assert_eq!(
+            plain
+                .expect("lookup must not error")
+                .map(|spec| (spec.name, spec.version)),
+            Some(("foo".to_string(), "1.0".to_string())),
+            "control: an ordinary gem must still resolve"
+        );
+        assert_eq!(
+            percent
+                .expect("lookup must not error")
+                .map(|spec| (spec.name, spec.version)),
+            Some(("pct%gem".to_string(), "1.0".to_string())),
+            "a `%` in a stored name only widens the candidate set, and the \
+             exact Rust re-check still selects this gem"
+        );
+        assert!(
+            widened.expect("lookup must not error").is_none(),
+            "`%` in the stored name `pct%gem` widens its pattern to `pct%gem-%`, which \
+             the narrowing query matches against `pctZZgem-1.0`. The exact re-check in \
+             Rust must still reject it — this is what makes the report's \
+             over-matching claim a non-defect, and a handler that served the first \
+             candidate row would answer Some(pct%gem) here"
+        );
+        assert!(
+            absent.expect("lookup must not error").is_none(),
+            "control: a request for a gem that does not exist must stay a miss \
+             — `ESCAPE ''` must not turn the narrowing predicate into a \
+             match-anything"
+        );
+    }
+
     #[tokio::test]
     async fn test_rubygems_download_404_when_missing() {
         let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
@@ -1670,6 +1816,34 @@ mod db_cov_tests {
                 .execute(&fx.pool)
                 .await;
         }
+        fx.teardown().await;
+    }
+
+    /// #3281: the Virtual arms of `gem_info` and `quick_spec` forward the
+    /// member's body verbatim and must serve the member's own `Content-Type`,
+    /// keeping today's literals (`application/json` / octet-stream) only for
+    /// a member that declares none.
+    #[tokio::test]
+    async fn test_rubygems_virtual_forwards_member_content_type_3281_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let rig = tdh::setup_ct_3281_rig(&fx, "rubygems", b"gem-info-3281").await;
+        rig.assert_member_ct_forwarded(
+            super::router(),
+            |key| format!("/{key}/api/v1/gems/pkg3281.json"),
+            "application/json",
+            "rubygems virtual gem_info",
+        )
+        .await;
+        rig.assert_member_ct_forwarded(
+            super::router(),
+            |key| format!("/{key}/quick/Marshal.4.8/pkg3281-1.0.0.gemspec.rz"),
+            "application/octet-stream",
+            "rubygems virtual quick_spec",
+        )
+        .await;
+        rig.cleanup(&fx.pool).await;
         fx.teardown().await;
     }
 }

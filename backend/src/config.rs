@@ -143,6 +143,29 @@ fn parse_opt_out_flag(value: Option<&str>) -> bool {
     )
 }
 
+/// Parse the `TOTP_POLICY` env pin (#2805).
+///
+/// `None` (unset, or set to something unrecognized) means "no pin": the stored
+/// `security.totp_policy` setting is used instead. An unparseable value is
+/// deliberately *ignored with a warning* rather than defaulted either way — a
+/// typo must neither silently disable enforcement an operator already stored in
+/// the database, nor silently lock an instance down. Pure so the truth table is
+/// unit-testable without touching the environment.
+fn parse_totp_policy_env(value: Option<&str>) -> Option<crate::services::totp_policy::TotpPolicy> {
+    let raw = value?;
+    match crate::services::totp_policy::TotpPolicy::parse(raw) {
+        Some(policy) => Some(policy),
+        None => {
+            tracing::warn!(
+                value = %raw,
+                "TOTP_POLICY is set but not one of disabled|required_for_admins|required_for_all; \
+                 ignoring the pin and using the stored security.totp_policy setting"
+            );
+            None
+        }
+    }
+}
+
 /// Minimum reap-threshold for the stuck-scan janitor.
 ///
 /// `STUCK_SCAN_THRESHOLD_SECS=0` would match every `running` row on every
@@ -257,6 +280,16 @@ pub struct Config {
 
     /// JWT secret key for signing tokens
     pub jwt_secret: String,
+
+    /// Validity window, in seconds, stamped onto every OpenPGP repository
+    /// metadata signature as a `SignatureExpirationTime` subpacket (#1327).
+    ///
+    /// Defaults to 7 days, matching the cadence official Debian archives
+    /// re-sign at. Set to `0` to emit no expiration subpacket at all
+    /// (pre-1.8.0 behaviour). Values are clamped into
+    /// `[MIN_SIGNATURE_EXPIRY_SECONDS, MAX_SIGNATURE_EXPIRY_SECONDS]` by
+    /// [`crate::services::signing_service::signature_expiry_duration`].
+    pub signature_expiry_seconds: u64,
 
     /// JWT token expiration in seconds (legacy, use jwt_access_token_expiry_minutes)
     pub jwt_expiration_secs: u64,
@@ -441,6 +474,19 @@ pub struct Config {
     /// check, so it never deletes while ref coverage is incomplete.
     pub blob_gc_enabled: bool,
 
+    /// Whether the orphaned row-less Maven flat-object sweep is allowed to
+    /// actually delete objects (#3431). Defaults to `false`, mirroring
+    /// [`Self::blob_gc_enabled`]: the sweep's whole subject matter is objects
+    /// the *catalog cannot see*, and on an instance migrated from another
+    /// registry that absence is the EXPECTED state of legitimate legacy data —
+    /// it is why the attribution table exists at all. Catalog absence alone is
+    /// therefore not proof of garbage, so the sweep must not delete until an
+    /// operator opts in with `MAVEN_FLAT_GC_ENABLED=true`. Unset, the sweep
+    /// still runs and REPORTS what it would reclaim
+    /// (`StorageGcResult::maven_flat_objects_gated`) but deletes nothing.
+    /// Bias to leaking storage over losing data.
+    pub maven_flat_gc_enabled: bool,
+
     /// Sweep-grace window (seconds) for the two-phase mark-and-sweep blob GC
     /// (#1660). A blob is first *marked* (`pending_delete_at`) in one pass and
     /// only physically *swept* (storage + row delete) in a later pass once it
@@ -490,6 +536,36 @@ pub struct Config {
     /// `false`, preserving the historical break-glass behaviour so existing
     /// deployments are unchanged. Env var: `SSO_DISABLE_ADMIN_BREAK_GLASS`.
     pub sso_disable_admin_break_glass: bool,
+
+    /// Kill switch for the web UI's silent SSO auto-login (check-sso).
+    ///
+    /// When an OIDC provider is enabled, the web frontend attempts one
+    /// invisible `prompt=none` authorization per browser session so a user
+    /// with a live IdP session is signed in without clicking the SSO button,
+    /// while anonymous visitors stay anonymous (the IdP answers
+    /// `login_required` and the attempt ends silently). Operators who do not
+    /// want the automatic attempt at all set `OIDC_SILENT_SSO=false` (or `0`):
+    /// the flag is advertised to the frontend through
+    /// `GET /api/v1/system/config` (`auth.silent_sso_enabled`) and the web UI
+    /// then never initiates the silent flow. Defaults to `true`. Display-only
+    /// on the server side: it gates no endpoint, so flipping it never locks
+    /// anyone out.
+    pub oidc_silent_sso_enabled: bool,
+
+    /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
+    ///
+    /// When set, this value overrides the `security.totp_policy` row in
+    /// `system_settings` and the admin API refuses to change the policy. That
+    /// makes `TOTP_POLICY=disabled` plus a restart an offline break-glass: an
+    /// operator who cannot complete the enrollment exchange (for example because
+    /// their web UI predates it) can turn enforcement off without needing a
+    /// working login first.
+    ///
+    /// Env var: `TOTP_POLICY`. Accepted: `disabled`, `required_for_admins`,
+    /// `required_for_all`. An unparseable value is ignored (with a warning) so a
+    /// typo can neither lock the instance down nor silently disable enforcement
+    /// that is already stored in the database.
+    pub totp_policy: Option<crate::services::totp_policy::TotpPolicy>,
 
     /// Port for the unauthenticated Prometheus metrics-only listener.
     ///
@@ -547,8 +623,16 @@ pub struct Config {
     /// this is aborted with 503 so a single wedged/CPU-bound request cannot
     /// hold a worker indefinitely.
     ///
-    /// Must exceed the slowest legitimate request — large multi-GB artifact
-    /// uploads — or they will be killed. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
+    /// Artifact **byte-transfer** routes are exempt (#3263): the timeout clock
+    /// covers the time the client spends streaming the body, so applying it to
+    /// uploads and downloads turns a duration cap into an effective size cap —
+    /// a ~90 MB upload over a slow link was aborted mid-body and the client saw
+    /// only a connection reset. See `api::routes::is_byte_transfer_path` for the
+    /// exact route set; their size is still bounded by `MAX_UPLOAD_SIZE` and
+    /// their concurrency by `GLOBAL_MAX_CONCURRENCY`.
+    ///
+    /// This value therefore only has to exceed the slowest legitimate
+    /// *non-transfer* request. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
 
@@ -851,6 +935,7 @@ redacted_debug!(Config {
     show gc_schedule,
     show storage_stats_schedule,
     show blob_gc_enabled,
+    show maven_flat_gc_enabled,
     show blob_gc_sweep_grace_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
@@ -859,6 +944,8 @@ redacted_debug!(Config {
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show sso_disable_admin_break_glass,
+    show oidc_silent_sso_enabled,
+    show totp_policy,
     show metrics_port,
     show database_max_connections,
     show database_min_connections,
@@ -929,6 +1016,8 @@ impl Default for Config {
             s3_region: None,
             s3_endpoint: None,
             jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
+            signature_expiry_seconds:
+                crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -964,6 +1053,7 @@ impl Default for Config {
             gc_schedule: "0 0 * * * *".into(),
             storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
+            maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
@@ -972,6 +1062,8 @@ impl Default for Config {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
+            oidc_silent_sso_enabled: true,
+            totp_policy: None,
             metrics_port: None,
             database_max_connections: 50,
             database_min_connections: 5,
@@ -1067,6 +1159,10 @@ impl Config {
             s3_endpoint: env::var("S3_ENDPOINT").ok(),
             jwt_secret: env::var("JWT_SECRET")
                 .map_err(|_| AppError::Config("JWT_SECRET not set".into()))?,
+            signature_expiry_seconds: env_parse(
+                "SIGNATURE_EXPIRY_SECONDS",
+                crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            ),
             jwt_expiration_secs: env_parse("JWT_EXPIRATION_SECS", 86400),
             jwt_access_token_expiry_minutes: env_parse("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", 30),
             jwt_refresh_token_expiry_days: env_parse("JWT_REFRESH_TOKEN_EXPIRY_DAYS", 7),
@@ -1171,6 +1267,13 @@ impl Config {
             // Accepts "true" / "1" (case-insensitive); anything else
             // (empty, garbage, unset) keeps live blob deletion disabled.
             blob_gc_enabled: parse_opt_in_flag(env::var("BLOB_GC_ENABLED").ok().as_deref()),
+            // The Maven flat-object sweep deletes objects whose only catalog
+            // record is their attribution row — including rows an operator
+            // inserted by hand to repair a fail-closed 404. Same opt-in
+            // discipline as blob GC: unset means report-only (#3431).
+            maven_flat_gc_enabled: parse_opt_in_flag(
+                env::var("MAVEN_FLAT_GC_ENABLED").ok().as_deref(),
+            ),
             // Two-phase blob-GC sweep grace (#1660). Clamped to at most 7 days
             // so a fat-fingered enormous value can't silently disable the
             // sweep forever; `0` is allowed (sweep on the next pass).
@@ -1198,6 +1301,18 @@ impl Config {
             sso_disable_admin_break_glass: matches!(
                 env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").as_deref(),
                 Ok("true" | "1")
+            ),
+            // Default-on kill switch: only an explicit "false"/"0" disables
+            // the web UI's silent SSO attempt, so existing deployments get
+            // the seamless sign-in without new configuration.
+            oidc_silent_sso_enabled: !matches!(
+                env::var("OIDC_SILENT_SSO").as_deref(),
+                Ok("false" | "0")
+            ),
+            totp_policy: parse_totp_policy_env(
+                env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
+                    .ok()
+                    .as_deref(),
             ),
             metrics_port: match env::var("METRICS_PORT") {
                 Ok(val) => match val.parse::<u16>() {
@@ -1836,6 +1951,63 @@ mod tests {
             env::set_var("BLOB_GC_ENABLED", v);
         } else {
             env::remove_var("BLOB_GC_ENABLED");
+        }
+    }
+
+    /// #3431: the orphaned Maven flat-object sweep must be opt-in, exactly as
+    /// blob deletion is. Its candidates are keys the catalog cannot see, which
+    /// on a migrated instance is the expected state of legitimate legacy data,
+    /// so "no anchors" is not proof of garbage without an operator saying so.
+    #[test]
+    fn test_config_maven_flat_gc_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("MAVEN_FLAT_GC_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("MAVEN_FLAT_GC_ENABLED");
+
+        let config = Config::from_env().unwrap();
+        assert!(
+            !config.maven_flat_gc_enabled,
+            "Maven flat-object GC must default to report-only when \
+             MAVEN_FLAT_GC_ENABLED is unset (#3431)"
+        );
+
+        // Only the recognized affirmatives opt in; garbage must not enable a
+        // destructive sweep by accident.
+        for value in ["false", "no", "", "yes-please"] {
+            env::set_var("MAVEN_FLAT_GC_ENABLED", value);
+            assert!(
+                !Config::from_env().unwrap().maven_flat_gc_enabled,
+                "MAVEN_FLAT_GC_ENABLED={value:?} must not enable deletion"
+            );
+        }
+
+        env::set_var("MAVEN_FLAT_GC_ENABLED", "true");
+        let config = Config::from_env().unwrap();
+        assert!(
+            config.maven_flat_gc_enabled,
+            "MAVEN_FLAT_GC_ENABLED=true must opt into live flat-object deletion"
+        );
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_flag {
+            env::set_var("MAVEN_FLAT_GC_ENABLED", v);
+        } else {
+            env::remove_var("MAVEN_FLAT_GC_ENABLED");
         }
     }
 
@@ -2707,6 +2879,37 @@ mod tests {
         restore_env("PLUGINS_TRUSTED_PUBKEY", saved_key);
     }
 
+    /// #2805: the `TOTP_POLICY` pin. Pure, so it needs no environment
+    /// manipulation and no `ENV_MUTEX`.
+    #[test]
+    fn test_parse_totp_policy_env() {
+        use crate::services::totp_policy::TotpPolicy;
+
+        // Unset => no pin; the stored setting governs.
+        assert_eq!(parse_totp_policy_env(None), None);
+
+        assert_eq!(
+            parse_totp_policy_env(Some("required_for_admins")),
+            Some(TotpPolicy::RequiredForAdmins)
+        );
+        assert_eq!(
+            parse_totp_policy_env(Some(" REQUIRED_FOR_ALL ")),
+            Some(TotpPolicy::RequiredForAll)
+        );
+        // Pinning to `disabled` is the documented offline break-glass, so it
+        // must be a real pin — not "unset".
+        assert_eq!(
+            parse_totp_policy_env(Some("disabled")),
+            Some(TotpPolicy::Disabled)
+        );
+
+        // A typo must not silently read as either extreme: no pin, and the
+        // stored setting keeps governing.
+        assert_eq!(parse_totp_policy_env(Some("requird_for_all")), None);
+        assert_eq!(parse_totp_policy_env(Some("true")), None);
+        assert_eq!(parse_totp_policy_env(Some("")), None);
+    }
+
     #[test]
     fn test_config_allow_local_admin_login() {
         let _lock = ENV_MUTEX.lock().unwrap();
@@ -2788,6 +2991,43 @@ mod tests {
         restore_env("DATABASE_URL", saved_db);
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("SSO_DISABLE_ADMIN_BREAK_GLASS", saved_flag);
+    }
+
+    #[test]
+    fn test_config_oidc_silent_sso_kill_switch() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("OIDC_SILENT_SSO").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Default is ON: existing deployments get silent SSO without new
+        // configuration.
+        env::remove_var("OIDC_SILENT_SSO");
+        let config = Config::from_env().unwrap();
+        assert!(config.oidc_silent_sso_enabled);
+
+        // "false" and "0" are the explicit kill switch.
+        env::set_var("OIDC_SILENT_SSO", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.oidc_silent_sso_enabled);
+
+        env::set_var("OIDC_SILENT_SSO", "0");
+        let config = Config::from_env().unwrap();
+        assert!(!config.oidc_silent_sso_enabled);
+
+        // Any other value (including a typo) leaves the feature enabled, so a
+        // misspelled opt-out is visible rather than silently flipping an
+        // unrelated default.
+        env::set_var("OIDC_SILENT_SSO", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.oidc_silent_sso_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("OIDC_SILENT_SSO", saved_flag);
     }
 
     #[test]
@@ -4197,6 +4437,481 @@ mod tests {
             !backend.contains("/bin/sh") && !backend.contains("/bin/bash"),
             "backend service must not use a shell entrypoint; the runtime image \
              has no shell (#2059/#2084). Offending block:\n{backend}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2099: publishing workflows must not cancel themselves
+    // -----------------------------------------------------------------------
+
+    /// List every workflow file under `.github/workflows`. Scanned rather than
+    /// hardcoded for the same reason `discover_compose_files` is: the compose
+    /// guard only caught `docker-compose.local-dev.yml` because it stopped
+    /// naming one file. Test-only.
+    fn discover_workflow_files(repo_root: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(repo_root.join(".github/workflows"))
+            .expect("read .github/workflows")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".yml") || name.ends_with(".yaml"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Markers that a workflow's product is a *published container image*
+    /// rather than a pass/fail verdict. `push: true` is `docker/build-push-
+    /// action` actually pushing; `imagetools create` and `docker push` are the
+    /// manifest-list and raw-push paths. A workflow matching any of these has
+    /// side effects a cancellation leaves half-applied.
+    ///
+    /// Pure so the classification is unit-testable without touching the repo.
+    fn workflow_publishes_images(workflow: &str) -> bool {
+        workflow
+            .lines()
+            // Ignore comments: `docker-publish.yml` *describes* `imagetools
+            // create` in prose right above the step that runs it, and a
+            // comment is not a publish.
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .any(|line| {
+                let l = line.trim();
+                l.starts_with("push: true")
+                    || l.contains("imagetools create")
+                    || l.contains("docker push")
+            })
+    }
+
+    /// Extract the value of the top-level `concurrency:` block's
+    /// `cancel-in-progress:` key, if the workflow has one. Returns `None` when
+    /// the workflow declares no top-level `concurrency` (which is safe — no
+    /// concurrency block means GitHub never cancels).
+    ///
+    /// Only the top-level block counts: a `concurrency` nested under a job is
+    /// indented and is not what supersedes a whole run. Pure/test-only.
+    fn workflow_cancel_in_progress(workflow: &str) -> Option<String> {
+        let mut in_block = false;
+        for line in workflow.lines() {
+            if line.starts_with("concurrency:") {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                // A new top-level key ends the block.
+                if !line.starts_with(' ') && !line.trim().is_empty() {
+                    break;
+                }
+                if let Some(rest) = line.trim().strip_prefix("cancel-in-progress:") {
+                    return Some(rest.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Regression guard for #2099.
+    ///
+    /// `docker-publish.yml` cancelled superseded branch pushes. Its arm64 legs
+    /// run on fast GitHub-hosted runners while its amd64 legs run on the capped
+    /// self-hosted pool, so a burst of merges to main killed the amd64 builds
+    /// mid-flight and the multi-arch manifest jobs — the only jobs that move
+    /// the `:dev`/`:main` floating tags — never ran. Floating tags silently
+    /// stayed on a stale digest and downstream image-reference gates broke.
+    ///
+    /// The rule this encodes: a workflow whose product is a *published image*
+    /// may not cancel itself, because a cancelled publish is not a re-runnable
+    /// verdict, it is a registry left inconsistent. Every workflow is scanned
+    /// rather than just the one #2099 was reported against, so a future
+    /// publishing workflow cannot reintroduce this the way
+    /// `docker-compose.local-dev.yml` reintroduced #2126.
+    #[test]
+    fn image_publishing_workflows_never_cancel_in_progress() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        let workflows = discover_workflow_files(repo_root);
+        assert!(
+            workflows.iter().any(|f| f == "docker-publish.yml"),
+            "expected to discover docker-publish.yml among the repo's \
+             workflows, found: {workflows:?}"
+        );
+
+        let mut publishers = Vec::new();
+        for file_name in &workflows {
+            let path = repo_root.join(".github/workflows").join(file_name);
+            let workflow = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            if !workflow_publishes_images(&workflow) {
+                continue;
+            }
+            publishers.push(file_name.clone());
+
+            if let Some(value) = workflow_cancel_in_progress(&workflow) {
+                assert_eq!(
+                    value, "false",
+                    "{file_name} publishes container images, so its top-level \
+                     `cancel-in-progress` must be the literal `false` (#2099). \
+                     An expression is not good enough: the one this guard was \
+                     written for evaluated to true on exactly the branch \
+                     pushes that publish the floating tags. Found: {value}"
+                );
+            }
+        }
+
+        assert!(
+            publishers.iter().any(|f| f == "docker-publish.yml"),
+            "docker-publish.yml must be classified as an image publisher, \
+             otherwise this guard silently checks nothing. Classified: \
+             {publishers:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_publishes_images_detects_each_push_form() {
+        assert!(workflow_publishes_images("      push: true\n"));
+        assert!(workflow_publishes_images(
+            "        docker buildx imagetools create -t x y\n"
+        ));
+        assert!(workflow_publishes_images("        docker push foo:bar\n"));
+    }
+
+    #[test]
+    fn workflow_publishes_images_ignores_comments_and_non_publishers() {
+        // Prose describing the publish step is not a publish.
+        assert!(!workflow_publishes_images(
+            "      # docker buildx imagetools create re-points tags\n"
+        ));
+        assert!(!workflow_publishes_images("      push: false\n"));
+        assert!(!workflow_publishes_images(
+            "jobs:\n  test:\n    steps:\n      - run: cargo test\n"
+        ));
+    }
+
+    #[test]
+    fn workflow_cancel_in_progress_reads_only_the_top_level_block() {
+        let wf = "name: x\nconcurrency:\n  group: g\n  cancel-in-progress: false\n\njobs:\n";
+        assert_eq!(
+            workflow_cancel_in_progress(wf),
+            Some("false".to_string()),
+            "top-level cancel-in-progress should be read"
+        );
+
+        // A job-level concurrency block must not be mistaken for the run-level
+        // one; only the run-level block supersedes a whole run.
+        let job_level =
+            "name: x\njobs:\n  build:\n    concurrency:\n      cancel-in-progress: true\n";
+        assert_eq!(workflow_cancel_in_progress(job_level), None);
+
+        // No concurrency block at all is safe — nothing cancels.
+        assert_eq!(
+            workflow_cancel_in_progress("name: x\njobs:\n  a: {}\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_cancel_in_progress_returns_expressions_verbatim() {
+        // The pre-#2099 shape: an expression that evaluates true on branch
+        // pushes. The guard must surface it rather than treat it as absent.
+        let wf =
+            "concurrency:\n  group: g\n  cancel-in-progress: ${{ github.event_name == 'push' }}\n";
+        assert_eq!(
+            workflow_cancel_in_progress(wf),
+            Some("${{ github.event_name == 'push' }}".to_string())
+        );
+    }
+
+    /// List every `docker/Dockerfile*` in the repo. Same rationale as
+    /// [`discover_compose_files`]: the guard below must cover any Dockerfile
+    /// added in future rather than a hardcoded pair that silently misses one.
+    /// Test-only.
+    fn discover_dockerfiles(repo_root: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(repo_root.join("docker"))
+            .expect("read docker/ directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("Dockerfile"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Extract every `ghcr.io/anchore/grype:<tag>` reference in `content` —
+    /// i.e. every place a PREBUILT upstream grype binary would be pulled in.
+    /// Since #3352 the expected answer is "none anywhere"; the extractor is
+    /// kept so the failure message can name the tag that came back.
+    /// Test-only.
+    fn prebuilt_grype_pins(content: &str) -> Vec<String> {
+        const PREFIX: &str = "ghcr.io/anchore/grype:";
+        let mut pins = Vec::new();
+        for (idx, _) in content.match_indices(PREFIX) {
+            let tag: String = content[idx + PREFIX.len()..]
+                .chars()
+                .take_while(|c| !c.is_whitespace())
+                .collect();
+            if !tag.is_empty() {
+                pins.push(tag);
+            }
+        }
+        pins
+    }
+
+    /// Value of a Dockerfile `ARG <name>=<value>` declaration, if present.
+    /// Only the defaulted form is recognised, which is the form that actually
+    /// pins something: a bare `ARG NAME` carries no value to compare.
+    /// Test-only.
+    fn dockerfile_arg(content: &str, name: &str) -> Option<String> {
+        content.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix("ARG ")?;
+            let (key, value) = rest.split_once('=')?;
+            (key.trim() == name).then(|| value.trim().trim_matches('"').to_string())
+        })
+    }
+
+    /// True if `content` builds grype from upstream source rather than copying
+    /// a released binary. Keyed on the clone URL because that is the line that
+    /// makes it a source build; the stage name is incidental. Test-only.
+    fn builds_grype_from_source(content: &str) -> bool {
+        content.contains("github.com/anchore/grype.git")
+    }
+
+    /// Suppression tokens that are LIVE in a `.trivyignore` — a bare
+    /// `CVE-…`/`GHSA-…` at the start of a line. Mirrors `suppression_tokens`
+    /// in `scripts/ci/release-preflight.sh`, so a `# RETIRED:` tombstone is
+    /// deliberately NOT a live token. Test-only.
+    fn live_suppression_tokens(content: &str) -> Vec<String> {
+        content
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| line.starts_with("CVE-") || line.starts_with("GHSA-"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The Go stdlib CVEs that failing `Security Scan` runs reported against
+    /// `usr/local/bin/grype`, all fixed in go1.26.6 (#3352). Kept as data so
+    /// the guard below can state exactly what must never come back as a
+    /// suppression. Test-only.
+    const GRYPE_STDLIB_CVES_FIXED_BY_TOOLCHAIN: &[&str] = &[
+        // The six that were unsuppressed and actually blocking publication.
+        "CVE-2026-33818", // encoding/asn1  DoS via recursion in Unmarshal
+        "CVE-2026-56853", // net/http       DoS on unencrypted connections
+        "CVE-2026-56858", // html/template  XSS via pathological input
+        "CVE-2026-56859", // encoding/xml   DoS via recursion depth
+        "CVE-2026-56860", // net/url        DoS via quadratic path complexity
+        "CVE-2026-56862", // crypto/tls     indefinite KeyUpdate
+        // The seven older stdlib tokens #3352 retired from .trivyignore.
+        "CVE-2026-27145",
+        "CVE-2026-39821",
+        "CVE-2026-39822",
+        "CVE-2026-42504",
+        "CVE-2026-42505",
+        "CVE-2026-42507",
+        "CVE-2026-46600",
+    ];
+
+    #[test]
+    fn prebuilt_grype_pins_extracts_tag_and_ignores_source_builds() {
+        assert_eq!(
+            prebuilt_grype_pins("FROM ghcr.io/anchore/grype:v0.117.0 AS grype-bin\n"),
+            vec!["v0.117.0".to_string()]
+        );
+        // The source-build form must not read as a prebuilt pin, otherwise the
+        // guard below would fire on the very thing it is asking for.
+        assert!(prebuilt_grype_pins(
+            "RUN git clone --branch v0.117.0 https://github.com/anchore/grype.git .\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn dockerfile_arg_reads_defaulted_args_only() {
+        let content = "FROM golang:1.26-alpine\nARG GRYPE_VERSION=0.117.0\nARG TARGETARCH\n";
+        assert_eq!(
+            dockerfile_arg(content, "GRYPE_VERSION"),
+            Some("0.117.0".to_string())
+        );
+        // Declared-but-unset: nothing is pinned, so there is nothing to report.
+        assert_eq!(dockerfile_arg(content, "TARGETARCH"), None);
+        assert_eq!(dockerfile_arg(content, "NOT_PRESENT"), None);
+    }
+
+    #[test]
+    fn live_suppression_tokens_ignores_retired_tombstones() {
+        let content =
+            "# RETIRED: CVE-2026-46600 (2026-08-16, #3352)\nCVE-2026-34040\n# CVE-2026-1\n";
+        assert_eq!(
+            live_suppression_tokens(content),
+            vec!["CVE-2026-34040".to_string()]
+        );
+    }
+
+    #[test]
+    fn builds_grype_from_source_detects_the_clone() {
+        assert!(builds_grype_from_source(
+            "RUN git clone --depth 1 https://github.com/anchore/grype.git .\n"
+        ));
+        assert!(!builds_grype_from_source(
+            "FROM ghcr.io/anchore/grype:v0.117.0 AS grype-bin\n"
+        ));
+    }
+
+    /// Regression guard for the bundled-grype drift class (#2881 / #3262 /
+    /// #3352).
+    ///
+    /// The backend images vendor the `grype` CLI, and that single Go binary is
+    /// the sole source of the repo's residual CRITICAL/HIGH container
+    /// findings. Until #3352 it was copied out of `ghcr.io/anchore/grype`,
+    /// which made every Go STDLIB advisory unfixable here — a stdlib CVE is a
+    /// property of the toolchain Anchore compiled with, so bumping the grype
+    /// tag does nothing, and the only lever left was a `.trivyignore` entry.
+    /// Six such CVEs failed `Security Scan` on five consecutive runs on `main`
+    /// and on `release/1.7.x`, publishing no images and blocking both a
+    /// `v1.7.5` security tag and `v1.8.0`.
+    ///
+    /// So the prebuilt binary must not come back. Every `docker/Dockerfile*`
+    /// is scanned rather than the two known today, for the reason CLAUDE.md
+    /// gives from #2126/#2059: fix one, forget the other, and the images
+    /// disagree about what they ship.
+    #[test]
+    fn no_dockerfile_pulls_a_prebuilt_grype_binary() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        let dockerfiles = discover_dockerfiles(repo_root);
+        assert!(
+            dockerfiles.iter().any(|f| f == "Dockerfile.backend")
+                && dockerfiles.iter().any(|f| f == "Dockerfile.backend.alpine"),
+            "expected to discover both Dockerfile.backend and \
+             Dockerfile.backend.alpine, found: {dockerfiles:?}"
+        );
+
+        let mut offenders: Vec<(String, String)> = Vec::new();
+        for file_name in &dockerfiles {
+            let path = repo_root.join("docker").join(file_name);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for tag in prebuilt_grype_pins(&content) {
+                offenders.push((file_name.clone(), tag));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these Dockerfiles pull a PREBUILT grype binary from \
+             ghcr.io/anchore/grype: {offenders:?}. Since #3352 grype is built \
+             from source with a patched Go toolchain, because a Go stdlib CVE \
+             in the upstream binary cannot be fixed by bumping the grype tag — \
+             it is the compiler, not the tool. Reverting to the prebuilt image \
+             re-opens the exact failure that blocked v1.7.5 and v1.8.0."
+        );
+    }
+
+    /// The source build has to be pinned the SAME WAY in every image, and the
+    /// `.trivyignore` rationale has to describe the version actually shipped.
+    ///
+    /// Version-agnostic on purpose: it asserts agreement, not a specific tag,
+    /// so a legitimate grype bump stays a small edit in each Dockerfile plus
+    /// the `.trivyignore` header. The commit is checked alongside the version
+    /// because a tag is mutable and the commit is what makes the pin mean
+    /// something; the Dockerfiles assert the two agree at build time.
+    #[test]
+    fn grype_source_build_is_pinned_consistently_across_images() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        // (file, version, commit, go floor) per Dockerfile that builds grype.
+        let mut builds: Vec<(String, String, String, String)> = Vec::new();
+        for file_name in discover_dockerfiles(repo_root) {
+            let path = repo_root.join("docker").join(&file_name);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            if !builds_grype_from_source(&content) {
+                continue;
+            }
+            let arg = |name: &str| {
+                dockerfile_arg(&content, name).unwrap_or_else(|| {
+                    panic!(
+                        "{file_name} builds grype from source but declares no \
+                         `ARG {name}=<value>`. The pin is what makes the build \
+                         reproducible and auditable (#3352)."
+                    )
+                })
+            };
+            builds.push((
+                file_name.clone(),
+                arg("GRYPE_VERSION"),
+                arg("GRYPE_COMMIT"),
+                arg("GO_MIN_PATCH"),
+            ));
+        }
+
+        assert!(
+            builds.len() >= 2,
+            "expected at least Dockerfile.backend and Dockerfile.backend.alpine \
+             to build grype from source, found: {builds:?}"
+        );
+
+        let (_, version, commit, go_min) = builds[0].clone();
+        for (file_name, v, c, g) in &builds {
+            assert_eq!(
+                (v, c, g),
+                (&version, &commit, &go_min),
+                "grype source-build pin drift in {file_name}: it builds \
+                 v{v} @ {c} on go>={g} while another Dockerfile builds \
+                 v{version} @ {commit} on go>={go_min}. Every image must ship \
+                 the same grype build, otherwise .trivyignore's rationale \
+                 describes a binary only some images carry. All: {builds:?}"
+            );
+        }
+
+        let trivyignore_path = repo_root.join(".trivyignore");
+        let trivyignore = std::fs::read_to_string(&trivyignore_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", trivyignore_path.display()));
+        assert!(
+            trivyignore.contains(version.as_str()),
+            ".trivyignore does not mention the grype version {version} the \
+             images build. Its remaining grype suppressions are justified \
+             per-version, so a bump must update the rationale there too \
+             (#3262/#3352)."
+        );
+    }
+
+    /// The six CVEs that blocked publication — and the seven older stdlib
+    /// tokens #3352 retired — must never be suppressed again.
+    ///
+    /// This is the guard that keeps #3352 from being undone the cheap way.
+    /// Every one of these is fixed by the Go toolchain the Dockerfiles build
+    /// on, so the correct response to a recurrence is to raise `GO_MIN_PATCH`,
+    /// not to add a line to `.trivyignore`. A tombstone (`# RETIRED: <token>`)
+    /// is fine and expected — the release-preflight gate reads those — but a
+    /// live token is a regression to the treadmill this issue removed.
+    #[test]
+    fn toolchain_fixed_grype_stdlib_cves_are_not_suppressed() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+        let trivyignore_path = repo_root.join(".trivyignore");
+        let trivyignore = std::fs::read_to_string(&trivyignore_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", trivyignore_path.display()));
+
+        let live = live_suppression_tokens(&trivyignore);
+        let resurrected: Vec<&&str> = GRYPE_STDLIB_CVES_FIXED_BY_TOOLCHAIN
+            .iter()
+            .filter(|cve| live.iter().any(|token| token == *cve))
+            .collect();
+
+        assert!(
+            resurrected.is_empty(),
+            ".trivyignore suppresses Go stdlib CVEs that the grype source \
+             build already fixes: {resurrected:?}. These are compiled-with \
+             CVEs — raise GO_MIN_PATCH in docker/Dockerfile.backend and \
+             docker/Dockerfile.backend.alpine so the binary stops carrying the \
+             vulnerable stdlib, rather than suppressing the finding (#3352). \
+             A `# RETIRED:` tombstone for these is fine; a live token is not."
         );
     }
 }

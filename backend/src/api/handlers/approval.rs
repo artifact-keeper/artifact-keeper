@@ -828,9 +828,10 @@ pub async fn approve_promotion(
     // it is skipped for repo-isolated (filesystem) backends. The tenant-access
     // gate above governs who may execute the approval — this closes the residual
     // write attribution hole.
-    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+    crate::services::artifact_service::guard_foreign_storage_key_for_promotion(
         &state.db,
         target_repo.id,
+        source_repo.id,
         &target_repo.storage_backend,
         &artifact.storage_key,
     )

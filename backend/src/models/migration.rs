@@ -188,16 +188,81 @@ pub struct MigrationJob {
     pub error_summary: Option<String>,
 }
 
+/// Share of a job's items that have reached a terminal per-item outcome.
+///
+/// `total` is what the worker has enumerated so far, not a count obtained up
+/// front: a paged source like Nexus never reports how many artifacts a
+/// repository holds, so the denominator grows page by page and the percentage
+/// can fall back when the next page lands (#3378). A job that has not
+/// enumerated anything yet reports 0 rather than dividing by zero. The result
+/// is clamped to 100 because repository-level failures — a source repo missing
+/// from the listing, a destination conflict — land in `failed` without ever
+/// having been enumerated as items.
+pub fn progress_percent(total: i32, completed: i32, failed: i32, skipped: i32) -> f64 {
+    if total <= 0 {
+        return 0.0;
+    }
+    let done = completed + failed + skipped;
+    (done as f64 / total as f64 * 100.0).min(100.0)
+}
+
+/// Highest share a job that has not finished enumerating is allowed to report.
+///
+/// See [`reported_progress_percent`].
+pub const RUNNING_PROGRESS_CEILING: f64 = 99.9;
+
+/// Whether the worker has stopped touching a job's counters.
+///
+/// Mirrors the terminal set the progress stream breaks on, so the point at
+/// which a client stops polling is the same point at which the figures stop
+/// moving.
+pub fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "completed_with_errors" | "failed" | "cancelled"
+    )
+}
+
+/// Share to report to a client for a job in `status`.
+///
+/// [`progress_percent`] alone is misleading while a job is still running,
+/// because the denominator is a running total published one page ahead of the
+/// items in that page: a job that has just drained page one of two reads
+/// `1000/1000` and sits at exactly 100.0 for as long as the next listing takes,
+/// then drops back to 50 (#3378). A client keying on `progress_percent >= 100`
+/// would call such a job finished several pages early, and a progress bar would
+/// fill and empty repeatedly. Only a job whose totals can no longer grow — one
+/// that has reached a terminal status — may report a full 100; anything else is
+/// held just below at [`RUNNING_PROGRESS_CEILING`]. `status` remains the
+/// authoritative completion signal either way.
+pub fn reported_progress_percent(
+    status: &str,
+    total: i32,
+    completed: i32,
+    failed: i32,
+    skipped: i32,
+) -> f64 {
+    let percent = progress_percent(total, completed, failed, skipped);
+    if percent >= 100.0 && !is_terminal_status(status) {
+        RUNNING_PROGRESS_CEILING
+    } else {
+        percent
+    }
+}
+
 impl MigrationJob {
     /// Calculate progress percentage
+    ///
+    /// Raw arithmetic over this row's counters. Reader-facing code wants
+    /// [`reported_progress_percent`], which additionally keeps a job that is
+    /// still enumerating from advertising a full 100.
     pub fn progress_percent(&self) -> f64 {
-        if self.total_items == 0 {
-            0.0
-        } else {
-            (self.completed_items + self.failed_items + self.skipped_items) as f64
-                / self.total_items as f64
-                * 100.0
-        }
+        progress_percent(
+            self.total_items,
+            self.completed_items,
+            self.failed_items,
+            self.skipped_items,
+        )
     }
 
     /// Estimate remaining time in seconds
@@ -481,6 +546,96 @@ mod tests {
         let job = make_test_job(10, 5, 3, 2);
         // (5 + 3 + 2) / 10 * 100 = 100.0
         assert!((job.progress_percent() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_progress_percent_follows_the_running_total() {
+        // Issue #3378: the worker publishes what it has enumerated so far, so
+        // the denominator grows page by page. Finishing a page of 1000 reads
+        // as done until the next page lands and the same work reads as half.
+        assert!((progress_percent(1000, 1000, 0, 0) - 100.0).abs() < f64::EPSILON);
+        assert!((progress_percent(2000, 1000, 0, 0) - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_progress_percent_nothing_enumerated_yet() {
+        // A job row starts at total_items = 0 and stays there until the
+        // first source page lands, so the divide-by-zero window is real and
+        // reports 0 rather than a NaN the UI would render as "NaN%".
+        assert_eq!(progress_percent(0, 0, 0, 0), 0.0);
+        assert_eq!(progress_percent(0, 7, 1, 2), 0.0);
+    }
+
+    #[test]
+    fn test_progress_percent_does_not_exceed_full() {
+        // Repository-level failures (a source repo missing from the listing, a
+        // destination conflict) land in failed_items without ever having been
+        // enumerated as items, so the processed count can outrun the total.
+        assert!((progress_percent(100, 99, 3, 0) - 100.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // reported_progress_percent — the running-job ceiling (#3378)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reported_progress_percent_running_job_never_reads_complete() {
+        // The denominator is published one page ahead of the items in it, so
+        // a job that has drained page one of two genuinely reads 1000/1000
+        // and would otherwise sit at a hard 100.0 while the next listing is
+        // in flight — then fall back to 50. A client keying on 100 would call
+        // it done several pages early.
+        assert!((progress_percent(1000, 1000, 0, 0) - 100.0).abs() < f64::EPSILON);
+        assert_eq!(
+            reported_progress_percent("running", 1000, 1000, 0, 0),
+            RUNNING_PROGRESS_CEILING
+        );
+        // The clamped over-full case is held back the same way.
+        assert_eq!(
+            reported_progress_percent("running", 100, 99, 3, 0),
+            RUNNING_PROGRESS_CEILING
+        );
+        // A paused job can still be resumed into more pages.
+        assert_eq!(
+            reported_progress_percent("paused", 1000, 1000, 0, 0),
+            RUNNING_PROGRESS_CEILING
+        );
+    }
+
+    #[test]
+    fn test_reported_progress_percent_terminal_job_reports_full() {
+        // Once the totals can no longer grow, 100 means 100.
+        for status in ["completed", "completed_with_errors", "failed", "cancelled"] {
+            assert!(
+                (reported_progress_percent(status, 1000, 1000, 0, 0) - 100.0).abs() < f64::EPSILON,
+                "{status} is terminal and must be allowed to report a full 100"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reported_progress_percent_passes_partial_shares_through() {
+        // The ceiling only touches a full reading; everything below it is the
+        // plain arithmetic, whatever the status.
+        for status in ["running", "paused", "completed", "pending"] {
+            assert!(
+                (reported_progress_percent(status, 2000, 1000, 0, 0) - 50.0).abs() < f64::EPSILON,
+                "{status} must report the plain share below full"
+            );
+            assert_eq!(reported_progress_percent(status, 0, 7, 1, 2), 0.0);
+        }
+    }
+
+    #[test]
+    fn test_is_terminal_status_matches_the_streams_stop_condition() {
+        // The progress stream breaks on exactly this set; if the two drift, a
+        // client either stops polling on a moving job or polls a dead one.
+        for status in ["completed", "completed_with_errors", "failed", "cancelled"] {
+            assert!(is_terminal_status(status), "{status} must be terminal");
+        }
+        for status in ["pending", "assessing", "ready", "running", "paused"] {
+            assert!(!is_terminal_status(status), "{status} must not be terminal");
+        }
     }
 
     // -----------------------------------------------------------------------

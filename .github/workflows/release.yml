@@ -35,9 +35,15 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          # Cone mode always includes top-level files, so CHANGELOG.md comes
+          # with the checkout; the three directories are what the bookkeeping
+          # assertions read (the notes set, the delegated [Unreleased] gate).
+          sparse-checkout: |
+            .github/scripts
+            .github/release-notes
+            scripts/ci
 
       # Scope, stated honestly: `created` is false only when a push updates an
       # existing ref, so this catches a force-push over a live tag -- the
@@ -72,14 +78,104 @@ jobs:
           set -euo pipefail
           .github/scripts/assert-release-absent.sh "${GITHUB_REF_NAME}"
 
+      # Bookkeeping, checked here so it costs a minute rather than the hour of
+      # gates that precedes the release job (issue #3537). Four of the last
+      # eight releases shipped with wrong or missing notes/CHANGELOG state and
+      # every one was found by a human days later; the only automated check
+      # asserted that a `## [X.Y.Z]` heading exists and is non-empty, which a
+      # section describing a DIFFERENT release also satisfies.
+      #
+      # Everything it reads comes from the ref being released, never from main
+      # -- `main` and `release/1.7.x` hold disjoint halves of the 1.7.x notes
+      # set, so a main-relative check would fail two correct releases.
+      - name: Verify release bookkeeping
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          .github/scripts/assert-release-bookkeeping.sh "${GITHUB_REF_NAME}"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # REQUIRE A GREEN RELEASE PREFLIGHT FOR THIS EXACT COMMIT  (issue #3538)
+  #
+  # RELEASING.md step 1 has said "run the release preflight and get a READY
+  # before you tag" since #3043. Nothing enforced it, and a guard's absence is
+  # invisible -- only its failure is visible. The two most expensive incidents
+  # in the 1.7.x line were both that shape:
+  #
+  #   v1.7.5  preflight check 4 (#3339) exists exactly to catch an unbumped
+  #           `docker/scanner-adapter/VERSION`, was merged 2026-08-13, and was
+  #           never run: zero Release Preflight runs between 2026-08-14T14:19Z
+  #           and 2026-08-17T13:51Z. The tag's Docker Publish hit the
+  #           never-republish guard, the chain stopped, and the immutable tag
+  #           was abandoned. ~38h and a burned version number.
+  #
+  #   v1.7.7  the preflight RAN and was RIGHT. Run 32377238021 reported the
+  #           manifest had not published cleanly; two dispatches at 21:22Z
+  #           reported the follow-up's `verdict does not exist yet`. v1.7.7 was
+  #           tagged at 21:40:17Z and that docker-publish concluded `failure`
+  #           19 seconds later.
+  #
+  # This job is the missing assertion, and it is deliberately EVIDENCE-BASED
+  # rather than a preflight re-run. Running the preflight inline here would be
+  # simpler and could not be stale -- but it would run it AFTER the tag exists,
+  # which is after the version number is already spent, and the tag is
+  # immutable. The value of the preflight is that it is cheap and BEFORE the
+  # tag; requiring its evidence is what actually forces it back in front of the
+  # cut, because the only way to have a green preflight for commit X is to have
+  # run it on X. An inline copy would move the red later, not earlier, and
+  # would still have burned v1.7.5's number.
+  #
+  # It also costs ~2 API calls rather than ~40s of duplicated work on every
+  # release, and it keeps ONE definition of "releasable" instead of two that
+  # can drift.
+  #
+  # The hazards the API route has to handle are handled in the script, with a
+  # self-test per leg (scripts/ci/test-assert-preflight-evidence.sh):
+  # in-flight runs block, a superseded green does not count, and the run must
+  # carry an artifact naming the commit it actually checked out -- because
+  # `head_sha` is the sha of the ref the run was DISPATCHED on, which is how
+  # v1.7.5/6/7 were each cut on a transcript that had audited main.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  preflight-evidence:
+    name: Require a green Release Preflight for this commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read   # list release-preflight runs and their artifacts
+    steps:
+      # Depth 1 and sparse on purpose, and NOT `fetch-depth: 0` by analogy with
+      # release-preflight.yml -- that workflow needs full history because check
+      # 5 bounds a commit range with `git describe` and `git log <tag>..HEAD`.
+      # This job reads the Actions API, not the repository: the only git call
+      # in the script is deriving the repo slug from the origin remote, and
+      # even that is bypassed because GATE_REPO is passed explicitly below.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: Assert a green preflight audited this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_REPO: ${{ github.repository }}
+          GATE_SHA: ${{ github.sha }}
+          GATE_TAG: ${{ github.ref_name }}
+        run: bash scripts/ci/assert-preflight-evidence.sh
+
   # ════════════════════════════════════════════════════════════════════════════
   # RESOLVE CANDIDATE IMAGE DIGEST  (issues #2696, #2711)
   #
   # docker-publish.yml runs INDEPENDENTLY on the same tag push and publishes
   # ghcr.io/.../artifact-keeper-backend:${VERSION} as a manifest list. A
   # cross-workflow `needs:` is impossible, so this job is the explicit gate:
-  # it follows the docker-publish RUN for this exact commit+tag to completion
-  # via the Actions API, then resolves the published digest from the registry.
+  # it waits, via the Actions API, for a SUCCESSFUL docker-publish run for
+  # this exact commit+tag -- the tag push's own run, or the documented
+  # `promote_version` recovery dispatch (#2698), which a re-tagged version
+  # needs because immutability correctly fails the push run forever (#3640) --
+  # then resolves the published digest from the registry.
   # Once merge-backend has pushed the tag, the digest-aware republish guard
   # (`assert-version-digest-consistent`) in docker-publish.yml guarantees it can
   # never be re-pointed to DIFFERENT content -- only re-applied to the same
@@ -102,7 +198,7 @@ jobs:
 
   resolve-candidate-digest:
     name: Resolve candidate image digest
-    needs: [release-preflight]
+    needs: [release-preflight, preflight-evidence]
     runs-on: ubuntu-latest
     # docker-publish's wall time is dominated by the amd64 backend image build
     # on the self-hosted runners: with a cold buildx cache it legitimately
@@ -121,7 +217,19 @@ jobs:
       backend_digest: ${{ steps.resolve.outputs.backend_digest }}   # sha256:...
       version: ${{ steps.resolve.outputs.version }}
     steps:
-      - name: Wait for the docker-publish run for this commit to complete
+      # scripts/ci for the resolver + adoption gate, .github/scripts for the
+      # registry probes, and full history so the adoption gate can diff the
+      # published image's source revision against the tag (the sparse worktree
+      # does not limit object-level `git diff <rev> <sha>`).
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          sparse-checkout: |
+            scripts/ci
+            .github/scripts
+
+      - name: Wait for a successful docker-publish run for this commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -129,47 +237,83 @@ jobs:
           echo "Locating the docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA}"
 
           # The same tag push triggers docker-publish.yml independently; find
-          # ITS run for this exact commit+tag. Webhook fan-out can lag, so
-          # allow up to 15 minutes for the run to appear before declaring
-          # docker-publish dead (a dead publish must fail this job RED rather
-          # than let a skipped gate slip the release through).
+          # a SUCCESSFUL run of it for this exact commit+tag. Selection lives
+          # in scripts/ci/resolve-candidate-publish-run.sh (self-tested by its
+          # sibling test-*.sh): it accepts `push` OR `workflow_dispatch` runs,
+          # because on a RE-TAGGED version the push run fails permanently on
+          # image immutability and the documented recovery is a
+          # `promote_version` dispatch (#2698) -- which re-points tags at the
+          # digest :$VERSION already names, rebuilding nothing, so the digest
+          # captured below is still the digest the gate then tests (#3640).
+          # It stays fail-closed: no successful run of either kind for this
+          # sha+ref blocks the release RED.
+          #
+          # Webhook fan-out can lag, so allow up to 15 minutes for a run to
+          # appear before declaring docker-publish dead. Once a run has been
+          # seen, there is deliberately NO fixed clock -- the job-level
+          # timeout-minutes above is the only ceiling, sized for the
+          # cold-cache amd64 build (issue #2711) -- and transient API errors
+          # just keep the loop polling.
           APPEAR_DEADLINE=$(($(date +%s) + 15*60))
-          RUN_ID=""
+          SEEN=0
           while true; do
-            RUN_ID=$(gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/runs?event=push&head_sha=${GITHUB_SHA}&per_page=20" \
-              --jq '.workflow_runs' 2>/dev/null \
-              | jq -r --arg ref "${GITHUB_REF_NAME}" \
-                  '[.[] | select(.head_branch == $ref)][0].id // empty' || true)
-            [ -n "${RUN_ID}" ] && break
-            if [ "$(date +%s)" -ge "${APPEAR_DEADLINE}" ]; then
-              echo "::error title=docker-publish never started::No docker-publish.yml run found for ${GITHUB_REF_NAME}@${GITHUB_SHA} after 15m. Release blocked."
-              exit 1
-            fi
-            echo "  no docker-publish run visible yet, waiting 30s..."
-            sleep 30
-          done
-          echo "  following docker-publish run ${RUN_ID}"
-
-          # Follow the run to completion. Deliberately NO fixed clock here --
-          # the job-level timeout-minutes above is the only ceiling, sized for
-          # the cold-cache amd64 build (issue #2711). Transient API errors
-          # yield STATUS=unknown and the loop just keeps polling.
-          while true; do
-            STATE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
-              --jq '.status + " " + (.conclusion // "-")' 2>/dev/null || echo "unknown -")
-            STATUS="${STATE%% *}"
-            CONCLUSION="${STATE#* }"
-            if [ "${STATUS}" = "completed" ]; then
-              if [ "${CONCLUSION}" = "success" ]; then
-                echo "  docker-publish run ${RUN_ID} completed successfully."
+            rc=0
+            RESOLVE_REPO="${GITHUB_REPOSITORY}" \
+            RESOLVE_SHA="${GITHUB_SHA}" \
+            RESOLVE_REF="${GITHUB_REF_NAME}" \
+              bash scripts/ci/resolve-candidate-publish-run.sh || rc=$?
+            case "${rc}" in
+              0)
+                echo "  a docker-publish run for this commit completed successfully."
                 break
-              fi
-              echo "::error title=docker-publish failed::docker-publish run ${RUN_ID} completed with conclusion '${CONCLUSION}'. Release blocked; fix and re-run docker-publish, then re-run this workflow."
-              exit 1
-            fi
-            echo "  docker-publish run ${RUN_ID}: ${STATUS}; waiting 60s..."
-            sleep 60
+                ;;
+              10)
+                SEEN=1
+                echo "  docker-publish still running; waiting 60s..."
+                sleep 60
+                ;;
+              20)
+                # Say something that can actually succeed. On a re-cut of an
+                # already-published version, "fix and re-run docker-publish"
+                # is impossible advice: every push-path rebuild is refused by
+                # the immutability guard, forever. Name the promote dispatch
+                # instead (#3640).
+                V="${GITHUB_REF_NAME#v}"
+                STATE=$(GHCR_TOKEN="${GH_TOKEN}" bash .github/scripts/registry-tag-state.sh \
+                  ghcr.io artifact-keeper/artifact-keeper-backend "${V}" 2>/dev/null || true)
+                case "${STATE}" in
+                  present)
+                    echo "::error title=docker-publish failed (version already published)::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success -- and backend:${V} is ALREADY PUBLISHED, so a push-path rebuild will be refused by the immutability guard every time. Recovery: gh workflow run docker-publish.yml --ref ${GITHUB_REF_NAME} -f promote_version=${V} ; when it succeeds, re-run this workflow (the promote re-points tags at the published digest and the next job verifies its sources against this tag)."
+                    ;;
+                  absent)
+                    echo "::error title=docker-publish failed::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success and backend:${V} is not published. Release blocked; fix the cause, re-run docker-publish, then re-run this workflow."
+                    ;;
+                  *)
+                    echo "::error title=docker-publish failed::Every docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA} completed without success (and whether backend:${V} is already published could not be read). Release blocked; if the version is already published, dispatch docker-publish with promote_version=${V}; otherwise fix the cause and re-run docker-publish. Then re-run this workflow."
+                    ;;
+                esac
+                exit 1
+                ;;
+              21|30)
+                # none-yet / API blip: before any run is seen these count
+                # against the appear deadline; after one was seen they are
+                # transient and the job timeout is the ceiling.
+                if [ "${SEEN}" = "0" ] && [ "$(date +%s)" -ge "${APPEAR_DEADLINE}" ]; then
+                  if [ "${rc}" = "30" ]; then
+                    echo "::error title=Cannot query docker-publish runs::The Actions API query kept failing for 15m; whether docker-publish ran for ${GITHUB_REF_NAME}@${GITHUB_SHA} is unknown. Release blocked; re-run this workflow."
+                  else
+                    echo "::error title=docker-publish never started::No docker-publish.yml run found for ${GITHUB_REF_NAME}@${GITHUB_SHA} after 15m. Release blocked."
+                  fi
+                  exit 1
+                fi
+                echo "  no verdict yet (state ${rc}); waiting 30s..."
+                sleep 30
+                ;;
+              *)
+                echo "::error title=resolver error::resolve-candidate-publish-run.sh exited ${rc} unexpectedly. Release blocked."
+                exit 1
+                ;;
+            esac
           done
 
       - name: Capture the published :$VERSION digest
@@ -263,6 +407,39 @@ jobs:
           echo "version=${VERSION}"               >> "$GITHUB_OUTPUT"
           echo "Candidate resolved: backend ${VERSION}@${BACKEND_DIGEST}"
 
+      # ── Adoption gate (#3640) ───────────────────────────────────────────────
+      # The run accepted above may be a promote dispatch, i.e. the published
+      # bytes may have been BUILT from a different commit than this tag (a
+      # re-tag after a non-image fix; rebuilds can never match because GIT_SHA
+      # is a build-arg and provenance embeds the revision). Adoption is
+      # verified, never assumed: read the revision the published index was
+      # built from and require it to be byte-identical to this tag across
+      # every input docker/Dockerfile.backend consumes. Any difference inside
+      # that set is a hard refusal -- those bytes are stale for this tag.
+      # Selection + refusal legs are self-tested offline in
+      # scripts/ci/test-assert-adopted-image-sources.sh.
+      - name: Assert the published image was built from this tag's sources
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          REV=$(GHCR_TOKEN="${GH_TOKEN}" bash .github/scripts/registry-tag-revision.sh \
+            ghcr.io artifact-keeper/artifact-keeper-backend "${VERSION}" || true)
+          echo "backend:${VERSION} reports source revision: ${REV}"
+          rc=0
+          ADOPT_TAG_SHA="${GITHUB_SHA}" \
+          ADOPT_PUBLISHED_REV="${REV}" \
+          ADOPT_LABEL="backend:${VERSION}" \
+            bash scripts/ci/assert-adopted-image-sources.sh || rc=$?
+          if [ "${rc}" = "1" ]; then
+            echo "::error title=Published image refused for this tag::backend:${VERSION} was built from ${REV}, which differs from ${GITHUB_SHA} inside the image input set. Adopting it would release stale bytes. Bump the version instead of re-tagging, or revert the input change."
+            exit 1
+          elif [ "${rc}" != "0" ]; then
+            echo "::error title=Image provenance unreadable::Could not verify what backend:${VERSION} was built from (see log). Indeterminate is not a pass; re-run this workflow."
+            exit 1
+          fi
+
   # ════════════════════════════════════════════════════════════════════════════
   # E2E GATE - Must pass before release proceeds
   # ════════════════════════════════════════════════════════════════════════════
@@ -341,10 +518,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
 
@@ -371,6 +548,18 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Same installer ci.yml uses for cargo-audit: prebuilt binaries, no
+      # compile on the release path. All three tools are published for Linux,
+      # macOS and Windows, which is what makes the five-target matrix viable.
+      #   cargo-auditable  embeds the dependency graph IN the binary
+      #   cargo-cyclonedx  emits the per-target SBOM shipped as a release asset
+      #   cargo-audit      reads the embedded graph back out, so the claim is
+      #                    checked here rather than asserted in a doc
+      - name: Install SBOM tooling
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-auditable,cargo-cyclonedx,cargo-audit
+
       - name: Set version from tag
         run: |
           VERSION=${GITHUB_REF_NAME#v}
@@ -389,7 +578,27 @@ jobs:
           SQLX_OFFLINE: true
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+        # `cargo auditable build` is a thin wrapper around `cargo build`: it
+        # wraps rustc to collect the resolved dependency versions and links
+        # them into the binary (`.dep-v0` on ELF, the equivalent section on
+        # Mach-O and PE). The compiled code is unchanged.
+        #
+        # This is what makes the SBOM verifiable FROM THE ARTIFACT. A .cdx.json
+        # shipped next to a tarball is a claim about a pairing the consumer
+        # cannot check; `cargo audit bin artifact-keeper-linux-amd64` asks the
+        # binary itself. It also survives the release profile's `strip = true`
+        # (Cargo.toml), which was measured rather than assumed: a release build
+        # of a throwaway crate carrying the same `strip = true` reports
+        # `stripped` to file(1), still carries a `.dep-v0` section, and
+        # `cargo audit bin` reads its dependency graph back out.
+        #
+        # The cross legs were rehearsed too, because they are the ones with no
+        # upstream CI coverage. Linux host -> mingw-w64
+        # `--target x86_64-pc-windows-gnu` with `strip = true` produced a PE32+
+        # that `cargo audit bin` read a complete graph out of. cargo-auditable's
+        # own CI covers native macOS and an ELF cross with a GCC cross-toolchain
+        # (i686), which is the shape of the aarch64-unknown-linux-gnu leg.
+        run: cargo auditable build --release --target ${{ matrix.target }} --features vendored-openssl
 
       - name: Package binary (Unix)
         if: "!contains(matrix.target, 'windows')"
@@ -413,6 +622,42 @@ jobs:
           cd dist
           sha256sum ${{ matrix.name }}.exe > ${{ matrix.name }}.exe.sha256
 
+      # A CycloneDX SBOM per target, from the Cargo dependency graph.
+      # `--target` is load-bearing and not decoration: the dependency graph is
+      # platform-filtered, so all five targets genuinely differ. Measured on
+      # this tree at 1.8.1 with cargo-cyclonedx 0.5.9 -- linux-amd64 724,
+      # linux-arm64 720, darwin-amd64 733, darwin-arm64 729, windows-amd64 744
+      # components. `--features vendored-openssl` matches the build above for
+      # the same reason: it pulls in openssl-src, which would otherwise be
+      # missing from the SBOM of a binary that contains it.
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          cargo cyclonedx \
+            --format json \
+            --spec-version 1.5 \
+            --all \
+            --target ${{ matrix.target }} \
+            --features vendored-openssl \
+            --override-filename "${{ matrix.name }}"
+          mkdir -p dist
+          # cargo-cyclonedx writes beside the CRATE manifest (backend/), not the
+          # workspace root, and appends only `.json` to --override-filename.
+          mv "backend/${{ matrix.name }}.json" "dist/${{ matrix.name }}.cdx.json"
+          ls -la "dist/${{ matrix.name }}.cdx.json"
+
+      # An embedded SBOM nobody checked is not an SBOM. `cargo audit bin`
+      # EXITS 0 on a binary with no embedded data -- it scrapes a partial list
+      # out of panic messages and warns -- so this step asserts on its OUTPUT.
+      # Without that, deleting `auditable` from the build command above leaves
+      # CI green and every shipped binary hollow.
+      # Failure legs exercised offline by scripts/ci/test-assert-binary-sbom.sh.
+      - name: Verify the shipped binary carries its dependency graph
+        env:
+          BINARY: dist/${{ matrix.name }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+          SBOM: dist/${{ matrix.name }}.cdx.json
+        run: ./scripts/ci/assert-binary-sbom.sh
+
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -420,6 +665,7 @@ jobs:
           path: |
             dist/${{ matrix.name }}.tar.gz*
             dist/${{ matrix.name }}.exe*
+            dist/${{ matrix.name }}.cdx.json
 
   # ════════════════════════════════════════════════════════════════════════════
   # VERIFY REQUIRED IMAGES PUBLISHED ON GHCR.IO
@@ -456,7 +702,7 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Checkout tag (for CHANGELOG verification)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # ── CHANGELOG documents the release ─────────────────────────────
       # Release policy: every final release vX.Y.Z must carry a
@@ -659,19 +905,40 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, release-gate, verify-images-published]
+    needs: [preflight-evidence, build-binaries, release-gate, verify-images-published]
+    # DECLARED, not inherited (#3558). This job used to take the workflow-level
+    # set, which gave it `packages: write` it has never used and -- more to the
+    # point -- gave it no `id-token` and no `attestations`, so it could not have
+    # signed or attested anything even if it had tried. Signing needs the OIDC
+    # token; provenance needs the attestations scope; and stating the set here
+    # means the next person adding a step to this job sees what it is allowed
+    # to do without cross-referencing the top of the file.
+    permissions:
+      contents: write       # create the Release, upload its assets, read the tree
+      id-token: write       # GitHub OIDC -> Fulcio, for cosign keyless signing
+      attestations: write   # actions/attest-build-provenance (and read, to verify it)
+      actions: read         # download this run's build-binaries artifacts
+      # `packages:` is deliberately absent: this job touches no registry. The
+      # image work is done and verified by the time it runs.
     # Every named gate is now required, but the condition stays explicit rather
     # than falling back to the default `success()`. `!cancelled()` rather than
     # `always()`: with `always()`, cancelling the run does not stop the
     # publication, because the gates it names have already reported success.
+    #
+    # `preflight-evidence` is named here as well as being an ancestor of every
+    # other job listed. That is redundant on purpose: it is the one gate whose
+    # whole subject is "a guard that is not required is a guard that will be
+    # skipped", so it is stated where the publication decision is actually
+    # made, not only where the dependency graph implies it (#3538).
     if: |
       !cancelled() &&
+      needs.preflight-evidence.result == 'success' &&
       needs.build-binaries.result == 'success' &&
       needs.release-gate.result == 'success' &&
       needs.verify-images-published.result == 'success'
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -702,17 +969,182 @@ jobs:
 
       - name: Collect release assets
         run: |
+          set -euo pipefail
           mkdir -p release-assets
           find artifacts -name "*.tar.gz*" -exec cp {} release-assets/ \;
           find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
+          find artifacts -name "*.cdx.json" -exec cp {} release-assets/ \;
           ls -la release-assets/
+
+      # ══════════════════════════════════════════════════════════════════════
+      # SIGN, ATTEST, THEN VERIFY -- ALL BEFORE `Create Release` (#3558)
+      #
+      # Until now the binaries shipped with a `<name>.sha256` next to them and
+      # nothing else. That file is served from the same place, by the same
+      # authority, as the artifact it describes: whoever can replace
+      # `artifact-keeper-linux-amd64.tar.gz` on the release can replace its
+      # `.sha256` in the same action. It detects a corrupted download. It is
+      # routinely read as detecting a substituted one.
+      #
+      # The ORDER is the point. `.github/scripts/assert-release-absent.sh`
+      # refuses to run against a tag that already has a release, and
+      # `overwrite_files: false` refuses to replace an asset, so a PARTIAL
+      # publish is not recoverable by re-running -- it burns an immutable tag.
+      # Everything that can fail therefore fails while this job has produced
+      # nothing public.
+      # ══════════════════════════════════════════════════════════════════════
+
+      # ONE manifest over the whole asset set, so ONE signature covers all of
+      # it. The per-file `.sha256` files stay: they are published today and
+      # people script against them, so removing them would be a silent break.
+      # They are now themselves listed in checksums.txt, which is the file that
+      # gets signed.
+      - name: Generate checksums.txt
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          # Written outside the directory first: `> checksums.txt` would create
+          # the file before `find` runs and the manifest would list itself.
+          # `-r` so an empty directory produces no manifest rather than
+          # `sha256sum` with no arguments, which reads stdin; `-d '\n'` so the
+          # split is on lines and not on whitespace inside a filename.
+          find . -maxdepth 1 -type f -printf '%P\n' | sort \
+            | xargs -r -d '\n' sha256sum > ../checksums.txt
+          mv ../checksums.txt checksums.txt
+          cat checksums.txt
+          # An empty or one-line manifest means the collect step found nothing.
+          # The verification step refuses it, but say so where it happened.
+          echo "checksums.txt lists $(wc -l < checksums.txt) file(s)"
+
+      # Version-pinned, unlike the docker-publish.yml installs, deliberately.
+      # `cosign verify-blob`'s `--signature`/`--certificate` pair is deprecated
+      # in v3 in favour of `--bundle` (v3.1.3 still accepts it, with a
+      # deprecation notice, and hides it from `--help`), so the exact CLI
+      # surface this job depends on is already mid-migration. This is the one
+      # job that cannot be rehearsed without cutting a tag, so it should not
+      # also be the place a silent CLI bump lands.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      # Keyless: GitHub OIDC -> Fulcio short-lived certificate -> Rekor. No key
+      # material exists to leak or rotate, and the certificate records WHICH
+      # workflow, in WHICH repository, at WHICH ref did the signing -- which is
+      # the property the verification step below pins against.
+      #
+      # ONE `.cosign.bundle` rather than a `.sig` + `.pem` pair: it carries the
+      # signature, the certificate and the transparency-log proof together, and
+      # it is what cosign v3 accepts.
+      #
+      # No `continue-on-error`, here or below. #2824: a failed cosign step let
+      # 1.6.1 ship unsigned and a human found it later. #3496 turned that into
+      # a rule, and scripts/ci/check-supply-chain-soft-fail.sh enforces it.
+      - name: Sign checksums.txt with cosign (keyless)
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle release-assets/checksums.txt.cosign.bundle \
+            release-assets/checksums.txt
+
+      # The images have carried build provenance since #3496; the binaries have
+      # not. This is what makes
+      # `gh attestation verify <file> --repo artifact-keeper/artifact-keeper`
+      # -- the command SECURITY.md now tells users to run -- return an answer.
+      # Same pinned SHA docker-publish.yml uses.
+      - name: Generate build provenance for the release assets
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        with:
+          subject-path: |
+            release-assets/*.tar.gz
+            release-assets/*.exe
+            release-assets/*.cdx.json
+            release-assets/checksums.txt
+
+      # THE POINT OF ALL OF IT. Signing without verifying is a ritual: nothing
+      # so far has checked that the signature covers these bytes, that it came
+      # from THIS workflow, or that checksums.txt describes what is actually in
+      # the directory.
+      #
+      # The identity is pinned to this repository's release workflow at THIS
+      # tag. Fulcio is a public CA -- `--certificate-identity-regexp '.*'`
+      # satisfies cosign and accepts a certificate minted by anyone's workflow
+      # -- so the gate inspects the pattern it was handed and refuses a
+      # permissive one before it verifies anything.
+      #
+      # Every failure leg is exercised offline by
+      # scripts/ci/test-verify-release-assets.sh, including the one that
+      # matters most: a real, valid signature carrying the WRONG certificate
+      # identity.
+      - name: Verify the release assets before publishing
+        env:
+          ASSETS_DIR: release-assets
+          ATTEST_REPO: ${{ github.repository }}
+          # `gh attestation verify --repo X` alone accepts an attestation from
+          # ANY workflow in X that holds `attestations: write`, and
+          # docker-publish.yml writes four per publish. Pin the signer, the
+          # same way the cosign certificate identity is pinned below.
+          ATTEST_SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release.yml
+          GH_TOKEN: ${{ github.token }}
+          # Deliberately spelled out rather than derived from the matrix. The
+          # matrix lives in another job and cannot be read from here, and an
+          # explicit list is what makes "a target silently stopped building"
+          # a refusal instead of a shorter release. The cross-check below
+          # catches drift in the other direction.
+          EXPECT_NAMES: |
+            artifact-keeper-linux-amd64
+            artifact-keeper-linux-arm64
+            artifact-keeper-darwin-amd64
+            artifact-keeper-darwin-arm64
+            artifact-keeper-windows-amd64
+        run: |
+          set -euo pipefail
+
+          # build-binaries uploads one artifact per matrix leg, named exactly
+          # `matrix.name`, so the downloaded directory names ARE the matrix.
+          # If it and EXPECT_NAMES disagree, one of them is stale.
+          downloaded="$(cd artifacts && ls -1d */ | sed 's#/##' | sort | tr '\n' ' ')"
+          expected="$(printf '%s\n' $EXPECT_NAMES | sed '/^$/d' | sort | tr '\n' ' ')"
+          if [ "$downloaded" != "$expected" ]; then
+            echo "::error title=Release asset expectation is stale::build-binaries produced [${downloaded}] but this step expects [${expected}]. Update EXPECT_NAMES in release.yml to match the build-binaries matrix."
+            exit 1
+          fi
+
+          # The Fulcio SAN for a job running directly in this workflow is
+          # `https://github.com/<repo>/.github/workflows/<file>@<ref>`. Pin all
+          # three. Built by a script rather than inline because the inline
+          # version was WRONG and silently so: its escaper never escaped
+          # anything, so every `.` in the "pinned" identity was a wildcard.
+          # scripts/ci/test-verify-release-assets.sh now asserts on the
+          # pattern's text and on what it accepts.
+          EXPECT_IDENTITY_REGEXP="$(./scripts/ci/release-identity-regexp.sh \
+            "${GITHUB_REPOSITORY}" release.yml "${GITHUB_REF}")"
+          export EXPECT_IDENTITY_REGEXP
+          export EXPECT_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+          echo "pinned certificate identity: ${EXPECT_IDENTITY_REGEXP}"
+
+          ./scripts/ci/verify-release-assets.sh
 
       - name: Resolve release notes
         id: notes
-        # Prefer a curated per-version notes body (.github/release-notes/<version>.md):
-        # a high-level paraphrase of the CHANGELOG, not the raw PR dump (see
-        # RELEASING.md "Release-notes style"). Fall back to GitHub's auto-generated
-        # notes only when no curated file exists (e.g. -rc/-beta prereleases).
+        # A stable release publishes a curated per-version body
+        # (.github/release-notes/<version>.md): a high-level paraphrase of the
+        # CHANGELOG, not the raw PR dump (RELEASING.md "Release-notes style").
+        # The `generate_release_notes` fallback survives for PRERELEASES only.
+        #
+        # It used to apply to everything, silently. v1.7.1 was cut with no
+        # curated file, this step logged "using GitHub auto-generated notes"
+        # and the release published anyway -- and because auto-notes do not
+        # promote the CHANGELOG, 8 `[Unreleased]` entries that had already
+        # shipped stayed under `[Unreleased]`, one of them an upgrade note
+        # telling 1.7.1 operators to act "before upgrading to 1.7.2" when they
+        # had been exposed for a week. Found six days later by a human
+        # (#3318, #3537).
+        #
+        # The preflight job asserts the same thing an hour earlier so this is
+        # rarely the arm that fires; it is here because this is where the
+        # decision is actually made, and a gate that lives only in a different
+        # job is one refactor away from being bypassed.
         run: |
           set -euo pipefail
           VER="${{ steps.version.outputs.version }}"
@@ -721,8 +1153,11 @@ jobs:
             echo "Using curated release notes: $F"
             echo "body_path=$F" >> "$GITHUB_OUTPUT"
             echo "generate=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Curated release notes missing::${F} does not exist on this ref. A stable release publishes a curated body, not GitHub's auto-generated PR list. Author it, commit it with the CHANGELOG promotion, and re-cut the tag."
+            exit 1
           else
-            echo "No curated notes for ${VER}; using GitHub auto-generated notes."
+            echo "No curated notes for prerelease ${VER}; using GitHub auto-generated notes."
             echo "body_path=" >> "$GITHUB_OUTPUT"
             echo "generate=true" >> "$GITHUB_OUTPUT"
           fi
@@ -753,6 +1188,217 @@ jobs:
           repository: artifact-keeper/artifact-keeper-windows
           event-type: backend-release
           client-payload: '{"version": "${{ steps.version.outputs.version }}", "tag": "${{ steps.version.outputs.tag }}"}'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PROMOTE FLOATING TAGS  (issues #2698, #3540)
+  #
+  # `:latest` and `:X.Y` are applied HERE, after the release gate and after the
+  # GitHub Release exists -- not by docker-publish at tag time, which is
+  # necessarily before the gate because it is what builds the bytes the gate
+  # tests. On v1.8.1 that gap was 78 minutes (publish 14:59:49, release
+  # 16:17:54) on a cut where nothing went wrong; on v1.7.2 it was ~9 hours for
+  # a version that was retired without the gate ever running.
+  #
+  # It rebuilds nothing. The dispatch runs docker-publish's existing PROMOTE
+  # path (#2698), which resolves the manifest-list digest that `:X.Y.Z`
+  # already names and re-points the floating tags at that same digest with
+  # `docker buildx imagetools create`. No layers move, the digest does not
+  # change, and the cosign signature and provenance attestation bound to it
+  # keep covering it. `:latest` becomes an alias for the exact bytes
+  # `resolve-candidate-digest` handed the gate; the assertion at the end of
+  # this job proves it rather than assuming it.
+  #
+  # THE FAILURE MODE THIS CREATES, STATED DELIBERATELY: when the gate fails --
+  # or when anything between the tag and the release fails -- `:latest` and
+  # `:X.Y` STAY ON THE PREVIOUS RELEASE. That is the intended end state. A
+  # floating tag is what an operator gets when they express no opinion, so the
+  # safe answer to "we do not yet know whether this build is good" is the last
+  # build we do know about. The visible consequence is that after a failed cut
+  # the registry looks like the release did not happen: `:X.Y.Z` exists (it is
+  # immutable and names real, scanned bytes) but `:latest` is unchanged. That
+  # is deliberate, and it is also the rollback story -- there is no separate
+  # rollback path to write, and no window in which `:latest` was wrong.
+  #
+  # Rolling `:latest` BACK after a bad release that did publish: delete or mark
+  # the bad GitHub Release as a prerelease, then dispatch
+  # `docker-publish.yml -f promote_version=<previous> -f promote_floating=true`.
+  # `.github/scripts/floating-tag-plan.sh` reads the published-release set, so
+  # once the bad release is gone the previous version becomes the newest and
+  # the floating tags are allowed to move to it. Un-publishing the release is
+  # the deliberate act; the tag movement follows from it.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  promote-floating-tags:
+    name: 🏷️ Promote Floating Tags
+    runs-on: ubuntu-latest
+    # Deliberately after `release`: the rule docker-publish enforces on the
+    # other side is "a floating tag may only name a version with a published
+    # GitHub Release", so the release object has to exist before the dispatch
+    # can succeed. That coupling is the point -- it means a hand-run promote
+    # cannot move `:latest` to something the gate never certified either.
+    needs: [resolve-candidate-digest, release-gate, build-binaries, verify-images-published, release]
+    # Default `success()` on every one of those. Prereleases keep their current
+    # behaviour exactly: they have never taken a floating tag, and this job
+    # does not give them one.
+    if: ${{ !contains(needs.resolve-candidate-digest.outputs.version, '-') }}
+    permissions:
+      actions: write   # dispatch docker-publish and follow its run
+      contents: read
+      packages: read
+    timeout-minutes: 45
+    steps:
+      - name: Dispatch the build-free floating-tag promotion
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve-candidate-digest.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Recorded BEFORE the dispatch so the run we then follow cannot be an
+          # older workflow_dispatch for the same commit. Backdated two minutes
+          # because this is a runner clock compared against GitHub's
+          # `created_at`: a runner running slightly fast would otherwise filter
+          # out the very run it just started and report the dispatch dead. The
+          # window stays far too small to catch a different promote of the same
+          # commit, and the newest match is the one taken.
+          START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "start=${START}" >> "$GITHUB_OUTPUT"
+          # Dispatched at the RELEASE TAG, not at a branch: the scanner-adapter
+          # promote path reads docker/scanner-adapter/VERSION from the ref it
+          # runs on, so it has to be the ref that was released.
+          gh workflow run docker-publish.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f "promote_version=${VERSION}" \
+            -f promote_floating=true
+          echo "Dispatched docker-publish promote (${VERSION}, floating) on ${GITHUB_REF_NAME}."
+
+      - name: Follow the promotion run to completion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          START: ${{ steps.dispatch.outputs.start }}
+        run: |
+          set -euo pipefail
+          # Webhook fan-out lags; allow the run to appear for 10 minutes before
+          # calling the dispatch dead.
+          APPEAR_DEADLINE=$(($(date +%s) + 10*60))
+          RUN_ID=""
+          while true; do
+            RUN_ID=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/runs?event=workflow_dispatch&per_page=50" \
+              --jq '.workflow_runs' 2>/dev/null \
+              | jq -r --arg sha "${GITHUB_SHA}" --arg since "${START}" \
+                  '[.[] | select(.head_sha == $sha and .created_at >= $since)]
+                   | sort_by(.created_at) | last | .id // empty' || true)
+            [ -n "${RUN_ID}" ] && break
+            if [ "$(date +%s)" -ge "${APPEAR_DEADLINE}" ]; then
+              echo "::error title=Promotion never started::No docker-publish workflow_dispatch run appeared for ${GITHUB_SHA} after 10m. The release is published but :latest was not moved; re-run this job, or dispatch docker-publish.yml with promote_version + promote_floating by hand."
+              exit 1
+            fi
+            echo "  no promotion run visible yet, waiting 20s..."
+            sleep 20
+          done
+          echo "Following docker-publish promote run ${RUN_ID}"
+          echo "  ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
+
+          while true; do
+            STATE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
+              --jq '.status + " " + (.conclusion // "-")' 2>/dev/null || echo "unknown -")
+            STATUS="${STATE%% *}"
+            CONCLUSION="${STATE#* }"
+            if [ "${STATUS}" = "completed" ]; then
+              if [ "${CONCLUSION}" = "success" ]; then
+                echo "  promotion run ${RUN_ID} completed successfully."
+                break
+              fi
+              echo "::error title=Floating-tag promotion failed::docker-publish promote run ${RUN_ID} concluded '${CONCLUSION}'. The release is published and :X.Y.Z is correct; :latest / :X.Y were NOT moved. Fix the cause and re-run this job."
+              exit 1
+            fi
+            echo "  promotion run ${RUN_ID}: ${STATUS}; waiting 30s..."
+            sleep 30
+          done
+
+      # ── Digest identity, end to end ─────────────────────────────────────────
+      # The whole release-assurance claim is bytes-tested == bytes-published.
+      # `verify-images-published` already asserts that for the exact tag; this
+      # extends the same assertion to the tags most consumers actually pull.
+      # A promotion that rebuilt instead of re-pointing would show up here as a
+      # different digest, on both registries.
+      - name: Assert floating tags resolve to the gate-tested digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_BACKEND: ${{ needs.resolve-candidate-digest.outputs.backend_digest }}
+          VERSION: ${{ needs.resolve-candidate-digest.outputs.version }}
+        run: |
+          set -uo pipefail
+          SERIES="${VERSION%.*}"
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          ghcr_digest() {
+            local name="$1" tag="$2" token
+            token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              -H "Authorization: Bearer ${GH_TOKEN}" | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            curl -sI --proto =https -H "Authorization: Bearer ${token}" ${MANIFEST_ACCEPT} \
+              "https://ghcr.io/v2/${name}/manifests/${tag}" \
+              | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { d = $2 } END { print d }'
+          }
+
+          hub_digest() {
+            local name="$1" tag="$2" token
+            token=$(curl -sf "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            curl -sI --proto =https -H "Authorization: Bearer ${token}" ${MANIFEST_ACCEPT} \
+              "https://registry-1.docker.io/v2/${name}/manifests/${tag}" \
+              | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { d = $2 } END { print d }'
+          }
+
+          # openscap is pinned by tag rather than digest, so its parity anchor
+          # is its own published :${VERSION} rather than a gate-captured digest.
+          EXPECTED_OPENSCAP="$(ghcr_digest artifact-keeper/artifact-keeper-openscap "${VERSION}")"
+          if [ -z "${EXPECTED_OPENSCAP}" ]; then
+            echo "::error::could not resolve ghcr openscap:${VERSION}"; exit 1
+          fi
+
+          echo "gate-tested backend digest : ${EXPECTED_BACKEND}"
+          echo "published openscap digest  : ${EXPECTED_OPENSCAP}"
+          echo ""
+
+          bad=0
+          assert() { # <label> <expected> <actual>
+            if [ -n "$3" ] && [ "$2" = "$3" ]; then
+              echo "  ok  $1 == $2"
+            else
+              echo "::error title=Floating tag digest mismatch::$1 resolves to ${3:-<unresolvable>}, expected $2."
+              bad=1
+            fi
+          }
+
+          for tag in "latest" "${SERIES}"; do
+            assert "ghcr backend:${tag}"   "${EXPECTED_BACKEND}"  "$(ghcr_digest artifact-keeper/artifact-keeper-backend "${tag}")"
+            assert "hub  backend:${tag}"   "${EXPECTED_BACKEND}"  "$(hub_digest artifactkeeper/backend "${tag}")"
+            assert "ghcr openscap:${tag}"  "${EXPECTED_OPENSCAP}" "$(ghcr_digest artifact-keeper/artifact-keeper-openscap "${tag}")"
+            assert "hub  openscap:${tag}"  "${EXPECTED_OPENSCAP}" "$(hub_digest artifactkeeper/openscap "${tag}")"
+          done
+
+          if [ "${bad}" -ne 0 ]; then
+            echo ""
+            echo "::error::Floating tags do not name the gate-tested bytes. :X.Y.Z is unaffected and remains correct."
+            exit 1
+          fi
+          {
+            echo "### Floating tags promoted"
+            echo ""
+            echo "\`:latest\` and \`:${SERIES}\` now resolve to the digest the release gate tested:"
+            echo ""
+            echo "- backend \`${EXPECTED_BACKEND}\`"
+            echo "- openscap \`${EXPECTED_OPENSCAP}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "OK: floating tags == gate-tested bytes."
 
   # ════════════════════════════════════════════════════════════════════════════
   # NOTE: Docker images are published by .github/workflows/docker-publish.yml,

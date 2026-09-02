@@ -20,6 +20,7 @@
 //! | SCT (signed certificate timestamp) | crate (`verify_digest`) |
 //! | Certificate validity at Rekor integrated time | crate (`verify_digest`) |
 //! | **Rekor inclusion proof + signed checkpoint** | **us** ([`rekor_glue`]) — the crate's `verify_digest` skips it (`TODO(tnytown)` in 0.14.0 and git main; it accepts forged proofs) |
+//! | **Rekor Signed Entry Timestamp (SET)** | **us** ([`rekor_glue`]) — the crate's `verify_digest` skips it too (`TODO(tnytown) SET verification`), though its *cosign* path implements the same check privately |
 //! | **OIDC issuer allowlist** | **us** — the crate's `policy::AnyOf` is secretly an AND, so we iterate the allowlist |
 //! | **Certificate identity extraction** | **us** ([`identity`]) — the crate exposes only assertion policies, never the parsed identity, and reads only Fulcio's deprecated `1.1` extensions |
 //! | **Subject-digest binding** | **us** — the crate reports a misleading `Transparency` error; our compare distinguishes replay from a bad signature |
@@ -29,25 +30,27 @@
 //! guard ([`AttestationVerdict::from_mask`]) makes "every check actually ran" an
 //! asserted property of *our* code, not an assumption about the crate's.
 //!
-//! # Known residual: `integratedTime` is not authenticated
+//! # `integratedTime` is authenticated by the SET (#3231, closed)
 //!
 //! The Signed Entry Timestamp is the field that binds a Rekor entry's
-//! `integratedTime`, and nothing verifies it — `verify_digest` skips it
-//! (`TODO(tnytown) SET verification` in 0.14.0) and the inclusion glue does not
-//! cover it either, because the SET is not part of `canonicalizedBody` and not
-//! part of the Merkle leaf. So the `integratedTime` that
-//! [`Check::CryptoAndChain`] compares against the certificate's validity window
-//! is a value the bundle's author chose, and that comparison is trivially
-//! satisfiable.
+//! `integratedTime`. `verify_digest` does not verify it (`TODO(tnytown) SET
+//! verification` in 0.14.0) and the inclusion glue does not cover it either,
+//! because the SET is not part of `canonicalizedBody` and not part of the Merkle
+//! leaf — so until #3231 the `integratedTime` that [`Check::CryptoAndChain`]
+//! compares against the certificate's validity window was a value the bundle's
+//! author chose, and that comparison was trivially satisfiable.
 //!
-//! This is not a practical bypass: satisfying it still requires a Fulcio leaf
-//! certificate whose SAN and source-repository extensions name the claimed
-//! publisher, which is the property [`Check::PublisherOwnerBound`] actually
-//! turns on. What it does mean is that the "cert was valid when it signed"
-//! check is corroborating evidence rather than an independent guarantee — do not
-//! describe it as a verified timestamp. Closing it means verifying the SET
-//! against the Rekor log key, which the crate does not expose primitives for;
-//! tracked as a follow-up.
+//! [`Check::RekorSet`] now verifies it against the Rekor log key from the pinned
+//! trusted root ([`rekor_glue::verify_signed_entry_timestamp`]), **fail-closed
+//! including a missing `inclusionPromise`**: an entry with no SET carries no
+//! authenticated timestamp, so it is rejected rather than downgraded. The
+//! practical effect is that "the certificate was valid when it signed" is now an
+//! independent statement by the log rather than corroborating evidence.
+//!
+//! The residual that remains is narrow and worth naming: verifying the SET
+//! proves the log *issued a promise* for this entry at that time; it is the
+//! inclusion proof ([`Check::RekorInclusion`]) that proves the entry is really
+//! in the log. Both are required here, so neither stands alone.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -97,6 +100,12 @@ pub enum Check {
     IssuerAllowlisted = 5,
     /// Cert-bound repository owner == claimed `publisher.repository` owner.
     PublisherOwnerBound = 6,
+    /// Rekor Signed Entry Timestamp, which authenticates `integratedTime` (our
+    /// glue — #3231). Runs *before* [`Check::RekorInclusion`] (the order the
+    /// crate's own cosign path uses), but takes the next free bit rather than
+    /// renumbering, so every bit position already reported in a log line or a
+    /// verdict keeps meaning what it meant.
+    RekorSet = 7,
 }
 
 impl Check {
@@ -109,6 +118,7 @@ impl Check {
             Check::BundleWellFormed => "bundle",
             Check::SubjectDigestBound => "subject binding",
             Check::CryptoAndChain => "signature/certificate chain",
+            Check::RekorSet => "transparency (Rekor SET)",
             Check::RekorInclusion => "transparency (Rekor inclusion)",
             Check::IssuerAllowlisted => "issuer",
             Check::IdentityExtracted => "identity",
@@ -122,6 +132,7 @@ pub const ALL_CHECKS: &[Check] = &[
     Check::BundleWellFormed,
     Check::SubjectDigestBound,
     Check::CryptoAndChain,
+    Check::RekorSet,
     Check::RekorInclusion,
     Check::IdentityExtracted,
     Check::IssuerAllowlisted,
@@ -215,9 +226,15 @@ impl AttestationVerdict {
     }
 
     /// **The structural short-circuit guard.** A verdict is `Verified` if and
-    /// only if the coverage bitmask has *every* check set. This is the single
-    /// place that can mint a `Verified` state, so "no check was skipped" is a
-    /// property of our code — proven by [`tests::success_requires_every_check`].
+    /// only if the coverage bitmask has *every* check set. This is the only
+    /// place a *live* verification can mint a `Verified` state, so "no check was
+    /// skipped" is a property of our code — proven by
+    /// [`tests::success_requires_every_check`].
+    ///
+    /// The one other minting site is [`AttestationVerdict::from_record`], which
+    /// re-hydrates a verdict this function already produced and persisted; it
+    /// runs no checks of its own and is reachable only through
+    /// [`reusable_verdict`]'s guards.
     fn from_mask(mask: u16, id: &identity::CertIdentity) -> Self {
         if mask != all_mask() {
             // Defensive: a caller that reached here without all bits is a bug;
@@ -234,6 +251,26 @@ impl AttestationVerdict {
             issuer: id.issuer.clone(),
             error: None,
             checks_passed: mask,
+        }
+    }
+
+    /// Re-hydrate a `Verified` verdict from the persisted record of an earlier
+    /// successful verification (#3230). Private on purpose: the only caller is
+    /// [`reusable_verdict`], which owns the guards that decide the record may
+    /// stand in for a fresh run.
+    ///
+    /// `repository` is `None` because migration 195 records the cert-bound
+    /// *owner* and identity but not the repository; the owner is what the
+    /// publisher binding and [`verified_marker`] consume.
+    fn from_record(identity: &str, issuer: &str, owner: &str) -> Self {
+        Self {
+            state: AttestationState::Verified,
+            identity: Some(identity.to_string()),
+            owner: Some(owner.to_string()),
+            repository: None,
+            issuer: Some(issuer.to_string()),
+            error: None,
+            checks_passed: all_mask(),
         }
     }
 
@@ -390,7 +427,17 @@ pub async fn verify_pypi_bundle(
     }
     mask |= Check::CryptoAndChain.bit();
 
-    // 4) Rekor inclusion proof + signed checkpoint (OUR glue over the crate's
+    // 4a) Rekor Signed Entry Timestamp (OUR glue — #3231). Runs before the
+    //     inclusion proof, the order the crate's own cosign path uses. This is
+    //     what makes the `integratedTime` that step 3 just compared against the
+    //     certificate's validity window a value the LOG asserted rather than one
+    //     the bundle's author picked. Fail-closed, missing promise included.
+    if let Err(e) = rekor_glue::verify_signed_entry_timestamp(bundle_json, trust.bytes()) {
+        return AttestationVerdict::failed(Check::RekorSet, mask, format!("{e:#}"));
+    }
+    mask |= Check::RekorSet.bit();
+
+    // 4b) Rekor inclusion proof + signed checkpoint (OUR glue over the crate's
     //    own primitives — `verify_digest` skips this entirely).
     if let Err(e) = rekor_glue::verify_inclusion(bundle_json, trust.bytes()) {
         return AttestationVerdict::failed(Check::RekorInclusion, mask, format!("{e:#}"));
@@ -505,6 +552,137 @@ pub fn verified_marker(verdict: &AttestationVerdict) -> Option<Value> {
         "identity": verdict.identity,
         "issuer": verdict.issuer,
     }))
+}
+
+/// Prepare the evaluation-context metadata for one catalog row: drop whatever
+/// verification marker the stored row carried, then inject the one this
+/// `verdict` earns (if any). Returns `true` if a pre-existing marker was
+/// dropped, which is always worth logging — a persisted marker can only come
+/// from a blob that asserted its own verification.
+///
+/// The marker is a trusted server-side assertion: `extract_publisher`
+/// short-circuits on it and returns `verified = true`. Strip-then-inject in one
+/// place is what keeps "the only way to reach the verified arm is a verdict we
+/// produced" true at every call site.
+pub fn apply_verified_marker(metadata: &mut Value, verdict: Option<&AttestationVerdict>) -> bool {
+    let dropped = crate::services::curation::publisher_source::strip_verification_marker(metadata);
+    if let Some(marker) = verdict.and_then(verified_marker) {
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                crate::services::curation::publisher_source::VERIFICATION_MARKER.to_string(),
+                marker,
+            );
+        }
+    }
+    dropped
+}
+
+/// How long a persisted `verified` record may be reused before the verification
+/// is re-run against the upstream distribution (#3230).
+///
+/// A verification is a statement about an immutable artifact digest, so it does
+/// not go stale the way a vulnerability scan does. What *can* change under it is
+/// the policy the statement was made against: the OIDC issuer allowlist (checked
+/// explicitly below, so a narrowed allowlist invalidates the record
+/// immediately), the pinned Sigstore trusted root, and the certificate-chain and
+/// transparency logic in this module and the crate under it. A bounded window
+/// makes those re-run on their own without an operator having to know they must
+/// force a re-verification.
+pub const VERIFIED_RECORD_MAX_AGE_DAYS: i64 = 30;
+
+/// The persisted attestation-verification record of one curation row — the
+/// columns migration 195 added, read back (#3230).
+///
+/// Borrowed rather than owned so the caller can build it straight off a
+/// [`crate::models::curation::CurationPackage`] with no allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct AttestationRecord<'a> {
+    /// `attestation_state`: `unverified` | `verified` | `failed`.
+    pub state: &'a str,
+    /// `attestation_identity` — the cert-bound workflow identity (SAN URI).
+    pub identity: Option<&'a str>,
+    /// `attestation_issuer` — the cert-bound OIDC issuer.
+    pub issuer: Option<&'a str>,
+    /// `attestation_owner` — the cert-bound repository owner.
+    pub owner: Option<&'a str>,
+    /// `attestation_verified_at` — when verification last ran.
+    pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `upstream_updated_at` — when the row's catalog content was last
+    /// re-ingested from the upstream. A record older than this describes
+    /// *different* row content and must not be reused.
+    pub upstream_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl<'a> AttestationRecord<'a> {
+    /// Read the record off a catalog row.
+    pub fn of(pkg: &'a crate::models::curation::CurationPackage) -> Self {
+        Self {
+            state: pkg.attestation_state.as_str(),
+            identity: pkg.attestation_identity.as_deref(),
+            issuer: pkg.attestation_issuer.as_deref(),
+            owner: pkg.attestation_owner.as_deref(),
+            verified_at: pkg.attestation_verified_at,
+            upstream_updated_at: pkg.upstream_updated_at,
+        }
+    }
+}
+
+/// Rehydrate a `Verified` verdict from a persisted record, or `None` if the
+/// record cannot be trusted to stand in for a fresh verification (#3230).
+///
+/// This is what stops a verification from evaporating with the scheduler tick
+/// that computed it: without it, any later re-evaluation of the row — an
+/// operator resetting a package to `pending`, `re_evaluate_pending`, a manual
+/// sync — loses `verified = true` and an `approved` package silently returns to
+/// `review`. It also means a re-evaluation does not re-download the distribution
+/// from the upstream, which is the reason the columns were added.
+///
+/// Fail-safe: every guard below returning `None` means "verify again", never
+/// "trust anyway". `None` is therefore always at most today's behaviour.
+///
+/// Guards, in order:
+/// 1. the record says `verified` (the column is `CHECK`-constrained to the three
+///    states, and only [`verified_marker`]'s own source can write `verified`);
+/// 2. all three cert-bound values are present and non-empty — a `verified` row
+///    without them is a partial write, not a verification;
+/// 3. the recorded issuer is **still** on the caller's current allowlist, so
+///    narrowing the allowlist takes effect on the next evaluation rather than at
+///    the next re-verification window;
+/// 4. the record is within [`VERIFIED_RECORD_MAX_AGE_DAYS`];
+/// 5. the row has not been re-ingested from the upstream since the record was
+///    written (`upstream_updated_at <= verified_at`) — otherwise the record
+///    describes content the row no longer carries.
+pub fn reusable_verdict(
+    record: &AttestationRecord<'_>,
+    issuer_allowlist: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<AttestationVerdict> {
+    if record.state != AttestationState::Verified.as_str() {
+        return None;
+    }
+    fn nonempty(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let identity = nonempty(record.identity)?;
+    let issuer = nonempty(record.issuer)?;
+    let owner = nonempty(record.owner)?;
+
+    if !issuer_allowlist.iter().any(|allowed| allowed == issuer) {
+        return None;
+    }
+
+    let verified_at = record.verified_at?;
+    if now.signed_duration_since(verified_at) > chrono::Duration::days(VERIFIED_RECORD_MAX_AGE_DAYS)
+    {
+        return None;
+    }
+    if let Some(updated) = record.upstream_updated_at {
+        if updated > verified_at {
+            return None;
+        }
+    }
+
+    Some(AttestationVerdict::from_record(identity, issuer, owner))
 }
 
 /// npm verification: ingested but unsupported. Always returns a `Failed`

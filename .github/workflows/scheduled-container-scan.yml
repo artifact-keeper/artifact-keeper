@@ -23,10 +23,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Log in to Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -41,7 +41,35 @@ jobs:
           docker rm "$CONTAINER_ID"
           trivy --version
 
-      - name: Trivy scan - Backend
+      # Record what each scanned tag actually IS before scanning it (#3262).
+      # `:latest` only moves on a stable release, so it can lag `main` by
+      # weeks; `:dev` tracks `main`. Without this provenance in the issue body
+      # a finding against a months-old release image is indistinguishable from
+      # a live regression on main, which is exactly how #3262 was read as "2
+      # CRITICAL/HIGH on the backend" when both findings were already fixed on
+      # main and present only in the frozen v1.6.3 `:latest` artifact.
+      - name: Record scanned image provenance
+        run: |
+          set -euo pipefail
+          : > scanned-images.txt
+          for entry in \
+            "Backend (latest):${REGISTRY}/${BACKEND_IMAGE}:latest" \
+            "Backend (dev):${REGISTRY}/${BACKEND_IMAGE}:dev" \
+            "OpenSCAP:${REGISTRY}/${OPENSCAP_IMAGE}:latest"; do
+            name="${entry%%:*}"
+            ref="${entry#*:}"
+            if docker pull -q "$ref" >/dev/null 2>&1; then
+              version=$(docker image inspect "$ref" \
+                --format '{{index .Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null || echo 'unknown')
+              created=$(docker image inspect "$ref" --format '{{.Created}}' 2>/dev/null || echo 'unknown')
+              printf '%s|%s|%s|%s\n' "$name" "$ref" "${version:-unknown}" "${created:-unknown}" >> scanned-images.txt
+            else
+              printf '%s|%s|%s|%s\n' "$name" "$ref" "pull-failed" "pull-failed" >> scanned-images.txt
+            fi
+          done
+          cat scanned-images.txt
+
+      - name: Trivy scan - Backend (latest)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
@@ -53,6 +81,21 @@ jobs:
           ignore-unfixed: true
           # Suppress residual CVEs in the bundled trivy/grype CLI binaries that
           # have no fixed tool release yet (justified per-CVE in .trivyignore).
+          trivyignores: '.trivyignore'
+          exit-code: '0'
+          skip-setup-trivy: true
+
+      # The tag that tracks `main`. A finding here is actionable by a PR; a
+      # finding that appears only against `:latest` is a property of the last
+      # stable release and clears on the next publish (#3262).
+      - name: Trivy scan - Backend (dev)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        if: always()
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:dev
+          format: 'sarif'
+          output: 'backend-dev-trivy.sarif'
+          ignore-unfixed: true
           trivyignores: '.trivyignore'
           exit-code: '0'
           skip-setup-trivy: true
@@ -80,14 +123,21 @@ jobs:
       # comes back online.
 
       - name: Upload Backend Trivy SARIF
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
         if: always()
         with:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend-scheduled'
 
+      - name: Upload Backend (dev) Trivy SARIF
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+        if: always()
+        with:
+          sarif_file: 'backend-dev-trivy.sarif'
+          category: 'trivy-backend-dev-scheduled'
+
       - name: Upload OpenSCAP Trivy SARIF
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
         if: always()
         with:
           sarif_file: 'openscap-trivy.sarif'
@@ -100,7 +150,9 @@ jobs:
           name: trivy-weekly-reports
           path: |
             backend-trivy.sarif
+            backend-dev-trivy.sarif
             openscap-trivy.sarif
+            scanned-images.txt
           retention-days: 90
 
       - name: Check for new findings and create issue
@@ -110,19 +162,68 @@ jobs:
           script: |
             const fs = require('fs');
 
+            // Provenance recorded before the scans: name|ref|version|created.
+            const provenance = {};
+            if (fs.existsSync('scanned-images.txt')) {
+              for (const line of fs.readFileSync('scanned-images.txt', 'utf8').split('\n')) {
+                if (!line.trim()) continue;
+                const [name, ref, version, created] = line.split('|');
+                provenance[name] = { ref, version, created };
+              }
+            }
+
+            // Severity comes from the SARIF rule, not from the step config:
+            // this scan sets no `severity:` filter at all (it is visibility
+            // only, exit-code 0), so calling every result CRITICAL/HIGH — as
+            // this script used to — overstates the result. #3262 was filed as
+            // "2 CRITICAL/HIGH" when it was 1 HIGH + 1 MEDIUM.
+            function summarize(file) {
+              const sarif = JSON.parse(fs.readFileSync(file, 'utf8'));
+              const run = sarif.runs?.[0] || {};
+              const results = run.results || [];
+              const rules = {};
+              for (const rule of run.tool?.driver?.rules || []) rules[rule.id] = rule;
+              const bySeverity = {};
+              const locations = {};
+              for (const r of results) {
+                const tags = rules[r.ruleId]?.properties?.tags || [];
+                const sev = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].find(s => tags.includes(s)) || 'UNKNOWN';
+                bySeverity[sev] = (bySeverity[sev] || 0) + 1;
+                const loc = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri || 'unknown';
+                locations[loc] = (locations[loc] || 0) + 1;
+              }
+              return { count: results.length, bySeverity, locations };
+            }
+
             let totalFindings = 0;
             const summaries = [];
 
-            for (const [name, file] of [['Backend', 'backend-trivy.sarif'], ['OpenSCAP', 'openscap-trivy.sarif']]) {
+            const targets = [
+              ['Backend (latest)', 'backend-trivy.sarif'],
+              ['Backend (dev)', 'backend-dev-trivy.sarif'],
+              ['OpenSCAP', 'openscap-trivy.sarif'],
+            ];
+
+            for (const [name, file] of targets) {
+              const p = provenance[name];
+              const meta = p ? ` — \`${p.ref}\` (version \`${p.version}\`, built ${p.created})` : '';
               if (!fs.existsSync(file)) {
-                summaries.push(`- **${name}**: Scan skipped or failed`);
+                summaries.push(`- **${name}**: Scan skipped or failed${meta}`);
                 continue;
               }
-              const sarif = JSON.parse(fs.readFileSync(file, 'utf8'));
-              const results = sarif.runs?.[0]?.results || [];
-              const count = results.length;
+              const { count, bySeverity, locations } = summarize(file);
               totalFindings += count;
-              summaries.push(`- **${name}**: ${count} finding(s)`);
+              if (count === 0) {
+                summaries.push(`- **${name}**: 0 findings${meta}`);
+                continue;
+              }
+              const sevText = Object.entries(bySeverity)
+                .map(([s, n]) => `${n} ${s}`)
+                .join(', ');
+              const locText = Object.entries(locations)
+                .map(([l, n]) => `\`${l}\` (${n})`)
+                .join(', ');
+              summaries.push(`- **${name}**: ${count} finding(s) — ${sevText}${meta}\n  - Located in: ${locText}`);
             }
 
             console.log(`Total findings: ${totalFindings}`);
@@ -150,9 +251,26 @@ jobs:
                   body: [
                     '## Weekly Container Scan Results',
                     '',
-                    `Trivy found **${totalFindings}** CRITICAL/HIGH finding(s) with available fixes:`,
+                    `Trivy found **${totalFindings}** finding(s) with an available fix, at all severities`,
+                    '(this scan sets no severity filter and gates nothing — `exit-code: 0`):',
                     '',
                     ...summaries,
+                    '',
+                    '### How to read this',
+                    '',
+                    '- **Backend (dev)** tracks `main`. A finding here is actionable by a PR.',
+                    '- **Backend (latest)** is the last *stable release*, which can lag `main` by weeks.',
+                    '  A finding that appears only against `:latest` is already fixed on `main` if the',
+                    '  version label above predates the fix — it clears on the next stable publish, and',
+                    '  must **not** be given a `.trivyignore` suppression (that would suppress a finding',
+                    '  in a build we no longer produce).',
+                    '- Findings located in `usr/local/bin/grype` come from the bundled scanner CLI,',
+                    '  which since #3352 is BUILT FROM SOURCE on a go1.26.6-floored toolchain rather',
+                    '  than copied from `ghcr.io/anchore/grype`. A Go **stdlib** finding here is',
+                    '  therefore fixable by raising `GO_MIN_PATCH` in docker/Dockerfile.backend and',
+                    '  docker/Dockerfile.backend.alpine — do **not** suppress it. A grype *dependency*',
+                    '  finding is only suppressible if no resolvable fixed version exists to build',
+                    '  against (see the docker/docker note in `.trivyignore`).',
                     '',
                     `[View scan run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
                     '',
@@ -168,7 +286,16 @@ jobs:
         run: |
           echo "## Weekly Container Scan Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Backend**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backend (latest)**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backend (dev)**: $([ -f backend-dev-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **OpenSCAP**: $([ -f openscap-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f scanned-images.txt ]; then
+            echo "| Image | Ref | Version | Built |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+            while IFS='|' read -r name ref version created; do
+              echo "| $name | \`$ref\` | \`$version\` | $created |" >> $GITHUB_STEP_SUMMARY
+            done < scanned-images.txt
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "SARIF reports uploaded to Security tab and as workflow artifacts." >> $GITHUB_STEP_SUMMARY

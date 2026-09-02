@@ -101,8 +101,10 @@ impl TrivyFsScanner {
         args.extend_from_slice(&[
             "--format",
             "json",
+            // #3296: the shared allowlist includes UNKNOWN so ungraded CVEs
+            // reach the report instead of being dropped at the CLI.
             "--severity",
-            "CRITICAL,HIGH,MEDIUM,LOW",
+            crate::services::scanner_service::TRIVY_FS_SEVERITY_LIST,
             // #903: enumerate every package the scanner saw (not just
             // CVE-bearing rows) so SBOM generation reflects the complete
             // dependency tree. `convert_trivy_packages` reads from the
@@ -120,7 +122,14 @@ impl TrivyFsScanner {
             "standalone"
         };
 
-        let output = tokio::process::Command::new("trivy")
+        let mut command = tokio::process::Command::new("trivy");
+        // `tokio::process::Command` defaults `kill_on_drop` to `false`. This
+        // scan runs inside the caller's inline-proxy-gate timeout, and when
+        // that timeout fires it drops this future -- without this, the trivy
+        // child is ORPHANED and keeps running to completion unsupervised.
+        // Same fix, same rationale, as the grype spawn (#3455).
+        command.kill_on_drop(true);
+        let output = command
             .args(&args)
             .output()
             .await

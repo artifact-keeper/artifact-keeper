@@ -60,7 +60,7 @@ fn regression_ghsa_mc8p_6758_jfp2_sumdb_host_allowlist() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 2 — GHSA-7f39-724h-cccm (PR #880)
+// Bug 2 — GHSA-93ch-hrfh-5wcw (PR #880)
 // Class:  SQL LIKE wildcard injection in Maven SNAPSHOT lookup
 // Seam:   `escape_like_literal` + composing helper `snapshot_like_pattern`
 // What:   User-controlled artifact path segments were interpolated into a
@@ -103,7 +103,7 @@ fn regression_ghsa_7f39_724h_cccm_maven_like_escape() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 3 — GHSA-93ch-hrfh-5wcw (PR #881)
+// Bug 3 — GHSA-7f39-724h-cccm (PR #881)
 // Class:  SSRF — IPv6 + extra cloud-metadata IP bypasses
 // Seam:   `validate_outbound_url` (the gatekeeper used by every outbound
 //         fetcher: cargo proxy, webhooks, remote replication, ...)

@@ -167,7 +167,7 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
           /mnt/rootfs/usr/bin/sed \
           /mnt/rootfs/usr/bin/bashbug*
 
-# ---------- Stage 5: Copy scanner CLIs from official images ----------
+# ---------- Stage 5: Build the grype scanner CLI from source ----------
 # The trivy CLI is intentionally NOT bundled in the runtime image. Container
 # image scans go through a Harbor scanner-adapter over HTTP (TRIVY_ADAPTER_URL,
 # #2088); the fs/incus scanners drive the trivy sidecar in server mode
@@ -175,23 +175,248 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # binary's HIGH-severity Go-dependency CVEs and ~150 MB of image size with no
 # functional loss. See issues #1544 and #2088.
 #
-# Grype is pinned to v0.117.0, the latest upstream release. Bumped from
-# v0.116.0 for #3307: v0.116.0 bundles github.com/go-git/go-git/v5 v5.19.1,
-# and CVE-2026-71556 (HIGH, GHSA-hc8v-wwc9-vgxm -- worktree operations resolve
-# symlinks outside the worktree boundary) was published against it, failing the
-# Docker Publish Trivy gate and skipping every multi-arch manifest. v0.117.0
-# pins go-git v5.19.2, which is the fixed version. It also moves grpc-go
-# 1.80.0 -> 1.82.1, which retires the GHSA-hrxh-6v49-42gf suppression, and
-# x/text 0.39.0 -> 0.40.0.
+# Grype is BUILT FROM SOURCE at the pinned upstream tag (#3352), the same
+# treatment #3123 gave trivy. It is NOT copied out of ghcr.io/anchore/grype
+# any more, and the two are not interchangeable: that image's binary is
+# compiled with whatever Go toolchain Anchore's release ran on, and a Go
+# STDLIB advisory against it is unfixable by us. Bumping the grype tag does
+# not help, because a stdlib CVE is a property of the compiler, not of grype
+# — v0.117.0 was the current release and was itself built on go1.26.3.
 #
-# Note that nothing regressed to cause that: v0.116.0 scanned clean when it was
-# pinned and went red days later when the advisory was published. A clean scan
-# is a statement about a moment, not a property of a pin.
+# That is not hypothetical. `Security Scan` in docker-publish.yml failed on
+# every run on main and on release/1.7.x with six HIGH stdlib findings against
+# usr/local/bin/grype (CVE-2026-33818 encoding/asn1, -56853 net/http, -56858
+# html/template, -56859 encoding/xml, -56860 net/url, -56862 crypto/tls), all
+# fixed in go1.26.6. No images published from either branch, blocking both a
+# v1.7.5 security tag and v1.8.0. Rebuilding on go1.26.6 clears those six plus
+# the five older stdlib CVEs .trivyignore was suppressing (-27145, -39821,
+# -39822, -42504, -46600): 12 HIGH+fixed findings against the binary drop to 1.
 #
-# It still bundles Go 1.26.3 stdlib and docker v28.5.2; those residual CVEs
-# have no fixed grype release yet and are documented/suppressed in /.trivyignore
-# rather than "bumped away". Re-evaluate that file on every bump (#2391).
-FROM ghcr.io/anchore/grype:v0.117.0 AS grype-bin
+# The upstream SOURCE tag is unchanged, so this is a repackaging, not a fork:
+# `grype --version` still prints exactly `grype 0.117.0` (GrypeScanner parses
+# that, and #3287 composes it with the CVE-DB build date into
+# `scanner_version`), `grype version` still reports GitCommit/GitDescription
+# for the upstream tag, and `Supported DB Schema` is still 6, so the DB seeded
+# in stage 5b below still loads. The one field that moves is GoVersion, which
+# is the entire point.
+#
+# History worth keeping: v0.116.0 -> v0.117.0 was bumped for #3307
+# (CVE-2026-71556 HIGH, go-git v5.19.1 -> v5.19.2, plus grpc-go 1.80.0 ->
+# 1.82.1 and x/text 0.39.0 -> 0.40.0). Nothing regressed to cause that —
+# v0.116.0 scanned clean when it was pinned and went red days later when the
+# advisory was published against a dependency it already shipped. A clean scan
+# is a statement about a moment, not a property of a pin, which is why this
+# stage is listed in `no-cache-filters` and rebuilt on every publish.
+#
+# Still NOT fixed by this stage: github.com/docker/docker v28.5.2
+# (CVE-2026-34040 HIGH, fixed in 29.3.1) is a DEPENDENCY, not the toolchain,
+# and stays suppressed in /.trivyignore. Overriding it was tried and does not
+# work: `go mod edit -require=github.com/docker/docker@v29.3.1+incompatible`
+# fails module resolution with "unknown revision v29.3.1", so unlike the
+# artifact-keeper/trivy overrides there is no version to point at. Suppress
+# when there is no fix; rebuild when the fix is a toolchain away.
+#
+# Fixed by this stage as of #3465: golang.org/x/mod. See the override block
+# below the clone. It is the third lever this stage has needed — bump the tag
+# (#3307), rebuild on a newer toolchain (#3352), override a module (#3465) —
+# and the only one that makes our build differ from upstream's, so it carries
+# more machinery than the other two.
+#
+# Build on $BUILDPLATFORM and cross-compile to $TARGETARCH (same pattern as
+# Dockerfile.scanner-adapter) so the multi-arch build does not run the Go
+# compiler under emulation. The output is still a TARGETARCH binary, exactly
+# as the multi-arch upstream image used to supply.
+#
+# GO_MIN_PATCH is a hard floor asserted below, not a comment. `golang:1.26`
+# floats to the newest 1.26.x, which is what you want for a security rebuild,
+# but the floor means a mirror lagging behind fails the build loudly instead
+# of silently shipping a vulnerable stdlib. Raise it when a new Go stdlib
+# advisory lands; that one-line bump replaces what used to be a .trivyignore
+# entry.
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
+ARG TARGETOS
+ARG TARGETARCH
+ARG GRYPE_VERSION=0.117.0
+ARG GRYPE_COMMIT=b5fa92bbcbef655497e3be840a2f718380e2cdd3
+ARG GO_MIN_PATCH=1.26.6
+# The single declared divergence from upstream grype at this tag. See the
+# override block below the clone for the justification and removal condition.
+ARG XMOD_FROM=v0.38.0
+ARG XMOD_TO=v0.40.0
+
+RUN apk add --no-cache git ca-certificates
+
+RUN set -eu; \
+    have="$(go env GOVERSION | sed 's/^go//')"; \
+    oldest="$(printf '%s\n%s\n' "${have}" "${GO_MIN_PATCH}" | sort -V | head -n1)"; \
+    if [ "${have}" != "${GO_MIN_PATCH}" ] && [ "${oldest}" != "${GO_MIN_PATCH}" ]; then \
+      echo "ERROR: Go toolchain go${have} is older than the required go${GO_MIN_PATCH}." >&2; \
+      echo "       Building grype on it would ship known-vulnerable stdlib (#3352)." >&2; \
+      exit 1; \
+    fi; \
+    echo "grype build: go${have} satisfies the go${GO_MIN_PATCH} floor"
+
+WORKDIR /src
+
+# Clone the pinned TAG and verify it resolves to the pinned COMMIT: a tag is
+# mutable, a commit is not, so this is what makes the pin a supply-chain
+# statement rather than a naming convention. Module downloads still go through
+# the Go module proxy and are checksum-verified against go.sum.
+RUN set -eu; \
+    git clone --depth 1 --branch "v${GRYPE_VERSION}" https://github.com/anchore/grype.git .; \
+    actual="$(git rev-parse HEAD)"; \
+    if [ "${actual}" != "${GRYPE_COMMIT}" ]; then \
+      echo "ERROR: grype v${GRYPE_VERSION} resolved to ${actual}, expected ${GRYPE_COMMIT}" >&2; \
+      exit 1; \
+    fi
+
+# ---- Dependency override: golang.org/x/mod ${XMOD_FROM} -> ${XMOD_TO} (#3465)
+#
+# CVE-2026-56864 (GO-2026-6180) and CVE-2026-56865 (GO-2026-6179), both HIGH
+# and both fixed in x/mod v0.40.0, are reported against `usr/local/bin/grype`
+# and failed the Docker Publish Security Scan for the v1.7.7 tag. That tag is
+# unrecoverable — rulesets forbid deleting or moving a tag — so it was the
+# third burned version in this series and the reason this block exists.
+#
+# THIS IS AN OVERRIDE, NOT A BUMP, and that distinction is the whole point.
+# The three levers this stage has, in order of preference:
+#   1. bump GRYPE_VERSION to a release that carries the fix  (#3307)
+#   2. rebuild on a newer Go toolchain, for a stdlib CVE     (#3352)
+#   3. override a module version ourselves                   (here)
+# Lever 1 does not apply: v0.117.0 (2026-08-10) IS the latest anchore/grype
+# release, v0.118.0 does not exist, and anchore/grype `main` (ffbca56,
+# 2026-08-14) still pins x/mod v0.38.0 with no open or merged PR to move it.
+# Upstream has not made this bump ANYWHERE. Lever 2 does not apply either:
+# x/mod is a module in grype's dependency graph, not the standard library, so
+# GO_MIN_PATCH cannot reach it. Only lever 3 is left.
+#
+# Note the contrast with the sibling artifact-keeper/trivy repo, whose override
+# policy this block is modelled on. There, the identical x/mod finding was
+# cleared by a plain version bump because upstream release v0.74.0 carried
+# x/mod v0.40.0 itself; that repo's overrides.yaml is empty as a result. An
+# override that duplicates a shipped release is strictly worse than the bump it
+# imitates — so check the RELEASE, not just `main`, before adding one here:
+#   gh api repos/anchore/grype/releases --jq '.[0].tag_name'
+#   git show <tag>:go.mod | grep golang.org/x/mod
+# That policy also asks that upstream have already made the same bump before we
+# do. Here they have not, on main or in any PR, so this override goes one step
+# further than the trivy repo's rules allow and is recorded as such.
+#
+# URGENCY, honestly stated: the vulnerable code is not linked into the binary.
+# Both advisories are scoped to specific import paths — golang.org/x/mod/sumdb
+# (Client.Lookup) and golang.org/x/mod/sumdb/tlog (tileHashReader.ReadHashes),
+# the GOSUMDB transparency-log client — and neither is in grype's build graph:
+# `go mod why golang.org/x/mod/sumdb` answers "main module does not need
+# package", and `go list -deps ./cmd/grype` links only x/mod's semver, module,
+# modfile and internal/lazyregexp. x/mod arrives via
+# cmd/grype/cli/commands/internal/jsonschema -> x/tools/go/packages ->
+# x/tools/internal/gocommand -> x/mod/semver. Trivy flags Go binaries at MODULE
+# granularity from the embedded build info and cannot see that; govulncheck,
+# which works at symbol granularity, would call this binary unaffected.
+# It is fixed here anyway rather than suppressed in /.trivyignore, because that
+# file is for findings with no fix available in a tool we can build, and this
+# one has a fix. Reachability changes how alarming the finding is, not whether
+# a fixable HIGH gets fixed.
+#
+# REMOVAL CONDITION: delete this block, and the XMOD_FROM/XMOD_TO ARGs, when
+# GRYPE_VERSION is moved to a grype release whose go.mod pins x/mod >= v0.40.0.
+# You do not have to remember: the guard below asserts that the pinned source
+# still requires ${XMOD_FROM} and FAILS THE BUILD when it does not, so the tag
+# bump that makes this block redundant is also what makes it stop the build
+# until it is deleted. Staleness is caught mechanically, the way the trivy
+# repo's apply-overrides.sh catches it, rather than by anyone remembering.
+#
+# `go get` rather than `go mod edit -require` or a `replace` directive, for two
+# reasons. (a) go.sum stays verifiable and complete: `go get` resolves the new
+# requirement through MVS over the real module graph, fetches every module the
+# resolution moves through the proxy, and writes their checksum-database-
+# verified hashes into go.sum in the same step. `go mod edit -require` is a
+# textual edit that writes nothing to go.sum and skips MVS entirely, leaving
+# go.mod internally inconsistent (x/mod v0.40.0 requires x/tools v0.49.0, which
+# -require would not select) until a `go mod tidy` re-does the work properly
+# anyway. (b) a `replace` arrow records the ORIGINAL version in the binary's
+# build info, so a scan and any SBOM we publish would still read v0.38.0 and
+# report a CVE the binary no longer carries; `go get` records the real upgraded
+# version. `go mod tidy` afterwards is a no-op on go.mod here (verified) and
+# only costs a full test-dependency download, so it is not run.
+#
+# MVS consequences are part of the override, not a surprise. Selecting x/mod
+# v0.40.0 also moves x/tools 0.48.0 -> 0.49.0 (required by x/mod v0.40.0), and
+# with it x/crypto 0.54.0 -> 0.55.0, x/net 0.57.0 -> 0.58.0 and x/text
+# 0.40.0 -> 0.41.0. All five are golang.org/x co-released modules and the set is
+# deterministic given the pinned grype commit. It is asserted below: if `go get`
+# ever moves a module outside that declared set, the build fails rather than
+# shipping an undeclared divergence.
+RUN set -eu; \
+    xmod_pin() { sed -n 's|^[[:space:]]*golang\.org/x/mod \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
+    have="$(xmod_pin)"; \
+    if [ "${have}" != "${XMOD_FROM}" ]; then \
+      echo "ERROR: grype v${GRYPE_VERSION} pins golang.org/x/mod ${have}, not ${XMOD_FROM}." >&2; \
+      echo "       This override was written against ${XMOD_FROM}. If upstream now" >&2; \
+      echo "       ships >= ${XMOD_TO}, DELETE the override block in this stage." >&2; \
+      echo "       If it moved to some other version, re-review it. See #3465." >&2; \
+      exit 1; \
+    fi; \
+    go get "golang.org/x/mod@${XMOD_TO}"; \
+    got="$(xmod_pin)"; \
+    if [ "${got}" != "${XMOD_TO}" ]; then \
+      echo "ERROR: override did not take: go.mod pins golang.org/x/mod ${got}." >&2; \
+      exit 1; \
+    fi; \
+    moved="$(git --no-pager diff --unified=0 go.mod \
+             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
+    expected="golang.org/x/crypto golang.org/x/mod golang.org/x/net golang.org/x/text golang.org/x/tools "; \
+    if [ "${moved}" != "${expected}" ]; then \
+      echo "ERROR: go get moved an undeclared set of modules." >&2; \
+      echo "       expected: ${expected}" >&2; \
+      echo "       actual:   ${moved}" >&2; \
+      echo "       Re-review the override and update the declared set (#3465)." >&2; \
+      exit 1; \
+    fi; \
+    go mod verify; \
+    echo "grype build: override applied — golang.org/x/mod ${XMOD_FROM} -> ${XMOD_TO}"
+
+# ldflags mirror .goreleaser.yaml at this tag so the built binary reports the
+# same identity upstream's release does. buildDate is the commit timestamp
+# rather than "now": a wall-clock date would make every rebuild produce a
+# different binary and defeat layer caching, and nothing in AK reads it
+# (GrypeScanner only parses `grype --version`).
+RUN set -eu; \
+    build_date="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
+      go build -trimpath -o /grype \
+        -ldflags "-w -s -extldflags '-static' \
+          -X main.version=${GRYPE_VERSION} \
+          -X main.gitCommit=${GRYPE_COMMIT} \
+          -X main.gitDescription=v${GRYPE_VERSION} \
+          -X main.buildDate=${build_date}" \
+        ./cmd/grype; \
+    install -Dm644 LICENSE /licenses/grype/LICENSE
+
+# Prove the override reached the artifact, not just the source tree. An
+# override that resolves in go.mod but does not end up in the compiled binary's
+# Go build info fixes nothing: the build info is exactly what Trivy reads, so
+# it is what the gate will see. The dep-record count is a plausibility check in
+# the same spirit as the trivy repo's assert-buildinfo.sh — without it this
+# step would happily report "verified" against a binary whose build info it
+# failed to parse at all.
+RUN set -eu; \
+    info="$(go version -m /grype)"; \
+    deps="$(printf '%s\n' "${info}" | grep -c '^[[:space:]]*dep[[:space:]]')"; \
+    if [ "${deps}" -lt 50 ]; then \
+      echo "ERROR: /grype reports only ${deps} dependency records; build info is" >&2; \
+      echo "       unreadable or implausible, so the override is unverified." >&2; \
+      exit 1; \
+    fi; \
+    recorded="$(printf '%s\n' "${info}" \
+                | sed -n 's|^[[:space:]]*dep[[:space:]]*golang\.org/x/mod[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
+                | head -n1)"; \
+    if [ "${recorded}" != "${XMOD_TO}" ]; then \
+      echo "ERROR: compiled grype records golang.org/x/mod '${recorded}', want ${XMOD_TO}." >&2; \
+      echo "       The Trivy gate reads this build info; the override did not ship (#3465)." >&2; \
+      exit 1; \
+    fi; \
+    echo "grype build: build info verified — golang.org/x/mod ${recorded} across ${deps} deps"
 
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
@@ -218,6 +443,12 @@ COPY --from=rootfs-builder /mnt/rootfs /
 # Copy the grype scanner CLI (local SBOM/vuln scans). The trivy CLI is
 # deliberately omitted; image scans use the trivy sidecar via TRIVY_URL.
 COPY --from=grype-bin /grype /usr/local/bin/
+
+# Apache-2.0 §4(a): grype is now built from source here rather than copied out
+# of an upstream image, so we are the ones distributing the binary and the
+# licence has to travel with it. Same arrangement the scanner-adapter uses for
+# its self-built trivy (/licenses/trivy).
+COPY --from=grype-bin /licenses/grype /licenses/grype
 
 # Pre-seeded Grype vulnerability DB (avoids first-scan network fetch)
 COPY --from=grype-db-seed --chown=1001:0 /grype-db /home/artifact/.cache/grype

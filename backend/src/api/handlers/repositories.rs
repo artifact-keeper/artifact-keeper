@@ -116,8 +116,21 @@ pub(crate) async fn require_repo_write_access(
     if repo.is_public || auth.is_admin {
         return Ok(());
     }
+    // TENANT-GATE-ONLY (#3331). Deliberately action-blind: this is the tenant
+    // half of the write/delete decision, and the ACTION half is layered
+    // separately and canonically by `require_repo_action(.., "write"/"delete",
+    // ..)` at the artifact upload and delete handlers below (the #2603 G1
+    // idiom — "the tenant gate above admits any grantee (incl. a write-only or
+    // read-only one), collapsing write/delete"). Naming `read` here would be
+    // actively wrong: it would refuse a legitimate publish-only identity, and
+    // naming `write` would silently duplicate — and eventually drift from —
+    // the real per-action gate.
     if repo_service
-        .user_can_access_repo(repo.id, auth.user_id)
+        .user_can_access_repo(
+            repo.id,
+            auth.user_id,
+            crate::services::repository_service::RepoAccess::TenantOnly,
+        )
         .await?
     {
         Ok(())
@@ -366,15 +379,45 @@ pub(crate) fn member_passes_token_scope(
     }
 }
 
-/// Ensure a repository is visible to the current user.
+/// Ensure a repository is READABLE by the current user.
 ///
 /// Public repos are visible to everyone. Private repos require authentication
-/// AND per-repo authorization: the caller must be an admin or hold a role
-/// assignment scoped to the repository (direct or global). The token-scope
-/// check (`can_access_repo`) is also enforced for repository-scoped API tokens.
+/// AND per-repo authorization: the caller must be an admin, or hold a grant on
+/// the repository (direct or global) that carries the `read` action. The
+/// token-scope check (`can_access_repo`) is also enforced for
+/// repository-scoped API tokens.
 ///
 /// Denials on private repos return `NotFound` (not `Forbidden`) to avoid
 /// leaking the existence of repositories the caller may not see.
+///
+/// # Why the action is `read` and is fixed here (#3331)
+///
+/// This helper used to stop at the tenant gate — any grant passed — which made
+/// it strictly looser than the OCI `/v2` and native-format read gates on the
+/// same repositories. Every production call site was classified before the
+/// action was chosen, and all of them read:
+///
+/// * `repositories.rs` — `get_repository`, `get_repository_storage`,
+///   `get_repository_storage_tree`, `list_artifacts`, `get_artifact_metadata`,
+///   `list_artifact_versions`, `download_artifact`, `list_virtual_members`,
+///   `test_upstream`, and `require_repo_id_visible` (the by-id wrapper, itself
+///   used by curation, promotion-rule, approval, signing and quarantine reads);
+/// * `approval.rs`, `curation.rs`, `promotion_rules.rs`, `security.rs`,
+///   `signing.rs`, `quality_gates.rs`, `repository_labels.rs`, `wasm_proxy.rs`
+///   — all `GET`s, plus three `POST`s that are read-only in effect
+///   (`request_approval` probes the SOURCE repo, `evaluate_rule` enumerates the
+///   source repo, `check_license_compliance` reads the repo's policy);
+/// * `require_member_attachable` — attaching a member to a virtual is a
+///   mutation, but the capability it confers (and the #3177 escalation it
+///   closes) is READING the member back out through the virtual, so `read` is
+///   the right bar. Whether re-export should additionally require write or
+///   ownership on the member remains the open product question in #3177; this
+///   does not answer it.
+///
+/// Mutating handlers do NOT come through here — they use
+/// `require_repo_write_access` (tenant) plus `require_repo_action` (action).
+/// That split is what lets this gate hold one constant action instead of
+/// threading an argument through 23 call sites that would all pass `read`.
 ///
 /// Exposed as `pub(crate)` so leaky-read sub-resource handlers in sibling
 /// modules (labels list, security read) can reuse the canonical visibility gate.
@@ -394,10 +437,23 @@ pub(crate) async fn require_visible(
                 return Err(not_found());
             }
             // Per-repo authorization: admins bypass; everyone else needs a
-            // role assignment scoped to this repo (or a global assignment).
+            // grant on this repo (or a global assignment) that carries `read`.
             if a.is_admin
                 || repo_service
-                    .user_can_access_repo(repo.id, a.user_id)
+                    .user_can_access_repo(
+                        repo.id,
+                        a.user_id,
+                        // CONTENT (#3331). Every production caller of
+                        // `require_visible` is a read of the repository's
+                        // contents, metadata or configuration — see the
+                        // classification in this function's doc comment — so
+                        // the action is fixed here rather than threaded through
+                        // 23 call sites that would all pass the same value. A
+                        // caller that wants to MUTATE uses
+                        // `require_repo_write_access` + `require_repo_action`
+                        // instead; that split is what keeps this one constant.
+                        crate::services::repository_service::RepoAccess::READ,
+                    )
                     .await?
             {
                 Ok(())
@@ -660,6 +716,11 @@ pub fn router() -> Router<SharedState> {
         )
         // Upstream auth management for remote repositories
         .route("/:key/upstream-auth", put(set_upstream_auth))
+        // Per-repository outbound egress proxy (#2469, #2811)
+        .route(
+            "/:key/egress-proxy",
+            put(set_egress_proxy).get(get_egress_proxy),
+        )
         .route("/:key/test-upstream", post(test_upstream))
         // Virtual repository member management
         .route(
@@ -1287,6 +1348,30 @@ fn validate_repository_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a repository key that collides with this deployment's active
+/// proxy-cache scope segment (#3454 follow-up).
+///
+/// `proxy-cache/<segment>/` is the root of this deployment's ENTIRE proxy
+/// cache, and it is also the exact shape of the legacy per-repository purge
+/// prefix `proxy-cache/<repo_key>/`. A repository whose key equals the scope
+/// segment makes those two namespaces ambiguous, so deleting that repository
+/// would otherwise sweep every other repository's cached content. Refusing the
+/// key at creation and rename removes the ambiguity structurally — it survives
+/// a future refactor of the purge path, whereas the guard in
+/// `ProxyService::purge_repo_cache` alone leaves the ambiguity in place.
+///
+/// Kept scope-aware and side-effect free (`scope_segment` is the resolved
+/// segment or `None` for the unscoped/legacy layout, in which nothing can
+/// collide) so it is unit-testable without a live `ProxyService`.
+fn validate_key_not_scope_collision(key: &str, scope_segment: Option<&str>) -> Result<()> {
+    if scope_segment == Some(key) {
+        return Err(AppError::Validation(format!(
+            "Repository key '{key}' collides with this deployment's proxy-cache scope segment and is reserved"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a custom outbound User-Agent string for a remote repository.
 ///
 /// Enforces a pragmatic 256-character cap and rejects control characters per
@@ -1414,7 +1499,9 @@ pub(crate) fn clamp_per_page(per_page: Option<u32>) -> u32 {
 /// with no members.
 ///
 /// Such repos are unusable: every fetch returns
-/// `404 Resource not found: Virtual repository has no members`. Pre-fix
+/// `404 Resource not found: Virtual repository has no accessible members`
+/// (`proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG`, shared with the case where the
+/// members exist but the caller may read none of them — see #3452). Pre-fix
 /// (#1279) the create handler tolerated both broken shapes silently:
 ///
 ///   * `member_repos` field omitted entirely. Operators who naturally
@@ -2103,6 +2190,23 @@ pub async fn invalidate_cache(
 
     proxy.invalidate_cache(&repo, &query.path).await?;
 
+    // #3290: a PyPI Simple project index is cached once per negotiated
+    // representation (PEP 503 HTML at `.../<project>/`, PEP 691 JSON at
+    // `.../<project>/index.v1+json`). Evicting one representation must evict
+    // the other, or the surviving one keeps serving an older upstream
+    // snapshot and content-negotiating clients (`uv` prefers JSON, `pip`
+    // consumes HTML) see the same project at two different points in time.
+    // Idempotent like the primary eviction: a sibling that was never cached
+    // is a no-op.
+    if matches!(
+        repo.format,
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry
+    ) {
+        if let Some(sibling) = crate::api::handlers::pypi::pep691_sibling_cache_path(&query.path) {
+            proxy.invalidate_cache(&repo, &sibling).await?;
+        }
+    }
+
     Ok(Json(InvalidateCacheResponse {
         repository_key: key,
         path: query.path,
@@ -2594,6 +2698,13 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
+    validate_key_not_scope_collision(
+        &payload.key,
+        state
+            .proxy_service
+            .as_ref()
+            .and_then(|p| p.cache_scope().segment()),
+    )?;
     // Resolve the format string via the service. The service owns both the
     // built-in enum mapping and the `format_handlers` fallback for WASM
     // plugin formats, so the handler keeps no business logic of its own here.
@@ -3544,6 +3655,13 @@ pub async fn update_repository(
     // Validate new key if provided
     if let Some(ref new_key) = payload.key {
         validate_repository_key(new_key)?;
+        validate_key_not_scope_collision(
+            new_key,
+            state
+                .proxy_service
+                .as_ref()
+                .and_then(|p| p.cache_scope().segment()),
+        )?;
     }
 
     // Validate quota_bytes is within a reasonable range (max 100 TiB)
@@ -4107,6 +4225,23 @@ async fn purge_repo_artifact_objects(
 ///
 /// The exclusivity and OCI-exclusion rules are documented on
 /// [`purge_repo_artifact_objects`].
+///
+/// `proxy-cache/%` is excluded for the same reason the storage GC excludes it
+/// (#3368), and the reason is worth restating because the exclusivity guard
+/// above does NOT cover it: that guard only asks whether another *`artifacts`*
+/// row shares the key, and a proxy-cache object's real owner is a
+/// `proxy_cache_artifacts` row, which this query cannot see. A legacy
+/// `artifacts` row carrying a proxy-cache key therefore looks exclusively
+/// owned while the live cache entry it names belongs to the proxy catalog —
+/// deleting the object would strand that catalog row and its `size_bytes`.
+///
+/// Cache keys are derived from `(repo_key, path)`, so this is normally the
+/// repository's own cache content, which `purge_repo_cache` reclaims properly
+/// on delete anyway. It stops being the repository's own content after a key
+/// rename with reuse, at which point this sweep would reach into another
+/// repository's cache. Before the layout was anchored the delete resolved to a
+/// key nothing had written and silently hit nothing; anchoring it makes the
+/// delete land, so the exclusion lands with it.
 async fn collect_repo_artifact_object_keys(
     state: &SharedState,
     repo_id: Uuid,
@@ -4115,6 +4250,7 @@ async fn collect_repo_artifact_object_keys(
     let mut keys: std::collections::BTreeSet<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.storage_key FROM artifacts a \
          WHERE a.repository_id = $1 \
+           AND a.storage_key NOT LIKE 'proxy-cache/%' \
            AND a.storage_key NOT LIKE 'oci-manifests/%' \
            AND a.storage_key NOT LIKE 'oci-blobs/%' \
            AND NOT EXISTS ( \
@@ -4274,8 +4410,27 @@ async fn purge_storage_object_keys(
 ///   the guard *does* test `is_deleted` and reclaims the key once those rows
 ///   are hard-deleted. A leak GC later collects is recoverable; a purge is not.
 async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
+    let sql = repo_maven_flat_keys_sql();
+    sqlx::query_scalar(&sql)
+        .bind(repo_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Failed to list Maven flat-object keys to purge before repository delete"
+            );
+            Vec::new()
+        })
+}
+
+/// The purge-list SQL [`collect_repo_maven_flat_keys`] runs, split out so the
+/// anti-drift test can assert its shape without a database. `$1` is the
+/// repository being deleted.
+fn repo_maven_flat_keys_sql() -> String {
     use crate::services::maven_flat_attribution as mfa;
-    let sql = format!(
+    format!(
         "SELECT o.storage_key \
          FROM maven_flat_object_owner o \
          WHERE o.repository_id = $1 \
@@ -4317,7 +4472,7 @@ async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec
                WHERE {is_rollup} \
                  AND mb.repository_id <> $1 \
                  AND mrb.storage_backend = o.storage_backend \
-                 AND mb.storage_key LIKE {rollup_dir} || '%' \
+                 AND {rollup_anchor} \
            )",
         files_match = mfa::metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key"),
         is_sidecar = mfa::is_sidecar_key_sql("o.storage_key"),
@@ -4327,20 +4482,8 @@ async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec
             &mfa::sidecar_base_key_sql("o.storage_key"),
         ),
         is_rollup = mfa::is_metadata_rollup_key_sql("o.storage_key"),
-        rollup_dir = mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
-    );
-    sqlx::query_scalar(&sql)
-        .bind(repo_id)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                repo_id = %repo_id,
-                error = %e,
-                "Failed to list Maven flat-object keys to purge before repository delete"
-            );
-            Vec::new()
-        })
+        rollup_anchor = mfa::metadata_rollup_dir_anchor_sql("mb.storage_key", "o.storage_key"),
+    )
 }
 
 /// Derived row-less Maven keys for a FILESYSTEM repository being deleted:
@@ -4624,6 +4767,20 @@ pub struct ArtifactResponse {
     pub content_type: String,
     pub download_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Id of the user that uploaded this artifact (#3271), mirroring
+    /// [`ArtifactVersionResponse::uploaded_by`] (#2397). Always serialized —
+    /// `null` for anonymous/unknown uploads and for proxy-cached objects,
+    /// which have no `artifacts` row — so the UI can rely on the key being
+    /// present.
+    pub uploaded_by: Option<Uuid>,
+    /// Display name for [`Self::uploaded_by`], resolved server-side so the UI
+    /// does not have to follow a bare UUID with an admin-only user lookup
+    /// (#3271). `null` whenever `uploaded_by` is `null`, and also when the
+    /// referenced user row no longer exists (a deleted account leaves the id
+    /// on the artifact). Populated by the listing and per-artifact metadata
+    /// endpoints; other responses that build an `ArtifactResponse` leave it
+    /// unresolved.
+    pub uploaded_by_username: Option<String>,
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
     /// Whether this artifact can have an SBOM generated or a security scan
@@ -5041,7 +5198,7 @@ pub async fn list_artifacts(
     // `normalize_lookup_path` (#1443); this keeps the listing consistent.
     let rewrite_npm_tarball_paths = is_npm_family_format(&repo.format);
 
-    let mut items = Vec::new();
+    let mut items: Vec<ArtifactResponse> = Vec::new();
     for artifact in artifacts {
         let artifact_id = artifact.id;
         let download_count = *download_counts.get(&artifact_id).unwrap_or(&0);
@@ -5060,6 +5217,11 @@ pub async fn list_artifacts(
             ));
         }
     }
+
+    // #3271: turn the uploader ids already carried on the rows into display
+    // names in one batched lookup, so the UI can render "uploaded by <name>"
+    // without an admin-only per-artifact user fetch.
+    resolve_uploader_usernames(&state.db, &mut items).await;
 
     Ok(Json(ArtifactListResponse {
         items,
@@ -5149,7 +5311,14 @@ async fn list_remote_cached_artifacts(
 
     let items = entries
         .iter()
-        .map(|entry| build_cached_artifact_response(entry, key))
+        .map(|entry| {
+            let mut item = build_cached_artifact_response(entry, key);
+            // #3265: same Maven coordinate recovery as the catalog-backed path
+            // above, so a pre-catalog cache is not left with filename-shaped
+            // names and no version.
+            apply_maven_cached_identity(&mut item, &repo.format);
+            item
+        })
         .collect();
 
     Ok(Json(ArtifactListResponse {
@@ -5246,9 +5415,23 @@ async fn list_remote_cached_from_catalog(
     };
     let total = grouped_listing_total(exact_total, offset, rows.len(), has_more);
 
+    // #3265: proxy-served downloads ARE recorded (in the
+    // `proxy_download_statistics` sibling of `download_statistics`), they were
+    // just never surfaced — every cached row reported `download_count: 0`. One
+    // batched lookup per page keeps that O(1) queries, like the hosted
+    // listing's `get_download_stats_batch`.
+    let page_paths: Vec<String> = rows.iter().map(|r| r.path.clone()).collect();
+    let download_counts =
+        proxy_catalog::download_counts_by_paths(&state.db, repo.id, &page_paths).await?;
+
     let items = rows
         .iter()
-        .map(|row| build_catalog_artifact_response(row, key))
+        .map(|row| {
+            let mut item = build_catalog_artifact_response(row, key);
+            item.download_count = download_counts.get(&row.path).copied().unwrap_or(0);
+            apply_maven_cached_identity(&mut item, &repo.format);
+            item
+        })
         .collect();
 
     Ok(Json(ArtifactListResponse {
@@ -5264,6 +5447,58 @@ async fn list_remote_cached_from_catalog(
         next_cursor,
         has_more: Some(has_more),
     }))
+}
+
+/// Overwrite a proxy-cached listing row's `name` / `version` with the Maven
+/// coordinates encoded in its path (#3265).
+///
+/// A remote listing row is reconstructed from the cache catalog, which stores
+/// only a path — so `name` defaulted to the bare filename
+/// (`guava-33.6.0-jre.jar`) and `version` to `None`. The UI reads those two
+/// fields as the artifactId and version, so a proxied Maven artifact showed a
+/// filename where hosted ones show `guava`, no version at all, and an install
+/// snippet built from the wrong coordinates. Deriving them from the path makes
+/// a proxied row carry the same `(name, version)` a hosted upload of the same
+/// GAV does.
+///
+/// No-op for non-Maven-family repositories and for paths that are not GAV
+/// shaped, so every other format keeps its filename/no-version defaults.
+fn apply_maven_cached_identity(item: &mut ArtifactResponse, format: &RepositoryFormat) {
+    if let Some((artifact_id, version)) = maven_cached_identity(format, &item.path) {
+        item.name = artifact_id;
+        item.version = Some(version);
+    }
+}
+
+/// Derive `(artifactId, version)` for a proxy-cached path under a Maven-family
+/// repository (#3265), or `None` when the path carries no usable coordinates.
+///
+/// Rejected (so the caller keeps the filename/no-version defaults):
+/// * a non-Maven-family repository format,
+/// * `maven-metadata.xml` and its checksum sidecars — these sit one directory
+///   ABOVE the version directory, so
+///   [`MavenHandler::parse_coordinates`](crate::formats::maven::MavenHandler::parse_coordinates)
+///   accepts them while reading the artifactId segment as the version,
+/// * anything else that does not parse as `groupId/artifactId/version/file`.
+///
+/// Checksum/signature sidecars of a real asset
+/// (`.../33.6.0-jre/guava-33.6.0-jre.jar.sha1`) DO resolve: they live in the
+/// version directory and carry the same coordinates as the asset itself,
+/// exactly as a hosted repository lists them.
+fn maven_cached_identity(format: &RepositoryFormat, path: &str) -> Option<(String, String)> {
+    if !matches!(
+        format,
+        RepositoryFormat::Maven | RepositoryFormat::Gradle | RepositoryFormat::Sbt
+    ) {
+        return None;
+    }
+    let path = path.trim_start_matches('/');
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    if filename == "maven-metadata.xml" || filename.starts_with("maven-metadata.xml.") {
+        return None;
+    }
+    let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
+    Some((coords.artifact_id, coords.version))
 }
 
 /// Map a `proxy_cache_artifacts` catalog row to the listing's
@@ -5292,6 +5527,10 @@ fn build_catalog_artifact_response(
             .unwrap_or_else(|| "application/octet-stream".to_string()),
         download_count: 0,
         created_at: row.cached_at,
+        // Proxy-cached objects have no `artifacts` row, so no uploader
+        // is recorded for them (#3271).
+        uploaded_by: None,
+        uploaded_by_username: None,
         metadata: None,
         // Same rationale as the sidecar-recovered path: synthetic id, no
         // `artifacts` row, so SBOM/scan cannot resolve the object.
@@ -5318,6 +5557,13 @@ fn build_catalog_artifact_response(
 /// every sidecar before slicing. `per_page` is treated as at least 1 so a
 /// `per_page == 0` query cannot wedge pagination. Pure / unit-testable
 /// without a storage backend.
+///
+/// Cached upstream index responses are dropped first, through the same
+/// [`proxy_catalog::is_cached_index_path`] predicate the catalog-backed
+/// listing pushes into SQL. This legacy path only runs for a cold pre-catalog
+/// cache, but it renders the same listing, so filtering only the catalog path
+/// would leave the empty-name rows visible on exactly the repositories nobody
+/// has touched since migration 159.
 fn filter_and_paginate_paths(
     paths: Vec<String>,
     path_prefix: Option<&str>,
@@ -5332,6 +5578,7 @@ fn filter_and_paginate_paths(
 
     let mut matched: Vec<String> = paths
         .into_iter()
+        .filter(|p| !crate::services::proxy_catalog::is_cached_index_path(p))
         .filter(|p| match path_prefix {
             Some(prefix) if !prefix.is_empty() => p.starts_with(prefix),
             _ => true,
@@ -5402,6 +5649,9 @@ fn build_cached_artifact_response(
         content_type: entry.content_type.clone(),
         download_count: 0,
         created_at: entry.cached_at,
+        // No `artifacts` row behind a proxy-cache entry (#3271).
+        uploaded_by: None,
+        uploaded_by_username: None,
         metadata: None,
         // Proxy-cached objects have no `artifacts` row (#1280/#1278) and a
         // synthetic id, so SBOM/scan cannot resolve them: not analyzable.
@@ -5604,6 +5854,12 @@ fn build_artifact_response(
         content_type: artifact.content_type.clone(),
         download_count,
         created_at: artifact.created_at,
+        // #3271: the uploader is already on the `artifacts` row the
+        // listing selected, so surfacing the id costs no extra query.
+        // The display name is resolved in one batched lookup by the
+        // caller (`apply_uploader_usernames`).
+        uploaded_by: artifact.uploaded_by,
+        uploaded_by_username: None,
         metadata: None,
         // Hosted artifact backed by a real `artifacts` row: SBOM/scan resolve.
         analyzable: true,
@@ -5623,6 +5879,68 @@ fn build_artifact_response(
         quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
         quarantine_until: artifact.quarantine_until,
     }
+}
+
+/// The distinct uploader ids referenced by a page of artifact rows (#3271),
+/// in first-seen order. Pure, so the de-duplication that keeps the username
+/// lookup to one small `= ANY` query is unit-testable without a database.
+fn uploader_ids(items: &[ArtifactResponse]) -> Vec<Uuid> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| item.uploaded_by)
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
+/// Stamp resolved uploader display names onto a page of artifact rows
+/// (#3271). Rows with no `uploaded_by`, and rows whose uploader has since
+/// been deleted (id present, no `users` row), keep `uploaded_by_username:
+/// None` — the raw id still ships, so the UI can degrade to showing it. Pure.
+fn apply_uploader_usernames(
+    items: &mut [ArtifactResponse],
+    usernames: &std::collections::HashMap<Uuid, String>,
+) {
+    for item in items.iter_mut() {
+        item.uploaded_by_username = item.uploaded_by.and_then(|id| usernames.get(&id)).cloned();
+    }
+}
+
+/// Look up display names for a batch of uploader ids (#3271).
+///
+/// One `= ANY` query per listing page (never per row), and best-effort: a
+/// failure logs and yields an empty map rather than failing the listing,
+/// since the uploader name is presentational and the raw id is already on the
+/// response.
+async fn fetch_uploader_usernames(
+    db: &sqlx::PgPool,
+    ids: &[Uuid],
+) -> std::collections::HashMap<Uuid, String> {
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let rows: std::result::Result<Vec<(Uuid, String)>, _> =
+        sqlx::query_as("SELECT id, username FROM users WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(db)
+            .await;
+    match rows {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(e) => {
+            tracing::debug!(error = %e, "uploader username lookup failed; omitting names");
+            std::collections::HashMap::new()
+        }
+    }
+}
+
+/// Resolve and stamp uploader display names for one page of artifact rows
+/// (#3271): the [`uploader_ids`] / [`fetch_uploader_usernames`] /
+/// [`apply_uploader_usernames`] trio in one call, so every listing surface
+/// wires it up the same way.
+async fn resolve_uploader_usernames(db: &sqlx::PgPool, items: &mut [ArtifactResponse]) {
+    let ids = uploader_ids(items);
+    let usernames = fetch_uploader_usernames(db, &ids).await;
+    apply_uploader_usernames(items, &usernames);
 }
 
 /// Build `ArtifactResponse` rows for each Maven secondary file recorded
@@ -5666,6 +5984,10 @@ fn expand_maven_secondary_files(
             content_type: content_type_for_maven_extension(ext).to_string(),
             download_count: 0,
             created_at: artifact.created_at,
+            // Companion files share the primary's row, so they share its
+            // uploader too (#3271).
+            uploaded_by: artifact.uploaded_by,
+            uploaded_by_username: None,
             metadata: None,
             // Secondary Maven files are recorded under a real primary
             // artifact row (its id), so they are analyzable like the primary.
@@ -5833,6 +6155,15 @@ async fn list_artifacts_grouped_by_maven_component(
         } else {
             None
         };
+        // #3270: the component rows come from the package catalog, which has
+        // no per-file detail, so `artifact_files` used to ship empty for every
+        // remote component and the web UI's grouped view rendered zero files
+        // (no POM row, no jar row). The individual cached objects ARE
+        // enumerated in `proxy_cache_artifacts`, so fill the list in from
+        // there for just this page's components — the proxy-side equivalent of
+        // what `build_maven_components_for_keys` does from the `artifacts`
+        // table for hosted repos.
+        populate_remote_component_files(&state.db, repo.id, &mut components).await?;
         let exact_total = if count_exact {
             Some(count_maven_catalog_components(&state.db, repo.id, search_query).await?)
         } else {
@@ -6126,6 +6457,96 @@ async fn build_maven_components_for_keys(
     Ok(order_components_by_keys(grouped, keys))
 }
 
+/// Upper bound on cached files pulled back to fill one page of remote Maven
+/// components' `artifact_files` (#3270). A Maven GAV directory normally holds
+/// well under a dozen objects (jar, pom, sources, javadoc, and their checksum
+/// sidecars); 64 per component leaves generous headroom while keeping the
+/// query bounded no matter how large the proxy cache grows.
+const REMOTE_COMPONENT_FILES_PER_COMPONENT: i64 = 64;
+
+/// Fill in `artifact_files` for one page of remote (proxy) Maven components
+/// from the proxy cache catalog (#3270, #3265).
+///
+/// Remote components are reconstructed from `packages` rows, which carry no
+/// file detail — so the grouped listing reported `artifact_files: []` and the
+/// web UI, which renders one row per file (with a special-cased POM row),
+/// showed an empty component. The cached objects themselves are cataloged in
+/// `proxy_cache_artifacts`, so one bounded `LIKE ANY` over this page's GAV
+/// directory prefixes recovers them. Components whose GAV has nothing cached
+/// (a catalog row written for a `.pom`-only lookup, say) keep an empty list
+/// rather than failing the listing.
+async fn populate_remote_component_files(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    components: &mut [MavenComponentResponse],
+) -> Result<()> {
+    let prefixes = maven_component_prefixes(components);
+    if prefixes.is_empty() {
+        return Ok(());
+    }
+    let limit = REMOTE_COMPONENT_FILES_PER_COMPONENT * prefixes.len() as i64;
+    let paths =
+        crate::services::proxy_catalog::paths_under_prefixes(db, repository_id, &prefixes, limit)
+            .await?;
+    attach_cached_files_to_components(components, &paths);
+    Ok(())
+}
+
+/// The GAV directory prefix of each Maven component, positionally aligned with
+/// `components` (`None` where the coordinates yield no prefix) so a caller can
+/// index straight back into the component list.
+fn maven_component_prefixes_aligned(components: &[MavenComponentResponse]) -> Vec<Option<String>> {
+    components
+        .iter()
+        .map(|c| {
+            maven_component_path_prefix(&format!("{}:{}", c.group_id, c.artifact_id), &c.version)
+        })
+        .collect()
+}
+
+/// The GAV directory prefixes for a page of Maven components, in component
+/// order and skipping any component whose coordinates do not yield one.
+/// Split out of [`populate_remote_component_files`] so the prefix derivation
+/// is unit-testable without a database.
+fn maven_component_prefixes(components: &[MavenComponentResponse]) -> Vec<String> {
+    maven_component_prefixes_aligned(components)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Attach each cached object path to the component whose GAV directory it
+/// lives directly under, as a sorted, de-duplicated filename list (#3270).
+///
+/// The prefix is re-checked here rather than trusted from SQL: the catalog
+/// query matches with `LIKE`, under which a `_` in a Maven artifactId is a
+/// single-character wildcard, so an over-broad match must not be attributed to
+/// the wrong component. Paths nested deeper than the GAV directory are
+/// dropped, matching the hosted listing's one-row-per-file view. Pure (no I/O)
+/// so the attribution contract is unit-testable.
+fn attach_cached_files_to_components(components: &mut [MavenComponentResponse], paths: &[String]) {
+    let prefixes = maven_component_prefixes_aligned(components);
+
+    for path in paths {
+        let trimmed = path.trim_start_matches('/');
+        for (idx, prefix) in prefixes.iter().enumerate() {
+            let Some(prefix) = prefix else { continue };
+            let Some(filename) = trimmed.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            if !filename.is_empty() && !filename.contains('/') {
+                components[idx].artifact_files.push(filename.to_string());
+            }
+            break;
+        }
+    }
+
+    for component in components.iter_mut() {
+        component.artifact_files.sort();
+        component.artifact_files.dedup();
+    }
+}
+
 /// Reorder/assemble grouped Maven components to match a keyset page's ordered
 /// `(groupId:artifactId, version)` keys (#2723). A component whose GAV is not
 /// in `keys` (pulled in by an over-broad path-prefix match) is dropped, and a
@@ -6305,6 +6726,9 @@ async fn maven_components_from_catalog(
             size_bytes: row.get("size_bytes"),
             download_count: row.get("download_count"),
             created_at: row.get("created_at"),
+            // The package catalog has no per-file detail; the caller fills
+            // this in from the proxy cache catalog for just the page it keeps
+            // (`populate_remote_component_files`, #3270).
             artifact_files: Vec::new(),
         });
     }
@@ -6642,6 +7066,25 @@ const DOCKER_TAG_ROWS_FROM_SQL: &str = r#"FROM oci_tags t
 const DOCKER_TAG_ROWS_WHERE_SQL: &str = r#"WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0"#;
 
+/// The `?search=` substring filter for the docker-tag listing, as a format
+/// template over the parameter index.
+///
+/// #3500: carries `ESCAPE '\'` and is fed [`super::escape_like_literal`]
+/// output. The search term is REQUEST input concatenated into a `LIKE`
+/// pattern, so unescaped a `%` or `_` in the term acted as a wildcard —
+/// searching for `1_0` matched `1.0`, `120`, `1a0` — and a backslash quoted
+/// the character after it, so a tag containing one could not be found by
+/// typing it. Both arms of the listing (the page and the `?count=exact`
+/// total) build the filter from this one fragment so they cannot drift and
+/// report a count that disagrees with the rows.
+///
+/// The operand is bound by the callers, not here, so the #3500 class gate is
+/// pointed at them explicitly and checks each one for the escaper:
+/// LIKE-OPERAND-ESCAPED-BY-CALLER: fetch_docker_tag_rows, count_docker_tag_rows
+fn docker_tag_search_sql(param: usize) -> String {
+    format!(" AND LOWER(t.tag) LIKE '%' || LOWER(${param}) || '%' ESCAPE '\\'")
+}
+
 /// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
 /// latest `scan_results` rows. Returns at most `limit` rows, ordered by
 /// `(name, tag)`.
@@ -6696,9 +7139,7 @@ async fn fetch_docker_tag_rows(
     );
     let mut next_param = 2;
     if search_query.is_some() {
-        sql.push_str(&format!(
-            " AND LOWER(t.tag) LIKE '%' || LOWER(${next_param}) || '%'"
-        ));
+        sql.push_str(&docker_tag_search_sql(next_param));
         next_param += 1;
     }
     if keyset.is_some() {
@@ -6717,7 +7158,7 @@ async fn fetch_docker_tag_rows(
 
     let mut query = sqlx::query(&sql).bind(repository_id);
     if let Some(q) = search_query {
-        query = query.bind(q);
+        query = query.bind(super::escape_like_literal(q));
     }
     if let Some((name, tag)) = keyset {
         query = query.bind(name.as_str()).bind(tag.as_str());
@@ -6777,11 +7218,11 @@ async fn count_docker_tag_rows(
 ) -> Result<i64> {
     let mut sql = format!("SELECT COUNT(*) {DOCKER_TAG_ROWS_FROM_SQL} {DOCKER_TAG_ROWS_WHERE_SQL}");
     if search_query.is_some() {
-        sql.push_str(" AND LOWER(t.tag) LIKE '%' || LOWER($2) || '%'");
+        sql.push_str(&docker_tag_search_sql(2));
     }
     let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(repository_id);
     if let Some(q) = search_query {
-        query = query.bind(q);
+        query = query.bind(super::escape_like_literal(q));
     }
     query
         .fetch_one(db)
@@ -7004,6 +7445,14 @@ pub async fn get_artifact_metadata(
         // `cache_metadata_lookup_path` maps the stored path back to the URL
         // shape for npm-family tarballs so the cache key matches what the
         // proxy wrote.
+        // #3271: resolve the uploader's display name for the artifact detail
+        // view. Best-effort and batched through the same helper the listing
+        // uses (a one-element batch here).
+        let uploader_username = match artifact.uploaded_by {
+            Some(id) => fetch_uploader_usernames(&state.db, &[id]).await.remove(&id),
+            None => None,
+        };
+
         let cache_lookup_path = cache_metadata_lookup_path(&artifact.path, &repo.format);
         let cache_meta = if repo.repo_type == RepositoryType::Remote {
             if let Some(proxy) = state.proxy_service.as_ref() {
@@ -7030,6 +7479,8 @@ pub async fn get_artifact_metadata(
             content_type: artifact.content_type,
             download_count: downloads,
             created_at: artifact.created_at,
+            uploaded_by: artifact.uploaded_by,
+            uploaded_by_username: uploader_username,
             metadata: metadata.map(|m| m.metadata),
             // This handler resolves a real `artifacts` row by id, so it is
             // always a hosted artifact (analyzable), even inside a Remote repo.
@@ -7162,6 +7613,10 @@ fn artifact_version_to_response(
         content_type: stored.content_type,
         download_count: 0,
         created_at: stored.created_at,
+        // #3271: `artifact_versions` records the uploader per revision
+        // (#2397); surface it on the revision response too.
+        uploaded_by: stored.uploaded_by,
+        uploaded_by_username: None,
         metadata: None,
         analyzable: false,
         cache_cached_at: None,
@@ -7338,9 +7793,40 @@ async fn authorize_generic_upload(
 ///
 /// The raw-`PUT` and multipart entry points authorize the request and stream the
 /// body to a bounded scratch file (computing the content digests in one pass);
-/// this shared tail verifies declared checksums, runs any WASM format plugin,
-/// derives the artifact coordinates, and persists via the streaming service
-/// method — never buffering the whole artifact in memory.
+/// Derive `(name, version)` from a generic-upload path's `/`-separated
+/// segments.
+///
+/// The flat convention is `{name}/{version}/{filename...}`. #3604 defect 3: an
+/// npm SCOPED package's name is itself `@scope/name` and so spans TWO segments
+/// before the version — `@babel/traverse/7.23.0/x.tgz` is
+/// `@babel/traverse@7.23.0`. The flat parse reads that as `@babel@traverse`,
+/// and once #3442 turns the coordinate into a scan pin that pins a component
+/// which does not exist, so a genuinely vulnerable scoped package reads clean.
+/// Only npm-family repos use the `@scope/` convention (`is_npm_format`); every
+/// other format keeps the flat parse byte for byte. `fallback_name` is returned
+/// when the path is too short to carry a coordinate.
+fn derive_generic_path_coordinate(
+    path: &str,
+    is_npm_format: bool,
+    fallback_name: String,
+) -> (String, Option<String>) {
+    let segments: Vec<&str> = path.split('/').collect();
+    let npm_scoped = is_npm_format && segments.first().is_some_and(|s| s.starts_with('@'));
+    if npm_scoped && segments.len() >= 4 {
+        (
+            format!("{}/{}", segments[0], segments[1]),
+            Some(segments[2].to_string()),
+        )
+    } else if segments.len() >= 3 {
+        (segments[0].to_string(), Some(segments[1].to_string()))
+    } else {
+        (fallback_name, None)
+    }
+}
+
+/// After verifying declared checksums and running any WASM format plugin,
+/// this shared tail derives the artifact coordinates and persists via the
+/// streaming service method — never buffering the whole artifact in memory.
 #[allow(clippy::too_many_arguments)]
 async fn persist_generic_staged_upload(
     state: &SharedState,
@@ -7429,13 +7915,7 @@ async fn persist_generic_staged_upload(
     let (name, version) = if let Some(ref meta) = wasm_metadata {
         (name, meta.version.clone())
     } else {
-        let segments: Vec<&str> = path.split('/').collect();
-        if segments.len() >= 3 {
-            // Path follows {package_name}/{version}/{filename...} convention
-            (segments[0].to_string(), Some(segments[1].to_string()))
-        } else {
-            (name, None)
-        }
+        derive_generic_path_coordinate(&path, repo.format.handler_key() == "npm", name)
     };
 
     // #2367: on versioning-enabled Generic/Mlmodel repos an explicit
@@ -7531,6 +8011,9 @@ async fn persist_generic_staged_upload(
             content_type: artifact.content_type,
             download_count: downloads,
             created_at: artifact.created_at,
+            // The upload was just performed by the authenticated caller.
+            uploaded_by: artifact.uploaded_by,
+            uploaded_by_username: None,
             metadata: metadata_json,
             // Freshly-uploaded hosted artifact with a real DB id: analyzable.
             analyzable: true,
@@ -8583,7 +9066,7 @@ pub async fn delete_artifact(
     let artifact_service = state.create_artifact_service(storage);
 
     // Find the artifact
-    let artifact = sqlx::query_scalar!(
+    let artifact_id = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
         repo.id,
         path
@@ -8593,9 +9076,96 @@ pub async fn delete_artifact(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
+    // Pre-flight the soft-delete (row load + the `BeforeDelete` veto) BEFORE
+    // opening the transaction below: a veto must abort before any index row is
+    // touched, and plugin I/O must never hold a Postgres transaction open.
+    let artifact = artifact_service.prepare_delete(artifact_id).await?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Docker/OCI manifests are indexed in `oci_tags`/`oci_manifest_refs`/
+    // `manifest_blob_refs` in addition to the `artifacts` row. Soft-deleting the
+    // artifacts row alone leaves those rows orphaned, so a re-push's HEAD
+    // manifest resolves the surviving tag and the client skips the PUT — the
+    // artifacts row is never resurrected (#3476). Unwind the OCI index here,
+    // mirroring `handle_delete_manifest`, so a later re-push cleanly re-creates
+    // it.
+    //
+    // The unwind acts ONLY on the index rows this artifact actually owns:
+    //   * the digest comes from the OCI index for `(repo, image, reference)`,
+    //     never from the row's own checksum — the index is the authority on what
+    //     a reference resolves to;
+    //   * it runs only when that indexed manifest IS this row (checksum
+    //     equality), so a row that is not the indexed manifest cannot drive the
+    //     removal of index rows belonging to a different image;
+    //   * it is scoped to the single `(name = image, tag = reference)` row this
+    //     REST path names, never to a repo-wide content-address sweep — that
+    //     scope is only correct on `/v2`, where the reference IS the resolved
+    //     digest.
+    //
+    // A reference with no index row (peer-replicated Docker artifacts and
+    // non-manifest files under an OCI repository both have `artifacts` rows and
+    // no index rows) simply has nothing to unwind: skip it and still soft-delete.
+    if crate::services::repository_service::format_handler_key(&repo.format) == "oci" {
+        if let Some((image, reference)) = path
+            .strip_prefix("v2/")
+            .and_then(|rest| rest.split_once("/manifests/"))
+        {
+            let indexed = crate::api::handlers::oci_v2::resolve_indexed_manifest_digest(
+                &mut *tx, repo.id, image, reference,
+            )
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            match crate::api::handlers::oci_v2::rest_unwind_digest(
+                indexed.as_deref(),
+                &artifact.checksum_sha256,
+            ) {
+                Some(digest) => {
+                    crate::api::handlers::oci_v2::delete_oci_manifest_content_in_tx(
+                        &mut tx,
+                        repo.id,
+                        image,
+                        reference,
+                        digest,
+                        crate::api::handlers::oci_v2::OciIndexDeleteScope::NamedReference,
+                    )
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+                None => {
+                    tracing::warn!(
+                        repository_id = %repo.id,
+                        path = %path,
+                        indexed_digest = indexed.as_deref().unwrap_or("<none>"),
+                        "OCI index unwind skipped: the reference is not indexed as this artifact's manifest"
+                    );
+                }
+            }
+        }
+    }
+
+    // The index unwind and the soft-delete are ONE transaction: a failure of
+    // either can never leave the index destroyed while the artifacts row still
+    // reads as present (or vice versa).
     artifact_service
-        .delete_with_sync_options(artifact, !is_replication)
+        .commit_delete_in_tx(&mut tx, artifact_id)
         .await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Best-effort side effects, deliberately after COMMIT: sync-task fan-out,
+    // the audit entry, the AfterDelete hook and the search-index removal must
+    // not hold the transaction open, and the audit write must not roll back
+    // with it.
+    artifact_service
+        .finish_delete(&artifact, !is_replication)
+        .await;
 
     // Deleting a Maven artifact changes the version set for its GAV. Drop both
     // the in-memory generation cache AND the *stored* verbatim maven-metadata.xml
@@ -9201,6 +9771,198 @@ pub async fn set_upstream_auth(
     ))
 }
 
+/// Per-repository egress proxy settings (#2469, #2811).
+///
+/// `proxy_url` is **write-only**: it is encrypted at rest and never returned.
+/// [`EgressProxyResponse`] echoes a redacted form (`http://***@proxy:3128`)
+/// so an operator can confirm the host and port without recovering the
+/// credentials, exactly as `upstream_auth_configured` does for upstream
+/// credentials.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct EgressProxyRequest {
+    /// `inherit` (follow the process `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`
+    /// environment — the default), `direct` (never proxy this repository, even
+    /// when the environment sets one), or `explicit` (use `proxy_url`, ignoring
+    /// the environment entirely).
+    pub mode: String,
+    /// Proxy endpoint, `scheme://host[:port]`, http or https. May embed
+    /// `user:pass@` credentials. Required when `mode` is `explicit`.
+    /// Write-only, never returned in responses.
+    pub proxy_url: Option<String>,
+    /// Comma-separated hosts / domain suffixes / CIDRs that bypass the proxy
+    /// for this repository. Only meaningful when `mode` is `explicit`.
+    pub no_proxy: Option<String>,
+}
+
+/// Read-back of a repository's egress-proxy settings. Carries no secret.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EgressProxyResponse {
+    /// `inherit`, `direct` or `explicit`.
+    pub mode: String,
+    /// The configured proxy with any credentials replaced by `***`. `None`
+    /// unless `mode` is `explicit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// The configured bypass list, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+    /// Whether the configured proxy URL carries credentials. The credentials
+    /// themselves are never returned.
+    pub proxy_credentials_configured: bool,
+}
+
+impl From<crate::services::egress_proxy::EgressProxyConfig> for EgressProxyResponse {
+    fn from(config: crate::services::egress_proxy::EgressProxyConfig) -> Self {
+        Self {
+            mode: config.mode.as_str().to_string(),
+            proxy_url: config.redacted_proxy_url(),
+            no_proxy: config.no_proxy.clone(),
+            proxy_credentials_configured: config.has_proxy_credentials(),
+        }
+    }
+}
+
+/// Validate an egress-proxy request and turn it into a storable config.
+///
+/// Pure (no DB, no network) so the mode/URL/`no_proxy` rules are unit-testable
+/// without a database, and so the handler body stays thin.
+pub(crate) fn build_egress_proxy_config(
+    mode: &str,
+    proxy_url: Option<&str>,
+    no_proxy: Option<&str>,
+) -> Result<crate::services::egress_proxy::EgressProxyConfig> {
+    use crate::services::egress_proxy::{
+        validate_no_proxy, validate_proxy_url, EgressProxyConfig, EgressProxyMode,
+    };
+
+    let mode = EgressProxyMode::parse(mode).ok_or_else(|| {
+        AppError::Validation("Invalid mode. Must be 'inherit', 'direct', or 'explicit'".to_string())
+    })?;
+
+    match mode {
+        EgressProxyMode::Explicit => {
+            let url = proxy_url
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    AppError::Validation(
+                        "proxy_url is required when mode is 'explicit'".to_string(),
+                    )
+                })?;
+            validate_proxy_url(url)?;
+            let no_proxy = no_proxy.map(str::trim).filter(|l| !l.is_empty());
+            if let Some(list) = no_proxy {
+                validate_no_proxy(list)?;
+            }
+            Ok(EgressProxyConfig {
+                mode,
+                proxy_url: Some(url.to_string()),
+                no_proxy: no_proxy.map(str::to_string),
+            })
+        }
+        // Reject rather than silently drop a URL the caller clearly meant to
+        // apply: a request that says `direct` AND carries a proxy_url is
+        // self-contradictory, and guessing which half was intended is how an
+        // egress control ends up not doing what its author believed.
+        _ => {
+            if proxy_url.is_some_and(|u| !u.trim().is_empty()) {
+                return Err(AppError::Validation(format!(
+                    "proxy_url is only valid when mode is 'explicit' (got '{}')",
+                    mode.as_str()
+                )));
+            }
+            Ok(EgressProxyConfig {
+                mode,
+                proxy_url: None,
+                no_proxy: None,
+            })
+        }
+    }
+}
+
+/// Configure the outbound egress proxy for a remote repository
+#[utoipa::path(
+    put,
+    path = "/{key}/egress-proxy",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = EgressProxyRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Egress proxy updated", body = EgressProxyResponse),
+        (status = 400, description = "Invalid mode or proxy URL"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_egress_proxy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<EgressProxyRequest>,
+) -> Result<Json<EgressProxyResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    let repo = load_remote_repo(&state, &auth, &key).await?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // Egress routing is a security control, and the proxy URL may carry
+    // credentials: same admin tier as `set_upstream_auth` (#2603).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+
+    let config = build_egress_proxy_config(
+        &payload.mode,
+        payload.proxy_url.as_deref(),
+        payload.no_proxy.as_deref(),
+    )?;
+
+    crate::services::egress_proxy::save_egress_proxy(&state.db, repo.id, &config).await?;
+    // Apply immediately in this process rather than after the cache TTL. Other
+    // replicas pick the change up within `EGRESS_CLIENT_CACHE_TTL_SECS`.
+    if let Some(proxy_service) = state.proxy_service.as_ref() {
+        proxy_service.invalidate_egress_client(repo.id).await;
+    }
+
+    Ok(Json(config.into()))
+}
+
+/// Read the outbound egress proxy configuration of a remote repository
+#[utoipa::path(
+    get,
+    path = "/{key}/egress-proxy",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Egress proxy configuration", body = EgressProxyResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_egress_proxy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<EgressProxyResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("read")?;
+    let repo = load_remote_repo(&state, &auth, &key).await?;
+    // Read is admin-gated too: the redacted URL still discloses the internal
+    // proxy host and port, which is infrastructure topology.
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+
+    let config = crate::services::egress_proxy::load_egress_proxy(&state.db, repo.id).await?;
+    Ok(Json(config.into()))
+}
+
 /// Test connectivity to the upstream URL of a remote repository
 #[utoipa::path(
     post,
@@ -9491,6 +10253,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         remove_virtual_member,
         update_virtual_members,
         set_upstream_auth,
+        set_egress_proxy,
+        get_egress_proxy,
         test_upstream,
         get_routing_rules,
         set_routing_rules,
@@ -9530,6 +10294,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         VirtualMembersListResponse,
         CreateVirtualMemberInput,
         UpstreamAuthRequest,
+        EgressProxyRequest,
+        EgressProxyResponse,
         SetRoutingRulesRequest,
         RoutingRulesResponse,
         RoutingRule,
@@ -10503,6 +11269,265 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Remote/proxy Maven component files (#3270) and coordinates (#3265)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remote_component_files_include_the_pom_and_are_sorted() {
+        // #3270: the grouped view for a proxy repo shipped `artifact_files:
+        // []`, so the web UI (which renders one row per file, with a
+        // special-cased POM row) showed a component with nothing in it.
+        let mut components = vec![maven_component("com.google.guava", "guava", "33.6.0-jre")];
+        let cached = vec![
+            "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar".to_string(),
+            "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.pom".to_string(),
+            "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar.sha1".to_string(),
+        ];
+        attach_cached_files_to_components(&mut components, &cached);
+        assert_eq!(
+            components[0].artifact_files,
+            vec![
+                "guava-33.6.0-jre.jar".to_string(),
+                "guava-33.6.0-jre.jar.sha1".to_string(),
+                "guava-33.6.0-jre.pom".to_string(),
+            ],
+            "the POM must be listed for a proxy-cached component (#3270)"
+        );
+    }
+
+    #[test]
+    fn remote_component_files_are_attributed_to_the_owning_component() {
+        // A sibling version and a different artifactId must not bleed into
+        // each other, and a path from an unrelated GAV is dropped entirely.
+        let mut components = vec![
+            maven_component("com.example", "mylib", "1.0.0"),
+            maven_component("com.example", "mylib", "2.0.0"),
+        ];
+        let cached = vec![
+            "com/example/mylib/1.0.0/mylib-1.0.0.jar".to_string(),
+            "com/example/mylib/2.0.0/mylib-2.0.0.jar".to_string(),
+            "com/example/other/1.0.0/other-1.0.0.jar".to_string(),
+        ];
+        attach_cached_files_to_components(&mut components, &cached);
+        assert_eq!(components[0].artifact_files, vec!["mylib-1.0.0.jar"]);
+        assert_eq!(components[1].artifact_files, vec!["mylib-2.0.0.jar"]);
+    }
+
+    #[test]
+    fn remote_component_files_drop_nested_paths_and_duplicates() {
+        // Anything below the GAV directory is not a file of the component,
+        // and a repeated catalog path must not double the list.
+        let mut components = vec![maven_component("com.example", "mylib", "1.0.0")];
+        let cached = vec![
+            "com/example/mylib/1.0.0/mylib-1.0.0.jar".to_string(),
+            "com/example/mylib/1.0.0/mylib-1.0.0.jar".to_string(),
+            "com/example/mylib/1.0.0/nested/extra.jar".to_string(),
+            "com/example/mylib/1.0.0/".to_string(),
+        ];
+        attach_cached_files_to_components(&mut components, &cached);
+        assert_eq!(components[0].artifact_files, vec!["mylib-1.0.0.jar"]);
+    }
+
+    #[test]
+    fn remote_component_files_reject_like_wildcard_overmatch() {
+        // `_` is legal in a Maven artifactId and is a single-character
+        // wildcard in the catalog's `LIKE ANY` query, so an over-fetched row
+        // must be dropped by the Rust-side prefix re-check rather than
+        // attributed to the wrong component.
+        let mut components = vec![maven_component("com.example", "my_lib", "1.0.0")];
+        let cached = vec![
+            "com/example/my_lib/1.0.0/my_lib-1.0.0.jar".to_string(),
+            "com/example/myXlib/1.0.0/myXlib-1.0.0.jar".to_string(),
+        ];
+        attach_cached_files_to_components(&mut components, &cached);
+        assert_eq!(components[0].artifact_files, vec!["my_lib-1.0.0.jar"]);
+    }
+
+    #[test]
+    fn maven_component_prefixes_cover_every_component_in_order() {
+        let components = vec![
+            maven_component("com.example", "mylib", "1.0.0"),
+            maven_component("org.junit.jupiter", "junit-jupiter-api", "5.11.0"),
+        ];
+        assert_eq!(
+            maven_component_prefixes(&components),
+            vec![
+                "com/example/mylib/1.0.0/".to_string(),
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/".to_string(),
+            ]
+        );
+        assert!(maven_component_prefixes(&[]).is_empty());
+    }
+
+    #[test]
+    fn maven_cached_identity_recovers_gav_from_the_cache_path() {
+        // #3265: a proxied jar listed as `name = "guava-33.6.0-jre.jar"` with
+        // no version drove the wrong artifactId, a blank version, and a broken
+        // "copy install command" snippet in the UI.
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Maven,
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar"
+            ),
+            Some(("guava".to_string(), "33.6.0-jre".to_string()))
+        );
+        // A checksum sidecar of a real asset lives in the version directory
+        // and carries the same coordinates, exactly as a hosted repo lists it.
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Gradle,
+                "/com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar.sha1"
+            ),
+            Some(("guava".to_string(), "33.6.0-jre".to_string()))
+        );
+    }
+
+    #[test]
+    fn maven_cached_identity_rejects_metadata_and_other_formats() {
+        // `maven-metadata.xml` sits ABOVE the version directory, so the
+        // coordinate parser would read the artifactId segment as the version.
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Maven,
+                "com/google/guava/guava/maven-metadata.xml"
+            ),
+            None
+        );
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Maven,
+                "com/google/guava/guava/maven-metadata.xml.sha1"
+            ),
+            None
+        );
+        // Not GAV shaped.
+        assert_eq!(
+            maven_cached_identity(&RepositoryFormat::Maven, "index.html"),
+            None
+        );
+        // A non-Maven-family proxy keeps its filename/no-version defaults.
+        assert_eq!(
+            maven_cached_identity(
+                &RepositoryFormat::Pypi,
+                "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_maven_cached_identity_rewrites_only_maven_rows() {
+        let mut item = sample_artifact_response(
+            "com/google/guava/guava/33.6.0-jre/guava-33.6.0-jre.jar",
+            "guava-33.6.0-jre.jar",
+        );
+        apply_maven_cached_identity(&mut item, &RepositoryFormat::Maven);
+        assert_eq!(item.name, "guava");
+        assert_eq!(item.version.as_deref(), Some("33.6.0-jre"));
+
+        // A path with no coordinates keeps the filename/no-version defaults.
+        let mut untouched = sample_artifact_response("index.html", "index.html");
+        apply_maven_cached_identity(&mut untouched, &RepositoryFormat::Maven);
+        assert_eq!(untouched.name, "index.html");
+        assert_eq!(untouched.version, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Uploader surfacing on artifact responses (#3271)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn uploader_ids_are_deduplicated_in_first_seen_order() {
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let mut items = vec![
+            sample_artifact_response("a.jar", "a"),
+            sample_artifact_response("b.jar", "b"),
+            sample_artifact_response("c.jar", "c"),
+            sample_artifact_response("d.jar", "d"),
+        ];
+        items[0].uploaded_by = Some(alice);
+        items[1].uploaded_by = Some(bob);
+        items[2].uploaded_by = Some(alice);
+        items[3].uploaded_by = None;
+        assert_eq!(uploader_ids(&items), vec![alice, bob]);
+        assert!(uploader_ids(&[]).is_empty());
+    }
+
+    #[test]
+    fn apply_uploader_usernames_resolves_known_ids_only() {
+        let alice = Uuid::new_v4();
+        let deleted = Uuid::new_v4();
+        let mut items = vec![
+            sample_artifact_response("a.jar", "a"),
+            sample_artifact_response("b.jar", "b"),
+            sample_artifact_response("c.jar", "c"),
+        ];
+        items[0].uploaded_by = Some(alice);
+        items[1].uploaded_by = Some(deleted);
+        items[2].uploaded_by = None;
+
+        let mut usernames = std::collections::HashMap::new();
+        usernames.insert(alice, "alice".to_string());
+        apply_uploader_usernames(&mut items, &usernames);
+
+        assert_eq!(items[0].uploaded_by_username.as_deref(), Some("alice"));
+        // Id retained, name unresolved: the account was deleted.
+        assert_eq!(items[1].uploaded_by, Some(deleted));
+        assert_eq!(items[1].uploaded_by_username, None);
+        assert_eq!(items[2].uploaded_by_username, None);
+    }
+
+    #[test]
+    fn artifact_response_always_serializes_the_uploader_keys() {
+        // #3271: the UI relies on the keys being present (null when unknown)
+        // rather than having to treat an absent key as "no uploader".
+        let alice = Uuid::new_v4();
+        let mut item = sample_artifact_response("a.jar", "a");
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"uploaded_by\":null"), "got {json}");
+        assert!(json.contains("\"uploaded_by_username\":null"), "got {json}");
+
+        item.uploaded_by = Some(alice);
+        item.uploaded_by_username = Some("alice".to_string());
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(
+            json.contains(&format!("\"uploaded_by\":\"{alice}\"")),
+            "got {json}"
+        );
+        assert!(
+            json.contains("\"uploaded_by_username\":\"alice\""),
+            "got {json}"
+        );
+    }
+
+    /// Minimal `ArtifactResponse` for the pure-helper tests above.
+    fn sample_artifact_response(path: &str, name: &str) -> ArtifactResponse {
+        ArtifactResponse {
+            id: Uuid::new_v4(),
+            repository_key: "maven-central".to_string(),
+            path: path.to_string(),
+            name: name.to_string(),
+            version: None,
+            size_bytes: 1,
+            checksum_sha256: String::new(),
+            content_type: "application/octet-stream".to_string(),
+            download_count: 0,
+            created_at: chrono::Utc::now(),
+            uploaded_by: None,
+            uploaded_by_username: None,
+            metadata: None,
+            analyzable: false,
+            cache_cached_at: None,
+            cache_expires_at: None,
+            revision: None,
+            version_label: None,
+            quarantine_status: NOT_QUARANTINED.to_string(),
+            quarantine_until: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Hosted/virtual Maven grouped keyset paging (#2723)
     // -----------------------------------------------------------------------
 
@@ -10899,6 +11924,31 @@ mod tests {
         // Sorted by path.
         assert_eq!(page[0], "is-odd/-/is-odd-3.0.1.tgz");
         assert_eq!(page[1], "lodash/-/lodash-4.17.21.tgz");
+    }
+
+    /// The legacy pre-catalog listing path must drop cached index responses
+    /// on the same terms as the catalog-backed one, or a cold cache still
+    /// renders the empty-name rows. `total` must drop with them, since it
+    /// drives the pager.
+    #[test]
+    fn test_filter_and_paginate_paths_drops_cached_index_responses() {
+        let input = paths(&[
+            "simple/idna/",
+            "simple/idna/idna-3.18-py3-none-any.whl",
+            "simple/pyyaml/",
+            "simple/pyyaml/index.v1+json",
+            // Near-miss: a real package named `index`, which must survive.
+            "simple/index/index-1.0.tar.gz",
+        ]);
+        let (page, total) = filter_and_paginate_paths(input, None, None, 1, 20);
+        assert_eq!(total, 2, "index responses are not artifacts");
+        assert_eq!(
+            page,
+            vec![
+                "simple/idna/idna-3.18-py3-none-any.whl",
+                "simple/index/index-1.0.tar.gz",
+            ]
+        );
     }
 
     #[test]
@@ -11398,6 +12448,44 @@ mod tests {
     #[test]
     fn test_validate_repository_key_valid_simple() {
         assert!(validate_repository_key("my-repo").is_ok());
+    }
+
+    // ---- #3454 follow-up: a key equal to the proxy-cache scope segment is
+    // reserved. `proxy-cache/<segment>/` is the whole deployment's cache root
+    // AND the legacy per-repository purge prefix `proxy-cache/<repo_key>/`, so
+    // a repository keyed as the segment makes deleting it sweep every other
+    // repository's cached content. Refusing it at creation/rename is the half
+    // of the fix that survives a refactor of the purge path.
+    #[test]
+    fn test_reject_repository_key_equal_to_scope_segment() {
+        let err = validate_key_not_scope_collision("prod-eu", Some("prod-eu"))
+            .expect_err("a key equal to the scope segment must be rejected");
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("proxy-cache scope segment"),
+                    "unexpected: {msg}"
+                );
+                assert!(msg.contains("prod-eu"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The UUID default segment is a legal repository key too, and equally
+        // reserved.
+        let uuid = "7ff7c6bf-e184-4d77-a541-0b23b208b3b4";
+        assert!(validate_key_not_scope_collision(uuid, Some(uuid)).is_err());
+    }
+
+    #[test]
+    fn test_scope_collision_permits_non_colliding_and_unscoped() {
+        // A different key under the same scope is fine.
+        assert!(validate_key_not_scope_collision("maven-proxy", Some("prod-eu")).is_ok());
+        // An unscoped/legacy deployment (no segment) can never collide.
+        assert!(validate_key_not_scope_collision("prod-eu", None).is_ok());
+        // The colliding key is still a well-formed key by the base validator —
+        // i.e. the base validator does NOT already reject it, so this check is
+        // load-bearing.
+        assert!(validate_repository_key("prod-eu").is_ok());
     }
 
     #[test]
@@ -12682,6 +13770,8 @@ mod tests {
             content_type: "application/java-archive".to_string(),
             download_count: 42,
             created_at: chrono::Utc::now(),
+            uploaded_by: None,
+            uploaded_by_username: None,
             metadata: None,
             analyzable: true,
             cache_cached_at: None,
@@ -12772,6 +13862,8 @@ mod tests {
             content_type: "application/octet-stream".to_string(),
             download_count: 0,
             created_at: cached,
+            uploaded_by: None,
+            uploaded_by_username: None,
             metadata: None,
             analyzable: false,
             cache_cached_at: Some(cached),
@@ -15238,6 +16330,512 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -----------------------------------------------------------------------
+    // REST delete: OCI index unwind (#3476)
+    //
+    // The unwind must remove the index rows the deleted artifact OWNS, and
+    // nothing else. Every fixture below seeds the index independently of the
+    // `artifacts` row's checksum so a divergence between the two is observable
+    // — a fixture that derives both sides from one value cannot see it.
+    // -----------------------------------------------------------------------
+
+    /// Test scaffolding for a Docker repo the fixture user may read/write/delete.
+    struct OciDeleteRig {
+        pool: sqlx::PgPool,
+        repo_id: Uuid,
+        key: String,
+        user_id: Uuid,
+        username: String,
+        auth: Option<AuthExtension>,
+        dir: std::path::PathBuf,
+    }
+
+    impl OciDeleteRig {
+        async fn setup() -> Option<Self> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let pool = tdh::try_pool().await?;
+            let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "docker").await;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            tdh::grant_repo_access(&pool, repo_id, user_id).await;
+            tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+            let auth = Some(tdh::make_auth(user_id, &username));
+            Some(Self {
+                pool,
+                repo_id,
+                key,
+                user_id,
+                username,
+                auth,
+                dir,
+            })
+        }
+
+        /// Insert an `artifacts` row at `path` whose content hash is `checksum`,
+        /// exactly as `upsert_manifest_artifact` writes it on a manifest push.
+        async fn seed_artifact(&self, path: &str, checksum: &str) {
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    repository_id, path, name, version, size_bytes,
+                    checksum_sha256, content_type, storage_key
+                )
+                VALUES ($1, $2, $2, 'v', 100,
+                        $3, 'application/vnd.oci.image.manifest.v1+json', $4)
+                "#,
+            )
+            .bind(self.repo_id)
+            .bind(path)
+            .bind(checksum)
+            .bind(format!("sha256:{checksum}"))
+            .execute(&self.pool)
+            .await
+            .expect("seed artifacts row");
+        }
+
+        /// Insert the `oci_tags` index row for `(image, reference)`. `digest` is
+        /// supplied independently of any artifacts row so the fixture can model
+        /// agreement AND divergence.
+        async fn seed_tag(&self, image: &str, reference: &str, digest: &str) {
+            sqlx::query(
+                "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+                 VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')",
+            )
+            .bind(self.repo_id)
+            .bind(image)
+            .bind(reference)
+            .bind(digest)
+            .execute(&self.pool)
+            .await
+            .expect("seed oci_tags row");
+        }
+
+        /// Insert the config + layer `manifest_blob_refs` a pushed manifest pins.
+        async fn seed_blob_refs(&self, digest: &str) {
+            for (kind, blob) in [("config", "cfg"), ("layer", "lay")] {
+                sqlx::query(
+                    "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) \
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(digest)
+                .bind(format!("sha256:{}{}", blob, "0".repeat(61)))
+                .bind(self.repo_id)
+                .bind(kind)
+                .execute(&self.pool)
+                .await
+                .expect("seed manifest_blob_refs");
+            }
+        }
+
+        async fn delete(&self, path: &str) -> Result<()> {
+            self.delete_as(path, self.auth.clone()).await
+        }
+
+        /// Delete as an admin. A literal `sha256:` manifest path classifies as
+        /// immutable, so only the admin retraction escape hatch reaches the
+        /// unwind for a digest-addressed path.
+        async fn delete_as_admin(&self, path: &str) -> Result<()> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let auth = Some(tdh::admin_auth(self.user_id, &self.username));
+            self.delete_as(path, auth).await
+        }
+
+        async fn delete_as(&self, path: &str, auth: Option<AuthExtension>) -> Result<()> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            delete_artifact(
+                State(tdh::build_state(
+                    self.pool.clone(),
+                    self.dir.to_string_lossy().as_ref(),
+                )),
+                Extension(auth),
+                Path((self.key.clone(), path.to_string())),
+                HeaderMap::new(),
+            )
+            .await
+        }
+
+        async fn tag_count(&self, image: &str, reference: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+            )
+            .bind(self.repo_id)
+            .bind(image)
+            .bind(reference)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn blob_ref_count(&self, digest: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+            )
+            .bind(self.repo_id)
+            .bind(digest)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn is_deleted(&self, path: &str) -> bool {
+            sqlx::query_scalar(
+                "SELECT is_deleted FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(self.repo_id)
+            .bind(path)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn teardown(self) {
+            use crate::api::handlers::test_db_helpers as tdh;
+            tdh::cleanup(&self.pool, self.repo_id, self.user_id).await;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// #3476 negative control (STRENGTHENED): a REST delete of a normally-pushed
+    /// manifest must still unwind the whole index footprint it owns — the tag
+    /// row AND the `manifest_blob_refs` that pin its config/layer blobs — while
+    /// leaving another image's tag in the same repository alone.
+    ///
+    /// The blob-ref half is the storage-reclaim half of #3476; the second image
+    /// pins the blast radius so a later "unwind everything with this digest"
+    /// regression cannot pass.
+    #[tokio::test]
+    async fn delete_artifact_docker_removes_oci_tags_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "a".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine";
+
+        rig.seed_artifact(path, &checksum).await;
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+
+        // A second, unrelated image in the same repository at its own digest.
+        let bystander_checksum = "b".repeat(64);
+        let bystander_digest = format!("sha256:{bystander_checksum}");
+        rig.seed_tag("nginx", "stable", &bystander_digest).await;
+        rig.seed_blob_refs(&bystander_digest).await;
+
+        let result = rig.delete(path).await;
+        assert!(
+            result.is_ok(),
+            "docker delete must succeed, got: {result:?}"
+        );
+
+        assert_eq!(
+            rig.tag_count("redis", "7-alpine").await,
+            0,
+            "oci_tags row must be removed by the REST delete"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&digest).await,
+            0,
+            "the deleted manifest's blob refs must be released so GC can reclaim them"
+        );
+        assert!(
+            rig.is_deleted(path).await,
+            "artifacts row must be soft-deleted"
+        );
+
+        assert_eq!(
+            rig.tag_count("nginx", "stable").await,
+            1,
+            "an unrelated image's tag must be untouched"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&bystander_digest).await,
+            2,
+            "an unrelated image's blob refs must be untouched"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// The REST delete resolves the digest it unwinds FROM THE OCI INDEX for
+    /// `(repository, image, reference)` — never from the deleted row's own
+    /// checksum. An `artifacts` row that merely *carries the same content hash*
+    /// as an indexed manifest, under an unrelated image name and a reference the
+    /// index does not know, owns no index rows and must not be able to remove
+    /// any.
+    #[tokio::test]
+    async fn rest_delete_of_decoy_manifest_must_not_unwind_victim_index_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let victim = "1".repeat(64);
+        let victim_digest = format!("sha256:{victim}");
+
+        // Victim: a real, indexed manifest.
+        rig.seed_artifact("v2/prodimg/manifests/1.0.0", &victim)
+            .await;
+        rig.seed_tag("prodimg", "1.0.0", &victim_digest).await;
+        rig.seed_blob_refs(&victim_digest).await;
+
+        // A second tag on the same digest, so a repo-wide content-addressed
+        // sweep would be visible here too.
+        rig.seed_tag("prodimg", "latest", &victim_digest).await;
+
+        // Decoy: an artifacts row under an unrelated image at a digest-SHAPED
+        // reference, holding the victim's content hash, with NO index row of its
+        // own (which is all the generic upload path creates).
+        let decoy_path = "v2/attackersandbox/manifests/blake3:00";
+        rig.seed_artifact(decoy_path, &victim).await;
+
+        let result = rig.delete(decoy_path).await;
+        assert!(
+            result.is_ok(),
+            "deleting an unindexed artifact must still succeed, got: {result:?}"
+        );
+
+        assert_eq!(
+            rig.tag_count("prodimg", "1.0.0").await,
+            1,
+            "the victim image's tag must survive a delete of an unrelated artifact"
+        );
+        assert_eq!(
+            rig.tag_count("prodimg", "latest").await,
+            1,
+            "a second tag on the same digest must survive too"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&victim_digest).await,
+            2,
+            "the victim image's blob refs must survive (they pin its blobs against GC)"
+        );
+        assert!(
+            rig.is_deleted(decoy_path).await,
+            "the deleted artifact must still be soft-deleted"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// Same invariant under a NON-digest-shaped reference: the decision is
+    /// "is this row the manifest the index names?", not "does the reference look
+    /// like a digest?". Guards the index-authority and checksum-identity rules
+    /// independently of the delete SCOPE rule.
+    #[tokio::test]
+    async fn rest_delete_of_unindexed_manifest_path_must_not_touch_index_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let victim = "3".repeat(64);
+        let victim_digest = format!("sha256:{victim}");
+
+        rig.seed_artifact("v2/prodimg/manifests/1.0.0", &victim)
+            .await;
+        rig.seed_tag("prodimg", "1.0.0", &victim_digest).await;
+        rig.seed_blob_refs(&victim_digest).await;
+
+        let decoy_path = "v2/attackersandbox/manifests/rogue";
+        rig.seed_artifact(decoy_path, &victim).await;
+
+        let result = rig.delete(decoy_path).await;
+        assert!(result.is_ok(), "delete must succeed, got: {result:?}");
+
+        assert_eq!(rig.tag_count("prodimg", "1.0.0").await, 1);
+        assert_eq!(rig.blob_ref_count(&victim_digest).await, 2);
+        assert!(rig.is_deleted(decoy_path).await);
+
+        rig.teardown().await;
+    }
+
+    /// The unwind requires the `artifacts` row to BE the manifest the index
+    /// names. When the two have diverged — the row carries different bytes than
+    /// the tag resolves to — the row does not own that tag, so deleting it must
+    /// leave the tag (which still names a stored manifest) alone rather than
+    /// making a live image unpullable.
+    #[tokio::test]
+    async fn rest_delete_of_diverged_artifact_row_must_not_unwind_indexed_manifest_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        // What the index says `prodimg:1.0.0` is...
+        let indexed = "5".repeat(64);
+        let indexed_digest = format!("sha256:{indexed}");
+        // ...and what the artifacts row at that path actually holds.
+        let stored = "6".repeat(64);
+
+        let path = "v2/prodimg/manifests/1.0.0";
+        rig.seed_artifact(path, &stored).await;
+        rig.seed_tag("prodimg", "1.0.0", &indexed_digest).await;
+        rig.seed_blob_refs(&indexed_digest).await;
+
+        let result = rig.delete(path).await;
+        assert!(result.is_ok(), "delete must still succeed, got: {result:?}");
+
+        assert_eq!(
+            rig.tag_count("prodimg", "1.0.0").await,
+            1,
+            "a row that is not the indexed manifest must not remove its tag"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&indexed_digest).await,
+            2,
+            "the indexed manifest's blob refs must stay pinned"
+        );
+        assert!(rig.is_deleted(path).await, "the row is still soft-deleted");
+
+        rig.teardown().await;
+    }
+
+    /// A digest-shaped reference on the REST route is NOT a content-addressed
+    /// delete. The REST verb removes one `artifacts` row, so its index footprint
+    /// is the single `(name, tag)` row that path names — sibling tags pointing
+    /// at the same digest keep the manifest live.
+    #[tokio::test]
+    async fn rest_delete_by_digest_reference_without_index_row_preserves_sibling_tags_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "c".repeat(64);
+        let digest = format!("sha256:{checksum}");
+
+        // Two tags on the same digest, and an artifacts row addressed BY DIGEST
+        // with no `('redis', 'sha256:C')` index row of its own. A literal
+        // `sha256:` manifest path is classified immutable, so this delete runs
+        // through the admin retraction escape hatch.
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_tag("redis", "7", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+        let path = format!("v2/redis/manifests/{digest}");
+        rig.seed_artifact(&path, &checksum).await;
+
+        let result = rig.delete_as_admin(&path).await;
+        assert!(result.is_ok(), "delete must succeed, got: {result:?}");
+
+        assert_eq!(
+            rig.tag_count("redis", "7-alpine").await,
+            1,
+            "a digest-addressed REST delete must not sweep every tag on the digest"
+        );
+        assert_eq!(rig.tag_count("redis", "7").await, 1);
+        assert_eq!(
+            rig.blob_ref_count(&digest).await,
+            2,
+            "the manifest is still tagged, so its blob refs must stay pinned"
+        );
+        assert!(rig.is_deleted(&path).await);
+
+        rig.teardown().await;
+    }
+
+    /// Concurrent deletes of the SAME artifact must produce exactly one
+    /// success. The handler's lookup and `prepare_delete` are non-locking
+    /// reads, so several racers can pass both; the soft-delete UPDATE is what
+    /// serializes them, and its `is_deleted = false` predicate is what makes
+    /// the losers report `NotFound` instead of each claiming a delete it did
+    /// not perform (and each writing an audit entry for it).
+    #[tokio::test]
+    async fn concurrent_rest_deletes_of_one_artifact_yield_exactly_one_success_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "7".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine";
+        rig.seed_artifact(path, &checksum).await;
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+
+        let results = futures::future::join_all((0..6).map(|_| rig.delete(path))).await;
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok, 1,
+            "exactly one concurrent delete may report success, got {ok}: {results:?}"
+        );
+        assert_eq!(rig.tag_count("redis", "7-alpine").await, 0);
+        assert_eq!(rig.blob_ref_count(&digest).await, 0);
+        assert!(rig.is_deleted(path).await);
+
+        rig.teardown().await;
+    }
+
+    /// The index unwind and the `artifacts` soft-delete are ONE transaction: if
+    /// the soft-delete fails, the index must be exactly as it was. Otherwise a
+    /// database hiccup destroys the image while the API reports the delete
+    /// failed — with no audit record of it.
+    ///
+    /// The failure is injected with a BEFORE UPDATE trigger scoped to this
+    /// fixture's single row id, so a leaked trigger is inert for every other row
+    /// in the shared cluster. Pinned to the `db-serial` nextest group all the
+    /// same (see `.config/nextest.toml`).
+    #[tokio::test]
+    async fn rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "d".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine";
+
+        rig.seed_artifact(path, &checksum).await;
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+
+        let artifact_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(rig.repo_id)
+                .bind(path)
+                .fetch_one(&rig.pool)
+                .await
+                .unwrap();
+
+        // Drop first, unconditionally, so a previously panicked run cannot leak
+        // the trigger into this one.
+        let drop_trigger = "DROP TRIGGER IF EXISTS ak_test_block_delete_3475 ON artifacts";
+        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION ak_test_block_delete_3475() RETURNS trigger AS \
+             $$ BEGIN RAISE EXCEPTION 'ak-test-3475 injected failure'; END $$ LANGUAGE plpgsql",
+        )
+        .execute(&rig.pool)
+        .await
+        .expect("create abort function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER ak_test_block_delete_3475 BEFORE UPDATE ON artifacts \
+             FOR EACH ROW WHEN (NEW.is_deleted AND NEW.id = '{artifact_id}') \
+             EXECUTE FUNCTION ak_test_block_delete_3475()"
+        ))
+        .execute(&rig.pool)
+        .await
+        .expect("create abort trigger");
+
+        let result = rig.delete(path).await;
+
+        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query("DROP FUNCTION IF EXISTS ak_test_block_delete_3475()")
+            .execute(&rig.pool)
+            .await
+            .ok();
+
+        assert!(
+            result.is_err(),
+            "the delete must fail when the soft-delete cannot be applied"
+        );
+        assert_eq!(
+            rig.tag_count("redis", "7-alpine").await,
+            1,
+            "a failed delete must not leave the index unwound"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&digest).await,
+            2,
+            "a failed delete must not release the manifest's blob refs"
+        );
+        assert!(
+            !rig.is_deleted(path).await,
+            "the artifacts row must still be live after a failed delete"
+        );
+
+        rig.teardown().await;
+    }
+
     /// #2603 G1 core: `require_repo_action` is DENY-BY-DEFAULT. On a RULES-LESS
     /// repository (no fine-grained rows) it must:
     ///   * deny a bare authenticated non-member `write`/`delete` on a PUBLIC
@@ -15517,6 +17115,7 @@ mod tests {
             "set_routing_rules",
             "delete_routing_rules",
             "set_upstream_auth",
+            "set_egress_proxy",
             "upload_artifact",
             "delete_artifact",
         ] {
@@ -15543,6 +17142,108 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Per-repository egress proxy request validation (#2469, #2811)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn egress_proxy_request_accepts_the_three_modes() {
+        use crate::services::egress_proxy::EgressProxyMode;
+
+        let cfg = build_egress_proxy_config("inherit", None, None).expect("inherit");
+        assert_eq!(cfg.mode, EgressProxyMode::Inherit);
+        assert_eq!(cfg.proxy_url, None);
+
+        let cfg = build_egress_proxy_config("direct", None, None).expect("direct");
+        assert_eq!(cfg.mode, EgressProxyMode::Direct);
+
+        let cfg = build_egress_proxy_config(
+            "explicit",
+            Some("http://proxy.corp.example.com:3128"),
+            Some("*.internal.example"),
+        )
+        .expect("explicit");
+        assert_eq!(cfg.mode, EgressProxyMode::Explicit);
+        assert_eq!(
+            cfg.proxy_url.as_deref(),
+            Some("http://proxy.corp.example.com:3128")
+        );
+        assert_eq!(cfg.no_proxy.as_deref(), Some("*.internal.example"));
+    }
+
+    #[test]
+    fn egress_proxy_request_rejects_an_unknown_mode() {
+        let err = build_egress_proxy_config("socks", None, None).expect_err("must reject");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+    }
+
+    #[test]
+    fn egress_proxy_request_requires_a_url_for_explicit() {
+        assert!(build_egress_proxy_config("explicit", None, None).is_err());
+        assert!(build_egress_proxy_config("explicit", Some("   "), None).is_err());
+    }
+
+    #[test]
+    fn egress_proxy_request_rejects_a_url_on_a_non_explicit_mode() {
+        // Self-contradictory input fails loudly instead of silently dropping
+        // half of what the caller asked for.
+        for mode in ["inherit", "direct"] {
+            assert!(
+                build_egress_proxy_config(mode, Some("http://proxy.corp:3128"), None).is_err(),
+                "mode {mode} silently accepted a proxy_url"
+            );
+        }
+    }
+
+    #[test]
+    fn egress_proxy_request_rejects_ssrf_targets() {
+        for url in [
+            "http://169.254.169.254",
+            "http://127.0.0.1:3128",
+            "http://localhost:3128",
+            "socks5://proxy.corp:1080",
+        ] {
+            assert!(
+                build_egress_proxy_config("explicit", Some(url), None).is_err(),
+                "accepted an SSRF-prone proxy target: {url}"
+            );
+        }
+    }
+
+    /// The response DTO must never carry the configured credentials — this is
+    /// the API-surface half of the redaction contract.
+    #[test]
+    fn egress_proxy_response_never_serializes_credentials() {
+        const SECRET: &str = "api-resp-secret";
+        let cfg = build_egress_proxy_config(
+            "explicit",
+            Some(&format!("http://svc:{SECRET}@proxy.corp.example.com:3128")),
+            None,
+        )
+        .expect("valid");
+
+        let response: EgressProxyResponse = cfg.into();
+        let json = serde_json::to_string(&response).expect("serialize");
+        assert!(
+            !json.contains(SECRET),
+            "response leaked the password: {json}"
+        );
+        assert!(
+            !json.contains("svc"),
+            "response leaked the username: {json}"
+        );
+        assert!(
+            json.contains("proxy.corp.example.com"),
+            "response should still show the host: {json}"
+        );
+        assert!(
+            json.contains("\"proxy_credentials_configured\":true"),
+            "response must report that credentials exist: {json}"
+        );
+        // And the Debug rendering of the response is safe too.
+        assert!(!format!("{response:?}").contains(SECRET));
+    }
+
     /// Repository administration / configuration subresources (#2603, area 3):
     ///
     /// Reconfiguring a repository's proxy/supply-chain behavior (upstream-auth
@@ -15559,6 +17260,11 @@ mod tests {
 
         for handler in [
             "set_upstream_auth",
+            // Egress routing is a security control and its URL may carry
+            // credentials, so both the write and the read are admin-tier
+            // (#2469).
+            "set_egress_proxy",
+            "get_egress_proxy",
             "set_routing_rules",
             "delete_routing_rules",
             "put_pypi_track",
@@ -16237,6 +17943,85 @@ mod tests {
             body_str.contains("\"path\":\"foo/bar-1.2.3.tgz\""),
             "response body must echo the URL-decoded `path` (#1539); got: {}",
             body_str,
+        );
+    }
+
+    /// #3290: on a PyPI Remote repo, invalidating either content-negotiated
+    /// representation of a Simple project index (PEP 503 HTML at
+    /// `simple/<p>/`, PEP 691 JSON at `simple/<p>/index.v1+json`) must evict
+    /// BOTH cache entries — otherwise the surviving variant keeps serving an
+    /// older upstream snapshot and `uv` (JSON) disagrees with `pip` (HTML)
+    /// about which versions exist.
+    #[tokio::test]
+    async fn invalidate_cache_evicts_pep691_sibling_for_pypi_3290() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_service::ProxyService;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+
+        // Materialize both variants' content + sidecar files where the
+        // filesystem cache backend stores them (hierarchical keys map to
+        // `<base>/<key>`, see FilesystemStorage::key_to_path).
+        let html_path = "simple/proj3290/";
+        let json_path = "simple/proj3290/index.v1+json";
+        let mut cached_files = Vec::new();
+        for path in [html_path, json_path] {
+            for key in [
+                ProxyService::cache_storage_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
+                ProxyService::cache_metadata_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
+            ] {
+                let file = fx.storage_dir.join(&key);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, b"{}").unwrap();
+                cached_files.push(file);
+            }
+        }
+
+        // Invalidate the HTML representation only.
+        let router = tdh::router_with_auth(super::router(), state, auth);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/cache/invalidate?path=simple%2Fproj3290%2F",
+                fx.repo_key
+            ))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        let survivors: Vec<_> = cached_files.iter().filter(|f| f.exists()).collect();
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "invalidate must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            survivors.is_empty(),
+            "invalidating one Simple-index representation must evict the \
+             PEP 691 sibling too (#3290); surviving cache files: {survivors:?}"
         );
     }
 
@@ -19106,6 +20891,83 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #3368: the repository-delete purge must not reclaim proxy-cache
+    /// objects.
+    ///
+    /// The purge's exclusivity guard asks only whether another *`artifacts`*
+    /// row shares the key. A proxy-cache object's real owner is a
+    /// `proxy_cache_artifacts` row, which that query cannot see, so a legacy
+    /// `artifacts` row carrying a cache key looks exclusively owned while the
+    /// object it names is live cache content. Cache keys embed the *cache
+    /// owner's* repository key, so after a repository key rename with reuse
+    /// this reaches into a different repository's cache entirely.
+    ///
+    /// Before the layout was anchored the delete resolved to a key nothing had
+    /// written and silently hit nothing; anchoring it makes the delete land.
+    ///
+    /// FAILS ON MAIN (with the anchoring in place): the cache object is
+    /// deleted while its `proxy_cache_artifacts` row survives.
+    #[tokio::test]
+    async fn purge_repo_artifact_objects_spares_proxy_cache_objects_3368() {
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = state.storage_for_repo(&location).expect("resolve storage");
+
+        // One cache object (owned by a DIFFERENT repository's cache key space)
+        // and one ordinary hosted object, both referenced by rows on the
+        // repository being deleted.
+        let uid = Uuid::new_v4().simple().to_string();
+        let cache_key =
+            format!("proxy-cache/some-other-remote-{uid}/simple/six/six-1.0.whl/__content__");
+        let hosted_key = format!("pypi/six/1.0/six-1.0-{uid}.whl");
+        for key in [&cache_key, &hosted_key] {
+            storage
+                .put(key, bytes::Bytes::from_static(b"payload"))
+                .await
+                .expect("seed object");
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by) \
+                 VALUES ($1, $2, 'six', '1.0', 7, 'cafe', 'application/zip', $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(key)
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await
+            .expect("insert artifacts row");
+        }
+
+        purge_repo_artifact_objects(&state, fx.repo_id, &location).await;
+
+        let cache_object = storage
+            .exists(&cache_key)
+            .await
+            .expect("probe cache object");
+        let hosted_object = storage
+            .exists(&hosted_key)
+            .await
+            .expect("probe hosted object");
+        fx.teardown().await;
+
+        assert!(
+            cache_object,
+            "#3368: proxy-cache content belongs to proxy_cache_artifacts, which this purge \
+             cannot see; deleting it strands that catalog row and its size_bytes"
+        );
+        assert!(
+            !hosted_object,
+            "negative control: the repository's own hosted object must still be purged, or \
+             the sweep has been disabled rather than scoped"
+        );
+    }
+
     #[tokio::test]
     async fn purge_repo_artifact_objects_is_best_effort_when_backend_unresolvable() {
         // The purge resolves the repository's OWN configured backend via
@@ -21786,6 +23648,176 @@ mod tests {
 // --------------------------------------------------------------------------
 
 #[cfg(test)]
+mod generic_path_coordinate_tests {
+    use super::derive_generic_path_coordinate;
+
+    #[test]
+    fn flat_coordinate_is_name_then_version() {
+        let (name, version) =
+            derive_generic_path_coordinate("lodash/4.17.11/lodash.tgz", true, "fallback".into());
+        assert_eq!(name, "lodash");
+        assert_eq!(version.as_deref(), Some("4.17.11"));
+    }
+
+    #[test]
+    fn npm_scoped_package_keeps_scope_with_name() {
+        // #3604 defect 3: the scope is PART of the name; the flat parse would
+        // read name=`@babel`, version=`traverse` and pin a component that does
+        // not exist, letting a vulnerable scoped package read clean.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/babel-traverse-7.23.0.tgz",
+            true,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel/traverse");
+        assert_eq!(version.as_deref(), Some("7.23.0"));
+    }
+
+    #[test]
+    fn scope_prefix_is_only_special_for_npm_formats() {
+        // A non-npm format never uses the `@scope/` convention, so the leading
+        // `@` segment is treated as an ordinary name and behavior is unchanged.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/x.tgz",
+            false,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel");
+        assert_eq!(version.as_deref(), Some("traverse"));
+    }
+
+    #[test]
+    fn too_short_path_falls_back() {
+        let (name, version) = derive_generic_path_coordinate("just-a-file.txt", true, "fb".into());
+        assert_eq!(name, "fb");
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn scoped_without_a_version_segment_falls_back_to_flat() {
+        // `@scope/name/file` has only three segments: not enough for a scoped
+        // coordinate, so the flat parse applies rather than mis-reading.
+        let (name, version) =
+            derive_generic_path_coordinate("@scope/name/file.tgz", true, "fb".into());
+        assert_eq!(name, "@scope");
+        assert_eq!(version.as_deref(), Some("name"));
+    }
+}
+
+#[cfg(test)]
+mod docker_tag_search_escape_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Seed one `oci_tags` row plus the `artifacts` row the listing joins to.
+    async fn seed_tag(pool: &sqlx::PgPool, repo_id: Uuid, image: &str, tag: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, $2, $3, 1, \
+             '0000000000000000000000000000000000000000000000000000000000000000', \
+             'application/vnd.oci.image.manifest.v1+json', $2)",
+        )
+        .bind(repo_id)
+        .bind(format!("v2/{image}/manifests/{tag}"))
+        .bind(image)
+        .execute(pool)
+        .await
+        .expect("seed manifest artifact");
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest) \
+             VALUES ($1, $2, $3, 'sha256:0000000000000000000000000000000000000000000000000000000000000000')",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .bind(tag)
+        .execute(pool)
+        .await
+        .expect("seed oci tag");
+    }
+
+    /// #3500. The docker-tag listing's `?search=` filter builds its `LIKE`
+    /// pattern in SQL (`LIKE '%' || LOWER($n) || '%'`) from REQUEST input.
+    /// Unescaped, a `%` or `_` in the search term was a wildcard — searching
+    /// `1_0` also returned `1.0` and `120` — and a backslash quoted the
+    /// character after it, so a tag containing one could not be found by
+    /// typing it.
+    ///
+    /// The `?count=exact` arm is asserted alongside the rows, because it is a
+    /// SEPARATE query: a fix applied to one arm and not the other reports a
+    /// total that disagrees with the page.
+    #[tokio::test]
+    async fn test_docker_tag_search_treats_wildcards_literally_3500() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "docker").await;
+        for tag in ["1_0", "1.0", "120", r"we\ird", "weird", "plain"] {
+            seed_tag(&pool, repo_id, "app", tag).await;
+        }
+
+        async fn search(pool: &sqlx::PgPool, repo_id: Uuid, q: &str) -> (Vec<String>, i64) {
+            let rows = fetch_docker_tag_rows(pool, repo_id, Some(q), None, 0, 50)
+                .await
+                .expect("tag rows");
+            let mut tags: Vec<String> = rows.into_iter().map(|r| r.tag).collect();
+            tags.sort();
+            let total = count_docker_tag_rows(pool, repo_id, Some(q))
+                .await
+                .expect("tag count");
+            (tags, total)
+        }
+
+        let underscore = search(&pool, repo_id, "1_0").await;
+        let backslash = search(&pool, repo_id, r"we\ir").await;
+        let plain = search(&pool, repo_id, "plain").await;
+        let substring = search(&pool, repo_id, "ir").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            underscore.0,
+            vec!["1_0".to_string()],
+            "searching `1_0` must match the tag literally named `1_0`; \
+             unescaped, `_` matches any single character and `1.0` and `120` \
+             come back too"
+        );
+        assert_eq!(
+            underscore.1, 1,
+            "the ?count=exact arm is a separate query and must agree with the page"
+        );
+        assert_eq!(
+            backslash.0,
+            vec![r"we\ird".to_string()],
+            r"searching `we\ir` must find the tag containing a backslash; \
+              unescaped, the backslash quotes the `i` and the pattern becomes \
+              `weir`, which matches the OTHER tag instead"
+        );
+        assert_eq!(
+            backslash.1, 1,
+            "count arm must agree for the backslash term"
+        );
+        assert_eq!(
+            plain.0,
+            vec!["plain".to_string()],
+            "positive control: an ordinary search term must still work"
+        );
+        assert_eq!(
+            substring.0,
+            vec![r"we\ird".to_string(), "weird".to_string()],
+            "positive control: this is still a SUBSTRING search — escaping the \
+             term must not turn it into an exact match"
+        );
+        assert_eq!(
+            substring.1, 2,
+            "count arm must agree for the substring term"
+        );
+    }
+}
+
+#[cfg(test)]
 mod apt_validation_tests {
     use super::*;
 
@@ -22428,6 +24460,142 @@ mod apt_validation_tests {
             collected.contains(&orphan_key),
             "positive control: a key no repository references must still be \
              collected for purge; collected: {collected:?}"
+        );
+    }
+
+    /// Deleting one repository must not purge the `maven-metadata.xml` of a
+    /// subtree ANOTHER repository is still serving when that subtree's key
+    /// contains a literal backslash.
+    ///
+    /// This collector runs on every repository delete on a cloud backend — it
+    /// carries no opt-in gate — and the guard it depends on builds its `LIKE`
+    /// pattern FROM the stored key. Postgres's default `LIKE` escape character
+    /// is a backslash, so without an `ESCAPE` clause `.../com/ba\ck/lib/`
+    /// becomes the pattern `.../com/back/lib/`, the foreign repository's live
+    /// artifact no longer matches, and the `NOT EXISTS` guard reports
+    /// "unanchored" for a document the other tenant is still serving. The
+    /// rollup is what resolves version ranges and `LATEST`/`RELEASE`, so the
+    /// loss breaks resolution for a repository that was not being deleted.
+    ///
+    /// The fixture deliberately has NO artifact under the collapsed
+    /// `.../com/back/lib/` directory: a fixture whose collapsed sibling exists
+    /// is spared even without the fix and proves nothing.
+    ///
+    /// Three positive controls keep the fix honest — the `<> $1` scoping (the
+    /// doomed repository's own live artifact under a backslash directory must
+    /// not anchor its own rollup, or the object leaks forever), a rollup over
+    /// an empty backslash subtree, and a plain unreferenced backslash key.
+    #[tokio::test]
+    async fn collect_repo_maven_flat_keys_spares_foreign_rollup_whose_directory_contains_a_backslash(
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_repo, _, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (other_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let uid = Uuid::new_v4().simple().to_string();
+        let root = format!("maven/rd3431/{uid}/com");
+
+        // The surviving tenant's live artifact, under a backslash directory.
+        seed_flat_artifact_row(
+            &pool,
+            other_repo,
+            &format!(r"{root}/ba\ck/lib/1.0/lib-1.0.jar"),
+        )
+        .await;
+        let foreign_rollup = format!(r"{root}/ba\ck/lib/maven-metadata.xml");
+        let foreign_rollup_sha1 = format!("{foreign_rollup}.sha1");
+        let foreign_rollup_asc = format!("{foreign_rollup}.asc");
+
+        // Control 1: the doomed repository's OWN live artifact, likewise under
+        // a backslash directory, must not anchor its own rollup.
+        seed_flat_artifact_row(
+            &pool,
+            owner_repo,
+            &format!(r"{root}/sel\f/lib/1.0/own-1.0.jar"),
+        )
+        .await;
+        let own_rollup = format!(r"{root}/sel\f/lib/maven-metadata.xml");
+        // Controls 2 and 3: nothing anchors either of these anywhere.
+        let dead_rollup = format!(r"{root}/de\ad/lib/maven-metadata.xml");
+        let orphan_key = format!(r"{root}/or\ph/lib/9.9.9/gone-9.9.9.pom");
+
+        // Every attribution row belongs to the repository being deleted.
+        for key in [
+            &foreign_rollup,
+            &foreign_rollup_sha1,
+            &foreign_rollup_asc,
+            &own_rollup,
+            &dead_rollup,
+            &orphan_key,
+        ] {
+            seed_flat_claim(&pool, owner_repo, key).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let collected = collect_repo_maven_flat_keys(&state, owner_repo).await;
+
+        tdh::cleanup(&pool, other_repo, Uuid::nil()).await;
+        tdh::cleanup(&pool, owner_repo, Uuid::nil()).await;
+
+        for key in [&foreign_rollup, &foreign_rollup_sha1, &foreign_rollup_asc] {
+            assert!(
+                !collected.contains(key),
+                "deleting this repository must NOT purge `{key}` — another \
+                 repository still has a live artifact under that directory, \
+                 and the only reason the guard misses it is that the literal \
+                 backslash in the stored key is read as a LIKE escape \
+                 character; collected: {collected:?}"
+            );
+        }
+        assert!(
+            collected.contains(&own_rollup),
+            "positive control: only the DOOMED repository's own artifact sits \
+             under this directory, so its rollup must still be collected even \
+             though the directory contains a backslash — otherwise the anchor \
+             is unscoped and every such object leaks forever; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_rollup),
+            "positive control: a rollup over an empty subtree must still be \
+             collected even though its directory contains a backslash — \
+             otherwise sparing every backslash key would pass; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&orphan_key),
+            "positive control: a plain key no repository references must still \
+             be collected for purge; collected: {collected:?}"
+        );
+    }
+
+    /// The repository-delete collector's rollup anchor must come from the
+    /// shared fragment, carrying `ESCAPE ''`, exactly as the GC sweep's guard 3
+    /// does (`test_flat_predicate_rollup_guard_uses_shared_fragments`).
+    ///
+    /// A shape test, not an oracle: it would pass with the wrong escape
+    /// character. It exists so a future edit cannot quietly re-inline the
+    /// anchor at one of the two delete paths and let them drift again — the
+    /// #1180 lesson, and the direct cause of #3156 and #3197.
+    #[test]
+    fn repo_maven_flat_keys_rollup_anchor_disables_like_escape() {
+        use crate::services::maven_flat_attribution as mfa;
+        let sql = repo_maven_flat_keys_sql();
+        let anchor = mfa::metadata_rollup_dir_anchor_sql("mb.storage_key", "o.storage_key");
+        assert!(
+            sql.contains(&anchor),
+            "the purge list's rollup guard must use the shared anchor fragment \
+             `{anchor}`, not an inline copy; sql: {sql}"
+        );
+        assert!(
+            anchor.contains("ESCAPE ''"),
+            "the rollup anchor must disable LIKE escape processing: without it \
+             a literal backslash in a stored key is read as an escape \
+             character and the guard misses the directory it was derived from, \
+             so deleting one repository purges a rollup another repository is \
+             still serving; anchor: {anchor}"
         );
     }
 

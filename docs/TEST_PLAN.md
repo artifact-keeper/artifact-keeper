@@ -9,7 +9,7 @@ The artifact-keeper backend uses a multi-tier testing strategy covering unit tes
 | Test Type | Framework | Count | CI Job | Status |
 |-----------|-----------|-------|--------|--------|
 | Unit | cargo test --lib | ~4900 tests | `test-backend-unit` | Active |
-| Integration | cargo test --test | 6 test files | `test-backend-integration` | Main/release only |
+| Integration | cargo test --test | 61 test files (16 registered in CI) | `test-backend-integration` | Main/release only |
 | Native client E2E | Shell scripts | 28 scripts, 12 formats | `smoke-e2e` | Active |
 | Stress | Shell scripts | 100 concurrent uploads | Manual/dispatch | Active |
 | Failure injection | Shell scripts | 3 scenarios | Manual/dispatch | Active |

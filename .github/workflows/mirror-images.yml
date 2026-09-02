@@ -18,25 +18,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: postgres:16-alpine
-            target: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
-          - image: alpine:3.19
-            target: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
-          - image: alpine:3.23
-            target: ghcr.io/artifact-keeper/ci-mirror/alpine:3.23
-          - image: python:3.12-slim
-            target: ghcr.io/artifact-keeper/ci-mirror/python:3.12-slim
-          - image: node:20-slim
-            target: ghcr.io/artifact-keeper/ci-mirror/node:20-slim
-          - image: rust:1.75-slim
-            target: ghcr.io/artifact-keeper/ci-mirror/rust:1.75-slim
+          - image: postgres:18-alpine
+            target: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
+          - image: alpine:3.24
+            target: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
+          - image: python:3.14-slim
+            target: ghcr.io/artifact-keeper/ci-mirror/python:3.14-slim
+          - image: node:26-slim
+            target: ghcr.io/artifact-keeper/ci-mirror/node:26-slim
+          - image: rust:1.98-slim
+            target: ghcr.io/artifact-keeper/ci-mirror/rust:1.98-slim
 
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
