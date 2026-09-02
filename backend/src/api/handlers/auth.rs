@@ -2162,6 +2162,122 @@ mod tests {
         assert_eq!(got, "/pypi/Mixed-Case-Repo");
     }
 
+    // -----------------------------------------------------------------------
+    // #3504: the one line joining the login rate limiter's per-IP pad budget
+    // to the service's `TimingPad` lives in the `login` handler. Nothing else
+    // exercises it — the service tests pass an explicit `TimingPad` and the
+    // middleware tests use a stub handler — so hardcoding either value there
+    // (i.e. silently deleting the timing fix on the only surface it protects)
+    // passed the whole suite. This drives the real `login_router()` behind the
+    // real middleware and counts bcrypt verifies.
+    // -----------------------------------------------------------------------
+
+    /// Build the real login route behind the real login limiter, with the
+    /// #3504 per-IP pad budget set to `failed_per_ip` and every other bucket
+    /// left generous.
+    #[cfg(test)]
+    fn login_app_with_pad_budget(state: SharedState, failed_per_ip: u32) -> Router {
+        use crate::api::middleware::rate_limit::{
+            login_rate_limit_middleware, LoginRateLimitState, RateLimitExemptions, RateLimitState,
+            RateLimiter,
+        };
+        let limiter_state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(10_000, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: true,
+                trusted_proxies: Arc::new(Vec::new()),
+            },
+            backstop: Arc::new(RateLimiter::new(10_000, 60)),
+            failed_by_ip: Arc::new(RateLimiter::new(failed_per_ip, 60)),
+        };
+        login_router()
+            .with_state(state)
+            .layer(axum::middleware::from_fn_with_state(
+                limiter_state,
+                login_rate_limit_middleware,
+            ))
+    }
+
+    /// POST one login for a username that exists in no deployment, and return
+    /// `(status, bcrypt verifies it cost)`.
+    #[cfg(test)]
+    async fn login_unknown_user_counting_bcrypt(app: &Router, username: &str) -> (StatusCode, u64) {
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+        use tower::ServiceExt;
+
+        let before = bcrypt_verify_counter().load(Ordering::Relaxed);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("X-Forwarded-For", "203.0.113.9")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"username":"{username}","password":"x"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let after = bcrypt_verify_counter().load(Ordering::Relaxed);
+        (status, after - before)
+    }
+
+    /// Within budget the login endpoint pads a hashless rejection; once the
+    /// budget is spent the identical request must not pad. Hardcoding either
+    /// `TimingPad::On` or `TimingPad::Off` in the handler fails one half.
+    ///
+    /// Relies on `cargo nextest`'s process-per-test isolation (the bcrypt
+    /// counter is a process-global), which CI and `CLAUDE.md` both mandate.
+    #[tokio::test]
+    async fn test_login_handler_maps_the_per_ip_pad_budget_to_the_timing_pad() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-3504-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool, dir.to_string_lossy().as_ref());
+
+        // Budget of 2: the first two rejections are padded, and each 401
+        // charges the source IP, so the third finds the budget spent.
+        const BUDGET: u32 = 2;
+        let app = login_app_with_pad_budget(state, BUDGET);
+
+        for i in 0..BUDGET {
+            let (status, verifies) =
+                login_unknown_user_counting_bcrypt(&app, &format!("ph-ghost-{}", Uuid::new_v4()))
+                    .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} must be rejected, never shed"
+            );
+            assert_eq!(
+                verifies, 1,
+                "attempt {i} is within the pad budget, so an unknown username \
+                 must still cost one bcrypt verify (#3504)"
+            );
+        }
+
+        let (status, verifies) =
+            login_unknown_user_counting_bcrypt(&app, &format!("ph-ghost-{}", Uuid::new_v4())).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a spent pad budget must never shed the request"
+        );
+        assert_eq!(
+            verifies, 0,
+            "past the pad budget the handler must pass TimingPad::Off, so an \
+             unknown username costs no bcrypt (#3504)"
+        );
+    }
+
     #[test]
     fn test_validate_path_does_not_lowercase_repo_key() {
         // Repo keys are validated as lowercase at creation, but a minter

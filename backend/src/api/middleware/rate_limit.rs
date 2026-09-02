@@ -314,11 +314,12 @@ impl RateLimiter {
     /// Peek at `key`'s budget **without** consuming it.
     ///
     /// Returns `Ok(remaining)` when the bucket still has room, or
-    /// `Err(retry_after_secs)` when it is full. Paired with
-    /// [`Self::record_attempt`] for the failed-login-per-IP cap (#3504), which
-    /// must charge only attempts that actually failed: the check has to happen
-    /// before the handler runs and the charge only after it answers, so
+    /// `Err(retry_after_secs)` when it is spent. Paired with
+    /// [`Self::record_attempt`] for the per-IP login pad budget (#3504), which
+    /// charges only attempts that actually failed: the budget must be read
+    /// before the handler runs and charged only after it answers, so
     /// [`Self::check_rate_limit`]'s check-and-consume shape does not fit.
+    /// Nothing is refused on either side — see [`LoginPadBudget`].
     pub async fn peek_rate_limit(&self, key: &str) -> Result<u32, u64> {
         let now = Instant::now();
         let requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
@@ -341,9 +342,9 @@ impl RateLimiter {
     /// Charge one unit against `key`'s budget, starting a fresh window when
     /// the previous one has expired.
     ///
-    /// Unlike [`Self::check_rate_limit`] this never refuses — it only records.
-    /// Refusal is [`Self::peek_rate_limit`]'s job on the *next* request, which
-    /// is what lets a limiter count outcomes rather than arrivals (#3504).
+    /// Unlike [`Self::check_rate_limit`] this only records; the split from
+    /// [`Self::peek_rate_limit`] is what lets a limiter count *outcomes*
+    /// rather than arrivals (#3504).
     pub async fn record_attempt(&self, key: &str) {
         let now = Instant::now();
         let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
@@ -355,15 +356,6 @@ impl RateLimiter {
             return;
         }
         entry.0 = entry.0.saturating_add(1);
-    }
-
-    /// Drop `key`'s bucket entirely, restoring its full budget.
-    ///
-    /// Used by the failed-login pad budget (#3504) so that one successful
-    /// login from a source IP clears the failures accumulated against it.
-    pub async fn clear(&self, key: &str) {
-        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
-        requests.remove(key);
     }
 
     /// Clean up expired entries from the rate limiter.
@@ -506,9 +498,9 @@ pub struct LoginRateLimitState {
     /// The per-key bucket above is keyed `login:{username}|{ip}`, so an
     /// attacker enumerating usernames gets a fresh bucket for every candidate
     /// and only the global backstop is left; this one accrues against the
-    /// source IP whatever username each attempt named. It never sheds a
-    /// request — see [`LoginPadBudget`]. `max_requests == 0` disables it
-    /// (the pad always runs).
+    /// source IP whatever username each attempt named, and is not reset by a
+    /// success. It never sheds a request — see [`LoginPadBudget`].
+    /// `max_requests == 0` disables it (the pad always runs).
     pub failed_by_ip: Arc<RateLimiter>,
 }
 
@@ -549,8 +541,15 @@ pub fn login_failed_ip_key(client_ip: &str) -> String {
 /// removed. Now an exhausted budget only means the login runs *unpadded*: the
 /// hashless arms answer without bcrypt (the timing oracle returns for that IP
 /// until the window rolls) while every account that has a stored hash is still
-/// verified normally. Nothing is ever refused, and a successful login clears
-/// the bucket.
+/// verified normally. Nothing is ever refused.
+///
+/// A successful login does **not** reset the budget. It costs a legitimate
+/// user nothing to be inside a spent bucket, and resetting would break the
+/// bound the setting advertises — behind a proxy that collapses every user
+/// onto one address, ordinary logins would continuously refill an attacker's
+/// sweep budget. The window is left to expire on its own, which makes the
+/// guarantee exactly "at most `max_requests` padded verifies per IP per
+/// window".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoginPadBudget {
     /// True when the pad should run for this request.
@@ -679,20 +678,20 @@ async fn run_login_with_key(
     match state.inner.limiter.check_rate_limit(key).await {
         Ok(remaining) => {
             let response = next.run(request).await;
-            if budget_enabled {
-                // 401 is the only status the login handler produces for a
-                // rejected credential, and since #3504 it is the same 401 for
-                // every arm — which is exactly why this has to be counted from
-                // the status rather than inferred from the body. Any success
-                // (200, including the TOTP challenge and the
-                // must-change-password response, all of which follow a
-                // verified password) clears the bucket, so a legitimate user
-                // restores the pad for their own IP.
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    state.failed_by_ip.record_attempt(&failed_key).await;
-                } else if response.status().is_success() {
-                    state.failed_by_ip.clear(&failed_key).await;
-                }
+            // 401 is the only status the login handler produces for a
+            // rejected credential, and since #3504 it is the same 401 for
+            // every arm — which is exactly why this has to be counted from the
+            // status rather than inferred from the body.
+            //
+            // A success deliberately does NOT clear the bucket. Since the
+            // budget only gates the pad, a spent bucket costs a legitimate
+            // user nothing, while clearing it would break the bound the
+            // setting advertises: behind a proxy that collapses every user
+            // onto one address, ordinary logins landing between an attacker's
+            // probes would refill the sweep's budget indefinitely, leaving
+            // only the global backstop. The window expires on its own.
+            if budget_enabled && response.status() == StatusCode::UNAUTHORIZED {
+                state.failed_by_ip.record_attempt(&failed_key).await;
             }
             tag_allowed(response, state.inner.limiter.max_requests, remaining)
         }
@@ -2286,7 +2285,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_successful_login_clears_the_per_ip_pad_budget() {
+    async fn test_successful_login_does_not_reset_the_per_ip_pad_budget() {
+        // The budget bounds an attacker's bcrypt amplification to N padded
+        // verifies per IP per window. Resetting it on success would break that
+        // bound wherever a proxy collapses users onto one source address:
+        // ordinary logins landing between an attacker's probes would refill
+        // the sweep's budget indefinitely, leaving only the global backstop.
+        // Being inside a spent bucket costs a legitimate user nothing, because
+        // the budget gates the pad and never the request.
         const CAP: u32 = 3;
         let app = pad_budget_app(CAP);
         for i in 0..CAP {
@@ -2298,16 +2304,15 @@ mod tests {
             "budget must be spent at this point"
         );
 
-        // One success restores it, so a legitimate user recovers the pad for
-        // their own origin without waiting out the window.
+        // A success in the middle of the sweep must not hand the pad back.
         assert_eq!(
             login_probe(&app, "good", "10.0.0.1").await.0,
             StatusCode::OK
         );
         assert_eq!(
             login_probe(&app, "sweep-y", "10.0.0.1").await,
-            (StatusCode::UNAUTHORIZED, true),
-            "a successful login must clear the IP's failed-login bucket"
+            (StatusCode::UNAUTHORIZED, false),
+            "a successful login must NOT refill the IP's pad budget"
         );
     }
 

@@ -441,8 +441,9 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
     // above is keyed per-(username, IP), so cycling usernames gets a fresh one
     // every request; this one accrues against the source IP. It gates the pad,
     // never the request — an exhausted budget makes logins run unpadded, it
-    // does not refuse them — and a successful login clears it. Default: 30
-    // failures / 5 minutes per IP; 0 disables it.
+    // does not refuse them — and it is not reset by a success, so the bound is
+    // exactly N padded verifies per IP per window. Default: 30 failures /
+    // 5 minutes per IP; 0 disables it.
     let login_failed_ip_rate_limiter = Arc::new(RateLimiter::new(
         state.config.rate_limit_login_failed_per_ip_per_window,
         state.config.rate_limit_login_failed_per_ip_window_secs,

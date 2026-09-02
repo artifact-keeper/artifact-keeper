@@ -702,13 +702,16 @@ pub struct Config {
     /// and never refuses a login: past the budget the hashless rejection arms
     /// answer without bcrypt — so the timing side-channel returns for that IP
     /// until the window rolls — while any account that has a stored password
-    /// hash is still verified normally. That is the trade: it bounds an
-    /// attacker's bcrypt amplification to this many verifies per IP per
-    /// window without ever shedding a legitimate user, which a shedding cap
-    /// could not do (behind a reverse proxy without
-    /// `rate_limit_trusted_proxy_cidrs` every user shares one source IP, so
-    /// shedding would deny the whole deployment). A successful login clears
-    /// the IP's bucket.
+    /// hash is still verified normally. That is the trade: at most this many
+    /// padded verifies per IP per window, without ever shedding a legitimate
+    /// user — which a shedding cap could not do, since behind a reverse proxy
+    /// without `rate_limit_trusted_proxy_cidrs` every user shares one source
+    /// IP and shedding would deny the whole deployment.
+    ///
+    /// A successful login does **not** reset the bucket; the window expires on
+    /// its own. Resetting would void the bound above, because on a shared
+    /// egress ordinary logins would continuously refill an attacker's sweep
+    /// budget. Being inside a spent bucket costs a legitimate user nothing.
     ///
     /// It exists because `rate_limit_login_per_window` is keyed
     /// per-`(username, IP)` — which is what keeps a flood against one identity
