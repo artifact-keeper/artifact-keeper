@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A re-tagged release version could never pass `resolve-candidate-digest`** (#3640, #3641). The release workflow located the Docker Publish run vouching for the tagged commit with a query hard-filtered to push events, so on a re-cut of an already-published version it could only ever see the push run that image immutability had (correctly, and permanently) refused — while the documented `promote_version` recovery dispatch succeeded invisibly beside it. The resolver now accepts a successful run for the same commit and ref from either a tag push or a promote dispatch, and adoption of already-published bytes is verified rather than assumed: the release hard-refuses unless the commit the published image was built from and the commit being tagged are byte-identical across every input the backend image is built from (`Cargo.toml`, `Cargo.lock`, `backend/`, `.sqlx/`, the Dockerfile and `.dockerignore`). Nothing changes for a normal cut; a missing or failed publish still blocks the release, and a stale success for a different commit or branch can never vouch for a tag.
+
 ## [1.8.2] - 2026-09-01
 
 ### Added
