@@ -172,6 +172,7 @@ utoipa-swagger-ui.workspace = true
 
 # gRPC
 tonic.workspace = true
+tonic-prost.workspace = true
 tonic-reflection.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -217,7 +218,7 @@ tikv-jemalloc-sys = { version = "0.6", optional = true }
 windows-service = "0.8"
 
 [build-dependencies]
-tonic-build.workspace = true
+tonic-prost-build.workspace = true
 prost-build.workspace = true
 
 [dev-dependencies]
