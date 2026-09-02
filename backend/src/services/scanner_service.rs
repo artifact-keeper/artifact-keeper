@@ -15053,9 +15053,10 @@ mod tests {
                 read: std::rc::Rc::clone(&read),
             };
 
-            let err = unpack_tar_limited(decoder, out.path(), BUDGET, 1000)
-                .err()
-                .unwrap_or_else(|| panic!("{label}: must be refused, not decompressed"));
+            let err =
+                unpack_tar_limited(decoder, out.path(), BUDGET, 1000, &AtomicBool::new(false))
+                    .err()
+                    .unwrap_or_else(|| panic!("{label}: must be refused, not decompressed"));
             assert!(
                 err.to_string().contains("decompression bomb"),
                 "{label}: unexpected error: {err}"
@@ -15103,7 +15104,14 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let decoder = flate2::read::GzDecoder::new(&buf[..]);
-        unpack_tar_limited(decoder, out.path(), 1_000_000, 1000).unwrap();
+        unpack_tar_limited(
+            decoder,
+            out.path(),
+            1_000_000,
+            1000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join(&long_path)).unwrap(),
             "payload"
