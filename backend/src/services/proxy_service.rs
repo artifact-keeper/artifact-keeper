@@ -1094,7 +1094,8 @@ enum RevalidationVerdict {
     /// Upstream changed (200 / different ETag) or there is no cheap validator:
     /// fall back to a full refill via the single-flight coordinator.
     Refill,
-    /// Upstream was unreachable (5xx / timeout / transport) within the
+    /// Upstream was unreachable (transport / timeout) or declined to answer
+    /// the conditional probe (429 / 403 / 408 / 5xx, #3571) within the
     /// `stale-if-error` grace window: serve the stale body we already hold.
     ServeStaleIfError,
 }
@@ -3097,6 +3098,23 @@ impl UpstreamClient {
                 );
                 Ok(true)
             }
+            status if probe_status_is_indeterminate(status) => {
+                // The upstream declined to say whether the object changed
+                // (throttled, refused, or broken). That is not a statement
+                // about the content, so it must not evict a cache entry we
+                // know is good: surface it as an error so `revalidate_verdict`
+                // takes the stale-if-error path instead of a refill that
+                // cannot succeed where the cheap HEAD was denied (#3571).
+                tracing::warn!(
+                    status = %status,
+                    url = %url,
+                    "upstream refused conditional probe; treating as indeterminate, not changed"
+                );
+                Err(AppError::BadGateway(format!(
+                    "Upstream returned {} on conditional probe",
+                    status
+                )))
+            }
             status => {
                 tracing::warn!(
                     "Unexpected status {} checking upstream {}, assuming changed",
@@ -3107,6 +3125,27 @@ impl UpstreamClient {
             }
         }
     }
+}
+
+/// Whether a conditional-probe status carries **no information about the
+/// resource** and must therefore not be read as "content changed" (#3571).
+///
+/// A throttled (429), refused (403), timed-out (408) or broken (5xx)
+/// upstream has declined to answer the question; evicting a known-good cache
+/// entry on that answer and refilling against the same upstream only deepens
+/// the outage. These statuses route into the stale-if-error path.
+///
+/// Deliberately excluded:
+/// * 401 — the OCI bearer-token exchange relies on 401 meaning "re-fetch
+///   with a token", handled by the caller's own arm.
+/// * 404 / 410 — real statements about the resource; a refill negative-caches
+///   them correctly.
+fn probe_status_is_indeterminate(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN | StatusCode::REQUEST_TIMEOUT
+        )
 }
 
 /// Proxy service for fetching and caching artifacts from upstream repositories
@@ -6068,7 +6107,8 @@ impl ProxyService {
     ///   revalidate cheaply).
     /// * **304 Not Modified** -> extend TTL, [`RevalidationVerdict::ServeRevalidated`].
     /// * **changed (200 / different ETag)** -> [`RevalidationVerdict::Refill`].
-    /// * **upstream error within grace** -> [`RevalidationVerdict::ServeStaleIfError`].
+    /// * **upstream error within grace** (transport, or a 429 / 403 / 408 /
+    ///   5xx probe answer, #3571) -> [`RevalidationVerdict::ServeStaleIfError`].
     /// * **upstream error past grace** -> [`RevalidationVerdict::Refill`].
     ///
     /// `accept` is the selecting `Accept` header of the cached representation,
@@ -16622,6 +16662,148 @@ mod tests {
             .await
             .expect("stale-if-error must serve the stale body when upstream is down");
         let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&body[..], b"stale-but-served");
+    }
+
+    /// #3571: the conditional-probe status classifier. A status that says
+    /// nothing about the resource must not be read as "changed"; the ones that
+    /// do describe it (or drive the OCI bearer flow) must stay out.
+    #[test]
+    fn test_probe_status_is_indeterminate_table() {
+        for indeterminate in [429u16, 403, 408, 500, 502, 503, 504] {
+            let status = StatusCode::from_u16(indeterminate).unwrap();
+            assert!(
+                probe_status_is_indeterminate(status),
+                "{indeterminate} must be indeterminate"
+            );
+        }
+        for determinate in [200u16, 304, 401, 404, 410] {
+            let status = StatusCode::from_u16(determinate).unwrap();
+            assert!(
+                !probe_status_is_indeterminate(status),
+                "{determinate} must not be indeterminate"
+            );
+        }
+    }
+
+    /// Shared driver for the #3571 revalidation tests: a stale mutable entry
+    /// whose conditional HEAD comes back with `probe_status`. `expired_secs_ago`
+    /// positions the entry relative to the stale-if-error grace window.
+    /// Mounts HEAD with `.expect(1)` and GET with `.expect(0)` when a refill
+    /// must not happen, so a regression to "assume changed" fails on the
+    /// wiremock expectation as well as on the returned body.
+    async fn revalidate_with_probe_status(
+        tag: &str,
+        probe_status: u16,
+        expired_secs_ago: i64,
+        refill_allowed: bool,
+    ) -> Option<Result<Bytes>> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pool = tdh::try_pool().await?;
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(probe_status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(probe_status))
+            .expect(if refill_allowed { 1 } else { 0 })
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s3571-{tag}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_key = format!("s3571-{tag}");
+        let repo = wiremock_remote_repo(&repo_key, &server.uri(), tmp.to_str().unwrap());
+
+        let now = Utc::now();
+        let body: &[u8] = b"stale-but-served";
+        let metadata = CacheMetadata {
+            upstream_commit_sha: None,
+            content_encoding: None,
+            cached_at: now - chrono::Duration::hours(3),
+            upstream_etag: Some("\"v1\"".to_string()),
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: now - chrono::Duration::seconds(expired_secs_ago),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: body.len() as i64,
+            checksum_sha256: StorageService::calculate_hash(&Bytes::copy_from_slice(body)),
+        };
+        write_primed_cache_files(
+            tmp.to_str().unwrap(),
+            &repo_key,
+            "meta.xml",
+            Some(body),
+            &metadata,
+        );
+
+        let result = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await
+            .map(|(body, _ct, _enc)| body);
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Dropping the server verifies the `.expect(n)` mount counts.
+        drop(server);
+        Some(result)
+    }
+
+    /// #3571: a throttled upstream (429) on the conditional probe must serve
+    /// the stale body within grace and must not attempt a refill.
+    #[tokio::test]
+    async fn test_revalidate_429_serves_stale_within_grace_and_skips_refill() {
+        let Some(result) = revalidate_with_probe_status("429", 429, 1, false).await else {
+            return;
+        };
+        let body = result.expect("429 on probe must serve stale within grace");
+        assert_eq!(&body[..], b"stale-but-served");
+    }
+
+    /// #3571: a broken upstream (503) on the probe takes the same path as a
+    /// transport failure.
+    #[tokio::test]
+    async fn test_revalidate_503_serves_stale_within_grace_and_skips_refill() {
+        let Some(result) = revalidate_with_probe_status("503", 503, 1, false).await else {
+            return;
+        };
+        let body = result.expect("503 on probe must serve stale within grace");
+        assert_eq!(&body[..], b"stale-but-served");
+    }
+
+    /// #3571: an upstream refusing the probe (403) is not a statement about
+    /// the content either.
+    #[tokio::test]
+    async fn test_revalidate_403_serves_stale_within_grace_and_skips_refill() {
+        let Some(result) = revalidate_with_probe_status("403", 403, 1, false).await else {
+            return;
+        };
+        let body = result.expect("403 on probe must serve stale within grace");
+        assert_eq!(&body[..], b"stale-but-served");
+    }
+
+    /// #3571 boundary pin: past the stale-if-error grace window a 429 probe
+    /// still falls through to a refill (one upstream GET, which the throttled
+    /// upstream refuses), and the post-refill stale-if-error fallback then
+    /// serves the body we hold. This is today's behaviour, kept deliberately;
+    /// skipping that GET via a longer or `Retry-After`-aware grace is a
+    /// separate change.
+    #[tokio::test]
+    async fn test_revalidate_429_past_grace_refills_once_then_serves_stale() {
+        let past_grace = cache_classifier::STALE_IF_ERROR_GRACE_SECS + 60;
+        let Some(result) = revalidate_with_probe_status("429-past", 429, past_grace, true).await
+        else {
+            return;
+        };
+        let body = result.expect("past grace the post-refill stale-if-error fallback still serves");
         assert_eq!(&body[..], b"stale-but-served");
     }
 
