@@ -1508,18 +1508,29 @@ impl Drop for WorkspaceGuard {
         let path = std::mem::take(&mut self.path);
         let sidecars = std::mem::take(&mut self.sidecars);
 
-        // Removing a 2 GiB / 200k-entry tree from a network-backed PVC takes
-        // seconds, and a dropped future runs on a runtime worker — doing it
-        // inline would stall every other task on that worker. Hand it to the
-        // blocking pool, which also affords the recursive pre-chmod that
-        // `cleanup_path` needs a child process for. A `spawn_blocking` queued
-        // during runtime shutdown may never run, so the inline path stays as
-        // the fallback for "no runtime" (unit tests, shutdown).
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn_blocking(move || remove_workspace_blocking(&path, &sidecars));
-            }
-            Err(_) => remove_workspace_blocking(&path, &sidecars),
+        // Removing a 2 GiB / 200k-entry tree from a network-backed volume
+        // takes seconds, and a dropped future runs on a runtime worker, so
+        // doing it inline would stall every other task on that worker.
+        //
+        // A plain OS thread, not `spawn_blocking`: a runtime handle is still
+        // current while the runtime is SHUTTING DOWN, and `spawn_blocking`
+        // then refuses the task and drops it unrun, which is exactly when the
+        // guards of every in-flight scan are being dropped — one leaked
+        // workspace per scan, per pod restart. `std::thread::spawn` needs no
+        // runtime and reports failure instead of panicking (a panic in `Drop`
+        // during an unwind aborts the process). One thread per cancelled
+        // scan, bounded in practice by the extraction concurrency limit; if
+        // the OS refuses it, remove inline rather than not at all.
+        let spawned = {
+            let path = path.clone();
+            let sidecars = sidecars.clone();
+            std::thread::Builder::new()
+                .name("scan-ws-cleanup".to_string())
+                .spawn(move || remove_workspace_blocking(&path, &sidecars))
+                .is_ok()
+        };
+        if !spawned {
+            remove_workspace_blocking(&path, &sidecars);
         }
     }
 }
@@ -1530,9 +1541,7 @@ impl Drop for WorkspaceGuard {
 /// trees can carry directories the runtime UID cannot traverse or delete (tar
 /// lands kernel-module dirs at `d--x--S---`), and those are also the largest
 /// workspaces and the likeliest to blow a budget, so skipping the chmod would
-/// fail exactly where cancellation matters most. `walkdir` yields a directory
-/// before descending into it, so widening its mode first is what makes the
-/// walk itself possible.
+/// fail exactly where cancellation matters most.
 fn remove_workspace_blocking(path: &Path, sidecars: &[PathBuf]) {
     for sidecar in sidecars {
         if let Err(e) = std::fs::remove_file(sidecar) {
@@ -1551,24 +1560,14 @@ fn remove_workspace_blocking(path: &Path, sidecars: &[PathBuf]) {
     }
 
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for entry in walkdir::WalkDir::new(path).follow_links(false) {
-            let Ok(entry) = entry else { continue };
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-            let mut perms = meta.permissions();
-            let widened = if meta.is_dir() { 0o700 } else { 0o600 };
-            perms.set_mode(perms.mode() | widened);
-            let _ = std::fs::set_permissions(entry.path(), perms);
-        }
-    }
+    widen_owner_modes(path);
 
-    // Two passes: the extractor checks its cancellation flag once per entry,
+    // Two passes. The extractor checks its cancellation flag once per entry,
     // so it can be mid-entry when the flag is set and materialise one last
-    // file after the first pass walked past it. A second pass settles it.
+    // file after the first pass walked past it. There is no synchronisation
+    // between the two, so this narrows the window rather than closing it: at
+    // most one entry can land after the removal, and in practice the flag —
+    // not this pass — is what keeps the tree from coming back.
     for attempt in 0..2 {
         match std::fs::remove_dir_all(path) {
             Ok(()) => continue,
@@ -1581,6 +1580,54 @@ fn remove_workspace_blocking(path: &Path, sidecars: &[PathBuf]) {
                 e
             ),
             Err(_) => {}
+        }
+    }
+}
+
+/// Add owner `rwX` across a tree, so a recursive removal is not defeated by a
+/// mode the extraction left behind (`chmod -R u+rwX`, without a child process).
+///
+/// Written as an explicit walk rather than `walkdir` because the ORDER is the
+/// whole point: a directory's mode must be widened BEFORE it is read.
+/// `walkdir` calls `read_dir` on a directory before yielding its entry, so on
+/// a `d--x--S---` directory the read has already failed `EACCES` by the time
+/// the mode could be fixed, and nothing nested beneath it is ever reached —
+/// which is the shape `tar` produces for kernel-module directories in a
+/// container rootfs, and the reason the pre-chmod exists at all.
+///
+/// Symlinks are stat-ed with `symlink_metadata` and never followed, so this
+/// cannot widen anything outside the tree. Iterative, so a pathologically
+/// deep tree cannot overflow the stack.
+#[cfg(unix)]
+fn widen_owner_modes(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        let widened = if meta.is_dir() { 0o700 } else { 0o600 };
+        let mut perms = meta.permissions();
+        if perms.mode() & widened != widened {
+            perms.set_mode(perms.mode() | widened);
+            if std::fs::set_permissions(&path, perms).is_err() {
+                continue;
+            }
+        }
+
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            stack.push(entry.path());
         }
     }
 }
@@ -7262,6 +7309,82 @@ mod tests {
             wait_until_gone(&path).await,
             "a cleanup cancelled midway must leave the guard armed, not leak {}",
             path.display()
+        );
+    }
+
+    /// #3565 review round 2: guards are dropped EN MASSE when the process
+    /// shuts down — SIGTERM during a rolling upgrade drops the runtime, which
+    /// drops every in-flight scan task. A runtime handle is still current at
+    /// that point, so `spawn_blocking` accepts the call and then silently
+    /// discards the task, leaking one workspace per in-flight scan per
+    /// restart. Removal therefore runs on a plain OS thread, which owes the
+    /// runtime nothing.
+    #[test]
+    fn workspace_is_removed_when_the_guard_drops_during_runtime_shutdown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("staged")).expect("create tree");
+
+        {
+            let rt = tokio::runtime::Runtime::new().expect("runtime");
+            let held = root.clone();
+            rt.spawn(async move {
+                let _workspace = WorkspaceGuard::new(held);
+                std::future::pending::<()>().await;
+            });
+            rt.block_on(async {
+                // Let the task reach its park, so the guard is alive and armed
+                // when the runtime goes away.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
+            // Dropping the runtime drops the parked task, and with it the
+            // still-armed guard.
+        }
+
+        for _ in 0..500 {
+            if !root.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "a workspace whose scan was still in flight at shutdown must not survive it: {}",
+            root.display()
+        );
+    }
+
+    /// #3565 review round 2: the drop path's pre-chmod must widen a directory
+    /// BEFORE it reads it. A `walkdir`-driven pass cannot — it opens a
+    /// directory before yielding its entry — so a hostile directory nested
+    /// inside another one was never reached and the tree survived the drop.
+    /// `0o2100` (`d--x--S---`) is the mode `tar` lands kernel-module
+    /// directories at, and the Incus scanner shells out to `tar` over a
+    /// container rootfs with a guarded workspace, so this is reachable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_drop_removes_a_nested_mode_hostile_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        let outer = root.join("a");
+        let inner = outer.join("b");
+        std::fs::create_dir_all(&inner).expect("create tree");
+        std::fs::write(inner.join("f"), b"x").expect("write leaf");
+
+        // Innermost first: widening `outer` last keeps it traversable until
+        // its child has been locked down.
+        for dir in [&inner, &outer] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2100))
+                .expect("make hostile");
+        }
+
+        drop(WorkspaceGuard::new(root.clone()));
+
+        assert!(
+            wait_until_gone(&root).await,
+            "a hostile directory nested in another must not defeat cleanup: {}",
+            root.display()
         );
     }
 
