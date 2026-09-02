@@ -984,7 +984,7 @@ impl ScanWorkspace {
         prefix: Option<&str>,
         artifact: &Artifact,
         content: &Bytes,
-    ) -> Result<PathBuf> {
+    ) -> Result<WorkspaceGuard> {
         Self::prepare_pinned(base, prefix, artifact, content, None).await
     }
 
@@ -1013,11 +1013,16 @@ impl ScanWorkspace {
         artifact: &Artifact,
         content: &Bytes,
         pin: Option<&ExpectedComponent>,
-    ) -> Result<PathBuf> {
+    ) -> Result<WorkspaceGuard> {
         let workspace = Self::workspace_dir(base, prefix, artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
+
+        // The directory exists from here on, so ownership passes to the guard:
+        // every later exit removes it, including the wall-clock timeout that
+        // drops this future mid-extraction (#3565).
+        let workspace = WorkspaceGuard::new(workspace);
 
         // NAMESPACE ISOLATION (#3004 follow-up 3). When this scan also writes
         // control files, the archive is unpacked into a dedicated subdirectory
@@ -1039,7 +1044,7 @@ impl ScanWorkspace {
                 })?;
                 dir
             }
-            None => workspace.clone(),
+            None => workspace.to_path_buf(),
         };
 
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
@@ -1375,6 +1380,92 @@ impl ScanWorkspace {
         tokio::task::spawn_blocking(move || extract_archive_blocking(kind, &src, &dst))
             .await
             .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
+    }
+}
+
+/// RAII owner of a prepared scan workspace directory.
+///
+/// The inline proxy scan path races the whole scanner future against a
+/// wall-clock budget (`run_scan_within_budget`). When the budget expires the
+/// future is dropped where it stands, so control never reached the explicit
+/// cleanup call that sits *after* the scan and the workspace — the staged
+/// artifact bytes, the control files, and for archive formats the entire
+/// extracted tree — stayed on the scan-workspace volume forever (#3565).
+/// Nothing else reaps it: the janitor reaps stale `scans` rows, not files.
+///
+/// Owning the path here puts cleanup on EVERY exit path, cancellation
+/// included, rather than only the ones a caller remembers. Dropping the guard
+/// removes the directory; [`WorkspaceGuard::cleanup`] is the richer async
+/// removal the paths that complete normally still take, and it disarms the
+/// guard so the directory is removed exactly once.
+#[derive(Debug)]
+pub(crate) struct WorkspaceGuard {
+    path: PathBuf,
+    /// Cleared by [`WorkspaceGuard::cleanup`]. A disarmed guard must not
+    /// delete on drop: these paths are derived from the artifact id, so a
+    /// concurrent scan of the same artifact can already own a fresh directory
+    /// at the same place.
+    armed: bool,
+}
+
+impl WorkspaceGuard {
+    /// Take ownership of a workspace directory that already exists on disk.
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    /// Remove the workspace on a path that runs to completion, and disarm the
+    /// guard. This is the full [`ScanWorkspace::cleanup_path`] treatment
+    /// (recursive pre-chmod, async removal), so behaviour on the paths that
+    /// reach it is exactly what it was before the guard existed.
+    pub(crate) async fn cleanup(&mut self) {
+        if self.armed {
+            self.armed = false;
+            ScanWorkspace::cleanup_path(&self.path).await;
+        }
+    }
+}
+
+impl std::ops::Deref for WorkspaceGuard {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for WorkspaceGuard {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for WorkspaceGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // A future being dropped cannot await, so this is the synchronous,
+        // best-effort form of `ScanWorkspace::cleanup_path`: the removal
+        // without the recursive pre-chmod (spawning a `chmod` child here would
+        // block the runtime thread unwinding the future). A tree whose modes
+        // defeat removal warns rather than disappearing silently.
+        //
+        // Archive extraction runs on a blocking task, which a dropped future
+        // does not cancel; if it is still unpacking when this runs it can
+        // recreate part of the tree underneath us. That leaves a partial tree
+        // rather than the whole staged workspace, and bounding it needs the
+        // extractor itself to become cancellation-aware — tracked separately.
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            // Already removed by an error path that ran to completion.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                "Failed to clean up scan workspace {} on drop: {}",
+                self.path.display(),
+                e
+            ),
+        }
     }
 }
 
@@ -6916,6 +7007,77 @@ mod tests {
         assert!(
             body.contains(".args([\"-R\", \"u+rwX\", &workspace_str])"),
             "the chmod pin must cover the recursive workspace cleanup command: {body}"
+        );
+    }
+
+    /// #3565: the inline proxy scan path races the scanner future against a
+    /// wall-clock budget, and the explicit cleanup call sits AFTER the scan.
+    /// When the budget expires the future is dropped before it ever gets
+    /// there, so the workspace is removed by the guard's `Drop` or not at all
+    /// — nothing else on the instance reaps files.
+    #[tokio::test]
+    async fn workspace_is_removed_when_the_scan_future_exceeds_its_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
+        let content = Bytes::from_static(b"staged scan input");
+
+        let workspace = ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+            .await
+            .expect("prepare");
+        let path = workspace.to_path_buf();
+        assert!(path.join("app.bin").exists(), "the input must be staged");
+
+        // The scan body outlives its budget, so `cleanup()` is never reached.
+        let scan = async move {
+            let mut workspace = workspace;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            workspace.cleanup().await;
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), scan)
+                .await
+                .is_err(),
+            "the budget must expire before the scan completes"
+        );
+
+        assert!(
+            !path.exists(),
+            "a scan cancelled by its wall-clock budget must not leak {}",
+            path.display()
+        );
+    }
+
+    /// The completion path still cleans up, and exactly once: `cleanup()`
+    /// disarms the guard, so a later drop cannot delete a directory a
+    /// concurrent scan of the same artifact has since created at that path.
+    #[tokio::test]
+    async fn workspace_cleanup_removes_the_directory_exactly_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
+        let content = Bytes::from_static(b"staged scan input");
+
+        let mut workspace =
+            ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+                .await
+                .expect("prepare");
+        let path = workspace.to_path_buf();
+
+        workspace.cleanup().await;
+        assert!(
+            !path.exists(),
+            "a completed scan must clean up after itself"
+        );
+
+        // A concurrent scan of the same artifact now owns this path.
+        tokio::fs::create_dir_all(&path).await.expect("recreate");
+        drop(workspace);
+        assert!(
+            path.exists(),
+            "a cleaned-up guard must not remove a directory it no longer owns"
         );
     }
 

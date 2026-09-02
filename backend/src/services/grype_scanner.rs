@@ -1878,7 +1878,7 @@ impl GrypeScanner {
         content: &Bytes,
         pin: Option<&crate::services::scanner_service::ExpectedComponent>,
     ) -> Result<ScanOutput> {
-        let workspace =
+        let mut workspace =
             ScanWorkspace::prepare_pinned(&self.scan_workspace, None, artifact, content, pin)
                 .await?;
 
@@ -1904,7 +1904,7 @@ impl GrypeScanner {
             cataloged.as_ref().map_or(0, |c| c.len()),
         );
 
-        ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
+        workspace.cleanup().await;
 
         // #1273: Grype's default JSON does not enumerate *every* installed
         // package the way Trivy's `--list-all-pkgs` does, but it does name
