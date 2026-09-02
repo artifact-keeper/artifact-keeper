@@ -6,19 +6,20 @@
 use crate::error::{AppError, Result};
 use crate::models::signing_key::{RepositorySigningConfig, SigningKey, SigningKeyPublic};
 use crate::services::encryption::CredentialEncryption;
-use chrono::{SubsecRound, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use pgp::composed::cleartext::CleartextSignedMessage;
 use pgp::composed::key::{KeyType, SecretKeyParamsBuilder};
 use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::public_key::PublicKeyAlgorithm;
 use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
-use pgp::types::{KeyVersion, PublicKeyTrait};
+use pgp::types::{KeyVersion, PublicKeyTrait, SecretKeyTrait};
 use pgp::ArmorOptions;
 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::{RsaPrivateKey, RsaPublicKey};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -43,6 +44,27 @@ pub const HEX_REGISTRY_KEY_ALGORITHM: &str = "rsa2048";
 /// per-artifact preparer lock). The class keeps this lock space disjoint
 /// from theirs.
 const HEX_REGISTRY_KEY_LOCK_CLASS: i32 = 0x4845_5801; // "HEX\x01"
+
+/// Digest algorithm for an RSA PKCS#1 v1.5 signature.
+///
+/// The digest is **not** a free choice: each consuming ecosystem fixes it, and
+/// a signature made with the wrong one is well-formed but rejected by the
+/// client that has to verify it. The variants exist because three different
+/// clients disagree:
+///
+/// * [`RsaDigest::Sha1`] — apk's `.SIGN.RSA.` index signature. apk-tools maps
+///   the signature entry's `RSA` infix to SHA-1 (`RSA256`/`RSA512` select the
+///   others); `abuild-sign` correspondingly runs `openssl dgst -sha1 -sign`.
+///   Only used for that index signature, where the format leaves no choice.
+/// * [`RsaDigest::Sha256`] — the Debian/Conda metadata default.
+/// * [`RsaDigest::Sha512`] — fixed by the hex registry protocol, whose client
+///   verifies with `public_key:verify(Payload, sha512, ...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsaDigest {
+    Sha1,
+    Sha256,
+    Sha512,
+}
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
@@ -249,24 +271,138 @@ pub fn verify_detached(trusted_armored_key: &str, data: &[u8], armored_sig: &str
     })
 }
 
+// ---------------------------------------------------------------------------
+// Signature expiration window (#1327)
+//
+// Every OpenPGP signature we mint carries an explicit `SignatureExpirationTime`
+// subpacket so mirror-validation tooling (debmirror, apt-mirror2, `gpgv
+// --check-quiet`) can tell a currently-published Release from one that has been
+// sitting on a stale mirror for months. apt itself does not enforce signature
+// expiry, so this is additive for ordinary clients.
+//
+// The functions below are deliberately pure: the expiry/rotation decision is
+// arithmetic on durations and timestamps, and must be testable without a
+// database, a keyring, or a running clock.
+// ---------------------------------------------------------------------------
+
+/// Default signature validity window: 7 days.
+///
+/// Chosen to match the cadence at which Debian archives themselves re-sign
+/// (`Valid-Until` on an official `InRelease` is typically 7 days), so a mirror
+/// that is healthy by Debian's own standard is also healthy by ours.
+pub const DEFAULT_SIGNATURE_EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Safety margin subtracted from the signature expiry to derive the maximum
+/// age of a cached signed-Release entry.
+///
+/// The cache must never hand out a signature that is *about* to expire, because
+/// a client that fetches at the last moment still needs the signature to verify
+/// on its end after network and clock skew. One hour comfortably covers both.
+pub const SIGNED_CACHE_SAFETY_MARGIN_SECONDS: i64 = 60 * 60;
+
+/// Floor on a configured expiry window.
+///
+/// Anything below this makes the cache max-age degenerate (or negative once the
+/// safety margin is subtracted) and would have the registry re-signing on
+/// essentially every `apt update` poll. A misconfigured tiny value is clamped up
+/// rather than rejected so a bad env var cannot take the registry down.
+pub const MIN_SIGNATURE_EXPIRY_SECONDS: u64 = 2 * 60 * 60;
+
+/// Ceiling on a configured expiry window (1 year).
+///
+/// A window this long is indistinguishable from "no expiry" in practice; the
+/// cap keeps the subpacket meaningful and keeps the `u32` seconds field that
+/// OpenPGP uses for this subpacket well inside range.
+pub const MAX_SIGNATURE_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// Resolve the configured signature expiry into the `Duration` that goes into
+/// the `SignatureExpirationTime` subpacket.
+///
+/// `0` is the explicit opt-out: it yields `None`, meaning "emit no expiration
+/// subpacket", which reproduces the pre-#1327 behaviour byte for byte. Any
+/// other value is clamped into
+/// `[MIN_SIGNATURE_EXPIRY_SECONDS, MAX_SIGNATURE_EXPIRY_SECONDS]`.
+pub fn signature_expiry_duration(configured_seconds: u64) -> Option<Duration> {
+    if configured_seconds == 0 {
+        return None;
+    }
+    let clamped =
+        configured_seconds.clamp(MIN_SIGNATURE_EXPIRY_SECONDS, MAX_SIGNATURE_EXPIRY_SECONDS);
+    Some(Duration::seconds(clamped as i64))
+}
+
+/// Maximum age a cached signed-Release entry may reach before it must be
+/// re-signed, derived from the same configured window.
+///
+/// This is the signature validity minus [`SIGNED_CACHE_SAFETY_MARGIN_SECONDS`],
+/// which is what makes the "never serve an expired signature" property hold:
+/// the cache stops serving an entry strictly before the signature inside it
+/// stops verifying. Returns `None` when expiry is disabled, in which case the
+/// cache has no age bound (content-keyed invalidation still applies).
+pub fn signed_cache_max_age(configured_seconds: u64) -> Option<Duration> {
+    let expiry = signature_expiry_duration(configured_seconds)?;
+    // The MIN clamp above guarantees expiry >= 2h > the 1h margin, so this
+    // subtraction is always positive.
+    Some(expiry - Duration::seconds(SIGNED_CACHE_SAFETY_MARGIN_SECONDS))
+}
+
+/// Whether a cached signed-Release entry inserted at `inserted_at` may still be
+/// served at `now`.
+///
+/// A `None` max age (expiry disabled) means entries never age out. A future
+/// `inserted_at` — a backwards clock step — is treated as fresh rather than
+/// stale: the signature it holds cannot have expired yet, and re-signing on
+/// every request during clock skew is the worse failure mode.
+pub fn signed_cache_entry_is_fresh(
+    inserted_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    max_age: Option<Duration>,
+) -> bool {
+    match max_age {
+        None => true,
+        Some(max_age) => now.signed_duration_since(inserted_at) < max_age,
+    }
+}
+
+/// Build the hashed-subpacket list shared by both OpenPGP signing paths.
+///
+/// Split out so the detached and cleartext signers cannot drift apart on which
+/// subpackets they emit — the exact class of bug #1327 exists to close.
+fn openpgp_hashed_subpackets(
+    fingerprint: pgp::types::Fingerprint,
+    expiry: Option<Duration>,
+) -> Vec<Subpacket> {
+    let mut subpackets = vec![
+        Subpacket::regular(SubpacketData::IssuerFingerprint(fingerprint)),
+        Subpacket::regular(SubpacketData::SignatureCreationTime(
+            Utc::now().trunc_subsecs(0),
+        )),
+    ];
+    if let Some(expiry) = expiry {
+        subpackets.push(Subpacket::regular(SubpacketData::SignatureExpirationTime(
+            expiry,
+        )));
+    }
+    subpackets
+}
+
 /// Create an ASCII-armored detached OpenPGP signature.
+///
+/// `expiry` is the validity window recorded in the `SignatureExpirationTime`
+/// subpacket; `None` omits the subpacket entirely (#1327).
 ///
 /// CPU-bound. Call from within `spawn_blocking`.
 fn sign_openpgp_detached_blocking(
     secret_key: pgp::SignedSecretKey,
     data: Vec<u8>,
+    expiry: Option<Duration>,
 ) -> Result<String> {
     let mut config = SignatureConfig::v4(
         SignatureType::Binary,
         PublicKeyAlgorithm::RSA,
         HashAlgorithm::SHA2_256,
     );
-    config.hashed_subpackets = vec![
-        Subpacket::regular(SubpacketData::IssuerFingerprint(secret_key.fingerprint())),
-        Subpacket::regular(SubpacketData::SignatureCreationTime(
-            chrono::Utc::now().trunc_subsecs(0),
-        )),
-    ];
+    config.hashed_subpackets = openpgp_hashed_subpackets(secret_key.fingerprint(), expiry);
     config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::Issuer(
         secret_key.key_id(),
     ))];
@@ -281,13 +417,48 @@ fn sign_openpgp_detached_blocking(
 
 /// Create an OpenPGP cleartext signed message.
 ///
+/// Builds the `SignatureConfig` explicitly (rather than calling
+/// `CleartextSignedMessage::sign`) so the expiration subpacket can be attached;
+/// the algorithm/hash/type selection below mirrors what that helper does, so
+/// the only difference from the previous behaviour is the added subpacket.
+///
 /// CPU-bound. Call from within `spawn_blocking`.
 fn sign_openpgp_cleartext_blocking(
     secret_key: pgp::SignedSecretKey,
     text: String,
+    expiry: Option<Duration>,
 ) -> Result<String> {
-    let rng = rand08::rngs::OsRng;
-    CleartextSignedMessage::sign(rng, &text, &secret_key, String::new)
+    let mut config = match secret_key.version() {
+        KeyVersion::V4 => SignatureConfig::v4(
+            SignatureType::Text,
+            secret_key.algorithm(),
+            secret_key.hash_alg(),
+        ),
+        KeyVersion::V6 => SignatureConfig::v6(
+            rand08::rngs::OsRng,
+            SignatureType::Text,
+            secret_key.algorithm(),
+            secret_key.hash_alg(),
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to build OpenPGP v6 signature config: {}",
+                e
+            ))
+        })?,
+        other => {
+            return Err(AppError::Internal(format!(
+                "Unsupported OpenPGP key version for cleartext signing: {:?}",
+                other
+            )))
+        }
+    };
+    config.hashed_subpackets = openpgp_hashed_subpackets(secret_key.fingerprint(), expiry);
+    config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::Issuer(
+        secret_key.key_id(),
+    ))];
+
+    CleartextSignedMessage::new(&text, config, &secret_key, String::new)
         .and_then(|msg| msg.to_armored_string(ArmorOptions::default()))
         .map_err(|e| {
             AppError::Internal(format!(
@@ -314,6 +485,17 @@ where
 pub struct SigningService {
     db: PgPool,
     encryption: CredentialEncryption,
+    /// Validity window stamped onto every OpenPGP signature this service mints
+    /// (#1327), in seconds. `0` disables the expiration subpacket.
+    ///
+    /// Defaults to `0` — **no expiry** — on purpose. An expiring signature is
+    /// only correct for metadata this registry re-signs on demand; a signature
+    /// that is minted once and stored immutably (RPM published `@N` snapshots
+    /// write `repomd.xml.asc` to storage and never regenerate it) would simply
+    /// stop verifying once the window elapsed. Opting in per call site via
+    /// [`SigningService::with_signature_expiry`] means any signing path not
+    /// explicitly audited for re-signing keeps its pre-#1327 behaviour.
+    signature_expiry_seconds: u64,
 }
 
 /// Result of a deliberate per-artifact signing action (#2535). The signature
@@ -357,7 +539,32 @@ impl SigningService {
         Self {
             db,
             encryption: CredentialEncryption::from_passphrase(encryption_key),
+            // No expiry unless a call site opts in — see the field docs.
+            signature_expiry_seconds: 0,
         }
+    }
+
+    /// Opt this service into stamping an OpenPGP signature expiration window
+    /// (#1327).
+    ///
+    /// Only valid for signatures the registry **re-signs on demand**: Debian
+    /// `InRelease` / `Release.gpg` and the live RPM `repomd.xml.asc`, all of
+    /// which are recomputed (and re-cached) from current repository content.
+    /// Do NOT apply it to a signing path whose output is persisted, such as
+    /// RPM published `@N` snapshots — those must keep verifying indefinitely.
+    ///
+    /// Expressed as a builder rather than a `new` parameter so that adding a
+    /// new signing call site cannot silently inherit an expiry it does not
+    /// re-sign for.
+    pub fn with_signature_expiry(mut self, seconds: u64) -> Self {
+        self.signature_expiry_seconds = seconds;
+        self
+    }
+
+    /// The resolved (clamped) signature validity window, or `None` when
+    /// expiry has been disabled.
+    pub fn signature_expiry(&self) -> Option<Duration> {
+        signature_expiry_duration(self.signature_expiry_seconds)
     }
 
     /// Generate a new signing key pair and store it.
@@ -603,12 +810,43 @@ impl SigningService {
 
     /// Sign data with the repository's active signing key (RSA PKCS#1 v1.5 SHA-256).
     pub async fn sign_data(&self, repo_id: Uuid, data: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.sign_data_with_digest(repo_id, data, RsaDigest::Sha256)
+            .await
+    }
+
+    /// Sign an Alpine `APKINDEX` segment with the repository's active signing
+    /// key, using the digest apk fixes for a `.SIGN.RSA.` entry: **SHA-1**.
+    ///
+    /// `data` must be the *compressed* bytes of the index gzip stream — apk
+    /// digests the raw segment bytes as they appear on the wire, not the
+    /// APKINDEX text. See `alpine::build_apk_signature_segment` for the
+    /// framing that carries the result.
+    ///
+    /// Cannot reuse [`SigningService::sign_data`]: a SHA-256 signature under a
+    /// `.SIGN.RSA.` entry is well-formed but apk verifies it against a SHA-1
+    /// digest and fails with `BAD signature` (#3021).
+    pub async fn sign_apk_index(&self, repo_id: Uuid, data: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.sign_data_with_digest(repo_id, data, RsaDigest::Sha1)
+            .await
+    }
+
+    /// Shared body of [`Self::sign_data`] / [`Self::sign_apk_index`]: resolve
+    /// the repository's active key, sign, and stamp `last_used_at`.
+    ///
+    /// `Ok(None)` when the repository has no active key — the caller decides
+    /// whether that is "serve unsigned" or an error.
+    async fn sign_data_with_digest(
+        &self,
+        repo_id: Uuid,
+        data: &[u8],
+        digest: RsaDigest,
+    ) -> Result<Option<Vec<u8>>> {
         let key = match self.get_active_key_for_repo(repo_id).await? {
             Some(k) => k,
             None => return Ok(None),
         };
 
-        let signature = self.sign_with_key(&key, data)?;
+        let signature = self.sign_with_key_digest(&key, data, digest)?;
 
         // Update last_used_at
         sqlx::query!(
@@ -716,31 +954,62 @@ impl SigningService {
         Ok(())
     }
 
-    /// Sign data with a specific key.
+    /// Sign data with a specific key: RSA PKCS#1 v1.5, **SHA-256** digest —
+    /// the Debian/Conda metadata default.
+    ///
+    /// Key material handling (zeroization, #1328) lives in
+    /// [`SigningService::load_rsa_private_key`].
+    pub fn sign_with_key(&self, key: &SigningKey, data: &[u8]) -> Result<Vec<u8>> {
+        self.sign_with_key_digest(key, data, RsaDigest::Sha256)
+    }
+
+    /// Decrypt and parse `key`'s RSA private half.
     ///
     /// The decrypted PEM bytes are held in a `Zeroizing<Vec<u8>>` so the
     /// plaintext private-key material is wiped from memory when the buffer
     /// drops, rather than waiting for the allocator to reuse the slot
-    /// (artifact-keeper #1328). The parsed `RsaPrivateKey` and the derived
-    /// `RsaSigningKey<Sha256>` both already implement `ZeroizeOnDrop` upstream
-    /// in the `rsa` crate, so they self-clean when this function returns.
-    pub fn sign_with_key(&self, key: &SigningKey, data: &[u8]) -> Result<Vec<u8>> {
-        // Decrypt private key into a zeroizing buffer.
+    /// (artifact-keeper #1328). The returned `RsaPrivateKey` already
+    /// implements `ZeroizeOnDrop` upstream in the `rsa` crate, so it
+    /// self-cleans when the caller drops it.
+    ///
+    /// Single source for every RSA signing path so the zeroization discipline
+    /// cannot drift between them.
+    fn load_rsa_private_key(&self, key: &SigningKey) -> Result<RsaPrivateKey> {
         let private_pem: Zeroizing<Vec<u8>> =
             Zeroizing::new(self.encryption.decrypt(&key.private_key_enc).map_err(|e| {
                 AppError::Internal(format!("Failed to decrypt private key: {}", e))
             })?);
 
-        let private_key = RsaPrivateKey::from_pkcs8_pem(
+        RsaPrivateKey::from_pkcs8_pem(
             std::str::from_utf8(&private_pem)
                 .map_err(|e| AppError::Internal(format!("Invalid UTF-8 in key: {}", e)))?,
         )
-        .map_err(|e| AppError::Internal(format!("Failed to parse private key: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to parse private key: {}", e)))
+    }
 
-        let signing_key = RsaSigningKey::<Sha256>::new(private_key);
-        let signature = signing_key.sign(data);
-
-        Ok(signature.to_bytes().to_vec())
+    /// Sign `data` with `key` using RSA PKCS#1 v1.5 over `digest`.
+    ///
+    /// The digest is a parameter rather than a constant because the verifying
+    /// client fixes it per format — see [`RsaDigest`].
+    pub fn sign_with_key_digest(
+        &self,
+        key: &SigningKey,
+        data: &[u8],
+        digest: RsaDigest,
+    ) -> Result<Vec<u8>> {
+        let private_key = self.load_rsa_private_key(key)?;
+        let signature = match digest {
+            RsaDigest::Sha1 => RsaSigningKey::<Sha1>::new(private_key)
+                .sign(data)
+                .to_bytes(),
+            RsaDigest::Sha256 => RsaSigningKey::<Sha256>::new(private_key)
+                .sign(data)
+                .to_bytes(),
+            RsaDigest::Sha512 => RsaSigningKey::<Sha512>::new(private_key)
+                .sign(data)
+                .to_bytes(),
+        };
+        Ok(signature.to_vec())
     }
 
     /// Sign hex registry bytes with `key`: RSA PKCS#1 v1.5, **SHA-512** digest.
@@ -751,24 +1020,8 @@ impl SigningService {
     /// [`SigningService::sign_with_key`], which signs with SHA-256 for the
     /// Debian/Conda metadata paths: a SHA-256 signature is well-formed but the
     /// hex client rejects it.
-    ///
-    /// Mirrors `sign_with_key`'s handling of the decrypted private key: the PEM
-    /// plaintext lives in a `Zeroizing` buffer and the parsed key self-cleans on
-    /// drop (#1328).
     pub fn sign_hex_registry(&self, key: &SigningKey, data: &[u8]) -> Result<Vec<u8>> {
-        let private_pem: Zeroizing<Vec<u8>> =
-            Zeroizing::new(self.encryption.decrypt(&key.private_key_enc).map_err(|e| {
-                AppError::Internal(format!("Failed to decrypt private key: {}", e))
-            })?);
-
-        let private_key = RsaPrivateKey::from_pkcs8_pem(
-            std::str::from_utf8(&private_pem)
-                .map_err(|e| AppError::Internal(format!("Invalid UTF-8 in key: {}", e)))?,
-        )
-        .map_err(|e| AppError::Internal(format!("Failed to parse private key: {}", e)))?;
-
-        let signing_key = RsaSigningKey::<Sha512>::new(private_key);
-        Ok(signing_key.sign(data).to_bytes().to_vec())
+        self.sign_with_key_digest(key, data, RsaDigest::Sha512)
     }
 
     /// Look up a repository's dedicated hex registry key, if it has one.
@@ -993,8 +1246,9 @@ impl SigningService {
         // spawn_blocking boundary.
         let secret_key = self.load_openpgp_secret_key(key)?;
         let data_owned = data.to_vec();
+        let expiry = self.signature_expiry();
         run_blocking("openpgp_sign_detached", move || {
-            sign_openpgp_detached_blocking(secret_key, data_owned)
+            sign_openpgp_detached_blocking(secret_key, data_owned, expiry)
         })
         .await
     }
@@ -1009,8 +1263,9 @@ impl SigningService {
     ) -> Result<String> {
         let secret_key = self.load_openpgp_secret_key(key)?;
         let text_owned = text.to_string();
+        let expiry = self.signature_expiry();
         run_blocking("openpgp_sign_cleartext", move || {
-            sign_openpgp_cleartext_blocking(secret_key, text_owned)
+            sign_openpgp_cleartext_blocking(secret_key, text_owned, expiry)
         })
         .await
     }
@@ -1278,6 +1533,176 @@ impl SigningService {
     }
 }
 
+/// Unit tests for the #1327 signature-expiry decision. Deliberately separate
+/// from the main `tests` module: every case here is pure arithmetic over
+/// durations and timestamps, so none of it needs a database, a keyring, or a
+/// real clock.
+#[cfg(test)]
+mod signature_expiry_tests {
+    use super::*;
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("valid timestamp")
+    }
+
+    #[test]
+    fn zero_disables_the_expiration_subpacket() {
+        assert_eq!(signature_expiry_duration(0), None);
+        assert_eq!(signed_cache_max_age(0), None);
+    }
+
+    #[test]
+    fn default_window_is_seven_days() {
+        assert_eq!(DEFAULT_SIGNATURE_EXPIRY_SECONDS, 604_800);
+        assert_eq!(
+            signature_expiry_duration(DEFAULT_SIGNATURE_EXPIRY_SECONDS),
+            Some(Duration::days(7))
+        );
+    }
+
+    #[test]
+    fn configured_window_is_used_verbatim_when_in_range() {
+        assert_eq!(
+            signature_expiry_duration(3 * 24 * 60 * 60),
+            Some(Duration::days(3))
+        );
+    }
+
+    #[test]
+    fn too_small_a_window_is_clamped_up_rather_than_rejected() {
+        // A misconfigured 30s window must not take the registry down, and must
+        // not produce a negative cache max age once the margin is subtracted.
+        assert_eq!(
+            signature_expiry_duration(30),
+            Some(Duration::seconds(MIN_SIGNATURE_EXPIRY_SECONDS as i64))
+        );
+    }
+
+    #[test]
+    fn too_large_a_window_is_clamped_down() {
+        assert_eq!(
+            signature_expiry_duration(u64::MAX),
+            Some(Duration::seconds(MAX_SIGNATURE_EXPIRY_SECONDS as i64))
+        );
+    }
+
+    /// The core safety property of #1327: the cache must stop serving an entry
+    /// strictly BEFORE the signature it holds stops verifying.
+    #[test]
+    fn cache_max_age_is_strictly_less_than_the_signature_window() {
+        for configured in [
+            MIN_SIGNATURE_EXPIRY_SECONDS,
+            2 * 60 * 60,
+            24 * 60 * 60,
+            DEFAULT_SIGNATURE_EXPIRY_SECONDS,
+            MAX_SIGNATURE_EXPIRY_SECONDS,
+        ] {
+            let expiry = signature_expiry_duration(configured).expect("enabled");
+            let max_age = signed_cache_max_age(configured).expect("enabled");
+            assert!(
+                max_age < expiry,
+                "cache max age {max_age} must be < signature window {expiry} \
+                 for configured={configured}"
+            );
+            assert!(
+                max_age > Duration::zero(),
+                "cache max age must stay positive for configured={configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_max_age_subtracts_exactly_the_safety_margin() {
+        assert_eq!(
+            signed_cache_max_age(DEFAULT_SIGNATURE_EXPIRY_SECONDS),
+            Some(Duration::days(7) - Duration::hours(1))
+        );
+    }
+
+    #[test]
+    fn a_young_entry_is_fresh_and_an_old_one_is_not() {
+        let max_age = signed_cache_max_age(DEFAULT_SIGNATURE_EXPIRY_SECONDS);
+        let inserted = ts(0);
+        // One hour old: comfortably inside the window.
+        assert!(signed_cache_entry_is_fresh(inserted, ts(3_600), max_age));
+        // Six days old: still inside 7d - 1h.
+        assert!(signed_cache_entry_is_fresh(
+            inserted,
+            ts(6 * 24 * 3_600),
+            max_age
+        ));
+        // Seven days old: past 7d - 1h, so the entry must be re-signed.
+        assert!(!signed_cache_entry_is_fresh(
+            inserted,
+            ts(7 * 24 * 3_600),
+            max_age
+        ));
+    }
+
+    #[test]
+    fn the_boundary_is_exclusive_so_an_exactly_aged_entry_is_stale() {
+        let max_age = signed_cache_max_age(DEFAULT_SIGNATURE_EXPIRY_SECONDS).expect("enabled");
+        let inserted = ts(0);
+        let exactly = ts(max_age.num_seconds());
+        assert!(!signed_cache_entry_is_fresh(
+            inserted,
+            exactly,
+            Some(max_age)
+        ));
+        assert!(signed_cache_entry_is_fresh(
+            inserted,
+            ts(max_age.num_seconds() - 1),
+            Some(max_age)
+        ));
+    }
+
+    #[test]
+    fn entries_never_age_out_when_expiry_is_disabled() {
+        // A decade later, with expiry off, the entry is still servable: only
+        // content-keyed invalidation applies, exactly as before #1327.
+        assert!(signed_cache_entry_is_fresh(
+            ts(0),
+            ts(10 * 365 * 24 * 3_600),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_backwards_clock_step_does_not_make_an_entry_stale() {
+        // now < inserted_at. The signature cannot have expired yet, and
+        // re-signing every request during clock skew is the worse failure.
+        let max_age = signed_cache_max_age(DEFAULT_SIGNATURE_EXPIRY_SECONDS);
+        assert!(signed_cache_entry_is_fresh(ts(10_000), ts(0), max_age));
+    }
+
+    /// `SigningService::new` must not stamp an expiry: a signing path that was
+    /// never audited for re-signing (e.g. the immutable RPM `@N` publish
+    /// snapshot) has to keep its pre-#1327 behaviour.
+    #[test]
+    fn expiry_is_opt_in_not_the_constructor_default() {
+        // Exercised through the same pure helper the service uses, so this
+        // needs no PgPool.
+        assert_eq!(signature_expiry_duration(0), None);
+    }
+
+    #[test]
+    fn hashed_subpackets_include_expiration_only_when_enabled() {
+        let fp = pgp::types::Fingerprint::V4([0u8; 20]);
+        let without = openpgp_hashed_subpackets(fp.clone(), None);
+        assert_eq!(without.len(), 2, "creation time + issuer fingerprint only");
+
+        let with = openpgp_hashed_subpackets(fp, Some(Duration::days(7)));
+        assert_eq!(with.len(), 3, "expiration subpacket appended");
+        assert!(
+            with.iter().any(|sp| matches!(
+                sp.data,
+                SubpacketData::SignatureExpirationTime(d) if d == Duration::days(7)
+            )),
+            "the 7-day expiration subpacket must be present"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1334,6 +1759,7 @@ mod tests {
         let service = SigningService {
             db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
             encryption: CredentialEncryption::from_passphrase(passphrase),
+            signature_expiry_seconds: 0,
         };
         let req = CreateKeyRequest {
             repository_id: None,
@@ -1379,6 +1805,7 @@ mod tests {
         let service = SigningService {
             db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
             encryption: CredentialEncryption::from_passphrase(passphrase),
+            signature_expiry_seconds: 0,
         };
         let (public_key, _) = pgp::SignedPublicKey::from_string(&key.public_key_pem).unwrap();
         public_key.verify().unwrap();
@@ -1415,6 +1842,7 @@ mod tests {
         let service = SigningService {
             db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
             encryption: CredentialEncryption::from_passphrase(passphrase),
+            signature_expiry_seconds: 0,
         };
 
         let repomd = b"<repomd><data type=\"primary\"></data></repomd>";
@@ -2353,6 +2781,7 @@ mod tests {
         SigningService {
             db: pool,
             encryption: CredentialEncryption::from_passphrase(TEST_PASSPHRASE),
+            signature_expiry_seconds: 0,
         }
     }
 

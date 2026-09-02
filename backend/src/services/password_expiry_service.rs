@@ -131,10 +131,65 @@ const NOTIFICATION_CLAIM_TTL_SECS: f64 = 300.0;
 const NOTIFICATION_RETRY_DELAY_SECS: f64 = 300.0;
 
 /// Proof that this worker owns one notification attempt.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct NotificationClaim {
     pub id: uuid::Uuid,
     pub claim_token: uuid::Uuid,
+}
+
+/// Token-guarded claim extension for one `password_expiry_notifications` row;
+/// executed through [`cluster_work::renew_row_claim`]'s shared `$1=id,
+/// $2=token, $3=ttl` contract.
+const RENEW_NOTIFICATION_CLAIM_SQL: &str = r#"
+    UPDATE password_expiry_notifications
+    SET claim_expires_at = NOW() + make_interval(secs => $3)
+    WHERE id = $1
+      AND claim_token = $2
+      AND status = 'claimed'
+"#;
+
+/// Extend a live SMTP claim. `Ok(false)` means the claim was lost (expired
+/// and reclaimed by another replica) and this worker no longer owns the row.
+pub(crate) async fn renew_notification_claim(
+    db: &sqlx::PgPool,
+    claim: &NotificationClaim,
+    claim_ttl_secs: f64,
+) -> crate::error::Result<bool> {
+    crate::services::cluster_work::renew_row_claim(
+        db,
+        RENEW_NOTIFICATION_CLAIM_SQL,
+        claim.id,
+        claim.claim_token,
+        claim_ttl_secs,
+    )
+    .await
+}
+
+/// Heartbeat the SMTP claim for as long as the send attempt runs (#3086).
+///
+/// The claim's fixed TTL alone leaves a duplicate-email window: an SMTP
+/// attempt that outlives the TTL lets a second replica reclaim the row and
+/// send the same notification again. The heartbeat keeps the claim alive for
+/// a live worker; the TTL remains the failover boundary for a dead one.
+fn spawn_notification_claim_renewal(
+    db: sqlx::PgPool,
+    claim: &NotificationClaim,
+    claim_ttl_secs: f64,
+) -> crate::services::cluster_work::RenewalGuard {
+    let claim = claim.clone();
+    crate::services::cluster_work::spawn_renewal_loop(
+        format!("password expiry notification {}", claim.id),
+        claim_ttl_secs,
+        move || {
+            let db = db.clone();
+            let claim = claim.clone();
+            async move {
+                renew_notification_claim(&db, &claim, claim_ttl_secs)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+    )
 }
 
 /// Claim `(user, tier, password version)` before SMTP.
@@ -347,6 +402,12 @@ pub async fn send_expiry_notifications(
                     continue;
                 }
             };
+
+            // Keep the claim alive while SMTP (and finalization) runs, so a
+            // slow send cannot outlive the claim TTL and be duplicated by
+            // another replica (#3086). Dropped at the end of this iteration.
+            let _claim_renewal =
+                spawn_notification_claim_renewal(db.clone(), &claim, NOTIFICATION_CLAIM_TTL_SECS);
 
             if let Err(e) = smtp
                 .send_email(&user.email, &subject, &body_html, &body_text)
@@ -847,6 +908,69 @@ mod tests {
                 .expect("claim query")
                 .is_none(),
             "a stale/inactive candidate must not reach SMTP"
+        );
+
+        cleanup_claim_test_user(&pool, user_id).await;
+    }
+
+    /// Tier-2: the SMTP heartbeat (#3086) extends a live claim, is fenced by
+    /// the claim token, and stops renewing once the row reaches `sent`.
+    #[tokio::test]
+    async fn notification_claim_heartbeat_extends_and_is_token_fenced() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, changed_at) = create_claim_test_user(&pool).await;
+
+        let claim = claim_notification(&pool, user_id, 7, changed_at, "replica-a", 60.0)
+            .await
+            .expect("claim query")
+            .expect("claim");
+
+        let before: chrono::DateTime<Utc> = sqlx::query_scalar(
+            "SELECT claim_expires_at FROM password_expiry_notifications WHERE id = $1",
+        )
+        .bind(claim.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read claim expiry");
+
+        assert!(
+            renew_notification_claim(&pool, &claim, 600.0)
+                .await
+                .expect("renew query"),
+            "a held claim must be renewable"
+        );
+        let after: chrono::DateTime<Utc> = sqlx::query_scalar(
+            "SELECT claim_expires_at FROM password_expiry_notifications WHERE id = $1",
+        )
+        .bind(claim.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read claim expiry");
+        assert!(
+            after > before,
+            "renewal must push claim_expires_at forward ({before} -> {after})"
+        );
+
+        let stranger = NotificationClaim {
+            id: claim.id,
+            claim_token: uuid::Uuid::new_v4(),
+        };
+        assert!(
+            !renew_notification_claim(&pool, &stranger, 600.0)
+                .await
+                .expect("renew query"),
+            "a mismatched token must not extend the claim"
+        );
+
+        assert!(mark_notification_sent(&pool, &claim).await);
+        assert!(
+            !renew_notification_claim(&pool, &claim, 600.0)
+                .await
+                .expect("renew query"),
+            "a finalized notification must not be renewable"
         );
 
         cleanup_claim_test_user(&pool, user_id).await;

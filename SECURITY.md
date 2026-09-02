@@ -54,6 +54,117 @@ We will coordinate disclosure with you and credit reporters in the release notes
 - Example WASM plugin template (`artifact-keeper-example-plugin/`)
 - Third-party dependencies (report upstream, but let us know if it affects us)
 
+## Verifying a release
+
+Every release published from `v1.8.2` onward is signed, carries build
+provenance, and ships a software bill of materials. Verify before you run it.
+
+### What ships, and what each file proves
+
+| Asset | What it is |
+|-------|------------|
+| `artifact-keeper-<os>-<arch>.tar.gz` / `.exe` | the binary |
+| `artifact-keeper-<os>-<arch>.tar.gz.sha256` | per-file digest, kept for compatibility |
+| `checksums.txt` | one manifest covering **every** asset on the release |
+| `checksums.txt.cosign.bundle` | the [Sigstore](https://www.sigstore.dev/) keyless signature over `checksums.txt` |
+| `artifact-keeper-<os>-<arch>.cdx.json` | CycloneDX SBOM for that target |
+
+A `.sha256` file on its own proves only that your download was not corrupted in
+transit. It is served from the same place, by the same authority, as the
+artifact it describes — anyone who can replace the tarball can replace its
+checksum in the same action. **`checksums.txt` plus its cosign signature is what
+proves the bytes came from us**, which is why the manifest, and not the
+individual digests, is the thing that is signed.
+
+### 1. Download
+
+```sh
+VERSION=1.8.2
+gh release download "v${VERSION}" --repo artifact-keeper/artifact-keeper
+```
+
+### 2. Verify the signature on `checksums.txt`
+
+Requires [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
+v2.4 or later (v3.x recommended).
+
+```sh
+# The certificate identity contains dots, which are regex metacharacters.
+IDENTITY="^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/release\.yml@refs/tags/v${VERSION//./\\.}$"
+
+cosign verify-blob \
+  --bundle checksums.txt.cosign.bundle \
+  --certificate-identity-regexp "$IDENTITY" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+```
+
+For `v1.8.2` that expands to, in full:
+
+```
+^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/release\.yml@refs/tags/v1\.8\.2$
+```
+
+**Do not relax that pattern.** Sigstore's Fulcio is a public CA: it will issue a
+certificate to anybody's GitHub Actions workflow. `--certificate-identity-regexp
+'.*'` satisfies cosign's "you must constrain the identity" requirement and
+constrains nothing — it accepts a signature made by any workflow, in any
+repository, in the world. The three things worth pinning are all in the pattern
+above: the repository, the workflow file, and the tag.
+
+### 3. Verify the artifacts against the manifest
+
+The signature covers `checksums.txt`. Only this step connects `checksums.txt`
+to the files you actually downloaded, so it is not optional:
+
+```sh
+sha256sum -c checksums.txt
+```
+
+### 4. Verify build provenance
+
+Requires the [GitHub CLI](https://cli.github.com/) (`gh` 2.49+):
+
+```sh
+gh attestation verify artifact-keeper-linux-amd64.tar.gz \
+  --repo artifact-keeper/artifact-keeper \
+  --signer-workflow artifact-keeper/artifact-keeper/.github/workflows/release.yml
+```
+
+`--signer-workflow` is worth including. Without it, `--repo` alone accepts an
+attestation produced by any workflow in this repository that can write one, and
+several can.
+
+### 5. Inspect the dependency graph
+
+The release binaries are built with
+[`cargo auditable`](https://github.com/rust-secure-code/cargo-auditable), so the
+exact set of crates that went into them is embedded in the binary itself. You do
+not have to trust that an SBOM file shipped alongside describes the binary next
+to it — you can ask the binary:
+
+```sh
+tar -xzf artifact-keeper-linux-amd64.tar.gz
+cargo audit bin artifact-keeper-linux-amd64
+```
+
+Note that `cargo audit bin` **exits 0 on a binary with no embedded data**: it
+falls back to recovering a partial list from panic messages and says so in a
+warning. Read the output, not just the exit code. It should say
+`Found 'cargo auditable' data`. The same data is readable by
+[trivy](https://github.com/aquasecurity/trivy), [grype](https://github.com/anchore/grype)
+and [syft](https://github.com/anchore/syft).
+
+The `.cdx.json` files are the same information as a standalone CycloneDX
+document, per target, for tooling that wants an SBOM as a file. They are covered
+by `checksums.txt` and by the provenance attestation.
+
+### Container images
+
+Images published to `ghcr.io` have carried cosign signatures, an SBOM
+attestation and build provenance for longer; see the image documentation for
+the equivalent `cosign verify` and `gh attestation verify` invocations.
+
 ## Security Best Practices for Operators
 
 - Always run behind a reverse proxy with TLS

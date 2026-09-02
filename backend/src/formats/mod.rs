@@ -390,6 +390,18 @@ static GO_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
     publish_time_resolver: false,
 };
 
+static VSCODE_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Vscode,
+    label: "vscode",
+    // Open VSX treats each publisher/extension/version/target-platform tuple
+    // as immutable. The VS Code handler includes the platform in its review
+    // coordinate, so a first-seen observation cannot age a different build.
+    immutable_coordinates: true,
+    // The Open VSX gallery adapter exposes the registry-controlled publish
+    // timestamp as each version's RFC3339 `lastUpdated` field.
+    publish_time_resolver: true,
+};
+
 /// Look up the age-gate capability spec for a repository format, collapsing
 /// protocol aliases (yarn/pnpm speak npm; poetry speaks PyPI) onto the
 /// canonical format that owns their policy. `None` means the format has no
@@ -401,6 +413,7 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         }
         RepositoryFormat::Pypi | RepositoryFormat::Poetry => Some(&PYPI_AGE_GATE_SPEC),
         RepositoryFormat::Go => Some(&GO_AGE_GATE_SPEC),
+        RepositoryFormat::Vscode => Some(&VSCODE_AGE_GATE_SPEC),
         _ => None,
     }
 }

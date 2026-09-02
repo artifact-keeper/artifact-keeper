@@ -335,9 +335,9 @@ pub fn spawn_all(
         let config_clone = config.clone();
         let gc_registry = storage_registry.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(120)).await;
+            tokio::time::sleep(jittered_startup_delay(120)).await;
             // Kept for the blob-GC readiness gate below; the pool itself is
-            // moved into the GC service on the next line.
+            // also moved into the GC service below.
             let gate_db = db.clone();
             // Post-GC storage-stats refresher (#2056): recompute the
             // deduplicated `repository_storage_stats` right after each GC pass
@@ -351,8 +351,14 @@ pub fn spawn_all(
             // the scheduled pass runs DRY-RUN: it logs what it would reclaim
             // but deletes nothing. Bias to leaking storage over losing data.
             let blob_gc_dry_run = !config_clone.blob_gc_enabled;
+            // The orphaned row-less Maven flat-object sweep is opt-in for the
+            // same reason blob deletion is (#3431): its candidates are keys
+            // the catalog cannot see, which on a migrated instance is the
+            // expected state of legitimate legacy data. Unset, that sweep
+            // reports what it would reclaim and deletes nothing.
             let service =
-                crate::services::storage_gc_service::StorageGcService::new(db, gc_registry);
+                crate::services::storage_gc_service::StorageGcService::new(db, gc_registry)
+                    .with_maven_flat_gc_enabled(config_clone.maven_flat_gc_enabled);
 
             let normalized = normalize_cron_expression(&config_clone.gc_schedule);
             let gc_schedule = match parse_cron_schedule(&normalized) {
@@ -376,38 +382,34 @@ pub fn spawn_all(
                     .unwrap_or(std::time::Duration::from_secs(3600));
                 tokio::time::sleep(delay).await;
 
-                tracing::info!("Running scheduled storage garbage collection");
-
-                match service.run_gc(false).await {
-                    Ok(result) => {
-                        if result.storage_keys_deleted > 0 {
-                            tracing::info!(
-                                "Storage GC: deleted {} keys, removed {} artifacts, freed {} bytes",
-                                result.storage_keys_deleted,
-                                result.artifacts_removed,
-                                result.bytes_freed
-                            );
-                            metrics_service::record_cleanup(
-                                "storage_gc",
-                                result.artifacts_removed as u64,
-                            );
-                        }
-                        if !result.errors.is_empty() {
-                            tracing::warn!(
-                                "Storage GC completed with {} errors",
-                                result.errors.len()
-                            );
-                            // Surface the actual messages, not just the count,
-                            // so the orchestration-layer log is actionable.
-                            for err in &result.errors {
-                                tracing::warn!(gc_error = %err, "Storage GC error");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Storage garbage collection failed: {}", e);
-                    }
-                }
+                // Multi-replica safety: without a lease, every replica computes
+                // the same `next` occurrence and fires this tick at the same
+                // instant, running the Maven flat-object orphan scan (and the
+                // rest of `run_gc`) concurrently on every replica. Only the
+                // scheduled tick is gated — the on-demand admin/per-repo GC
+                // endpoints call `run_gc`/`run_gc_for_repository` directly and
+                // must keep working even while a scheduled tick holds this
+                // lease. See `StorageGcService::run_scheduled_tick`.
+                //
+                // SCOPE — the lease covers `run_gc` and NOTHING ELSE in this
+                // tick. The blob-GC mark/sweep and the storage-stats
+                // recompute below still run on EVERY replica, concurrently,
+                // and #3384 is therefore only PARTIALLY closed by this gate.
+                // Measured with two replicas: the leased
+                // `maven_flat_object_owner` scan drops to 1/minute while the
+                // un-leased `oci_blobs` scans stay at 4-6/minute. Worse, a
+                // replica that LOSES the lease now returns here immediately
+                // instead of after a ~119s GC, so the un-leased half of the
+                // tick fires on every replica at the same instant with none
+                // of the accidental stagger the slow path used to provide.
+                // Extending the lease (or a second one) over the rest of the
+                // tick is tracked by #3503; it is deliberately not done here
+                // because blob GC has its own readiness gate and dry-run
+                // default whose interaction with a skipped tick needs its own
+                // analysis.
+                service
+                    .run_scheduled_tick(crate::services::storage_gc_service::SCHEDULED_GC_JOB_NAME)
+                    .await;
 
                 // Blob layer GC runs in the same tick: the manifest GC pass
                 // above frees `oci-manifests/...` storage keys, this pass
@@ -445,7 +447,18 @@ pub fn spawn_all(
                     .await
                     {
                         Ok(true) => {
+                            // #3285: name the offending digests. Without this,
+                            // diagnosing a stuck gate meant reconstructing the
+                            // gate query by hand against the database.
+                            let blockers =
+                                crate::services::manifest_blob_refs_backfill::list_live_manifests_missing_refs(
+                                    &gate_db,
+                                    crate::services::manifest_blob_refs_backfill::GATE_BLOCKER_SAMPLE_LIMIT,
+                                )
+                                .await
+                                .unwrap_or_default();
                             tracing::warn!(
+                                blocking_manifests = %crate::services::manifest_blob_refs_backfill::describe_gate_blockers(&blockers),
                                 "Blob GC: manifest_blob_refs is incomplete for one or more live \
                                  image manifests (startup backfill unfinished or partially \
                                  failed); forcing dry-run this tick and retrying next tick"
@@ -921,6 +934,7 @@ struct BackupScheduleRow {
     pub name: String,
     pub backup_type: BackupType,
     pub include_repositories: Option<Vec<uuid::Uuid>>,
+    pub last_run_at: Option<chrono::DateTime<Utc>>,
 }
 
 /// Raw row decoded from the atomic schedule claim statement.
@@ -931,6 +945,7 @@ struct ClaimedBackupScheduleRow {
     pub name: String,
     pub backup_type: BackupType,
     pub include_repositories: Option<Vec<uuid::Uuid>>,
+    pub last_run_at: Option<chrono::DateTime<Utc>>,
     pub scheduled_for: chrono::DateTime<Utc>,
 }
 
@@ -970,7 +985,7 @@ async fn claim_backup_schedule_run(
     let row = sqlx::query_as::<_, ClaimedBackupScheduleRow>(
         r#"
         WITH eligible AS MATERIALIZED (
-            SELECT id, name, backup_type, include_repositories,
+            SELECT id, name, backup_type, include_repositories, last_run_at,
                    COALESCE(next_run_at, 'epoch'::timestamptz) AS due_at
             FROM backup_schedules
             WHERE id = $1
@@ -1000,7 +1015,7 @@ async fn claim_backup_schedule_run(
             RETURNING id AS run_id, claim_token, schedule_id, scheduled_for
         )
         SELECT c.run_id, c.claim_token, e.name, e.backup_type,
-               e.include_repositories, c.scheduled_for
+               e.include_repositories, e.last_run_at, c.scheduled_for
         FROM claimed c
         JOIN eligible e
           ON e.id = c.schedule_id
@@ -1021,6 +1036,7 @@ async fn claim_backup_schedule_run(
             name: row.name,
             backup_type: row.backup_type,
             include_repositories: row.include_repositories,
+            last_run_at: row.last_run_at,
         },
         claim: BackupRunClaim {
             run_id: row.run_id,
@@ -1030,36 +1046,45 @@ async fn claim_backup_schedule_run(
     }))
 }
 
+/// Token-guarded claim extension for one `backup_schedule_runs` row; executed
+/// through [`cluster_work::renew_row_claim`]'s shared `$1=id, $2=token,
+/// $3=ttl` contract.
+const RENEW_BACKUP_RUN_CLAIM_SQL: &str = r#"
+    UPDATE backup_schedule_runs
+    SET claim_expires_at = NOW() + make_interval(secs => $3)
+    WHERE id = $1
+      AND claim_token = $2
+      AND status = 'running'
+"#;
+
 async fn renew_backup_schedule_run_claim(
     db: &PgPool,
     claim: &BackupRunClaim,
     claim_ttl_secs: f64,
 ) -> crate::error::Result<bool> {
-    let result = sqlx::query(
-        r#"
-        UPDATE backup_schedule_runs
-        SET claim_expires_at = NOW() + make_interval(secs => $3)
-        WHERE id = $1
-          AND claim_token = $2
-          AND status = 'running'
-        "#,
+    crate::services::cluster_work::renew_row_claim(
+        db,
+        RENEW_BACKUP_RUN_CLAIM_SQL,
+        claim.run_id,
+        claim.claim_token,
+        claim_ttl_secs,
     )
-    .bind(claim.run_id)
-    .bind(claim.claim_token)
-    .bind(claim_ttl_secs)
-    .execute(db)
     .await
-    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
-
-    Ok(result.rows_affected() == 1)
 }
 
+/// Heartbeat the run claim and hand back the cancellation token the backup
+/// worker observes between chunks: a lost claim means another replica may
+/// already have reclaimed this occurrence, so the in-flight archive must be
+/// aborted, not finished (#3084).
 fn spawn_backup_run_renewal(
     db: PgPool,
     claim: BackupRunClaim,
     claim_ttl_secs: f64,
-) -> crate::services::cluster_work::RenewalGuard {
-    crate::services::cluster_work::spawn_renewal_loop(
+) -> (
+    crate::services::cluster_work::RenewalGuard,
+    tokio_util::sync::CancellationToken,
+) {
+    crate::services::cluster_work::spawn_renewal_loop_with_cancellation(
         format!("backup schedule run {}", claim.run_id),
         claim_ttl_secs,
         move || {
@@ -1071,6 +1096,22 @@ fn spawn_backup_run_renewal(
             }
         },
     )
+}
+
+/// The `since` cutoff a *scheduled* backup runs with (#3011).
+///
+/// An incremental schedule captures the delta since its previous run; its
+/// first run has no anchor, so it captures everything (a full snapshot is the
+/// only honest "delta from nothing"). Full and metadata schedules never carry
+/// a cutoff.
+fn scheduled_backup_since(
+    backup_type: BackupType,
+    last_run_at: Option<chrono::DateTime<Utc>>,
+) -> Option<chrono::DateTime<Utc>> {
+    match backup_type {
+        BackupType::Incremental => Some(last_run_at.unwrap_or(chrono::DateTime::UNIX_EPOCH)),
+        BackupType::Full | BackupType::Metadata => None,
+    }
 }
 
 /// Token-fence the run outcome and advance the schedule in one transaction.
@@ -1302,55 +1343,58 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
             storage.clone(),
             archive_storage.clone(),
         );
-        let run_renewal = spawn_backup_run_renewal(db.clone(), claim, BACKUP_RUN_CLAIM_TTL_SECS);
+        // The renewal loop heartbeats the claim; its cancellation token fires
+        // if ownership is lost (DB partition, expired TTL reclaimed by another
+        // replica) so the in-flight archive is aborted instead of producing a
+        // second backup for the same occurrence (#3084).
+        let (run_renewal, claim_lost) =
+            spawn_backup_run_renewal(db.clone(), claim, BACKUP_RUN_CLAIM_TTL_SECS);
 
-        // Create and execute the backup
+        // Create and execute the backup. Success/failure metrics and audit
+        // events are recorded inside `execute_cancellable` (#3011), so only
+        // the create-failure arm — where no run ever starts — records here.
         let create_result = service
             .create(CreateBackupRequest {
                 backup_type: schedule_row.backup_type,
                 repository_ids: schedule_row.include_repositories.clone(),
                 exclude_repository_ids: None, // schedules use include-lists today
-                since: None,                  // schedules back up every artifact (#2789)
-                created_by: None,             // system-initiated
-                name: None,                   // scheduled backups keep the default {uuid} name
+                since: scheduled_backup_since(schedule_row.backup_type, schedule_row.last_run_at),
+                created_by: None, // system-initiated
+                name: None,       // scheduled backups keep the default {uuid} name
             })
             .await;
 
-        let backup_type_str = format!("{:?}", schedule_row.backup_type).to_lowercase();
-        let start = std::time::Instant::now();
-
         let (succeeded, backup_id, error_message) = match create_result {
-            Ok(backup) => match service.execute(backup.id).await {
+            Ok(backup) => match service.execute_cancellable(backup.id, claim_lost).await {
                 Ok(completed) => {
-                    let elapsed = start.elapsed().as_secs_f64();
                     tracing::info!(
                         "Scheduled backup '{}' completed: {} bytes, {} artifacts",
                         schedule_row.name,
                         completed.size_bytes.unwrap_or(0),
                         completed.artifact_count.unwrap_or(0)
                     );
-                    metrics_service::record_backup(&backup_type_str, true, elapsed);
                     (true, Some(backup.id), None)
                 }
                 Err(e) => {
-                    let elapsed = start.elapsed().as_secs_f64();
                     tracing::error!(
                         "Scheduled backup '{}' execution failed: {}",
                         schedule_row.name,
                         e
                     );
-                    metrics_service::record_backup(&backup_type_str, false, elapsed);
                     (false, Some(backup.id), Some(e.to_string()))
                 }
             },
             Err(e) => {
-                let elapsed = start.elapsed().as_secs_f64();
                 tracing::error!(
                     "Failed to create scheduled backup '{}': {}",
                     schedule_row.name,
                     e
                 );
-                metrics_service::record_backup(&backup_type_str, false, elapsed);
+                metrics_service::record_backup(
+                    &format!("{:?}", schedule_row.backup_type).to_lowercase(),
+                    false,
+                    0.0,
+                );
                 (false, None, Some(e.to_string()))
             }
         };
@@ -1989,35 +2033,49 @@ async fn evaluate_ondemand_curation(
 
         match format {
             "pypi" => {
-                let verdict = match &trust {
-                    Some(t) => {
-                        verify_pypi_curation_row(
-                            client,
-                            upstream_auth,
-                            upstream_url,
-                            &pkg,
-                            &allowlist,
-                            t,
-                        )
-                        .await
+                // #3230: the persisted record is the source of truth when it is
+                // still usable. Re-verifying means re-downloading the whole
+                // distribution from the upstream, and a verification is a
+                // statement about an immutable digest — so a fresh record short-
+                // circuits the network work AND, more importantly, survives the
+                // tick that computed it. `reusable_verdict` fails safe: any
+                // doubt returns None and we verify again.
+                let cached = attestation_verify::reusable_verdict(
+                    &attestation_verify::AttestationRecord::of(&pkg),
+                    &allowlist,
+                    chrono::Utc::now(),
+                );
+                let verdict = match cached {
+                    Some(v) => v,
+                    None => {
+                        let verdict = match &trust {
+                            Some(t) => {
+                                verify_pypi_curation_row(
+                                    client,
+                                    upstream_auth,
+                                    upstream_url,
+                                    &pkg,
+                                    &allowlist,
+                                    t,
+                                )
+                                .await
+                            }
+                            None => attestation_verify::AttestationVerdict::unverified(),
+                        };
+                        let _ = curation
+                            .record_attestation(
+                                pkg.id,
+                                verdict.state.as_str(),
+                                verdict.identity.as_deref(),
+                                verdict.issuer.as_deref(),
+                                verdict.owner.as_deref(),
+                                verdict.error.as_deref(),
+                            )
+                            .await;
+                        verdict
                     }
-                    None => attestation_verify::AttestationVerdict::unverified(),
                 };
-                let _ = curation
-                    .record_attestation(
-                        pkg.id,
-                        verdict.state.as_str(),
-                        verdict.identity.as_deref(),
-                        verdict.issuer.as_deref(),
-                        verdict.owner.as_deref(),
-                        verdict.error.as_deref(),
-                    )
-                    .await;
-                if let Some(marker) = attestation_verify::verified_marker(&verdict) {
-                    if let Some(obj) = eval_metadata.as_object_mut() {
-                        obj.insert(publisher_source::VERIFICATION_MARKER.to_string(), marker);
-                    }
-                }
+                attestation_verify::apply_verified_marker(&mut eval_metadata, Some(&verdict));
             }
             "npm" => {
                 // npm is ingested but unsupported (sha512-only subject binding);
@@ -2300,6 +2358,37 @@ fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #3011 — the `since` anchor scheduled backups run with
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scheduled_incremental_backup_anchors_on_the_previous_run() {
+        let last = Utc::now() - chrono::Duration::hours(6);
+        assert_eq!(
+            scheduled_backup_since(BackupType::Incremental, Some(last)),
+            Some(last),
+            "an incremental schedule must capture the delta since its last run"
+        );
+    }
+
+    #[test]
+    fn scheduled_incremental_backup_first_run_captures_everything() {
+        assert_eq!(
+            scheduled_backup_since(BackupType::Incremental, None),
+            Some(chrono::DateTime::UNIX_EPOCH),
+            "the first incremental run has no anchor and must capture everything"
+        );
+    }
+
+    #[test]
+    fn scheduled_full_and_metadata_backups_carry_no_cutoff() {
+        let last = Some(Utc::now());
+        assert_eq!(scheduled_backup_since(BackupType::Full, last), None);
+        assert_eq!(scheduled_backup_since(BackupType::Metadata, last), None);
+        assert_eq!(scheduled_backup_since(BackupType::Full, None), None);
+    }
 
     // -----------------------------------------------------------------------
     // #2955 — guards on the credentialed attestation-enrichment fetches
@@ -2619,6 +2708,7 @@ mod tests {
             name: "nightly-backup".to_string(),
             backup_type: BackupType::Full,
             include_repositories: None,
+            last_run_at: None,
         };
         assert_eq!(row.name, "nightly-backup");
         assert!(row.include_repositories.is_none());
@@ -2632,6 +2722,7 @@ mod tests {
             name: "selective-backup".to_string(),
             backup_type: BackupType::Incremental,
             include_repositories: Some(repo_ids.clone()),
+            last_run_at: None,
         };
         assert_eq!(row.include_repositories.as_ref().unwrap().len(), 2);
     }
@@ -2643,6 +2734,7 @@ mod tests {
             name: "test".to_string(),
             backup_type: BackupType::Metadata,
             include_repositories: None,
+            last_run_at: None,
         };
         let debug_str = format!("{:?}", row);
         assert!(debug_str.contains("BackupScheduleRow"));

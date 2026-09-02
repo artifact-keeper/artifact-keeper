@@ -225,6 +225,33 @@ pub fn request_base_url_from_request(headers: &HeaderMap, uri: Option<&Uri>) -> 
     }
 }
 
+/// Derive an external base URL without consulting `X-Forwarded-Host` or an
+/// absolute-form request URI.
+///
+/// This is for client-fetchable URLs embedded in cacheable response metadata.
+/// A forged forwarding header must not be able to point later asset downloads
+/// at another host. `AK_EXTERNAL_URL` remains authoritative when configured;
+/// otherwise the request's direct `Host` header keeps the generated origin
+/// aligned with the origin used to request (and cache) the response.
+pub fn request_base_url_from_host_header(headers: &HeaderMap) -> String {
+    if let Some(external) = configured_external_url() {
+        return external.to_string();
+    }
+
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| value.eq_ignore_ascii_case("https"))
+        .map_or("http", |_| "https");
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost");
+
+    format!("{scheme}://{host}")
+}
+
 /// Returns `true` when the incoming request reached the trusted edge over
 /// HTTPS, as signalled by `X-Forwarded-Proto: https` (case-insensitive).
 ///
@@ -355,6 +382,19 @@ mod tests {
         assert_eq!(
             request_base_url_from_request(&headers, Some(&uri)),
             "https://external.example.com"
+        );
+    }
+
+    #[test]
+    fn test_host_header_base_url_ignores_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("registry.example.com"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("evil.example"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+
+        assert_eq!(
+            request_base_url_from_host_header(&headers),
+            "https://registry.example.com"
         );
     }
 

@@ -320,6 +320,7 @@ async fn public_key(
 
 async fn package_info(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
@@ -337,24 +338,26 @@ async fn package_info(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
+            // Verbatim pass-through of upstream's signed registry bytes: the
+            // upstream `Content-Encoding` is re-declared when present
+            // (RFC 9110 §8.4, #3260) — nothing on this path decodes.
             let upstream_path = format!("packages/{}", name);
-            let (content, content_type) = proxy_helpers::proxy_fetch_capped(
-                proxy,
-                repo.id,
-                &repo_key,
-                upstream_url,
-                &upstream_path,
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await?;
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(
-                    CONTENT_TYPE,
-                    content_type.unwrap_or_else(|| "application/json".to_string()),
+            let (content, content_type, content_encoding) =
+                proxy_helpers::proxy_fetch_capped_encoded(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
-                .body(Body::from(content))
-                .unwrap());
+                .await?;
+            return Ok(proxy_helpers::forward_verbatim_metadata(
+                content,
+                content_type,
+                "application/json",
+                content_encoding,
+            ));
         }
     }
 
@@ -392,7 +395,12 @@ async fn package_info(
         // published name. Local-first lookup also avoids an unnecessary
         // network round-trip when the package is already known to a member.
         if repo.repo_type == RepositoryType::Virtual {
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            // Caller-authorized member walk (#3323): the registry document is
+            // content, so a member this caller may not read directly is neither
+            // consulted locally nor proxied.
+            let members =
+                proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+                    .await?;
 
             // Pass 1+2: any member that already has artifact rows for this name.
             // Non-Remote members run first so they shadow Remote upstreams; this
@@ -408,18 +416,27 @@ async fn package_info(
             }
 
             // Pass 3: fall through to remote proxy for un-cached packages.
+            // Verbatim forward of the member's registry bytes: its
+            // `Content-Encoding` is re-declared when present (RFC 9110 §8.4,
+            // #3260) and its own `Content-Type` is served (#3281) — the
+            // member's registry blob is a signed protobuf, not JSON, and the
+            // Remote arm of this same endpoint already forwards the
+            // upstream's type. The literal survives only as the fallback for
+            // a member that declared none.
             let upstream_path = format!("packages/{}", name);
             return proxy_helpers::resolve_virtual_metadata(
                 &state.db,
+                auth.as_ref(),
                 state.proxy_service.as_deref(),
                 repo.id,
                 &upstream_path,
-                |content, _member_key| async move {
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from(content))
-                        .unwrap())
+                |content, content_type, content_encoding, _member_key| async move {
+                    Ok(proxy_helpers::forward_verbatim_metadata(
+                        content,
+                        content_type,
+                        "application/json",
+                        content_encoding,
+                    ))
                 },
             )
             .await;
@@ -1055,6 +1072,7 @@ fn canonical_hex_names(rows: &[(String, DateTime<Utc>)]) -> Vec<hex_registry::He
 
 async fn list_names(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
@@ -1102,32 +1120,38 @@ async fn list_names(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, content_type) = proxy_helpers::proxy_fetch_capped(
-                proxy,
-                repo.id,
-                &repo_key,
-                upstream_url,
-                "names",
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await?;
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(
-                    CONTENT_TYPE,
-                    content_type.unwrap_or_else(|| "application/json".to_string()),
+            // Verbatim pass-through: re-declare the upstream
+            // `Content-Encoding` when present (RFC 9110 §8.4, #3260).
+            let (content, content_type, content_encoding) =
+                proxy_helpers::proxy_fetch_capped_encoded(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    "names",
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
-                .body(Body::from(content))
-                .unwrap());
+                .await?;
+            return Ok(proxy_helpers::forward_verbatim_metadata(
+                content,
+                content_type,
+                "application/json",
+                content_encoding,
+            ));
         }
     }
     // Virtual: merge package names from all member repositories (local DB + remote proxy).
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323). This site additionally had no
+        // `repo_type` filter at all, so a Remote member's cached rows were
+        // exposed alongside the local ones.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut merged = query_local_member_names(&state.db, &members).await?;
 
         let remote_results = proxy_helpers::collect_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             "names",
@@ -1202,6 +1226,7 @@ fn canonical_hex_versions(rows: &[(String, String, DateTime<Utc>)]) -> Vec<(Stri
 
 async fn list_versions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
@@ -1257,32 +1282,36 @@ async fn list_versions(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, content_type) = proxy_helpers::proxy_fetch_capped(
-                proxy,
-                repo.id,
-                &repo_key,
-                upstream_url,
-                "versions",
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await?;
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(
-                    CONTENT_TYPE,
-                    content_type.unwrap_or_else(|| "application/json".to_string()),
+            // Verbatim pass-through: re-declare the upstream
+            // `Content-Encoding` when present (RFC 9110 §8.4, #3260).
+            let (content, content_type, content_encoding) =
+                proxy_helpers::proxy_fetch_capped_encoded(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    "versions",
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
-                .body(Body::from(content))
-                .unwrap());
+                .await?;
+            return Ok(proxy_helpers::forward_verbatim_metadata(
+                content,
+                content_type,
+                "application/json",
+                content_encoding,
+            ));
         }
     }
     // Virtual: merge versions from all member repositories (local DB + remote proxy).
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323).
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut merged = query_local_member_versions(&state.db, &members).await?;
 
         let remote_results = proxy_helpers::collect_virtual_metadata(
             &state.db,
+            auth.as_ref(),
             state.proxy_service.as_deref(),
             repo.id,
             "versions",
@@ -3971,6 +4000,104 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "cached tarball must serve locally");
         assert_eq!(&body[..], b"cached-tarball-bytes");
 
+        fx.teardown().await;
+    }
+
+    /// #3260: the Remote arms of `/packages/{name}`, `/names` and `/versions`
+    /// and the Virtual arm of `/packages/{name}` forward upstream's signed
+    /// registry bytes VERBATIM (see the #2658 pass-through contract above),
+    /// so the upstream `Content-Encoding` must be re-declared (RFC 9110 §8.4)
+    /// and `Content-Length` must describe the coded bytes actually sent
+    /// (§8.6). Nothing on this path decodes (`http_client` disables every
+    /// codec and advertises `Accept-Encoding: identity`), so before the fix
+    /// `mix` received coded bytes labelled as plain.
+    ///
+    /// GZIP-coded upstream plus an uncoded control in the SAME fixture. The
+    /// coding deliberately differs from the goproxy / rubygems arms' deflate:
+    /// if every #3260 suite mounted one coding, pinning the production
+    /// builder to that literal would leave them all green — which is exactly
+    /// the hole `tdh::coded_fixture`'s doc comment was written about, and
+    /// exactly the hole this suite originally shipped with.
+    #[tokio::test]
+    async fn test_hex_registry_forwards_upstream_content_encoding_verbatim_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "hex").await else {
+            return;
+        };
+        let up = tdh::coded_and_plain_upstreams(
+            "gzip",
+            "application/octet-stream",
+            b"hex-registry-3260 ",
+        )
+        .await;
+
+        // fx repo = the coded Remote (Remote-arm probes); a second coded
+        // Remote wrapped by a Virtual (Virtual-arm probe); a plain Remote +
+        // Virtual pair as the uncoded control.
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.coded_mock.uri()).await;
+        let (coded_member_id, _cm_key, virt_coded_id, virt_coded_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "hex", &up.coded_mock.uri()).await;
+        let (plain_id, plain_key, virt_plain_id, virt_plain_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "hex", &up.plain_mock.uri()).await;
+
+        // Remote arms: all three registry resources.
+        for resource in ["packages/pkg3260", "names", "versions"] {
+            let uri = format!("/{}/{}", fx.repo_key, resource);
+            let (body, headers) =
+                tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+            up.assert_coded_forward(&headers, &body, &format!("remote {resource}"));
+        }
+
+        // Virtual arm: `/packages/{name}` pass 3 (`resolve_virtual_metadata`).
+        let uri = format!("/{}/packages/pkg3260", virt_coded_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        up.assert_coded_forward(&headers, &body, "virtual packages (cold, Pass 2)");
+
+        // Controls: uncoded upstream through the Remote and Virtual arms.
+        for (key, resource, what) in [
+            (&plain_key, "packages/pkg3260", "control remote packages"),
+            (&plain_key, "names", "control remote names"),
+            (
+                &virt_plain_key,
+                "packages/pkg3260",
+                "control virtual packages",
+            ),
+        ] {
+            let uri = format!("/{}/{}", key, resource);
+            let (body, headers) =
+                tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+            up.assert_plain_forward(&headers, &body, what);
+        }
+
+        for id in [virt_coded_id, coded_member_id, virt_plain_id, plain_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+    }
+
+    /// #3281: the Virtual arm of `package_info` (pass 3,
+    /// `resolve_virtual_metadata`) forwards the member's signed registry blob
+    /// verbatim and must serve the member's own `Content-Type` — the Remote
+    /// arm of the same endpoint already does — keeping the `application/json`
+    /// literal only for a member that declares none. Before the fix a `mix`
+    /// client got the member's protobuf labelled `application/json`.
+    #[tokio::test]
+    async fn test_hex_virtual_packages_forwards_member_content_type_3281_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "hex").await else {
+            return;
+        };
+        let rig = tdh::setup_ct_3281_rig(&fx, "hex", b"hex-registry-blob-3281").await;
+        rig.assert_member_ct_forwarded(
+            super::router(),
+            |key| format!("/{key}/packages/pkg3281"),
+            "application/json",
+            "hex virtual packages",
+        )
+        .await;
+        rig.cleanup(&fx.pool).await;
         fx.teardown().await;
     }
 }

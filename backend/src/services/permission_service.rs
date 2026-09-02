@@ -2012,4 +2012,124 @@ mod tests {
             tx.rollback().await.expect("rollback migration fixture");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // #3185: enforcement-vs-message drift guard.
+    //
+    // A stale startup warning claimed permission rules are "stored but not
+    // consulted during request authorization" (#794). That claim is false —
+    // enforcement landed across #817/#824/#826/#827/#819/#2603. This DB-backed
+    // test pins the actual behaviour the warning described so the two cannot
+    // drift apart again: a fine-grained `permissions` rule IS consulted, with
+    // deny-by-default for a principal the rule does not name. If enforcement is
+    // ever silently regressed (rules stored but not honoured — i.e. the warning
+    // becomes true again), this test goes red rather than a log line quietly
+    // becoming accurate. Requires a database: with none, it returns PASS early
+    // (~0.04s tell) exactly like the sibling DB tests.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn permission_rule_is_consulted_during_authorization() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = PermissionService::new(pool.clone());
+
+        // A private repository with a single fine-grained grant.
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (granted_user, _gu) = tdh::create_user(&pool).await; // holds the rule
+        let (other_user, _ou) = tdh::create_user(&pool).await; // no rule, no role
+
+        // Grant `granted_user` read+write on this repo via the `permissions`
+        // table (the exact CRUD surface #794 said was inert).
+        tdh::grant_repo_actions(&pool, repo_id, granted_user, &["read", "write"]).await;
+
+        // The rule is visible to the middleware's "should we enforce?" probe.
+        assert!(
+            service
+                .has_any_rules_for_target("repository", repo_id)
+                .await
+                .expect("rule-existence probe must reach the DB"),
+            "the just-inserted permissions rule must be observable"
+        );
+
+        // Collect every verdict BEFORE tearing down, then assert after. A
+        // failing assert must not skip cleanup: this suite runs
+        // process-per-test against a SHARED database, so leaked rows surface
+        // as unrelated failures elsewhere (the #3129 class).
+        let other_write = service
+            .check_repository_action(other_user, repo_id, "write", false)
+            .await
+            .expect("write check must reach the DB");
+        let other_read = service
+            .check_permission(other_user, "repository", repo_id, "read", false)
+            .await
+            .expect("read check must reach the DB");
+        let granted_write = service
+            .check_repository_action(granted_user, repo_id, "write", false)
+            .await
+            .expect("write check must reach the DB");
+        let granted_read = service
+            .check_permission(granted_user, "repository", repo_id, "read", false)
+            .await
+            .expect("read check must reach the DB");
+        let granted_delete = service
+            .check_repository_action(granted_user, repo_id, "delete", false)
+            .await
+            .expect("delete check must reach the DB");
+
+        // Scope teardown to this fixture's own rows only (#3129: no
+        // cluster-wide deletes on a shared database).
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id IN ($1, $2)")
+            .bind(granted_user)
+            .bind(other_user)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        // These two are CONTROLS, not the discriminating assertions — the
+        // comments here previously had it the other way round. `other_user`
+        // has no applicable rule, so it never takes the rule arm: it falls
+        // through to the role-assignment `ELSE` (see the `CASE` around
+        // permission_service.rs:216-224) and is denied for want of a role.
+        // Mutating the rule arm to `WHEN false` leaves BOTH of these green.
+        assert!(
+            !other_write,
+            "a principal with neither a rule nor a role must be denied write"
+        );
+        assert!(
+            !other_read,
+            "a principal with neither a rule nor a role must be denied read"
+        );
+
+        // THESE gate the claim. `granted_user` holds no role assignment, so
+        // the only way it can be allowed is if the `permissions` rule was
+        // actually consulted. Mutating the rule arm to `WHEN false` fails
+        // exactly here.
+        assert!(
+            granted_write,
+            "the granted principal must be allowed write — the rule IS consulted"
+        );
+        assert!(
+            granted_read,
+            "the granted principal must be allowed read — the rule IS consulted"
+        );
+
+        // The rule is AUTHORITATIVE for the principal it names, not merely
+        // additive: an action it does not carry is denied. Without this, a
+        // resolver returning "any applicable rule ⇒ allow" would satisfy
+        // everything above.
+        assert!(
+            !granted_delete,
+            "the granted principal holds read+write only; delete must be denied"
+        );
+    }
 }

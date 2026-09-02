@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(DISTINCT a.name)\n        FROM artifacts a\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%' ESCAPE '\\')\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f94a778e5491ec9491235ec0e5a225d6d75c29c5956d71ccf047ea787a23d407"
+}

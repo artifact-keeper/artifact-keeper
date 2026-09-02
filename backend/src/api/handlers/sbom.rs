@@ -20,14 +20,31 @@ use crate::models::sbom::{
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::sbom_service::{DependencyInfo, LicenseCheckResult, SbomService};
 
-/// Not-found message for artifact-scoped analysis endpoints (SBOM generate,
-/// CVE history). A bare "Artifact not found" was confusing for proxy-cached
-/// (Remote) objects: those are listed with a synthetic, SHA-256-derived id and
-/// have no row in the `artifacts` table (#1280/#1278), so SBOM/scan lookups by
-/// `artifacts.id` can never resolve them even though the object is visible in
-/// the listing. This message distinguishes that expected case from a genuine
-/// missing id and tells the caller what actually works. (#2227)
-pub(crate) const ARTIFACT_NOT_ANALYZABLE_MSG: &str = "Artifact not found or not eligible for analysis: SBOM generation and security scanning are available only for artifacts hosted in this registry, not proxy-cached remote artifacts.";
+/// Not-found messages for artifact-scoped endpoints. Proxy-cached (Remote)
+/// objects are listed with a synthetic, SHA-256-derived id and have no row in
+/// the `artifacts` table (#1278/#1280), so lookups by `artifacts.id` cannot
+/// resolve them even though the object is visible in the listing. (#2227)
+///
+/// One message per capability (#3344). The previous single constant claimed
+/// "SBOM generation and security scanning" were both hosted-only; the scanning
+/// half has been false since #2954, where proxy-cached artifacts began being
+/// scanned and blocked at download time under the repository's scan-on-proxy
+/// policy. Messages that describe a capability with a proxy equivalent must
+/// point the caller at it.
+pub(crate) const SBOM_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for SBOM generation: SBOM generation is available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository. Their verdicts and per-CVE detail are served by GET /api/v1/repositories/{key}/security/proxy-scans?path=<cache path>, their SBOM by GET /api/v1/repositories/{key}/security/proxy-sbom, and either can be regenerated with POST /api/v1/repositories/{key}/security/proxy-scans/rescan.";
+
+pub(crate) const ON_DEMAND_SCAN_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for on-demand scanning: on-demand scans are available only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository. Their verdicts and per-CVE detail are served by GET /api/v1/repositories/{key}/security/proxy-scans?path=<cache path>, their SBOM by GET /api/v1/repositories/{key}/security/proxy-sbom, and either can be regenerated with POST /api/v1/repositories/{key}/security/proxy-scans/rescan.";
+
+pub(crate) const SIGNING_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for signing: signing is available only for artifacts hosted in this registry, not proxy-cached remote artifacts.";
+
+/// CVE history is recorded only for artifacts scanned as part of a hosted
+/// upload or an on-demand scan; there is no `artifacts` row (and therefore no
+/// `scan_results`/`cve_status` history) for a proxy-cached object under its
+/// synthetic id (#1278/#1280). This is the message `ensure_artifact_repo_access`
+/// hands to the three CVE-history endpoints (list/get by artifact, update
+/// status by artifact+CVE) so a caller asking about CVE history is not told
+/// the SBOM-specific "not eligible for SBOM generation" (#3344 finding 2).
+pub(crate) const CVE_HISTORY_NOT_AVAILABLE_MSG: &str = "Artifact not found or not eligible for CVE history: CVE history is recorded only for artifacts hosted in this registry, not proxy-cached remote artifacts. Proxy-cached artifacts in PyPI, npm and Docker/OCI repositories can be scanned at download time when scan-on-proxy is enabled for the repository. Their verdicts and per-CVE detail are served by GET /api/v1/repositories/{key}/security/proxy-scans?path=<cache path>, their SBOM by GET /api/v1/repositories/{key}/security/proxy-sbom, and either can be regenerated with POST /api/v1/repositories/{key}/security/proxy-scans/rescan.";
 
 /// Emit an audit log entry for an SBOM action against an artifact. Failures
 /// are logged but never propagated: the mutation/read is already complete and
@@ -88,6 +105,149 @@ pub(crate) fn sbom_read_details(
         "format": format,
         "lookup": lookup,
     })
+}
+
+/// Returned when a cached path resolves but no package inventory was ever
+/// recorded for its digest.
+///
+/// This is the common case on any deployment that predates the inventory
+/// write path: only content pulled AFTER it shipped has an inventory. It must
+/// stay distinguishable from "an SBOM with zero components", which would read
+/// as "this artifact has no dependencies" -- a claim the data cannot support,
+/// and the same class of false-clean bug as the green all-clear shield.
+pub(crate) const PROXY_SBOM_NOT_RECORDED_MSG: &str =
+    "No SBOM recorded for this proxy-cached artifact. An inventory is captured \
+     when the artifact is scanned at download time, so this artifact will have \
+     one the next time it is pulled through a repository with scan-on-proxy \
+     enabled.";
+
+/// Returned when the cache path itself does not resolve for this repository.
+pub(crate) const PROXY_SBOM_PATH_NOT_FOUND_MSG: &str =
+    "No proxy-cached artifact at that path in this repository.";
+
+/// Query for [`get_proxy_sbom`].
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ProxySbomQuery {
+    /// Cache path within the calling repository.
+    ///
+    /// Path-keyed, never digest-keyed: verdicts and inventories are stored by
+    /// content digest and are therefore global, so accepting a digest would
+    /// turn this into a cross-tenant lookup oracle. A path is inherently
+    /// scoped to the repository that cached it.
+    pub path: String,
+    /// `cyclonedx` (default) or `spdx`.
+    pub format: Option<String>,
+}
+
+/// Generate an SBOM for a proxy-cached artifact, on demand.
+///
+/// Proxy-cached content has no `artifacts` row (#1278/#1280), so it cannot be
+/// served by the artifact-keyed SBOM handlers and nothing is persisted in
+/// `sbom_documents`. The document is regenerated per request from the package
+/// inventory the inline proxy scan recorded, which is why this endpoint has no
+/// SBOM id, no listing, and no delete.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repositories/{key}/security/proxy-sbom",
+    params(ProxySbomQuery, ("key" = String, Path, description = "Repository key")),
+    responses(
+        (status = 200, description = "SBOM document for the cached artifact"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Path unknown, or no inventory recorded"),
+    ),
+    tag = "sbom"
+)]
+async fn get_proxy_sbom(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<ProxySbomQuery>,
+) -> Result<Json<serde_json::Value>> {
+    // Authentication FIRST, unconditionally. `require_visible` returns Ok early
+    // for a public repository, so checking visibility first would make this
+    // anonymously readable on exactly the repositories with the widest
+    // audience.
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    let repo_service =
+        crate::services::repository_service::RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    crate::api::handlers::repositories::require_visible(&repo, &Some(auth), &repo_service).await?;
+
+    let format = parse_proxy_sbom_format(query.format.as_deref())?;
+
+    // Resolve the path to a digest, scoped to THIS repository. Rows whose
+    // checksum is still NULL are placeholders written before the content
+    // committed; they resolve to no inventory, not to an empty one.
+    let digest: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT checksum_sha256
+        FROM proxy_cache_artifacts
+        WHERE repository_id = $1 AND path = $2 AND checksum_sha256 IS NOT NULL
+        "#,
+    )
+    .bind(repo.id)
+    .bind(&query.path)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let digest =
+        digest.ok_or_else(|| AppError::NotFound(PROXY_SBOM_PATH_NOT_FOUND_MSG.to_string()))?;
+
+    let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    let packages = pss
+        .fetch_packages(
+            &digest,
+            crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+        )
+        .await?;
+
+    // An empty inventory is NOT an empty SBOM. Returning a zero-component
+    // document here would assert that the artifact has no components, which is
+    // exactly the false-clean failure this feature exists to remove.
+    if packages.is_empty() {
+        return Err(AppError::NotFound(PROXY_SBOM_NOT_RECORDED_MSG.to_string()));
+    }
+
+    let dependencies: Vec<DependencyInfo> = packages
+        .into_iter()
+        .map(|p| DependencyInfo {
+            name: p.name,
+            version: p.version,
+            purl: p.purl,
+            license: p.license,
+            sha256: None,
+        })
+        .collect();
+
+    let document =
+        SbomService::new(state.db.clone()).generate_ephemeral(format, &dependencies, None)?;
+
+    Ok(Json(document))
+}
+
+/// Parse the requested SBOM format, rejecting anything unrecognized.
+///
+/// Deliberately not a silent fallback: a typo'd `format=cyclonedex` that
+/// quietly returned SPDX would be indistinguishable from the caller's intent.
+fn parse_proxy_sbom_format(raw: Option<&str>) -> Result<SbomFormat> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(SbomFormat::CycloneDX),
+        Some(s) if s.eq_ignore_ascii_case("cyclonedx") => Ok(SbomFormat::CycloneDX),
+        Some(s) if s.eq_ignore_ascii_case("spdx") => Ok(SbomFormat::SPDX),
+        Some(other) => Err(AppError::Validation(format!(
+            "Unsupported SBOM format '{other}'. Supported formats: cyclonedx, spdx."
+        ))),
+    }
+}
+
+/// Repository-scoped proxy SBOM route, merged into the `/repositories` nest.
+///
+/// Registered here rather than in `security.rs` so the proxy SBOM read path
+/// lives beside the other SBOM handlers it shares generation logic with.
+pub fn proxy_repo_router() -> Router<SharedState> {
+    Router::new().route("/:key/security/proxy-sbom", get(get_proxy_sbom))
 }
 
 /// Create SBOM routes.
@@ -370,7 +530,7 @@ async fn generate_sbom(
             .fetch_optional(&state.db)
             .await
             .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
-            .ok_or_else(|| AppError::NotFound(ARTIFACT_NOT_ANALYZABLE_MSG.into()))?;
+            .ok_or_else(|| AppError::NotFound(SBOM_NOT_AVAILABLE_MSG.into()))?;
 
     // If force_regenerate, delete existing SBOM first
     if body.force_regenerate {
@@ -435,7 +595,7 @@ async fn list_sboms(
     // also enforces access (callers cannot list a repo's SBOMs without
     // having access to that repo).
     if let Some(artifact_id) = query.artifact_id {
-        ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+        ensure_artifact_repo_access(&state.db, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
     }
     // #3174: this branch used to gate on `auth.can_access_repo(repo_id)` alone.
     // That is the caller's TOKEN SCOPE, not repository visibility: it resolves
@@ -586,7 +746,7 @@ async fn get_sbom_by_artifact(
     Path(artifact_id): Path<Uuid>,
     Query(query): Query<ListSbomsQuery>,
 ) -> Result<Json<SbomContentResponse>> {
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
     let service = SbomService::new(state.db.clone());
     let format = query
         .format
@@ -918,7 +1078,13 @@ async fn get_cve_history(
 
     match classify_cve_history_path(&id) {
         CveHistoryPath::Artifact(artifact_id) => {
-            ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+            ensure_artifact_repo_access(
+                &state.db,
+                &auth,
+                artifact_id,
+                CVE_HISTORY_NOT_AVAILABLE_MSG,
+            )
+            .await?;
             let entries = service.get_cve_history(artifact_id).await?;
             Ok(Json(entries))
         }
@@ -959,7 +1125,8 @@ async fn get_cve_history_by_artifact(
     Path(artifact_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
     let service = SbomService::new(state.db.clone());
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG)
+        .await?;
     let entries = service.get_cve_history(artifact_id).await?;
     Ok(Json(entries))
 }
@@ -1139,7 +1306,8 @@ async fn update_cve_status_by_artifact_cve(
     if !is_valid_vuln_id(&cve_id) {
         return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
     }
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG)
+        .await?;
     let service = SbomService::new(state.db.clone());
     let status = CveStatus::parse(&body.status)
         .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
@@ -1692,7 +1860,17 @@ async fn require_repo_visibility(
     if !is_public && !auth.is_admin {
         let repo_service = crate::services::repository_service::RepositoryService::new(db.clone());
         if !repo_service
-            .user_can_access_repo(repo_id, auth.user_id)
+            .user_can_access_repo(
+                repo_id,
+                auth.user_id,
+                // CONTENT (#3331): a private repository's dependency inventory
+                // and CVE history. Every non-admin-reachable caller of this
+                // helper is a GET; the one POST
+                // (`update_cve_status_by_artifact_cve`) is gated on global admin
+                // by `enforce_admin_audited` before it gets here, and admins
+                // short-circuit above, so `read` narrows no mutation.
+                crate::services::repository_service::RepoAccess::READ,
+            )
             .await?
         {
             return Err(AppError::NotFound(missing_msg.into()));
@@ -1723,10 +1901,21 @@ async fn ensure_repo_visibility(
 
 /// Resolve `artifact_id → (repository_id, is_public)` and apply
 /// [`require_repo_visibility`].
+///
+/// `missing_msg` is caller-supplied rather than hardcoded because this helper
+/// guards endpoints with two different capability contracts: the SBOM read
+/// endpoints (`list_sboms`, `get_sbom_by_artifact`) should 404 with
+/// [`SBOM_NOT_AVAILABLE_MSG`], while the CVE-history endpoints
+/// (`get_cve_history`, `get_cve_history_by_artifact`,
+/// `update_cve_status_by_artifact_cve`) should 404 with
+/// [`CVE_HISTORY_NOT_AVAILABLE_MSG`] — telling a CVE-history caller they're
+/// "not eligible for SBOM generation" names the wrong capability (#3344
+/// finding 2).
 async fn ensure_artifact_repo_access(
     db: &sqlx::PgPool,
     auth: &AuthExtension,
     artifact_id: Uuid,
+    missing_msg: &'static str,
 ) -> Result<()> {
     let repo: Option<(Uuid, bool)> = sqlx::query_as(
         "SELECT r.id, r.is_public FROM artifacts a \
@@ -1738,7 +1927,7 @@ async fn ensure_artifact_repo_access(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    require_repo_visibility(db, auth, repo, ARTIFACT_NOT_ANALYZABLE_MSG).await
+    require_repo_visibility(db, auth, repo, missing_msg).await
 }
 
 /// Like [`ensure_artifact_repo_access`] but resolves through `sbom_documents`
@@ -1803,6 +1992,120 @@ pub struct SbomApiDoc;
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    // -----------------------------------------------------------------------
+    // Proxy SBOM (#3344 follow-up)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn proxy_sbom_format_defaults_to_cyclonedx() {
+        assert!(matches!(
+            parse_proxy_sbom_format(None),
+            Ok(SbomFormat::CycloneDX)
+        ));
+        // An explicitly empty or whitespace-only value is the same as absent:
+        // `?format=` is what a client sends when it has no preference.
+        assert!(matches!(
+            parse_proxy_sbom_format(Some("")),
+            Ok(SbomFormat::CycloneDX)
+        ));
+        assert!(matches!(
+            parse_proxy_sbom_format(Some("   ")),
+            Ok(SbomFormat::CycloneDX)
+        ));
+    }
+
+    #[test]
+    fn proxy_sbom_format_accepts_both_formats_case_insensitively() {
+        for raw in ["cyclonedx", "CycloneDX", "CYCLONEDX", " cyclonedx "] {
+            assert!(
+                matches!(
+                    parse_proxy_sbom_format(Some(raw)),
+                    Ok(SbomFormat::CycloneDX)
+                ),
+                "{raw} should parse as CycloneDX"
+            );
+        }
+        for raw in ["spdx", "SPDX", " Spdx "] {
+            assert!(
+                matches!(parse_proxy_sbom_format(Some(raw)), Ok(SbomFormat::SPDX)),
+                "{raw} should parse as SPDX"
+            );
+        }
+    }
+
+    /// A typo must be rejected, not silently served as the default. Falling
+    /// back would make `format=cyclonedex` indistinguishable from the caller
+    /// getting what they asked for.
+    #[test]
+    fn proxy_sbom_format_rejects_unknown_rather_than_falling_back() {
+        for raw in ["cyclonedex", "spdx2", "json", "xml"] {
+            let err = parse_proxy_sbom_format(Some(raw));
+            assert!(err.is_err(), "{raw} must be rejected");
+        }
+    }
+
+    /// The empty-inventory message must never read as a clean or empty SBOM.
+    /// A zero-component document would assert "this artifact has no
+    /// dependencies", which is the same false-clean failure as the green
+    /// all-clear shield this work exists to remove.
+    #[test]
+    fn proxy_sbom_absent_message_does_not_imply_an_empty_sbom() {
+        let msg = PROXY_SBOM_NOT_RECORDED_MSG;
+        assert!(
+            msg.contains("No SBOM recorded"),
+            "must state that no SBOM exists, not that the SBOM is empty"
+        );
+        // It must tell the operator how to get one, or the feature reports a
+        // problem and offers no remedy.
+        assert!(
+            msg.contains("next time it is pulled"),
+            "must name the remedy: pulling the artifact again records an inventory"
+        );
+        for forbidden in ["no components", "no dependencies", "clean", "empty"] {
+            assert!(
+                !msg.to_ascii_lowercase().contains(forbidden),
+                "message must not imply the artifact has nothing in it: {forbidden}"
+            );
+        }
+    }
+
+    /// The path lookup must be repository-scoped and must exclude placeholder
+    /// rows whose checksum has not been backfilled. `record_proxy_download`
+    /// upserts those before content commits, and they can persist
+    /// indefinitely, so they must resolve to "no inventory" rather than
+    /// joining to nothing and rendering as an empty document.
+    #[test]
+    fn proxy_sbom_path_lookup_is_repo_scoped_and_skips_placeholders() {
+        let source = include_str!("sbom.rs");
+        let marker = "async fn get_proxy_sbom(";
+        let start = source.find(marker).expect("handler not found");
+        let rest = &source[start + marker.len()..];
+        // Bound at a top-level closing brace: later declarations inside
+        // `mod tests` are indented, so slicing to the next `async fn` would
+        // run to EOF and pick up this test's own assertions.
+        let body = &rest[..rest.find("\n}\n").unwrap_or(rest.len())];
+
+        assert!(
+            body.contains("repository_id = $1"),
+            "path resolution must be scoped to the calling repository"
+        );
+        assert!(
+            body.contains("checksum_sha256 IS NOT NULL"),
+            "placeholder rows with a NULL checksum must not resolve"
+        );
+        let auth_at = body
+            .find("auth.ok_or_else(")
+            .expect("must reject an unauthenticated caller");
+        let visible_at = body
+            .find("require_visible(")
+            .expect("must call require_visible");
+        assert!(
+            auth_at < visible_at,
+            "authentication must be enforced BEFORE require_visible, which \
+             returns early for public repositories"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Default functions
@@ -2487,25 +2790,196 @@ mod tests {
     }
 
     #[test]
-    fn test_artifact_analysis_missing_uses_honest_not_analyzable_message() {
-        // #2227: the artifact-scoped analysis endpoints (SBOM generate, CVE
-        // history) no longer return a bare "Artifact not found". When the id
-        // has no `artifacts` row -- e.g. the synthetic id a Remote repo lists
-        // for a proxy-cached object -- the caller must learn that analysis is
-        // only available for hosted artifacts. Pin the exact wording that
-        // `ensure_artifact_repo_access` (and `generate_sbom`) surface.
-        let auth = make_auth(None, false);
-        let err = require_repo_access(&auth, None, ARTIFACT_NOT_ANALYZABLE_MSG).unwrap_err();
-        match err {
-            AppError::NotFound(msg) => {
-                assert_eq!(msg, ARTIFACT_NOT_ANALYZABLE_MSG);
-                assert!(msg.contains("hosted in this registry"));
-                assert!(msg.contains("proxy-cached remote artifacts"));
-                assert_ne!(msg, "Artifact not found");
-            }
-            other => panic!("expected NotFound with the honest message, got {:?}", other),
+    fn test_capability_messages_do_not_claim_scanning_is_unavailable() {
+        // #3344: the single shared message claimed "SBOM generation and
+        // security scanning are available only for artifacts hosted in this
+        // registry". The scanning half has been false since #2954: proxy-cached
+        // artifacts are scanned at download time when scan-on-proxy is enabled.
+        // Each endpoint now states only its own limitation.
+        for msg in [
+            SBOM_NOT_AVAILABLE_MSG,
+            ON_DEMAND_SCAN_NOT_AVAILABLE_MSG,
+            SIGNING_NOT_AVAILABLE_MSG,
+            CVE_HISTORY_NOT_AVAILABLE_MSG,
+        ] {
+            assert!(
+                !msg.contains("SBOM generation and security scanning"),
+                "message still makes the blanket claim: {msg}"
+            );
+            assert_ne!(msg, "Artifact not found");
+            assert!(
+                msg.contains("proxy-cached remote artifacts") || msg.contains("proxy-cached"),
+                "message should still name the proxy-cached case: {msg}"
+            );
         }
+
+        // The three messages for capabilities that DO have a proxy equivalent
+        // must point the caller at it rather than dead-ending.
+        assert!(SBOM_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+        assert!(ON_DEMAND_SCAN_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+        assert!(CVE_HISTORY_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+
+        // Signing has no proxy equivalent, so it must not imply one.
+        assert!(!SIGNING_NOT_AVAILABLE_MSG.contains("scan-on-proxy"));
+
+        // #3344 point 2: the message's value is that it explains the expected
+        // case rather than saying "not found", so it must name the endpoint
+        // that DOES answer the question — not merely assert that an answer
+        // exists somewhere. Each route named here is mounted in
+        // `security::repo_security_router` / `sbom::proxy_repo_router`; the
+        // route-registration tests in those modules are what keep these
+        // strings from naming a 404.
+        for (msg, route) in [
+            (SBOM_NOT_AVAILABLE_MSG, "/security/proxy-sbom"),
+            (
+                ON_DEMAND_SCAN_NOT_AVAILABLE_MSG,
+                "/security/proxy-scans/rescan",
+            ),
+            (CVE_HISTORY_NOT_AVAILABLE_MSG, "/security/proxy-scans?path="),
+        ] {
+            assert!(
+                msg.contains(route),
+                "message must point the caller at {route}: {msg}"
+            );
+        }
+        // Signing still dead-ends deliberately: there is no proxy signing
+        // endpoint to point at, and inventing a pointer would be the same
+        // class of stale claim #3344 was filed about.
+        assert!(!SIGNING_NOT_AVAILABLE_MSG.contains("/security/proxy-"));
+
+        // #3344 finding 1: proxy scan-at-download-time is wired only for
+        // PyPI, npm and Docker/OCI. A message that talks about download-time
+        // scanning must name exactly those formats rather than implying it
+        // works for every proxy repo (e.g. Maven, Go, NuGet, RubyGems, none
+        // of which wire scan_on_proxy to anything).
+        for msg in [
+            SBOM_NOT_AVAILABLE_MSG,
+            ON_DEMAND_SCAN_NOT_AVAILABLE_MSG,
+            CVE_HISTORY_NOT_AVAILABLE_MSG,
+        ] {
+            assert!(
+                msg.contains("PyPI, npm and Docker/OCI"),
+                "message describes download-time scanning but does not name \
+                 the only formats it's wired for: {msg}"
+            );
+            assert!(
+                !msg.contains("still"),
+                "message should not claim scanning still/always happens \
+                 for proxy-cached artifacts (overclaims for unsupported \
+                 formats and over-cap artifacts): {msg}"
+            );
+        }
+
+        // Signing has no download-time-scanning claim at all, so it must not
+        // name the format list either.
+        assert!(!SIGNING_NOT_AVAILABLE_MSG.contains("PyPI, npm and Docker/OCI"));
     }
+
+    /// #3344 finding 3: nothing pinned which `*_NOT_AVAILABLE_MSG` constant
+    /// each handler actually passes. `cargo test --lib` (no DB) exercised
+    /// the constants' *content* but never their *wiring* — the eight
+    /// production call sites below could have their constants permuted
+    /// arbitrarily (e.g. `get_cve_history` handed the SBOM message, or
+    /// `sign_artifact` handed the CVE-history message) and every existing
+    /// test would still pass, because the DB-backed tests only assert on
+    /// `AppError::NotFound(_)` variant, never on the message text.
+    ///
+    /// Source-grep because these handlers need a full DB-backed
+    /// `SharedState` to invoke; follows the `body_of` pattern from
+    /// `security.rs`'s `test_repo_security_handlers_enforce_tenant_gate`.
+    #[test]
+    fn test_endpoint_to_not_available_message_wiring_is_pinned() {
+        fn body_of<'a>(source: &'a str, handler: &str) -> &'a str {
+            let marker = format!("async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+            &rest[..end]
+        }
+
+        let sbom_src = include_str!("sbom.rs");
+        // SBOM read/write endpoints: eligible only for hosted artifacts,
+        // with a proxy scan-on-proxy pointer.
+        for handler in ["generate_sbom", "list_sboms", "get_sbom_by_artifact"] {
+            let body = body_of(sbom_src, handler);
+            assert!(
+                body.contains("SBOM_NOT_AVAILABLE_MSG"),
+                "{handler} must use SBOM_NOT_AVAILABLE_MSG for its not-found/\
+                 not-eligible response"
+            );
+            assert!(
+                !body.contains("CVE_HISTORY_NOT_AVAILABLE_MSG")
+                    && !body.contains("ON_DEMAND_SCAN_NOT_AVAILABLE_MSG")
+                    && !body.contains("SIGNING_NOT_AVAILABLE_MSG"),
+                "{handler} must not also reference a different capability's \
+                 not-available constant"
+            );
+        }
+
+        // CVE-history endpoints: must NOT get the SBOM-specific message
+        // (#3344 finding 2 — this is the exact defect this PR fixes).
+        for handler in [
+            "get_cve_history",
+            "get_cve_history_by_artifact",
+            "update_cve_status_by_artifact_cve",
+        ] {
+            let body = body_of(sbom_src, handler);
+            assert!(
+                body.contains("CVE_HISTORY_NOT_AVAILABLE_MSG"),
+                "{handler} must use CVE_HISTORY_NOT_AVAILABLE_MSG, not the \
+                 SBOM-specific message, for its not-found/not-eligible response"
+            );
+            assert!(
+                !body.contains("SBOM_NOT_AVAILABLE_MSG"),
+                "{handler} must not tell a CVE-history caller they're \
+                 \"not eligible for SBOM generation\" (#3344 finding 2)"
+            );
+        }
+
+        // On-demand scan trigger (security.rs) and signing (signing.rs) live
+        // in different files; each must use its own capability's constant.
+        let security_src = include_str!("security.rs");
+        let trigger_scan_body = body_of(security_src, "trigger_scan");
+        assert!(
+            trigger_scan_body.contains("ON_DEMAND_SCAN_NOT_AVAILABLE_MSG"),
+            "trigger_scan must use ON_DEMAND_SCAN_NOT_AVAILABLE_MSG"
+        );
+        assert!(
+            !trigger_scan_body.contains("SBOM_NOT_AVAILABLE_MSG")
+                && !trigger_scan_body.contains("CVE_HISTORY_NOT_AVAILABLE_MSG")
+                && !trigger_scan_body.contains("SIGNING_NOT_AVAILABLE_MSG"),
+            "trigger_scan must not also reference a different capability's \
+             not-available constant"
+        );
+
+        let signing_src = include_str!("signing.rs");
+        let sign_artifact_body = body_of(signing_src, "sign_artifact");
+        assert!(
+            sign_artifact_body.contains("SIGNING_NOT_AVAILABLE_MSG"),
+            "sign_artifact must use SIGNING_NOT_AVAILABLE_MSG"
+        );
+        assert!(
+            !sign_artifact_body.contains("SBOM_NOT_AVAILABLE_MSG")
+                && !sign_artifact_body.contains("CVE_HISTORY_NOT_AVAILABLE_MSG")
+                && !sign_artifact_body.contains("ON_DEMAND_SCAN_NOT_AVAILABLE_MSG"),
+            "sign_artifact must not also reference a different capability's \
+             not-available constant"
+        );
+    }
+
+    // A test named `test_sbom_visibility_denial_uses_the_sbom_message` used to
+    // live here. It passed `SBOM_NOT_AVAILABLE_MSG` into `require_repo_access`
+    // and asserted the same constant came back out — tautological, since
+    // `require_repo_access` returns whatever `missing_msg` it is given
+    // (any string would have passed). That propagation behavior is already
+    // covered generically, with two different messages, by
+    // `test_require_repo_access_missing_msg_propagates` below. The actual
+    // question the deleted test's name implied — *which* constant each
+    // handler passes in — is what the source-scanning test
+    // `test_endpoint_to_not_available_message_wiring_is_pinned` now pins.
+    // Deleted rather than renamed (#3344 finding 4).
 
     #[test]
     fn test_require_repo_access_unrestricted_jwt_passes() {
@@ -3549,7 +4023,13 @@ mod tests {
         // Unrestricted JWT (allowed_repo_ids = Admin scope) — passes the old
         // token-scope-only gate but must now fail on private-repo membership.
         let auth = tdh::make_auth(outsider, &outname);
-        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        let res = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
         tdh::cleanup_user(&fx.pool, outsider).await;
         fx.teardown().await;
         assert!(
@@ -3567,7 +4047,13 @@ mod tests {
         };
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         let auth = tdh::make_auth(fx.user_id, &fx.username);
-        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        let res = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
         fx.teardown().await;
         assert!(res.is_ok(), "member must pass: {:?}", res.err());
     }
@@ -3581,7 +4067,13 @@ mod tests {
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         let (admin_id, admin_name) = tdh::create_user(&fx.pool).await;
         let auth = tdh::admin_auth(admin_id, &admin_name);
-        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        let res = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
         tdh::cleanup_user(&fx.pool, admin_id).await;
         fx.teardown().await;
         assert!(res.is_ok(), "admin bypass must pass: {:?}", res.err());
@@ -3597,7 +4089,13 @@ mod tests {
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         let (outsider, outname) = tdh::create_user(&fx.pool).await;
         let auth = tdh::make_auth(outsider, &outname);
-        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        let res = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
         tdh::cleanup_user(&fx.pool, outsider).await;
         fx.teardown().await;
         assert!(

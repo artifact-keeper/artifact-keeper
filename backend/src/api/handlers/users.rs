@@ -604,6 +604,45 @@ pub async fn update_user(
     Ok(Json(user_to_response(user)))
 }
 
+/// Postgres SQLSTATE for `foreign_key_violation`.
+const SQLSTATE_FOREIGN_KEY_VIOLATION: &str = "23503";
+
+/// Whether a database error code is a foreign-key violation.
+pub(crate) fn is_foreign_key_violation(sqlstate: Option<&str>) -> bool {
+    sqlstate == Some(SQLSTATE_FOREIGN_KEY_VIOLATION)
+}
+
+/// Operator-actionable message for a user DELETE refused by a referencing row.
+///
+/// Migration 200 gives every `REFERENCES users(id)` an explicit ON DELETE
+/// action, so this should no longer fire; it exists so that a *future* table
+/// added with a bare `REFERENCES users(id)` reports which relationship blocked
+/// the delete instead of the opaque "db operation failed" from #2878.
+pub(crate) fn user_delete_blocked_message(table: Option<&str>, constraint: Option<&str>) -> String {
+    let what = match (table, constraint) {
+        (Some(table), _) => format!("rows in '{table}'"),
+        (None, Some(constraint)) => format!("the '{constraint}' relationship"),
+        (None, None) => "rows in another table".to_string(),
+    };
+    format!(
+        "Cannot delete this user: {what} still reference it and the relationship \
+         has no ON DELETE action. Reassign or remove those rows first."
+    )
+}
+
+/// Map the `DELETE FROM users` failure onto a status the caller can act on.
+fn map_user_delete_error(e: sqlx::Error) -> AppError {
+    if let Some(db_err) = e.as_database_error() {
+        if is_foreign_key_violation(db_err.code().as_deref()) {
+            return AppError::Conflict(user_delete_blocked_message(
+                db_err.table(),
+                db_err.constraint(),
+            ));
+        }
+    }
+    AppError::Database(e.to_string())
+}
+
 /// Delete user
 #[utoipa::path(
     delete,
@@ -654,7 +693,7 @@ pub async fn delete_user(
     let result = sqlx::query!("DELETE FROM users WHERE id = $1", id)
         .execute(&state.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(map_user_delete_error)?;
 
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("User not found".to_string()));
@@ -690,7 +729,18 @@ pub struct RoleListResponse {
     pub items: Vec<RoleResponse>,
 }
 
-/// Get user roles
+/// Get user roles.
+///
+/// Lists the `user_roles` rows [`assign_role`] writes, together with each
+/// role's `permissions` array. Those capabilities describe the ROLE, not this
+/// user's effective access: `user_roles` is identity/SSO-mapping metadata and
+/// is read by no authorization gate (#3387 / #3522 — see [`assign_role`] for
+/// the full split between the two role stores). A user can appear here with
+/// `developer` / `["read","write"]` and still have access to no repository.
+///
+/// Effective repository access is the union of `role_assignments` and the
+/// fine-grained `permissions` table; `GET /api/v1/permissions` lists the
+/// latter.
 #[utoipa::path(
     get,
     path = "/{id}/roles",
@@ -700,7 +750,11 @@ pub struct RoleListResponse {
         ("id" = Uuid, Path, description = "User ID"),
     ),
     responses(
-        (status = 200, description = "List of user roles", body = RoleListResponse),
+        (status = 200, description = "List of user roles. The `permissions` \
+         array describes the ROLE's capabilities, not this user's effective \
+         repository access: roles listed here are identity/SSO-mapping \
+         metadata and grant no repository access on their own (#3387 / #3522).",
+         body = RoleListResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -743,7 +797,31 @@ pub struct AssignRoleRequest {
     pub role_id: Uuid,
 }
 
-/// Assign role to user
+/// Assign role to user.
+///
+/// **This does not by itself grant access to any repository (#3387 / #3522).**
+///
+/// There are two role stores and they are not interchangeable. This endpoint
+/// writes `user_roles`, which is identity metadata: it is listed back by
+/// `GET /api/v1/users/{id}/roles`, it is what SSO role mapping rebuilds on
+/// every federated login (`AuthService::apply_role_mapping`), and it is read by
+/// no authorization gate. Repository authorization resolves
+/// `role_assignments` (creator auto-grant, `repository-owner`, the rows
+/// migration 172 wrote) and the fine-grained `permissions` table — never this
+/// one.
+///
+/// To give a principal access to repositories, write a fine-grained grant with
+/// `POST /api/v1/permissions`. That endpoint takes `user`, `service_account`
+/// and `group` principals against `repository` or `project` targets, and IS
+/// resolved by every gate (`check_repository_action`, `query_actions`,
+/// `permissions_grant_exists_for`).
+///
+/// Wiring `user_roles` into the gates is deliberately NOT done here: the table
+/// carries no repository scope, so every row is global, and the built-in
+/// `developer` role carries `read` + `write` — making it live would retroactively
+/// hand every existing row write access to every repository in the instance,
+/// and would turn an IdP role claim into a global write grant. That decision is
+/// tracked in #3522 rather than taken as a side effect of a bug fix.
 #[utoipa::path(
     post,
     path = "/{id}/roles",
@@ -754,7 +832,10 @@ pub struct AssignRoleRequest {
     ),
     request_body = AssignRoleRequest,
     responses(
-        (status = 200, description = "Role assigned successfully"),
+        (status = 200, description = "Role assigned successfully. NOTE: roles \
+         assigned here are identity/SSO-mapping metadata and do NOT by \
+         themselves grant access to any repository — use POST \
+         /api/v1/permissions for that (#3387 / #3522)."),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1755,6 +1836,190 @@ pub struct UsersApiDoc;
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    // -----------------------------------------------------------------------
+    // #2878: deleting a user must not be blocked by an ON DELETE-less FK
+    //
+    // `REFERENCES users(id)` with no ON DELETE clause defaults to NO ACTION
+    // (RESTRICT semantics), so any user who had created a migration job or a
+    // signing key could never be deleted -- the DELETE aborted with a
+    // foreign-key violation surfaced as "db operation failed". Migration 200
+    // gives every such column an explicit disposition; these tests keep the
+    // remediation list honest and make the residual failure legible.
+    // -----------------------------------------------------------------------
+
+    fn migrations_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")
+    }
+
+    fn read_migrations() -> Vec<(String, String)> {
+        let mut files: Vec<_> = std::fs::read_dir(migrations_dir())
+            .expect("backend/migrations must be readable")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension()?.to_str()? != "sql" {
+                    return None;
+                }
+                let name = path.file_name()?.to_str()?.to_string();
+                Some((name, std::fs::read_to_string(&path).ok()?))
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    /// `(table, column)` for every inline column definition declared as
+    /// `<col> UUID [NOT NULL] REFERENCES users(id)` with no ON DELETE action.
+    fn bare_users_fk_columns(sql: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut current_table: Option<String> = None;
+        for raw in sql.lines() {
+            let line = raw.trim();
+            if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
+                let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+                let name = rest
+                    .split(|c: char| c.is_whitespace() || c == '(')
+                    .next()
+                    .unwrap_or("");
+                if !name.is_empty() {
+                    current_table = Some(name.to_string());
+                }
+            }
+            if !line.contains("REFERENCES users(id)") || line.contains("ON DELETE") {
+                continue;
+            }
+            let mut tokens = line.split_whitespace();
+            let (Some(column), Some(ty)) = (tokens.next(), tokens.next()) else {
+                continue;
+            };
+            // Only inline column definitions -- skips the multi-line
+            // `ALTER TABLE ... ADD CONSTRAINT` shape used by remediations.
+            if !ty.eq_ignore_ascii_case("UUID") {
+                continue;
+            }
+            if let Some(table) = current_table.as_ref() {
+                found.push((table.clone(), column.to_string()));
+            }
+        }
+        found
+    }
+
+    /// Filename of the migration that carries the #2878 remediation. Matched
+    /// by NAME rather than by number: migration numbers get reassigned when two
+    /// in-flight PRs collide on one (as #3401 and this change did on 198), and a
+    /// number-based lookup would then silently bind to an unrelated migration
+    /// and pass vacuously.
+    const REMEDIATION_MIGRATION: &str = "_users_fk_on_delete_actions.sql";
+
+    /// `(table, column)` pairs the remediation migration gives an explicit
+    /// ON DELETE action, parsed from its VALUES list.
+    fn remediated_pairs(sql: &str) -> Vec<(String, String)> {
+        sql.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line.strip_prefix("('")?;
+                let (table, rest) = rest.split_once("',")?;
+                let rest = rest.trim_start().strip_prefix('\'')?;
+                let (column, _) = rest.split_once('\'')?;
+                Some((table.to_string(), column.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_users_foreign_key_has_an_explicit_on_delete_action() {
+        let migrations = read_migrations();
+        let remediation = migrations
+            .iter()
+            .find(|(name, _)| name.ends_with(REMEDIATION_MIGRATION))
+            .map(|(_, sql)| remediated_pairs(sql))
+            .expect("the users-FK ON DELETE remediation migration must exist");
+
+        // Remediated before #2878 by 083_download_tickets_cascade.sql.
+        let mut covered = remediation.clone();
+        covered.push(("download_tickets".to_string(), "user_id".to_string()));
+
+        let mut offenders: Vec<(String, String, String)> = Vec::new();
+        for (name, sql) in &migrations {
+            for (table, column) in bare_users_fk_columns(sql) {
+                if !covered.contains(&(table.clone(), column.clone())) {
+                    offenders.push((name.clone(), table, column));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these columns REFERENCE users(id) with no ON DELETE action and are \
+             not remediated by migration 200; a user owning any such row cannot \
+             be deleted (#2878): {offenders:?}"
+        );
+
+        // Guard against the scan going vacuously green: the columns from the
+        // original report must still be discovered as bare declarations AND be
+        // present in the remediation list.
+        for pair in [
+            ("migration_jobs", "created_by"),
+            ("signing_keys", "created_by"),
+        ] {
+            let pair = (pair.0.to_string(), pair.1.to_string());
+            assert!(
+                migrations
+                    .iter()
+                    .any(|(_, sql)| bare_users_fk_columns(sql).contains(&pair)),
+                "{pair:?} should still be declared inline without ON DELETE; \
+                 update this test if the original CREATE TABLE changed"
+            );
+            assert!(
+                remediation.contains(&pair),
+                "{pair:?} must be remediated by migration 200 (#2878)"
+            );
+        }
+    }
+
+    #[test]
+    fn remediation_list_gives_every_column_a_deliberate_disposition() {
+        let migrations = read_migrations();
+        let (_, sql) = migrations
+            .iter()
+            .find(|(name, _)| name.ends_with(REMEDIATION_MIGRATION))
+            .expect("the users-FK ON DELETE remediation migration must exist");
+        // Provenance columns keep their row and lose the pointer; NOT NULL
+        // transient upload-session rows cascade. Nothing else is allowed.
+        assert!(sql.contains("'SET NULL'"), "SET NULL disposition missing");
+        assert!(sql.contains("'CASCADE'"), "CASCADE disposition missing");
+        assert!(
+            !sql.contains("'RESTRICT'") && !sql.contains("'NO ACTION'"),
+            "re-declaring a users FK as RESTRICT/NO ACTION reintroduces #2878"
+        );
+        for (table, column) in remediated_pairs(sql) {
+            assert!(
+                !table.is_empty() && !column.is_empty(),
+                "malformed remediation entry"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_key_violation_is_detected_by_sqlstate() {
+        assert!(is_foreign_key_violation(Some("23503")));
+        assert!(!is_foreign_key_violation(Some("23505"))); // unique violation
+        assert!(!is_foreign_key_violation(None));
+    }
+
+    #[test]
+    fn blocked_user_delete_message_names_the_blocking_relation() {
+        let msg = user_delete_blocked_message(Some("migration_jobs"), Some("mj_created_by_fkey"));
+        assert!(msg.contains("migration_jobs"), "{msg}");
+        assert!(msg.contains("Cannot delete this user"), "{msg}");
+
+        // Falls back to the constraint, then to a generic phrasing -- never to
+        // the opaque "db operation failed" of #2878.
+        let msg = user_delete_blocked_message(None, Some("signing_keys_created_by_fkey"));
+        assert!(msg.contains("signing_keys_created_by_fkey"), "{msg}");
+        let msg = user_delete_blocked_message(None, None);
+        assert!(msg.contains("another table"), "{msg}");
+    }
 
     // -----------------------------------------------------------------------
     // generate_password

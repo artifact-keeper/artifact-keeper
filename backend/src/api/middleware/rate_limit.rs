@@ -161,6 +161,12 @@ pub struct RateLimitState {
     /// or multiply its rate-limit budget. Empty (the default) means `XFF` is
     /// never trusted. Driven by `Config::rate_limit_trusted_proxy_cidrs`
     /// (env `RATE_LIMIT_TRUSTED_PROXY_CIDRS`).
+    ///
+    /// Within a believed chain the client is the **rightmost** token outside
+    /// these ranges — appending proxies preserve a client-supplied prefix, so
+    /// the leftmost token is attacker-controlled (GHSA-8jm4-4x6c-6787). Every
+    /// hop of a multi-proxy chain must be covered by these ranges; any token
+    /// not covered is treated as the client.
     pub trusted_proxies: Arc<Vec<CidrRange>>,
 }
 
@@ -581,13 +587,11 @@ fn too_many_requests(retry_after: u64, max_requests: u32) -> Response {
 }
 
 /// First `X-Forwarded-For` token, trimmed, as a string (may be a hostname or
-/// otherwise non-parseable). `None` when the header is absent or empty.
-fn first_xff_token(request: &Request) -> Option<&str> {
-    first_xff_token_in(request.headers())
-}
-
-/// [`first_xff_token`] over a bare header map, for callers that only hold
-/// request parts (e.g. the download-telemetry extractor, #2365).
+/// otherwise non-parseable). `None` when the header is absent or empty. Used
+/// only by the no-`ConnectInfo` (test-harness) fallback in
+/// [`resolve_client_ip_addr`]; trusted-proxy resolution never takes the
+/// leftmost token — see [`rightmost_untrusted_xff_token`]
+/// (GHSA-8jm4-4x6c-6787).
 fn first_xff_token_in(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers
         .get("x-forwarded-for")?
@@ -599,20 +603,96 @@ fn first_xff_token_in(headers: &axum::http::HeaderMap) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Whether the request's immediate TCP peer (from `ConnectInfo`) is a trusted
-/// reverse proxy, i.e. its IP falls within one of `trusted_proxies`. Returns
-/// `false` when `ConnectInfo` is absent or the list is empty, so `XFF` is only
-/// believed for an explicitly-configured proxy in front of the backend.
-fn peer_is_trusted_proxy(request: &Request, trusted_proxies: &[CidrRange]) -> bool {
-    if trusted_proxies.is_empty() {
-        return false;
+/// Rightmost `X-Forwarded-For` token that is NOT itself a trusted proxy —
+/// the right-side-aware client-IP selection for GHSA-8jm4-4x6c-6787.
+///
+/// Trusted appending proxies (Caddy in the default compose deployment)
+/// preserve any client-supplied `XFF` prefix and append the address they
+/// actually observed, so the LEFTMOST token is attacker-controlled while the
+/// RIGHT side of the chain is appended by hops we trust. Walk the tokens
+/// right-to-left from the immediate peer: skip tokens inside a trusted-proxy
+/// CIDR (appends by hops in our own chain) and select the first token outside
+/// every trusted range — the address the outermost trusted proxy observed for
+/// the downstream client.
+///
+/// An attacker prefix token can never be selected: it always sits LEFT of the
+/// trusted proxy's own append, and the walk stops at the first non-trusted
+/// token from the right. A non-empty token that fails to parse as an `IpAddr`
+/// aborts the walk (`None` → caller falls back to the TCP peer) rather than
+/// diving further left into attacker-controlled text; empty tokens carry no
+/// information and are skipped. `None` is also returned when every token is
+/// trusted (no client IP recoverable from the header).
+///
+/// ⚠️ Walks **every** `X-Forwarded-For` field line, last line first, not just
+/// the first one (#3372). RFC 9110 §5.2 makes repeated field lines equivalent
+/// to the comma-joined value *in order*, and proxies differ in which they
+/// emit: Caddy merges into one line, but HAProxy (`option forwardfor`), Go
+/// `net/http` reverse proxies and some Envoy configurations `Add` a second
+/// line. Reading only `headers.get()` there returns the ATTACKER's line —
+/// theirs arrives first — and the walk never sees the trusted proxy's own
+/// append, leaving GHSA-8jm4-4x6c-6787 unmitigated for those topologies.
+///
+/// Tokens are stripped of an optional `:port` suffix and `[..]` brackets
+/// before parsing: Azure Application Gateway appends `1.2.3.4:5678` and some
+/// proxies append `[2001:db8::1]`, and treating either as unparseable aborted
+/// the walk and silently collapsed every client onto the shared peer bucket.
+/// Strip the decorations real proxies add to an `X-Forwarded-For` token so it
+/// parses as a bare `IpAddr`: surrounding whitespace, `[..]` brackets around an
+/// IPv6 literal, and a trailing `:port`.
+///
+/// A bare IPv6 address contains multiple colons and must NOT be truncated at
+/// one, so a `:port` is only stripped when the remainder still looks like an
+/// address (bracketed form, or a single colon as in `1.2.3.4:5678`).
+fn normalize_xff_token(token: &str) -> &str {
+    let t = token.trim();
+    if let Some(rest) = t.strip_prefix('[') {
+        // `[2001:db8::1]` or `[2001:db8::1]:443`
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+        return t;
     }
-    request
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .map(|peer| trusted_proxies.iter().any(|cidr| cidr.contains(peer)))
-        .unwrap_or(false)
+    if t.matches(':').count() == 1 {
+        // `1.2.3.4:5678` — an IPv4 address with a port. A bare IPv6 always
+        // has two or more colons, so this cannot truncate one.
+        if let Some((host, _port)) = t.rsplit_once(':') {
+            return host;
+        }
+    }
+    t
+}
+
+fn rightmost_untrusted_xff_token(
+    headers: &axum::http::HeaderMap,
+    trusted_proxies: &[CidrRange],
+) -> Option<IpAddr> {
+    // Last field line first, then tokens right-to-left within each line.
+    let lines: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    for token in lines.iter().rev().flat_map(|line| line.split(',').rev()) {
+        let token = normalize_xff_token(token);
+        if token.is_empty() {
+            continue;
+        }
+        match token.parse::<IpAddr>() {
+            // Trusted proxy hop: keep walking left toward the client.
+            Ok(ip) if trusted_proxies.iter().any(|cidr| cidr.contains(ip)) => continue,
+            // First non-trusted IP from the right: the client as observed by
+            // the outermost trusted proxy.
+            Ok(ip) => return Some(ip),
+            // Unparseable token: the chain is not a well-formed trusted
+            // append; bail to the TCP peer instead of trusting text further
+            // left.
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Extract the client IP address from the request, as the rate-limit key.
@@ -622,29 +702,25 @@ fn peer_is_trusted_proxy(request: &Request, trusted_proxies: &[CidrRange]) -> bo
 /// IP **only** when the immediate peer is a configured trusted reverse proxy
 /// (`trusted_proxies`); otherwise it is ignored so a rotating/spoofed `XFF`
 /// from an untrusted client cannot steer or multiply its budget (#2023).
+/// Within a believed chain the client is the rightmost token outside the
+/// trusted ranges — never the attacker-controlled leftmost token
+/// (GHSA-8jm4-4x6c-6787, see [`resolve_client_ip_addr`]).
 ///
 /// When `ConnectInfo` is unavailable (e.g. a test harness building the Router
-/// directly, with no socket peer), `XFF` is used as a last-resort fallback so
-/// keying still distinguishes callers; otherwise all such requests would share
-/// a single `ip:unknown` bucket.
+/// directly, with no socket peer), a parseable `XFF` token is used as a
+/// last-resort fallback so keying still distinguishes callers; otherwise all
+/// such requests would share a single `ip:unknown` bucket. Only validated
+/// `IpAddr` values ever key a bucket: a raw, unparseable (attacker-
+/// controlled) `XFF` token is never used (GHSA-8jm4-4x6c-6787).
 fn extract_client_ip(request: &Request, trusted_proxies: &[CidrRange]) -> String {
     if let Some(ip) = extract_client_ip_addr(request, trusted_proxies) {
         return format!("ip:{}", ip);
     }
-    // No resolvable IP yet. If the peer is a trusted proxy, honor a non-
-    // parseable XFF token (hostname / malformed) so the key is still per-
-    // client. If there is no ConnectInfo at all, fall back to XFF too (the
-    // direct-test / pre-ConnectInfo topology). An untrusted real peer never
-    // reaches here: `extract_client_ip_addr` already returned its socket IP.
-    let connect_info_present = request
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .is_some();
-    if !connect_info_present || peer_is_trusted_proxy(request, trusted_proxies) {
-        if let Some(first) = first_xff_token(request) {
-            return format!("ip:{}", first);
-        }
-    }
+    // GHSA-8jm4-4x6c-6787: no raw-string XFF fallback. With `ConnectInfo`
+    // present this branch is unreachable (`resolve_client_ip_addr` always
+    // yields at least the socket peer); without it, an unparseable XFF
+    // collapses into the shared `ip:unknown` bucket instead of minting an
+    // attacker-named bucket per request.
     "ip:unknown".to_string()
 }
 
@@ -670,9 +746,12 @@ fn extract_client_ip_addr(request: &Request, trusted_proxies: &[CidrRange]) -> O
 /// Same trusted-proxy contract as [`extract_client_ip_addr`], which delegates
 /// here: the socket `peer` is authoritative; `X-Forwarded-For` overrides it
 /// **only** when the peer falls inside a configured trusted-proxy CIDR
-/// (#2023). With no peer at all (test harness / pre-`ConnectInfo` topology),
-/// a parseable `XFF` first token is a last-resort fallback. Returns `None`
-/// when nothing resolves — callers must record "unknown", never a sentinel.
+/// (#2023), and then the client is the rightmost token outside the trusted
+/// ranges — never the attacker-controlled leftmost token
+/// (GHSA-8jm4-4x6c-6787, see [`rightmost_untrusted_xff_token`]). With no peer
+/// at all (test harness / pre-`ConnectInfo` topology), a parseable `XFF`
+/// first token is a last-resort fallback. Returns `None` when nothing
+/// resolves — callers must record "unknown", never a sentinel.
 pub(crate) fn resolve_client_ip_addr(
     headers: &axum::http::HeaderMap,
     peer: Option<IpAddr>,
@@ -681,14 +760,18 @@ pub(crate) fn resolve_client_ip_addr(
     if let Some(peer) = peer {
         // Believe XFF only when the immediate peer is a trusted proxy.
         if trusted_proxies.iter().any(|cidr| cidr.contains(peer)) {
-            if let Some(first) = first_xff_token_in(headers) {
-                if let Ok(ip) = first.parse::<IpAddr>() {
-                    return Some(ip);
-                }
+            // GHSA-8jm4-4x6c-6787: select the rightmost non-trusted token,
+            // NOT the leftmost. An appending trusted proxy preserves any
+            // client-supplied XFF prefix, so the leftmost token is attacker-
+            // controlled; the proxy's own append sits on the right. On any
+            // parse/trust failure the walk yields None and the real TCP peer
+            // remains the key.
+            if let Some(ip) = rightmost_untrusted_xff_token(headers, trusted_proxies) {
+                return Some(ip);
             }
         }
-        // Untrusted peer (or trusted peer with no/unparseable XFF): the real
-        // TCP peer is the key.
+        // Untrusted peer (or trusted peer with no/unparseable/all-trusted
+        // XFF): the real TCP peer is the key.
         return Some(peer);
     }
 
@@ -706,6 +789,122 @@ pub(crate) fn resolve_client_ip_addr(
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
+
+    // ---- GHSA-8jm4 follow-up: multi-line XFF + token normalization (#3372) ----
+
+    fn xff_lines(lines: &[&str]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for l in lines {
+            h.append(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_str(l).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// REVERT-PROOF for the core defect. A proxy that `Add`s its own field
+    /// line (HAProxy `option forwardfor`, Go `net/http`, some Envoy configs)
+    /// puts the ATTACKER's line first. Reading only `headers.get()` returns
+    /// `9.9.9.9` and the walk never sees the trusted proxy's own append, so
+    /// the attacker controls the rate-limit key — the advisory, unmitigated.
+    #[test]
+    fn xff_walks_every_field_line_not_just_the_first() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        // line 1 = attacker-supplied; line 2 = the trusted proxy's observation
+        let headers = xff_lines(&["9.9.9.9", "203.0.113.9, 172.30.0.5"]);
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &trusted),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap()),
+            "must select the client observed by the trusted proxy, not the attacker's first line"
+        );
+    }
+
+    /// The attacker cannot win by making their line the LAST one either: the
+    /// walk starts at the right, and their token is not inside a trusted CIDR,
+    /// so it is only selected if no trusted hop appended after it. Here the
+    /// real proxy's line is last, so its observation wins.
+    #[test]
+    fn xff_attacker_line_does_not_win_when_proxy_appends_after() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        let headers = xff_lines(&["1.2.3.4, 9.9.9.9", "203.0.113.9, 172.30.0.5"]);
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &trusted),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    /// Single merged line (Caddy, the shipped compose stack) is unchanged.
+    #[test]
+    fn xff_single_merged_line_still_selects_rightmost_untrusted() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        let headers = xff_lines(&["9.9.9.9, 203.0.113.9, 172.30.0.5"]);
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &trusted),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    /// Azure Application Gateway appends `ip:port`. Pre-fix that token failed
+    /// to parse, aborted the walk, and silently collapsed every client onto
+    /// the shared TCP-peer bucket.
+    #[test]
+    fn xff_strips_port_suffix_from_ipv4_token() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        let headers = xff_lines(&["203.0.113.9:5678, 172.30.0.5"]);
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &trusted),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    /// Bracketed IPv6, with and without a port.
+    #[test]
+    fn xff_strips_brackets_from_ipv6_token() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        for tok in ["[2001:db8::1]", "[2001:db8::1]:443"] {
+            let headers = xff_lines(&[&format!("{tok}, 172.30.0.5")]);
+            assert_eq!(
+                rightmost_untrusted_xff_token(&headers, &trusted),
+                Some("2001:db8::1".parse::<IpAddr>().unwrap()),
+                "failed for {tok}"
+            );
+        }
+    }
+
+    /// A BARE IPv6 address has multiple colons and must never be truncated at
+    /// one — the port-strip must not corrupt it.
+    #[test]
+    fn xff_bare_ipv6_is_not_truncated_by_port_strip() {
+        assert_eq!(normalize_xff_token("2001:db8::1"), "2001:db8::1");
+        assert_eq!(normalize_xff_token(" 2001:db8::1 "), "2001:db8::1");
+        // single-colon IPv6 is not representable, so this is unambiguously host:port
+        assert_eq!(normalize_xff_token("1.2.3.4:5678"), "1.2.3.4");
+        assert_eq!(normalize_xff_token("1.2.3.4"), "1.2.3.4");
+    }
+
+    /// Every token trusted → no client IP recoverable → caller uses the peer.
+    #[test]
+    fn xff_all_trusted_yields_none() {
+        let trusted = vec![CidrRange::parse("172.30.0.0/24").unwrap()];
+        let headers = xff_lines(&["172.30.0.9", "172.30.0.5"]);
+        assert_eq!(rightmost_untrusted_xff_token(&headers, &trusted), None);
+    }
+
+    /// Empty trusted list must fail CLOSED (fall back to the TCP peer), never
+    /// open onto attacker-controlled header text.
+    #[test]
+    fn xff_empty_trusted_list_selects_rightmost_and_caller_falls_back() {
+        let headers = xff_lines(&["9.9.9.9, 203.0.113.9"]);
+        // With nothing trusted, the rightmost token is returned; the CALLER
+        // (resolve_client_ip_addr) only consults this when the peer is itself
+        // trusted, which an empty list makes impossible.
+        assert_eq!(
+            rightmost_untrusted_xff_token(&headers, &[]),
+            Some("203.0.113.9".parse::<IpAddr>().unwrap())
+        );
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -927,16 +1126,118 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_client_ip_uses_first_xff_ip_from_trusted_proxy() {
-        // When XFF contains multiple IPs and the peer is trusted, use the first
-        // (the client IP set by the outermost proxy).
+    fn test_extract_client_ip_uses_rightmost_untrusted_xff_from_trusted_proxy() {
+        // GHSA-8jm4-4x6c-6787: when XFF contains multiple IPs and the peer is
+        // a trusted APPENDING proxy (Caddy in the default compose deployment),
+        // the client IP is the rightmost token outside the trusted ranges —
+        // the address the proxy itself observed and appended — never the
+        // leftmost token, which is a client-supplied (spoofable) prefix.
         let request = req_with_peer(
             "127.0.0.1:443",
             Some("203.0.113.50, 70.41.3.18, 150.172.238.178"),
         );
         assert_eq!(
             extract_client_ip(&request, &loopback_trusted_proxies()),
-            "ip:203.0.113.50"
+            "ip:150.172.238.178"
+        );
+    }
+
+    #[test]
+    fn test_ghsa_8jm4_attacker_xff_prefix_does_not_control_resolved_ip() {
+        // GHSA-8jm4-4x6c-6787: an unauthenticated caller sends
+        // `X-Forwarded-For: 10.9.9.9`; the trusted appending proxy (peer
+        // 127.0.0.1) preserves the prefix and appends the real client IP.
+        // Resolution must track the proxy-observed address, so the spoofed
+        // prefix token never steers keying or IP attribution.
+        let proxies = loopback_trusted_proxies();
+        let request = req_with_peer("127.0.0.1:443", Some("10.9.9.9, 198.51.100.23"));
+        assert_eq!(
+            extract_client_ip(&request, &proxies),
+            "ip:198.51.100.23",
+            "the trusted proxy's own append (rightmost) must win, not the \
+             client-supplied prefix (leftmost)"
+        );
+        // The parts-level core (#2365) follows the same contract.
+        let ip = resolve_client_ip_addr(
+            &xff_headers("10.9.9.9, 198.51.100.23"),
+            Some("127.0.0.1".parse().unwrap()),
+            &proxies,
+        );
+        assert_eq!(ip, Some("198.51.100.23".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_ghsa_8jm4_rotating_xff_prefix_behind_trusted_proxy_shares_bucket() {
+        // GHSA-8jm4-4x6c-6787: rotating the spoofed prefix across requests
+        // must NOT mint a fresh rate-limit bucket per request — every variant
+        // resolves to the same proxy-appended client IP.
+        let proxies = loopback_trusted_proxies();
+        let keys: Vec<String> = (1..=5)
+            .map(|i| {
+                let xff = format!("10.0.0.{i}, 198.51.100.23");
+                extract_client_ip(&req_with_peer("127.0.0.1:443", Some(&xff)), &proxies)
+            })
+            .collect();
+        assert!(
+            keys.iter().all(|k| k == "ip:198.51.100.23"),
+            "all spoofed-prefix variants must collapse to one bucket, got {keys:?}"
+        );
+    }
+
+    #[test]
+    fn test_ghsa_8jm4_cannot_spoof_trusted_cidr_exemption_via_xff_prefix() {
+        // GHSA-8jm4-4x6c-6787: a `RATE_LIMIT_TRUSTED_CIDRS` exemption (#969)
+        // must not be claimable by prefixing XFF with an exempt address. The
+        // resolved IP is the proxy's append (198.51.100.23), which is NOT in
+        // the exemption range, so the request is not exempt.
+        let proxies = loopback_trusted_proxies();
+        let exemptions = RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            vec![CidrRange::parse("10.0.0.0/8").unwrap()],
+        );
+        let request = req_with_peer("127.0.0.1:443", Some("10.0.0.5, 198.51.100.23"));
+        let ip = extract_client_ip_addr(&request, &proxies).unwrap();
+        assert_eq!(ip, "198.51.100.23".parse::<IpAddr>().unwrap());
+        assert!(
+            !exemptions.is_trusted_cidr(ip),
+            "a spoofed prefix token inside the exemption range must never be \
+             the resolved IP"
+        );
+        // Sanity: a caller whose REAL peer is inside the range still exempts.
+        let real = req_with_peer("10.0.0.5:1234", None);
+        let real_ip = extract_client_ip_addr(&real, &proxies).unwrap();
+        assert!(exemptions.is_trusted_cidr(real_ip));
+    }
+
+    #[test]
+    fn test_ghsa_8jm4_multi_hop_chain_walks_past_trusted_proxies() {
+        // GHSA-8jm4-4x6c-6787: two trusted hops — client -> front proxy
+        // (203.0.113.1) -> Caddy (127.0.0.1) -> backend. XFF arrives as
+        // "spoofed-prefix, real-client, front-proxy"; the right-to-left walk
+        // skips the trusted front-proxy append and lands on the real client,
+        // not the attacker prefix.
+        let proxies = vec![
+            CidrRange::parse("127.0.0.0/8").unwrap(),
+            CidrRange::parse("203.0.113.1/32").unwrap(),
+        ];
+        let request = req_with_peer(
+            "127.0.0.1:443",
+            Some("10.9.9.9, 198.51.100.23, 203.0.113.1"),
+        );
+        assert_eq!(extract_client_ip(&request, &proxies), "ip:198.51.100.23");
+    }
+
+    #[test]
+    fn test_ghsa_8jm4_unparseable_xff_token_falls_back_to_peer() {
+        // GHSA-8jm4-4x6c-6787: a non-empty token that does not parse as an
+        // IpAddr aborts the right-to-left walk — resolution must NOT continue
+        // left into attacker-controlled prefix text, and the raw token must
+        // never become a bucket key. The real TCP peer remains the key.
+        let request = req_with_peer("127.0.0.1:443", Some("10.0.0.5, bogus-token"));
+        assert_eq!(
+            extract_client_ip(&request, &loopback_trusted_proxies()),
+            "ip:127.0.0.1"
         );
     }
 

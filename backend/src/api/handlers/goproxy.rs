@@ -211,9 +211,11 @@ async fn handle_get(
     let request = parse_path(&path)?;
 
     match request {
-        GoProxyRequest::List { module } => list_versions(&state, &repo, &module).await,
+        GoProxyRequest::List { module } => {
+            list_versions(&state, auth.as_ref(), &repo, &module).await
+        }
         GoProxyRequest::Info { module, version } => {
-            version_info(&state, &repo, &module, &version).await
+            version_info(&state, auth.as_ref(), &repo, &module, &version).await
         }
         GoProxyRequest::Mod { module, version } => {
             get_mod_file(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
@@ -221,7 +223,9 @@ async fn handle_get(
         GoProxyRequest::Zip { module, version } => {
             download_zip(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
         }
-        GoProxyRequest::Latest { module } => latest_version(&state, &repo, &module).await,
+        GoProxyRequest::Latest { module } => {
+            latest_version(&state, auth.as_ref(), &repo, &module).await
+        }
         GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
     }
 }
@@ -364,53 +368,61 @@ async fn handle_put(
 /// back to the local/not-found response.
 async fn try_proxy_go_metadata(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     upstream_path: &str,
     default_content_type: &str,
 ) -> Result<Response, ()> {
-    // Remote repo: proxy to upstream
+    // Remote repo: proxy to upstream. The upstream body is forwarded
+    // VERBATIM (`.info` JSON / `.mod` bytes as the upstream served them), so
+    // the upstream `Content-Encoding` must be re-declared when present
+    // (RFC 9110 §8.4, #3260) — nothing on this path decodes.
     if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
-                proxy,
-                repo.id,
-                &repo.key,
-                upstream_url,
-                upstream_path,
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await
+            if let Ok((content, content_type, content_encoding)) =
+                proxy_helpers::proxy_fetch_capped_encoded(
+                    proxy,
+                    repo.id,
+                    &repo.key,
+                    upstream_url,
+                    upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                )
+                .await
             {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| default_content_type.to_string()),
-                    )
-                    .body(Body::from(content))
-                    .unwrap());
+                return Ok(proxy_helpers::forward_verbatim_metadata(
+                    content,
+                    content_type,
+                    default_content_type,
+                    content_encoding,
+                ));
             }
         }
     }
 
-    // Virtual repo: try each member in priority order
+    // Virtual repo: try each member in priority order. Same verbatim-forward
+    // contract as the Remote arm above: the member's coding is re-declared,
+    // and the member's own `Content-Type` is served (#3281), with the
+    // caller's default only as the fallback for a member that declared none.
     if repo.repo_type == RepositoryType::Virtual {
         let ct = default_content_type.to_string();
         if let Ok(resp) = proxy_helpers::resolve_virtual_metadata(
             &state.db,
+            auth,
             state.proxy_service.as_deref(),
             repo.id,
             upstream_path,
-            |bytes, _key| {
+            |bytes, content_type, content_encoding, _key| {
                 let ct = ct.clone();
                 async move {
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, ct)
-                        .body(Body::from(bytes))
-                        .unwrap())
+                    Ok(proxy_helpers::forward_verbatim_metadata(
+                        bytes,
+                        content_type,
+                        &ct,
+                        content_encoding,
+                    ))
                 }
             },
         )
@@ -448,15 +460,30 @@ fn filter_version_list(body: &str, blocked: &std::collections::HashSet<String>) 
 /// source id is what the age-gate listing filter resolves policy from: for a
 /// virtual repository each member's own gate configuration governs its
 /// contribution (#2264).
+///
+/// Returns `(source_repo_id, body_as_transferred, content_encoding)` (#3280):
+/// the body is the upstream's bytes AS TRANSFERRED — nothing on this path
+/// decodes (`http_client::base_client_builder` disables every codec and
+/// advertises `Accept-Encoding: identity`, but object stores return a
+/// *stored* `Content-Encoding` regardless) — and the coding travels with it
+/// so each caller can act correctly:
+///
+/// * a caller that PARSES or rebuilds the document (`@v/list`) must strip the
+///   coding first via [`decode_go_metadata_body`] and drop the header — the
+///   bytes it emits are not the bytes the coding describes;
+/// * a caller that forwards the bytes VERBATIM after parsing a copy
+///   (`@latest`) must re-declare the coding on its response (RFC 9110 §8.4),
+///   e.g. via [`proxy_helpers::forward_verbatim_metadata`].
 async fn fetch_go_metadata_with_source(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     upstream_path: &str,
-) -> Option<(uuid::Uuid, Bytes)> {
+) -> Option<(uuid::Uuid, Bytes, Option<String>)> {
     let proxy = state.proxy_service.as_ref()?;
     if repo.repo_type == RepositoryType::Remote {
         let upstream_url = repo.upstream_url.as_deref()?;
-        let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
+        let (content, _content_type, content_encoding) = proxy_helpers::proxy_fetch_capped_encoded(
             proxy,
             repo.id,
             &repo.key,
@@ -466,10 +493,14 @@ async fn fetch_go_metadata_with_source(
         )
         .await
         .ok()?;
-        return Some((repo.id, content));
+        return Some((repo.id, content, content_encoding));
     }
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
+        // Caller-authorized member walk (#3323): a Remote member may hold
+        // credentials for a private upstream feed, so proxying one for a caller
+        // who cannot read that member would launder a credentialed private
+        // index to them. The sibling `download_zip` was already gated this way.
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
             .await
             .ok()?;
         for member in members {
@@ -479,21 +510,56 @@ async fn fetch_go_metadata_with_source(
             let Some(upstream_url) = member.upstream_url.as_deref() else {
                 continue;
             };
-            if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch_capped(
-                proxy,
-                member.id,
-                &member.key,
-                upstream_url,
-                upstream_path,
-                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            )
-            .await
+            if let Ok((content, _content_type, content_encoding)) =
+                proxy_helpers::proxy_fetch_capped_encoded(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    upstream_url,
+                    upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                )
+                .await
             {
-                return Some((member.id, content));
+                return Some((member.id, content, content_encoding));
             }
         }
     }
     None
+}
+
+/// Strip a declared content coding off a buffered Go metadata body so it can
+/// be PARSED (#3280). Runs through the shared bounded decoder
+/// ([`crate::util::content_coding::strip_content_coding`]), so a hostile
+/// upstream cannot inflate past the process-wide decompressed-byte budget.
+///
+/// Fails closed: an upstream that declares a coding this build cannot strip,
+/// or whose coded stream is corrupt, yields a 502 — never a lossily-decoded
+/// run of U+FFFD served as a 200 (the pre-#3280 `@v/list` corruption), and
+/// never a silent parse failure surfacing as a 404 (the pre-#3280 `@latest`).
+#[allow(clippy::result_large_err)]
+fn decode_go_metadata_body(
+    content: &Bytes,
+    content_encoding: Option<&str>,
+) -> Result<Bytes, Response> {
+    use crate::util::content_coding::{strip_content_coding, Decoded};
+    match strip_content_coding(content, content_encoding) {
+        Ok(Decoded::Bytes(std::borrow::Cow::Borrowed(_))) => Ok(content.clone()),
+        Ok(Decoded::Bytes(std::borrow::Cow::Owned(decoded))) => Ok(Bytes::from(decoded)),
+        Ok(Decoded::Unsupported) => Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "upstream metadata declares an unsupported content coding: {}",
+                content_encoding.unwrap_or_default()
+            ),
+        )
+            .into_response()),
+        Err(_) => Err((
+            StatusCode::BAD_GATEWAY,
+            "upstream metadata body failed to decode under its declared content coding",
+        )
+            .into_response()),
+    }
 }
 
 /// Filter a `@v/list` document through the serving repository's download age
@@ -623,7 +689,8 @@ async fn enforce_go_zip_age_gate(
 
 /// Positive existence evidence for `module@version`: the upstream serves its
 /// `.info` document. Failures are treated as "no evidence" — the gate then
-/// blocks without starting a clock, never the reverse.
+/// blocks without starting a clock, never the reverse. The body (and hence
+/// its `Content-Encoding`, #3260) is discarded: only reachability matters.
 async fn go_version_exists_upstream(
     state: &SharedState,
     params: &crate::services::age_gate_service::AgeGateRepoParams,
@@ -651,6 +718,7 @@ async fn go_version_exists_upstream(
 
 async fn list_versions(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     module: &str,
 ) -> Result<Response, Response> {
@@ -683,21 +751,29 @@ async fn list_versions(
         // not consult. Aggregate distinct versions across those members so
         // a module stored only in a Local member is listed (#1782).
         if repo.repo_type == RepositoryType::Virtual {
+            // Caller-authorized member set (#3323). This walk used to join
+            // `virtual_repo_members` directly, which no visibility predicate
+            // reaches; the member ids are now resolved through the shared
+            // authorization helper and the query constrained to them.
+            let member_ids: Vec<uuid::Uuid> =
+                proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
+                    .await?
+                    .into_iter()
+                    .filter(|m| m.repo_type != crate::models::repository::RepositoryType::Remote)
+                    .map(|m| m.id)
+                    .collect();
             let member_versions: Vec<Option<String>> = sqlx::query_scalar(
                 r#"
                 SELECT DISTINCT a.version
                 FROM artifacts a
-                INNER JOIN virtual_repo_members vrm ON a.repository_id = vrm.member_repo_id
-                INNER JOIN repositories member ON member.id = vrm.member_repo_id
-                WHERE vrm.virtual_repo_id = $1
-                  AND member.repo_type != 'remote'::repository_type
+                WHERE a.repository_id = ANY($1)
                   AND a.name = $2
                   AND a.is_deleted = false
                   AND a.version IS NOT NULL
                 ORDER BY a.version
                 "#,
             )
-            .bind(repo.id)
+            .bind(&member_ids)
             .bind(module)
             .fetch_all(&state.db)
             .await
@@ -715,10 +791,15 @@ async fn list_versions(
         }
 
         let upstream_path = build_go_upstream_list_path(module);
-        if let Some((source_repo_id, content)) =
-            fetch_go_metadata_with_source(state, repo, &upstream_path).await
+        if let Some((source_repo_id, content, content_encoding)) =
+            fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await
         {
-            let upstream_body = String::from_utf8_lossy(&content).into_owned();
+            // This arm REBUILDS the document (parse + age-gate filter), so a
+            // declared coding must be stripped before parsing and dropped from
+            // the response (#3280) — lossily decoding coded bytes served a run
+            // of U+FFFD as a 200.
+            let decoded = decode_go_metadata_body(&content, content_encoding.as_deref())?;
+            let upstream_body = String::from_utf8_lossy(&decoded).into_owned();
             let filtered =
                 filter_go_version_list(state, source_repo_id, module, &upstream_body).await?;
             return Ok(Response::builder()
@@ -744,6 +825,7 @@ async fn list_versions(
 
 async fn version_info(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     module: &str,
     version: &str,
@@ -782,27 +864,40 @@ async fn version_info(
             // queries. Look across member repos for the earliest matching
             // artifact before falling through to the upstream proxy (#1782).
             if repo.repo_type == RepositoryType::Virtual {
-                if let Some(member_row) = sqlx::query!(
+                // Caller-authorized member set (#3323). Unlike the `list`
+                // sibling this walk carries no `repo_type` predicate — that
+                // asymmetry is preserved here deliberately, since narrowing it
+                // would change which versions the endpoint reports; only the
+                // caller-visibility filter is added.
+                let member_ids: Vec<uuid::Uuid> =
+                    proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
+                        .await?
+                        .into_iter()
+                        .map(|m| m.id)
+                        .collect();
+                // Runtime-checked (`query_scalar`, not `query!`) because the
+                // member-id array is bound rather than joined; the returned
+                // column is a single `timestamptz`.
+                if let Some(created_at) = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
                     r#"
                     SELECT a.created_at
                     FROM artifacts a
-                    INNER JOIN virtual_repo_members vrm ON a.repository_id = vrm.member_repo_id
-                    WHERE vrm.virtual_repo_id = $1
+                    WHERE a.repository_id = ANY($1)
                       AND a.name = $2
                       AND a.version = $3
                       AND a.is_deleted = false
                     ORDER BY a.created_at ASC
                     LIMIT 1
                     "#,
-                    repo.id,
-                    module,
-                    version
                 )
+                .bind(&member_ids)
+                .bind(module)
+                .bind(version)
                 .fetch_optional(&state.db)
                 .await
                 .map_err(crate::api::handlers::db_err)?
                 {
-                    let time_str = format_go_timestamp(&member_row.created_at);
+                    let time_str = format_go_timestamp(&created_at);
                     let info = build_version_info_json(version, &time_str);
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
@@ -814,7 +909,7 @@ async fn version_info(
 
             let upstream_path = build_go_upstream_path(module, version, "info");
             if let Ok(resp) =
-                try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
+                try_proxy_go_metadata(state, auth, repo, &upstream_path, "application/json").await
             {
                 return Ok(resp);
             }
@@ -878,24 +973,26 @@ async fn get_mod_file(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
+                    // Verbatim forward of the upstream go.mod bytes: the
+                    // upstream `Content-Encoding` must be re-declared when
+                    // present (RFC 9110 §8.4, #3260).
                     let upstream_path = build_go_upstream_path(module, version, "mod");
-                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
-                        proxy,
-                        repo.id,
-                        &repo.key,
-                        upstream_url,
-                        &upstream_path,
-                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "text/plain; charset=utf-8".to_string()),
+                    let (content, content_type, content_encoding) =
+                        proxy_helpers::proxy_fetch_capped_encoded(
+                            proxy,
+                            repo.id,
+                            &repo.key,
+                            upstream_url,
+                            &upstream_path,
+                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                         )
-                        .body(Body::from(content))
-                        .unwrap());
+                        .await?;
+                    return Ok(proxy_helpers::forward_verbatim_metadata(
+                        content,
+                        content_type,
+                        "text/plain; charset=utf-8",
+                        content_encoding,
+                    ));
                 }
             }
 
@@ -1025,7 +1122,7 @@ async fn download_zip(
                     // matches the buffered handler's prior fallback so the
                     // Go toolchain still sees `application/zip` when
                     // upstream omits the header (review N2).
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo.key,
@@ -1033,7 +1130,22 @@ async fn download_zip(
                         &upstream_path,
                         "application/zip",
                     )
+                    .await?;
+                    // #3446: count the proxied module zip. The `.mod` and
+                    // `.info` siblings are metadata the toolchain fetches on
+                    // every resolve; the `.zip` is the artifact, so it is the
+                    // one seam that counts — the same "one download per
+                    // fetched artifact, not per protocol round-trip" rule
+                    // OCI applies at the manifest.
+                    proxy_helpers::record_proxy_download(
+                        state,
+                        repo.id,
+                        &repo.key,
+                        &upstream_path,
+                        ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
 
@@ -1141,6 +1253,7 @@ async fn download_zip(
 
 async fn latest_version(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     module: &str,
 ) -> Result<Response, Response> {
@@ -1173,14 +1286,18 @@ async fn latest_version(
         Ok(a) => a,
         Err(not_found) => {
             let upstream_path = build_go_upstream_latest_path(module);
-            if let Some((source_repo_id, content)) =
-                fetch_go_metadata_with_source(state, repo, &upstream_path).await
+            if let Some((source_repo_id, content, content_encoding)) =
+                fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await
             {
+                // Parse a DECODED copy for the age gate (#3280): a coded
+                // upstream body used to fail `from_slice` here and 404 the
+                // endpoint for exactly the coded-upstream population.
+                let decoded = decode_go_metadata_body(&content, content_encoding.as_deref())?;
                 // Gate the advertised version: a blocked (or unparseable)
                 // "latest" is withheld as 404 so the client re-resolves from
                 // the filtered version list instead of learning about — and
                 // then failing on — a version this repository will not serve.
-                let json: Option<serde_json::Value> = serde_json::from_slice(&content).ok();
+                let json: Option<serde_json::Value> = serde_json::from_slice(&decoded).ok();
                 let version = json
                     .as_ref()
                     .and_then(|j| j.get("Version"))
@@ -1203,11 +1320,15 @@ async fn latest_version(
                         (StatusCode::NOT_FOUND, "no latest version available").into_response()
                     );
                 }
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(content))
-                    .unwrap());
+                // The response body is the upstream's bytes VERBATIM (the
+                // decoded copy above was for gating only), so the upstream
+                // coding is re-declared when present (RFC 9110 §8.4, #3280).
+                return Ok(proxy_helpers::forward_verbatim_metadata(
+                    content,
+                    None,
+                    "application/json",
+                    content_encoding,
+                ));
             }
             return Err(not_found);
         }
@@ -1664,7 +1785,7 @@ mod tests {
 
         // First sight: the upstream-served list is the existence evidence,
         // both versions are observed and withheld.
-        let listed = list_versions(&state, &repo, module)
+        let listed = list_versions(&state, None, &repo, module)
             .await
             .expect("list must succeed");
         assert_eq!(body_string(listed).await, "", "young versions are withheld");
@@ -1678,7 +1799,7 @@ mod tests {
         assert_eq!(observations, 2, "listing observes every advertised version");
 
         // Young @latest is withheld as 404 (client falls back to the list).
-        let err = latest_version(&state, &repo, module)
+        let err = latest_version(&state, None, &repo, module)
             .await
             .expect_err("young latest must be withheld");
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
@@ -1727,7 +1848,7 @@ mod tests {
             .expect("remove temporary LKG fixture");
 
         // Version-addressed metadata stays readable while the zip is gated.
-        let info = version_info(&state, &repo, module, "v1.1.0")
+        let info = version_info(&state, None, &repo, module, "v1.1.0")
             .await
             .expect(".info is metadata and passes");
         assert_eq!(info.status(), StatusCode::OK);
@@ -1742,11 +1863,11 @@ mod tests {
         .await
         .expect("backdate observations");
 
-        let listed = list_versions(&state, &repo, module)
+        let listed = list_versions(&state, None, &repo, module)
             .await
             .expect("aged list must succeed");
         assert_eq!(body_string(listed).await, "v1.0.0\nv1.1.0");
-        let latest = latest_version(&state, &repo, module)
+        let latest = latest_version(&state, None, &repo, module)
             .await
             .expect("aged latest must serve");
         let latest_body = body_string(latest).await;
@@ -2581,5 +2702,350 @@ mod tests {
             mod_bytes,
             "mod endpoint must serve the go.mod artifact, not the zip (#1782)"
         );
+    }
+
+    /// #3260: goproxy forwards `.info` / `.mod` upstream bodies VERBATIM —
+    /// the Remote arm of `try_proxy_go_metadata`, `get_mod_file`'s Remote
+    /// arm, and the Virtual arm via `resolve_virtual_metadata` — so the
+    /// upstream `Content-Encoding` must be re-declared (RFC 9110 §8.4, the
+    /// header describes the coding of the bytes as transferred) and
+    /// `Content-Length` must describe the coded bytes actually sent (§8.6).
+    /// Nothing on this path decodes (`http_client::base_client_builder`
+    /// disables every codec and advertises `Accept-Encoding: identity`), so
+    /// before the fix a coded upstream module document was persisted by `go`
+    /// as if it were plain.
+    ///
+    /// Deflate (non-gzip) coded upstream plus an uncoded control in the SAME
+    /// fixture — see `tdh::coded_fixture` for why gzip would prove less. The
+    /// hex arm mounts `gzip` for the same reason in reverse: with all three
+    /// suites on one coding, pinning the production line to that literal
+    /// keeps every assertion green.
+    ///
+    /// The Virtual `.info` URI is probed TWICE: cold (Pass 2, the upstream
+    /// fan-out) and warm (Pass 1, `cached_metadata_if_servable`). Pass 1 is a
+    /// line this fix changed — it used to discard the member's coding — and
+    /// only the second probe reaches it.
+    /// #3446: a PROXIED Go module `.zip` must increment the Downloads counter.
+    ///
+    /// The `.zip` is the artifact; `.mod` / `.info` are metadata the toolchain
+    /// re-fetches on every resolve and must NOT count, or a single `go build`
+    /// would report several downloads per module. Both halves are asserted so a
+    /// future "record everything the proxy serves" change cannot pass.
+    #[tokio::test]
+    async fn test_proxied_go_module_zip_is_counted_but_metadata_is_not_3446() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+
+        let module = "example.com/counted";
+        let version = "v1.4.0";
+        let zip_body = b"PK\x03\x04 pretend module zip".repeat(4);
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/{module}/@v/{version}.zip")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_body.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/{module}/@v/{version}.mod")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("module example.com/counted\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+
+        let counted = |path: String| {
+            let pool = fx.pool.clone();
+            let repo_id = fx.repo_id;
+            async move {
+                crate::services::proxy_catalog::download_counts_by_paths(
+                    &pool,
+                    repo_id,
+                    std::slice::from_ref(&path),
+                )
+                .await
+                .expect("count proxy downloads")
+                .get(&path)
+                .copied()
+                .unwrap_or(0)
+            }
+        };
+        let zip_path = format!("{module}/@v/{version}.zip");
+        let mod_path = format!("{module}/@v/{version}.mod");
+
+        assert_eq!(
+            counted(zip_path.clone()).await,
+            0,
+            "negative control: nothing counted before the first download"
+        );
+
+        // The `.mod` metadata fetch must leave the counter alone.
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{}/{}/@v/{}.mod", fx.repo_key, module, version)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the .mod metadata fetch must succeed"
+        );
+        assert_eq!(
+            counted(mod_path).await,
+            0,
+            "#3446: `.mod` is metadata, not a download - counting it would report \
+             several downloads for one `go build`"
+        );
+
+        // The `.zip` artifact must count, cold and warm alike.
+        for expected in 1..=2i64 {
+            let (status, served) = tdh::send(
+                tdh::router_anon(super::router(), state.clone()),
+                tdh::get(format!("/{}/{}/@v/{}.zip", fx.repo_key, module, version)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "proxied module zip must be served");
+            assert_eq!(&served[..], &zip_body[..], "the full zip body is served");
+            assert_eq!(
+                counted(zip_path.clone()).await,
+                expected,
+                "#3446: proxied module zip download {expected} must be counted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_go_metadata_forwards_upstream_content_encoding_verbatim_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        let up =
+            tdh::coded_and_plain_upstreams("deflate", "application/json", b"go-meta-3260 ").await;
+
+        // fx repo = the coded Remote (Remote-arm probes); a second coded
+        // Remote wrapped by a Virtual (Virtual-arm probe, cold cache so the
+        // upstream pass of `resolve_virtual_metadata` runs); a plain Remote +
+        // Virtual pair as the uncoded control.
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &up.coded_mock.uri()).await;
+        let (coded_member_id, _cm_key, virt_coded_id, virt_coded_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "go", &up.coded_mock.uri()).await;
+        let (plain_id, plain_key, virt_plain_id, virt_plain_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "go", &up.plain_mock.uri()).await;
+
+        // Remote arm, `.info` (`try_proxy_go_metadata`).
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.info", fx.repo_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        up.assert_coded_forward(&headers, &body, "remote .info");
+
+        // Remote arm, `.mod` (`get_mod_file`).
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.mod", fx.repo_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        up.assert_coded_forward(&headers, &body, "remote .mod");
+
+        // Virtual arm, `.info`, COLD: `resolve_virtual_metadata` Pass 2 (the
+        // upstream fan-out) transforms the fetched bytes.
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.info", virt_coded_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        up.assert_coded_forward(&headers, &body, "virtual .info (cold, Pass 2)");
+
+        // Virtual arm, `.info`, WARM: the same URI again now resolves through
+        // `resolve_virtual_metadata` Pass 1 (`cached_metadata_if_servable`),
+        // which reads the coding off the cache sidecar. Cold and warm are
+        // different lines of production code and only this probe covers the
+        // warm one. The unchanged upstream hit count is the barrier proving
+        // the response really came from the cache rather than a second
+        // fan-out — a barrier both the fixed and the coding-dropping shape of
+        // Pass 1 reach.
+        let upstream_path = "/example.com/coded/@v/v1.0.0.info";
+        let hits_before = up.coded_hits(upstream_path).await;
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.info", virt_coded_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        assert_eq!(
+            up.coded_hits(upstream_path).await,
+            hits_before,
+            "second probe must be served from the proxy cache (Pass 1), not refetched"
+        );
+        up.assert_coded_forward(&headers, &body, "virtual .info (warm, Pass 1)");
+
+        // Controls: uncoded upstream through the same three arms.
+        for (key, what) in [
+            (&plain_key, "control remote .info"),
+            (&virt_plain_key, "control virtual .info"),
+        ] {
+            let uri = format!("/{}/example.com/coded/@v/v1.0.0.info", key);
+            let (body, headers) =
+                tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+            up.assert_plain_forward(&headers, &body, what);
+        }
+        // ... including the warm virtual path: a cache hit on an uncoded
+        // member must not invent a coding either.
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.info", virt_plain_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        up.assert_plain_forward(&headers, &body, "control virtual .info (warm, Pass 1)");
+        let uri = format!("/{}/example.com/coded/@v/v1.0.0.mod", plain_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        up.assert_plain_forward(&headers, &body, "control remote .mod");
+
+        for id in [virt_coded_id, coded_member_id, virt_plain_id, plain_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3280: coded upstream bodies on the `@v/list` / `@latest` parse paths.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_go_metadata_body_strips_declared_coding_3280() {
+        let plain = b"v1.0.0\nv1.1.0\n".repeat(8);
+        let coded = Bytes::from(tdh::code_bytes("deflate", &plain));
+        let decoded = super::decode_go_metadata_body(&coded, Some("deflate"))
+            .expect("a supported coding must decode");
+        assert_eq!(&decoded[..], &plain[..]);
+        // Identity / absent codings pass the bytes through untouched.
+        let plain = Bytes::from(plain);
+        let out = super::decode_go_metadata_body(&plain, None).expect("no coding");
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn test_decode_go_metadata_body_fails_closed_3280() {
+        use axum::response::IntoResponse;
+        // An unsupported coding must 502, never parse still-coded bytes.
+        let body = Bytes::from_static(b"\x1b\x0e\x00brotli-ish");
+        let resp = super::decode_go_metadata_body(&body, Some("br"))
+            .expect_err("unsupported coding must fail closed")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // A corrupt stream under a supported coding must 502 too — the
+        // pre-#3280 shape lossily decoded it into U+FFFD and served a 200.
+        let resp = super::decode_go_metadata_body(&Bytes::from_static(b"not-gzip"), Some("gzip"))
+            .expect_err("corrupt coded body must fail closed")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// #3280: when the upstream stores a `Content-Encoding` on its metadata,
+    /// `@v/list` must serve the DECODED, rebuilt document (previously: the
+    /// coded bytes lossily became a run of U+FFFD served as 200), and
+    /// `@latest` must decode for the age gate and then forward the upstream
+    /// bytes VERBATIM with the coding re-declared (previously: the JSON parse
+    /// failed on the coded bytes and the endpoint 404ed).
+    #[tokio::test]
+    async fn test_go_list_and_latest_handle_coded_upstream_3280_db() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        let list_plain = b"v1.0.0\nv1.1.0\n".to_vec();
+        let latest_plain = br#"{"Version":"v1.1.0","Time":"2024-01-02T03:04:05Z"}"#.to_vec();
+        let list_coded = tdh::code_bytes("deflate", &list_plain);
+        let latest_coded = tdh::code_bytes("deflate", &latest_plain);
+
+        let coded_mock = MockServer::start().await;
+        for (upstream_path, body, ct) in [
+            (
+                "/example.com/coded/@v/list",
+                list_coded.clone(),
+                "text/plain; charset=utf-8",
+            ),
+            (
+                "/example.com/coded/@latest",
+                latest_coded.clone(),
+                "application/json",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(upstream_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", ct)
+                        .insert_header("content-encoding", "deflate")
+                        .set_body_bytes(body),
+                )
+                .mount(&coded_mock)
+                .await;
+        }
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &coded_mock.uri()).await;
+
+        // `@v/list`: rebuilt from the decoded document; no coding declared.
+        let uri = format!("/{}/example.com/coded/@v/list", fx.repo_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_ENCODING),
+            None,
+            "@v/list rebuilds its document, so no upstream coding may be declared"
+        );
+        assert_eq!(
+            &body[..],
+            &list_plain[..],
+            "@v/list must serve the DECODED version list, not U+FFFD garbage (#3280)"
+        );
+
+        // `@latest`: 200 (was 404 for coded upstreams), upstream bytes
+        // verbatim with the coding re-declared (RFC 9110 §8.4/§8.6).
+        let uri = format!("/{}/example.com/coded/@latest", fx.repo_key);
+        let (body, headers) =
+            tdh::probe_ok(tdh::router_anon(super::router(), state.clone()), uri).await;
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("deflate"),
+            "@latest forwards the upstream bytes verbatim and must re-declare the coding"
+        );
+        assert_eq!(
+            &body[..],
+            &latest_coded[..],
+            "@latest must forward the coded upstream bytes byte-identically"
+        );
+        assert_eq!(
+            tdh::decode_coded("deflate", &body),
+            latest_plain,
+            "the declared coding must decode the served body back to the JSON document"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// #3281: the Virtual arm of `try_proxy_go_metadata` forwards the member
+    /// upstream's body verbatim and must serve the member's own
+    /// `Content-Type`, keeping the caller's default (`application/json` for
+    /// `.info`) only for a member that declares none.
+    #[tokio::test]
+    async fn test_go_virtual_info_forwards_member_content_type_3281_db() {
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        let rig = tdh::setup_ct_3281_rig(&fx, "go", b"{\"Version\":\"v1.0.0\"}").await;
+        rig.assert_member_ct_forwarded(
+            super::router(),
+            |key| format!("/{key}/example.com/typed/@v/v1.0.0.info"),
+            "application/json",
+            "goproxy virtual .info",
+        )
+        .await;
+        rig.cleanup(&fx.pool).await;
+        fx.teardown().await;
     }
 }

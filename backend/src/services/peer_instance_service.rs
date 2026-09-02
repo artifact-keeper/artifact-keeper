@@ -172,6 +172,70 @@ impl PeerInstanceService {
         Ok(node)
     }
 
+    /// Reconcile the `is_local` row in `peer_instances` with the current
+    /// `PEER_INSTANCE_NAME` / `PEER_PUBLIC_ENDPOINT` configuration (#2832).
+    ///
+    /// The row is seeded at first boot, but env changes after that must land
+    /// on it too — the same env-vs-persisted-state contract
+    /// `peer_instance_identity` already honors — or the Peers UI shows the
+    /// stale first-boot name/endpoint forever. Updating in place (matched by
+    /// `is_local`, not by name) preserves the row's id and its repository
+    /// assignments across a rename; the insert path only runs when no local
+    /// row exists yet.
+    ///
+    /// Runtime (non-macro) queries so no offline `.sqlx` prepare is needed.
+    pub async fn reconcile_local_instance(
+        &self,
+        name: &str,
+        endpoint_url: &str,
+        api_key: &str,
+    ) -> Result<()> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE peer_instances
+            SET name = $1,
+                endpoint_url = $2,
+                api_key = $3,
+                status = 'online',
+                updated_at = NOW()
+            WHERE is_local = true
+            "#,
+        )
+        .bind(name)
+        .bind(endpoint_url)
+        .bind(api_key)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if updated.rows_affected() > 0 {
+            return Ok(());
+        }
+
+        // First boot: no local row exists yet. The name-conflict arm adopts a
+        // pre-existing row of the same name as local rather than duplicating it.
+        sqlx::query(
+            r#"
+            INSERT INTO peer_instances (name, endpoint_url, status, api_key, is_local)
+            VALUES ($1, $2, 'online', $3, true)
+            ON CONFLICT (name) DO UPDATE SET
+                endpoint_url = EXCLUDED.endpoint_url,
+                api_key = EXCLUDED.api_key,
+                status = 'online',
+                is_local = true,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(name)
+        .bind(endpoint_url)
+        .bind(api_key)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Get the local peer instance
     pub async fn get_local_instance(&self) -> Result<PeerInstance> {
         let node = sqlx::query_as!(
@@ -839,6 +903,92 @@ pub struct SyncTask {
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    /// Tier-2 (skips without DATABASE_URL): the `is_local` peer row must
+    /// follow PEER_INSTANCE_NAME / PEER_PUBLIC_ENDPOINT on every boot, in
+    /// place — same row id, no duplicate row — not only at first boot (#2832).
+    #[tokio::test]
+    async fn local_peer_row_reconciles_with_env_on_every_boot() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+
+        // Snapshot any pre-existing local row so the shared test database is
+        // left exactly as found.
+        let existing: Option<(Uuid, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, endpoint_url, api_key FROM peer_instances WHERE is_local = true",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("snapshot local row");
+
+        let suffix = Uuid::new_v4();
+        let first_name = format!("reconcile-first-{suffix}");
+        let second_name = format!("reconcile-second-{suffix}");
+
+        if existing.is_none() {
+            // First boot: the reconcile seeds the local row.
+            svc.reconcile_local_instance(&first_name, "http://first:8080", "key-1")
+                .await
+                .expect("first-boot reconcile seeds the local row");
+        }
+
+        let (before_id, _): (Uuid, String) =
+            sqlx::query_as("SELECT id, name FROM peer_instances WHERE is_local = true")
+                .fetch_one(&pool)
+                .await
+                .expect("one local row exists");
+
+        // A later boot with changed env must update the SAME row.
+        svc.reconcile_local_instance(&second_name, "http://second:9090", "key-2")
+            .await
+            .expect("reconcile with changed env");
+
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, name, endpoint_url FROM peer_instances WHERE is_local = true",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("re-read local rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "reconcile must never duplicate the local row"
+        );
+        let (after_id, after_name, after_endpoint) = &rows[0];
+        assert_eq!(
+            *after_id, before_id,
+            "the local row keeps its id (and repository assignments) across a rename"
+        );
+        assert_eq!(after_name, &second_name);
+        assert_eq!(after_endpoint, "http://second:9090");
+
+        // Restore the database to its pre-test state.
+        match existing {
+            Some((id, name, endpoint_url, api_key)) => {
+                sqlx::query(
+                    "UPDATE peer_instances SET name = $2, endpoint_url = $3, api_key = $4 \
+                     WHERE id = $1",
+                )
+                .bind(id)
+                .bind(name)
+                .bind(endpoint_url)
+                .bind(api_key)
+                .execute(&pool)
+                .await
+                .expect("restore snapshot");
+            }
+            None => {
+                sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                    .bind(before_id)
+                    .execute(&pool)
+                    .await
+                    .expect("remove seeded test row");
+            }
+        }
+    }
 
     /// DB-backed: a queued sync task must surface a populated `created_at`
     /// through `get_pending_sync_tasks`, so callers can tell a freshly

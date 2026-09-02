@@ -2645,6 +2645,7 @@ mod tests {
         assert_eq!(format_label(&RepositoryFormat::Npm), "npm");
         assert_eq!(format_label(&RepositoryFormat::Pypi), "pypi");
         assert_eq!(format_label(&RepositoryFormat::Go), "go");
+        assert_eq!(format_label(&RepositoryFormat::Vscode), "vscode");
         assert_eq!(format_label(&RepositoryFormat::Yarn), "npm");
         assert_eq!(format_label(&RepositoryFormat::Poetry), "pypi");
         // Anything outside the gate's supported formats collapses to "other"
@@ -3252,6 +3253,7 @@ mod tests {
         assert_eq!(AgeGateService::normalize_format(F::Poetry), F::Pypi);
         assert_eq!(AgeGateService::normalize_format(F::Npm), F::Npm);
         assert_eq!(AgeGateService::normalize_format(F::Pypi), F::Pypi);
+        assert_eq!(AgeGateService::normalize_format(F::Vscode), F::Vscode);
         assert_eq!(AgeGateService::normalize_format(F::Generic), F::Generic);
     }
 
@@ -3264,6 +3266,10 @@ mod tests {
             ));
             assert!(AgeGateService::supports_format_mode(
                 &RepositoryFormat::Pypi,
+                mode
+            ));
+            assert!(AgeGateService::supports_format_mode(
+                &RepositoryFormat::Vscode,
                 mode
             ));
             // No registry entry -> not gateable in any mode. NuGet stays

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Instant;
 
-use bcrypt::{hash, verify, DEFAULT_COST};
+use bcrypt::{hash, verify};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{
     decode, encode, Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation,
@@ -202,6 +202,11 @@ impl Claims {
         self.iat_ms.unwrap_or_else(|| self.iat.saturating_mul(1000))
     }
 }
+
+/// `token_type` claim of a forced-TOTP-enrollment ticket (#2805). Kept distinct
+/// from `totp_pending` so an enrollment ticket can never be redeemed at
+/// `/auth/totp/verify` for a session, and vice versa.
+pub const TOTP_ENROLLMENT_TOKEN_TYPE: &str = "totp_enroll";
 
 /// Token pair response
 #[derive(Debug, Serialize)]
@@ -772,6 +777,70 @@ fn auth_token_cache_registry() -> &'static RwLock<Vec<Weak<TokenCacheMap>>> {
 // the static methods directly leave it unset and get the legacy uncapped
 // behaviour, which preserves their semantics.
 static GLOBAL_AUTH_SEMAPHORE: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+
+/// The bcrypt work factor used for every hash this crate produces.
+///
+/// Production is [`bcrypt::DEFAULT_COST`] (12), ~100-300 ms per operation.
+///
+/// #3407: the lib unit-test binary uses cost 4 instead. This is a *test-harness
+/// throughput* fix, not a security relaxation — `cfg(test)` is never set for
+/// the shipped binary, and integration tests under `backend/tests/` link the
+/// library without it and so still get cost 12.
+///
+/// Why it was needed: `hash_password` and `verify_password` hold a permit from
+/// the process-wide auth-concurrency semaphore for the whole bcrypt
+/// computation. The `--lib` binary runs ~15k tests concurrently, and the
+/// DB-backed ones drive the real router through `tdh::Fixture::router_with_auth`,
+/// so each one authenticates for real. At cost 12 a permit is held for
+/// ~300 ms, the cap saturates, `acquire_auth_permit_for_bcrypt` exhausts its
+/// 3 s queue tolerance, and requests shed to 503 — surfacing as the NuGet
+/// `push_db_tests`/`read_db_tests` flakes, which failed on transport rather
+/// than on any assertion.
+///
+/// Cost 4 is ~256x less work than cost 12, which collapses the permit hold
+/// time to ~1 ms and takes the semaphore out of the critical path entirely.
+/// It is the root-cost fix rather than a workaround: nothing about these tests
+/// needs a production work factor, the hand-rolled fixtures throughout this
+/// crate already hash at cost 4, and it speeds up every authenticating test
+/// rather than just the NuGet cluster.
+///
+/// Deliberately *not* a serial lock around the affected tests. That is the fix
+/// for #3402 (genuinely shared DB state) and would make this failure worse, by
+/// holding auth permits for longer while serialised tests queue behind them.
+#[cfg(not(test))]
+pub(crate) fn bcrypt_cost() -> u32 {
+    bcrypt::DEFAULT_COST
+}
+
+/// See [`bcrypt_cost`] — test-binary work factor (#3407).
+#[cfg(test)]
+pub(crate) fn bcrypt_cost() -> u32 {
+    4
+}
+
+/// Auth-concurrency cap for in-crate test fixtures (#3407).
+///
+/// The fixtures previously each hardcoded `auth_max_concurrency: 8`, a value
+/// borrowed from production tuning for a 1-2 core box. It is the wrong shape
+/// for a test binary that deliberately runs everything at once, and because
+/// [`install_global_auth_semaphore`] is a `OnceLock` the cap is whatever the
+/// first `AppState` built in the process asked for — so the effective limit
+/// depended on test ordering.
+///
+/// Sharing one constant makes the installed cap deterministic regardless of
+/// which fixture wins the race, and sizes it for the harness. This is defence
+/// in depth: with [`bcrypt_cost`] at 4 the semaphore is no longer the binding
+/// constraint, but a fixture that hashes at a high cost on purpose should
+/// still not be able to starve the rest of the binary.
+#[cfg(test)]
+pub(crate) const TEST_AUTH_MAX_CONCURRENCY: usize = 512;
+
+/// The installed cap must be sized for the harness, not for a two-core
+/// production box (#3407). Checked at compile time so a well-meaning "align
+/// this with production" edit fails the build rather than reintroducing the
+/// flake intermittently and at a distance.
+#[cfg(test)]
+const _: () = assert!(TEST_AUTH_MAX_CONCURRENCY >= 256);
 
 /// Install the process-wide bcrypt-bound auth concurrency cap. Idempotent —
 /// the first call wins, subsequent calls are silently ignored so multiple
@@ -2108,7 +2177,7 @@ impl AuthService {
         let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
         tokio::task::spawn_blocking(move || {
-            hash(&pwd, DEFAULT_COST)
+            hash(&pwd, bcrypt_cost())
                 .map_err(|e| AppError::Internal(format!("Password hashing failed: {}", e)))
         })
         .await
@@ -2134,13 +2203,21 @@ impl AuthService {
         .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?
     }
 
-    /// Returns a dummy bcrypt hash (cost-12) generated once at runtime.
-    /// Running bcrypt verify against this ensures all rejection paths take
-    /// the same wall-clock time, preventing timing side-channel leaks.
+    /// Returns a dummy bcrypt hash generated once at runtime, at the same cost
+    /// factor as real stored hashes ([`bcrypt_cost`]). Running bcrypt verify
+    /// against this ensures all rejection paths take the same wall-clock time,
+    /// preventing timing side-channel leaks.
+    ///
+    /// The cost must track [`bcrypt_cost`] rather than being pinned: bcrypt
+    /// reads its work factor out of the hash it is verifying, so a dummy at a
+    /// *different* cost from real hashes would make the "not found" path take
+    /// visibly different time from the "wrong password" path — reintroducing
+    /// exactly the oracle the dummy exists to close.
     fn dummy_bcrypt_hash() -> &'static str {
         static DUMMY: OnceLock<String> = OnceLock::new(); //NOSONAR - intentional dummy hash for constant-time rejection
         DUMMY.get_or_init(|| {
-            hash("__dummy_timing_pad__", 12).expect("bcrypt hash generation must not fail")
+            hash("__dummy_timing_pad__", bcrypt_cost())
+                .expect("bcrypt hash generation must not fail")
         })
     }
 
@@ -3088,6 +3165,60 @@ impl AuthService {
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
     }
 
+    /// Generate a short-lived *enrollment* ticket for the forced-enrollment
+    /// flow introduced by the 2FA policy (#2805).
+    ///
+    /// Distinct from [`AuthService::generate_totp_pending_token`] in two ways
+    /// that matter:
+    ///
+    /// * A different `token_type` (`totp_enroll`), so an enrollment ticket can
+    ///   never be presented to `/auth/totp/verify` (which would let a user who
+    ///   has *not* proven possession of a second factor obtain a session), and a
+    ///   verify ticket can never be presented to the enrollment endpoints.
+    /// * A slightly longer life (10 minutes rather than 5) because enrolling
+    ///   means installing/scanning a QR code, not typing a code you already
+    ///   have. It is still far shorter than a session.
+    ///
+    /// The `jti` is claimed by the *completing* call only
+    /// ([`AuthService::consume_totp_pending_jti`], shared table): the ticket
+    /// authorizes `/auth/totp/enroll/setup` any number of times (regenerating a
+    /// secret is harmless and idempotent) but yields a session exactly once.
+    pub fn generate_totp_enrollment_token(&self, user: &User) -> Result<String> {
+        let now = Utc::now();
+        let exp = now + Duration::minutes(10);
+        let claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            allowed_repo_ids: None,
+            iat: now.timestamp(),
+            iat_ms: Some(now.timestamp_millis()),
+            exp: exp.timestamp(),
+            token_type: TOTP_ENROLLMENT_TOKEN_TYPE.to_string(),
+            jti: Some(Uuid::new_v4()),
+            family_id: None,
+            scan_pull_repo: None,
+            scopes: None,
+        };
+        encode(&Header::default(), &claims, &self.encoding_key)
+            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
+    }
+
+    /// Validate a TOTP enrollment ticket and return its claims.
+    ///
+    /// Rejects any other `token_type` — in particular a full access token, so
+    /// the enrollment endpoints cannot be used as an unauthenticated
+    /// "enroll on behalf of" oracle with a leaked session token, and a
+    /// `totp_pending` ticket, so the verify and enroll flows stay disjoint.
+    pub fn validate_totp_enrollment_token(&self, token: &str) -> Result<Claims> {
+        let token_data = self.decode_token(token)?;
+        if token_data.claims.token_type != TOTP_ENROLLMENT_TOKEN_TYPE {
+            return Err(AppError::Authentication("Invalid token type".to_string()));
+        }
+        Ok(token_data.claims)
+    }
+
     /// Validate a TOTP pending token and return claims.
     ///
     /// Verifies the JWT signature/expiry and that `token_type == "totp_pending"`.
@@ -3598,6 +3729,7 @@ mod tests {
             s3_region: None,
             s3_endpoint: None,
             jwt_secret: "super-secret-test-key-for-unit-tests-minimum-length".to_string(),
+            signature_expiry_seconds: 604_800,
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
             jwt_refresh_token_expiry_days: 7,
@@ -3632,6 +3764,7 @@ mod tests {
             gc_schedule: "0 0 * * * *".to_string(),
             storage_stats_schedule: "0 0 */4 * * *".to_string(),
             blob_gc_enabled: false,
+            maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
@@ -3640,13 +3773,15 @@ mod tests {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
+            oidc_silent_sso_enabled: true,
+            totp_policy: None,
             metrics_port: None,
             database_max_connections: 20,
             database_min_connections: 5,
             database_acquire_timeout_secs: 30,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
-            auth_max_concurrency: 8,
+            auth_max_concurrency: TEST_AUTH_MAX_CONCURRENCY,
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
             rate_limit_enabled: true,
@@ -4590,6 +4725,70 @@ mod tests {
         let h1 = AuthService::dummy_bcrypt_hash();
         let h2 = AuthService::dummy_bcrypt_hash();
         assert_eq!(h1, h2);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3407: bcrypt work factor in the test binary
+    // -----------------------------------------------------------------------
+
+    /// Parse the cost factor out of a bcrypt modular-crypt string
+    /// (`$2b$<cost>$<salt+digest>`). Test-only.
+    fn cost_of(hash_str: &str) -> u32 {
+        let mut parts = hash_str.split('$');
+        parts.next(); // leading empty segment
+        parts.next().expect("algorithm identifier");
+        parts
+            .next()
+            .expect("cost field")
+            .parse()
+            .expect("cost is numeric")
+    }
+
+    /// #3407: the lib test binary must hash at a cheap work factor.
+    ///
+    /// At `DEFAULT_COST` each `hash_password` holds an auth-concurrency permit
+    /// for ~300 ms. Across ~15k concurrently-running tests that saturates the
+    /// semaphore, `acquire_auth_permit_for_bcrypt` burns its 3 s queue
+    /// tolerance, and requests shed to 503 — which is how the NuGet
+    /// `push_db_tests`/`read_db_tests` cluster failed, on transport rather
+    /// than on any assertion it made.
+    ///
+    /// Pinning the value matters: if someone "restores" `DEFAULT_COST` here
+    /// the flake comes back intermittently and at a distance, which is the
+    /// worst possible failure mode to rediscover.
+    #[tokio::test]
+    async fn hash_password_uses_the_cheap_test_cost_factor() {
+        let hashed = AuthService::hash_password("correct horse battery staple")
+            .await
+            .expect("hashing must succeed");
+
+        assert_eq!(
+            cost_of(&hashed),
+            4,
+            "the test binary must hash at cost 4 (#3407); got {hashed}"
+        );
+        assert_eq!(bcrypt_cost(), 4, "bcrypt_cost() must agree with the hash");
+
+        // The cheap cost must still round-trip, or every auth test is broken.
+        assert!(verify("correct horse battery staple", &hashed).expect("verify must not error"));
+        assert!(!verify("wrong password", &hashed).expect("verify must not error"));
+    }
+
+    /// The timing pad must be generated at the *same* cost as real hashes.
+    ///
+    /// bcrypt reads its work factor from the hash being verified, so a dummy
+    /// at a different cost would make the "token prefix not found" path take
+    /// visibly different wall-clock time from the "wrong secret" path — the
+    /// exact side channel `dummy_bcrypt_hash` exists to close (#3407 must not
+    /// regress the constant-time property it piggybacks on).
+    #[test]
+    fn dummy_bcrypt_hash_cost_matches_real_hash_cost() {
+        assert_eq!(
+            cost_of(AuthService::dummy_bcrypt_hash()),
+            bcrypt_cost(),
+            "dummy timing pad must track bcrypt_cost(), else the \
+             constant-time rejection path leaks token existence by timing"
+        );
     }
 
     // -----------------------------------------------------------------------

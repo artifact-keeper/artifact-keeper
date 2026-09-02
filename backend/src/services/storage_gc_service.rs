@@ -179,6 +179,20 @@ pub(crate) const MAVEN_SIDECAR_SUFFIXES: [&str; 4] = [".md5", ".sha1", ".sha256"
 /// Upper bound on flat-object attribution rows examined per GC pass.
 const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 
+/// TTL for the [`StorageGcService::run_scheduled_tick`] singleton lease.
+/// Matches the GC's own default hourly cadence so a crashed holder's lease
+/// lapses in time for the next natural tick rather than blocking it.
+const STORAGE_GC_LEASE_TTL_SECS: f64 = 3600.0;
+
+/// `scheduler_leases.job_name` the scheduled storage-GC tick claims.
+///
+/// This is an OPERATOR-VISIBLE wire value: diagnosing a stuck or contended
+/// tick means `SELECT * FROM scheduler_leases WHERE job_name = 'storage_gc'`,
+/// and it is what the #3384 runbook names. The scheduler passes this constant
+/// rather than a literal so the value the scheduler claims and the value the
+/// regression test pins cannot drift apart.
+pub(crate) const SCHEDULED_GC_JOB_NAME: &str = "storage_gc";
+
 /// SQL fragment expressing the orphaned row-less Maven flat-object predicate
 /// over an outer `maven_flat_object_owner` row aliased `o` (#2668).
 ///
@@ -199,8 +213,12 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 ///    requires that NO live artifact exists under its directory prefix on
 ///    the same backend: the metadata document stays while any version of
 ///    its groupId/artifactId (or group, for group-level plugin metadata)
-///    is still live. The `LIKE` prefix test can only over-match (SQL
-///    wildcards in a key match a superset), i.e. only ever over-PROTECT.
+///    is still live. The `LIKE` prefix test carries `ESCAPE ''`
+///    ([`crate::services::maven_flat_attribution::metadata_rollup_dir_anchor_sql`]),
+///    which is what makes it able only to over-match (`%`/`_` in a stored key
+///    match a superset) and never to under-match. Without that clause a
+///    literal `\` in the key is read as an escape character and the guard
+///    misses its own directory -- a `NOT EXISTS` miss means DELETE.
 /// 4. A checksum sidecar additionally requires its base key to be anchored
 ///    by neither an `artifacts` row (any state) nor a metadata `files[]`
 ///    reference on the same backend.
@@ -220,6 +238,18 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 /// unreferenced and was purged by the sweep while its parent artifact was
 /// still serving it (#3156).
 ///
+/// The FIRST arm is the source allowlist
+/// ([`crate::services::maven_flat_attribution::SYSTEM_WRITTEN_ATTRIBUTION_SOURCES`]).
+/// Everything below it tests catalog *anchors*, which is only a proof of
+/// garbage for rows the system wrote and can re-derive. An owner row is also
+/// what makes a row-less legacy object READABLE (#2574/#2585), and for an
+/// object whose only catalog record is its owner row every anchor arm is true
+/// by construction and permanently — so before this arm existed, an
+/// operator-inserted row (the documented repair for keys the catalog-only
+/// backfill cannot see) nominated its own object for deletion within the hour
+/// (#3431). Unknown/novel sources are protected by default: the arm is an
+/// allowlist, so the failure direction is leaked storage, never lost bytes.
+///
 /// Guards 3, 4 and 5 likewise take their sidecar-suffix regex from
 /// [`crate::services::maven_flat_attribution::GUARDED_SIDECAR_SUFFIXES`] rather
 /// than an inline `(md5|sha1|sha256|sha512)` alternation. The inline copies
@@ -231,14 +261,15 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 /// sidecar), read as orphan, and was reclaimed while its base stayed live
 /// (#3197). The rollup guard shares
 /// [`crate::services::maven_flat_attribution::is_metadata_rollup_key_sql`] /
-/// [`crate::services::maven_flat_attribution::metadata_rollup_dir_prefix_sql`]
+/// [`crate::services::maven_flat_attribution::metadata_rollup_dir_anchor_sql`]
 /// with the repository-delete collector for the same anti-drift reason.
 static ORPHAN_MAVEN_FLAT_PREDICATE_SQL: Lazy<String> = Lazy::new(|| {
     use crate::services::maven_flat_attribution as mfa;
     let sidecar_base = mfa::sidecar_base_key_sql("o.storage_key");
     format!(
         r#"
-o.storage_key LIKE 'maven/%'
+{system_source}
+AND o.storage_key LIKE 'maven/%'
 AND o.created_at < NOW() - INTERVAL '1 hour'
 AND NOT EXISTS (
     SELECT 1 FROM artifacts a
@@ -259,7 +290,7 @@ AND NOT EXISTS (
     WHERE {is_rollup}
       AND r2.storage_backend = o.storage_backend
       AND a2.is_deleted = false
-      AND a2.storage_key LIKE {rollup_dir} || '%'
+      AND {rollup_anchor}
 )
 AND NOT EXISTS (
     SELECT 1 FROM artifacts ab
@@ -277,9 +308,10 @@ AND NOT EXISTS (
       AND {sidecar_base_files_match}
 )
 "#,
+        system_source = mfa::system_written_source_sql("o.source"),
         files_match = mfa::metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key"),
         is_rollup = mfa::is_metadata_rollup_key_sql("o.storage_key"),
-        rollup_dir = mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
+        rollup_anchor = mfa::metadata_rollup_dir_anchor_sql("a2.storage_key", "o.storage_key"),
         is_sidecar = mfa::is_sidecar_key_sql("o.storage_key"),
         sidecar_base_files_match =
             mfa::metadata_files_name_key_sql("am2.metadata->'files'", &sidecar_base),
@@ -294,6 +326,14 @@ pub struct StorageGcResult {
     pub artifacts_removed: i64,
     pub bytes_freed: i64,
     pub errors: Vec<String>,
+    /// Orphaned row-less Maven flat objects this pass identified but left in
+    /// place because the sweep is not opted in (`MAVEN_FLAT_GC_ENABLED`
+    /// unset, #3431). Report-only: these objects and their attribution rows
+    /// were NOT deleted and are not counted in `storage_keys_deleted`. Always
+    /// `0` on a dry run (a dry run deletes nothing anyway) and when the sweep
+    /// is enabled.
+    #[serde(default)]
+    pub maven_flat_objects_gated: i64,
 }
 
 /// Default grace window (hours) used to classify "recent" OCI blobs in the
@@ -382,6 +422,13 @@ pub struct OciBlobFootprintReport {
 pub struct StorageGcService {
     db: PgPool,
     storage_registry: Arc<StorageRegistry>,
+    /// Opt-in gate for [`StorageGcService::cleanup_orphan_maven_flat_objects`]
+    /// (#3431). `false` — the default from [`StorageGcService::new`] — makes
+    /// that sweep report-only. Set from `Config::maven_flat_gc_enabled` via
+    /// [`StorageGcService::with_maven_flat_gc_enabled`] at every production
+    /// entry point (scheduler + admin handlers), so an entry point that
+    /// forgets to wire the flag fails SAFE.
+    maven_flat_gc_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -469,7 +516,19 @@ impl StorageGcService {
         Self {
             db,
             storage_registry,
+            // Fail safe: the orphan Maven flat-object sweep never deletes
+            // until a caller explicitly opts in (#3431).
+            maven_flat_gc_enabled: false,
         }
+    }
+
+    /// Opt the orphaned row-less Maven flat-object sweep into live deletion
+    /// (#3431). Mirrors `BLOB_GC_ENABLED`: without this the sweep still runs
+    /// and reports what it would reclaim, but deletes nothing.
+    #[must_use]
+    pub fn with_maven_flat_gc_enabled(mut self, enabled: bool) -> Self {
+        self.maven_flat_gc_enabled = enabled;
+        self
     }
 
     /// Get the storage backend for a given storage location.
@@ -498,6 +557,82 @@ impl StorageGcService {
     /// resurrecting the rows before they are hard-deleted.
     pub async fn run_gc(&self, dry_run: bool) -> Result<StorageGcResult> {
         self.run_gc_inner(None, dry_run).await
+    }
+
+    /// One scheduled storage-GC tick, gated by the cluster-wide `job_name`
+    /// singleton lease (`cluster_work::SchedulerLease`). Every replica's
+    /// scheduler independently computes the same cron occurrence, so without
+    /// this gate every replica ran `run_gc` at the same instant — confirmed
+    /// in production via `pg_stat_activity`: multiple identical copies of the
+    /// Maven flat-object orphan scan running concurrently for 20+ minutes,
+    /// sharing one `xact_start` (artifact-keeper#3384).
+    ///
+    /// Returns `true` if this replica won the lease and ran GC, `false` if
+    /// another replica currently holds it (a no-op tick).
+    ///
+    /// Only the scheduler's automatic tick should call this — the on-demand
+    /// admin/per-repo GC endpoints (`storage_gc.rs`) call
+    /// `run_gc`/`run_gc_for_repository` directly and must keep working even
+    /// while a scheduled tick holds this lease.
+    ///
+    /// SCOPE: this gates `run_gc` only. The blob-GC mark/sweep and the
+    /// storage-stats recompute that share the same scheduler tick are NOT
+    /// under this lease and still run on every replica — #3384 is only
+    /// partially closed by this method. See the scope note at the call site
+    /// in `scheduler_service::spawn_all` and issue #3503.
+    ///
+    /// This method changes WHO runs the sweep, never WHAT it deletes. The
+    /// `MAVEN_FLAT_GC_ENABLED` opt-in gate (#3431) lives further in, in
+    /// `cleanup_orphan_maven_flat_objects`, and is reached through
+    /// `run_gc(false)` exactly as it is from the on-demand endpoints.
+    pub(crate) async fn run_scheduled_tick(&self, job_name: &str) -> bool {
+        let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+            &self.db,
+            job_name,
+            STORAGE_GC_LEASE_TTL_SECS,
+        )
+        .await
+        else {
+            tracing::debug!("Another replica owns the storage GC lease; skipping tick");
+            return false;
+        };
+        // A pass can outlive the fixed TTL on a large registry; keep the
+        // lease alive for as long as this one runs.
+        let lease_renewal = lease.spawn_renewal(self.db.clone(), STORAGE_GC_LEASE_TTL_SECS);
+
+        tracing::info!("Running scheduled storage garbage collection");
+
+        match self.run_gc(false).await {
+            Ok(result) => {
+                if result.storage_keys_deleted > 0 {
+                    tracing::info!(
+                        "Storage GC: deleted {} keys, removed {} artifacts, freed {} bytes",
+                        result.storage_keys_deleted,
+                        result.artifacts_removed,
+                        result.bytes_freed
+                    );
+                    crate::services::metrics_service::record_cleanup(
+                        "storage_gc",
+                        result.artifacts_removed as u64,
+                    );
+                }
+                if !result.errors.is_empty() {
+                    tracing::warn!("Storage GC completed with {} errors", result.errors.len());
+                    // Surface the actual messages, not just the count, so the
+                    // orchestration-layer log is actionable.
+                    for err in &result.errors {
+                        tracing::warn!(gc_error = %err, "Storage GC error");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Storage garbage collection failed: {}", e);
+            }
+        }
+
+        drop(lease_renewal);
+        lease.release(&self.db).await;
+        true
     }
 
     /// Repository-scoped variant of [`Self::run_gc`] (web #708).
@@ -611,16 +746,52 @@ impl StorageGcService {
                 // retry after a crash mid-delete still reclaims the soft-deleted
                 // row instead of erroring every pass — matching the cloud
                 // backends' NotFound→Ok mapping.
-                match storage.delete(&storage_key).await {
-                    Ok(()) | Err(AppError::NotFound(_)) => {}
-                    Err(e) => {
-                        let _ = tx.rollback().await;
-                        let msg =
-                            format_gc_error("delete storage key", &storage_key, &e.to_string());
-                        tracing::warn!("{}", msg);
-                        result.errors.push(msg);
-                        // Skip DB cleanup if storage delete fails
-                        continue;
+                //
+                // ...except for proxy-cache content, whose object is NOT this
+                // sweep's to reclaim (#3368). A soft-deleted `artifacts` row
+                // can carry a `proxy-cache/` key — legacy rows from before the
+                // proxy catalog was split out (#1278). The key is derived
+                // purely from `(repo_key, path)`, so the object such a row
+                // names is the SAME object a live `proxy_cache_artifacts` row
+                // points at, and this predicate never consults that catalog:
+                // deleting it would destroy a live cache entry and leave a
+                // dangling catalog row whose `size_bytes` only clears on the
+                // next fetch. Proxy-cache objects are reclaimed by
+                // `purge_repo_cache` and by TTL/lifecycle expiry.
+                //
+                // The stale `artifacts` ROW is still reclaimed below, which is
+                // the point of skipping only the delete rather than excluding
+                // the key from the candidate scan: the row is a redundant
+                // second reference to an object the proxy catalog owns, and
+                // leaving it behind would make these rows unreclaimable — the
+                // hard-delete here is the only reaper of soft-deleted
+                // `artifacts` rows in the codebase.
+                //
+                // It never mattered before because the delete was issued
+                // against a key nothing had written (`<S3_PREFIX>/proxy-cache/…`,
+                // or the per-repository filesystem root) and silently hit
+                // nothing. Anchoring the layout makes it land, which is why
+                // the guard has to be explicit now.
+                let is_cache_object =
+                    crate::services::proxy_service::ProxyService::is_proxy_cache_key(&storage_key);
+                if is_cache_object {
+                    tracing::debug!(
+                        storage_key = storage_key.as_str(),
+                        "GC reclaiming the stale artifacts row only; the object belongs to the \
+                         proxy cache catalog and is left for purge_repo_cache / lifecycle expiry"
+                    );
+                } else {
+                    match storage.delete(&storage_key).await {
+                        Ok(()) | Err(AppError::NotFound(_)) => {}
+                        Err(e) => {
+                            let _ = tx.rollback().await;
+                            let msg =
+                                format_gc_error("delete storage key", &storage_key, &e.to_string());
+                            tracing::warn!("{}", msg);
+                            result.errors.push(msg);
+                            // Skip DB cleanup if storage delete fails
+                            continue;
+                        }
                     }
                 }
 
@@ -693,7 +864,14 @@ impl StorageGcService {
                     continue;
                 }
 
-                record_gc_success(&mut result, bytes, count);
+                if is_cache_object {
+                    // No object was deleted and no bytes were freed: only the
+                    // stale row went away. Counting it as a reclaimed storage
+                    // key would overstate what GC actually recovered.
+                    result.artifacts_removed += count;
+                } else {
+                    record_gc_success(&mut result, bytes, count);
+                }
             }
         }
 
@@ -1332,69 +1510,11 @@ impl StorageGcService {
         let grace_hours = clamp_grace_hours(grace_hours);
 
         // Aggregate 1: global totals + dedup-aware physical bytes + aged
-        // figures, all in one pass.
-        //
-        // Physical identity mirrors [`BLOB_PROTECTED_BY_REFS_SQL`] (and
-        // `StorageRegistry::backend_is_repo_isolated`): on shared backends
-        // (anything other than 'filesystem') the content-addressed key
-        // `oci-blobs/<digest>` resolves to ONE object per backend, so a
-        // digest counts once per backend; on 'filesystem' every repository
-        // roots its own tree at `storage_path`, so the same digest under
-        // two paths is two real files and must count twice. `per_object`
-        // therefore groups by (digest, backend, path-if-filesystem);
-        // `size_bytes` is MAX within a group (rows for the same digest
-        // share a size) and `first_seen` is the group's oldest row.
-        // `distinct_digests` stays digest-level (content identities),
-        // independent of how many physical copies exist; counting it over
-        // `per_object` equals counting over `oci_blobs` directly (the NOT
-        // NULL `repository_id` FK means the join drops no rows) and saves
-        // a fourth scan of the table.
-        //
-        // DELIBERATE: rows with `pending_delete_at IS NOT NULL` (the
-        // mark-and-sweep marker, migration 141) are INCLUDED in every
-        // figure — marked-but-not-yet-swept bytes are still physically on
-        // disk, and this is a footprint view. Do not "fix" by excluding
-        // them.
-        //
-        // `grace_hours` binds as int8, but `make_interval` only defines int4
-        // named parameters, so the SQL must cast `$1::int` or Postgres
-        // rejects the call outright (#2626). Safe: clamp_grace_hours caps
-        // the value at 8760. The SUM(...) columns need `::BIGINT` because
-        // SUM over bigint yields NUMERIC, which the i64 decodes below
-        // reject — and a failed decode is a hard error (propagated), never
-        // a silent zero.
-        let totals_sql = r#"
-            WITH per_object AS (
-                SELECT ob.digest,
-                       MAX(ob.size_bytes) AS size_bytes,
-                       MIN(ob.created_at) AS first_seen
-                FROM oci_blobs ob
-                JOIN repositories r ON r.id = ob.repository_id
-                GROUP BY ob.digest,
-                         r.storage_backend,
-                         CASE WHEN r.storage_backend = 'filesystem'
-                              THEN r.storage_path ELSE '' END
-            )
-            SELECT
-                (SELECT COUNT(*) FROM oci_blobs)                       AS total_blob_rows,
-                (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
-                   FROM oci_blobs)                                     AS logical_bytes,
-                COUNT(DISTINCT digest)                                 AS distinct_digests,
-                COALESCE(SUM(size_bytes), 0)::BIGINT                   AS physical_bytes,
-                COUNT(DISTINCT digest) FILTER (
-                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
-                )                                                      AS aged_distinct_digests,
-                COALESCE(SUM(size_bytes) FILTER (
-                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
-                ), 0)::BIGINT                                          AS aged_physical_bytes
-            FROM per_object
-        "#;
-
-        let totals = sqlx::query(totals_sql)
-            .bind(grace_hours)
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        // figures, all in one pass. The production report is always
+        // cluster-wide (`digest_scope: None`); see
+        // [`Self::fetch_blob_footprint_totals`] for the semantics and for
+        // why a scoped mode exists at all.
+        let totals = self.fetch_blob_footprint_totals(grace_hours, None).await?;
 
         // Aggregate 2: per-repository logical footprint, biggest first.
         let per_repo_sql = r#"
@@ -1424,20 +1544,109 @@ impl StorageGcService {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let totals = BlobFootprintTotals {
+        Ok(assemble_blob_footprint_report(
+            totals,
+            grace_hours,
+            per_repository,
+        ))
+    }
+
+    /// Fetch the totals block of the OCI blob footprint report.
+    ///
+    /// Physical identity mirrors [`BLOB_PROTECTED_BY_REFS_SQL`] (and
+    /// `StorageRegistry::backend_is_repo_isolated`): on shared backends
+    /// (anything other than 'filesystem') the content-addressed key
+    /// `oci-blobs/<digest>` resolves to ONE object per backend, so a
+    /// digest counts once per backend; on 'filesystem' every repository
+    /// roots its own tree at `storage_path`, so the same digest under
+    /// two paths is two real files and must count twice. `per_object`
+    /// therefore groups by (digest, backend, path-if-filesystem);
+    /// `size_bytes` is MAX within a group (rows for the same digest
+    /// share a size) and `first_seen` is the group's oldest row.
+    /// `distinct_digests` stays digest-level (content identities),
+    /// independent of how many physical copies exist; counting it over
+    /// `per_object` equals counting over the scoped rows directly (the
+    /// NOT NULL `repository_id` FK means the join drops no rows) and
+    /// saves a fourth scan of the table.
+    ///
+    /// DELIBERATE: rows with `pending_delete_at IS NOT NULL` (the
+    /// mark-and-sweep marker, migration 141) are INCLUDED in every
+    /// figure — marked-but-not-yet-swept bytes are still physically on
+    /// disk, and this is a footprint view. Do not "fix" by excluding
+    /// them.
+    ///
+    /// `grace_hours` binds as int8, but `make_interval` only defines int4
+    /// named parameters, so the SQL must cast `$1::int` or Postgres
+    /// rejects the call outright (#2626). Safe: [`clamp_grace_hours`] caps
+    /// the value at 8760 (callers pass the already-clamped value). The
+    /// SUM(...) columns need `::BIGINT` because SUM over bigint yields
+    /// NUMERIC, which the i64 decodes below reject — and a failed decode
+    /// is a hard error (propagated), never a silent zero.
+    ///
+    /// `digest_scope`: `None` aggregates the whole cluster — the only
+    /// mode the production report uses. `Some(digests)` restricts every
+    /// figure to rows whose digest is in the given set. The scoped mode
+    /// exists for the DB-backed regression test (#3129): the test
+    /// database is shared by the entire `cargo nextest` run
+    /// (process-per-test), so a before/after delta over cluster-wide
+    /// totals races every concurrent suite that inserts or deletes
+    /// `oci_blobs` rows. Scoping to the test's own UUID-derived
+    /// (collision-free) digests makes the expected figures exact and
+    /// deterministic while still exercising this very statement — the
+    /// scoped and unscoped paths share ONE SQL string, so the grouping,
+    /// dedup and age logic the test pins is the logic the report ships.
+    async fn fetch_blob_footprint_totals(
+        &self,
+        grace_hours: i64,
+        digest_scope: Option<&[String]>,
+    ) -> Result<BlobFootprintTotals> {
+        let totals_sql = r#"
+            WITH scoped AS (
+                SELECT digest, size_bytes, created_at, repository_id
+                FROM oci_blobs
+                WHERE $2::text[] IS NULL OR digest = ANY($2)
+            ),
+            per_object AS (
+                SELECT ob.digest,
+                       MAX(ob.size_bytes) AS size_bytes,
+                       MIN(ob.created_at) AS first_seen
+                FROM scoped ob
+                JOIN repositories r ON r.id = ob.repository_id
+                GROUP BY ob.digest,
+                         r.storage_backend,
+                         CASE WHEN r.storage_backend = 'filesystem'
+                              THEN r.storage_path ELSE '' END
+            )
+            SELECT
+                (SELECT COUNT(*) FROM scoped)                          AS total_blob_rows,
+                (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
+                   FROM scoped)                                        AS logical_bytes,
+                COUNT(DISTINCT digest)                                 AS distinct_digests,
+                COALESCE(SUM(size_bytes), 0)::BIGINT                   AS physical_bytes,
+                COUNT(DISTINCT digest) FILTER (
+                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
+                )                                                      AS aged_distinct_digests,
+                COALESCE(SUM(size_bytes) FILTER (
+                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
+                ), 0)::BIGINT                                          AS aged_physical_bytes
+            FROM per_object
+        "#;
+
+        let totals = sqlx::query(totals_sql)
+            .bind(grace_hours)
+            .bind(digest_scope)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(BlobFootprintTotals {
             total_blob_rows: decode_report_i64(&totals, "total_blob_rows")?,
             distinct_digests: decode_report_i64(&totals, "distinct_digests")?,
             logical_bytes: decode_report_i64(&totals, "logical_bytes")?,
             physical_bytes: decode_report_i64(&totals, "physical_bytes")?,
             aged_distinct_digests: decode_report_i64(&totals, "aged_distinct_digests")?,
             aged_physical_bytes: decode_report_i64(&totals, "aged_physical_bytes")?,
-        };
-
-        Ok(assemble_blob_footprint_report(
-            totals,
-            grace_hours,
-            per_repository,
-        ))
+        })
     }
 
     async fn cleanup_abandoned_oci_uploads(
@@ -2285,6 +2494,27 @@ impl StorageGcService {
         let candidates = self.select_orphan_maven_flat_objects(repo_scope).await?;
         let mut objects_removed = 0_i64;
 
+        // Opt-in gate (#3431), mirroring BLOB_GC_ENABLED's "bias to leaking
+        // storage over losing data". This sweep's entire subject matter is
+        // objects the catalog cannot see; on an instance migrated from another
+        // registry that absence is the EXPECTED state of legitimate legacy
+        // data — it is why the attribution table exists — so catalog absence
+        // alone is not proof of garbage. Unset, the pass still reports what it
+        // would reclaim and deletes nothing.
+        if !dry_run && !self.maven_flat_gc_enabled {
+            let gated = candidates.len() as i64;
+            result.maven_flat_objects_gated += gated;
+            if gated > 0 {
+                tracing::info!(
+                    maven_flat_objects_gated = gated,
+                    "Maven flat GC (disabled): would reclaim {} orphaned row-less Maven flat \
+                     objects; deleting nothing (set MAVEN_FLAT_GC_ENABLED=true to delete)",
+                    gated,
+                );
+            }
+            return Ok(());
+        }
+
         for row in candidates {
             let storage_key: String = row
                 .try_get("storage_key")
@@ -3054,7 +3284,7 @@ fn repo_scope_clause(column: &str, param: usize, repo_scope: Option<Uuid>) -> St
 /// Decoded global aggregate values for the OCI blob footprint report.
 ///
 /// This is the row-free intermediate between the `totals_sql` query in
-/// [`StorageGcService::oci_blob_footprint_report`] and the final
+/// `StorageGcService::fetch_blob_footprint_totals` and the final
 /// [`OciBlobFootprintReport`]. Splitting it out lets the report-assembly
 /// logic (which is pure arithmetic/struct shuffling, not I/O) be unit
 /// tested without a live database.
@@ -3156,6 +3386,7 @@ pub(crate) fn empty_gc_result(dry_run: bool) -> StorageGcResult {
         artifacts_removed: 0,
         bytes_freed: 0,
         errors: Vec::new(),
+        maven_flat_objects_gated: 0,
     }
 }
 
@@ -3173,12 +3404,119 @@ pub(crate) async fn storage_gc_test_guard() -> tokio::sync::MutexGuard<'static, 
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// #3368: GC must not delete proxy-cache OBJECTS, but must still reap the
+    /// stale `artifacts` ROWS that name them.
+    ///
+    /// A soft-deleted legacy `artifacts` row can carry a proxy-cache key, and
+    /// because `CacheKeys::derive` is pure, that is the SAME key a live
+    /// `proxy_cache_artifacts` row points at. The orphan predicate never
+    /// consults that catalog, so deleting the object destroys a live cache
+    /// entry and strands its catalog row (whose `size_bytes` then over-counts
+    /// until the next fetch). Anchoring the key layout is what made that
+    /// delete actually land — before, it addressed a key nothing had written.
+    ///
+    /// Skipping the *object* rather than excluding the *key* from the
+    /// candidate scan is load-bearing: this hard-delete is the only reaper of
+    /// soft-deleted `artifacts` rows in the codebase (the only other
+    /// production `DELETE FROM artifacts` is the path-specific re-upload
+    /// tombstone in `handlers/mod.rs`), so excluding the key would leave these
+    /// rows unreclaimable forever.
+    ///
+    /// FAILS ON MAIN: the object is deleted.
+    #[tokio::test]
+    async fn test_gc_spares_proxy_cache_objects_but_reaps_their_rows_3368() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        // A live cache object, written where the proxy cache writes it, plus
+        // the stale soft-deleted `artifacts` row that also names it.
+        let uid = Uuid::new_v4().simple().to_string();
+        let cache_key = format!("proxy-cache/remote-{uid}/simple/six/six-1.0.whl/__content__");
+        let hosted_key = format!("pypi/six/1.0/six-1.0-{uid}.whl");
+        let storage = fixture
+            .state
+            .storage_for_repo(
+                &tdh::make_repo_info(
+                    fixture.repo_id,
+                    &fixture.repo_key,
+                    &fixture.storage_dir,
+                    "local",
+                    None,
+                )
+                .storage_location(),
+            )
+            .expect("resolve storage");
+        for key in [&cache_key, &hosted_key] {
+            storage
+                .put(key, bytes::Bytes::from_static(b"payload"))
+                .await
+                .expect("seed object");
+        }
+        for key in [&cache_key, &hosted_key] {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by, is_deleted) \
+                 VALUES ($1, $2, 'six', '1.0', 7, 'cafe', 'application/zip', $2, $3, true)",
+            )
+            .bind(fixture.repo_id)
+            .bind(key)
+            .bind(fixture.user_id)
+            .execute(&fixture.pool)
+            .await
+            .expect("insert soft-deleted row");
+        }
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        service.run_gc(false).await.expect("gc run");
+
+        let cache_object = storage
+            .exists(&cache_key)
+            .await
+            .expect("probe cache object");
+        let hosted_object = storage
+            .exists(&hosted_key)
+            .await
+            .expect("probe hosted object");
+        let rows_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND storage_key = ANY($2)",
+        )
+        .bind(fixture.repo_id)
+        .bind(vec![cache_key.clone(), hosted_key.clone()])
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count surviving rows");
+
+        fixture.teardown().await;
+
+        assert!(
+            cache_object,
+            "#3368: the proxy-cache object is owned by proxy_cache_artifacts, which this \
+             predicate cannot see; GC must leave it to purge_repo_cache / lifecycle expiry"
+        );
+        assert!(
+            !hosted_object,
+            "negative control: a hosted orphan object must still be reclaimed, or the whole \
+             sweep has been disabled rather than scoped"
+        );
+        assert_eq!(
+            rows_left, 0,
+            "both stale rows must still be hard-deleted; this is the only reaper of \
+             soft-deleted artifacts rows, so sparing the object must not spare the row"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Mock storage backend for unit tests
@@ -3252,6 +3590,7 @@ mod tests {
             artifacts_removed: 12,
             bytes_freed: 1024 * 1024,
             errors: vec![],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"storage_keys_deleted\":5"));
@@ -3266,6 +3605,7 @@ mod tests {
             artifacts_removed: 0,
             bytes_freed: 0,
             errors: vec![],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"dry_run\":true"));
@@ -3279,6 +3619,7 @@ mod tests {
             artifacts_removed: 3,
             bytes_freed: 512,
             errors: vec!["Failed to delete key abc".to_string()],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -3302,6 +3643,7 @@ mod tests {
                 "error two".to_string(),
                 "error three".to_string(),
             ],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -3338,6 +3680,7 @@ mod tests {
             artifacts_removed: i64::MAX,
             bytes_freed: i64::MAX,
             errors: vec![],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         let restored: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -3354,6 +3697,7 @@ mod tests {
             artifacts_removed: 0,
             bytes_freed: 0,
             errors: vec![],
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"errors\":[]"));
@@ -3367,6 +3711,7 @@ mod tests {
             artifacts_removed: 2,
             bytes_freed: 3,
             errors: vec!["err".to_string()],
+            maven_flat_objects_gated: 0,
         };
         let debug = format!("{:?}", result);
         assert!(debug.contains("StorageGcResult"));
@@ -3386,6 +3731,7 @@ mod tests {
             artifacts_removed: 50,
             bytes_freed: 50 * 1024,
             errors: errors.clone(),
+            maven_flat_objects_gated: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         let restored: StorageGcResult = serde_json::from_str(&json).unwrap();
@@ -3821,6 +4167,246 @@ mod tests {
         );
     }
 
+    /// The lease name is an operator-visible wire value (`SELECT * FROM
+    /// scheduler_leases WHERE job_name = 'storage_gc'`), so pin it. Renaming
+    /// it silently breaks every runbook and dashboard built on #3384 while
+    /// leaving both replicas perfectly happy.
+    #[test]
+    fn scheduled_gc_lease_job_name_is_the_documented_wire_name() {
+        assert_eq!(
+            SCHEDULED_GC_JOB_NAME, "storage_gc",
+            "the scheduled GC lease name is operator-visible (#3384) — do not rename it"
+        );
+    }
+
+    /// [`StorageGcService::run_scheduled_tick`] must skip (return `false`)
+    /// while another replica holds the named lease, and must acquire, run,
+    /// and release it (returning `true`) once that lease is free — the
+    /// concurrency guard added for artifact-keeper#3384.
+    ///
+    /// Runs against the REAL [`SCHEDULED_GC_JOB_NAME`], not a random name, so
+    /// the argument the scheduler actually passes is under test; nothing else
+    /// in the tree claims that lease (the scheduler itself never starts in a
+    /// `--lib` test binary).
+    ///
+    /// Also pins the other half of the contract: the on-demand admin endpoint
+    /// is NOT gated by this lease and must still run while a scheduled tick
+    /// holds it. That is the property the whole change is allowed to be
+    /// invisible on — an operator hitting `POST /api/v1/admin/storage-gc`
+    /// during a tick must not silently get a no-op.
+    #[tokio::test]
+    async fn run_scheduled_tick_respects_the_singleton_lease() {
+        use crate::api::handlers::storage_gc::{run_storage_gc, StorageGcRequest};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
+        use crate::services::cluster_work;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let storage = fixture_storage(&fixture);
+        let uid = Uuid::new_v4().simple().to_string();
+        let job = SCHEDULED_GC_JOB_NAME;
+
+        // One genuinely orphaned, system-written, past-the-age-floor object.
+        // The fixture config leaves `MAVEN_FLAT_GC_ENABLED` off, so a pass
+        // that reaches it REPORTS it (`maven_flat_objects_gated`) and deletes
+        // nothing. That counter is what makes the on-demand assertion below
+        // observable: a lease-gated no-op would report zero.
+        let probe_key = format!("maven/ondemand3384/{uid}/lib/maven-metadata.xml");
+        seed_objects(&storage, &[&probe_key]).await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &probe_key,
+            2,
+            "metadata_rollup",
+        )
+        .await;
+        // Defensive: a previous crashed run of this test could have left the
+        // singleton row behind, which would make the first assertion pass for
+        // the wrong reason.
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(job)
+            .execute(&fixture.pool)
+            .await;
+
+        // Simulate another replica already holding the lease for this tick.
+        let other_replica_lease =
+            cluster_work::try_acquire_scheduler_lease(&fixture.pool, job, "other-replica", 60.0)
+                .await
+                .expect("query ok")
+                .expect("first claim wins");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        assert!(
+            !service.run_scheduled_tick(job).await,
+            "tick must skip while another replica holds the lease"
+        );
+
+        // The on-demand admin endpoint shares the service but NOT the lease:
+        // it calls `run_gc` directly and must still work here.
+        let admin = AuthExtension {
+            user_id: fixture.user_id,
+            username: fixture.username.clone(),
+            is_admin: true,
+            ..Default::default()
+        };
+        let on_demand = run_storage_gc(
+            axum::extract::State(fixture.state.clone()),
+            axum::extract::Extension(admin),
+            axum::Json(StorageGcRequest { dry_run: false }),
+        )
+        .await;
+        let on_demand =
+            on_demand.expect("on-demand admin GC must not error while the lease is held");
+        assert!(
+            on_demand.0.maven_flat_objects_gated >= 1,
+            "the on-demand admin GC endpoint must not be blocked by the \
+             scheduled tick's lease — it must actually run the flat-object \
+             sweep and report the seeded orphan, not return an empty no-op \
+             result: {:?}",
+            on_demand.0
+        );
+        assert!(
+            storage.exists(&probe_key).await.expect("exists check"),
+            "the on-demand pass is gated the same way the scheduled one is: \
+             MAVEN_FLAT_GC_ENABLED is off, so it reports and deletes nothing"
+        );
+
+        // Free the lease; the next tick must win it, run, and release it.
+        other_replica_lease.release(&fixture.pool).await;
+        assert!(
+            service.run_scheduled_tick(job).await,
+            "tick must run once the lease is free"
+        );
+
+        let held_after = cluster_work::try_acquire_scheduler_lease(
+            &fixture.pool,
+            job,
+            "post-tick-checker",
+            60.0,
+        )
+        .await
+        .expect("query ok");
+        assert!(
+            held_after.is_some(),
+            "a completed tick must release the lease, not hold it forever"
+        );
+
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(job)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+    }
+
+    /// Winning the lease must change WHO sweeps, never WHAT is swept.
+    ///
+    /// The #3431 incident was an unrecoverable data loss on exactly this
+    /// sweep, and this PR is its reachability multiplier (the trigram index
+    /// makes the candidate scan orders of magnitude faster, so a pass that
+    /// used to be slow enough to be starved now reliably completes to its
+    /// full 1000-key budget). Both #3431 guards are
+    /// therefore re-asserted THROUGH the leased entry point rather than only
+    /// through `run_gc`/`run_gc_for_repository`:
+    ///
+    /// 1. `MAVEN_FLAT_GC_ENABLED` unset ⇒ a won tick deletes nothing.
+    /// 2. Opted in, the `metadata_rollup` row is reclaimed (positive control,
+    ///    so (1) cannot pass by simply never finding a candidate) while the
+    ///    `operator_repair` row — a source outside
+    ///    `SYSTEM_WRITTEN_ATTRIBUTION_SOURCES` — is preserved.
+    #[tokio::test]
+    async fn run_scheduled_tick_honours_the_flat_gc_gate_and_source_allowlist() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let storage = fixture_storage(&fixture);
+        let uid = Uuid::new_v4().simple().to_string();
+        let job = format!("test-storage-gc-gate-{uid}");
+
+        // Both are genuinely orphaned and past the one-hour age floor; the
+        // ONLY difference between them is `source`.
+        let system_key = format!("maven/gate3384/{uid}/sys/maven-metadata.xml");
+        let operator_key = format!("maven/gate3384/{uid}/ops/maven-metadata.xml");
+        seed_objects(&storage, &[&system_key, &operator_key]).await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &system_key,
+            2,
+            "metadata_rollup",
+        )
+        .await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &operator_key,
+            2,
+            "operator_repair",
+        )
+        .await;
+
+        // (1) Gate unset — default construction, exactly as production builds
+        // it when MAVEN_FLAT_GC_ENABLED is absent.
+        let gated =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        assert!(
+            gated.run_scheduled_tick(&job).await,
+            "the gated tick must still WIN the lease — the gate is about \
+             deleting, not about running"
+        );
+        let after_gated = objects_left(&storage, &[&system_key, &operator_key]).await;
+        let sys_rows_gated = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &system_key).await;
+
+        // (2) Same fixture data, same leased entry point, opted in.
+        let enabled =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_maven_flat_gc_enabled(true);
+        assert!(
+            enabled.run_scheduled_tick(&job).await,
+            "the second tick must win the lease the first one released"
+        );
+        let after_enabled = objects_left(&storage, &[&system_key, &operator_key]).await;
+        let ops_rows_enabled =
+            count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &operator_key).await;
+
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(&job)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+
+        assert_eq!(
+            after_gated,
+            vec![true, true],
+            "with MAVEN_FLAT_GC_ENABLED unset a WON tick must delete nothing \
+             (#3431); leasing the tick must not open a second path around the gate"
+        );
+        assert_eq!(
+            sys_rows_gated, 1,
+            "the gated tick must leave the attribution row in place too"
+        );
+        assert_eq!(
+            after_enabled,
+            vec![false, true],
+            "opted in, the leased tick reclaims the system-written \
+             `metadata_rollup` object (positive control) and PRESERVES the \
+             `operator_repair` one — the #3431 source allowlist still holds \
+             through the lease path"
+        );
+        assert_eq!(
+            ops_rows_enabled, 1,
+            "an operator_repair attribution row is a primary record nothing \
+             can re-derive; it must survive an opted-in leased tick"
+        );
+    }
+
     /// Reference kind for [`insert_referenced_soft_deleted_artifact`].
     enum RefKind {
         /// Insert an `oci_tags` row pointing at the digest.
@@ -4082,9 +4668,11 @@ mod tests {
     #[test]
     fn test_flat_predicate_rollup_guard_uses_shared_fragments() {
         use crate::services::maven_flat_attribution as mfa;
+        let anchor = mfa::metadata_rollup_dir_anchor_sql("a2.storage_key", "o.storage_key");
         for fragment in [
             mfa::is_metadata_rollup_key_sql("o.storage_key"),
             mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
+            anchor.clone(),
         ] {
             assert!(
                 ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(&fragment),
@@ -4092,6 +4680,13 @@ mod tests {
                  not an inline copy"
             );
         }
+        assert!(
+            anchor.contains("ESCAPE ''"),
+            "the rollup anchor must disable LIKE escape processing: without it \
+             a literal backslash in a stored key is read as an escape \
+             character and the guard misses its OWN directory, so a NOT EXISTS \
+             delete guard deletes a still-served rollup; anchor: {anchor}"
+        );
     }
 
     /// #3156: a live parent artifact's metadata `files[]` must anchor its
@@ -4270,6 +4865,115 @@ mod tests {
         );
     }
 
+    /// The rollup anchor must survive a literal backslash in the stored key.
+    ///
+    /// Guard 3 builds its `LIKE` pattern FROM the candidate key
+    /// (`metadata_rollup_dir_anchor_sql`), and Postgres's default `LIKE`
+    /// escape character is a backslash. Without an `ESCAPE` clause the prefix
+    /// `.../com/ba\ck/lib/` is read as the pattern `.../com/back/lib/`, so the
+    /// rollup's OWN live artifact no longer matches, the guard reads "nothing
+    /// anchors this", and a `NOT EXISTS` miss means DELETE — the sweep
+    /// reclaims a `maven-metadata.xml` that is still being served. The loss is
+    /// silent, because the Maven read path synthesises a substitute document.
+    ///
+    /// The backslash fixture deliberately has NO artifact under the collapsed
+    /// `.../com/back/lib/` directory. If such a sibling existed the accidental
+    /// pattern would match it and the rollup would be spared *without* the
+    /// fix, making the test green for the wrong reason.
+    ///
+    /// The `%` and `_` fixtures pin the OTHER direction: those characters
+    /// widen the pattern, so the guard over-matches and therefore
+    /// over-PROTECTS. That is the safe failure direction on an unrecoverable
+    /// delete path and `ESCAPE ''` keeps it deliberately — these two
+    /// assertions fail if anyone later swaps in an exact SQL-side escaper.
+    ///
+    /// TWO positive controls keep the fix honest: a genuinely unreferenced
+    /// rollup whose directory contains a backslash, and a plain one. Without
+    /// them, sparing every key containing a backslash would pass.
+    #[tokio::test]
+    async fn test_orphan_maven_flat_scan_spares_rollup_whose_directory_contains_a_backslash() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let uid = Uuid::new_v4().simple().to_string();
+        let root = format!("maven/gcesc/{uid}/com");
+
+        // 1. The oracle. `\c` collapses to `c` without ESCAPE, and nothing
+        //    lives under the collapsed `back/lib/` directory.
+        let bs_rollup = format!(r"{root}/ba\ck/lib/maven-metadata.xml");
+        let bs_live = format!(r"{root}/ba\ck/lib/1.0/lib-1.0.jar");
+        // 2/3. Over-protect pins: the live artifact sits under a DIFFERENT
+        //      directory that only the widened pattern reaches.
+        let pct_rollup = format!("{root}/pc%nt/lib/maven-metadata.xml");
+        let pct_live = format!("{root}/pcXXnt/lib/1.0/lib-1.0.jar");
+        let und_rollup = format!("{root}/us_c/lib/maven-metadata.xml");
+        let und_live = format!("{root}/usZc/lib/1.0/lib-1.0.jar");
+        // 4/5. Positive controls: nothing live under either directory, and
+        //      nothing under the backslash one's collapsed `dead/lib/` form.
+        let dead_bs_rollup = format!(r"{root}/de\ad/lib/maven-metadata.xml");
+        let dead_rollup = format!("{root}/plain/lib/maven-metadata.xml");
+
+        for key in [&bs_live, &pct_live, &und_live] {
+            insert_maven_artifact_row(&fixture.pool, fixture.repo_id, fixture.user_id, key, false)
+                .await;
+        }
+        for key in [
+            &bs_rollup,
+            &pct_rollup,
+            &und_rollup,
+            &dead_bs_rollup,
+            &dead_rollup,
+        ] {
+            insert_flat_attribution_row(&fixture.pool, fixture.repo_id, key, 2).await;
+        }
+
+        let rows = service
+            .select_orphan_maven_flat_objects(Some(fixture.repo_id))
+            .await;
+        let collected: Vec<String> = rows
+            .expect("scan succeeds")
+            .iter()
+            .map(|r| r.get::<String, _>("storage_key"))
+            .collect();
+        fixture.teardown().await;
+
+        assert!(
+            !collected.contains(&bs_rollup),
+            "guard 3: a maven-metadata.xml whose directory contains a literal \
+             backslash must NOT be collected while its own subtree is still \
+             live — without ESCAPE '' the derived pattern names a DIFFERENT \
+             directory and the guard misses its own artifact; \
+             collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&pct_rollup),
+            "a `%` in a stored key must keep WIDENING the anchor (over-PROTECT, \
+             the safe direction on an unrecoverable delete path); this fails if \
+             the anchor is switched to an exact SQL-side escaper; \
+             collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&und_rollup),
+            "a `_` in a stored key must keep widening the anchor for the same \
+             reason as `%`; collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_bs_rollup),
+            "positive control: a rollup over an EMPTY subtree must still be \
+             collected even though its directory contains a backslash — \
+             otherwise sparing every backslash key would pass; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_rollup),
+            "positive control: a plain rollup over an empty subtree must still \
+             be collected; collected: {collected:?}"
+        );
+    }
+
     /// Seed a parent `artifacts` row plus an `artifact_metadata` row whose
     /// `files[]` array lists a row-less companion under `json_key_name`.
     async fn seed_flat_parent_metadata(
@@ -4328,15 +5032,36 @@ mod tests {
         storage_key: &str,
         age_hours: i32,
     ) {
+        insert_flat_attribution_row_with_source(
+            pool,
+            repo_id,
+            storage_key,
+            age_hours,
+            "write_claim",
+        )
+        .await;
+    }
+
+    /// [`insert_flat_attribution_row`] with an explicit `source`, for the
+    /// #3431 tests that turn on which writer produced the row. `source` is a
+    /// test literal, never external input.
+    async fn insert_flat_attribution_row_with_source(
+        pool: &PgPool,
+        repo_id: Uuid,
+        storage_key: &str,
+        age_hours: i32,
+        source: &str,
+    ) {
         sqlx::query(
             "INSERT INTO maven_flat_object_owner \
                  (storage_backend, storage_key, repository_id, source, created_at) \
-             VALUES ('filesystem', $1, $2, 'write_claim', \
+             VALUES ('filesystem', $1, $2, $4, \
                      NOW() - make_interval(hours => $3))",
         )
         .bind(storage_key)
         .bind(repo_id)
         .bind(age_hours)
+        .bind(source)
         .execute(pool)
         .await
         .expect("insert flat attribution row");
@@ -4366,8 +5091,13 @@ mod tests {
         let fixture =
             crate::api::handlers::test_db_helpers::Fixture::setup("local", "maven").await?;
         let storage = fixture_storage(&fixture);
+        // These are the #2668 RECLAIM tests, so they opt the flat-object
+        // sweep in explicitly (#3431). The default is report-only; the gate
+        // itself is covered by
+        // `test_run_gc_gated_flat_sweep_reports_but_deletes_nothing_3431`.
         let service =
-            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_maven_flat_gc_enabled(true);
         let uid = Uuid::new_v4().simple().to_string();
         Some((fixture, storage, service, uid))
     }
@@ -4562,6 +5292,284 @@ mod tests {
              (#2668 safety)"
         );
         assert_eq!(rows_left, 2, "both attribution rows must be intact");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3431: the attribution table must not nominate its own keys for deletion
+    // -----------------------------------------------------------------------
+
+    /// Revert-proof, DB-free: the source allowlist must be IN the predicate,
+    /// and every value in it must be one the system actually writes.
+    ///
+    /// `ORPHAN_MAVEN_FLAT_PREDICATE_SQL` enumerates its candidates FROM
+    /// `maven_flat_object_owner` and tests catalog anchors only. Since
+    /// #2574/#2585 an owner row is also what makes a row-less legacy object
+    /// READABLE, so for an object whose only catalog record is its owner row
+    /// every anchor arm is true by construction and permanently: without this
+    /// arm the row that makes the object servable is the row that queues it
+    /// for deletion (#3431).
+    #[test]
+    fn test_flat_predicate_restricts_reclaim_to_system_written_sources_3431() {
+        use crate::services::maven_flat_attribution as mfa;
+
+        let arm = mfa::system_written_source_sql("o.source");
+        assert!(
+            ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(&arm),
+            "ORPHAN_MAVEN_FLAT_PREDICATE_SQL must restrict reclaim to \
+             system-written attribution sources (#3431); expected the arm \
+             {arm} to appear in:\n{}",
+            ORPHAN_MAVEN_FLAT_PREDICATE_SQL.as_str()
+        );
+        for source in mfa::SYSTEM_WRITTEN_ATTRIBUTION_SOURCES {
+            assert!(
+                arm.contains(&format!("'{source}'")),
+                "{source} must be quoted into the SQL allowlist"
+            );
+        }
+        // An ALLOWLIST, not a denylist: the arm must name the sources it
+        // permits, never the ones it excludes, so an unknown/future value is
+        // protected by default rather than reclaimed by default.
+        assert!(
+            arm.contains(" IN (") && !arm.contains("NOT IN"),
+            "the source arm must be an allowlist (`IN`), so unknown sources \
+             fail SAFE (#3431); got: {arm}"
+        );
+    }
+
+    /// #3431 repro, fixed: an operator repairs a fail-closed 404 by inserting
+    /// an attribution row by hand (`source='manual'`, the documented
+    /// remediation for keys the catalog-only backfill of migrations 163/170
+    /// cannot see). Before the fix the next hourly pass deleted the S3 object
+    /// AND the row, so the key went 404 -> 200 -> permanently gone.
+    ///
+    /// The sweep is opted IN here, so this test isolates the source allowlist
+    /// from the opt-in gate: reverting the allowlist alone must fail it.
+    ///
+    /// The `write_claim` positive control is load-bearing — the fix must not
+    /// disable the sweep's legitimate purpose. An orphaned claim left by a
+    /// crashed first publish is exactly the leftover it exists to collect,
+    /// and without this assertion "spare everything" would pass.
+    #[tokio::test]
+    async fn test_run_gc_spares_operator_attributed_flat_object_3431() {
+        let Some((fixture, storage, service, uid)) = maven_gc_2668_setup().await else {
+            return;
+        };
+
+        // Hand-repaired legacy companion: no artifacts row, no files[]
+        // reference, nothing under its directory. Its owner row is the ONLY
+        // record of it, and the only reason a GET serves it.
+        let manual = format!("maven/gc3431/{uid}/com/example/lib/1.0.0/lib-1.0.0.pom");
+        // Orphaned write claim from a crashed publish: system-written, and
+        // re-derivable (the next publish re-claims the key).
+        let claim = format!("maven/gc3431/{uid}/com/example/crashed/1.0.0/crashed-1.0.0.jar");
+        seed_objects(&storage, &[&manual, &claim]).await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &manual,
+            2,
+            "manual",
+        )
+        .await;
+        insert_flat_attribution_row(&fixture.pool, fixture.repo_id, &claim, 2).await;
+
+        let gc = service.run_gc_for_repository(fixture.repo_id, false).await;
+
+        let left = objects_left(&storage, &[&manual, &claim]).await;
+        let manual_rows = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &manual).await;
+        let claim_rows = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &claim).await;
+        fixture.teardown().await;
+
+        gc.expect("run_gc_for_repository succeeds");
+        assert!(
+            left[0],
+            "an object whose owner row an OPERATOR wrote (source='manual') \
+             must survive the sweep — that row is a primary record, not a \
+             re-derivable cache, and deleting the object destroys the only \
+             physical copy (#3431)"
+        );
+        assert_eq!(
+            manual_rows, 1,
+            "the operator's attribution row must survive too — it is the only \
+             record that the key was hand-attributed, and losing it makes the \
+             object unreadable even if the bytes were restored (#3431)"
+        );
+        assert!(
+            !left[1],
+            "positive control: an orphaned `write_claim` is system-written and \
+             re-derivable, so it must STILL be reclaimed — the fix must not \
+             disable the sweep's legitimate purpose (#3431)"
+        );
+        assert_eq!(
+            claim_rows, 0,
+            "the reclaimed claim's attribution row is dropped with its object"
+        );
+    }
+
+    /// Per-source candidacy, at the scan: every system-written source stays
+    /// reclaimable once its anchors are gone, and every non-system source —
+    /// including a value no code in this tree has ever written — is spared.
+    ///
+    /// The unknown-source case (`external_repair_tool`) is the FAIL-SAFE
+    /// property: the arm is an allowlist, so a value stamped by a future code
+    /// path or an external repair tool is protected until someone
+    /// deliberately adds it. Getting this backwards leaks storage; getting it
+    /// right the other way destroys the only copy of an object.
+    ///
+    /// Repository-scoped, so no GC lock is needed (#1493 pattern).
+    #[tokio::test]
+    async fn test_orphan_maven_flat_scan_spares_non_system_sources_3431() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::maven_flat_attribution::SYSTEM_WRITTEN_ATTRIBUTION_SOURCES;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let uid = Uuid::new_v4().simple().to_string();
+
+        // Non-system sources: the operator repair from the report, plus a
+        // value nothing in this tree writes.
+        let protected_sources = ["manual", "external_repair_tool"];
+
+        let mut expect_collected = Vec::new();
+        for source in SYSTEM_WRITTEN_ATTRIBUTION_SOURCES {
+            let key = format!("maven/scan3431/{uid}/{source}/1.0/gone-1.0.pom");
+            insert_flat_attribution_row_with_source(
+                &fixture.pool,
+                fixture.repo_id,
+                &key,
+                2,
+                source,
+            )
+            .await;
+            expect_collected.push((source, key));
+        }
+        let mut expect_spared = Vec::new();
+        for source in protected_sources {
+            let key = format!("maven/scan3431/{uid}/{source}/1.0/kept-1.0.pom");
+            insert_flat_attribution_row_with_source(
+                &fixture.pool,
+                fixture.repo_id,
+                &key,
+                2,
+                source,
+            )
+            .await;
+            expect_spared.push((source, key));
+        }
+
+        let rows = service
+            .select_orphan_maven_flat_objects(Some(fixture.repo_id))
+            .await;
+        let collected: Vec<String> = rows
+            .expect("scan succeeds")
+            .iter()
+            .map(|r| r.get::<String, _>("storage_key"))
+            .collect();
+        fixture.teardown().await;
+
+        for (source, key) in &expect_collected {
+            assert!(
+                collected.contains(key),
+                "source='{source}' is written by the system and is a cache \
+                 over other catalog state, so it must STAY reclaimable once \
+                 its anchors are gone — sparing it leaks storage forever \
+                 (#3431); collected: {collected:?}"
+            );
+        }
+        for (source, key) in &expect_spared {
+            assert!(
+                !collected.contains(key),
+                "source='{source}' is not one the system writes, so its row is \
+                 a primary record nothing can re-derive and its object must NOT \
+                 be collected; unknown sources are protected by DEFAULT because \
+                 the arm is an allowlist (#3431); collected: {collected:?}"
+            );
+        }
+    }
+
+    /// The opt-in gate (#3431), mirroring `BLOB_GC_ENABLED`: with
+    /// `MAVEN_FLAT_GC_ENABLED` unset the sweep still reports what it would
+    /// reclaim but deletes nothing — neither the object nor its attribution
+    /// row. Flipping the flag on the same fixture data reclaims it, which
+    /// keeps the gate from passing by simply never finding candidates.
+    ///
+    /// This runs through `run_gc_for_repository`, the per-repository admin
+    /// endpoint's entry point, which shares both the predicate constant and
+    /// the gate with the scheduled pass.
+    #[tokio::test]
+    async fn test_run_gc_gated_flat_sweep_reports_but_deletes_nothing_3431() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let storage = fixture_storage(&fixture);
+        let uid = Uuid::new_v4().simple().to_string();
+
+        // Genuinely orphaned, system-written, past the age floor: the source
+        // allowlist alone would reclaim this one.
+        let key = format!("maven/gate3431/{uid}/lib/maven-metadata.xml");
+        seed_objects(&storage, &[&key]).await;
+        insert_flat_attribution_row(&fixture.pool, fixture.repo_id, &key, 2).await;
+
+        // Default construction == MAVEN_FLAT_GC_ENABLED unset.
+        let gated =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let gated_result = gated
+            .run_gc_for_repository(fixture.repo_id, false)
+            .await
+            .expect("gated run_gc_for_repository succeeds");
+        let survived = storage.exists(&key).await.expect("exists check");
+        let rows_after_gated = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &key).await;
+
+        // Same data, same code path, flag on.
+        let enabled =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_maven_flat_gc_enabled(true);
+        let enabled_result = enabled
+            .run_gc_for_repository(fixture.repo_id, false)
+            .await
+            .expect("enabled run_gc_for_repository succeeds");
+        let left_after_enabled = storage.exists(&key).await.expect("exists check");
+        let rows_after_enabled = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &key).await;
+        fixture.teardown().await;
+
+        assert!(
+            survived,
+            "with MAVEN_FLAT_GC_ENABLED unset the flat-object sweep must \
+             delete nothing (#3431)"
+        );
+        assert_eq!(
+            rows_after_gated, 1,
+            "the attribution row must survive the gated pass too"
+        );
+        assert_eq!(
+            gated_result.maven_flat_objects_gated, 1,
+            "the gated pass must still REPORT what it would reclaim, so an \
+             operator can size the sweep before opting in (#3431)"
+        );
+        assert_eq!(
+            gated_result.storage_keys_deleted, 0,
+            "a gated pass must not count un-deleted objects as deleted"
+        );
+
+        assert!(
+            !left_after_enabled,
+            "positive control: with the flag on, the very same key IS \
+             reclaimed — otherwise the gate test would pass on a sweep that \
+             simply never finds candidates (#3431)"
+        );
+        assert_eq!(
+            rows_after_enabled, 0,
+            "the enabled pass drops the attribution row with the object"
+        );
+        assert_eq!(
+            enabled_result.maven_flat_objects_gated, 0,
+            "nothing is gated once the sweep is opted in"
+        );
     }
 
     /// End-to-end variant of the manifest-survival test: run GC with
@@ -7440,14 +8448,23 @@ mod tests {
     ///    files (counted per `storage_path`), while a digest shared by two
     ///    repos on a shared backend is ONE object.
     /// 3. The age filter is genuinely exercised: backdating a blob past the
-    ///    grace window must move the `aged_*` figures by that blob. A
-    ///    vacuous filter (always true or always false) yields a zero delta
-    ///    either way and fails.
+    ///    grace window must move the `aged_*` figures by exactly that blob.
+    ///    A vacuous filter (always true or always false) fails either the
+    ///    aged==0 assertion before the backdate or the aged==300 one after.
     ///
-    /// Global totals are asserted as before/after DELTAS with `>=`:
-    /// `oci_blobs` is cluster-wide and other DB-backed suites seed it
-    /// concurrently (their inserts only inflate the deltas). Per-repository
-    /// rows are keyed by our own repo ids and asserted exactly.
+    /// The model assertions run against `fetch_blob_footprint_totals`
+    /// scoped to the seeded digests — the SAME statement the unscoped
+    /// production report executes — so every figure is EXACT (`==`), not a
+    /// cluster-wide before/after delta. The previous delta form raced every
+    /// concurrent suite that deletes `oci_blobs` rows (`cargo nextest` is
+    /// process-per-test against one shared database) and was flaky in CI
+    /// (#3129). The digests are locally generated UUIDs, so no concurrent
+    /// test can add or remove matching rows. The unscoped report itself is
+    /// still called and pinned by race-free ABSOLUTE lower bounds (our rows
+    /// exist for the whole test, so cluster totals can never be below our
+    /// contribution), which also proves the `None` scope arm filters
+    /// nothing out. Per-repository rows are keyed by our own repo ids and
+    /// asserted exactly, as before.
     #[tokio::test]
     async fn test_oci_blob_footprint_report_executes_dedups_and_ages() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -7466,14 +8483,6 @@ mod tests {
         ));
         let svc = StorageGcService::new(pool.clone(), registry);
 
-        // On main this call errors with `function make_interval(hours =>
-        // bigint) does not exist` before returning any row.
-        let r0 = svc
-            .oci_blob_footprint_report(24)
-            .await
-            .expect("baseline footprint report must execute (#2626)");
-        assert_eq!(r0.grace_hours, 24);
-
         // Fixture: a digest shared by two filesystem repos (distinct
         // storage_path => two physical files), a digest unique to repo_a,
         // and a digest shared by two repos on a shared backend ('s3': one
@@ -7487,42 +8496,65 @@ mod tests {
         let repo_c = seed_footprint_repo(&pool, "s3", &[(&shared_cloud, 700)]).await;
         let repo_d = seed_footprint_repo(&pool, "s3", &[(&shared_cloud, 700)]).await;
 
+        let digests = [shared_fs.clone(), only_a.clone(), shared_cloud.clone()];
+
+        // Totals scoped to exactly the seeded digests: deterministic under
+        // any concurrent suite, so every figure is exact.
+        let t1 = svc
+            .fetch_blob_footprint_totals(24, Some(&digests))
+            .await
+            .expect("scoped footprint totals must execute (#2626)");
+        assert_eq!(t1.total_blob_rows, 5, "five rows seeded across four repos");
+        assert_eq!(t1.distinct_digests, 3, "three content identities seeded");
+        assert_eq!(
+            t1.logical_bytes, 3_700,
+            "1000+300+1000 fs + 700+700 cloud rows seeded"
+        );
+        // Filesystem copies count per storage_path (1000 + 1000 + 300) and
+        // the cloud digest counts once (700). Global per-digest dedup would
+        // report 2000 here; per-path-everywhere counting would report
+        // 3700. Both MUST fail this.
+        assert_eq!(
+            t1.physical_bytes, 3_000,
+            "fs digest per path + cloud digest once"
+        );
+        // Every seeded row is seconds old: nothing crosses the 24h grace
+        // window yet. An always-true age filter reports 3000 here.
+        assert_eq!(t1.aged_distinct_digests, 0);
+        assert_eq!(t1.aged_physical_bytes, 0);
+
+        // The production (unscoped) report must EXECUTE (#2626) and share
+        // the same statement. Our rows exist for the whole test and no
+        // other suite can delete them, so cluster totals at this snapshot
+        // are at least our contribution — an absolute lower bound that
+        // holds regardless of concurrent inserts/deletes elsewhere (no
+        // before/after delta, which is what made this test flaky, #3129).
+        // A `None` digest scope that wrongly filtered rows out would
+        // report 0 here and fail.
         let r1 = svc
             .oci_blob_footprint_report(24)
             .await
-            .expect("footprint report must execute after seeding");
-
-        assert!(r1.total_blob_rows - r0.total_blob_rows >= 5);
-        assert!(r1.distinct_digests - r0.distinct_digests >= 3);
-        let logical_delta = r1.logical_bytes - r0.logical_bytes;
-        let physical_delta = r1.physical_bytes - r0.physical_bytes;
+            .expect("footprint report must execute after seeding (#2626)");
+        assert_eq!(r1.grace_hours, 24);
         assert!(
-            logical_delta >= 3_700,
-            "1000+300+1000 fs + 700+700 cloud rows seeded, got {logical_delta}"
+            r1.total_blob_rows >= 5,
+            "cluster row count can never be below our 5 live rows, got {}",
+            r1.total_blob_rows
         );
-        // Filesystem copies count per storage_path (2000 + 300) and the
-        // cloud digest counts once (700). Global per-digest dedup would
-        // report only 2000 here and MUST fail this.
         assert!(
-            physical_delta >= 3_000,
-            "fs digest per path + cloud digest once, got {physical_delta}"
+            r1.distinct_digests >= 3,
+            "cluster digest count can never be below our 3 live digests, got {}",
+            r1.distinct_digests
         );
-        // The cloud pair is the only sharing we introduced whose copies
-        // dedup away: logical exceeds physical by that one 700-byte copy.
-        // Per-path-everywhere counting would make our contribution to this
-        // difference 0 and MUST fail this.
-        assert!(
-            logical_delta - physical_delta >= 700,
-            "exactly one cloud copy dedups away, got {}",
-            logical_delta - physical_delta
-        );
+        // Snapshot-internal invariants (computed in one statement, so
+        // consistent even mid-churn).
         assert!(r1.logical_bytes >= r1.physical_bytes);
         assert!(r1.aged_physical_bytes <= r1.physical_bytes);
 
         // Backdate the unique digest past the 24h grace window: the aged
-        // figures must move by at least that blob (all our other rows are
+        // figures must move by exactly that blob (all our other rows are
         // seconds old). A filter that ignores `first_seen` in either
-        // direction produces a ~0 delta here.
+        // direction fails these exact assertions.
         sqlx::query(
             "UPDATE oci_blobs SET created_at = NOW() - INTERVAL '48 hours' \
              WHERE repository_id = $1 AND digest = $2",
@@ -7533,21 +8565,26 @@ mod tests {
         .await
         .expect("backdate blob");
 
-        let r2 = svc
-            .oci_blob_footprint_report(24)
+        let t2 = svc
+            .fetch_blob_footprint_totals(24, Some(&digests))
             .await
-            .expect("footprint report must execute after backdating");
-        assert!(
-            r2.aged_physical_bytes - r1.aged_physical_bytes >= 300,
-            "backdated 300-byte blob crossed the grace window: {} -> {}",
-            r1.aged_physical_bytes,
-            r2.aged_physical_bytes
+            .expect("scoped footprint totals must execute after backdating");
+        assert_eq!(
+            t2.aged_distinct_digests, 1,
+            "exactly the backdated digest crossed the grace window"
         );
-        assert!(r2.aged_distinct_digests - r1.aged_distinct_digests >= 1);
-        assert!(r2.aged_physical_bytes <= r2.physical_bytes);
+        assert_eq!(
+            t2.aged_physical_bytes, 300,
+            "backdated 300-byte blob crossed the grace window: {} -> {}",
+            t1.aged_physical_bytes, t2.aged_physical_bytes
+        );
+        // The backdate must not disturb the non-aged figures.
+        assert_eq!(t2.total_blob_rows, 5);
+        assert_eq!(t2.logical_bytes, 3_700);
+        assert_eq!(t2.physical_bytes, 3_000);
 
         // Per-repo rows are isolated to our repos and exact.
-        let by_repo: std::collections::HashMap<Uuid, (i64, i64)> = r2
+        let by_repo: std::collections::HashMap<Uuid, (i64, i64)> = r1
             .per_repository
             .iter()
             .map(|r| (r.repository_id, (r.blob_rows, r.logical_bytes)))

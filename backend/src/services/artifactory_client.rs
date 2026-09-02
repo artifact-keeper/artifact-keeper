@@ -289,6 +289,32 @@ pub struct PermissionsResponse {
 /// pass the same outbound SSRF policy (`validate_outbound_url`) as any other
 /// upstream URL before we issue a request to it. Factored out as a free
 /// function so the guard is unit-testable without a live HTTP client.
+/// Candidate ping endpoints for an Artifactory deployment, in probe order
+/// (#2847).
+///
+/// `{base}/api/system/ping` is the classic Artifactory REST ping, correct
+/// when `base_url` carries the `/artifactory` context (the self-hosted
+/// default) or when the deployment routes the Artifactory service at the
+/// root. Instances fronted by the JFrog Platform unified router (JFrog
+/// Cloud, or self-hosted platform installs) 404 that path and expose the
+/// Access service's ping at `{platform_root}/access/api/v1/system/ping`
+/// instead — the Access service lives at the platform root, so a trailing
+/// `/artifactory` context is stripped for that candidate.
+fn ping_candidate_urls(base_url: &str) -> Vec<String> {
+    let base = base_url.trim_end_matches('/');
+    let platform_root = base.strip_suffix("/artifactory").unwrap_or(base);
+    let mut candidates = vec![format!("{}/api/system/ping", base)];
+    for url in [
+        format!("{}/access/api/v1/system/ping", platform_root),
+        format!("{}/access/api/v1/system/ping", base),
+    ] {
+        if !candidates.contains(&url) {
+            candidates.push(url);
+        }
+    }
+    candidates
+}
+
 fn download_uri_is_safe_to_follow(download_uri: &str) -> bool {
     crate::api::validation::validate_outbound_url(download_uri, "Artifactory downloadUri").is_ok()
 }
@@ -497,13 +523,33 @@ impl ArtifactoryClient {
 
     // ============ API Methods ============
 
-    /// Ping Artifactory to check if it's reachable
+    /// Ping Artifactory to check if it's reachable (#2847).
+    ///
+    /// Probes each shape from [`ping_candidate_urls`] in order and reports
+    /// reachable on the first success. Deployments fronted by the JFrog
+    /// Platform router 404 the classic `/api/system/ping` and only answer the
+    /// Access service's `/access/api/v1/system/ping`, so a single-endpoint
+    /// probe wrongly reported those instances as unreachable.
     pub async fn ping(&self) -> Result<bool, ArtifactoryError> {
-        let url = format!("{}/api/system/ping", self.config.base_url);
-        let request = self.auth_request(self.client.get(&url));
-
-        let response = request.send().await?;
-        Ok(response.status().is_success())
+        let mut last_err: Option<ArtifactoryError> = None;
+        for url in ping_candidate_urls(&self.config.base_url) {
+            let request = self.auth_request(self.client.get(&url));
+            match request.send().await {
+                Ok(response) if response.status().is_success() => return Ok(true),
+                // Non-success: this deployment does not answer this ping
+                // shape; try the next candidate.
+                Ok(_) => {}
+                Err(e) => last_err = Some(ArtifactoryError::HttpError(e)),
+            }
+        }
+        match last_err {
+            // The host answered every candidate, just never successfully —
+            // same `Ok(false)` the old single-endpoint probe reported.
+            None => Ok(false),
+            // At least one candidate failed at the transport level and none
+            // succeeded: surface the error, as before.
+            Some(e) => Err(e),
+        }
     }
 
     /// Get Artifactory system version information
@@ -937,6 +983,111 @@ mod tests {
         assert_eq!(config.timeout_secs, 30);
         assert_eq!(config.max_concurrent, 4);
         assert_eq!(config.throttle_delay_ms, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Ping endpoint fallback (#2847)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ping_candidates_classic_first_then_access() {
+        assert_eq!(
+            ping_candidate_urls("https://repo.example.com"),
+            vec![
+                "https://repo.example.com/api/system/ping".to_string(),
+                "https://repo.example.com/access/api/v1/system/ping".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ping_candidates_strip_artifactory_context_for_access() {
+        // The Access service lives at the PLATFORM root, not under the
+        // `/artifactory` context; both spellings are probed.
+        assert_eq!(
+            ping_candidate_urls("https://repo.example.com/artifactory/"),
+            vec![
+                "https://repo.example.com/artifactory/api/system/ping".to_string(),
+                "https://repo.example.com/access/api/v1/system/ping".to_string(),
+                "https://repo.example.com/artifactory/access/api/v1/system/ping".to_string(),
+            ]
+        );
+    }
+
+    /// Build a client over a plain reqwest client (no `https_only`) so
+    /// wiremock's HTTP listener is reachable without env toggles.
+    fn test_client(base_url: String) -> ArtifactoryClient {
+        ArtifactoryClient {
+            client: reqwest::Client::new(),
+            config: ArtifactoryClientConfig {
+                base_url,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A JFrog Platform deployment 404s the classic `/api/system/ping` and
+    /// answers only the Access service's ping (#2847). The probe must fall
+    /// through and report reachable.
+    #[tokio::test]
+    async fn test_ping_falls_back_to_access_service_endpoint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/system/ping"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("404 page not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/access/api/v1/system/ping"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
+            .mount(&server)
+            .await;
+
+        let client = test_client(server.uri());
+        assert!(
+            client.ping().await.expect("ping must not error"),
+            "ping must fall back to /access/api/v1/system/ping and succeed"
+        );
+    }
+
+    /// A reachable host that answers no ping shape is `Ok(false)`, exactly as
+    /// the old single-endpoint probe reported.
+    #[tokio::test]
+    async fn test_ping_false_when_no_shape_answers() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = test_client(server.uri());
+        assert!(!client.ping().await.expect("ping must not error"));
+    }
+
+    /// The classic endpoint still wins on deployments that serve it — no
+    /// second request is made.
+    #[tokio::test]
+    async fn test_ping_classic_endpoint_short_circuits() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/system/ping"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(server.uri());
+        assert!(client.ping().await.expect("ping must not error"));
+        let hits = server.received_requests().await.unwrap_or_default().len();
+        assert_eq!(hits, 1, "a successful classic ping must short-circuit");
     }
 
     #[test]

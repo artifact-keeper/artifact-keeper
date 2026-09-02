@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT password_hash, totp_secret, totp_enabled, username, is_admin, is_service_account,\n                  auth_provider as \"auth_provider: crate::models::user::AuthProvider\"\n           FROM users WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "password_hash",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "totp_secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "username",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "is_admin",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_service_account",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "auth_provider: crate::models::user::AuthProvider",
+        "type_info": {
+          "Custom": {
+            "name": "auth_provider",
+            "kind": {
+              "Enum": [
+                "local",
+                "ldap",
+                "saml",
+                "oidc",
+                "ci"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1f30879f912651b42371381aab9ed2099a8884d345b5e9390a01c93bc27d3e10"
+}

@@ -1,0 +1,35 @@
+# Pinned Rust toolchain — see #3551.
+#
+# WHY THIS FILE EXISTS
+# Nothing here used to pin a compiler. `🦀 Check Rust` runs on the self-hosted
+# `ak-ci-runners` image and simply used whatever rustc that image happened to
+# bake in; every other Rust job used `dtolnay/rust-toolchain@stable`, which
+# resolves at run time. So the toolchain could change under `main` with no diff,
+# no PR and no announcement — and on 2026-08-24 it did: the runner image picked
+# up Rust 1.98.0 (released 2026-08-20) and `cargo clippy -- -D warnings` went
+# from clean to 555 errors on an unchanged tree, turning `main` and every open
+# PR red at once. Reproduced exactly: 1.97.0 exits 0 and 1.98.0 exits 101 on
+# commit dc069400.
+#
+# WHAT IT BUYS
+# `rustup` reads this file and it outranks `rustup default`, which is what
+# `dtolnay/rust-toolchain` sets — so this one line governs CI, local `cargo`
+# runs and the Docker build alike, and a compiler upgrade becomes a reviewable
+# one-line diff that runs the full suite before it can reach `main`.
+#
+# HOW TO UPGRADE
+# Bump `channel` here and the matching `dtolnay/rust-toolchain@<version>` refs
+# in .github/workflows/*.yml in the SAME pull request — `scripts/ci/check-
+# toolchain-pin.sh` fails the build if they disagree, so they cannot drift.
+# Do it deliberately and on a schedule (a bump PR each Rust release, ~6 weeks)
+# rather than never: a pin that is not maintained is how a codebase ends up
+# years behind and unable to take a security fix. The bump PR is where new
+# lints get triaged, which is the whole point — one PR that has to go green,
+# instead of a surprise on `main`.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+# `🪟 Windows Cross-Build` (ci.yml) cross-compiles with no toolchain-install
+# step of its own, so the target must come from here or that job loses its std.
+targets = ["x86_64-pc-windows-gnu"]
+profile = "minimal"

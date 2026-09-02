@@ -153,7 +153,14 @@ pub async fn get_quarantine_status(
     let holds_repository = auth_ext.can_access_repo(row.repository_id)
         && (auth_ext.is_admin
             || repo_service
-                .user_can_access_repo(row.repository_id, auth_ext.user_id)
+                .user_can_access_repo(
+                    row.repository_id,
+                    auth_ext.user_id,
+                    // CONTENT (#3331): the reason is the policy name, finding
+                    // counts and admin incident notes behind the hold — private
+                    // security detail, so `read` and not merely a grant.
+                    crate::services::repository_service::RepoAccess::READ,
+                )
                 .await?);
     let quarantine_reason = if holds_repository {
         row.quarantine_reason

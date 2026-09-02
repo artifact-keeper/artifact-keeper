@@ -78,7 +78,11 @@ fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
         storage_path,
     )));
     let storage_service = Arc::new(StorageService::new(proxy_backend));
-    state.proxy_service = Some(Arc::new(ProxyService::new(pool, storage_service)));
+    state.proxy_service = Some(Arc::new(ProxyService::new(
+        pool,
+        storage_service,
+        artifact_keeper_backend::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+    )));
 
     Arc::new(state)
 }
@@ -207,7 +211,7 @@ async fn resolve_virtual_blob_walks_to_third_member_when_first_two_404() {
     add_member(&pool, virt_id, member_c, 3).await;
 
     let state = build_state(pool.clone(), &storage_path);
-    let res = resolve_virtual_blob(&state, virt_id, "myimage", &blob_digest).await;
+    let res = resolve_virtual_blob(&state, None, virt_id, "myimage", &blob_digest).await;
 
     match res {
         // #2274: the remote member blob is now STREAMED (teed into the proxy
@@ -273,13 +277,13 @@ async fn resolve_virtual_blob_returns_none_when_no_member_has_it_and_negative_ca
     let state = build_state(pool.clone(), &storage_path);
 
     // First probe: walks both upstreams, gets None.
-    let first = resolve_virtual_blob(&state, virt_id, "missing", &blob_digest).await;
+    let first = resolve_virtual_blob(&state, None, virt_id, "missing", &blob_digest).await;
     assert!(first.is_none(), "expected None on first probe");
 
     // Second probe immediately after: should hit the negative cache and
     // NOT re-walk the upstreams. The mock `.expect(1)` enforces this on
     // server drop.
-    let second = resolve_virtual_blob(&state, virt_id, "missing", &blob_digest).await;
+    let second = resolve_virtual_blob(&state, None, virt_id, "missing", &blob_digest).await;
     assert!(
         second.is_none(),
         "expected None on second probe (negative cache hit)"
@@ -350,7 +354,7 @@ async fn resolve_virtual_manifest_rejects_digest_ref_mismatch_and_falls_through(
     add_member(&pool, virt_id, member_b, 2).await;
 
     let state = build_state(pool.clone(), &storage_path);
-    let res = resolve_virtual_manifest(&state, virt_id, "myimage", &digest, None).await;
+    let res = resolve_virtual_manifest(&state, None, virt_id, "myimage", &digest, None).await;
 
     match res {
         Some((returned_digest, _ct, body, _member)) => {
@@ -400,7 +404,7 @@ async fn resolve_virtual_manifest_returns_none_when_every_member_tampers() {
     add_member(&pool, virt_id, member, 1).await;
 
     let state = build_state(pool.clone(), &storage_path);
-    let res = resolve_virtual_manifest(&state, virt_id, "myimage", &digest, None).await;
+    let res = resolve_virtual_manifest(&state, None, virt_id, "myimage", &digest, None).await;
 
     assert!(
         res.is_none(),

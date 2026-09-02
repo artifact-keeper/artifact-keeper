@@ -716,6 +716,35 @@ impl SbomService {
     /// forever for artifacts uploaded before this fix shipped. With the
     /// hash-gated cache, a rescan that surfaces 30 new packages re-emits
     /// the document; identical re-generations skip the write.
+    /// Build an SBOM document and return it **without persisting anything**.
+    ///
+    /// Exists for proxy-cached content, which has no `artifacts` row
+    /// (#1278/#1280) and therefore cannot be stored in `sbom_documents` —
+    /// `artifact_id` is `NOT NULL` with a foreign key to `artifacts`. Rather
+    /// than make that column nullable (which would touch every SBOM query in
+    /// the codebase and put a cross-tenant `ON DELETE CASCADE` in the path),
+    /// the proxy read path regenerates from the stored package inventory each
+    /// time.
+    ///
+    /// The generators are pure functions of the dependency list, so this is
+    /// in-memory assembly over a bounded row set. Skipping persistence also
+    /// skips the `content_hash` cache-invalidation logic that only exists to
+    /// keep a stored row consistent.
+    pub fn generate_ephemeral(
+        &self,
+        format: SbomFormat,
+        dependencies: &[DependencyInfo],
+        inventory_completeness: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let (content, _components) = match format {
+            SbomFormat::CycloneDX => {
+                self.generate_cyclonedx_inner(dependencies, inventory_completeness)?
+            }
+            SbomFormat::SPDX => self.generate_spdx_inner(dependencies, inventory_completeness)?,
+        };
+        Ok(content)
+    }
+
     pub async fn generate_sbom(
         &self,
         artifact_id: Uuid,

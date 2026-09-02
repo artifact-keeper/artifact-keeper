@@ -1,5 +1,9 @@
 //! Admin handlers (backups, system settings).
 
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
+use crate::services::totp_policy::{self, check_policy_activation, TotpPolicy, TotpPolicySource};
 use axum::{
     extract::{Extension, Path, Query, State},
     routing::{get, post},
@@ -29,6 +33,10 @@ pub fn router() -> Router<SharedState> {
         .route("/backups/:id/restore", post(restore_backup))
         .route("/backups/:id/cancel", post(cancel_backup))
         .route("/settings", get(get_settings).post(update_settings))
+        .route(
+            "/settings/totp-policy",
+            get(get_totp_policy).put(update_totp_policy),
+        )
         .route("/stats", get(get_system_stats))
         .route("/downloads", get(list_downloads))
         .route("/downloads/by-ip/:ip", get(list_downloads_by_ip))
@@ -38,6 +46,10 @@ pub fn router() -> Router<SharedState> {
         .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
         .route("/audit", get(list_audit_logs))
+        .route(
+            "/proxy-scan-verdicts/:digest",
+            get(get_proxy_scan_verdicts).delete(delete_proxy_scan_verdicts),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +465,13 @@ pub async fn create_backup(
 }
 
 /// Execute a pending backup
+///
+/// Answers with the backup resource as persisted after the run. A run that
+/// FAILED is reported as `status = "failed"` with `error_message` naming the
+/// cause — it is not a transport-level error, because the request was
+/// understood and carried out and the outcome belongs to the backup (#3327).
+/// Clients must read `status`, not just the HTTP code. `500` is reserved for
+/// the cases where no run outcome exists to report at all.
 #[utoipa::path(
     post,
     path = "/backups/{id}/execute",
@@ -462,9 +481,10 @@ pub async fn create_backup(
         ("id" = Uuid, Path, description = "Backup ID")
     ),
     responses(
-        (status = 200, description = "Backup executed", body = BackupResponse),
+        (status = 200, description = "Backup run finished; `status` is `completed` or `failed` and `error_message` carries the cause of a failure", body = BackupResponse),
         (status = 404, description = "Backup not found"),
-        (status = 500, description = "Internal server error")
+        (status = 409, description = "Another backup is already in progress"),
+        (status = 500, description = "The run could not be started or its outcome could not be recorded")
     ),
     security(("bearer_auth" = []))
 )]
@@ -485,7 +505,20 @@ pub async fn execute_backup(
     let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
     let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
 
-    let backup = service.execute(id).await?;
+    // `execute_run`, not `execute`: a run that ends FAILED has already recorded
+    // its own terminal state and the message naming what went wrong, and that
+    // is what the caller is answered with. Collapsing it into an `Err` here
+    // produced a bare `500 {"code":"INTERNAL_ERROR"}` whose body threw away the
+    // very message the failure exists to deliver (#3327).
+    let run = service.execute_run(id).await?;
+    if let Some(ref message) = run.failure {
+        tracing::warn!(
+            backup_id = %id,
+            "backup run finished in state failed: {}",
+            message
+        );
+    }
+    let backup = run.backup;
 
     Ok(Json(BackupResponse {
         id: backup.id,
@@ -507,6 +540,17 @@ pub struct RestoreRequest {
     pub restore_database: Option<bool>,
     pub restore_artifacts: Option<bool>,
     pub target_repository_id: Option<Uuid>,
+    /// Accept an archive whose integrity cannot be established (#3373).
+    ///
+    /// A restore refuses an archive it cannot check: since #3373 every backup
+    /// records its payload checksum on the `backups` row, outside the archive,
+    /// and the archive's contents are verified against it before any row is
+    /// ingested. Archives captured before that column existed fall back to the
+    /// checksum in their own manifest; one carrying neither cannot be verified
+    /// at all, and this flag is the deliberate, audited way to restore it
+    /// anyway. It never waives a checksum that is present and does not match.
+    #[serde(default)]
+    pub allow_unverified_archive: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -514,6 +558,11 @@ pub struct RestoreResponse {
     pub tables_restored: Vec<String>,
     pub artifacts_restored: i32,
     pub errors: Vec<String>,
+    /// What the archive's contents were checked against (#3373):
+    /// `recorded` (the digest on the `backups` row, the strong case),
+    /// `manifest` (the archive's own checksum -- detects corruption, not
+    /// tampering), or `waived` (`allow_unverified_archive` was set).
+    pub integrity_anchor: String,
 }
 
 /// Restore from backup
@@ -528,6 +577,8 @@ pub struct RestoreResponse {
     request_body = RestoreRequest,
     responses(
         (status = 200, description = "Backup restored", body = RestoreResponse),
+        (status = 400, description = "Archive integrity could not be established, or an \
+                                      unsupported option was supplied"),
         (status = 404, description = "Backup not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -535,6 +586,7 @@ pub struct RestoreResponse {
 )]
 pub async fn restore_backup(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>> {
@@ -555,6 +607,8 @@ pub async fn restore_backup(
         restore_database: payload.restore_database.unwrap_or(true),
         restore_artifacts: payload.restore_artifacts.unwrap_or(true),
         target_repository_id: payload.target_repository_id,
+        allow_unverified_archive: payload.allow_unverified_archive,
+        actor: Some(auth.user_id),
     };
 
     let result = service.restore(id, options).await?;
@@ -563,6 +617,7 @@ pub async fn restore_backup(
         tables_restored: result.tables_restored,
         artifacts_restored: result.artifacts_restored,
         errors: result.errors,
+        integrity_anchor: result.integrity_anchor.to_string(),
     }))
 }
 
@@ -791,17 +846,208 @@ pub async fn update_settings(
     Ok(Json(settings))
 }
 
+// ---------------------------------------------------------------------------
+// TOTP (2FA) enforcement policy (#2805)
+// ---------------------------------------------------------------------------
+
+/// Current 2FA enforcement policy plus the context an operator needs before
+/// tightening it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TotpPolicyResponse {
+    /// The policy in force.
+    pub policy: TotpPolicy,
+    /// Whether it comes from the `TOTP_POLICY` environment variable (in which
+    /// case `PUT` is refused) or from the database.
+    pub source: TotpPolicySource,
+    /// Whether `PUT` can change the policy at all right now.
+    pub editable: bool,
+    /// Local (password-authenticating, non-service) administrators.
+    pub local_admins: i64,
+    /// How many of those already have TOTP enabled. Under
+    /// `required_for_admins`, `local_admins - local_admins_with_totp` is the
+    /// number of administrators who will be sent through forced enrollment at
+    /// their next sign-in.
+    pub local_admins_with_totp: i64,
+    /// Local (password-authenticating, non-service) users, admins included.
+    pub local_users: i64,
+    /// How many of those already have TOTP enabled.
+    pub local_users_with_totp: i64,
+    /// Whether the *calling* administrator has TOTP enabled. Tightening the
+    /// policy requires this.
+    pub caller_totp_enabled: bool,
+}
+
+/// Request body for `PUT /admin/settings/totp-policy`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateTotpPolicyRequest {
+    pub policy: TotpPolicy,
+}
+
+/// Counts of local (password) accounts and how many have TOTP enrolled.
+struct LocalTotpCounts {
+    admins: i64,
+    admins_with_totp: i64,
+    users: i64,
+    users_with_totp: i64,
+}
+
+/// Population the policy can actually apply to: active, local-provider,
+/// non-service accounts. SSO/LDAP/CI users and service accounts are exempt, so
+/// counting them here would overstate the blast radius of a policy change.
+async fn local_totp_counts(db: &sqlx::PgPool) -> Result<LocalTotpCounts> {
+    let row = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE is_admin)                     as "admins!",
+            COUNT(*) FILTER (WHERE is_admin AND totp_enabled)    as "admins_with_totp!",
+            COUNT(*)                                             as "users!",
+            COUNT(*) FILTER (WHERE totp_enabled)                 as "users_with_totp!"
+        FROM users
+        WHERE is_active = true
+          AND is_service_account = false
+          AND auth_provider = 'local'
+        "#
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(LocalTotpCounts {
+        admins: row.admins,
+        admins_with_totp: row.admins_with_totp,
+        users: row.users,
+        users_with_totp: row.users_with_totp,
+    })
+}
+
+async fn build_totp_policy_response(
+    state: &SharedState,
+    caller_id: Uuid,
+) -> Result<TotpPolicyResponse> {
+    let (policy, source) = totp_policy::effective_policy(&state.db, state.config.totp_policy).await;
+    let counts = local_totp_counts(&state.db).await?;
+    let caller_totp_enabled =
+        sqlx::query_scalar!("SELECT totp_enabled FROM users WHERE id = $1", caller_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .unwrap_or(false);
+
+    Ok(TotpPolicyResponse {
+        policy,
+        source,
+        editable: source == TotpPolicySource::Database,
+        local_admins: counts.admins,
+        local_admins_with_totp: counts.admins_with_totp,
+        local_users: counts.users,
+        local_users_with_totp: counts.users_with_totp,
+        caller_totp_enabled,
+    })
+}
+
+/// Read the system-wide 2FA enforcement policy.
+#[utoipa::path(
+    get,
+    path = "/settings/totp-policy",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Current 2FA enforcement policy", body = TotpPolicyResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_totp_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<TotpPolicyResponse>> {
+    Ok(Json(
+        build_totp_policy_response(&state, auth.user_id).await?,
+    ))
+}
+
+/// Change the system-wide 2FA enforcement policy.
+///
+/// Tightening the policy requires the calling administrator to have TOTP
+/// enabled — that is the lockout-safety guard: it guarantees at least one
+/// administrator whose (pre-existing, already-working) sign-in path survives the
+/// change. Loosening is never refused. A policy change does **not** invalidate
+/// existing sessions or refresh tokens; it takes effect at the next interactive
+/// password login, so the administrator making the change keeps their session.
+#[utoipa::path(
+    put,
+    path = "/settings/totp-policy",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = UpdateTotpPolicyRequest,
+    responses(
+        (status = 200, description = "Policy updated", body = TotpPolicyResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Refused: policy pinned by TOTP_POLICY, or the calling admin has not enrolled in TOTP", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_totp_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<UpdateTotpPolicyRequest>,
+) -> Result<Json<TotpPolicyResponse>> {
+    let current = build_totp_policy_response(&state, auth.user_id).await?;
+
+    if let Err(refusal) = check_policy_activation(
+        current.policy,
+        payload.policy,
+        current.source == TotpPolicySource::Environment,
+        current.caller_totp_enabled,
+    ) {
+        return Err(AppError::Conflict(refusal.message().to_string()));
+    }
+
+    totp_policy::store_policy(&state.db, payload.policy, auth.user_id).await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::TotpPolicyChanged, ResourceType::User)
+            .user(auth.user_id)
+            .resource(auth.user_id)
+            .actor_name(&auth.username)
+            .details(serde_json::json!({
+                "from": current.policy.as_str(),
+                "to": payload.policy.as_str(),
+                "local_admins": current.local_admins,
+                "local_admins_with_totp": current.local_admins_with_totp,
+            })),
+    )
+    .await;
+
+    Ok(Json(
+        build_totp_policy_response(&state, auth.user_id).await?,
+    ))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SystemStats {
     pub total_repositories: i64,
+    /// Rows in `artifacts` (for OCI repositories that is manifests only —
+    /// layer/config blobs are content-addressed objects, not artifacts).
+    /// Unlike the byte total, this count still includes legacy backfilled
+    /// `proxy-cache/%` rows.
     pub total_artifacts: i64,
+    /// All stored bytes, summed from `repository_usage_ledger`
+    /// (`hosted_bytes + proxy_bytes + oci_bytes`) — the same source the
+    /// per-repository `storage_used_bytes` figures are read from, so the
+    /// dashboard total is consistent with the per-repo column by
+    /// construction (#3134). Includes OCI layer/config blob bytes
+    /// (`oci_blobs`) and proxy-cached bytes; `proxy_storage_bytes` below is
+    /// a *breakdown* of this total, not a disjoint bucket.
     pub total_storage_bytes: i64,
     pub total_downloads: i64,
     pub total_users: i64,
     pub active_peers: i64,
     pub pending_sync_tasks: i64,
     /// Proxy-cached (pull-through) objects, tracked in `proxy_cache_artifacts`
-    /// rather than `artifacts`, so they are reported separately here.
+    /// rather than `artifacts`. Since #3134 the byte figure is a breakdown of
+    /// `total_storage_bytes` (do not add the two).
     pub proxy_artifact_count: i64,
     pub proxy_storage_bytes: i64,
 }
@@ -824,30 +1070,46 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let artifact_stats = sqlx::query!(
+    let artifact_count = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) as "count!" FROM artifacts WHERE is_deleted = false"#
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // #3134: byte totals come from the usage ledger, not a raw `artifacts`
+    // aggregate. The `artifacts` table holds no OCI layer/config blobs (only
+    // manifests land there — blobs live in `oci_blobs`), so summing it
+    // under-reported a docker repository by orders of magnitude. The ledger's
+    // per-repository components are maintained by the migration-182 triggers
+    // and trued up by `reconcile_all_usage_ledgers` from the authoritative
+    // 3-way source sums (`artifacts` excluding legacy `proxy-cache/%` keys +
+    // `proxy_cache_artifacts` + `oci_blobs`), and are exactly what the
+    // per-repository `storage_used_bytes` column and quota admission already
+    // read — one accounting implementation, so the dashboard total equals the
+    // sum of the per-repo figures by construction. This is the logical
+    // (per-repository) figure: a blob cross-repo-mounted into N repositories
+    // counts once per repository, matching quota; physical dedup on shared
+    // backends is the storage-GC footprint report's concern. Virtual
+    // repositories own no rows in the source tables, so nothing is
+    // double-counted (#2785). Also the O(repositories) shape #3094 asks for.
+    let storage_totals = sqlx::query!(
         r#"
         SELECT
-            COUNT(*) as "count!",
-            COALESCE(SUM(size_bytes), 0)::BIGINT as "size!"
-        FROM artifacts
-        WHERE is_deleted = false
+            COALESCE(SUM(hosted_bytes + proxy_bytes + oci_bytes), 0)::BIGINT as "total!",
+            COALESCE(SUM(proxy_bytes), 0)::BIGINT as "proxy!"
+        FROM repository_usage_ledger
         "#
     )
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let proxy_stats = sqlx::query!(
-        r#"
-        SELECT
-            COUNT(*) as "count!",
-            COALESCE(SUM(size_bytes), 0)::BIGINT as "size!"
-        FROM proxy_cache_artifacts
-        "#
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let proxy_count =
+        sqlx::query_scalar!(r#"SELECT COUNT(*) as "count!" FROM proxy_cache_artifacts"#)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
     let download_count =
         sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM download_statistics")
@@ -876,14 +1138,14 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
 
     Ok(Json(SystemStats {
         total_repositories: repo_count,
-        total_artifacts: artifact_stats.count,
-        total_storage_bytes: artifact_stats.size,
+        total_artifacts: artifact_count,
+        total_storage_bytes: storage_totals.total,
         total_downloads: download_count,
         total_users: user_count,
         active_peers: active_edge_count,
         pending_sync_tasks: pending_sync_count,
-        proxy_artifact_count: proxy_stats.count,
-        proxy_storage_bytes: proxy_stats.size,
+        proxy_artifact_count: proxy_count,
+        proxy_storage_bytes: storage_totals.proxy,
     }))
 }
 
@@ -1405,6 +1667,208 @@ pub async fn rescan_for_inventory(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Proxy scan verdict inspect / invalidate (#3244)
+// ---------------------------------------------------------------------------
+
+/// Normalize an operator-supplied content digest for the `proxy_scan_results`
+/// key: accepts either `sha256:<64 hex>` or the bare 64-hex form (the stored
+/// shape), lowercases it, and rejects anything else. Pure so the validation is
+/// unit-testable without a DB.
+pub(crate) fn normalize_verdict_digest(raw: &str) -> Option<String> {
+    let hex = raw.trim().strip_prefix("sha256:").unwrap_or(raw.trim());
+    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hex.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// One stored `proxy_scan_results` row, as returned by the admin
+/// inspect/invalidate endpoints (#3244).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyScanVerdictItem {
+    pub checksum_sha256: String,
+    pub scan_type: String,
+    pub verdict: String,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub max_severity: Option<String>,
+    pub scanner_version: Option<String>,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::services::proxy_scan_service::ProxyScanRow> for ProxyScanVerdictItem {
+    fn from(r: crate::services::proxy_scan_service::ProxyScanRow) -> Self {
+        Self {
+            checksum_sha256: r.checksum_sha256,
+            scan_type: r.scan_type,
+            verdict: r.verdict,
+            findings_count: r.findings_count,
+            critical_count: r.critical_count,
+            high_count: r.high_count,
+            medium_count: r.medium_count,
+            low_count: r.low_count,
+            max_severity: r.max_severity,
+            scanner_version: r.scanner_version,
+            scanned_at: r.scanned_at,
+        }
+    }
+}
+
+/// Response for the admin proxy-scan-verdict endpoints (#3244).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyScanVerdictListResponse {
+    /// The normalized (bare-hex) digest the verdicts are keyed on.
+    pub digest: String,
+    pub verdicts: Vec<ProxyScanVerdictItem>,
+}
+
+/// Inspect the stored proxy scan verdict(s) for a content digest (#3244).
+///
+/// The verdict store is content-addressed and GLOBAL across repositories and
+/// tenants (the same bytes are the same CVEs), which is why this surface is
+/// instance-admin only: no repo-scoped principal should read — let alone
+/// clear — a lever that spans every repo.
+#[utoipa::path(
+    get,
+    path = "/proxy-scan-verdicts/{digest}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(("digest" = String, Path, description = "Content digest: `sha256:<64 hex>` or bare 64-hex")),
+    responses(
+        (status = 200, description = "Stored verdict rows for the digest", body = ProxyScanVerdictListResponse),
+        (status = 400, description = "Malformed digest"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "No stored verdict for this digest"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_proxy_scan_verdicts(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(digest): Path<String>,
+) -> Result<Json<ProxyScanVerdictListResponse>> {
+    // Defense-in-depth behind the /admin nest's admin_middleware, with the
+    // RBAC-deny recorded (#2321 G-AUDIT convention).
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::ScanResult,
+        "/api/v1/admin/proxy-scan-verdicts",
+        "GET",
+    )
+    .await?;
+    let normalized = normalize_verdict_digest(&digest).ok_or_else(|| {
+        AppError::Validation("digest must be sha256:<64 hex> or bare 64-hex".to_string())
+    })?;
+    let rows = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone())
+        .list_verdicts_for_digest(&normalized)
+        .await?;
+    if rows.is_empty() {
+        return Err(AppError::NotFound(
+            "no stored proxy scan verdict for this digest".to_string(),
+        ));
+    }
+    Ok(Json(ProxyScanVerdictListResponse {
+        digest: normalized,
+        verdicts: rows.into_iter().map(Into::into).collect(),
+    }))
+}
+
+/// Invalidate (delete) the stored proxy scan verdict(s) for a content digest
+/// (#3244).
+///
+/// This forces RE-ASSESSMENT on the next pull — it is NOT a waiver. The next
+/// pull of the digest re-scans (inline under `fail_closed`, asynchronously
+/// under `fail_open`) and records a fresh verdict; a still-flagged image is
+/// immediately re-blocked. Only a stale verdict (advisory withdrawn, CVE-DB
+/// corrected) is durably cleared. Deleting by digest un-blocks that content
+/// EVERYWHERE (the store is global by design), hence instance-admin only.
+/// The deletion is audited with the removed rows' verdict summary.
+#[utoipa::path(
+    delete,
+    path = "/proxy-scan-verdicts/{digest}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(("digest" = String, Path, description = "Content digest: `sha256:<64 hex>` or bare 64-hex")),
+    responses(
+        (status = 200, description = "Deleted verdict rows (re-assessment forced on next pull)", body = ProxyScanVerdictListResponse),
+        (status = 400, description = "Malformed digest"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "No stored verdict for this digest"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_proxy_scan_verdicts(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(digest): Path<String>,
+) -> Result<Json<ProxyScanVerdictListResponse>> {
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::ScanResult,
+        "/api/v1/admin/proxy-scan-verdicts",
+        "DELETE",
+    )
+    .await?;
+    let normalized = normalize_verdict_digest(&digest).ok_or_else(|| {
+        AppError::Validation("digest must be sha256:<64 hex> or bare 64-hex".to_string())
+    })?;
+    let rows = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone())
+        .delete_verdicts_for_digest(&normalized)
+        .await?;
+    if rows.is_empty() {
+        return Err(AppError::NotFound(
+            "no stored proxy scan verdict for this digest".to_string(),
+        ));
+    }
+    // Audit the clear: who removed which verdicts for which digest. Details
+    // carry the verdict summary so the trail shows what protection state was
+    // discarded, never any credential material.
+    let audit = crate::services::audit_service::AuditService::new(state.db.clone());
+    let entry = crate::services::audit_service::AuditEntry::new(
+        crate::services::audit_service::AuditAction::ProxyScanVerdictDeleted,
+        crate::services::audit_service::ResourceType::ScanResult,
+    )
+    .user(auth.user_id)
+    .details(serde_json::json!({
+        "digest": normalized,
+        "deleted": rows
+            .iter()
+            .map(|r| serde_json::json!({
+                "scan_type": r.scan_type,
+                "verdict": r.verdict,
+                "findings_count": r.findings_count,
+                "max_severity": r.max_severity,
+                "scanner_version": r.scanner_version,
+                "scanned_at": r.scanned_at,
+            }))
+            .collect::<Vec<_>>(),
+    }));
+    if let Err(e) = audit.log(entry).await {
+        // Fire-and-forget posture: an audit-table outage must not turn a
+        // completed delete into a 500, but it must be loud.
+        tracing::error!(digest = %normalized, error = %e, "failed to audit proxy scan verdict deletion");
+    }
+    tracing::warn!(
+        actor_user_id = %auth.user_id,
+        digest = %normalized,
+        deleted = rows.len(),
+        "admin cleared proxy scan verdict(s); next pull re-assesses"
+    );
+    Ok(Json(ProxyScanVerdictListResponse {
+        digest: normalized,
+        verdicts: rows.into_iter().map(Into::into).collect(),
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -1417,6 +1881,8 @@ pub async fn rescan_for_inventory(
         delete_backup,
         get_settings,
         update_settings,
+        get_totp_policy,
+        update_totp_policy,
         get_system_stats,
         list_downloads,
         list_downloads_by_ip,
@@ -1426,6 +1892,8 @@ pub async fn rescan_for_inventory(
         rescan_for_inventory,
         list_storage_backends,
         list_audit_logs,
+        get_proxy_scan_verdicts,
+        delete_proxy_scan_verdicts,
     ),
     components(schemas(
         ListBackupsQuery,
@@ -1435,6 +1903,10 @@ pub async fn rescan_for_inventory(
         RestoreRequest,
         RestoreResponse,
         SystemSettings,
+        TotpPolicyResponse,
+        UpdateTotpPolicyRequest,
+        TotpPolicy,
+        TotpPolicySource,
         SystemStats,
         ListDownloadsQuery,
         DownloadRecord,
@@ -1446,6 +1918,8 @@ pub async fn rescan_for_inventory(
         RescanForInventoryResponse,
         AuditLogItem,
         AuditLogListResponse,
+        ProxyScanVerdictItem,
+        ProxyScanVerdictListResponse,
     ))
 )]
 pub struct AdminApiDoc;
@@ -1458,6 +1932,58 @@ mod tests {
     // audit_page_bounds (#2366) — pure pagination arithmetic, no DB required so
     // the coverage gate exercises it even without Postgres.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // normalize_verdict_digest (#3244) — pure digest validation, no DB.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_verdict_digest_accepts_both_forms() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            normalize_verdict_digest(&format!("sha256:{hex}")).as_deref(),
+            Some(hex.as_str()),
+            "prefixed digest normalizes to the stored bare-hex shape"
+        );
+        assert_eq!(
+            normalize_verdict_digest(&hex).as_deref(),
+            Some(hex.as_str())
+        );
+        // Uppercase hex lowercases (the store is lowercase hex).
+        let upper = "A".repeat(64);
+        assert_eq!(
+            normalize_verdict_digest(&upper).as_deref(),
+            Some(hex.as_str())
+        );
+        // Surrounding whitespace is tolerated.
+        assert_eq!(
+            normalize_verdict_digest(&format!("  sha256:{hex}  ")).as_deref(),
+            Some(hex.as_str())
+        );
+    }
+
+    #[test]
+    fn test_normalize_verdict_digest_rejects_malformed() {
+        assert_eq!(normalize_verdict_digest(""), None);
+        assert_eq!(normalize_verdict_digest("sha256:"), None);
+        assert_eq!(normalize_verdict_digest(&"a".repeat(63)), None, "too short");
+        assert_eq!(normalize_verdict_digest(&"a".repeat(65)), None, "too long");
+        assert_eq!(
+            normalize_verdict_digest(&format!("{}g", "a".repeat(63))),
+            None,
+            "non-hex"
+        );
+        assert_eq!(
+            normalize_verdict_digest(&format!("md5:{}", "a".repeat(64))),
+            None,
+            "unknown algorithm prefix must not silently pass through"
+        );
+        // SQL-shaped garbage can never reach the query.
+        assert_eq!(
+            normalize_verdict_digest("'; DROP TABLE proxy_scan_results;--"),
+            None
+        );
+    }
 
     #[test]
     fn test_audit_page_bounds_defaults() {
@@ -1712,6 +2238,170 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #2805 — 2FA enforcement policy endpoints (DB-backed; no-op without
+    // DATABASE_URL). Serialized on the shared policy-row advisory lock.
+    // -----------------------------------------------------------------------
+
+    /// Build an `AuthExtension` for `user_id` as an admin caller.
+    fn admin_auth(user_id: Uuid, username: &str) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{username}@test.local"),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
+        }
+    }
+
+    /// The lockout-safety guard, end to end: an admin who has not enrolled
+    /// cannot tighten the policy; the same admin, once enrolled, can; and
+    /// loosening never requires enrollment.
+    #[tokio::test]
+    async fn test_totp_policy_put_enforces_the_you_first_guard() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::totp_policy_serial_lock().await;
+        let restore = totp_policy::stored_policy(&pool).await;
+
+        // Deliberately NOT flagged `is_admin` in the database: the admin check
+        // is route middleware, and `admin_security`'s accessible-users test
+        // asserts a global count that every active admin enters. Creating one
+        // here would make that pre-existing race fire. Nothing under test reads
+        // the column -- `check_policy_activation` keys on the actor's TOTP
+        // state, not their role.
+        let (user_id, username) = tdh::create_user(&pool).await;
+        totp_policy::store_policy(&pool, TotpPolicy::Disabled, user_id)
+            .await
+            .expect("seed disabled");
+
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-totp-policy");
+        let auth = admin_auth(user_id, &username);
+
+        // 1. Not enrolled -> tightening is refused with 409.
+        let refused = update_totp_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::RequiredForAdmins,
+            }),
+        )
+        .await;
+        let refused_err = refused.err();
+
+        // 2. Enrol the caller, then the same change is accepted.
+        sqlx::query("UPDATE users SET totp_enabled = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("enrol caller");
+        let accepted = update_totp_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::RequiredForAll,
+            }),
+        )
+        .await;
+
+        // 3. Loosening never requires enrollment.
+        sqlx::query("UPDATE users SET totp_enabled = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("un-enrol caller");
+        let loosened = update_totp_policy(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::Disabled,
+            }),
+        )
+        .await;
+
+        let read = get_totp_policy(State(state), Extension(auth)).await;
+
+        totp_policy::store_policy(&pool, restore, user_id)
+            .await
+            .expect("restore policy");
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            matches!(refused_err, Some(AppError::Conflict(_))),
+            "an unenrolled admin must not be able to tighten the policy: {refused_err:?}"
+        );
+        let accepted = accepted.expect("an enrolled admin may tighten").0;
+        assert_eq!(accepted.policy, TotpPolicy::RequiredForAll);
+        assert_eq!(accepted.source, TotpPolicySource::Database);
+        assert!(accepted.editable);
+
+        let loosened = loosened.expect("loosening must never be refused").0;
+        assert_eq!(loosened.policy, TotpPolicy::Disabled);
+
+        let read = read.expect("read policy").0;
+        assert_eq!(read.policy, TotpPolicy::Disabled);
+        // The blast-radius counts must see the local user we created, and the
+        // admin subset can never exceed the whole.
+        assert!(read.local_users >= 1);
+        assert!(read.local_admins <= read.local_users);
+    }
+
+    /// While `TOTP_POLICY` pins the policy, the API reports it as
+    /// non-editable and refuses every change — including a loosening one,
+    /// because the write would silently do nothing.
+    #[tokio::test]
+    async fn test_totp_policy_put_is_refused_while_pinned_by_env() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::totp_policy_serial_lock().await;
+
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // `is_admin` is deliberately left alone -- see the sibling test.
+        sqlx::query("UPDATE users SET totp_enabled = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("enrol caller");
+
+        let state = tdh::build_state_with(pool.clone(), "/tmp/admin-totp-pinned", |cfg| {
+            cfg.totp_policy = Some(TotpPolicy::RequiredForAll);
+        });
+        let auth = admin_auth(user_id, &username);
+
+        let read = get_totp_policy(State(state.clone()), Extension(auth.clone())).await;
+        let write = update_totp_policy(
+            State(state),
+            Extension(auth),
+            Json(UpdateTotpPolicyRequest {
+                policy: TotpPolicy::Disabled,
+            }),
+        )
+        .await;
+        let write_err = write.err();
+
+        tdh::cleanup_user(&pool, user_id).await;
+
+        let read = read.expect("read policy").0;
+        assert_eq!(read.policy, TotpPolicy::RequiredForAll);
+        assert_eq!(read.source, TotpPolicySource::Environment);
+        assert!(!read.editable);
+        assert!(read.caller_totp_enabled);
+        assert!(
+            matches!(write_err, Some(AppError::Conflict(_))),
+            "a pinned policy must refuse writes: {write_err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // BackupResponse serialization
     // -----------------------------------------------------------------------
 
@@ -1844,11 +2534,21 @@ mod tests {
     }
 
     /// DB-backed (skips without `DATABASE_URL`): the proxy-cache aggregate
-    /// must COALESCE `SUM(size_bytes)` to 0 — not NULL — over an empty table,
+    /// must COALESCE `SUM(size_bytes)` to 0 — not NULL — over an empty set,
     /// since the handler decodes the column as a non-nullable BIGINT
-    /// (`"size!"`). The shared test database can hold rows from concurrent
-    /// tests, so the empty-table shape is forced inside a transaction: the
-    /// DELETE is rolled back and never observed by other tests.
+    /// (`"size!"`). Without the COALESCE, `SUM` yields SQL NULL and the
+    /// `(i64, i64)` decode below is a hard error, so this test fails.
+    ///
+    /// #3277: the empty set is a SCOPED subset, not the whole table. The
+    /// suite runs process-per-test against a SHARED database, and the
+    /// previous shape (DELETE everything + cluster-wide aggregate inside a
+    /// rolled-back transaction) raced concurrent tests: READ COMMITTED lets
+    /// the SELECT see rows other tests commit after the DELETE. Filtering on
+    /// a freshly generated `repository_id` gives a subset the FK to
+    /// `repositories` guarantees is empty — `SUM` over zero rows is NULL
+    /// either way, so the COALESCE contract is exercised identically with no
+    /// global assumption. Same approach as #3242 for the storage-GC
+    /// footprint test.
     #[tokio::test]
     async fn test_proxy_cache_stats_query_empty_table_coalesces_to_zero_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -1857,24 +2557,279 @@ mod tests {
             return;
         };
 
-        let mut tx = pool.begin().await.expect("begin transaction");
-        sqlx::query("DELETE FROM proxy_cache_artifacts")
-            .execute(&mut *tx)
-            .await
-            .expect("clear proxy cache rows inside transaction");
+        // Never inserted into `repositories`, so the FK guarantees no
+        // `proxy_cache_artifacts` row can carry it: a deterministically
+        // empty subset regardless of concurrent suite activity.
+        let unused_repo_id = Uuid::new_v4();
+
         let (count, size): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)::BIGINT FROM proxy_cache_artifacts",
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)::BIGINT \
+             FROM proxy_cache_artifacts WHERE repository_id = $1",
         )
-        .fetch_one(&mut *tx)
+        .bind(unused_repo_id)
+        .fetch_one(&pool)
         .await
-        .expect("aggregate over empty proxy cache table");
-        tx.rollback().await.expect("rollback");
+        .expect("aggregate over empty proxy cache subset");
 
         assert_eq!(count, 0);
-        assert_eq!(
-            size, 0,
-            "COALESCE must map SUM's NULL to 0 on an empty table"
+        assert_eq!(size, 0, "COALESCE must map SUM's NULL to 0 on an empty set");
+    }
+
+    /// DB-backed regression for #3134: the dashboard `total_storage_bytes`
+    /// must include OCI layer/config blob bytes. Blobs live in `oci_blobs`,
+    /// not `artifacts` (only manifests land there), so the old raw
+    /// `SUM(artifacts.size_bytes)` reported a docker repository at a few KiB
+    /// of manifests while it held GiBs of layers.
+    ///
+    /// The fixture also pins the surrounding accounting semantics:
+    ///  - LOGICAL counting: a blob digest cross-repo-mounted into two
+    ///    repositories counts once per repository (like the per-repo storage
+    ///    column and quota), while extra manifest references to the same blob
+    ///    within one repository do NOT multiply the figure (two
+    ///    `manifest_blob_refs` rows are seeded for the shared digest).
+    ///  - Positive control: a non-OCI repository's hosted bytes are still
+    ///    counted, and a proxy-cache catalog row is still counted.
+    ///  - No double count: a legacy backfilled `artifacts` row with a
+    ///    `proxy-cache/%` storage key is excluded from the total (its bytes
+    ///    are represented by the catalog row instead).
+    ///
+    /// Assertions are before/after deltas produced by this fixture's own
+    /// rows. The suite runs process-per-test against a SHARED database, so a
+    /// cluster-wide delta races every concurrently running test (the #3129
+    /// flake class): under a full-suite parallel run an exact-equality check
+    /// here fails reliably. Two defenses, both required:
+    ///  - fixture sizes are TERABYTE-scale integers (no real storage is
+    ///    written), so each accounting component sits 4+ orders of magnitude
+    ///    above realistic concurrent churn, and every wrong composition
+    ///    (blob bytes missing, per-reference double count, physical-once
+    ///    dedup, legacy row double count) lands >= 23 TB away from the
+    ///    expected window while concurrent tests move KBs-to-GBs;
+    ///  - the check tolerates +/- `SLACK` (10 GB) of unrelated churn inside
+    ///    the observation window and retries a few times in case a concurrent
+    ///    test ever moves more than that (like
+    ///    `test_get_system_stats_reports_proxy_cache_totals_db` above).
+    #[tokio::test]
+    async fn test_system_stats_total_storage_includes_oci_blob_bytes() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::repository_service::RepositoryService;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-oci-stats");
+        let repo_service = RepositoryService::new(pool.clone());
+
+        // Distinctive prime multiples of 1 TB so the expected delta cannot be
+        // assembled by accident from a different combination of components.
+        const TB: i64 = 1_000_000_000_000;
+        const MANIFEST: i64 = 11 * TB; // artifacts row in the docker repo
+        const BLOB_SHARED: i64 = 23 * TB; // digest mounted in BOTH docker repos
+        const BLOB_SOLO: i64 = 37 * TB; // blob only in the first docker repo
+        const HOSTED_PLAIN: i64 = 41 * TB; // artifacts row in the generic repo
+        const LEGACY: i64 = 53 * TB; // legacy `proxy-cache/%` artifacts row
+        const CACHED: i64 = 61 * TB; // proxy_cache_artifacts catalog row
+        const SLACK: i64 = 10_000_000_000; // unrelated concurrent churn budget
+
+        // Once per repo: BLOB_SHARED twice (two repos), refs don't multiply.
+        const EXPECTED_TOTAL_DELTA: i64 =
+            MANIFEST + 2 * BLOB_SHARED + BLOB_SOLO + HOSTED_PLAIN + CACHED;
+
+        let (oci_a, _, _) = tdh::create_repo(&pool, "local", "docker").await;
+        let (oci_b, _, _) = tdh::create_repo(&pool, "local", "docker").await;
+        let (plain, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (remote, _, _) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let repo_ids = [oci_a, oci_b, plain, remote];
+
+        let mut matched = false;
+        for _attempt in 0..5 {
+            let Json(before) = get_system_stats(State(state.clone())).await.unwrap();
+
+            let digest_shared = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+            let digest_solo = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+
+            for (repo, name, size, storage_key) in [
+                (
+                    oci_a,
+                    "manifest",
+                    MANIFEST,
+                    format!("oci/{oci_a}/manifests/m"),
+                ),
+                (
+                    plain,
+                    "plain",
+                    HOSTED_PLAIN,
+                    format!("generic/{plain}/plain.bin"),
+                ),
+                (
+                    remote,
+                    "legacy",
+                    LEGACY,
+                    format!("proxy-cache/{remote}/legacy.whl"),
+                ),
+            ] {
+                sqlx::query(
+                    "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key) \
+                     VALUES ($1, $2, $3, '1.0.0', $4, $5, 'application/octet-stream', $6)",
+                )
+                .bind(repo)
+                .bind(format!("stats-3134/{name}/{}", Uuid::new_v4()))
+                .bind(name)
+                .bind(size)
+                .bind(format!("{:0>64}", "3134"))
+                .bind(storage_key)
+                .execute(&pool)
+                .await
+                .expect("seed artifacts row");
+            }
+
+            for (repo, digest, size) in [
+                (oci_a, &digest_shared, BLOB_SHARED),
+                (oci_b, &digest_shared, BLOB_SHARED),
+                (oci_a, &digest_solo, BLOB_SOLO),
+            ] {
+                sqlx::query(
+                    "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(repo)
+                .bind(digest)
+                .bind(size)
+                .bind(format!("oci-blobs/{digest}"))
+                .execute(&pool)
+                .await
+                .expect("seed oci_blobs row");
+            }
+
+            // Two manifests referencing the shared blob in the same repo:
+            // per-REFERENCE counting would inflate the figure; per-repo-row
+            // counting (the ledger's) must not.
+            for i in 0..2 {
+                sqlx::query(
+                    "INSERT INTO manifest_blob_refs \
+                     (manifest_digest, blob_digest, repository_id, kind) \
+                     VALUES ($1, $2, $3, 'layer')",
+                )
+                .bind(format!("sha256:{:0>63}{i}", Uuid::new_v4().simple()))
+                .bind(&digest_shared)
+                .bind(oci_a)
+                .execute(&pool)
+                .await
+                .expect("seed manifest_blob_refs row");
+            }
+
+            sqlx::query(
+                "INSERT INTO proxy_cache_artifacts \
+                 (repository_id, path, storage_key, metadata_key, size_bytes) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(remote)
+            .bind("stats-3134/legacy.whl")
+            .bind(format!(
+                "proxy-cache/{remote}/stats-3134/legacy.whl/__content__"
+            ))
+            .bind(format!(
+                "proxy-cache/{remote}/stats-3134/legacy.whl/__cache_meta__.json"
+            ))
+            .bind(CACHED)
+            .execute(&pool)
+            .await
+            .expect("seed proxy cache row");
+
+            // The migration-182 triggers charge the ledger inline; reconcile
+            // anyway so the assertion binds to the documented authoritative
+            // per-repo sums rather than to trigger bookkeeping.
+            for repo in repo_ids {
+                repo_service
+                    .reconcile_usage_ledger(repo)
+                    .await
+                    .expect("reconcile usage ledger");
+            }
+
+            let Json(after) = get_system_stats(State(state.clone())).await.unwrap();
+
+            // Remove this attempt's rows before deciding, so a retry re-seeds
+            // from a clean slate.
+            for table in ["manifest_blob_refs", "oci_blobs", "proxy_cache_artifacts"] {
+                let sql = format!("DELETE FROM {table} WHERE repository_id = ANY($1)");
+                sqlx::query(&sql)
+                    .bind(&repo_ids[..])
+                    .execute(&pool)
+                    .await
+                    .expect("cleanup seeded rows");
+            }
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = ANY($1)")
+                .bind(&repo_ids[..])
+                .execute(&pool)
+                .await
+                .expect("cleanup seeded artifacts");
+
+            let total_delta = after.total_storage_bytes - before.total_storage_bytes;
+            let proxy_delta = after.proxy_storage_bytes - before.proxy_storage_bytes;
+            if (total_delta - EXPECTED_TOTAL_DELTA).abs() <= SLACK
+                && (proxy_delta - CACHED).abs() <= SLACK
+            {
+                matched = true;
+                break;
+            }
+            eprintln!(
+                "attempt saw total delta {total_delta} (expected {EXPECTED_TOTAL_DELTA}) / \
+                 proxy delta {proxy_delta} (expected {CACHED}); retrying"
+            );
+        }
+        // Clean up the fixture repositories BEFORE asserting, so a failing
+        // run does not leak them into the shared test database.
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(&repo_ids[..])
+            .execute(&pool)
+            .await
+            .expect("cleanup repos");
+
+        assert!(
+            matched,
+            "get_system_stats never reflected the seeded storage: expected \
+             total_storage_bytes +{EXPECTED_TOTAL_DELTA} +/- {SLACK} (manifest {MANIFEST} + \
+             shared blob {BLOB_SHARED} once per mounted repo + solo blob {BLOB_SOLO} + hosted \
+             {HOSTED_PLAIN} + cached {CACHED}, legacy proxy-cache/% row {LEGACY} excluded) \
+             and proxy_storage_bytes +{CACHED} +/- {SLACK}"
         );
+    }
+
+    /// DB-backed (skips without `DATABASE_URL`): the #3134 ledger aggregate
+    /// must COALESCE `SUM(...)` to 0 — not NULL — over an empty
+    /// `repository_usage_ledger` set (a fresh install's dashboard), since
+    /// the handler decodes both columns as non-nullable BIGINT (`"total!"`,
+    /// `"proxy!"`). Without the COALESCE, `SUM` yields SQL NULL and the
+    /// `(i64, i64)` decode is a hard error, so this test fails.
+    ///
+    /// #3277: same scoped-empty-subset shape as the proxy-cache test above —
+    /// the previous DELETE-then-aggregate-in-a-rolled-back-transaction raced
+    /// concurrent tests under READ COMMITTED (this table is written by the
+    /// migration-182 triggers on every artifact insert suite-wide).
+    #[tokio::test]
+    async fn test_ledger_totals_query_empty_table_coalesces_to_zero_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // Never inserted into `repositories`; the ledger PK/FK guarantees an
+        // empty subset for it.
+        let unused_repo_id = Uuid::new_v4();
+
+        let (total, proxy): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(hosted_bytes + proxy_bytes + oci_bytes), 0)::BIGINT, \
+                    COALESCE(SUM(proxy_bytes), 0)::BIGINT \
+             FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(unused_repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("aggregate over empty ledger subset");
+
+        assert_eq!(total, 0, "COALESCE must map SUM's NULL to 0");
+        assert_eq!(proxy, 0, "COALESCE must map SUM's NULL to 0");
     }
 
     // -----------------------------------------------------------------------
@@ -1923,11 +2878,15 @@ mod tests {
             tables_restored: vec!["users".to_string(), "artifacts".to_string()],
             artifacts_restored: 42,
             errors: vec![],
+            integrity_anchor: "recorded".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["tables_restored"].as_array().unwrap().len(), 2);
         assert_eq!(json["artifacts_restored"], 42);
         assert!(json["errors"].as_array().unwrap().is_empty());
+        // The caller must be able to see WHAT the archive was checked against
+        // (#3373), not just that the restore returned 200.
+        assert_eq!(json["integrity_anchor"], "recorded");
     }
 
     // -----------------------------------------------------------------------
@@ -2288,5 +3247,127 @@ mod tests {
         assert_eq!(uid, None);
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3327: a backup run that ends FAILED is reported as the backup resource
+    // (HTTP 200, `status = "failed"`, `error_message` naming the cause), not as
+    // a transport-level 500.
+    //
+    // The regression this pins: `execute_backup` used to call
+    // `BackupService::execute`, whose `Err` for a failed run propagated through
+    // `Result<Json<_>>` into `500 {"code":"INTERNAL_ERROR","message":"Internal
+    // server error"}`. The message #3170 composes — the one naming every
+    // artifact object whose bytes could not be read, which is the entire point
+    // of failing the job — was written to `backups.error_message` and to the
+    // server log, and then discarded at the HTTP boundary. An operator
+    // triggering a backup got a bare 500 and no way to learn why.
+    //
+    // The assertion is deliberately on BOTH halves: the status code must not be
+    // 5xx, AND the body must carry the failed status plus the causal message.
+    // Asserting only on the code would pass for a handler that reports success.
+    // -----------------------------------------------------------------------
+
+    /// Insert an artifact row whose bytes are absent from the repository's
+    /// resolved storage root, so the backup enumerates a key it cannot read.
+    #[cfg(test)]
+    async fn insert_unreadable_artifact(pool: &sqlx::PgPool, repo_id: Uuid) -> String {
+        let key = format!("bk-3327/{}", Uuid::new_v4());
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (repository_id, path, name, size_bytes, checksum_sha256,
+                 content_type, storage_key)
+            VALUES ($1, $2, 'unreadable', 10, $3, 'application/octet-stream', $4)
+            "#,
+        )
+        .bind(repo_id)
+        .bind(format!("path/{}", key))
+        .bind("0".repeat(64))
+        .bind(&key)
+        .execute(pool)
+        .await
+        .expect("insert artifact row with no bytes behind it");
+        key
+    }
+
+    #[tokio::test]
+    async fn execute_reports_a_failed_run_as_the_backup_resource_not_a_500() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let missing_key = insert_unreadable_artifact(&f.pool, f.repo_id).await;
+
+        // Scope the backup to the fixture repository so the assertion cannot be
+        // satisfied (or broken) by unrelated rows in a shared test database.
+        let storage = Arc::new(
+            StorageService::from_config(&f.state.config)
+                .await
+                .expect("storage from test config"),
+        );
+        let service = BackupService::new(f.pool.clone(), storage);
+        let backup = service
+            .create(ServiceCreateBackup {
+                backup_type: BackupType::Full,
+                repository_ids: Some(vec![f.repo_id]),
+                exclude_repository_ids: None,
+                since: None,
+                created_by: None,
+                name: None,
+            })
+            .await
+            .expect("create backup job");
+
+        // `execute_backup` extracts the non-Option `Extension<AuthExtension>`,
+        // exactly as the production auth middleware inserts it.
+        let app = tdh::router_with_auth_ext(
+            super::router(),
+            f.state.clone(),
+            tdh::make_auth(f.user_id, &f.username),
+        );
+        let (status, body) = tdh::send(
+            app,
+            tdh::post(
+                format!("/backups/{}/execute", backup.id),
+                "application/json",
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+
+        assert!(
+            !status.is_server_error(),
+            "a recorded run outcome must not surface as a transport error; got {status} body={}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "the trigger answers with the backup resource"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("execute must answer with a BackupResponse");
+        assert_eq!(
+            json["status"], "failed",
+            "the run failed, so the resource must say so rather than report success: {json}"
+        );
+        let message = json["error_message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&missing_key),
+            "the response must carry the message naming the unreadable object; got {message:?}"
+        );
+
+        // The persisted row agrees with what the caller was told.
+        let row = service.get_by_id(backup.id).await.expect("reload backup");
+        assert_eq!(row.status, BackupStatus::Failed);
+
+        let _ = sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(backup.id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
     }
 }

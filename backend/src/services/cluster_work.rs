@@ -43,6 +43,7 @@ use std::ops::Deref;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -199,17 +200,38 @@ fn renewal_interval(ttl_secs: f64) -> Duration {
 /// `Ok(false)` means ownership was lost and stops the loop. Transient errors
 /// are logged and retried; the original TTL remains the failover boundary if
 /// the database stays unavailable.
-pub fn spawn_renewal_loop<F, Fut>(
+pub fn spawn_renewal_loop<F, Fut>(label: impl Into<String>, ttl_secs: f64, renew: F) -> RenewalGuard
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = std::result::Result<bool, String>> + Send + 'static,
+{
+    spawn_renewal_loop_with_cancellation(label, ttl_secs, renew).0
+}
+
+/// Like [`spawn_renewal_loop`], but also hands back a [`CancellationToken`]
+/// that is cancelled the moment a renewal attempt reports ownership loss
+/// (`Ok(false)`).
+///
+/// Renewal loss means another replica may already have legitimately reclaimed
+/// the work, so a long-running worker performing external side effects
+/// (archive writes, peer HTTP, SMTP) must observe this token between chunks
+/// and abort rather than finish the side effect a second owner is about to
+/// redo (#3084). Transient renewal errors do NOT cancel the token — the claim
+/// is still held until its TTL lapses — and dropping the [`RenewalGuard`]
+/// only stops the heartbeat, it never cancels the token.
+pub fn spawn_renewal_loop_with_cancellation<F, Fut>(
     label: impl Into<String>,
     ttl_secs: f64,
     mut renew: F,
-) -> RenewalGuard
+) -> (RenewalGuard, CancellationToken)
 where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = std::result::Result<bool, String>> + Send + 'static,
 {
     let label = label.into();
     let every = renewal_interval(ttl_secs);
+    let token = CancellationToken::new();
+    let on_loss = token.clone();
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -221,6 +243,7 @@ where
                 Ok(true) => {}
                 Ok(false) => {
                     tracing::warn!(claim = %label, "claim renewal stopped because ownership was lost");
+                    on_loss.cancel();
                     break;
                 }
                 Err(e) => {
@@ -230,7 +253,31 @@ where
         }
     });
 
-    RenewalGuard { handle }
+    (RenewalGuard { handle }, token)
+}
+
+/// Execute a token-guarded claim-extension statement for one claimed row.
+///
+/// `sql` stays per-table (typed, reviewable — see the module docs) and must
+/// bind `$1 = row id`, `$2 = claim token`, `$3 = TTL seconds`, extending the
+/// row's claim expiry only while the row is still owned (token + status
+/// predicate). Returns whether the claim is still held; `Ok(false)` means the
+/// row was reclaimed elsewhere and the caller must stop side effects.
+pub async fn renew_row_claim(
+    db: &PgPool,
+    sql: &str,
+    row_id: Uuid,
+    claim_token: Uuid,
+    ttl_secs: f64,
+) -> Result<bool> {
+    let result = sqlx::query(sql)
+        .bind(row_id)
+        .bind(claim_token)
+        .bind(ttl_secs)
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(result.rows_affected() == 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +522,54 @@ mod tests {
             "ownership loss must terminate the renewal task"
         );
         drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ownership_loss_cancels_the_cancellation_token() {
+        let (guard, cancel) = spawn_renewal_loop_with_cancellation(
+            "lost claim",
+            15.0,
+            move || async move { Ok(false) },
+        );
+
+        assert!(
+            !cancel.is_cancelled(),
+            "token must start uncancelled while the claim is held"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            cancel.is_cancelled(),
+            "renewal reporting Ok(false) must cancel the in-flight work token"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_renewal_errors_do_not_cancel_the_token() {
+        let (guard, cancel) =
+            spawn_renewal_loop_with_cancellation("flaky claim", 15.0, move || async move {
+                Err("temporary database error".to_string())
+            });
+
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !cancel.is_cancelled(),
+            "transient errors leave the claim held until its TTL; work must continue"
+        );
+
+        // Dropping the guard stops the heartbeat but must not cancel work.
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(
+            !cancel.is_cancelled(),
+            "dropping the guard aborts the heartbeat, never the worker"
+        );
     }
 
     #[tokio::test(start_paused = true)]
