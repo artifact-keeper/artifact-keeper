@@ -108,6 +108,22 @@ regression test.
 
 ## Surviving GitHub outages
 
+### Best: lockfile mode (mise ≥ 2026.3)
+
+Commit a `mise.lock` (run `mise lock` once, online) and install with
+`mise install --locked` (or `MISE_LOCKED=1`). The lockfile stores each
+platform's resolved download URL and sha256, and since
+[jdx/mise#8679](https://github.com/jdx/mise/pull/8679) locked installs make
+**no `api.github.com` calls at all** — the only network traffic is the asset
+download, which the `github-releases` proxy serves from cache indefinitely.
+Verified empirically: a cold client with every GitHub hostname unreachable
+and the proxy's own upstream dead installed a locked tool from cache alone,
+with the checksum verified from the lockfile. In this mode the `github-api`
+repository is not needed and there is no outage time limit — only the warm
+cache and the runner image (points 2 and 4 below) still apply.
+
+### Without a lockfile
+
 With both repositories and both replacement rules in place, a runner with a
 **cold client cache** can install tools while GitHub is completely down,
 provided:
