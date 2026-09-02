@@ -23,6 +23,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
+use crate::services::opensearch_service::ArtifactDocument;
 use crate::services::search_service::{SearchFacets, SearchQuery, SearchResult, SearchService};
 
 // ---------------------------------------------------------------------------
@@ -118,6 +119,28 @@ pub(crate) fn clamp_positive_limit(limit: Option<i64>, default: i64, min: i64, m
 /// different, `trending`, `recent`). Centralising the field mapping here
 /// guarantees the five endpoints stay in lockstep when a new SearchResult
 /// field is added.
+/// Map an OpenSearch [`ArtifactDocument`] onto the same API-facing
+/// `SearchResultItem` the PostgreSQL path produces, so a caller cannot tell
+/// which backend served the request (#3670).
+///
+/// `size_bytes` and `created_at` come from the indexed document. `created_at`
+/// is stored as a Unix timestamp, so a value that cannot be represented as a
+/// `DateTime<Utc>` falls back to the epoch rather than dropping the hit.
+pub(crate) fn build_search_result_item_from_doc(d: ArtifactDocument) -> SearchResultItem {
+    SearchResultItem {
+        id: Uuid::parse_str(&d.id).unwrap_or_default(),
+        result_type: "artifact".to_string(),
+        name: d.name,
+        path: Some(d.path),
+        repository_key: d.repository_key,
+        format: Some(d.format),
+        version: d.version,
+        size_bytes: Some(d.size_bytes),
+        created_at: DateTime::from_timestamp(d.created_at, 0).unwrap_or_default(),
+        highlights: None,
+    }
+}
+
 pub(crate) fn build_search_result_item(r: SearchResult) -> SearchResultItem {
     SearchResultItem {
         id: r.id,
@@ -376,8 +399,44 @@ pub async fn quick_search(
         }));
     }
 
-    let accessible_repo_ids: Option<Vec<Uuid>> =
-        resolve_accessible_repos(&state.db, &auth).await?.into();
+    let scope = resolve_accessible_repos(&state.db, &auth).await?;
+
+    // Prefer OpenSearch when configured: it gives typo tolerance and relevance
+    // ranking the PostgreSQL tsquery path cannot (#3670). The caller's scope is
+    // passed through so the index is filtered by the same authoritative
+    // repository allowlist PostgreSQL would apply.
+    //
+    // Any OpenSearch failure falls through to PostgreSQL rather than surfacing
+    // an error: a degraded or unreachable search cluster must not take search
+    // down, matching the graceful degradation the startup path already applies
+    // when OpenSearch is absent entirely.
+    if let Some(ref search) = state.search_service {
+        match search
+            // `limit` is clamped to 1..=50 by `clamp_positive_limit` above, so
+            // the cast cannot lose information or change sign.
+            .search_artifacts(&query_text, None, None, limit as usize, 0, &scope)
+            .await
+        {
+            Ok(found) => {
+                return Ok(Json(QuickSearchResponse {
+                    results: found
+                        .hits
+                        .into_iter()
+                        .map(build_search_result_item_from_doc)
+                        .collect(),
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "search",
+                    error = %e,
+                    "OpenSearch quick search failed; falling back to PostgreSQL"
+                );
+            }
+        }
+    }
+
+    let accessible_repo_ids: Option<Vec<Uuid>> = scope.into();
 
     let search_query = SearchQuery {
         q: Some(query_text),

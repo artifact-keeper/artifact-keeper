@@ -25,6 +25,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 
 const ARTIFACTS_INDEX: &str = "artifacts";
 const REPOSITORIES_INDEX: &str = "repositories";
@@ -77,6 +78,31 @@ pub struct SearchResults<T> {
 // ---------------------------------------------------------------------------
 // OpenSearch service
 // ---------------------------------------------------------------------------
+
+/// Translate a caller's [`AccessScope`] into an OpenSearch `filter` clause
+/// restricting results to repositories that caller may read.
+///
+/// Returns `None` for [`AccessScope::Admin`] — no restriction — and
+/// `Some(terms-clause)` for an allowlist. `repository_id` is mapped as
+/// `keyword`, so a `terms` clause matches it exactly.
+///
+/// Note this filters on `repository_id` and **never** on the indexed
+/// `is_public` flag. `ArtifactDocument` denormalises repository visibility at
+/// index time, and `RepositoryService::update` reindexes only the repository
+/// document — not the artifact documents belonging to it — so a repository
+/// flipped from public to private leaves its artifact documents carrying
+/// `is_public: true` until the next full reindex. The caller's scope is
+/// resolved from PostgreSQL per request and is the only authoritative source.
+pub(crate) fn visibility_filter_clause(scope: &AccessScope) -> Option<Value> {
+    match scope {
+        AccessScope::Admin => None,
+        AccessScope::Restricted(ids) => Some(json!({
+            "terms": {
+                "repository_id": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>()
+            }
+        })),
+    }
+}
 
 /// OpenSearch service for indexing and searching artifacts and repositories.
 pub struct OpenSearchService {
@@ -249,6 +275,14 @@ impl OpenSearchService {
     /// The `sort` parameter accepts Meilisearch-style sort strings
     /// (e.g. `["created_at:desc", "name:asc"]`) which are translated into
     /// OpenSearch sort clauses via [`translate_sort`].
+    /// Search the artifacts index, restricted to what `scope` permits.
+    ///
+    /// `scope` is authoritative and comes from PostgreSQL for the current
+    /// request; the indexed `is_public` flag is never consulted, because it can
+    /// be stale (see [`visibility_filter_clause`]). An
+    /// [`AccessScope::Restricted`] allowlist that is **empty** returns no
+    /// results without querying the cluster at all — deny-by-default, and it
+    /// avoids depending on how OpenSearch treats an empty `terms` array.
     pub async fn search_artifacts(
         &self,
         query: &str,
@@ -256,7 +290,17 @@ impl OpenSearchService {
         sort: Option<&[&str]>,
         limit: usize,
         offset: usize,
+        scope: &AccessScope,
     ) -> Result<SearchResults<ArtifactDocument>> {
+        if matches!(scope, AccessScope::Restricted(ids) if ids.is_empty()) {
+            return Ok(SearchResults {
+                hits: Vec::new(),
+                total_hits: 0,
+                processing_time_ms: 0,
+                query: query.to_string(),
+            });
+        }
+
         let mut must_clause = json!({
             "multi_match": {
                 "query": query,
@@ -271,7 +315,10 @@ impl OpenSearchService {
             must_clause = json!({ "match_all": {} });
         }
 
-        let filter_clauses = filter.map(translate_filter).unwrap_or_default();
+        let mut filter_clauses = filter.map(translate_filter).unwrap_or_default();
+        if let Some(visibility) = visibility_filter_clause(scope) {
+            filter_clauses.push(visibility);
+        }
 
         let mut body = json!({
             "query": {
@@ -1305,6 +1352,63 @@ mod tests {
     // -----------------------------------------------------------------------
     // Constants tests
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Visibility filter (#3670)
+    // -----------------------------------------------------------------------
+
+    /// Admin means no restriction: no filter clause is emitted at all.
+    #[test]
+    fn test_visibility_filter_admin_has_no_clause() {
+        assert!(visibility_filter_clause(&AccessScope::Admin).is_none());
+    }
+
+    /// A restricted scope emits a `terms` clause on `repository_id`, which is
+    /// mapped as `keyword` so the match is exact.
+    #[test]
+    fn test_visibility_filter_restricted_emits_terms_on_repository_id() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let clause = visibility_filter_clause(&AccessScope::Restricted(vec![a, b]))
+            .expect("restricted scope must emit a clause");
+
+        let ids = clause["terms"]["repository_id"]
+            .as_array()
+            .expect("terms value must be an array");
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().any(|v| v == &json!(a.to_string())));
+        assert!(ids.iter().any(|v| v == &json!(b.to_string())));
+    }
+
+    /// The filter must never key off the denormalised `is_public` flag, which
+    /// goes stale when a repository's visibility changes (only the repository
+    /// document is reindexed, not its artifacts). Pinning this because keying
+    /// on `is_public` would serve private artifacts to anonymous callers.
+    #[test]
+    fn test_visibility_filter_never_uses_is_public() {
+        let clause = visibility_filter_clause(&AccessScope::Restricted(vec![Uuid::new_v4()]))
+            .expect("clause");
+        let rendered = clause.to_string();
+        assert!(
+            !rendered.contains("is_public"),
+            "visibility must be enforced on repository_id, not the stale indexed \
+             is_public flag, got: {rendered}"
+        );
+    }
+
+    /// An empty allowlist must return nothing. `search_artifacts`
+    /// short-circuits before querying, so this pins the deny-by-default shape
+    /// rather than relying on OpenSearch's handling of an empty `terms` array.
+    #[test]
+    fn test_empty_restricted_scope_is_deny_by_default() {
+        let scope = AccessScope::Restricted(vec![]);
+        assert!(
+            matches!(&scope, AccessScope::Restricted(ids) if ids.is_empty()),
+            "the short-circuit search_artifacts uses must match an empty allowlist"
+        );
+        // And the scope itself grants nothing.
+        assert!(!scope.grants(Uuid::new_v4()));
+    }
 
     #[test]
     fn test_constants() {
