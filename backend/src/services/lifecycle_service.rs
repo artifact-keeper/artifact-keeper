@@ -1279,7 +1279,7 @@ impl LifecycleService {
     ) -> Result<PolicyExecutionResult> {
         let repo_filter = policy.repository_id;
 
-        let matched = sqlx::query_as::<_, CountBytes>(&format!(
+        let matched = sqlx::query_as::<_, CountBytes>(sqlx::AssertSqlSafe(&*format!(
             r#"
             SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes
             FROM artifacts a
@@ -1287,7 +1287,7 @@ impl LifecycleService {
               AND ($1::UUID IS NULL OR a.repository_id = $1)
               AND a.name {op} $2
             "#
-        ))
+        )))
         .bind(repo_filter)
         .bind(pattern)
         .fetch_one(&mut *conn)
@@ -1296,14 +1296,14 @@ impl LifecycleService {
 
         let mut removed = 0i64;
         if !dry_run && matched.count > 0 {
-            let result = sqlx::query(&format!(
+            let result = sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
                 UPDATE artifacts SET is_deleted = true
                 WHERE is_deleted = false
                   AND ($1::UUID IS NULL OR repository_id = $1)
                   AND name {op} $2
                 "#
-            ))
+            )))
             .bind(repo_filter)
             .bind(pattern)
             .execute(&mut *conn)

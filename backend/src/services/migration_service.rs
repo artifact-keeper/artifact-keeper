@@ -48,6 +48,40 @@ pub enum MigrationError {
     Other(String),
 }
 
+/// How much of the source a migration run had seen when it published its
+/// figures to the job row.
+///
+/// A run's in-memory counters restart at zero every time `process_job` is
+/// entered, while the job row's do not: a resumed job still carries the
+/// `completed_items` of the pass that was paused. Publishing a partial view
+/// absolutely therefore *overwrites a complete record with an incomplete one*
+/// — a paused-then-resumed-then-repaused job had its `completed_items` and
+/// `transferred_bytes` reset to zero even though the transfers had happened
+/// and the `migration_items` rows proving it were still there (#3510).
+///
+/// So a run may only *overwrite* the row once it has enumerated the whole
+/// source; while its view is still partial it may only *advance* the row.
+/// Overwriting has to stay available at the end of a run, because that is what
+/// lets a stale assessment estimate be corrected downwards — the very thing
+/// #3378 asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceView {
+    /// The run is still enumerating: it has seen some of the source, and
+    /// anything already on the row may describe more work than it has. Writes
+    /// may only move the figures forward.
+    Partial,
+    /// The run enumerated the whole source and re-classified every item it
+    /// found, so its figures supersede whatever the row carried.
+    Complete,
+}
+
+impl SourceView {
+    /// Whether a write in this view is allowed to overwrite the row outright.
+    fn overwrites(self) -> bool {
+        matches!(self, SourceView::Complete)
+    }
+}
+
 /// Package format compatibility
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatCompatibility {
@@ -702,6 +736,35 @@ impl MigrationService {
         Ok(())
     }
 
+    /// Move a job into `running` on behalf of the worker, unless the operator
+    /// has already paused or cancelled it. Returns whether the job was claimed.
+    ///
+    /// `start_migration` flips the row to `running` and then spawns a detached
+    /// task, so there is a window between the operator getting their `200 OK`
+    /// and the worker actually waking up. A cancel that lands in that window
+    /// used to be undone by the worker's own unguarded `update_job_status(
+    /// Running)`: the row went `cancelled` -> `running`, after which
+    /// `finalize_job_status`'s `WHERE status NOT IN ('paused','cancelled')`
+    /// guard saw nothing to protect and stamped the job `completed` — having
+    /// migrated every artifact of a migration the operator had cancelled
+    /// (#3510). Claiming under the same guard closes that window: if the job
+    /// was stopped first, the worker never starts.
+    #[instrument(skip(self), fields(job_id = %job_id))]
+    pub async fn claim_job_running(&self, job_id: Uuid) -> Result<bool, MigrationError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE migration_jobs
+            SET status = 'running'
+            WHERE id = $1 AND status NOT IN ('paused', 'cancelled')
+            "#,
+        )
+        .bind(job_id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Finalize a job with a terminal status and stamp `finished_at`, unless
     /// the operator has already paused or cancelled it — the guard keeps a
     /// pause that races the worker's final write from being overwritten
@@ -728,7 +791,27 @@ impl MigrationService {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Update job progress
+    /// Publish the numerator of a job's progress fraction.
+    ///
+    /// `view` decides whether the run is allowed to overwrite the row or may
+    /// only advance it; see [`SourceView`]. Under `Partial` the three item
+    /// counters move as a group and only when the run has accounted for at
+    /// least as many items as the row already claims, and `transferred_bytes`
+    /// never shrinks. That is what stops a run whose counters restarted at
+    /// zero from erasing the record of work an earlier pass of the same job
+    /// really did (#3510): the counters are per-run by design — `resume_job`
+    /// re-lists from offset 0 and re-classifies the earlier pass's items as
+    /// `skipped` — but a run that has not finished re-listing yet has not
+    /// re-classified them either, so its figures are not a replacement for
+    /// the row's until it has.
+    ///
+    /// Deliberately NOT gated on `status`, unlike [`Self::update_job_totals`]:
+    /// an item that finished transferring while the operator's pause was in
+    /// flight has genuinely been migrated, and counting it is honest. The
+    /// monotonic rule alone is what protects the row, and this statement never
+    /// touches `status`, so it cannot revive a stopped job (#3440).
+    ///
+    /// Returns whether the numerator was published.
     pub async fn update_job_progress(
         &self,
         job_id: Uuid,
@@ -736,15 +819,24 @@ impl MigrationService {
         failed: i32,
         skipped: i32,
         transferred_bytes: i64,
-    ) -> Result<(), MigrationError> {
-        sqlx::query(
+        view: SourceView,
+    ) -> Result<bool, MigrationError> {
+        let result = sqlx::query(
             r#"
             UPDATE migration_jobs
             SET completed_items = $1,
                 failed_items = $2,
                 skipped_items = $3,
-                transferred_bytes = $4
+                transferred_bytes = CASE
+                    WHEN $6 THEN $4
+                    ELSE GREATEST(transferred_bytes, $4)
+                END
             WHERE id = $5
+              AND (
+                    $6
+                    OR $1 + $2 + $3
+                       >= completed_items + failed_items + skipped_items
+                  )
             "#,
         )
         .bind(completed)
@@ -752,10 +844,65 @@ impl MigrationService {
         .bind(skipped)
         .bind(transferred_bytes)
         .bind(job_id)
+        .bind(view.overwrites())
         .execute(&self.db)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Update the totals a job is measured against
+    ///
+    /// The worker calls this as it enumerates the source, so `total_items`
+    /// tracks what has actually been discovered instead of staying at the zero
+    /// the row was created with, which left every job reporting `N/0` and 0%
+    /// (#3378). The values are rebuilt rather than accumulated: a resumed or
+    /// re-run job enumerates from the first page again, so adding to them
+    /// would double count.
+    ///
+    /// A rebuild is only allowed to *replace* the denominator once the run has
+    /// enumerated the whole source (`SourceView::Complete`) — which is what
+    /// lets an assessment's over-estimate be corrected downwards. Mid-run the
+    /// denominator may only grow, so a resumed run that is stopped partway
+    /// cannot leave the row advertising one page of a source it had already
+    /// measured in full, with a numerator counting the whole of it (#3510).
+    ///
+    /// The write is guarded the same way `finalize_job_status` is. A page
+    /// listing already in flight when the operator pauses or cancels lands
+    /// after the row has left `running`, and while this statement never
+    /// touches `status` — so it cannot revive a stopped job — an ungated
+    /// write left a dead job advertising a denominator covering work it
+    /// never processed (`cancelled`, `1000/2000`, 50%). Returns whether the
+    /// totals were published.
+    pub async fn update_job_totals(
+        &self,
+        job_id: Uuid,
+        total_items: i32,
+        total_bytes: i64,
+        view: SourceView,
+    ) -> Result<bool, MigrationError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE migration_jobs
+            SET total_items = CASE
+                    WHEN $4 THEN $1
+                    ELSE GREATEST(total_items, $1)
+                END,
+                total_bytes = CASE
+                    WHEN $4 THEN $2
+                    ELSE GREATEST(total_bytes, $2)
+                END
+            WHERE id = $3 AND status NOT IN ('paused', 'cancelled')
+            "#,
+        )
+        .bind(total_items)
+        .bind(total_bytes)
+        .bind(job_id)
+        .bind(view.overwrites())
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     /// Add migration items for a job
@@ -1350,6 +1497,16 @@ impl MigrationService {
     }
 
     /// Save assessment result to database
+    ///
+    /// The totals written here are the assessment's pre-run estimate and hold
+    /// only until the job runs: the worker republishes what it enumerates as
+    /// it goes and once more when the run ends (see `update_job_totals`), so
+    /// a repository whose real content differs from the assessment does not
+    /// leave a stale denominator behind. The estimate is overwritten rather
+    /// than cleared up front, so the row never shows a zero denominator
+    /// against a non-zero numerator while the first page is being fetched
+    /// (#3378). The estimate itself survives in `config.assessment`, which is
+    /// what `GET /assessment` reads.
     pub async fn save_assessment(
         &self,
         job_id: Uuid,
@@ -1730,6 +1887,143 @@ mod tests {
                 .await
                 .ok();
         }
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // A partial success must be STORABLE, not just computable (issue #3497)
+    // -----------------------------------------------------------------------
+
+    /// DB-backed proof for #3497.
+    ///
+    /// `determine_final_status(failed > 0, completed > 0)` returns
+    /// `CompletedWithErrors`, which `Display`s as `completed_with_errors`.
+    /// Migration 020's CHECK constraint on `migration_jobs.status` never listed
+    /// that value and was never altered, so `finalize_job_status` came back with
+    /// a check-constraint violation for every mixed-outcome job; `process_job`
+    /// propagated it and the spawn wrapper in `api/handlers/migration.rs`
+    /// stamped the job `failed` with the raw Postgres text in `error_summary` —
+    /// a total failure reported for a run most of whose artifacts transferred.
+    /// Migration 207 adds the value to the constraint.
+    ///
+    /// This test goes through the database on purpose. `migration_worker` has
+    /// seven `determine_final_status` tests, two of which assert exactly this
+    /// enum; all of them passed for as long as the write was impossible,
+    /// because none of them writes. The function was never wrong — the column
+    /// was. So the status under test is taken from `determine_final_status`
+    /// itself rather than hand-written, and every assertion is on the row that
+    /// came back out of Postgres.
+    ///
+    /// The loop over the whole status set is the negative control: it proves
+    /// the constraint still REJECTS an unknown value, so this cannot be
+    /// satisfied by simply dropping the constraint.
+    ///
+    /// No-ops when `DATABASE_URL` is unset so it skips cleanly off-CI.
+    #[tokio::test]
+    async fn test_finalize_job_status_stores_completed_with_errors_3497() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::migration_worker::determine_final_status;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("partial-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed source connection");
+
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config, status, \
+             completed_items, failed_items) \
+             VALUES ($1, 'full', '{}'::jsonb, 'running', 47, 3) RETURNING id",
+        )
+        .bind(conn_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed migration job");
+
+        // 47 transferred, 3 failed: the mixed outcome the worker reports.
+        let final_status = determine_final_status(3, 47);
+        assert_eq!(
+            final_status,
+            MigrationJobStatus::CompletedWithErrors,
+            "a mixed outcome must resolve to CompletedWithErrors"
+        );
+
+        let svc = MigrationService::new(pool.clone());
+        let finalized = svc
+            .finalize_job_status(job_id, final_status)
+            .await
+            .expect("a partially-successful job must be storable, not a constraint violation");
+        assert!(finalized, "a running job finalizes");
+
+        let (status, finished, completed_items, failed_items): (String, bool, i32, i32) =
+            sqlx::query_as(
+                "SELECT status, finished_at IS NOT NULL, completed_items, failed_items \
+                 FROM migration_jobs WHERE id = $1",
+            )
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read finalized job row");
+        assert_eq!(
+            status, "completed_with_errors",
+            "the partial success must be recorded as itself, not collapsed into failed"
+        );
+        assert!(finished, "finalize must stamp finished_at");
+        assert_eq!(
+            (completed_items, failed_items),
+            (47, 3),
+            "the per-item counters that explain the partial outcome must survive"
+        );
+
+        // The constraint must still accept every status the model can produce
+        // and still reject anything else — a fix that just dropped the CHECK
+        // would satisfy the assertions above.
+        for accepted in [
+            MigrationJobStatus::Pending,
+            MigrationJobStatus::Assessing,
+            MigrationJobStatus::Ready,
+            MigrationJobStatus::Running,
+            MigrationJobStatus::Paused,
+            MigrationJobStatus::Completed,
+            MigrationJobStatus::CompletedWithErrors,
+            MigrationJobStatus::Failed,
+            MigrationJobStatus::Cancelled,
+        ] {
+            sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
+                .bind(accepted.to_string())
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("status '{accepted}' must be storable: {e}"));
+        }
+
+        let rejected = sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
+            .bind("definitely_not_a_status")
+            .bind(job_id)
+            .execute(&pool)
+            .await;
+        assert!(
+            rejected.is_err(),
+            "the status CHECK must still reject a value outside the model's set"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
         sqlx::query("DELETE FROM source_connections WHERE id = $1")
             .bind(conn_id)
             .execute(&pool)
@@ -3031,5 +3325,361 @@ mod tests {
         assert!(deserialized.repositories.is_empty());
         assert_eq!(deserialized.blockers.len(), 1);
         assert_eq!(deserialized.warnings.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // update_job_totals — the same terminal-state guard finalize_job_status has
+    // -----------------------------------------------------------------------
+
+    /// A page listing already in flight when the operator stops the job lands
+    /// after the row has left `running`. `update_job_totals` never touches
+    /// `status`, so it cannot revive a stopped job, but without a guard it
+    /// leaves a dead job advertising a denominator covering work it never
+    /// processed — `cancelled, 1000/2000, 50%`. `finalize_job_status` has
+    /// carried this guard since #3380; the totals write needs the same one.
+    ///
+    /// Fails-before: the ungated `UPDATE ... WHERE id = $1` writes the totals
+    /// to both stopped rows and reports success.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_update_job_totals_does_not_write_to_a_stopped_job_3378() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let svc = MigrationService::new(pool.clone());
+
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("totals-guard-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed source connection");
+
+        let mut job_ids = Vec::new();
+        for status in ["paused", "cancelled", "running"] {
+            let job_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO migration_jobs (source_connection_id, job_type, config, status) \
+                 VALUES ($1, 'full', '{}'::jsonb, $2) RETURNING id",
+            )
+            .bind(conn_id)
+            .bind(status)
+            .fetch_one(&pool)
+            .await
+            .expect("seed migration job");
+            job_ids.push((status, job_id));
+
+            let published = svc
+                .update_job_totals(job_id, 2000, 20_000, SourceView::Partial)
+                .await
+                .expect("update_job_totals must not error");
+
+            let (total_items, total_bytes, row_status): (i32, i64, String) = sqlx::query_as(
+                "SELECT total_items, total_bytes, status FROM migration_jobs WHERE id = $1",
+            )
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read job row");
+
+            if status == "running" {
+                // Positive control: the guard must not block the normal path.
+                assert!(published, "a running job's totals must still be published");
+                assert_eq!((total_items, total_bytes), (2000, 20_000));
+            } else {
+                assert!(
+                    !published,
+                    "{status}: update_job_totals must report that it published nothing"
+                );
+                assert_eq!(
+                    (total_items, total_bytes),
+                    (0, 0),
+                    "{status}: a stopped job must not be given a denominator it never processed"
+                );
+            }
+            // The write never touches `status` either way.
+            assert_eq!(row_status, status);
+        }
+
+        for (_, job_id) in job_ids {
+            let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+                .bind(job_id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3510: a run that has only seen part of the source may advance the job
+    // row, never overwrite it
+    // -----------------------------------------------------------------------
+
+    /// The six columns both progress readers divide, in the order
+    /// [`read_figures`] returns them: `(total_items, total_bytes,
+    /// completed_items, failed_items, skipped_items, transferred_bytes)`.
+    type Figures = (i32, i64, i32, i32, i32, i64);
+
+    /// Seed a source connection and a `running` migration job carrying the
+    /// figures an earlier pass left behind, and return `(conn_id, job_id)`.
+    async fn seed_job_with_figures(
+        pool: &sqlx::PgPool,
+        prefix: &str,
+        figures: Figures,
+    ) -> (Uuid, Uuid) {
+        let (total_items, total_bytes, completed, failed, skipped, transferred) = figures;
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("{prefix}-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(pool)
+        .await
+        .expect("seed source connection");
+
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs \
+               (source_connection_id, job_type, config, status, total_items, total_bytes, \
+                completed_items, failed_items, skipped_items, transferred_bytes) \
+             VALUES ($1, 'full', '{}'::jsonb, 'running', $2, $3, $4, $5, $6, $7) RETURNING id",
+        )
+        .bind(conn_id)
+        .bind(total_items)
+        .bind(total_bytes)
+        .bind(completed)
+        .bind(failed)
+        .bind(skipped)
+        .bind(transferred)
+        .fetch_one(pool)
+        .await
+        .expect("seed migration job");
+
+        (conn_id, job_id)
+    }
+
+    async fn read_figures(pool: &sqlx::PgPool, job_id: Uuid) -> Figures {
+        sqlx::query_as(
+            "SELECT total_items, total_bytes, completed_items, failed_items, skipped_items, \
+                    transferred_bytes FROM migration_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("read job figures")
+    }
+
+    async fn drop_job(pool: &sqlx::PgPool, job_id: Uuid, conn_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// The numerator write is absolute, and the worker's counters restart at
+    /// zero on every entry to `process_job`, so a resumed pass that had not
+    /// re-classified anything yet published `0/0/0` over a row recording work
+    /// an earlier pass really did (#3510). A run that has only seen part of
+    /// the source may move the row forward; it may not walk it back.
+    ///
+    /// Fails-before: the ungated `UPDATE ... WHERE id = $5` writes the smaller
+    /// figures and the row loses 5 completed items and 5000 transferred bytes.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_update_job_progress_partial_view_never_walks_a_job_backwards_3510() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = MigrationService::new(pool.clone());
+
+        let (conn_id, job_id) =
+            seed_job_with_figures(&pool, "progress-3510", (100, 10_000, 5, 1, 2, 5_000)).await;
+
+        // A pass that has accounted for less than the row already records.
+        let published = svc
+            .update_job_progress(job_id, 0, 0, 0, 0, SourceView::Partial)
+            .await
+            .expect("update_job_progress must not error");
+        assert!(
+            !published,
+            "a partial view describing less work must report that it published nothing"
+        );
+        assert_eq!(
+            read_figures(&pool, job_id).await,
+            (100, 10_000, 5, 1, 2, 5_000),
+            "a partial view describing less work must leave the row alone"
+        );
+
+        // The same pass once it has caught up: 4 + 2 + 3 = 9 >= 5 + 1 + 2.
+        let published = svc
+            .update_job_progress(job_id, 4, 2, 3, 6_000, SourceView::Partial)
+            .await
+            .expect("update_job_progress must not error");
+        assert!(published, "a partial view that has caught up must publish");
+        assert_eq!(
+            read_figures(&pool, job_id).await,
+            (100, 10_000, 4, 2, 3, 6_000),
+            "the three item counters move together once the run has caught up"
+        );
+
+        // Bytes never shrink under a partial view even when the item count grows:
+        // a resumed pass re-classifies earlier transfers as skips and so carries
+        // none of their bytes.
+        let published = svc
+            .update_job_progress(job_id, 4, 2, 4, 10, SourceView::Partial)
+            .await
+            .expect("update_job_progress must not error");
+        assert!(published);
+        assert_eq!(
+            read_figures(&pool, job_id).await,
+            (100, 10_000, 4, 2, 4, 6_000),
+            "transferred_bytes is what `generate_report` reports as moved; a \
+             partial view must not shrink it"
+        );
+
+        // A run that enumerated the whole source owns the row outright.
+        let published = svc
+            .update_job_progress(job_id, 1, 0, 0, 12, SourceView::Complete)
+            .await
+            .expect("update_job_progress must not error");
+        assert!(published, "a complete view must always publish");
+        assert_eq!(
+            read_figures(&pool, job_id).await,
+            (100, 10_000, 1, 0, 0, 12),
+            "a run that re-listed the whole source replaces the numerator"
+        );
+
+        drop_job(&pool, job_id, conn_id).await;
+    }
+
+    /// The same rule on the denominator. #3445 made the run rebuild the totals
+    /// absolutely, which is right at the end of a run — it is what lets an
+    /// assessment's over-estimate be corrected downwards — but mid-run it left
+    /// a resumed job that had been stopped after one page advertising one page
+    /// of a source it had already measured in full, under a numerator counting
+    /// the whole of it (#3510).
+    ///
+    /// Fails-before: the partial write shrinks the denominator to `(2, 12)`.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_update_job_totals_partial_view_never_shrinks_the_denominator_3510() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = MigrationService::new(pool.clone());
+
+        let (conn_id, job_id) =
+            seed_job_with_figures(&pool, "totals-3510", (1_500, 15_000, 73, 0, 0, 7_300)).await;
+
+        svc.update_job_totals(job_id, 2, 12, SourceView::Partial)
+            .await
+            .expect("update_job_totals must not error");
+        assert_eq!(
+            read_figures(&pool, job_id).await,
+            (1_500, 15_000, 73, 0, 0, 7_300),
+            "a run one page into a source it had already measured must not \
+             republish a denominator smaller than the numerator on the row"
+        );
+
+        // Still grows in the normal direction.
+        svc.update_job_totals(job_id, 2_000, 20_000, SourceView::Partial)
+            .await
+            .expect("update_job_totals must not error");
+        assert_eq!(
+            read_figures(&pool, job_id).await,
+            (2_000, 20_000, 73, 0, 0, 7_300),
+            "a partial view must still advance the denominator"
+        );
+
+        // And a finished run still corrects an over-estimate downwards.
+        svc.update_job_totals(job_id, 2, 12, SourceView::Complete)
+            .await
+            .expect("update_job_totals must not error");
+        assert_eq!(
+            read_figures(&pool, job_id).await,
+            (2, 12, 73, 0, 0, 7_300),
+            "a run that enumerated the whole source owns the denominator"
+        );
+
+        drop_job(&pool, job_id, conn_id).await;
+    }
+
+    /// `start_migration` flips the row to `running` and then spawns a detached
+    /// task, so an operator cancel can land before the worker wakes. The
+    /// worker's own `update_job_status(Running)` is unguarded and used to undo
+    /// it, after which `finalize_job_status` saw a `running` row and stamped
+    /// the cancelled job `completed` (#3510). Claiming the job under the same
+    /// guard the finalize carries closes the window.
+    ///
+    /// Fails-before: `update_job_status(Running)` reports nothing and rewrites
+    /// every row, including the stopped ones.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_claim_job_running_refuses_a_stopped_job_3510() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = MigrationService::new(pool.clone());
+
+        for (status, claimable) in [
+            ("paused", false),
+            ("cancelled", false),
+            ("pending", true),
+            ("running", true),
+        ] {
+            let (conn_id, job_id) =
+                seed_job_with_figures(&pool, "claim-3510", (0, 0, 0, 0, 0, 0)).await;
+            sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
+                .bind(status)
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .expect("stage job status");
+
+            let claimed = svc
+                .claim_job_running(job_id)
+                .await
+                .expect("claim_job_running must not error");
+            assert_eq!(
+                claimed, claimable,
+                "{status}: claim_job_running reported the wrong outcome"
+            );
+
+            let observed: String =
+                sqlx::query_scalar("SELECT status FROM migration_jobs WHERE id = $1")
+                    .bind(job_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read job status");
+            let expected = if claimable { "running" } else { status };
+            assert_eq!(
+                observed, expected,
+                "{status}: the worker must not walk a stopped job back to running"
+            );
+
+            drop_job(&pool, job_id, conn_id).await;
+        }
     }
 }

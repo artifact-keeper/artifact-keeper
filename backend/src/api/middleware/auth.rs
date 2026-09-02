@@ -1648,8 +1648,20 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
     // token-channel read. Skip the `t/<TOKEN>` pair for conda token URLs so the
     // actual repository key is returned.
     if format == "conda" && segments.clone().next() == Some("t") {
-        segments.next(); // "t"
-        segments.next(); // "<TOKEN>"
+        // Only a real token channel carries the repository key AFTER the
+        // credential (`/conda/t/<TOKEN>/<repo_key>/...`). A two-segment
+        // `/conda/t/<route>` — `/conda/t/upload`, `/conda/t/channeldata.json`,
+        // `/conda/t/notices.json` — is the PLAIN conda router serving a
+        // repository whose key is literally `t`, and skipping the pair there
+        // yields an empty key for a request that does name a repository.
+        // Only skip when a segment actually follows the token.
+        let mut after_token = segments.clone();
+        after_token.next(); // "t"
+        after_token.next(); // "<TOKEN>"
+        if after_token.next().is_some() {
+            segments.next(); // "t"
+            segments.next(); // "<TOKEN>"
+        }
     }
     // WASM plugin proxy routes are nested as
     //   /ext/<format_key>/<repo_key>/...
@@ -1662,6 +1674,20 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
     // format-key segment so the real repository key is evaluated.
     if format == "ext" {
         segments.next(); // "<format_key>"
+    }
+    // Two format routers are ALSO mounted under an `/api` prefix, matching the
+    // URL shape their clients build:
+    //   /api/cargo/<repo_key>/...    sparse index (#3000)
+    //   /api/helm/<repo_key>/charts  ChartMuseum cm-push (#2941)
+    // Those paths are `/api/<format>/<repo_key>/...`, so the generic rule
+    // returned the literal "cargo"/"helm" as the key, nothing resolved, and
+    // the visibility middleware answered from its no-repo branch — 401 for
+    // anonymous callers, existence-hiding 404 for a valid credential. Both
+    // aliases were mounted but dead. Skip the `/api` prefix for exactly those
+    // two format names so the real repository key is evaluated; every other
+    // `/api` path, `/api/v1/...` included, keeps its second segment.
+    if format == "api" && matches!(segments.clone().next(), Some("cargo" | "helm")) {
+        segments.next(); // "<format>"
     }
     let raw = segments.next().unwrap_or("");
     match percent_decode_path_segment(raw) {
@@ -1693,10 +1719,19 @@ pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     if segments.next()? != "t" {
         return None;
     }
-    match segments.next() {
-        Some(token) if !token.is_empty() => Some(token),
-        _ => None,
-    }
+    let token = match segments.next() {
+        Some(token) if !token.is_empty() => token,
+        _ => return None,
+    };
+    // A token channel carries the repository key AFTER the credential
+    // (`/conda/t/<TOKEN>/<repo_key>/...`). With nothing after it, the path is
+    // the plain conda route for a repository whose key is literally `t`
+    // (`/conda/t/upload`, `/conda/t/channeldata.json`) and that route segment
+    // is not a credential — treating it as one made an anonymous read of such
+    // a repository fail with 401 for an *invalid credential* it never sent.
+    // Same shape test `extract_repo_key` applies to the matching skip.
+    segments.next()?;
+    Some(token)
 }
 
 /// Is `path` the NuGet package-push route (`/nuget/<repo_key>/api/v2/package`)?
@@ -2082,7 +2117,36 @@ pub async fn repo_visibility_middleware(
     let repo_key = extract_repo_key(&path);
 
     if repo_key.is_empty() {
-        return next.run(request).await;
+        // An empty `:repo_key` segment names no repository: repository keys are
+        // non-empty by construction, so no row can ever match and no format
+        // route can serve anything here. Every format route reaches this branch
+        // when its key segment is empty (`/npm//pkg`, `/maven//`,
+        // `/pypi//simple/`, `/api/cargo//ve/ri/x`).
+        //
+        // Answer the existence-hiding 404 directly instead of running the
+        // handler. Two properties depend on not falling through:
+        //
+        // 1. No unauthenticated 500. The handler binds
+        //    `Extension<Option<AuthExtension>>`, and axum answers a missing
+        //    extension with a 500 that prints the extension's type path (#3443
+        //    / #3444). Never invoking the handler closes that without having to
+        //    inject an extension for it.
+        //
+        // 2. No request body is read for a caller this middleware has not
+        //    authorized. `next.run` hands the request to the handler, whose
+        //    extractors run in order, so a body extractor (`Bytes`, `Multipart`,
+        //    ...) buffers the WHOLE upload before the handler's own auth check
+        //    can reject it. Falling through therefore gave an anonymous caller a
+        //    `MAX_UPLOAD_SIZE`-per-request (10 GiB default) heap allocation on
+        //    every format prefix, with no credential and no repository — the
+        //    write gate below, which would have refused it, sits after this
+        //    branch. Returning here rejects before the body is touched.
+        //
+        // The empty key carries no information about which repositories exist,
+        // so a flat 404 leaks nothing (contrast the non-empty no-repo branch
+        // below, which mirrors the private-repo 401 to close the #1808
+        // existence oracle).
+        return not_found_response();
     }
 
     // Check the shared repo cache first to avoid a DB round-trip on every
@@ -2376,6 +2440,12 @@ pub async fn repo_visibility_middleware(
                         // "admin" which implies all actions (#827 policy compat).
                         // Both calls resolve from the same cached action set, so
                         // the second call is essentially free.
+                        //
+                        // These two are a CACHED FAST PATH for the common
+                        // "an applicable rule names this principal" case, not
+                        // the decision itself: `check_permission` reads the
+                        // `permissions` table only. The canonical decision is
+                        // `check_repository_action` below (#3387/#3452).
                         let allowed = vis_state
                             .permission_service
                             .check_permission(ext.user_id, "repository", repo.id, action, false)
@@ -2391,9 +2461,86 @@ pub async fn repo_visibility_middleware(
                                     false,
                                 )
                                 .await
+                                .unwrap_or(false)
+                            // #3387/#3452: role assignments are part of the read
+                            // decision, exactly as they already are for the
+                            // write/delete arm ~40 lines above, for REST reads
+                            // (`require_visible` -> `user_can_access_repo` ->
+                            // `RepoAccess::READ`) and for virtual members
+                            // (`try_authorize_virtual_members`). This branch was
+                            // the ONLY read gate in the codebase resolving reads
+                            // from `permissions` alone, so the FIRST fine-grained
+                            // rule written against a repository — for any
+                            // principal, including an unrelated one — silently
+                            // revoked native-protocol READ for every principal
+                            // whose grant is a `role_assignment` (the creator
+                            // auto-grant, `repository-owner`, and the rows
+                            // migration 172 wrote on upgrade), while leaving that
+                            // same principal's WRITE on the same route intact.
+                            // Reproduced as 403 on `GET /maven/{repo}/…` with 201
+                            // on `PUT` to the same path and 200 on
+                            // `GET /api/v1/repositories/{key}`.
+                            //
+                            // `check_repository_action` is a strict SUPERSET of
+                            // the two calls above (an applicable rule carrying
+                            // `action` or `admin` satisfies both), so this can
+                            // only widen, never narrow. What it adds is the
+                            // codebase's documented rule, in FULL:
+                            //
+                            //   a) a role assignment carrying `admin` wins over
+                            //      everything, including an applicable rule —
+                            //      the "durable owner capability" migration 172
+                            //      established, OR-ed OUTSIDE the CASE in
+                            //      `check_repository_action`;
+                            //   b) otherwise an applicable direct/group/project
+                            //      rule is authoritative for the principals it
+                            //      names;
+                            //   c) otherwise the principal keeps its role
+                            //      capabilities.
+                            //
+                            // (a) is easy to state loosely and get wrong: the
+                            // consequence is that `POST /api/v1/permissions`
+                            // CANNOT narrow a repository owner's read here, and
+                            // `repository-owner` is auto-granted to every
+                            // repository creator. That is not introduced by this
+                            // line — the write/delete arm below, `require_visible`
+                            // (~23 REST read surfaces) and
+                            // `try_authorize_virtual_members` have all resolved
+                            // through this same function since #3331, and a
+                            // baseline `GET /api/v1/artifacts/…/download`
+                            // already answered 200 for exactly that principal.
+                            // This line makes the native read arm agree with
+                            // them instead of being the lone holdout.
+                            // `test_3387_applicable_rule_beats_an_ordinary_role_but_not_an_admin_carrying_one`
+                            // pins all three arms, including (a), so the
+                            // carve-out cannot be quietly re-described.
+                            //
+                            // Ordering is deliberate but is NOT a claim that the
+                            // canonical query only runs on denials: for the
+                            // role-assignment principal this change unblocks,
+                            // `check_permission` returns false every time, so
+                            // the uncached 2-CTE query runs on every ALLOWED
+                            // read too (measured ~0.5 ms cold, ~0 warm). What
+                            // the two cached calls do buy is short-circuiting
+                            // the population that IS named by a rule — the
+                            // common case on a ruled repository — off the
+                            // uncached path. `unwrap_or(false)` keeps the
+                            // existing fail-closed direction of this branch
+                            // rather than converting a DB blip from 403 to 503.
+                            || vis_state
+                                .permission_service
+                                .check_repository_action(ext.user_id, repo.id, action, false)
+                                .await
                                 .unwrap_or(false);
 
                         if !allowed {
+                            tracing::info!(
+                                repository_id = %repo.id,
+                                user_id = %ext.user_id,
+                                action,
+                                "native-format read denied: no applicable permission rule and no \
+                                 role assignment carrying the action"
+                            );
                             return forbidden_permission_response();
                         }
                     }
@@ -2428,7 +2575,27 @@ pub async fn repo_visibility_middleware(
                     match granted {
                         Ok(true) => {}
                         // Existence-hiding 404, matching REST `require_visible`.
-                        Ok(false) => return not_found_response(),
+                        //
+                        // The RESPONSE stays byte-identical to the one a
+                        // nonexistent key produces — that indistinguishability
+                        // is the point (#1808 / GHSA-fv45-mwhh-q23r) and is not
+                        // traded away here. The operator-facing half of #3452
+                        // was that nothing on the server said WHICH of the two
+                        // it was either: the only clue in the reporter's log was
+                        // an unrelated `no permission rules found for target`
+                        // line, so a 20-byte `Repository not found` was
+                        // indistinguishable from a missing repository in the
+                        // logs as well as on the wire. Say it here, where the
+                        // decision is made.
+                        Ok(false) => {
+                            tracing::info!(
+                                repository_id = %repo.id,
+                                user_id = %ext.user_id,
+                                "private repository read denied: caller holds no grant on this \
+                                 repository; answering the existence-hiding 404"
+                            );
+                            return not_found_response();
+                        }
                         Err(_) => {
                             // DB error on access check: fail closed.
                             tracing::error!("repo access check failed: database unreachable");
@@ -3650,7 +3817,30 @@ mod tests {
         );
         // A conda channel that merely happens to be named "t" (no token
         // segment shape) still resolves to that key when addressed plainly.
-        assert_eq!(extract_repo_key("/conda/t"), "");
+        assert_eq!(extract_repo_key("/conda/t"), "t");
+    }
+
+    #[test]
+    fn test_extract_repo_key_conda_t_route_is_not_a_token_channel() {
+        // `/conda/t/<TOKEN>/<repo_key>/...` is a token channel; `/conda/t/x` is
+        // the PLAIN conda router serving a repository whose key is literally
+        // `t` (`/conda/<repo_key>/upload`, `/conda/<repo_key>/notices.json`).
+        // Skipping the `t/<TOKEN>` pair on those two-segment paths returned an
+        // EMPTY key for a request that does name a repository, so the
+        // repository never got a visibility, token-scope or write-gate check
+        // and the caller's credential was replaced with the anonymous value.
+        // The token skip applies only when a segment follows the token.
+        assert_eq!(extract_repo_key("/conda/t/upload"), "t");
+        assert_eq!(extract_repo_key("/conda/t/channeldata.json"), "t");
+        assert_eq!(extract_repo_key("/conda/t/notices.json"), "t");
+        // Three or more segments: unchanged token-channel behaviour.
+        assert_eq!(extract_repo_key("/conda/t/tok/my-channel"), "my-channel");
+        assert_eq!(
+            extract_repo_key("/conda/t/tok/my-channel/noarch/repodata.json"),
+            "my-channel"
+        );
+        // An empty repo-key segment inside a token channel stays empty.
+        assert_eq!(extract_repo_key("/conda/t/tok//noarch/repodata.json"), "");
     }
 
     #[test]
@@ -3679,6 +3869,51 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_repo_key_api_alias() {
+        // #2941 / #3000: the cm-push and cargo alias routers are mounted at
+        // `/api/helm` and `/api/cargo`, so their paths are
+        // `/api/<format>/<repo_key>/...` and the repository key is the THIRD
+        // segment. Before the fix the generic rule returned the literal
+        // "helm"/"cargo", no repo matched, and the visibility middleware's
+        // no-repo branch rejected every alias request before the handler ran.
+        assert_eq!(extract_repo_key("/api/helm/my-repo/charts"), "my-repo");
+        assert_eq!(
+            extract_repo_key("/api/helm/my-repo/charts/mychart/1.2.3"),
+            "my-repo"
+        );
+        assert_eq!(
+            extract_repo_key("/api/cargo/my-repo/config.json"),
+            "my-repo"
+        );
+        assert_eq!(
+            extract_repo_key("/api/cargo/my-repo/api/v1/crates/new"),
+            "my-repo"
+        );
+        // Missing repo segment: empty key, as at any other format root.
+        assert_eq!(extract_repo_key("/api/cargo"), "");
+        assert_eq!(extract_repo_key("/api"), "");
+    }
+
+    #[test]
+    fn test_extract_repo_key_api_non_alias_unchanged() {
+        // The skip is limited to the two aliased format names. `/api/v1` is
+        // the REST API, not a format mount, and must never be read as
+        // `/api/<format>/<repo_key>/...` — a broadened "any /api/<x>" rule
+        // would turn "v1" into a format prefix and the resource name into a
+        // repository key.
+        assert_eq!(extract_repo_key("/api/v1/repositories"), "v1");
+        assert_eq!(
+            extract_repo_key("/api/v1/repositories/my-repo/artifacts"),
+            "v1"
+        );
+        assert_eq!(extract_repo_key("/api/packages/flutter_web"), "packages");
+        // The native mounts are untouched, including a repository that
+        // happens to be named after an aliased format.
+        assert_eq!(extract_repo_key("/cargo/helm/config.json"), "helm");
+        assert_eq!(extract_repo_key("/helm/cargo/index.yaml"), "cargo");
+    }
+
+    #[test]
     fn test_extract_repo_key_percent_decoded() {
         // GHSA-fv45-mwhh-q23r: axum's `Path<String>` extraction percent-decodes
         // route params, so the middleware must evaluate the SAME decoded key.
@@ -3696,14 +3931,19 @@ mod tests {
         assert_eq!(extract_repo_key("/npm/my+repo/pkg"), "my+repo");
         // Double-encoding decodes exactly once, like the handler.
         assert_eq!(extract_repo_key("/npm/a%2520b/pkg"), "a%20b");
-        // The conda token-channel and /ext skips happen BEFORE decoding, so
-        // encoded keys under those mounts canonicalize the same way.
+        // The conda token-channel, /ext and /api alias skips all happen
+        // BEFORE decoding, so encoded keys under those mounts canonicalize
+        // the same way.
         assert_eq!(
             extract_repo_key("/conda/t/abc123token/privat%65/noarch/repodata.json"),
             "private"
         );
         assert_eq!(
             extract_repo_key("/ext/pypi-custom/privat%65/simple/"),
+            "private"
+        );
+        assert_eq!(
+            extract_repo_key("/api/cargo/privat%65/config.json"),
             "private"
         );
     }
@@ -3740,6 +3980,16 @@ mod tests {
         // Empty token segment is not a credential.
         assert_eq!(extract_conda_url_token("/conda/t//my-channel"), None);
         assert_eq!(extract_conda_url_token("/conda/t"), None);
+        // Two-segment `/conda/t/<route>` is the plain conda router serving a
+        // repository keyed `t`, not a token channel: the route segment is not
+        // a credential. (`extract_repo_key` resolves the same paths to `t`.)
+        assert_eq!(extract_conda_url_token("/conda/t/upload"), None);
+        assert_eq!(extract_conda_url_token("/conda/t/channeldata.json"), None);
+        // A repo key after the token is what makes it a token channel.
+        assert_eq!(
+            extract_conda_url_token("/conda/t/abc123token/my-channel"),
+            Some("abc123token")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6535,12 +6785,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_repo_visibility_pass_through_when_no_repo_key() {
+    async fn test_repo_visibility_no_repo_key_is_not_found() {
         // A path with no repo segment short-circuits at the empty-key check,
-        // before the cache is touched. Hitting `/` for example.
+        // before the cache is touched. It names no repository, so it is
+        // answered with the existence-hiding 404 and the handler never runs.
         let state = make_vis_state(None).await;
         let resp = run_through_visibility(state, empty_get("/")).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -6804,6 +7055,566 @@ mod tests {
         let state = make_vis_state(Some((key.to_string(), cached))).await;
         let resp = run_through_visibility(state, empty_get("/pypi/privat%65/simple/")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_api_alias_resolves_repo_key() {
+        // #3000: the cargo alias is mounted at `/api/cargo`, so the key is the
+        // third segment. The repo below is PUBLIC and cached under that key,
+        // so the anonymous sparse-index read passes (200). Before the fix the
+        // middleware looked up the literal "cargo", missed, and answered from
+        // its no-repo branch (401 anonymous / 404 with a credential) — the
+        // alias route was mounted but unreachable. The `/api/helm` cm-push
+        // alias shares the same shape and the same extraction.
+        let key = "myrepo";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached))).await;
+        let resp = run_through_visibility(state, empty_get("/api/cargo/myrepo/config.json")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3443 — the authorization half of the `/api` alias defect.
+    //
+    // `/api/cargo/{repo}/...` and `/api/helm/{repo}/charts` are mounted
+    // (routes.rs), but `extract_repo_key` returned the SECOND segment, i.e.
+    // the literal string `"cargo"` / `"helm"`. Those are ordinary, accepted
+    // repository keys, and they are the names an operator naturally gives a
+    // cargo or a Helm repository. Whenever such a repository exists, the
+    // middleware evaluated visibility, token scope and permissions against
+    // THAT repository while axum handed the handler the third segment — the
+    // repository actually being served. A checked-vs-served split, exactly
+    // the shape of GHSA-9rqp-mgmw-5879 (`/ext`) and GHSA-fv45-mwhh-q23r.
+    //
+    // The tests below encode the bypass primitives themselves, not just the
+    // extraction: each one passes the request through the real middleware and
+    // asserts a DENIAL that only holds once the key resolves to the third
+    // segment.
+    // -----------------------------------------------------------------------
+
+    /// Build a visibility state whose repo cache is pre-populated with several
+    /// repositories, so a request can be driven against one key while another
+    /// key is also resolvable — the decoy setup the `/api` alias defect needs.
+    async fn make_vis_state_multi(cached: Vec<(String, CachedRepo)>) -> RepoVisibilityState {
+        let state = make_vis_state(None).await;
+        {
+            let mut cache = state.repo_cache.write().await;
+            for (key, entry) in cached {
+                cache.insert(key, (entry, std::time::Instant::now()));
+            }
+        }
+        state
+    }
+
+    /// A PUBLIC repository literally named `cargo` — the ordinary result of
+    /// `POST /api/v1/repositories {"key":"cargo"}` — alongside the PRIVATE
+    /// repository whose crates are being protected.
+    async fn decoy_cargo_vis_state() -> RepoVisibilityState {
+        make_vis_state_multi(vec![
+            ("cargo".to_string(), make_cached_repo(/* is_public */ true)),
+            (
+                "cargo-priv".to_string(),
+                make_cached_repo(/* is_public */ false),
+            ),
+        ])
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_api_alias_decoy_cargo_repo_does_not_authorize_anonymous_private_read() {
+        // A repository literally named `cargo` exists and is public — the
+        // ordinary result of `POST /api/v1/repositories {"key":"cargo"}`.
+        // A second, PRIVATE repository holds the crates being protected.
+        //
+        // Before the fix the middleware resolved the key `"cargo"`, saw a
+        // PUBLIC repository, allowed the anonymous read, and the handler then
+        // served `cargo-priv` — an unauthenticated download of a private
+        // crate. The key must resolve to the repository the handler serves.
+        let state = decoy_cargo_vis_state().await;
+        let resp = run_through_visibility(
+            state,
+            empty_get("/api/cargo/cargo-priv/api/v1/crates/verifycrate/0.1.0/download"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an anonymous read of a PRIVATE repository through /api/cargo must \
+             be refused even when a public repository named `cargo` exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_alias_decoy_cargo_repo_does_not_authorize_anonymous_sparse_index() {
+        // Same primitive on the sparse-index shape cargo actually fetches
+        // first: the index reveals every crate name and version in the
+        // private repository before a single download is attempted.
+        let state = decoy_cargo_vis_state().await;
+        for uri in [
+            "/api/cargo/cargo-priv/config.json",
+            "/api/cargo/cargo-priv/ve/ri/verifycrate",
+        ] {
+            let resp = run_through_visibility(state.clone(), empty_get(uri)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "anonymous {uri} must be refused while `cargo-priv` is private"
+            );
+        }
+    }
+
+    /// Mint an access JWT carrying an `allowed_repo_ids` ceiling, i.e. the
+    /// claim shape a repository-scoped API token is exchanged into.
+    fn mint_scoped_access_jwt(
+        secret: &str,
+        sub: Uuid,
+        username: &str,
+        allowed_repo_ids: Vec<Uuid>,
+    ) -> String {
+        let now = Utc::now();
+        let claims = Claims {
+            sub,
+            username: username.to_string(),
+            email: format!("{}@example.test", username),
+            is_admin: false,
+            allowed_repo_ids: Some(allowed_repo_ids),
+            iat: now.timestamp(),
+            iat_ms: Some(now.timestamp_millis()),
+            exp: now.timestamp() + 300,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+            scopes: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode scoped access jwt")
+    }
+
+    /// Shared fixture for the two scoped-token alias tests.
+    ///
+    /// The caller holds a token scoped to a repository named after the alias
+    /// format (`cargo` / `helm`) and every fine-grained action on it — the
+    /// legitimate owner of that repository. A second, unrelated private
+    /// repository is the victim, and the caller has NO grant and NO scope on
+    /// it. Both repositories live only in the middleware's repo cache; the
+    /// database is needed for the users row the JWT validator re-reads and for
+    /// the `permissions` rows the write gate consults.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset, and `AK_TESTS_REQUIRE_DB=1`
+    /// (set by both the unit-test and coverage CI jobs) turns an unreachable
+    /// database into a hard failure rather than a silent skip.
+    async fn api_alias_scoped_token_fixture(
+        decoy_key: &str,
+        victim_key: &str,
+        actions: &[&str],
+    ) -> Option<(sqlx::PgPool, RepoVisibilityState, String, Uuid, Uuid)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await; // non-admin
+
+        // The repositories live in the cache only, so no `repositories` rows
+        // (and no globally-unique `cargo` / `helm` key) are claimed in a
+        // shared test database. `permissions.target_id` is an unconstrained
+        // uuid, so the grant below still drives the real permission service.
+        let decoy_id = Uuid::new_v4();
+        let victim_id = Uuid::new_v4();
+        tdh::grant_repo_actions(&pool, decoy_id, user_id, actions).await;
+
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let config = std::sync::Arc::new(crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        });
+        let auth_service = Arc::new(AuthService::new(pool.clone(), config));
+        let bearer = format!(
+            "Bearer {}",
+            mint_scoped_access_jwt(secret, user_id, &username, vec![decoy_id])
+        );
+
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let mut guard = cache.write().await;
+            for (key, id) in [(decoy_key, decoy_id), (victim_key, victim_id)] {
+                let entry = CachedRepo {
+                    id,
+                    ..make_cached_repo(/* is_public */ false)
+                };
+                guard.insert(key.to_string(), (entry, std::time::Instant::now()));
+            }
+        }
+        let state = RepoVisibilityState {
+            auth_service,
+            db: pool.clone(),
+            repo_cache: cache,
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        Some((pool, state, bearer, user_id, decoy_id))
+    }
+
+    /// Delete the fixture rows created against ids that have no `repositories`
+    /// row, which `tdh::cleanup` cannot reach.
+    async fn api_alias_scoped_token_cleanup(pool: &sqlx::PgPool, user_id: Uuid, decoy_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(decoy_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_api_alias_scoped_token_cannot_publish_to_another_repository() {
+        // A token scoped to the repository named `cargo` publishing into a
+        // DIFFERENT repository through `/api/cargo/{other}/api/v1/crates/new`.
+        //
+        // Before the fix the middleware resolved `"cargo"` — the very
+        // repository the token IS scoped to — so `can_access_repo` passed and
+        // the write gate checked the caller's grant on `cargo`. Both said yes,
+        // and the handler then published into `othercrates`. The repository
+        // ceiling was lost on the alias path, the #3316 shape.
+        let Some((pool, state, bearer, user_id, decoy_id)) =
+            api_alias_scoped_token_fixture("cargo", "othercrates", &["read", "write", "delete"])
+                .await
+        else {
+            return;
+        };
+
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri("/api/cargo/othercrates/api/v1/crates/new")
+            .header("Authorization", &bearer)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let status = run_through_visibility(state, req).await.status();
+
+        api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a token scoped to the repository `cargo` must not publish into \
+             another repository through /api/cargo"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_alias_scoped_token_cannot_delete_in_another_repository() {
+        // The destructive half, on the cm-push alias: a token scoped to the
+        // repository named `helm` deleting a chart out of a different
+        // repository through `/api/helm/{other}/charts/{name}/{version}`.
+        let Some((pool, state, bearer, user_id, decoy_id)) =
+            api_alias_scoped_token_fixture("helm", "helm-priv", &["read", "write", "delete"]).await
+        else {
+            return;
+        };
+
+        let req = axum::http::Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/helm/helm-priv/charts/testchart/0.1.0")
+            .header("Authorization", &bearer)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let status = run_through_visibility(state, req).await.status();
+
+        api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a token scoped to the repository `helm` must not delete a chart \
+             in another repository through /api/helm"
+        );
+    }
+
+    /// Every format prefix, addressed with an EMPTY `:repo_key` segment. Used
+    /// by both empty-key regression tests below so the two axes (#3443's 500
+    /// and the body-buffering primitive) are proven over the same surface.
+    ///
+    /// `/conda/t/upload` is deliberately included: it is a SINGLE-slash path,
+    /// so a reverse proxy that collapses `//` does not filter it. It is also
+    /// the one entry here whose second segment is NOT empty — it addresses a
+    /// repository whose key is literally `t` (see
+    /// `test_extract_repo_key_conda_t_route_is_not_a_token_channel`), so it is
+    /// answered by the no-repo branch with the #1808 401 challenge rather than
+    /// by the empty-key branch. Either way the body is never read, which is
+    /// what the third column pins.
+    const EMPTY_REPO_KEY_PROBES: &[(Method, &str, StatusCode)] = &[
+        (Method::PUT, "/npm//pkg", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/maven//com/x/1.0/x-1.0.jar",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/pypi//", StatusCode::NOT_FOUND),
+        (Method::POST, "/debian//upload", StatusCode::NOT_FOUND),
+        (Method::PUT, "/nuget//api/v2/package", StatusCode::NOT_FOUND),
+        (Method::POST, "/rpm//upload", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/cargo//api/v1/crates/new",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/api/cargo//api/v1/crates/new",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/gems//api/v1/gems", StatusCode::NOT_FOUND),
+        (Method::PUT, "/lfs//objects/deadbeef", StatusCode::NOT_FOUND),
+        (
+            Method::POST,
+            "/pub//api/packages/versions/newUpload",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::PUT, "/go//x", StatusCode::NOT_FOUND),
+        (Method::POST, "/helm//api/charts", StatusCode::NOT_FOUND),
+        (Method::POST, "/api/helm//charts", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/composer//api/packages",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/conan//v2/conans/n/v/u/c/revisions/r/files/f",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/alpine//upload", StatusCode::NOT_FOUND),
+        (Method::POST, "/conda//upload", StatusCode::NOT_FOUND),
+        (Method::POST, "/conda/t/upload", StatusCode::UNAUTHORIZED),
+        (
+            Method::PUT,
+            "/swift//scope/name/1.0.0",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/terraform//v1/modules/ns/n/p/1.0.0",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/cocoapods//pods", StatusCode::NOT_FOUND),
+        (Method::POST, "/hex//publish", StatusCode::NOT_FOUND),
+        (
+            Method::POST,
+            "/huggingface//api/models/m/upload/main",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/jetbrains//plugin/uploadPlugin",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/chef//api/v1/cookbooks",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/puppet//v3/releases", StatusCode::NOT_FOUND),
+        (
+            Method::POST,
+            "/ansible//api/v3/artifacts/collections/",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/cran//src/contrib/f.tar.gz",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::PUT, "/ivy//x/y.jar", StatusCode::NOT_FOUND),
+        (
+            Method::POST,
+            "/vscode//api/extensions",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/proto//buf.registry.module.v1beta1.UploadService/Upload",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/incus//images/p/v/f/uploads",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/lxc//images/p/v/f/uploads",
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::PUT, "/ext/wasmfmt//x", StatusCode::NOT_FOUND),
+        (Method::GET, "/general//x", StatusCode::NOT_FOUND),
+    ];
+
+    /// A request body that records whether anything ever polled it.
+    ///
+    /// The generator does not run until the stream is first polled, so the flag
+    /// answers exactly one question: did anything downstream of the middleware
+    /// start reading the request body?
+    fn tripwire_body(read_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> axum::body::Body {
+        use std::sync::atomic::Ordering;
+        axum::body::Body::from_stream(async_stream::stream! {
+            read_flag.store(true, Ordering::SeqCst);
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[0u8; 4096]));
+        })
+    }
+
+    /// Run `request` through the real middleware in front of a handler that
+    /// binds the two extractors every format upload handler binds: the strict
+    /// `Extension<Option<AuthExtension>>` and a body extractor.
+    async fn run_through_visibility_body_probe(
+        state: RepoVisibilityState,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> (StatusCode, String) {
+        use axum::{middleware, routing::any, Extension, Router};
+        use tower::ServiceExt;
+
+        async fn probe(
+            Extension(auth): Extension<Option<AuthExtension>>,
+            body: bytes::Bytes,
+        ) -> (StatusCode, String) {
+            let _ = auth;
+            (StatusCode::OK, format!("handler-read-{}-bytes", body.len()))
+        }
+
+        let app: Router = Router::new()
+            .fallback(any(probe))
+            .layer(middleware::from_fn_with_state(
+                state,
+                repo_visibility_middleware,
+            ));
+        let resp = app.oneshot(request).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_empty_key_never_leaks_a_500() {
+        // Axis 1 (#3443/#3444): an empty `:repo_key` segment must never produce
+        // an unauthenticated 500. Every format handler binds
+        // `Extension<Option<AuthExtension>>`, and axum answers a missing
+        // extension with a 500 whose body prints the extension's type path.
+        // The middleware closes that by answering the request itself, so the
+        // handler — and its strict extractor — never runs.
+        for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
+            let state = make_vis_state(None).await;
+            let req = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(*uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, body) = run_through_visibility_body_probe(state, req).await;
+            assert_ne!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {uri} answered 500: {body}"
+            );
+            assert!(
+                !body.contains("Missing request extension"),
+                "{method} {uri} leaked the extension type path: {body}"
+            );
+            assert_eq!(
+                status, *expected,
+                "{method} {uri} must be refused by the middleware itself"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_empty_key_does_not_read_the_request_body() {
+        // Axis 2: an anonymous, unauthorized request with an empty `:repo_key`
+        // must be refused BEFORE its body is read.
+        //
+        // The middleware used to insert an anonymous extension and fall through
+        // to the handler. Handler extractors then ran in order, so a body
+        // extractor buffered the ENTIRE upload into memory before the handler's
+        // own auth check could reject it — an unauthenticated allocation of up
+        // to `MAX_UPLOAD_SIZE` (10 GiB default) per request, on every format
+        // prefix, multiplied by `GLOBAL_MAX_CONCURRENCY`. The #508 write gate
+        // that would have refused it sits AFTER this branch.
+        //
+        // The tripwire body flips its flag on the first poll, so this asserts
+        // the property directly rather than by proxy: nothing read the body.
+        for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
+            let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let state = make_vis_state(None).await;
+            let req = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(*uri)
+                .header("Content-Type", "application/octet-stream")
+                .body(tripwire_body(read.clone()))
+                .unwrap();
+            let (status, body) = run_through_visibility_body_probe(state, req).await;
+            assert!(
+                !read.load(std::sync::atomic::Ordering::SeqCst),
+                "{method} {uri} read the request body of an unauthorized \
+                 anonymous request (status {status}, body {body})"
+            );
+            assert!(
+                !body.contains("handler-read"),
+                "{method} {uri} reached the handler: {body}"
+            );
+            assert_eq!(status, *expected, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_body_tripwire_flips_when_the_handler_is_reached() {
+        // Negative control for the two tests above: on a path the middleware
+        // DOES pass through (public repo, anonymous read), the same probe
+        // handler runs and reads the same tripwire body — so the flag flips.
+        // Without this, "the body was not read" could be an artifact of a
+        // tripwire that never flips at all.
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some(("myrepo".to_string(), cached))).await;
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/pypi/myrepo/simple/")
+            .body(tripwire_body(read.clone()))
+            .unwrap();
+        let (status, body) = run_through_visibility_body_probe(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(
+            body.contains("handler-read-4096-bytes"),
+            "the probe handler must have read the tripwire body, got {body}"
+        );
+        assert!(
+            read.load(std::sync::atomic::Ordering::SeqCst),
+            "the tripwire must flip when the body IS read"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_non_empty_key_write_gate_unchanged() {
+        // The empty-key change must not move any authorization outcome on a
+        // NON-empty key: an anonymous write to a public repository is still
+        // refused by the #508 gate with 401 (not the empty-key 404), and it is
+        // still refused before the body is read.
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some(("myrepo".to_string(), cached))).await;
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri("/npm/myrepo/pkg")
+            .body(tripwire_body(read.clone()))
+            .unwrap();
+        let (status, body) = run_through_visibility_body_probe(state, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+        assert!(
+            !read.load(std::sync::atomic::Ordering::SeqCst),
+            "the #508 write gate must reject before the body is read"
+        );
     }
 
     #[tokio::test]
@@ -7536,6 +8347,482 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "unflagged principal must not be gated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3387 / #3386 / #3452: role assignments are part of the native READ
+    // decision, exactly as they already are for writes and for REST reads.
+    // -----------------------------------------------------------------------
+
+    /// Fixture for the native-format read gate on a PRIVATE repository that
+    /// carries at least one fine-grained rule.
+    ///
+    /// The repository is a REAL row: `role_assignments.repository_id` is a
+    /// foreign key, so a synthetic id would silently drop the role grant and
+    /// the test would pass for the wrong reason. The middleware resolves the
+    /// repository from its cache, keyed by `repo_key`, so the cached entry
+    /// carries the real id.
+    ///
+    /// Returns `(pool, state, repo_id, role_user, ruled_user, bare_user)`:
+    ///
+    ///   * `role_user`  — holds a `developer` **role assignment** scoped to the
+    ///     repository (the shape the creator auto-grant, `repository-owner` and
+    ///     migration 172 write) and NO fine-grained rule;
+    ///   * `ruled_user` — holds a `{write}` rule, i.e. an APPLICABLE rule that
+    ///     does not carry `read`, PLUS the same `developer` role assignment;
+    ///   * `bare_user`  — holds nothing at all.
+    ///
+    /// A separate unrelated principal holds the `{read}` rule that makes
+    /// `has_any_rules_for_target` true for this repository. That is the whole
+    /// trigger: before this fix, the FIRST rule written against a repository —
+    /// for anyone — moved every read on it onto a gate that consults the
+    /// `permissions` table alone.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset, and `AK_TESTS_REQUIRE_DB=1`
+    /// (set by the unit-test and coverage CI jobs) turns an unreachable
+    /// database into a hard failure rather than a silent skip.
+    struct RoleGateFixture {
+        pool: sqlx::PgPool,
+        state: RepoVisibilityState,
+        repo_id: Uuid,
+        /// `developer` role assignment, no fine-grained rule.
+        role_user: Uuid,
+        /// `developer` role assignment PLUS an applicable `{write}` rule.
+        ruled_user: Uuid,
+        /// `repository-owner` role assignment PLUS an applicable `{write}`
+        /// rule. `repository-owner` carries `admin`, which is the documented
+        /// durable-owner carve-out (#3387 review F1).
+        owner_user: Uuid,
+        /// No rule, no role.
+        bare_user: Uuid,
+    }
+
+    async fn role_assignment_read_fixture(repo_key: &str) -> Option<RoleGateFixture> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let pool = tdh::try_pool().await?;
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+
+        let (rule_holder, _n1) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, repo_id, rule_holder, &["read"]).await;
+
+        let (role_user, _n2) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, role_user).await;
+
+        let (ruled_user, _n3) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, ruled_user).await;
+        tdh::grant_repo_actions(&pool, repo_id, ruled_user, &["write"]).await;
+
+        // Same shape as `ruled_user`, but the role is `repository-owner`, which
+        // carries `admin`. `grant_repo_access` deliberately grants `developer`,
+        // the ONE built-in role for which "an applicable rule wins" is true, so
+        // a fixture built only from it cannot see the carve-out below.
+        let (owner_user, _n5) = tdh::create_user(&pool).await;
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'repository-owner' \
+             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+        )
+        .bind(owner_user)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("grant repository-owner role");
+        tdh::grant_repo_actions(&pool, repo_id, owner_user, &["write"]).await;
+
+        let (bare_user, _n4) = tdh::create_user(&pool).await;
+
+        let config = std::sync::Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let entry = CachedRepo {
+                id: repo_id,
+                format: "maven".to_string(),
+                ..make_cached_repo(/* is_public */ false)
+            };
+            cache
+                .write()
+                .await
+                .insert(repo_key.to_string(), (entry, std::time::Instant::now()));
+        }
+        let state = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(pool.clone(), config)),
+            db: pool.clone(),
+            repo_cache: cache,
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        Some(RoleGateFixture {
+            pool,
+            state,
+            repo_id,
+            role_user,
+            ruled_user,
+            owner_user,
+            bare_user,
+        })
+    }
+
+    const ROLE_GATE_SECRET: &str = "test-secret-at-least-32-bytes-long-for-testing";
+
+    /// An UNSCOPED bearer for `user_id` (no repository ceiling), so the only
+    /// thing under test is the permission gate.
+    fn role_gate_bearer(user_id: Uuid) -> String {
+        format!(
+            "Bearer {}",
+            mint_access_jwt(ROLE_GATE_SECRET, user_id, "rolegate")
+        )
+    }
+
+    async fn role_gate_status(state: &RepoVisibilityState, uri: &str, user_id: Uuid) -> StatusCode {
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("Authorization", role_gate_bearer(user_id))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        run_through_visibility(state.clone(), req).await.status()
+    }
+
+    /// Verified-bug regression for #3387 (and #3386, its other framing).
+    ///
+    /// `repo_visibility_middleware` was the ONLY read gate in the codebase that
+    /// resolved reads from the `permissions` table alone. Every other gate on
+    /// the same repositories — this middleware's own write/delete arm
+    /// (`check_repository_action`), the ~23 REST read surfaces behind
+    /// `require_visible` (`user_can_access_repo` with `RepoAccess::READ`), and
+    /// the virtual-member filter (`try_authorize_virtual_members`) — resolves
+    /// through `check_repository_action`, which additionally honours role
+    /// assignments when no rule applies to the principal.
+    ///
+    /// The consequence, reproduced live before the fix: writing the FIRST
+    /// fine-grained rule against a repository, for ANY principal including a
+    /// completely unrelated one, silently revoked native-protocol READ for
+    /// every principal whose grant is a `role_assignment` — while leaving that
+    /// same principal's WRITE on the same route working.
+    ///
+    ///   GET  /maven/{repo}/…  403   (was 200 before the unrelated rule existed)
+    ///   PUT  /maven/{repo}/…  201   (unchanged)
+    ///   GET  /api/v1/repositories/{key}  200   (unchanged)
+    ///
+    /// Two formats are driven through the same fixture because the middleware
+    /// is mounted on every native format route; a fix scoped to one path would
+    /// pass the first assertion and fail the second.
+    #[tokio::test]
+    async fn test_3387_role_assignment_satisfies_native_read_on_a_ruled_repository() {
+        let Some(fx) = role_assignment_read_fixture("rolegate-a").await else {
+            return;
+        };
+
+        let maven = role_gate_status(
+            &fx.state,
+            "/maven/rolegate-a/com/example/demo/1.0.0/demo-1.0.0.pom",
+            fx.role_user,
+        )
+        .await;
+        let npm = role_gate_status(&fx.state, "/npm/rolegate-a/demo-pkg", fx.role_user).await;
+
+        crate::api::handlers::test_db_helpers::cleanup(&fx.pool, fx.repo_id, fx.role_user).await;
+
+        assert_eq!(
+            maven,
+            StatusCode::OK,
+            "#3387: a principal holding a `developer` role assignment on this repository must be \
+             able to READ it over a native format route. Before the fix the presence of an \
+             unrelated principal's fine-grained rule moved this read onto a `permissions`-only \
+             gate and answered 403, while the same principal's PUT on the same path still \
+             succeeded."
+        );
+        assert_eq!(
+            npm,
+            StatusCode::OK,
+            "#3387: the gate is the shared middleware, so the same principal must read through \
+             every native format mount, not just the one the fix was tested against"
+        );
+    }
+
+    /// The existence-hiding property this change PRESERVES (#3452).
+    ///
+    /// #3452 asks for consistent errors, and the cheapest way to give an
+    /// operator that would have been to distinguish "no such repository" from
+    /// "a repository you may not see". That is the #1808 / GHSA-fv45-mwhh-q23r
+    /// oracle and is deliberately NOT traded away: on a private repository with
+    /// no fine-grained rules, a caller holding no grant gets the same bytes a
+    /// nonexistent key gets. The diagnosis added by this change goes to the
+    /// server log instead, which is why that branch now emits a `tracing::info!`
+    /// before returning.
+    ///
+    /// Asserted as a byte-for-byte comparison of status, content-type and body,
+    /// because "the same 404" is exactly the property and a status-only check
+    /// would miss a body that differed.
+    #[tokio::test]
+    async fn test_3452_private_no_grant_stays_indistinguishable_from_no_such_repository() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // A private repository with NO fine-grained rules, so the read arm falls
+        // through to the role-assignment check, and a caller holding nothing.
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (bare_user, _n) = tdh::create_user(&pool).await;
+        // A second principal WITH a role assignment, as the positive control:
+        // without it, a fixture that 404s every request would satisfy the
+        // equality below.
+        let (member_user, _m) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, member_user).await;
+
+        let config = std::sync::Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let entry = CachedRepo {
+                id: repo_id,
+                format: "maven".to_string(),
+                ..make_cached_repo(/* is_public */ false)
+            };
+            cache.write().await.insert(
+                "hidden-repo".to_string(),
+                (entry, std::time::Instant::now()),
+            );
+        }
+        let state = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(pool.clone(), config)),
+            db: pool.clone(),
+            repo_cache: cache,
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+
+        async fn probe(
+            state: &RepoVisibilityState,
+            key: &str,
+            user_id: Uuid,
+        ) -> (u16, String, String) {
+            let req = axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/maven/{key}/com/example/demo/1.0.0/demo-1.0.0.pom"
+                ))
+                .header("Authorization", role_gate_bearer(user_id))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            let status = resp.status().as_u16();
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, ct, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let hidden = probe(&state, "hidden-repo", bare_user).await;
+        let nonexistent = probe(&state, "no-such-repository-key", bare_user).await;
+        let granted = probe(&state, "hidden-repo", member_user).await;
+
+        tdh::cleanup(&pool, repo_id, member_user).await;
+        tdh::cleanup_user(&pool, bare_user).await;
+
+        assert_eq!(
+            granted.0,
+            StatusCode::OK.as_u16(),
+            "POSITIVE CONTROL: a principal with a role assignment on the rules-less private \
+             repository must read it, or the equality below is vacuous"
+        );
+        assert_eq!(
+            hidden, nonexistent,
+            "#1808 / GHSA-fv45-mwhh-q23r: a private repository the caller holds no grant on must \
+             be byte-for-byte indistinguishable from a repository key that names nothing. #3452 \
+             asks for a clearer error; the clarification belongs in the server log, not here"
+        );
+        assert_eq!(
+            hidden.0,
+            StatusCode::NOT_FOUND.as_u16(),
+            "both must be the existence-hiding 404, not some other shared status"
+        );
+    }
+
+    /// Characterization test for the POLICY half of #3387, tracked in #3522.
+    ///
+    /// There are two role stores and only one of them is an authorization
+    /// input:
+    ///
+    /// | table | written by | read by a gate |
+    /// |---|---|---|
+    /// | `role_assignments` | repository creation, migration 172 | yes |
+    /// | `user_roles` | `POST /api/v1/users/{id}/roles`, SSO role mapping | no |
+    ///
+    /// A user can therefore hold `developer` (`["read","write"]`) as reported
+    /// by `GET /api/v1/users/{id}/roles` and still reach nothing — which is
+    /// the operational complaint in #3387 ("group/role-level access is not
+    /// honored; it has to be duplicated as an individual grant").
+    ///
+    /// This test asserts the CURRENT behaviour on purpose. Making `user_roles`
+    /// live would move the gate in the fail-open direction with instance-wide
+    /// blast radius: the table has no `repository_id` column, so every row is
+    /// global, and `developer` carries `write` — every existing row would
+    /// become read+write on every repository, and an IdP role claim would
+    /// become a global write grant (`apply_role_mapping` rebuilds the table on
+    /// every federated login). If that is later decided to be right, this test
+    /// must be deleted deliberately as part of the decision rather than
+    /// discovered to be failing.
+    ///
+    /// The positive control is the same fixture's `role_assignments` principal,
+    /// so "everything is denied here" cannot make the assertion pass.
+    #[tokio::test]
+    async fn test_3522_user_roles_is_not_a_repository_authorization_input() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = role_assignment_read_fixture("rolegate-c").await else {
+            return;
+        };
+        let (pool, state, repo_id, role_user, bare_user) = (
+            fx.pool.clone(),
+            fx.state.clone(),
+            fx.repo_id,
+            fx.role_user,
+            fx.bare_user,
+        );
+        let owner_user = fx.owner_user;
+        let ruled_user = fx.ruled_user;
+        let uri = "/maven/rolegate-c/com/example/demo/1.0.0/demo-1.0.0.pom";
+
+        // Give the otherwise-ungranted principal the `developer` role through
+        // the only public role API's table. `GET /api/v1/users/{id}/roles`
+        // would now report `developer` with `["read","write"]` for this user.
+        sqlx::query(
+            "INSERT INTO user_roles (user_id, role_id) \
+             SELECT $1, r.id FROM roles r WHERE r.name = 'developer' \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(bare_user)
+        .execute(&pool)
+        .await
+        .expect("insert user_roles row");
+
+        let via_user_roles = role_gate_status(&state, uri, bare_user).await;
+        let via_role_assignments = role_gate_status(&state, uri, role_user).await;
+
+        tdh::cleanup(&pool, repo_id, role_user).await;
+        for uid in [bare_user, owner_user, ruled_user] {
+            tdh::cleanup_user(&pool, uid).await;
+        }
+
+        assert_eq!(
+            via_role_assignments,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the `role_assignments` principal must read, or the denial below \
+             says nothing about `user_roles` specifically"
+        );
+        assert_eq!(
+            via_user_roles,
+            StatusCode::FORBIDDEN,
+            "#3522: a `user_roles` row confers no repository access today. This is the \
+             documented state, not an oversight to patch in passing -- see the doc comment"
+        );
+    }
+
+    /// The negative controls for
+    /// `test_3387_role_assignment_satisfies_native_read_on_a_ruled_repository`,
+    /// and the exact boundary of "an applicable rule is authoritative".
+    ///
+    /// Without these, "always allow" would satisfy that test. Three properties
+    /// are pinned, and the third is a CARVE-OUT rather than a guarantee:
+    ///
+    ///   1. **A bare principal is still denied.** No rule, no role: 403.
+    ///   2. **An applicable rule beats an ORDINARY role.** `ruled_user` holds a
+    ///      `{write}` rule and a `developer` role assignment. The rule applies
+    ///      to that principal, it does not carry `read`, and `developer` does
+    ///      not carry `admin` — so the rule decides and the answer is 403. A
+    ///      naive "OR the role in" fix turns this into a 200 and hands every
+    ///      write-only grantee read.
+    ///   3. **An applicable rule does NOT beat a role carrying `admin`.**
+    ///      `owner_user` holds the same `{write}` rule but the
+    ///      `repository-owner` role, and reads: **200**. This is not a bug in
+    ///      this change and not something it introduced —
+    ///      `check_repository_action` OR-s
+    ///      `EXISTS (assigned_roles WHERE 'admin' = ANY(permissions))`
+    ///      *outside* the `CASE WHEN EXISTS (applicable_rules)` block, which is
+    ///      the "durable owner capability" its own doc comment describes and
+    ///      which migration 172 was written to establish. The write/delete arm
+    ///      of this same middleware, `require_visible`, and
+    ///      `try_authorize_virtual_members` have all behaved this way since
+    ///      #3331; adopting the canonical function on native reads makes the
+    ///      read arm agree with them. `repository-owner` is auto-granted to
+    ///      every repository CREATOR (`repository_service.rs`) and, on upgrade,
+    ///      to repo-scoped `developer`s on creator-less rules-less repositories
+    ///      (migration 172), so the population is not marginal.
+    ///
+    ///      The practical consequence, stated so it is not discovered later:
+    ///      **`POST /api/v1/permissions` cannot narrow a repository owner's
+    ///      read on the native routes** (nor on REST, nor its writes — that was
+    ///      already true). Revoking an owner means removing the
+    ///      `repository-owner` role assignment, not writing a narrower rule.
+    ///
+    /// Pinning (3) rather than asserting its opposite is the point of this
+    /// test: an earlier revision of this PR claimed "an applicable rule is
+    /// authoritative for the principals it names" without the carve-out, and
+    /// the claim survived review only because `tdh::grant_repo_access` grants
+    /// `developer` — the one built-in role for which it happens to be true.
+    #[tokio::test]
+    async fn test_3387_applicable_rule_beats_an_ordinary_role_but_not_an_admin_carrying_one() {
+        let Some(fx) = role_assignment_read_fixture("rolegate-b").await else {
+            return;
+        };
+        let uri = "/maven/rolegate-b/com/example/demo/1.0.0/demo-1.0.0.pom";
+
+        let write_only_rule = role_gate_status(&fx.state, uri, fx.ruled_user).await;
+        let owner_with_write_only_rule = role_gate_status(&fx.state, uri, fx.owner_user).await;
+        let bare = role_gate_status(&fx.state, uri, fx.bare_user).await;
+        // Positive control in the same fixture, so a fixture that denies
+        // everyone cannot make the denials below pass vacuously.
+        let granted = role_gate_status(&fx.state, uri, fx.role_user).await;
+
+        crate::api::handlers::test_db_helpers::cleanup(&fx.pool, fx.repo_id, fx.role_user).await;
+        for uid in [fx.ruled_user, fx.owner_user, fx.bare_user] {
+            crate::api::handlers::test_db_helpers::cleanup_user(&fx.pool, uid).await;
+        }
+
+        assert_eq!(
+            granted,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the role-assigned principal must still read, or the denials \
+             below prove nothing"
+        );
+        assert_eq!(
+            write_only_rule,
+            StatusCode::FORBIDDEN,
+            "an APPLICABLE rule is authoritative over an ORDINARY role: a `{{write}}` rule must \
+             keep denying `read` for a principal whose role (`developer`) does not carry \
+             `admin`. Widening the gate must not turn a write-only grant into a read grant \
+             (the #3325 shape, in reverse)"
+        );
+        assert_eq!(
+            owner_with_write_only_rule,
+            StatusCode::OK,
+            "CARVE-OUT, pinned deliberately: a role carrying `admin` (`repository-owner`) wins \
+             over an applicable `{{write}}` rule, because `check_repository_action` OR-s the \
+             admin-role term OUTSIDE its CASE. If this ever flips to 403, the durable-owner \
+             capability changed and the write arm, `require_visible` and the virtual-member \
+             filter changed with it -- that is a policy decision, not a refactor"
+        );
+        assert_eq!(
+            bare,
+            StatusCode::FORBIDDEN,
+            "a principal with no rule and no role assignment must stay denied on a private \
+             repository"
         );
     }
 }

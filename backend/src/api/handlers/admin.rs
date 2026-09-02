@@ -540,6 +540,17 @@ pub struct RestoreRequest {
     pub restore_database: Option<bool>,
     pub restore_artifacts: Option<bool>,
     pub target_repository_id: Option<Uuid>,
+    /// Accept an archive whose integrity cannot be established (#3373).
+    ///
+    /// A restore refuses an archive it cannot check: since #3373 every backup
+    /// records its payload checksum on the `backups` row, outside the archive,
+    /// and the archive's contents are verified against it before any row is
+    /// ingested. Archives captured before that column existed fall back to the
+    /// checksum in their own manifest; one carrying neither cannot be verified
+    /// at all, and this flag is the deliberate, audited way to restore it
+    /// anyway. It never waives a checksum that is present and does not match.
+    #[serde(default)]
+    pub allow_unverified_archive: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -547,6 +558,11 @@ pub struct RestoreResponse {
     pub tables_restored: Vec<String>,
     pub artifacts_restored: i32,
     pub errors: Vec<String>,
+    /// What the archive's contents were checked against (#3373):
+    /// `recorded` (the digest on the `backups` row, the strong case),
+    /// `manifest` (the archive's own checksum -- detects corruption, not
+    /// tampering), or `waived` (`allow_unverified_archive` was set).
+    pub integrity_anchor: String,
 }
 
 /// Restore from backup
@@ -561,6 +577,8 @@ pub struct RestoreResponse {
     request_body = RestoreRequest,
     responses(
         (status = 200, description = "Backup restored", body = RestoreResponse),
+        (status = 400, description = "Archive integrity could not be established, or an \
+                                      unsupported option was supplied"),
         (status = 404, description = "Backup not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -589,6 +607,7 @@ pub async fn restore_backup(
         restore_database: payload.restore_database.unwrap_or(true),
         restore_artifacts: payload.restore_artifacts.unwrap_or(true),
         target_repository_id: payload.target_repository_id,
+        allow_unverified_archive: payload.allow_unverified_archive,
         actor: Some(auth.user_id),
     };
 
@@ -598,6 +617,7 @@ pub async fn restore_backup(
         tables_restored: result.tables_restored,
         artifacts_restored: result.artifacts_restored,
         errors: result.errors,
+        integrity_anchor: result.integrity_anchor.to_string(),
     }))
 }
 
@@ -1184,9 +1204,9 @@ pub(crate) fn parse_rfc3339_bound(
 }
 
 /// Append the shared WHERE clauses for the download-telemetry queries.
-fn push_download_filters<'a>(
-    builder: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
-    query: &'a ListDownloadsQuery,
+fn push_download_filters(
+    builder: &mut sqlx::QueryBuilder<sqlx::Postgres>,
+    query: &ListDownloadsQuery,
     from: Option<chrono::DateTime<chrono::Utc>>,
     to: Option<chrono::DateTime<chrono::Utc>>,
 ) {
@@ -2732,7 +2752,7 @@ mod tests {
             // from a clean slate.
             for table in ["manifest_blob_refs", "oci_blobs", "proxy_cache_artifacts"] {
                 let sql = format!("DELETE FROM {table} WHERE repository_id = ANY($1)");
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(&*sql))
                     .bind(&repo_ids[..])
                     .execute(&pool)
                     .await
@@ -2858,11 +2878,15 @@ mod tests {
             tables_restored: vec!["users".to_string(), "artifacts".to_string()],
             artifacts_restored: 42,
             errors: vec![],
+            integrity_anchor: "recorded".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["tables_restored"].as_array().unwrap().len(), 2);
         assert_eq!(json["artifacts_restored"], 42);
         assert!(json["errors"].as_array().unwrap().is_empty());
+        // The caller must be able to see WHAT the archive was checked against
+        // (#3373), not just that the restore returned 200.
+        assert_eq!(json["integrity_anchor"], "recorded");
     }
 
     // -----------------------------------------------------------------------

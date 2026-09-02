@@ -2,17 +2,55 @@
 //!
 //! `.github/workflows/docker-publish.yml` states a policy: CRITICAL/HIGH
 //! CVEs with an available fix block image publication, with `.trivyignore`
-//! as the documented exception path. These tests pin the two pieces of
-//! wiring that make that claim true, so neither can be loosened silently:
+//! as the documented exception path. These tests pin the wiring that makes
+//! that claim true, so none of it can be loosened silently:
 //!
-//!   1. every Trivy scan step runs with `exit-code: '1'` (findings fail the
-//!      Security Scan job instead of being informational), and
-//!   2. every `merge-*` job `needs: scan-containers` (a failing scan stops
+//!   1. every scanned image is covered by BOTH Trivy passes — a visibility
+//!      pass and an enforcement pass (see below),
+//!   2. the enforcement pass actually enforces the stated policy
+//!      (`exit-code: '1'`, `CRITICAL,HIGH`, `ignore-unfixed`, `.trivyignore`,
+//!      and a non-SARIF format so the severity filter survives), and
+//!   3. every `merge-*` job `needs: scan-containers` (a failing scan stops
 //!      tag publication, not just the scan job itself).
 //!
+//! # Why two passes, and why this file used to be wrong (#3437)
+//!
+//! Until #3122 the workflow ran ONE Trivy step per image: SARIF format,
+//! `severity: CRITICAL,HIGH`, `exit-code: '1'`. `aquasecurity/trivy-action`
+//! runs `unset TRIVY_SEVERITY` whenever the format is SARIF and
+//! `limit-severities-for-sarif` is not exactly `true`, so that step discarded
+//! its own filter and blocked publication on a fixable CVE of ANY severity —
+//! a LOW stopped every publish from `main` for days (#3121).
+//!
+//! #3122 split it in two, per image:
+//!
+//!   * a VISIBILITY pass (`format: sarif`, `exit-code: '0'`, no `severity:`)
+//!     that feeds the Security tab at every severity and never blocks, and
+//!   * an ENFORCEMENT pass (`format: table`, `severity: CRITICAL,HIGH`,
+//!     `exit-code: '1'`) that is the control the merge jobs depend on.
+//!
+//! The #2609 guard here predated that split and asserted that EVERY Trivy
+//! step carries `exit-code: '1'`, so from #3122 onward it failed on the
+//! visibility pass — reporting the gate as disabled while it was in fact
+//! working. Three of its four assertions only ever made sense on the
+//! enforcement pass. The guard now models the pair, which is stronger than
+//! filtering to the enforcement pass alone: a workflow that quietly dropped
+//! its enforcement pass entirely would satisfy a filter-based check
+//! vacuously, and fails this one.
+//!
+//! `scripts/ci/check-trivy-gate-severity.sh` is the sibling of these tests
+//! and covers the same policy from the other side (every GATING step in every
+//! workflow applies the severity filter it declares). It is deliberately kept
+//! separate: it runs in `shell-tests` with no Rust compile, and it is
+//! repo-wide rather than docker-publish-specific.
+//!
 //! They parse the workflow YAML directly; no network, no Docker, no DB.
+//! CI runs this target explicitly from the Tier 1 `test-backend-unit` job —
+//! see the comment there for why it cannot live in the Tier 2 `--test`
+//! allowlist.
 
 use serde_yaml::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 fn load_docker_publish_workflow() -> Value {
@@ -33,9 +71,35 @@ fn jobs(workflow: &Value) -> &serde_yaml::Mapping {
         .expect("workflow has a `jobs` mapping")
 }
 
-/// All steps across all jobs that invoke the aquasecurity/trivy-action,
-/// keyed as (job name, step name).
-fn trivy_scan_steps(workflow: &Value) -> Vec<(String, String, Value)> {
+/// A Trivy step, reduced to what the policy is stated in terms of.
+struct TrivyStep {
+    job: String,
+    name: String,
+    /// The `with.image-ref` value, e.g. `${{ steps.refs.outputs.backend }}`.
+    /// Two steps that scan the same image share this string exactly.
+    image_ref: String,
+    format: String,
+    exit_code: String,
+    severity: Option<String>,
+    ignore_unfixed: Option<bool>,
+    trivyignores: Option<String>,
+}
+
+impl TrivyStep {
+    /// The enforcement pass is the one that can fail the job. `exit-code` is
+    /// the whole definition: it is what the merge jobs' `needs:` edge reacts
+    /// to, and what #2609 exists to keep non-zero.
+    fn is_enforcement(&self) -> bool {
+        self.exit_code != "0"
+    }
+
+    fn where_(&self) -> String {
+        format!("{} / {}", self.job, self.name)
+    }
+}
+
+/// All steps across all jobs that invoke the aquasecurity/trivy-action.
+fn trivy_scan_steps(workflow: &Value) -> Vec<TrivyStep> {
     let mut found = Vec::new();
     for (job_name, job) in jobs(workflow) {
         let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
@@ -43,61 +107,196 @@ fn trivy_scan_steps(workflow: &Value) -> Vec<(String, String, Value)> {
         };
         for step in steps {
             let uses = step.get("uses").and_then(Value::as_str).unwrap_or("");
-            if uses.starts_with("aquasecurity/trivy-action@") {
-                let step_name = step
+            if !uses.starts_with("aquasecurity/trivy-action@") {
+                continue;
+            }
+            let with = step
+                .get("with")
+                .unwrap_or_else(|| panic!("trivy step in {job_name:?} has no `with`"));
+            let str_input = |key: &str| with.get(key).and_then(Value::as_str).map(str::to_string);
+            found.push(TrivyStep {
+                job: job_name.as_str().unwrap_or("<job>").to_string(),
+                name: step
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("<unnamed>")
-                    .to_string();
-                found.push((
-                    job_name.as_str().unwrap_or("<job>").to_string(),
-                    step_name,
-                    step.clone(),
-                ));
-            }
+                    .to_string(),
+                image_ref: str_input("image-ref").unwrap_or_else(|| {
+                    panic!("trivy step in {job_name:?} declares no `image-ref`")
+                }),
+                // trivy-action's own default when the input is omitted.
+                format: str_input("format").unwrap_or_else(|| "table".to_string()),
+                // Likewise: an omitted `exit-code` means "report only".
+                exit_code: str_input("exit-code").unwrap_or_else(|| "0".to_string()),
+                severity: str_input("severity"),
+                ignore_unfixed: with.get("ignore-unfixed").and_then(Value::as_bool),
+                trivyignores: str_input("trivyignores"),
+            });
         }
     }
     found
 }
 
-/// Wiring half 1: a CRITICAL/HIGH fixable finding must FAIL the scan step.
-/// `exit-code: '0'` is exactly the report-but-don't-enforce regression #2609
-/// closed; if a scan needs to be unblocked, the exception path is a justified
-/// `.trivyignore` entry, not a global exit-code downgrade.
+/// Group the Trivy steps by the image they scan, preserving nothing else.
+fn steps_by_image(steps: Vec<TrivyStep>) -> BTreeMap<String, Vec<TrivyStep>> {
+    let mut by_image: BTreeMap<String, Vec<TrivyStep>> = BTreeMap::new();
+    for step in steps {
+        by_image
+            .entry(step.image_ref.clone())
+            .or_default()
+            .push(step);
+    }
+    by_image
+}
+
+/// Wiring half 1a: every scanned image gets BOTH passes, exactly once each.
+///
+/// This is the assertion that makes the guard non-vacuous. Filtering to
+/// enforcement-pass steps and checking those would pass a workflow that had
+/// silently lost its enforcement pass altogether — precisely the regression
+/// #2609 exists to catch. Requiring the pair also pins that no image is
+/// scanned for visibility alone, and that nobody adds a third pass whose role
+/// is ambiguous.
 #[test]
-fn trivy_scan_steps_enforce_via_exit_code() {
+fn every_scanned_image_is_covered_by_both_trivy_passes() {
+    let workflow = load_docker_publish_workflow();
+    let by_image = steps_by_image(trivy_scan_steps(&workflow));
+
+    assert!(
+        by_image.len() >= 3,
+        "expected the backend/openscap/scanner-adapter images to be scanned in \
+         docker-publish.yml; found {} distinct image-refs. If the scanner moved \
+         or the images were renamed, move this contract test with them",
+        by_image.len()
+    );
+
+    for (image, steps) in &by_image {
+        let enforcement: Vec<&TrivyStep> = steps.iter().filter(|s| s.is_enforcement()).collect();
+        let visibility: Vec<&TrivyStep> = steps.iter().filter(|s| !s.is_enforcement()).collect();
+        let listing: Vec<String> = steps
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} (exit-code {}, format {})",
+                    s.where_(),
+                    s.exit_code,
+                    s.format
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            enforcement.len(),
+            1,
+            "{image}: expected exactly ONE enforcement Trivy pass (non-zero \
+             exit-code) — that is the step the merge jobs' `needs:` edge reacts \
+             to (#2609). Found {}: {listing:?}",
+            enforcement.len()
+        );
+        assert_eq!(
+            visibility.len(),
+            1,
+            "{image}: expected exactly ONE visibility Trivy pass (exit-code \
+             '0', SARIF to the Security tab) alongside the enforcement pass \
+             (#3122). Found {}: {listing:?}",
+            visibility.len()
+        );
+    }
+}
+
+/// Wiring half 1b: the enforcement pass must enforce the policy as stated.
+/// `exit-code: '0'` on this pass is exactly the report-but-don't-enforce
+/// regression #2609 closed; if a scan needs to be unblocked, the exception
+/// path is a justified `.trivyignore` entry, not an exit-code downgrade.
+#[test]
+fn trivy_enforcement_pass_gates_on_the_stated_policy() {
     let workflow = load_docker_publish_workflow();
     let steps = trivy_scan_steps(&workflow);
+    let enforcement: Vec<&TrivyStep> = steps.iter().filter(|s| s.is_enforcement()).collect();
     assert!(
-        !steps.is_empty(),
-        "expected trivy-action scan steps in docker-publish.yml; \
-         if the scanner moved, move this contract test with it"
+        !enforcement.is_empty(),
+        "docker-publish.yml has no ENFORCING Trivy step (none with a non-zero \
+         `exit-code`), so a CRITICAL/HIGH finding blocks nothing (#2609)"
     );
-    for (job, name, step) in &steps {
-        let with = step.get("with").expect("trivy step has `with`");
-        let exit_code = with.get("exit-code").and_then(Value::as_str);
+
+    for step in enforcement {
+        let at = step.where_();
         assert_eq!(
-            exit_code,
-            Some("1"),
-            "{job} / {name}: Trivy must run with exit-code '1' so policy \
-             violations fail the scan (#2609); use .trivyignore for exceptions"
+            step.exit_code, "1",
+            "{at}: the enforcing Trivy pass must use exit-code '1'; \
+             use .trivyignore for exceptions (#2609)"
         );
         // The stated scope of the policy: fixable CRITICAL/HIGH only.
         assert_eq!(
-            with.get("severity").and_then(Value::as_str),
+            step.severity.as_deref(),
             Some("CRITICAL,HIGH"),
-            "{job} / {name}: severity scope drifted from the stated policy"
+            "{at}: severity scope drifted from the stated policy"
+        );
+        // ...and the filter has to survive the action. trivy-action does
+        // `unset TRIVY_SEVERITY` for SARIF unless `limit-severities-for-sarif`
+        // is exactly "true", which is what made a LOW block every publish from
+        // main for days (#3121/#3122). A gating pass must not be SARIF.
+        assert_ne!(
+            step.format, "sarif",
+            "{at}: a gating Trivy pass must not use `format: sarif` — \
+             trivy-action discards `severity:` for SARIF, so the step would \
+             block on a fixable CVE of ANY severity (#3122)"
         );
         assert_eq!(
-            with.get("ignore-unfixed").and_then(Value::as_bool),
+            step.ignore_unfixed,
             Some(true),
-            "{job} / {name}: ignore-unfixed keeps unfixable base-image CVEs \
+            "{at}: ignore-unfixed keeps unfixable base-image CVEs \
              report-only; removing it changes the stated policy"
         );
         assert_eq!(
-            with.get("trivyignores").and_then(Value::as_str),
+            step.trivyignores.as_deref(),
             Some(".trivyignore"),
-            "{job} / {name}: .trivyignore is the documented exception path"
+            "{at}: .trivyignore is the documented exception path"
+        );
+    }
+}
+
+/// Wiring half 1c: the visibility pass must not block, and must not pretend
+/// to filter. It exists to feed the Security tab at ALL severities; declaring
+/// a `severity:` there only creates the illusion of a filter, because
+/// trivy-action throws that input away for SARIF (#3122). It shares the
+/// enforcement pass's `.trivyignore` so the Security tab and the gate agree
+/// on what has been accepted.
+#[test]
+fn trivy_visibility_pass_never_blocks_and_never_claims_a_filter() {
+    let workflow = load_docker_publish_workflow();
+    let steps = trivy_scan_steps(&workflow);
+    let visibility: Vec<&TrivyStep> = steps.iter().filter(|s| !s.is_enforcement()).collect();
+    assert!(
+        !visibility.is_empty(),
+        "docker-publish.yml has no VISIBILITY Trivy pass (none with \
+         `exit-code: '0'`), so nothing reaches the Security tab (#3122)"
+    );
+
+    for step in visibility {
+        let at = step.where_();
+        assert_eq!(
+            step.format, "sarif",
+            "{at}: a non-blocking Trivy pass is only useful as SARIF for the \
+             Security tab; a non-SARIF pass that cannot fail reports nowhere"
+        );
+        assert_eq!(
+            step.severity, None,
+            "{at}: the SARIF pass must NOT declare a `severity:` — \
+             trivy-action unsets it for SARIF, so writing one there documents \
+             a filter that does not exist (#3122)"
+        );
+        assert_eq!(
+            step.trivyignores.as_deref(),
+            Some(".trivyignore"),
+            "{at}: both passes apply .trivyignore so the Security tab and the \
+             gate agree on which findings have been accepted"
+        );
+        assert_eq!(
+            step.ignore_unfixed,
+            Some(true),
+            "{at}: the two passes must agree on ignore-unfixed, or the \
+             Security tab and the gate describe different scans"
         );
     }
 }

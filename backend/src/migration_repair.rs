@@ -616,9 +616,11 @@ mod tests {
             .after_connect(move |conn, _meta| {
                 let schema = schema.clone();
                 Box::pin(async move {
-                    sqlx::query(&format!("SET search_path TO \"{schema}\""))
-                        .execute(&mut *conn)
-                        .await?;
+                    sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                        "SET search_path TO \"{schema}\""
+                    )))
+                    .execute(&mut *conn)
+                    .await?;
                     Ok(())
                 })
             })
@@ -628,7 +630,7 @@ mod tests {
     }
 
     async fn create_isolation_schema(pool: &PgPool, schema: &str) {
-        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        sqlx::query(sqlx::AssertSqlSafe(&*format!("CREATE SCHEMA \"{schema}\"")))
             .execute(pool)
             .await
             .expect("create schema");
@@ -640,9 +642,11 @@ mod tests {
         // fails on Postgres when the current search_path target is
         // missing.
         if let Ok(pool) = PgPool::connect(url).await {
-            let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
-                .execute(&pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"
+            )))
+            .execute(&pool)
+            .await;
         }
     }
 
@@ -1089,7 +1093,7 @@ mod tests {
         let url = std::env::var("DATABASE_URL").ok()?;
         let admin = PgPool::connect(&url).await.ok()?;
         let name = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+        sqlx::query(sqlx::AssertSqlSafe(&*format!("CREATE DATABASE \"{name}\"")))
             .execute(&admin)
             .await
             .ok()?;
@@ -1101,9 +1105,11 @@ mod tests {
     async fn drop_scratch_database(admin_url: &str, pool: PgPool, name: &str) {
         pool.close().await;
         if let Ok(admin) = PgPool::connect(admin_url).await {
-            let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-                .execute(&admin)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+            )))
+            .execute(&admin)
+            .await;
             admin.close().await;
         }
     }
@@ -1118,7 +1124,7 @@ mod tests {
             if m.migration_type.is_down_migration() || m.version > max_version {
                 continue;
             }
-            sqlx::raw_sql(m.sql.as_ref())
+            sqlx::raw_sql(m.sql.clone())
                 .execute(pool)
                 .await
                 .unwrap_or_else(|e| panic!("apply migration {}: {e}", m.version));

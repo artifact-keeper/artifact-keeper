@@ -27,12 +27,69 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    `# RETIRED:` tombstone (the drift that stalled v1.7.0-rc.1 at Security
    Scan, #3039; the tombstone mechanism is #3309), the version set is
    consistent, Docker Publish for the exact commit being tagged (not
-   merely the latest run, #3338) cleanly published its manifest, and no
+   merely the latest run, #3338) cleanly published its manifest, no
    component pinned by a checked-in `VERSION` file would try to republish an
    exact tag that already exists with different content (the collision that
-   killed the v1.7.2 tag). A `NOT READY` (exit 1) means fix main first;
+   killed the v1.7.2 tag), and the pending CHANGELOG section and the commit
+   range `<previous stable tag>..HEAD` describe the same work in both
+   directions (#3537). A `NOT READY` (exit 1) means fix main first;
    tagging over it costs a full re-cut cycle. An exit 2 is `INFRA` — a check
-   that could not be measured, which is neither a pass nor a failure.
+   that could not be measured, which is neither a pass nor a failure. If a
+   check has already found a blocking problem and a *later* check cannot be
+   measured, you get exit 1, not exit 2 (#3538): the blocking problem is
+   definite and retrying will not remove it, so "retryable" would be the wrong
+   instruction. The transcript says which checks did not run, so re-run the
+   preflight for a full verdict once you have fixed them.
+
+   **This step is now enforced, not advisory (#3538).** `release.yml`'s
+   `preflight-evidence` job refuses to proceed unless a green run of the
+   **Release Preflight workflow** exists for the exact commit the tag points
+   at. A local `scripts/ci/release-preflight.sh` run is still useful, but it
+   leaves no evidence — only the workflow does, as a
+   `release-preflight-<sha>` artifact carrying the sha it actually checked
+   out. So:
+
+   - Run **Release Preflight** from the Actions UI (or
+     `gh workflow run release-preflight.yml --ref <branch>`) on the branch
+     whose tip is the commit you are about to tag, and wait for it to go
+     green. Cutting a maintenance release? Dispatch it **on that branch** —
+     the workflow audits the ref it was dispatched on, and says which one in
+     its verdict line.
+   - A preflight that is still running does **not** satisfy the gate. That is
+     deliberate: v1.7.7 was tagged 18 minutes after a preflight reported
+     `verdict does not exist yet`, and the run it was waiting on concluded
+     `failure` 19 seconds after the tag push.
+   - If the branch moves after the preflight goes green, the preflight no
+     longer applies — tag the commit it audited, or run it again.
+
+   **Break glass.** The gate predicts whether the chain will stall; it does
+   not certify the bytes, so it is override-able (the gates that *do* certify
+   bytes — `resolve-candidate-digest`, `release-gate`,
+   `verify-images-published` — are not). The override is a trailer in the
+   annotated tag's own message, and it requires a real reason:
+
+   ```bash
+   git tag -a v1.8.2 -m "Release 1.8.2
+
+   Preflight-Override: cut off-branch at 635496d0, which has no branch to
+   dispatch the workflow on; preflight run locally against that exact tree,
+   transcript on #3538"
+   ```
+
+   It lives there rather than in a workflow input or a repository variable
+   because the tag object is immutable (ruleset 19144026), is scoped to
+   exactly one version, cannot be added after the fact, and is readable
+   forever with `git show v1.8.2`. A trailer with no reason (or under 20
+   characters of one) is **refused**, not honoured. Every honoured override is
+   printed as a workflow warning and written to the release run's summary,
+   together with the verdict it overrode.
+
+   Check 5 reads the issue reference each entry leads with, so **every
+   CHANGELOG bullet must name the issue it closes** — `- **Summary**
+   (#NNNN). prose` — and every merged PR in the range must be named by some
+   pending entry. Dependency bumps (`chore: bump …`) and `chore(release):`
+   commits are the only exemptions. `### Sponsors` and `### Thank You`
+   bullets are credits, not entries, and are not reconciled.
 
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
@@ -136,11 +193,145 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    (for a missing CHANGELOG entry: land the promotion on `main`, delete
    and re-cut the tag) rather than publishing the draft by hand.
 
-8. **Post-release checks.** Confirm the GitHub Release is published (not
+   While the gates run, the registry holds only the immutable `:X.Y.Z`
+   tags. `:latest` and `:X.Y` still point at the PREVIOUS release, and
+   that is correct: nothing has certified the new bytes yet.
+
+8. **Watch the floating-tag promotion.** After the GitHub Release
+   publishes, `promote-floating-tags` dispatches `docker-publish.yml` with
+   `promote_version=X.Y.Z -f promote_floating=true`. That run rebuilds
+   nothing: it re-points `:latest` and `:X.Y` at the manifest-list digest
+   `:X.Y.Z` already names, and the job then asserts that both tags, on both
+   registries, resolve to the digest the release gate tested.
+
+   If it fails, the release is published and correct but `:latest` has not
+   moved. Re-run the job, or dispatch it by hand:
+
+   ```bash
+   gh workflow run docker-publish.yml --repo artifact-keeper/artifact-keeper \
+     --ref vX.Y.Z -f promote_version=X.Y.Z -f promote_floating=true
+   ```
+
+   A backport moves only its series alias: promoting `1.7.9` while `1.8.2`
+   is the newest release advances `:1.7` and leaves `:latest` alone.
+
+9. **Post-release checks.** Confirm the GitHub Release is published (not
    draft), release notes are the curated per-version body (see "Release-notes
-   style" below), not the raw auto-generated PR list, `:latest` moved only if this is a stable release, and the demo
+   style" below), not the raw auto-generated PR list, `:latest` and `:X.Y`
+   moved (stable releases only), and the demo
    or any pinned environments are updated intentionally (see
    "Infrastructure & Cost Rules" in CLAUDE.md).
+
+   Then verify the release the way an operator would, from a clean directory —
+   the `release` job already did this before publishing, but running it from
+   outside proves the assets a downloader actually receives are the ones that
+   were verified:
+
+   ```bash
+   REPO_DIR="$PWD"                       # your artifact-keeper checkout
+   IDENTITY="$("$REPO_DIR"/scripts/ci/release-identity-regexp.sh \
+     artifact-keeper/artifact-keeper release.yml refs/tags/vX.Y.Z)"
+
+   cd "$(mktemp -d)"
+   gh release download vX.Y.Z --repo artifact-keeper/artifact-keeper
+
+   cosign verify-blob \
+     --bundle checksums.txt.cosign.bundle \
+     --certificate-identity-regexp "$IDENTITY" \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     checksums.txt
+   sha256sum -c checksums.txt
+   gh attestation verify artifact-keeper-linux-amd64.tar.gz \
+     --repo artifact-keeper/artifact-keeper \
+     --signer-workflow artifact-keeper/artifact-keeper/.github/workflows/release.yml
+   ```
+
+   `scripts/ci/release-identity-regexp.sh` is the same script the release job
+   uses to build its pin, so this checks the release against exactly the
+   identity the job required — not a hand-typed approximation of it.
+
+   `SECURITY.md` carries the same commands written out for a user who does
+   not have the repository checked out; keep the two in step.
+
+## Supply chain: what the release job signs, and what it refuses
+
+Release binaries used to ship with a `<name>.sha256` beside them and nothing
+else, which is a corruption check routinely read as an authenticity check: it
+is served from the same place, by the same authority, as the artifact it
+describes. Since #3558 the `release` job does four things between "Collect
+release assets" and "Create Release", **in this order**:
+
+1. writes one `checksums.txt` covering every asset (the per-file `.sha256`
+   files stay, and are themselves listed in it);
+2. signs `checksums.txt` with **cosign keyless** — GitHub OIDC to Fulcio to
+   Rekor, no key material to hold or rotate — producing
+   `checksums.txt.cosign.bundle`;
+3. attaches **build provenance** to every archive, SBOM and the manifest with
+   `actions/attest-build-provenance`;
+4. **verifies all of it** with `scripts/ci/verify-release-assets.sh` before
+   anything is published.
+
+The order is the point, and it is not stylistic. `assert-release-absent.sh`
+refuses to run against a tag that already has a release and
+`softprops/action-gh-release` runs with `overwrite_files: false`, so a
+*partial* publish is not recoverable by re-running — it burns an immutable
+version number. Everything that can fail therefore fails while the job has
+produced nothing public, and the recovery is "re-run the job".
+
+The verification refuses, among other things: an asset missing from
+`checksums.txt` (an unlisted asset is an unsigned asset), digests that do not
+match the bytes on disk, a missing signature, a valid signature carrying the
+**wrong certificate identity**, a certificate-identity pattern permissive
+enough to accept one, provenance signed by a different workflow, and a missing
+`.cdx.json`. It separates a Sigstore or GitHub API outage (exit 2, INFRA,
+"retry") from a genuine mismatch (exit 1, BLOCKED, "something replaced your
+bytes"); both stop the release. Every one of those legs is exercised offline
+by `scripts/ci/test-verify-release-assets.sh` in CI's shell-tests job, because
+this code path runs once per release and cannot be rehearsed without cutting a
+tag.
+
+Binaries are built with `cargo auditable`, so the dependency graph is embedded
+in the shipped executable and a `.cdx.json` CycloneDX SBOM ships per target.
+`scripts/ci/assert-binary-sbom.sh` asserts the embedding actually happened,
+which is necessary rather than belt-and-braces: `cargo audit bin` **exits 0**
+on a binary with no embedded data, printing a warning and falling back to a
+partial list scraped from panic messages. Without an assertion on its output,
+dropping `auditable` from the build command leaves CI green and every shipped
+binary hollow.
+
+**Do not add `continue-on-error` to any of these steps.**
+`scripts/ci/check-supply-chain-soft-fail.sh` blocks it, for the reason #2824
+exists: a soft-failed cosign step let 1.6.1 ship unsigned and a human found it
+later.
+
+
+## Rolling `:latest` back
+
+There is no separate rollback path, because there is nothing to roll back in
+the normal failure case: if any gate fails, `:latest` and `:X.Y` were never
+moved and still name the previous release. The only visible consequence is
+that after a failed cut the registry looks like the release did not happen —
+`:X.Y.Z` exists and is immutable, but the floating tags are unchanged.
+
+To move `:latest` back off a release that DID publish and then turned out to
+be bad:
+
+1. Delete the bad GitHub Release, or mark it as a prerelease. This is the
+   deliberate act; the tag movement follows from it.
+2. Dispatch the promotion for the version you want:
+
+   ```bash
+   gh workflow run docker-publish.yml --repo artifact-keeper/artifact-keeper \
+     --ref vX.Y.Z -f promote_version=X.Y.Z -f promote_floating=true
+   ```
+
+`.github/scripts/floating-tag-plan.sh` reads the published-release set, so once
+the bad release is gone the previous version is the newest one and the floating
+tags are allowed to move to it. While the bad release is still published, the
+same command is refused — floating tags never move backwards by accident.
+
+Do NOT delete container tags to roll back. `:X.Y.Z` is immutable and names real,
+scanned bytes; deleting it breaks every chart that pins it.
 
 ## Policy summary
 
@@ -151,12 +342,37 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
 - The GitHub Release body is a curated high-level paraphrase of the
   version's `## [X.Y.Z]` CHANGELOG section (see "Release-notes style"),
   NOT the raw auto-generated PR list; recognition sections (Sponsors,
-  Thank You) follow the CLAUDE.md policy.
+  Thank You) follow the CLAUDE.md policy. For a stable release
+  `.github/release-notes/<version>.md` is REQUIRED on the ref being
+  released — `generate_release_notes` is a prerelease-only fallback, and a
+  stable tag without the file is refused (#3537).
+- Every CHANGELOG entry names the issue it closes, and every merged PR
+  since the previous stable tag is named by some pending entry. Enforced
+  in both directions by `release-preflight.sh` check 5 (#3537).
 - Prerelease tags (`-rc.N`, `-beta.N`) are exempt from the CHANGELOG
   entry requirement; final releases are not.
 - `CHANGELOG.md` always has an open `## [Unreleased]` as its first `## [`
   heading. Enforced by `scripts/ci/check-changelog-unreleased.sh` in CI's
   shell-tests job (#3433).
+- Floating tags (`:latest`, `:X.Y`) are applied ONLY after the release gate
+  and the GitHub Release, by a build-free promotion that re-points them at the
+  digest `:X.Y.Z` already names. A floating tag may only name a version with a
+  published, non-draft, non-prerelease GitHub Release, and only if that version
+  is the newest in the line the tag represents. Enforced by
+  `.github/scripts/floating-tag-plan.sh` and pinned by
+  `scripts/ci/check-floating-tag-promotion.sh` in CI's shell-tests job.
+  Prereleases never take a floating tag.
+- Release binaries are signed and verified before publication, never after:
+  one `checksums.txt` over every asset, a cosign keyless signature over it, and
+  build provenance on the assets — all three VERIFIED by
+  `scripts/ci/verify-release-assets.sh` before `Create Release` runs, because
+  `overwrite_files: false` plus `assert-release-absent.sh` make a partial
+  publish unrecoverable. The certificate identity is pinned to this repository,
+  this workflow file and this tag; a permissive pattern is refused by the gate
+  rather than passed to cosign (#3558).
+- Binaries embed their dependency graph (`cargo auditable`) and ship a
+  per-target CycloneDX SBOM, and the embedding is ASSERTED at build time —
+  `cargo audit bin` exits 0 on a binary that has none (#3558).
 - No change reaches a tag that touches a versioned component's source set
   (`docker/*/VERSION` and its sibling Dockerfile) without bumping that
   component's `VERSION` — step 5. Exact version tags are never republished,
@@ -200,7 +416,26 @@ section**:
 
 Mechanics: author the body as `.github/release-notes/<version>.md` and
 commit it in the same PR as the CHANGELOG promotion. `release.yml`'s
-"Resolve release notes" step uses that file as the Release `body_path`
-when present, and falls back to `generate_release_notes` only for versions
-without a curated file (e.g. `-rc.N` prereleases). Security hotfix releases
-use the tighter "am I affected" table format instead.
+"Resolve release notes" step uses that file as the Release `body_path`.
+
+For a stable `vX.Y.Z` the file is **required**: with no curated file the
+release-preflight job refuses the tag, and the "Resolve release notes" step
+refuses it again an hour later. `generate_release_notes` survives only for
+prereleases (`-rc.N`, `-beta.N`). That fallback used to apply to everything,
+silently: v1.7.1 was cut with no curated file, the step logged "using GitHub
+auto-generated notes", and the release published — and because auto-notes do
+not promote the CHANGELOG, eight `[Unreleased]` entries that had already
+shipped stayed under `[Unreleased]`, one of them telling operators to act
+"before upgrading to 1.7.2" when they had been exposed for a week (#3318,
+#3537).
+
+The notes file is read from **the ref being released**, not from `main`.
+`main` and `release/1.7.x` hold disjoint halves of the 1.7.x set — 1.7.6 and
+1.7.8 live only on the release branch, which is where they belong. Put the
+file on the branch you are cutting from.
+
+`.github/release-notes/` must also hold no file for a version that has
+neither a tag nor a Release. A stale notes file is what a human reads when
+reconstructing what shipped, and it is one rename away from being published
+as another version's body. Security hotfix releases use the tighter "am I
+affected" table format instead.

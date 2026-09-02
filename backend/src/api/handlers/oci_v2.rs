@@ -2380,7 +2380,7 @@ pub fn extract_blob_refs(body: &[u8]) -> Vec<BlobRef> {
 /// the DB round-trip.
 ///
 /// Pure and DB-free so the array-pairing logic is unit-testable without a
-/// database (the raw `sqlx::query(...).execute()` is exercised only by the
+/// database (the raw `sqlx::query(sqlx::AssertSqlSafe(&*...)).execute()` is exercised only by the
 /// Tier-2 integration tests).
 fn blob_refs_to_columns(refs: &[BlobRef]) -> Option<(Vec<String>, Vec<String>)> {
     if refs.is_empty() {
@@ -3864,6 +3864,17 @@ async fn cache_manifest_reference_locally(
         }
     }
 
+    // #3441/#3611: the packages-catalog write does NOT happen here. This
+    // function runs BEFORE `maybe_gate_remote_manifest_scan` on the cold GET
+    // path (deliberately -- caching first is what gives the gate
+    // `manifest_blob_refs` to reassemble a layout from) and is also reached
+    // from the ungated HEAD handler, so a write here advertised scan-blocked
+    // content in the packages catalog and let a bare HEAD publish rows
+    // (#3611). The GET handler indexes via `index_proxied_manifest_package`
+    // only after the scan gate has agreed to serve, the same ordering
+    // `record_oci_manifest_pull` already follows for download counting
+    // (#3446).
+
     Ok(digest)
 }
 
@@ -3890,6 +3901,119 @@ async fn cache_manifest_or_compute_digest(
             compute_sha256(content)
         }
     }
+}
+
+/// #3441: surface a pulled-through image in the packages catalog.
+///
+/// The Packages page reads `packages`/`package_versions` (via
+/// /api/v1/packages), NOT `artifacts`. `handle_put_manifest` learned to
+/// populate the catalog so a PUSHED image stopped being "pullable yet
+/// invisible"; the PROXY path never did. The rows
+/// `cache_manifest_reference_locally` writes are what the artifact listing
+/// and the docker-tag grouping read; they are not what the Packages page
+/// reads.
+///
+/// This is a direct call rather than a new arm in `catalog_indexable_format`.
+/// That allow-list gates `index_cached_package`, which only ever sees paths
+/// that flow through the shared proxy-fetch layer -- for OCI that is BLOBS.
+/// Manifests are cached outside that layer on purpose (#1278's guard,
+/// `cache_manifest_reference_locally_does_not_call_proxy_cache_artifact`).
+/// Widening the allow-list would therefore have indexed layer blobs --
+/// digest-named, versionless, dozens per image -- and still not the image.
+/// The identity a user recognises exists only at the manifest seam.
+///
+/// # Ordering (#3611)
+///
+/// Called by `handle_get_manifest` strictly AFTER
+/// `maybe_gate_remote_manifest_scan` has agreed to serve, next to
+/// `record_oci_manifest_pull` and for the same reason (#3446): an image the
+/// gate refuses to serve must be neither counted as a download nor
+/// advertised in the packages catalog. It is NOT called from
+/// `handle_head_manifest` -- HEAD stays ungated (parity with the
+/// direct-Remote HEAD path), so a bare HEAD must not publish catalog rows
+/// either. A manifest cached by a refused pull is indexed by the next
+/// upstream re-fetch that passes the gate (the cached tag expires and the
+/// cold path re-enters).
+///
+/// # Why tags only, and why that is the whole answer to the duplicate
+/// # question
+///
+/// Gating on `oci_reference_is_tag` is what keeps a multi-manifest format
+/// from turning into catalog noise, and it is the SAME rule the push path
+/// already applies rather than a new policy invented here:
+///
+///   * `docker pull nginx:1.27` fetches the index by TAG (one package row,
+///     `nginx` @ `1.27`) and then each architecture's child manifest BY
+///     DIGEST -- those are not user-facing versions and produce no rows.
+///   * `docker pull nginx@sha256:...` names no version a person chose, so
+///     it produces no row either, exactly as a digest-only push does not.
+///   * A re-pull of the same tag upserts the one row instead of adding to
+///     it, so a busy proxy converges on one row per image per tag.
+///
+/// # Size
+///
+/// The same pair of helpers the push path sizes with, and the two manifest
+/// classes land in genuinely different places -- measured, not assumed.
+///
+/// An IMAGE manifest is sized exactly: `manifest_total_size` reads
+/// `config.size + layers[].size` out of the manifest body, so it is right
+/// WITHOUT its layers having been pulled, which matters here because on a
+/// proxy the manifest arrives before any blob.
+///
+/// An image INDEX carries no config or layers of its own, so its size is the
+/// sum over the child manifests already cached -- and on a proxy that is 0
+/// on the first pull, because the children are fetched AFTER the index.
+/// It is not the case that an ordinary re-pull fixes it: a warm proxy cache
+/// serves the tag without re-entering the cold path, so the row is only
+/// recomputed once the cached tag has expired and the tag is re-fetched
+/// from upstream. Even then the sum is over the children's RECORDED
+/// artifact sizes, and the rows the cache function writes for a proxied
+/// child record the manifest body length rather than the image size -- so
+/// the number for a proxied multi-arch tag is not the image's download size.
+/// Verified live: a hosted push of a single-arch image records 54 bytes for
+/// a 37-byte config plus a 17-byte layer, while a proxied `alpine:3.19`
+/// index records 0. Correcting it means teaching the proxied child-manifest
+/// artifact rows to carry image sizes, which changes a shared pre-existing
+/// path that the docker-tag grouping also reads; that is filed on its own
+/// rather than smuggled in here. Showing the image at all is what #3441 is
+/// about, and a size that is honest about being a lower bound beats an
+/// invented one.
+///
+/// Best-effort: a catalog failure must not fail the client's pull. The
+/// fire-and-forget wrapper logs it.
+async fn index_proxied_manifest_package(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    reference: &str,
+    content: &Bytes,
+    digest: &str,
+) {
+    if !oci_reference_is_tag(reference) {
+        return;
+    }
+    let class = classify_manifest(content);
+    if matches!(class, ManifestClass::Malformed) {
+        // Not a real manifest: the cache function kept the body for the
+        // client but recorded no tag row (#1409 C1); the catalog mirrors
+        // that and records nothing.
+        return;
+    }
+    let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
+    let child_size = match class {
+        ManifestClass::Index => index_child_artifact_size_sum(&state.db, repo.id, digest).await,
+        _ => 0,
+    };
+    crate::services::package_service::PackageService::new(state.db.clone())
+        .try_create_or_update_from_artifact(
+            repo.id,
+            &repo.image,
+            reference,
+            manifest_total_size(content).saturating_add(child_size),
+            checksum,
+            None,
+            Some(serde_json::json!({ "format": "docker" })),
+        )
+        .await;
 }
 
 /// Try to fetch an OCI resource from the upstream registry for a remote repo.
@@ -7960,6 +8084,10 @@ async fn handle_head_manifest(
             ct.as_deref(),
         )
         .await;
+        // #3611: deliberately NO `index_proxied_manifest_package` here. HEAD
+        // is ungated (see above), so publishing catalog rows from it let a
+        // bare HEAD advertise content the scan gate refuses to serve. The
+        // catalog write lives on the GET path, after its scan gate.
         return build_oci_proxy_response(
             &content,
             ct,
@@ -9271,6 +9399,11 @@ async fn handle_get_manifest(
         // the gate refuses to serve is not counted as a download, and using the
         // same manifest path the fetch above cached under so the cold pull and
         // every subsequent warm pull accumulate on one catalog row.
+        //
+        // #3611: the packages-catalog write obeys the same ordering, and for
+        // the same reason -- a pull the gate refused must not advertise the
+        // image on the Packages page or in /v2/_catalog.
+        index_proxied_manifest_package(state, &repo, reference, &content, &digest).await;
         record_oci_manifest_pull(state, &repo, reference, &digest, ctx).await;
         return with_scan_pending_header(
             build_oci_proxy_response(
@@ -10027,7 +10160,7 @@ async fn tags_list_local(
 ) -> Result<LocalTagsPage, Response> {
     let limit = (n.saturating_add(1)) as i64;
     let rows = if let Some(last) = last {
-        sqlx::query_scalar::<_, String>(local_tags_query(true))
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(local_tags_query(true)))
             .bind(repo_id)
             .bind(image_name)
             .bind(last)
@@ -10035,7 +10168,7 @@ async fn tags_list_local(
             .fetch_all(db)
             .await
     } else {
-        sqlx::query_scalar::<_, String>(local_tags_query(false))
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(local_tags_query(false)))
             .bind(repo_id)
             .bind(image_name)
             .bind(limit)
@@ -10731,7 +10864,7 @@ async fn catalog_local_entries(
     let limit = (n as i64).saturating_add(1);
 
     let sql = catalog_page_sql(last.is_some(), authorized.is_some());
-    let mut query = sqlx::query_as::<_, (String,)>(&sql);
+    let mut query = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(&*sql));
     if let Some(cursor) = last {
         query = query.bind(cursor);
     }
@@ -10913,115 +11046,20 @@ async fn handle_delete_manifest(
         }
     };
 
-    let mut tx = match state.db.begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
-
-    // Remove tag rows for this delete. A digest reference is a content-address
-    // delete, so every tag pointing at that digest in this repo is removed. A
-    // tag-name reference removes ONLY the named tag row, leaving sibling tags
-    // that happen to share the same manifest digest intact (#1776).
-    let tag_delete = if is_digest_reference(reference) {
-        sqlx::query!(
-            "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
-            repo.id,
-            digest
-        )
-        .execute(&mut *tx)
-        .await
+    // Preserve the OCI contract exactly: a digest reference is a
+    // content-addressed delete (every tag pointing at the digest goes), a tag
+    // reference removes only that tag. The digest here was resolved FROM this
+    // repository's index, which is what makes the content-addressed scope
+    // correct on this route.
+    let scope = if is_digest_reference(reference) {
+        OciIndexDeleteScope::ContentAddressed
     } else {
-        sqlx::query!(
-            "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
-            repo.id,
-            repo.image,
-            reference
-        )
-        .execute(&mut *tx)
-        .await
+        OciIndexDeleteScope::NamedReference
     };
-    if let Err(e) = tag_delete {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
-    }
-
-    // A tag-name delete only removes the named tag (#1776). If a sibling tag in
-    // this repo still points at the same manifest digest, the manifest is still
-    // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
-    // intact. The cleanup only runs once the last tag for the digest is gone (or
-    // for a content-addressed digest delete, which removes every such tag).
-    let digest_still_tagged = match sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
-        repo.id,
-        digest
-    )
-    .fetch_one(&mut *tx)
-    .await
+    if let Err(e) =
+        delete_oci_manifest_content(&state.db, repo.id, &repo.image, reference, &digest, scope)
+            .await
     {
-        Ok(exists) => exists.unwrap_or(false),
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
-
-    if !digest_still_tagged {
-        // Drop stale index relationships for this digest. Live child edges are
-        // preserved so a still-tagged parent index keeps the child relationship
-        // live and the child's blobs protected.
-        if let Err(e) = clear_repo_manifest_refs(&mut *tx, repo.id, &digest).await {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
-        }
-
-        // #1409: drop the manifest's blob refs so its config + layer blobs
-        // become reclaimable once nothing else references them. Scoped to skip a
-        // digest still referenced as a live per-architecture child of a tagged
-        // index (its blobs are protected ONLY by these rows). After #1681 these
-        // rows also gate digest fallback, so a cleanup error must abort the
-        // delete.
-        if let Err(e) = delete_manifest_blob_refs(&mut *tx, repo.id, &digest).await {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
-        }
-
-        // #3108: drop this manifest's referrers subject edge so a deleted
-        // referrer stops appearing in `GET /v2/<name>/referrers/<digest>`.
-        if let Err(e) = sqlx::query(
-            "DELETE FROM oci_manifest_subjects WHERE repository_id = $1 AND manifest_digest = $2",
-        )
-        .bind(repo.id)
-        .bind(&digest)
-        .execute(&mut *tx)
-        .await
-        {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
-        }
-    }
-
-    if let Err(e) = tx.commit().await {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -11049,6 +11087,199 @@ async fn handle_delete_manifest(
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
+}
+
+/// Which OCI index rows a manifest delete is allowed to remove.
+///
+/// The two delete routes reach [`delete_oci_manifest_content_in_tx`] with very
+/// different guarantees about their `digest` argument, so the scope is made
+/// explicit rather than re-derived from the reference's shape:
+///
+/// * [`OciIndexDeleteScope::ContentAddressed`] is the OCI `DELETE
+///   /v2/<name>/manifests/<digest>` contract — the reference *is* the digest and
+///   it was resolved from this repository's own index, so removing every tag row
+///   pointing at that digest is the documented behaviour (#1776).
+/// * [`OciIndexDeleteScope::NamedReference`] removes exactly the
+///   `(name = image, tag = reference)` row. The REST artifact delete always uses
+///   this scope: it deletes ONE `artifacts` row, and that row's index footprint
+///   is exactly the `(image, reference)` key `persist_tag_and_refs` and
+///   `upsert_manifest_artifact` wrote together. Widening it to a content-address
+///   delete would let a caller-supplied path drive removal of index rows that
+///   belong to a different image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OciIndexDeleteScope {
+    /// Remove every tag row in the repository pointing at `digest`.
+    ContentAddressed,
+    /// Remove only the `(name = image, tag = reference)` tag row.
+    NamedReference,
+}
+
+/// Resolve the manifest digest that `(repo_id, image, reference)` names in the
+/// OCI index, or `None` when that reference has no index row.
+///
+/// The OCI index is the only authority on what a reference resolves to. A
+/// digest-reference push writes an `oci_tags` row whose `tag` is the literal
+/// digest string (`handle_put_manifest` passes the same `(image, reference)`
+/// pair to `persist_tag_and_refs` and `upsert_manifest_artifact`), so the
+/// `(name, tag)` lookup is complete for any path-derived reference and needs no
+/// tag-vs-digest branching.
+///
+/// `None` is a normal, non-exceptional outcome: peer-replicated Docker artifacts
+/// and non-manifest files stored under an OCI repository have `artifacts` rows
+/// with no index rows at all.
+pub(crate) async fn resolve_indexed_manifest_digest<'e, E>(
+    executor: E,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_scalar!(
+        "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+        repo_id,
+        image,
+        reference
+    )
+    .fetch_optional(executor)
+    .await
+}
+
+/// The digest a REST artifact delete may unwind from the OCI index, if any.
+///
+/// Returns `Some` only when the index's digest for the reference is the very
+/// manifest the `artifacts` row holds — i.e. when the row being deleted IS that
+/// indexed manifest. `indexed_digest` is what
+/// [`resolve_indexed_manifest_digest`] returned; `artifact_checksum_sha256` is
+/// the `artifacts.checksum_sha256` column of the row being deleted.
+///
+/// The two disagreement cases both yield `None`, which the caller treats as
+/// "skip the unwind, still soft-delete":
+///
+/// * **Not indexed** (`None`): nothing to unwind. This is the replication case
+///   and must stay a successful delete.
+/// * **Indexed, but a different manifest**: the `artifacts` row is not the one
+///   the reference resolves to, so unwinding would destroy index rows the row
+///   does not own. Skipping degrades to the pre-#3476 behaviour (an orphaned
+///   index entry, which is non-destructive and self-heals on re-push) instead of
+///   making a diverged row permanently undeletable.
+///
+/// A non-`sha256:` index digest can never match a `checksum_sha256` column and
+/// so is always `None`.
+pub(crate) fn rest_unwind_digest<'a>(
+    indexed_digest: Option<&'a str>,
+    artifact_checksum_sha256: &str,
+) -> Option<&'a str> {
+    let digest = indexed_digest?;
+    let hex = digest.strip_prefix("sha256:")?;
+    if !hex.is_empty() && hex.eq_ignore_ascii_case(artifact_checksum_sha256) {
+        Some(digest)
+    } else {
+        None
+    }
+}
+
+/// Transactionally remove a Docker/OCI manifest from the OCI index: delete its
+/// `oci_tags` row(s) and, when the digest is no longer tagged by any sibling
+/// tag, its `oci_manifest_refs`/`manifest_blob_refs`/`oci_manifest_subjects`
+/// edges so storage GC can reclaim the blobs. Shared by the OCI
+/// `handle_delete_manifest` path and the REST `delete_artifact` path so a UI
+/// delete leaves the index consistent.
+///
+/// Thin begin/commit wrapper around [`delete_oci_manifest_content_in_tx`],
+/// mirroring the `persist_tag_and_refs` / `persist_tag_and_refs_in_tx` pair.
+///
+/// The caller is responsible for soft-deleting the corresponding `artifacts`
+/// row and for resolving `digest`; this function only unwinds the OCI index.
+pub(crate) async fn delete_oci_manifest_content(
+    pool: &PgPool,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest: &str,
+    scope: OciIndexDeleteScope,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    delete_oci_manifest_content_in_tx(&mut tx, repo_id, image, reference, digest, scope).await?;
+    tx.commit().await
+}
+
+/// Transaction-participating form of [`delete_oci_manifest_content`]. Runs the
+/// tag removal and index cleanup against a caller-owned transaction WITHOUT
+/// committing, so the caller can bind the unwind to a larger atomic unit — the
+/// REST delete pairs it with the `artifacts` soft-delete UPDATE so a failure of
+/// either can never leave the index and the artifacts row disagreeing.
+pub(crate) async fn delete_oci_manifest_content_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest: &str,
+    scope: OciIndexDeleteScope,
+) -> Result<(), sqlx::Error> {
+    // Remove tag rows for this delete. A content-addressed delete (the OCI
+    // `DELETE .../manifests/<digest>` contract) removes every tag pointing at
+    // that digest in this repo. A named-reference delete removes ONLY the named
+    // tag row, leaving sibling tags that happen to share the same manifest
+    // digest intact (#1776).
+    match scope {
+        OciIndexDeleteScope::ContentAddressed => {
+            sqlx::query!(
+                "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+                repo_id,
+                digest
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+        OciIndexDeleteScope::NamedReference => {
+            sqlx::query!(
+                "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+                repo_id,
+                image,
+                reference
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+
+    // A tag-name delete only removes the named tag (#1776). If a sibling tag in
+    // this repo still points at the same manifest digest, the manifest is still
+    // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
+    // intact. The cleanup only runs once the last tag for the digest is gone.
+    let digest_still_tagged = sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
+        repo_id,
+        digest
+    )
+    .fetch_one(&mut **tx)
+    .await?
+    .unwrap_or(false);
+
+    if !digest_still_tagged {
+        // Drop stale index relationships for this digest. Live child edges are
+        // preserved so a still-tagged parent index keeps the child relationship
+        // live and the child's blobs protected.
+        clear_repo_manifest_refs(&mut **tx, repo_id, digest).await?;
+
+        // #1409: drop the manifest's blob refs so its config + layer blobs
+        // become reclaimable once nothing else references them.
+        delete_manifest_blob_refs(&mut **tx, repo_id, digest).await?;
+
+        // #3108: drop this manifest's referrers subject edge so a deleted
+        // referrer stops appearing in `GET /v2/<name>/referrers/<digest>`.
+        sqlx::query(
+            "DELETE FROM oci_manifest_subjects WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -13218,6 +13449,115 @@ mod tests {
     #[test]
     fn test_is_digest_reference_rejects_tag_with_dot() {
         assert!(!is_digest_reference("v1.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // REST delete unwind authority (#3476)
+    // -----------------------------------------------------------------------
+
+    /// `rest_unwind_digest` is the choke point that decides whether a REST
+    /// artifact delete may touch the OCI index at all. It must say "yes" only
+    /// when the index's digest for the reference IS the manifest the artifacts
+    /// row holds — the index is the authority, and the row must be that
+    /// manifest.
+    #[test]
+    fn rest_unwind_digest_requires_the_index_to_name_this_artifact() {
+        let victim = "1".repeat(64);
+        let other = "2".repeat(64);
+
+        // Not indexed at all (a replicated artifact, or any non-manifest file
+        // stored under an OCI repo): nothing to unwind.
+        assert_eq!(rest_unwind_digest(None, &victim), None);
+
+        // Indexed as exactly this artifact's manifest: unwind is authorized,
+        // and the digest handed on is the INDEX's, not one rebuilt from the
+        // row's checksum.
+        let indexed = format!("sha256:{victim}");
+        assert_eq!(rest_unwind_digest(Some(&indexed), &victim), Some(&*indexed));
+
+        // Digest hex is case-insensitive, matching the checksum comparison the
+        // upload path uses.
+        let upper = format!("sha256:{}", victim.to_uppercase());
+        assert_eq!(rest_unwind_digest(Some(&upper), &victim), Some(&*upper));
+
+        // Indexed as a DIFFERENT manifest: this row does not own those index
+        // rows, so it may not unwind them.
+        assert_eq!(rest_unwind_digest(Some(&indexed), &other), None);
+
+        // A non-`sha256:` index digest is not comparable to the
+        // `checksum_sha256` column and can never authorize an unwind.
+        assert_eq!(rest_unwind_digest(Some("blake3:00"), "00"), None);
+        assert_eq!(rest_unwind_digest(Some("blake3:00"), &victim), None);
+
+        // Degenerate/empty forms are never a match.
+        assert_eq!(rest_unwind_digest(Some("sha256:"), ""), None);
+        assert_eq!(rest_unwind_digest(Some(&victim), &victim), None);
+    }
+
+    /// The unwind must participate in the caller's transaction, not commit
+    /// itself: that is what lets the REST delete bind it atomically to the
+    /// `artifacts` soft-delete. Rolling the caller's transaction back must
+    /// restore the index.
+    #[tokio::test]
+    async fn oci_index_unwind_participates_in_caller_transaction_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let repo = fixture.repo_id;
+        let digest = format!("sha256:{}", "c".repeat(64));
+
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'app', 'v1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo)
+        .bind(&digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed oci_tags row");
+
+        let mut tx = fixture.pool.begin().await.expect("begin");
+        delete_oci_manifest_content_in_tx(
+            &mut tx,
+            repo,
+            "app",
+            "v1",
+            &digest,
+            OciIndexDeleteScope::NamedReference,
+        )
+        .await
+        .expect("unwind");
+
+        // Gone inside the transaction...
+        let inside: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(inside, 0, "unwind must be visible inside the caller's tx");
+
+        tx.rollback().await.expect("rollback");
+
+        // ...and back after the caller rolls back: the helper did not commit.
+        let after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, 1,
+            "the unwind must roll back with the caller's transaction"
+        );
+
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&fixture.pool)
+            .await
+            .ok();
+        fixture.teardown().await;
     }
 
     #[test]
@@ -17473,10 +17813,13 @@ mod manifest_digest_db_tests {
             "oci_tags",
             "oci_blobs",
         ] {
-            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
-                .bind(fx.repo_id)
-                .execute(&fx.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                table
+            )))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
         }
         fx.teardown().await;
     }
@@ -17875,10 +18218,13 @@ mod manifest_digest_db_tests {
             "oci_blobs",
             "artifacts",
         ] {
-            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
-                .bind(other_id)
-                .execute(&fx.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                table
+            )))
+            .bind(other_id)
+            .execute(&fx.pool)
+            .await;
         }
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(other_id)
@@ -17936,25 +18282,25 @@ mod manifest_digest_db_tests {
         let suffix = Uuid::new_v4().simple().to_string();
         let function_name = format!("ak_test_fail_mbr_delete_{}", suffix);
         let trigger_name = format!("ak_test_fail_mbr_delete_{}", suffix);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {function_name}() RETURNS trigger
              LANGUAGE plpgsql AS $$
              BEGIN
                  RAISE EXCEPTION 'forced manifest_blob_refs delete failure';
              END;
              $$"
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create failure function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trigger_name}
              BEFORE DELETE ON manifest_blob_refs
              FOR EACH ROW
              WHEN (OLD.repository_id = '{}'::uuid)
              EXECUTE FUNCTION {function_name}()",
             fx.repo_id
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create failure trigger");
@@ -17988,14 +18334,16 @@ mod manifest_digest_db_tests {
         .await
         .expect("count refs");
 
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        ))
+        )))
         .execute(&fx.pool)
         .await;
-        let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {function_name}()"))
-            .execute(&fx.pool)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP FUNCTION IF EXISTS {function_name}()"
+        )))
+        .execute(&fx.pool)
+        .await;
         cleanup(&fx).await;
 
         assert_eq!(
@@ -18837,7 +19185,7 @@ mod oci_blob_upload_streaming_tests {
                 trigger_name = trigger.trigger_name,
                 function_name = trigger.function_name,
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .execute(pool)
                 .await
                 .expect("create deferred upload-session trigger");
@@ -18856,7 +19204,7 @@ mod oci_blob_upload_streaming_tests {
                 trigger_name = trigger.trigger_name,
                 function_name = trigger.function_name,
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .execute(pool)
                 .await
                 .expect("create deferred upload-part trigger");
@@ -18868,10 +19216,14 @@ mod oci_blob_upload_streaming_tests {
                 "DROP TRIGGER IF EXISTS {} ON {}",
                 self.trigger_name, self.table
             );
-            let _ = sqlx::query(&drop_trigger).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_trigger))
+                .execute(pool)
+                .await;
 
             let drop_function = format!("DROP FUNCTION IF EXISTS {}()", self.function_name);
-            let _ = sqlx::query(&drop_function).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_function))
+                .execute(pool)
+                .await;
         }
 
         async fn create(pool: &PgPool, table: &'static str) -> Self {
@@ -18887,7 +19239,7 @@ mod oci_blob_upload_streaming_tests {
                  $$",
                 function_name = function_name,
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .execute(pool)
                 .await
                 .expect("create deferred failure function");
@@ -19448,7 +19800,7 @@ mod oci_blob_upload_streaming_tests {
             // handler's `oci_blobs` INSERT fails like a real DB constraint
             // error while every other row (and the journal) is untouched.
             let fn_name = format!("{}_fn", self.trigger_name);
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
                 CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
                 BEGIN
@@ -19462,11 +19814,11 @@ mod oci_blob_upload_streaming_tests {
                 fn_name = fn_name,
                 repo = self.repository_id,
                 digest = self.digest,
-            ))
+            )))
             .execute(&self.pool)
             .await
             .map_err(AppError::from)?;
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
                 CREATE TRIGGER {trig}
                     BEFORE INSERT ON oci_blobs
@@ -19474,7 +19826,7 @@ mod oci_blob_upload_streaming_tests {
                 "#,
                 trig = self.trigger_name,
                 fn_name = fn_name,
-            ))
+            )))
             .execute(&self.pool)
             .await
             .map_err(AppError::from)?;
@@ -20289,17 +20641,17 @@ mod oci_blob_upload_streaming_tests {
 
         // Drop the injected trigger so it cannot affect other tests sharing the
         // `oci_blobs` table.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP TRIGGER IF EXISTS {trig} ON oci_blobs",
             trig = storage.trigger_name
-        ))
+        )))
         .execute(&f.inner.pool)
         .await
         .expect("drop injected trigger");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP FUNCTION IF EXISTS {trig}_fn()",
             trig = storage.trigger_name
-        ))
+        )))
         .execute(&f.inner.pool)
         .await
         .expect("drop injected trigger function");
@@ -24150,24 +24502,24 @@ mod proxy_manifest_artifact_indexing_tests {
         let suffix = Uuid::new_v4().simple().to_string();
         let function_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
         let trigger_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {function_name}() RETURNS trigger
              LANGUAGE plpgsql AS $$
              BEGIN
                  RAISE EXCEPTION 'forced manifest_blob_refs insert failure for atomicity test';
              END;
              $$"
-        ))
+        )))
         .execute(&pool)
         .await
         .expect("create failure function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trigger_name}
              BEFORE INSERT ON manifest_blob_refs
              FOR EACH ROW
              WHEN (NEW.repository_id = '{repo_id}'::uuid)
              EXECUTE FUNCTION {function_name}()"
-        ))
+        )))
         .execute(&pool)
         .await
         .expect("create failure trigger");
@@ -24205,14 +24557,16 @@ mod proxy_manifest_artifact_indexing_tests {
                 .expect("count refs");
 
         // Cleanup (trigger first, so the cascade delete on repositories works).
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        ))
+        )))
         .execute(&pool)
         .await;
-        let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {function_name}()"))
-            .execute(&pool)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP FUNCTION IF EXISTS {function_name}()"
+        )))
+        .execute(&pool)
+        .await;
         let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
             .bind(repo_id)
             .execute(&pool)
@@ -25491,7 +25845,7 @@ mod cross_repo_session_regression_tests {
              VALUES ($1, $2, $2, $3, '{}'::repository_type, 'docker'::repository_format, true, $4)",
             repo_type
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(id)
             .bind(&key)
             .bind(&*storage_dir.to_string_lossy())
@@ -29632,6 +29986,482 @@ mod proxy_scan_block_tests {
             "positive control: a clean image's layer still serves on a fail-closed repo"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #3441: a pulled-through image must appear in the packages catalog
+    // -----------------------------------------------------------------------
+
+    /// Read the packages-catalog rows this repository holds, as
+    /// `(name, version, size_bytes)`. The Packages page reads this table via
+    /// `/api/v1/packages`; the `artifacts` table it does NOT read is asserted
+    /// separately, so a test can tell "the catalog gate skipped it" from
+    /// "the pull cached nothing at all".
+    async fn package_rows(pool: &sqlx::PgPool, repo_id: Uuid) -> Vec<(String, String, i64)> {
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT name, version, size_bytes FROM packages
+             WHERE repository_id = $1 ORDER BY name, version",
+        )
+        .bind(repo_id)
+        .fetch_all(pool)
+        .await
+        .expect("read packages")
+    }
+
+    async fn artifact_path_count(pool: &sqlx::PgPool, repo_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("count artifacts")
+    }
+
+    /// #3441: pulling an image THROUGH a Remote repository must surface it on
+    /// the Packages page. Before this, a proxied pull wrote `artifacts` and
+    /// `oci_tags` rows -- so the image showed in the flat artifact view and in
+    /// the Docker tag panel -- but never a `packages` row, which is the table
+    /// `/api/v1/packages` actually reads.
+    #[tokio::test]
+    async fn test_proxied_tag_pull_creates_a_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3441");
+        let layer = unique_fixture_bytes("layer-3441");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.27", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, "1.27").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the proxied pull itself must succeed"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "a tag pulled through a proxy must produce exactly one packages row; \
+             an empty catalog is #3441 -- the image is pullable and appears under \
+             artifacts, but never on the Packages page. Got {rows:?}"
+        );
+        assert_eq!(
+            rows[0].0, "app",
+            "the package is identified by the IMAGE name, not by the tag or the \
+             manifest path"
+        );
+        assert_eq!(rows[0].1, "1.27", "the tag is the package version");
+        // Sized from the FIXTURE's own bytes, not from anything the handler
+        // computed: config.size + layers[].size, which the manifest body
+        // carries even though no blob has been pulled yet.
+        assert_eq!(
+            rows[0].2,
+            (config.len() + layer.len()) as i64,
+            "an image manifest must be sized from its own config+layers, which is \
+             available on a proxy before any blob is fetched"
+        );
+    }
+
+    /// #3441, the noise control: a multi-manifest format must not turn one
+    /// `docker pull` into a pile of catalog rows. `docker pull image:tag`
+    /// fetches the index by TAG and then each architecture's child manifest BY
+    /// DIGEST; only the tag is a version a person chose.
+    ///
+    /// The assertion is deliberately two-sided -- the artifacts row MUST exist
+    /// while the packages row must not -- so this cannot pass because the pull
+    /// silently failed and cached nothing.
+    #[tokio::test]
+    async fn test_proxied_digest_pull_creates_no_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3441-digest");
+        let layer = unique_fixture_bytes("layer-3441-digest");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+        let reference = format!("sha256:{digest}");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            &reference,
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, &reference)
+            .await
+            .status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "the digest pull must succeed");
+        assert!(
+            artifacts > 0,
+            "the digest pull must still have cached the manifest as an artifact -- \
+             otherwise the packages assertion below proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "a digest-addressed pull names no version a user chose (it is how the \
+             child manifests of a multi-arch index are fetched), so it must add \
+             nothing to the catalog. Got {rows:?}"
+        );
+    }
+
+    /// #3441: re-pulling the same tag upserts the single row rather than
+    /// accumulating one per pull, so a busy proxy converges on one row per
+    /// image per tag instead of growing without bound.
+    #[tokio::test]
+    async fn test_proxied_tag_repull_keeps_one_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3441-repull");
+        let layer = unique_fixture_bytes("layer-3441-repull");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "stable",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let first = pull_manifest(&state, &fx.repo_key, "stable").await.status();
+        let second = pull_manifest(&state, &fx.repo_key, "stable").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(second, StatusCode::OK);
+        assert_eq!(
+            rows.len(),
+            1,
+            "two pulls of one tag must leave ONE catalog row, not one per pull: {rows:?}"
+        );
+        assert_eq!(rows[0].1, "stable");
+    }
+
+    /// #3441: an image INDEX pulled by tag is the common multi-arch case and
+    /// must produce the one row for the tag. Its children are referenced by
+    /// digest and contribute no rows of their own.
+    #[tokio::test]
+    async fn test_proxied_index_tag_pull_creates_one_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let index = index_manifest();
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "multi", &index, INDEX_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, "multi").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a multi-arch tag must produce exactly one catalog row -- one per \
+             architecture would be exactly the duplicate noise this gate exists \
+             to prevent. Got {rows:?}"
+        );
+        assert_eq!(rows[0].0, "app");
+        assert_eq!(rows[0].1, "multi");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3611: the catalog write sits on the SERVE side of the scan gate
+    // -----------------------------------------------------------------------
+
+    /// HEAD through the real router (the same anonymous auth as
+    /// `pull_manifest`). HEAD is deliberately ungated, which is exactly why it
+    /// must not publish catalog rows.
+    async fn head_manifest(state: &SharedState, repo_key: &str, reference: &str) -> Response {
+        let app = tdh::router_anon(router(), state.clone());
+        let req = Request::builder()
+            .method("HEAD")
+            .uri(format!("/{repo_key}/app/manifests/{reference}"))
+            .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.expect("oneshot")
+    }
+
+    /// #3611 defect 1: a scan-BLOCKED cold pull must leave the packages
+    /// catalog EMPTY. Before the fix the catalog write ran inside
+    /// `cache_manifest_reference_locally`, i.e. before
+    /// `maybe_gate_remote_manifest_scan`, so a 403'd pull still advertised
+    /// the image on the Packages page and in /v2/_catalog.
+    ///
+    /// The assertion is two-sided: the `artifacts` cache rows MUST exist
+    /// (caching before the gate is deliberate -- it is what gives the gate
+    /// `manifest_blob_refs` to reassemble a layout from), so an empty
+    /// `packages` cannot be explained by the pull having cached nothing.
+    #[tokio::test]
+    async fn test_scan_blocked_pull_does_not_index_package_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-blocked");
+        let layer = unique_fixture_bytes("layer-3611-blocked");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                2,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "precondition: the gate must refuse this pull"
+        );
+        assert!(
+            artifacts > 0,
+            "the refused pull still caches the manifest (deliberate; the gate \
+             needs the refs) -- without this the packages assertion below \
+             proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "an image the scan gate refuses to serve must NOT be advertised in \
+             the packages catalog; a row here means the catalog write ran on \
+             the wrong side of `maybe_gate_remote_manifest_scan`. Got {rows:?}"
+        );
+    }
+
+    /// #3611 positive control for the ordering: with the SAME fail_closed
+    /// policy, a pull the gate agrees to serve (fresh clean verdict, matching
+    /// live scanner) must still index exactly one catalog row. Together with
+    /// the blocked case above this pins the ordering, not merely the
+    /// existence, of the write.
+    #[tokio::test]
+    async fn test_scan_allowed_pull_still_indexes_package_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-allowed");
+        let layer = unique_fixture_bytes("layer-3611-allowed");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            storage_path.as_str(),
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-1.0.0-test"),
+                rescan: MockCveRescan::Error,
+            })],
+        );
+
+        let status = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "precondition: the gate must agree to serve this pull"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "an ALLOWED pull on the same fail_closed repo must still index -- \
+             moving the write behind the gate must not lose the #3441 fix. \
+             Got {rows:?}"
+        );
+        assert_eq!(rows[0].0, "app");
+        assert_eq!(rows[0].1, "1.0");
+    }
+
+    /// #3611 defect 2 (catalog half): a bare HEAD -- no prior GET -- must not
+    /// publish catalog rows. HEAD is deliberately ungated (parity with the
+    /// direct-Remote HEAD path), so before the fix it both bypassed the scan
+    /// gate's catalog ordering AND let an existence probe mutate the catalog.
+    /// The two-sided artifact assertion again keeps the empty-catalog check
+    /// falsifiable: the HEAD really did reach the cache path.
+    #[tokio::test]
+    async fn test_head_manifest_publishes_no_package_row_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-head");
+        let layer = unique_fixture_bytes("layer-3611-head");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = head_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "precondition: HEAD is ungated and must succeed with no prior GET"
+        );
+        assert!(
+            artifacts > 0,
+            "the HEAD must have cached the manifest -- otherwise the packages \
+             assertion below proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "a bare HEAD must not publish the image into the packages catalog; \
+             a row here means `handle_head_manifest`'s cache write still \
+             indexes packages. Got {rows:?}"
+        );
+    }
+
+    /// #3611 defect 3: a valid tag at the OCI grammar's 128-character bound
+    /// must index. `packages.version`/`package_versions.version` were
+    /// VARCHAR(100) (019_builds_packages.sql), so a 101-128 char tag -- CI
+    /// schemes like `v1.2.3-nightly-<date>-<sha>-<platform>-<branch>` cross
+    /// 100 routinely -- failed the best-effort upsert into a swallowed warn:
+    /// 200 on the pull, nothing on the Packages page. Migration 211 widens
+    /// the columns; this pins it end-to-end through the pull path.
+    #[tokio::test]
+    async fn test_proxied_max_length_tag_indexes_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-longtag");
+        let layer = unique_fixture_bytes("layer-3611-longtag");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        // 128 chars, valid OCI tag grammar: [a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}
+        let tag = format!("v1.2.3-nightly-20260831-{}", "a".repeat(104));
+        assert_eq!(tag.len(), 128, "fixture must sit exactly at the bound");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", &tag, &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, &tag).await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "the pull itself always succeeded");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a 128-char tag is valid per the OCI grammar and must index; an \
+             empty catalog here is the VARCHAR(100) truncation failure being \
+             swallowed into a warn. Got {} rows",
+            rows.len()
+        );
+        assert_eq!(rows[0].1, tag, "the full 128-char tag is the version");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -31657,10 +32487,12 @@ mod oci_read_authz_tests {
 
         async fn teardown(&self) {
             for table in ["oci_tags", "oci_blobs"] {
-                let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                    .bind(self.repo_id)
-                    .execute(&self.pool)
-                    .await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "DELETE FROM {table} WHERE repository_id = $1"
+                )))
+                .bind(self.repo_id)
+                .execute(&self.pool)
+                .await;
             }
             for user_id in &self.extra_users {
                 tdh::cleanup_user(&self.pool, *user_id).await;
@@ -32144,10 +32976,12 @@ mod oci_read_authz_tests {
             .execute(&f.pool)
             .await;
         for table in ["oci_tags", "oci_blobs"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                .bind(public_id)
-                .execute(&f.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {table} WHERE repository_id = $1"
+            )))
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
         }
         for repo in [public_id, virt_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -32306,10 +33140,12 @@ mod oci_read_authz_tests {
             .execute(&f.pool)
             .await;
         for table in ["oci_tags", "oci_blobs"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                .bind(public_id)
-                .execute(&f.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {table} WHERE repository_id = $1"
+            )))
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
         }
         for repo in [public_id, virt_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -32466,10 +33302,12 @@ mod oci_read_authz_tests {
             .execute(&f.pool)
             .await;
         for table in ["oci_tags", "oci_blobs"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                .bind(public_id)
-                .execute(&f.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {table} WHERE repository_id = $1"
+            )))
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
         }
         for repo in [public_id, virt_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -32683,10 +33521,13 @@ mod oci_error_envelope_db_tests {
             .execute(&fx.pool)
             .await;
         for table in ["oci_manifest_refs", "manifest_blob_refs", "oci_tags"] {
-            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
-                .bind(fx.repo_id)
-                .execute(&fx.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                table
+            )))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
         }
         fx.teardown().await;
 

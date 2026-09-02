@@ -179,6 +179,20 @@ pub(crate) const MAVEN_SIDECAR_SUFFIXES: [&str; 4] = [".md5", ".sha1", ".sha256"
 /// Upper bound on flat-object attribution rows examined per GC pass.
 const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 
+/// TTL for the [`StorageGcService::run_scheduled_tick`] singleton lease.
+/// Matches the GC's own default hourly cadence so a crashed holder's lease
+/// lapses in time for the next natural tick rather than blocking it.
+const STORAGE_GC_LEASE_TTL_SECS: f64 = 3600.0;
+
+/// `scheduler_leases.job_name` the scheduled storage-GC tick claims.
+///
+/// This is an OPERATOR-VISIBLE wire value: diagnosing a stuck or contended
+/// tick means `SELECT * FROM scheduler_leases WHERE job_name = 'storage_gc'`,
+/// and it is what the #3384 runbook names. The scheduler passes this constant
+/// rather than a literal so the value the scheduler claims and the value the
+/// regression test pins cannot drift apart.
+pub(crate) const SCHEDULED_GC_JOB_NAME: &str = "storage_gc";
+
 /// SQL fragment expressing the orphaned row-less Maven flat-object predicate
 /// over an outer `maven_flat_object_owner` row aliased `o` (#2668).
 ///
@@ -199,8 +213,12 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 ///    requires that NO live artifact exists under its directory prefix on
 ///    the same backend: the metadata document stays while any version of
 ///    its groupId/artifactId (or group, for group-level plugin metadata)
-///    is still live. The `LIKE` prefix test can only over-match (SQL
-///    wildcards in a key match a superset), i.e. only ever over-PROTECT.
+///    is still live. The `LIKE` prefix test carries `ESCAPE ''`
+///    ([`crate::services::maven_flat_attribution::metadata_rollup_dir_anchor_sql`]),
+///    which is what makes it able only to over-match (`%`/`_` in a stored key
+///    match a superset) and never to under-match. Without that clause a
+///    literal `\` in the key is read as an escape character and the guard
+///    misses its own directory -- a `NOT EXISTS` miss means DELETE.
 /// 4. A checksum sidecar additionally requires its base key to be anchored
 ///    by neither an `artifacts` row (any state) nor a metadata `files[]`
 ///    reference on the same backend.
@@ -243,7 +261,7 @@ const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
 /// sidecar), read as orphan, and was reclaimed while its base stayed live
 /// (#3197). The rollup guard shares
 /// [`crate::services::maven_flat_attribution::is_metadata_rollup_key_sql`] /
-/// [`crate::services::maven_flat_attribution::metadata_rollup_dir_prefix_sql`]
+/// [`crate::services::maven_flat_attribution::metadata_rollup_dir_anchor_sql`]
 /// with the repository-delete collector for the same anti-drift reason.
 static ORPHAN_MAVEN_FLAT_PREDICATE_SQL: Lazy<String> = Lazy::new(|| {
     use crate::services::maven_flat_attribution as mfa;
@@ -272,7 +290,7 @@ AND NOT EXISTS (
     WHERE {is_rollup}
       AND r2.storage_backend = o.storage_backend
       AND a2.is_deleted = false
-      AND a2.storage_key LIKE {rollup_dir} || '%'
+      AND {rollup_anchor}
 )
 AND NOT EXISTS (
     SELECT 1 FROM artifacts ab
@@ -293,7 +311,7 @@ AND NOT EXISTS (
         system_source = mfa::system_written_source_sql("o.source"),
         files_match = mfa::metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key"),
         is_rollup = mfa::is_metadata_rollup_key_sql("o.storage_key"),
-        rollup_dir = mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
+        rollup_anchor = mfa::metadata_rollup_dir_anchor_sql("a2.storage_key", "o.storage_key"),
         is_sidecar = mfa::is_sidecar_key_sql("o.storage_key"),
         sidecar_base_files_match =
             mfa::metadata_files_name_key_sql("am2.metadata->'files'", &sidecar_base),
@@ -541,6 +559,82 @@ impl StorageGcService {
         self.run_gc_inner(None, dry_run).await
     }
 
+    /// One scheduled storage-GC tick, gated by the cluster-wide `job_name`
+    /// singleton lease (`cluster_work::SchedulerLease`). Every replica's
+    /// scheduler independently computes the same cron occurrence, so without
+    /// this gate every replica ran `run_gc` at the same instant — confirmed
+    /// in production via `pg_stat_activity`: multiple identical copies of the
+    /// Maven flat-object orphan scan running concurrently for 20+ minutes,
+    /// sharing one `xact_start` (artifact-keeper#3384).
+    ///
+    /// Returns `true` if this replica won the lease and ran GC, `false` if
+    /// another replica currently holds it (a no-op tick).
+    ///
+    /// Only the scheduler's automatic tick should call this — the on-demand
+    /// admin/per-repo GC endpoints (`storage_gc.rs`) call
+    /// `run_gc`/`run_gc_for_repository` directly and must keep working even
+    /// while a scheduled tick holds this lease.
+    ///
+    /// SCOPE: this gates `run_gc` only. The blob-GC mark/sweep and the
+    /// storage-stats recompute that share the same scheduler tick are NOT
+    /// under this lease and still run on every replica — #3384 is only
+    /// partially closed by this method. See the scope note at the call site
+    /// in `scheduler_service::spawn_all` and issue #3503.
+    ///
+    /// This method changes WHO runs the sweep, never WHAT it deletes. The
+    /// `MAVEN_FLAT_GC_ENABLED` opt-in gate (#3431) lives further in, in
+    /// `cleanup_orphan_maven_flat_objects`, and is reached through
+    /// `run_gc(false)` exactly as it is from the on-demand endpoints.
+    pub(crate) async fn run_scheduled_tick(&self, job_name: &str) -> bool {
+        let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+            &self.db,
+            job_name,
+            STORAGE_GC_LEASE_TTL_SECS,
+        )
+        .await
+        else {
+            tracing::debug!("Another replica owns the storage GC lease; skipping tick");
+            return false;
+        };
+        // A pass can outlive the fixed TTL on a large registry; keep the
+        // lease alive for as long as this one runs.
+        let lease_renewal = lease.spawn_renewal(self.db.clone(), STORAGE_GC_LEASE_TTL_SECS);
+
+        tracing::info!("Running scheduled storage garbage collection");
+
+        match self.run_gc(false).await {
+            Ok(result) => {
+                if result.storage_keys_deleted > 0 {
+                    tracing::info!(
+                        "Storage GC: deleted {} keys, removed {} artifacts, freed {} bytes",
+                        result.storage_keys_deleted,
+                        result.artifacts_removed,
+                        result.bytes_freed
+                    );
+                    crate::services::metrics_service::record_cleanup(
+                        "storage_gc",
+                        result.artifacts_removed as u64,
+                    );
+                }
+                if !result.errors.is_empty() {
+                    tracing::warn!("Storage GC completed with {} errors", result.errors.len());
+                    // Surface the actual messages, not just the count, so the
+                    // orchestration-layer log is actionable.
+                    for err in &result.errors {
+                        tracing::warn!(gc_error = %err, "Storage GC error");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Storage garbage collection failed: {}", e);
+            }
+        }
+
+        drop(lease_renewal);
+        lease.release(&self.db).await;
+        true
+    }
+
     /// Repository-scoped variant of [`Self::run_gc`] (web #708).
     ///
     /// Every candidate scan is filtered to rows owned by `repository_id`:
@@ -652,16 +746,52 @@ impl StorageGcService {
                 // retry after a crash mid-delete still reclaims the soft-deleted
                 // row instead of erroring every pass — matching the cloud
                 // backends' NotFound→Ok mapping.
-                match storage.delete(&storage_key).await {
-                    Ok(()) | Err(AppError::NotFound(_)) => {}
-                    Err(e) => {
-                        let _ = tx.rollback().await;
-                        let msg =
-                            format_gc_error("delete storage key", &storage_key, &e.to_string());
-                        tracing::warn!("{}", msg);
-                        result.errors.push(msg);
-                        // Skip DB cleanup if storage delete fails
-                        continue;
+                //
+                // ...except for proxy-cache content, whose object is NOT this
+                // sweep's to reclaim (#3368). A soft-deleted `artifacts` row
+                // can carry a `proxy-cache/` key — legacy rows from before the
+                // proxy catalog was split out (#1278). The key is derived
+                // purely from `(repo_key, path)`, so the object such a row
+                // names is the SAME object a live `proxy_cache_artifacts` row
+                // points at, and this predicate never consults that catalog:
+                // deleting it would destroy a live cache entry and leave a
+                // dangling catalog row whose `size_bytes` only clears on the
+                // next fetch. Proxy-cache objects are reclaimed by
+                // `purge_repo_cache` and by TTL/lifecycle expiry.
+                //
+                // The stale `artifacts` ROW is still reclaimed below, which is
+                // the point of skipping only the delete rather than excluding
+                // the key from the candidate scan: the row is a redundant
+                // second reference to an object the proxy catalog owns, and
+                // leaving it behind would make these rows unreclaimable — the
+                // hard-delete here is the only reaper of soft-deleted
+                // `artifacts` rows in the codebase.
+                //
+                // It never mattered before because the delete was issued
+                // against a key nothing had written (`<S3_PREFIX>/proxy-cache/…`,
+                // or the per-repository filesystem root) and silently hit
+                // nothing. Anchoring the layout makes it land, which is why
+                // the guard has to be explicit now.
+                let is_cache_object =
+                    crate::services::proxy_service::ProxyService::is_proxy_cache_key(&storage_key);
+                if is_cache_object {
+                    tracing::debug!(
+                        storage_key = storage_key.as_str(),
+                        "GC reclaiming the stale artifacts row only; the object belongs to the \
+                         proxy cache catalog and is left for purge_repo_cache / lifecycle expiry"
+                    );
+                } else {
+                    match storage.delete(&storage_key).await {
+                        Ok(()) | Err(AppError::NotFound(_)) => {}
+                        Err(e) => {
+                            let _ = tx.rollback().await;
+                            let msg =
+                                format_gc_error("delete storage key", &storage_key, &e.to_string());
+                            tracing::warn!("{}", msg);
+                            result.errors.push(msg);
+                            // Skip DB cleanup if storage delete fails
+                            continue;
+                        }
                     }
                 }
 
@@ -734,7 +864,14 @@ impl StorageGcService {
                     continue;
                 }
 
-                record_gc_success(&mut result, bytes, count);
+                if is_cache_object {
+                    // No object was deleted and no bytes were freed: only the
+                    // stale row went away. Counting it as a reclaimed storage
+                    // key would overstate what GC actually recovered.
+                    result.artifacts_removed += count;
+                } else {
+                    record_gc_success(&mut result, bytes, count);
+                }
             }
         }
 
@@ -1265,7 +1402,7 @@ impl StorageGcService {
             "#,
             protected = BLOB_PROTECTED_BY_REFS_SQL,
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(MIN_BLOB_AGE_SECS as i64)
             .fetch_all(&self.db)
             .await
@@ -1302,7 +1439,7 @@ impl StorageGcService {
             "#,
             protected = BLOB_PROTECTED_BY_REFS_SQL,
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(sweep_grace_secs)
             .fetch_all(&self.db)
             .await
@@ -1346,7 +1483,7 @@ impl StorageGcService {
             predicate = ORPHAN_PREDICATE_SQL,
             scope = repo_scope_clause("a.repository_id", 1, repo_scope),
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql));
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -1388,7 +1525,7 @@ impl StorageGcService {
             GROUP BY repository_id
             ORDER BY logical_bytes DESC, repository_id ASC
         "#;
-        let per_repo_rows = sqlx::query(per_repo_sql)
+        let per_repo_rows = sqlx::query(sqlx::AssertSqlSafe(per_repo_sql))
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1495,7 +1632,7 @@ impl StorageGcService {
             FROM per_object
         "#;
 
-        let totals = sqlx::query(totals_sql)
+        let totals = sqlx::query(sqlx::AssertSqlSafe(totals_sql))
             .bind(grace_hours)
             .bind(digest_scope)
             .fetch_one(&self.db)
@@ -1672,7 +1809,8 @@ impl StorageGcService {
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
             scope = repo_scope_clause("repository_id", 2, repo_scope),
         );
-        let mut query = sqlx::query(&sql).bind(ABANDONED_OCI_UPLOAD_SCAN_LIMIT);
+        let mut query =
+            sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(ABANDONED_OCI_UPLOAD_SCAN_LIMIT);
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -1898,7 +2036,8 @@ impl StorageGcService {
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 2, repo_scope),
         );
-        let mut query = sqlx::query(&sql).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
+        let mut query =
+            sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -1965,7 +2104,7 @@ impl StorageGcService {
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 3, repo_scope),
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
             .bind(crate::services::cluster_work::WorkerIdentity::for_process().as_str());
         if let Some(id) = repo_scope {
@@ -2078,7 +2217,7 @@ impl StorageGcService {
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             liveness = kind.liveness_predicate_sql(),
         );
-        match sqlx::query(&sql)
+        match sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(cleanup_key.id)
             .bind(cleanup_key.claim_token)
             .execute(&self.db)
@@ -2307,7 +2446,8 @@ impl StorageGcService {
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 2, repo_scope),
         );
-        let mut query = sqlx::query(&sql).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
+        let mut query =
+            sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -2523,7 +2663,7 @@ impl StorageGcService {
             predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL.as_str(),
             scope = repo_scope_clause("o.repository_id", 2, repo_scope),
         );
-        let mut query = sqlx::query(&sql).bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT);
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -2582,7 +2722,7 @@ impl StorageGcService {
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 3, repo_scope),
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
             .bind(crate::services::cluster_work::WorkerIdentity::for_process().as_str());
         if let Some(id) = repo_scope {
@@ -2718,7 +2858,7 @@ async fn is_maven_flat_object_still_orphan(
         "#,
         predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL.as_str(),
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(storage_backend)
         .bind(storage_key)
         .fetch_one(&mut **tx)
@@ -2769,7 +2909,7 @@ async fn lock_abandoned_oci_upload_session(
         "#,
         ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
     );
-    let Some(row) = sqlx::query(&sql)
+    let Some(row) = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(session_id)
         .fetch_optional(&mut **tx)
         .await?
@@ -2896,7 +3036,7 @@ async fn is_still_orphan(
         predicate = ORPHAN_PREDICATE_SQL,
     );
 
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(storage_key)
         .bind(storage_backend)
         .bind(storage_path)
@@ -2963,7 +3103,7 @@ async fn is_blob_still_orphan(
         "#,
         protected = BLOB_PROTECTED_BY_REFS_SQL,
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_id)
         .bind(digest)
         .bind(require_pending_mark)
@@ -3267,12 +3407,119 @@ pub(crate) async fn storage_gc_test_guard() -> tokio::sync::MutexGuard<'static, 
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// #3368: GC must not delete proxy-cache OBJECTS, but must still reap the
+    /// stale `artifacts` ROWS that name them.
+    ///
+    /// A soft-deleted legacy `artifacts` row can carry a proxy-cache key, and
+    /// because `CacheKeys::derive` is pure, that is the SAME key a live
+    /// `proxy_cache_artifacts` row points at. The orphan predicate never
+    /// consults that catalog, so deleting the object destroys a live cache
+    /// entry and strands its catalog row (whose `size_bytes` then over-counts
+    /// until the next fetch). Anchoring the key layout is what made that
+    /// delete actually land — before, it addressed a key nothing had written.
+    ///
+    /// Skipping the *object* rather than excluding the *key* from the
+    /// candidate scan is load-bearing: this hard-delete is the only reaper of
+    /// soft-deleted `artifacts` rows in the codebase (the only other
+    /// production `DELETE FROM artifacts` is the path-specific re-upload
+    /// tombstone in `handlers/mod.rs`), so excluding the key would leave these
+    /// rows unreclaimable forever.
+    ///
+    /// FAILS ON MAIN: the object is deleted.
+    #[tokio::test]
+    async fn test_gc_spares_proxy_cache_objects_but_reaps_their_rows_3368() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        // A live cache object, written where the proxy cache writes it, plus
+        // the stale soft-deleted `artifacts` row that also names it.
+        let uid = Uuid::new_v4().simple().to_string();
+        let cache_key = format!("proxy-cache/remote-{uid}/simple/six/six-1.0.whl/__content__");
+        let hosted_key = format!("pypi/six/1.0/six-1.0-{uid}.whl");
+        let storage = fixture
+            .state
+            .storage_for_repo(
+                &tdh::make_repo_info(
+                    fixture.repo_id,
+                    &fixture.repo_key,
+                    &fixture.storage_dir,
+                    "local",
+                    None,
+                )
+                .storage_location(),
+            )
+            .expect("resolve storage");
+        for key in [&cache_key, &hosted_key] {
+            storage
+                .put(key, bytes::Bytes::from_static(b"payload"))
+                .await
+                .expect("seed object");
+        }
+        for key in [&cache_key, &hosted_key] {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by, is_deleted) \
+                 VALUES ($1, $2, 'six', '1.0', 7, 'cafe', 'application/zip', $2, $3, true)",
+            )
+            .bind(fixture.repo_id)
+            .bind(key)
+            .bind(fixture.user_id)
+            .execute(&fixture.pool)
+            .await
+            .expect("insert soft-deleted row");
+        }
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        service.run_gc(false).await.expect("gc run");
+
+        let cache_object = storage
+            .exists(&cache_key)
+            .await
+            .expect("probe cache object");
+        let hosted_object = storage
+            .exists(&hosted_key)
+            .await
+            .expect("probe hosted object");
+        let rows_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND storage_key = ANY($2)",
+        )
+        .bind(fixture.repo_id)
+        .bind(vec![cache_key.clone(), hosted_key.clone()])
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count surviving rows");
+
+        fixture.teardown().await;
+
+        assert!(
+            cache_object,
+            "#3368: the proxy-cache object is owned by proxy_cache_artifacts, which this \
+             predicate cannot see; GC must leave it to purge_repo_cache / lifecycle expiry"
+        );
+        assert!(
+            !hosted_object,
+            "negative control: a hosted orphan object must still be reclaimed, or the whole \
+             sweep has been disabled rather than scoped"
+        );
+        assert_eq!(
+            rows_left, 0,
+            "both stale rows must still be hard-deleted; this is the only reaper of \
+             soft-deleted artifacts rows, so sparing the object must not spare the row"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Mock storage backend for unit tests
@@ -3923,6 +4170,246 @@ mod tests {
         );
     }
 
+    /// The lease name is an operator-visible wire value (`SELECT * FROM
+    /// scheduler_leases WHERE job_name = 'storage_gc'`), so pin it. Renaming
+    /// it silently breaks every runbook and dashboard built on #3384 while
+    /// leaving both replicas perfectly happy.
+    #[test]
+    fn scheduled_gc_lease_job_name_is_the_documented_wire_name() {
+        assert_eq!(
+            SCHEDULED_GC_JOB_NAME, "storage_gc",
+            "the scheduled GC lease name is operator-visible (#3384) — do not rename it"
+        );
+    }
+
+    /// [`StorageGcService::run_scheduled_tick`] must skip (return `false`)
+    /// while another replica holds the named lease, and must acquire, run,
+    /// and release it (returning `true`) once that lease is free — the
+    /// concurrency guard added for artifact-keeper#3384.
+    ///
+    /// Runs against the REAL [`SCHEDULED_GC_JOB_NAME`], not a random name, so
+    /// the argument the scheduler actually passes is under test; nothing else
+    /// in the tree claims that lease (the scheduler itself never starts in a
+    /// `--lib` test binary).
+    ///
+    /// Also pins the other half of the contract: the on-demand admin endpoint
+    /// is NOT gated by this lease and must still run while a scheduled tick
+    /// holds it. That is the property the whole change is allowed to be
+    /// invisible on — an operator hitting `POST /api/v1/admin/storage-gc`
+    /// during a tick must not silently get a no-op.
+    #[tokio::test]
+    async fn run_scheduled_tick_respects_the_singleton_lease() {
+        use crate::api::handlers::storage_gc::{run_storage_gc, StorageGcRequest};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
+        use crate::services::cluster_work;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let storage = fixture_storage(&fixture);
+        let uid = Uuid::new_v4().simple().to_string();
+        let job = SCHEDULED_GC_JOB_NAME;
+
+        // One genuinely orphaned, system-written, past-the-age-floor object.
+        // The fixture config leaves `MAVEN_FLAT_GC_ENABLED` off, so a pass
+        // that reaches it REPORTS it (`maven_flat_objects_gated`) and deletes
+        // nothing. That counter is what makes the on-demand assertion below
+        // observable: a lease-gated no-op would report zero.
+        let probe_key = format!("maven/ondemand3384/{uid}/lib/maven-metadata.xml");
+        seed_objects(&storage, &[&probe_key]).await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &probe_key,
+            2,
+            "metadata_rollup",
+        )
+        .await;
+        // Defensive: a previous crashed run of this test could have left the
+        // singleton row behind, which would make the first assertion pass for
+        // the wrong reason.
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(job)
+            .execute(&fixture.pool)
+            .await;
+
+        // Simulate another replica already holding the lease for this tick.
+        let other_replica_lease =
+            cluster_work::try_acquire_scheduler_lease(&fixture.pool, job, "other-replica", 60.0)
+                .await
+                .expect("query ok")
+                .expect("first claim wins");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        assert!(
+            !service.run_scheduled_tick(job).await,
+            "tick must skip while another replica holds the lease"
+        );
+
+        // The on-demand admin endpoint shares the service but NOT the lease:
+        // it calls `run_gc` directly and must still work here.
+        let admin = AuthExtension {
+            user_id: fixture.user_id,
+            username: fixture.username.clone(),
+            is_admin: true,
+            ..Default::default()
+        };
+        let on_demand = run_storage_gc(
+            axum::extract::State(fixture.state.clone()),
+            axum::extract::Extension(admin),
+            axum::Json(StorageGcRequest { dry_run: false }),
+        )
+        .await;
+        let on_demand =
+            on_demand.expect("on-demand admin GC must not error while the lease is held");
+        assert!(
+            on_demand.0.maven_flat_objects_gated >= 1,
+            "the on-demand admin GC endpoint must not be blocked by the \
+             scheduled tick's lease — it must actually run the flat-object \
+             sweep and report the seeded orphan, not return an empty no-op \
+             result: {:?}",
+            on_demand.0
+        );
+        assert!(
+            storage.exists(&probe_key).await.expect("exists check"),
+            "the on-demand pass is gated the same way the scheduled one is: \
+             MAVEN_FLAT_GC_ENABLED is off, so it reports and deletes nothing"
+        );
+
+        // Free the lease; the next tick must win it, run, and release it.
+        other_replica_lease.release(&fixture.pool).await;
+        assert!(
+            service.run_scheduled_tick(job).await,
+            "tick must run once the lease is free"
+        );
+
+        let held_after = cluster_work::try_acquire_scheduler_lease(
+            &fixture.pool,
+            job,
+            "post-tick-checker",
+            60.0,
+        )
+        .await
+        .expect("query ok");
+        assert!(
+            held_after.is_some(),
+            "a completed tick must release the lease, not hold it forever"
+        );
+
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(job)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+    }
+
+    /// Winning the lease must change WHO sweeps, never WHAT is swept.
+    ///
+    /// The #3431 incident was an unrecoverable data loss on exactly this
+    /// sweep, and this PR is its reachability multiplier (the trigram index
+    /// makes the candidate scan orders of magnitude faster, so a pass that
+    /// used to be slow enough to be starved now reliably completes to its
+    /// full 1000-key budget). Both #3431 guards are
+    /// therefore re-asserted THROUGH the leased entry point rather than only
+    /// through `run_gc`/`run_gc_for_repository`:
+    ///
+    /// 1. `MAVEN_FLAT_GC_ENABLED` unset ⇒ a won tick deletes nothing.
+    /// 2. Opted in, the `metadata_rollup` row is reclaimed (positive control,
+    ///    so (1) cannot pass by simply never finding a candidate) while the
+    ///    `operator_repair` row — a source outside
+    ///    `SYSTEM_WRITTEN_ATTRIBUTION_SOURCES` — is preserved.
+    #[tokio::test]
+    async fn run_scheduled_tick_honours_the_flat_gc_gate_and_source_allowlist() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let storage = fixture_storage(&fixture);
+        let uid = Uuid::new_v4().simple().to_string();
+        let job = format!("test-storage-gc-gate-{uid}");
+
+        // Both are genuinely orphaned and past the one-hour age floor; the
+        // ONLY difference between them is `source`.
+        let system_key = format!("maven/gate3384/{uid}/sys/maven-metadata.xml");
+        let operator_key = format!("maven/gate3384/{uid}/ops/maven-metadata.xml");
+        seed_objects(&storage, &[&system_key, &operator_key]).await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &system_key,
+            2,
+            "metadata_rollup",
+        )
+        .await;
+        insert_flat_attribution_row_with_source(
+            &fixture.pool,
+            fixture.repo_id,
+            &operator_key,
+            2,
+            "operator_repair",
+        )
+        .await;
+
+        // (1) Gate unset — default construction, exactly as production builds
+        // it when MAVEN_FLAT_GC_ENABLED is absent.
+        let gated =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        assert!(
+            gated.run_scheduled_tick(&job).await,
+            "the gated tick must still WIN the lease — the gate is about \
+             deleting, not about running"
+        );
+        let after_gated = objects_left(&storage, &[&system_key, &operator_key]).await;
+        let sys_rows_gated = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &system_key).await;
+
+        // (2) Same fixture data, same leased entry point, opted in.
+        let enabled =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
+                .with_maven_flat_gc_enabled(true);
+        assert!(
+            enabled.run_scheduled_tick(&job).await,
+            "the second tick must win the lease the first one released"
+        );
+        let after_enabled = objects_left(&storage, &[&system_key, &operator_key]).await;
+        let ops_rows_enabled =
+            count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &operator_key).await;
+
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(&job)
+            .execute(&fixture.pool)
+            .await;
+        fixture.teardown().await;
+
+        assert_eq!(
+            after_gated,
+            vec![true, true],
+            "with MAVEN_FLAT_GC_ENABLED unset a WON tick must delete nothing \
+             (#3431); leasing the tick must not open a second path around the gate"
+        );
+        assert_eq!(
+            sys_rows_gated, 1,
+            "the gated tick must leave the attribution row in place too"
+        );
+        assert_eq!(
+            after_enabled,
+            vec![false, true],
+            "opted in, the leased tick reclaims the system-written \
+             `metadata_rollup` object (positive control) and PRESERVES the \
+             `operator_repair` one — the #3431 source allowlist still holds \
+             through the lease path"
+        );
+        assert_eq!(
+            ops_rows_enabled, 1,
+            "an operator_repair attribution row is a primary record nothing \
+             can re-derive; it must survive an opted-in leased tick"
+        );
+    }
+
     /// Reference kind for [`insert_referenced_soft_deleted_artifact`].
     enum RefKind {
         /// Insert an `oci_tags` row pointing at the digest.
@@ -4184,9 +4671,11 @@ mod tests {
     #[test]
     fn test_flat_predicate_rollup_guard_uses_shared_fragments() {
         use crate::services::maven_flat_attribution as mfa;
+        let anchor = mfa::metadata_rollup_dir_anchor_sql("a2.storage_key", "o.storage_key");
         for fragment in [
             mfa::is_metadata_rollup_key_sql("o.storage_key"),
             mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
+            anchor.clone(),
         ] {
             assert!(
                 ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(&fragment),
@@ -4194,6 +4683,13 @@ mod tests {
                  not an inline copy"
             );
         }
+        assert!(
+            anchor.contains("ESCAPE ''"),
+            "the rollup anchor must disable LIKE escape processing: without it \
+             a literal backslash in a stored key is read as an escape \
+             character and the guard misses its OWN directory, so a NOT EXISTS \
+             delete guard deletes a still-served rollup; anchor: {anchor}"
+        );
     }
 
     /// #3156: a live parent artifact's metadata `files[]` must anchor its
@@ -4372,6 +4868,115 @@ mod tests {
         );
     }
 
+    /// The rollup anchor must survive a literal backslash in the stored key.
+    ///
+    /// Guard 3 builds its `LIKE` pattern FROM the candidate key
+    /// (`metadata_rollup_dir_anchor_sql`), and Postgres's default `LIKE`
+    /// escape character is a backslash. Without an `ESCAPE` clause the prefix
+    /// `.../com/ba\ck/lib/` is read as the pattern `.../com/back/lib/`, so the
+    /// rollup's OWN live artifact no longer matches, the guard reads "nothing
+    /// anchors this", and a `NOT EXISTS` miss means DELETE — the sweep
+    /// reclaims a `maven-metadata.xml` that is still being served. The loss is
+    /// silent, because the Maven read path synthesises a substitute document.
+    ///
+    /// The backslash fixture deliberately has NO artifact under the collapsed
+    /// `.../com/back/lib/` directory. If such a sibling existed the accidental
+    /// pattern would match it and the rollup would be spared *without* the
+    /// fix, making the test green for the wrong reason.
+    ///
+    /// The `%` and `_` fixtures pin the OTHER direction: those characters
+    /// widen the pattern, so the guard over-matches and therefore
+    /// over-PROTECTS. That is the safe failure direction on an unrecoverable
+    /// delete path and `ESCAPE ''` keeps it deliberately — these two
+    /// assertions fail if anyone later swaps in an exact SQL-side escaper.
+    ///
+    /// TWO positive controls keep the fix honest: a genuinely unreferenced
+    /// rollup whose directory contains a backslash, and a plain one. Without
+    /// them, sparing every key containing a backslash would pass.
+    #[tokio::test]
+    async fn test_orphan_maven_flat_scan_spares_rollup_whose_directory_contains_a_backslash() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let uid = Uuid::new_v4().simple().to_string();
+        let root = format!("maven/gcesc/{uid}/com");
+
+        // 1. The oracle. `\c` collapses to `c` without ESCAPE, and nothing
+        //    lives under the collapsed `back/lib/` directory.
+        let bs_rollup = format!(r"{root}/ba\ck/lib/maven-metadata.xml");
+        let bs_live = format!(r"{root}/ba\ck/lib/1.0/lib-1.0.jar");
+        // 2/3. Over-protect pins: the live artifact sits under a DIFFERENT
+        //      directory that only the widened pattern reaches.
+        let pct_rollup = format!("{root}/pc%nt/lib/maven-metadata.xml");
+        let pct_live = format!("{root}/pcXXnt/lib/1.0/lib-1.0.jar");
+        let und_rollup = format!("{root}/us_c/lib/maven-metadata.xml");
+        let und_live = format!("{root}/usZc/lib/1.0/lib-1.0.jar");
+        // 4/5. Positive controls: nothing live under either directory, and
+        //      nothing under the backslash one's collapsed `dead/lib/` form.
+        let dead_bs_rollup = format!(r"{root}/de\ad/lib/maven-metadata.xml");
+        let dead_rollup = format!("{root}/plain/lib/maven-metadata.xml");
+
+        for key in [&bs_live, &pct_live, &und_live] {
+            insert_maven_artifact_row(&fixture.pool, fixture.repo_id, fixture.user_id, key, false)
+                .await;
+        }
+        for key in [
+            &bs_rollup,
+            &pct_rollup,
+            &und_rollup,
+            &dead_bs_rollup,
+            &dead_rollup,
+        ] {
+            insert_flat_attribution_row(&fixture.pool, fixture.repo_id, key, 2).await;
+        }
+
+        let rows = service
+            .select_orphan_maven_flat_objects(Some(fixture.repo_id))
+            .await;
+        let collected: Vec<String> = rows
+            .expect("scan succeeds")
+            .iter()
+            .map(|r| r.get::<String, _>("storage_key"))
+            .collect();
+        fixture.teardown().await;
+
+        assert!(
+            !collected.contains(&bs_rollup),
+            "guard 3: a maven-metadata.xml whose directory contains a literal \
+             backslash must NOT be collected while its own subtree is still \
+             live — without ESCAPE '' the derived pattern names a DIFFERENT \
+             directory and the guard misses its own artifact; \
+             collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&pct_rollup),
+            "a `%` in a stored key must keep WIDENING the anchor (over-PROTECT, \
+             the safe direction on an unrecoverable delete path); this fails if \
+             the anchor is switched to an exact SQL-side escaper; \
+             collected: {collected:?}"
+        );
+        assert!(
+            !collected.contains(&und_rollup),
+            "a `_` in a stored key must keep widening the anchor for the same \
+             reason as `%`; collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_bs_rollup),
+            "positive control: a rollup over an EMPTY subtree must still be \
+             collected even though its directory contains a backslash — \
+             otherwise sparing every backslash key would pass; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_rollup),
+            "positive control: a plain rollup over an empty subtree must still \
+             be collected; collected: {collected:?}"
+        );
+    }
+
     /// Seed a parent `artifacts` row plus an `artifact_metadata` row whose
     /// `files[]` array lists a row-less companion under `json_key_name`.
     async fn seed_flat_parent_metadata(
@@ -4523,7 +5128,7 @@ mod tests {
     }
 
     async fn count_rows(pool: &PgPool, table_sql: &str, key: &str) -> i64 {
-        sqlx::query_scalar(table_sql)
+        sqlx::query_scalar(sqlx::AssertSqlSafe(table_sql))
             .bind(key)
             .fetch_one(pool)
             .await
@@ -6843,7 +7448,7 @@ mod tests {
             "#,
             protected = BLOB_PROTECTED_BY_REFS_SQL,
         );
-        sqlx::query_scalar::<_, bool>(&sql)
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(&*sql))
             .bind(repo_id)
             .bind(digest)
             .bind(MIN_BLOB_AGE_SECS as i64)
@@ -8747,11 +9352,11 @@ mod tests {
             "NULL"
         };
 
-        let journal_id: i64 = sqlx::query(&format!(
+        let journal_id: i64 = sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "INSERT INTO oci_upload_cleanup_keys \
                  (repository_id, storage_key, created_at, storage_write_completed_at) \
              VALUES ($1, $2, NOW() - INTERVAL '72 hours', {marker}) RETURNING id"
-        ))
+        )))
         .bind(fixture.repo_id)
         .bind(&blob_key)
         .fetch_one(&fixture.pool)
@@ -8760,11 +9365,11 @@ mod tests {
         .try_get("id")
         .expect("journal id");
 
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "INSERT INTO oci_upload_cleanup_keys \
                  (repository_id, storage_key, created_at, storage_write_completed_at) \
              VALUES ($1, $2, NOW() - INTERVAL '71 hours', {marker})"
-        ))
+        )))
         .bind(fixture.repo_id)
         .bind(&control_key)
         .execute(&fixture.pool)

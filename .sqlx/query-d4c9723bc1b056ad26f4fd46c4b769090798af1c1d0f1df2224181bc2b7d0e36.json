@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE scan_results\n            SET status = 'completed',\n                completed_at = NOW(),\n                findings_count = $2,\n                critical_count = $3,\n                high_count = $4,\n                medium_count = $5,\n                low_count = $6,\n                info_count = $7,\n                is_reused = true,\n                source_scan_id = $8,\n                scanner_version = $9\n            WHERE id = $1 AND status = 'running'\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id\n            ",
+  "query": "\n            UPDATE scan_results\n            SET status = 'completed',\n                completed_at = NOW(),\n                findings_count = $2,\n                critical_count = $3,\n                high_count = $4,\n                medium_count = $5,\n                low_count = $6,\n                info_count = $7,\n                is_reused = true,\n                source_scan_id = $8,\n                scanner_version = $9,\n                pin_identity = $10\n            WHERE id = $1 AND status = 'running'\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id\n            ",
   "describe": {
     "columns": [
       {
@@ -104,7 +104,8 @@
         "Int4",
         "Int4",
         "Uuid",
-        "Varchar"
+        "Varchar",
+        "Text"
       ]
     },
     "nullable": [
@@ -128,5 +129,5 @@
       true
     ]
   },
-  "hash": "990621bb5e971a715abd79ff2b4ad40b6b91544a2088ff7fcfb7f806f65ba233"
+  "hash": "d4c9723bc1b056ad26f4fd46c4b769090798af1c1d0f1df2224181bc2b7d0e36"
 }

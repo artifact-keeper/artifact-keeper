@@ -1088,14 +1088,14 @@ impl RepositoryService {
         // the legacy `role_assignments` predicate OR a fine-grained
         // `permissions` grant (direct or via group), mirroring the
         // `RepoVisibility::User` listing arm so direct GET and listing agree.
-        let granted: bool = sqlx::query_scalar(&format!(
+        let granted: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!(
             "SELECT EXISTS ( \
                  SELECT 1 FROM role_assignments ra \
                  WHERE ra.user_id = $1 \
                    AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
              ) OR {}",
             permissions_grant_exists("$2", 1)
-        ))
+        )))
         .bind(user_id)
         .bind(repo_id)
         .fetch_one(&self.db)
@@ -1167,7 +1167,7 @@ impl RepositoryService {
             "SELECT r.id FROM repositories r \
              WHERE r.id = ANY($1) AND ({visibility_clause})"
         );
-        let query = sqlx::query_scalar(&sql).bind(candidate_ids);
+        let query = sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql)).bind(candidate_ids);
         let query = match &ids_bind {
             Some(ids) => query.bind(ids.clone()),
             None => query.bind(user_id_bind),
@@ -1302,7 +1302,7 @@ impl RepositoryService {
             "#
         );
 
-        let page_query = sqlx::query_as::<_, Repository>(&select_sql)
+        let page_query = sqlx::query_as::<_, Repository>(sqlx::AssertSqlSafe(&*select_sql))
             .bind(format_filter.clone())
             .bind(type_filter.clone());
         // $3 shape depends on the visibility variant (single uuid vs uuid[]).
@@ -1332,7 +1332,7 @@ impl RepositoryService {
             "#
         );
 
-        let count_query = sqlx::query_scalar::<_, i64>(&count_sql)
+        let count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql))
             .bind(format_filter)
             .bind(type_filter);
         let count_query = match &ids_bind {
@@ -1979,7 +1979,7 @@ impl RepositoryService {
             ) t
             "#
         );
-        let usage: i64 = sqlx::query_scalar(&sql)
+        let usage: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
             .bind(virtual_repo_id)
             .bind(user_id_bind)
             .bind(scope_bind)
@@ -2059,7 +2059,7 @@ impl RepositoryService {
              GROUP BY leaves.root_id
             "#
         );
-        let rows: Vec<(Uuid, i64)> = sqlx::query_as(&sql)
+        let rows: Vec<(Uuid, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
             .bind(virtual_ids)
             .bind(user_id_bind)
             .bind(scope_bind)

@@ -353,7 +353,7 @@ impl StorageStatsService {
             union = REPO_OBJECT_UNION_SQL,
         );
 
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -469,7 +469,7 @@ impl StorageStatsService {
             union = PATH_REF_UNION_SQL,
             max_depth = MAX_MATERIALIZED_PATH_DEPTH,
         );
-        sqlx::query(&insert_sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*insert_sql))
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;

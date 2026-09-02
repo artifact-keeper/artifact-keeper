@@ -709,6 +709,43 @@ pub fn forward_verbatim_metadata(
     builder.body(axum::body::Body::from(content)).unwrap()
 }
 
+/// Wrap already-buffered bytes in a response [`Body`] that OWNS a
+/// [`proxy_metadata_budget`] reservation, releasing it only after the buffered
+/// chunk has been handed to the response writer (#2665).
+///
+/// Holding the permit to the end of the FUNCTION that buffered the document is
+/// not the same bound. Anything derived from the buffer before the response is
+/// built — a parsed tree, a re-serialized rendering — outlives that scope, and
+/// the rendered body itself stays resident until it leaves the server. A caller
+/// that drops its permit at handler return therefore lets the next request pile
+/// another buffer on top of a body still queued for the socket, which is the
+/// difference between "each request is capped" and "the concurrent total is
+/// bounded". Callers that PARSE and re-serialize (rather than forwarding the
+/// upstream bytes verbatim) should keep the permit across that work and then
+/// hand it here, so the whole working set is accounted for.
+///
+/// Extracted from the RPM repodata proxy, which is where the bound was first
+/// established; it is now shared so a second parse-and-reserialize caller does
+/// not re-derive it.
+pub fn budgeted_body(content: Bytes, permit: OwnedSemaphorePermit) -> axum::body::Body {
+    enum State {
+        Data(Bytes, OwnedSemaphorePermit),
+        Done(OwnedSemaphorePermit),
+    }
+    axum::body::Body::from_stream(futures::stream::unfold(
+        State::Data(content, permit),
+        |state| async move {
+            match state {
+                State::Data(bytes, permit) => {
+                    Some((Ok::<Bytes, std::io::Error>(bytes), State::Done(permit)))
+                }
+                // Permit dropped here, after the chunk reached the response writer.
+                State::Done(_permit) => None,
+            }
+        },
+    ))
+}
+
 /// Budget-reserving sibling of [`proxy_fetch_capped`] (#2684).
 ///
 /// Reserves `max` bytes of the process-wide [`proxy_metadata_budget`] BEFORE
@@ -726,6 +763,16 @@ pub fn forward_verbatim_metadata(
 /// resident metadata memory past the budget. The reservation is sized to the
 /// cap rather than the (not-yet-known) body length, matching the RPM path, so
 /// the bound holds during the buffering read itself and not only afterwards.
+///
+/// Takes the repository's real `format` (#3459, the buffered-metadata sibling
+/// of #2312/#3206). Maven/Gradle clients fetch a `.sha1`/`.md5` sidecar for
+/// every artifact they download, and those sidecars are served through this
+/// helper. The pre-#3459 `build_remote_repo` synthesis handed
+/// `cache_classifier::classify` a `Generic` format, which has no classifier
+/// arm, so `foo-1.0.pom.sha1` fell to the conservative
+/// [`cache_classifier::MUTABLE_DEFAULT_TTL_SECS`] 5-minute TTL even though the
+/// released coordinate it describes is immutable and is itself cached for a
+/// decade. The result was an upstream round-trip per checksum per build.
 pub async fn proxy_fetch_capped_budgeted(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -733,10 +780,14 @@ pub async fn proxy_fetch_capped_budgeted(
     upstream_url: &str,
     path: &str,
     max: usize,
+    format: RepositoryFormat,
 ) -> Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response> {
     let permit = proxy_metadata_budget().reserve(max).await;
-    let (content, content_type) =
-        proxy_fetch_capped(proxy_service, repo_id, repo_key, upstream_url, path, max).await?;
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let (content, content_type) = proxy_service
+        .fetch_artifact_capped(&repo, path, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))?;
     Ok((content, content_type, permit))
 }
 
@@ -901,6 +952,51 @@ pub async fn proxy_fetch_streaming(
     .await
 }
 
+/// Format-carrying sibling of [`proxy_fetch_streaming`] (#3459).
+///
+/// Identical in every respect except that the synthesized [`Repository`]
+/// carries the caller's REAL format instead of the `Generic` stand-in
+/// [`build_remote_repo`] produces, so `cache_classifier::classify` can reach
+/// its per-format arm. With `Generic` there is no arm, so a coordinate the
+/// format considers immutable falls to the conservative 5-minute mutable TTL
+/// and is re-fetched from upstream on the next request.
+///
+/// **Scope.** #3459 moved the Maven/Gradle and sbt artifact arms here. It did
+/// NOT sweep the rest of the class, and this helper does not by itself make
+/// that possible: `proxy_fetch_streaming_with_disposition` and
+/// `proxy_fetch_capped` have no format-carrying sibling, so the RPM
+/// (`rpm.rs`), conda (`conda.rs`) and OCI inline-scan (`oci_v2.rs`) arms that
+/// call them still synthesize `Generic` and still cache immutable content for
+/// five minutes. Those are real instances of this bug, tracked separately;
+/// they are not fixed here because flipping a path from mutable to immutable
+/// serves stale content forever if the classification is wrong for that
+/// handler's cache-path shape, which needs per-site reading. See #3556 before
+/// adding a sibling and sweeping them.
+///
+/// Same class as #2312/#3206, which fixed it for the OCI blob/manifest arms.
+pub async fn proxy_fetch_streaming_with_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    default_content_type: &str,
+    format: RepositoryFormat,
+) -> Result<Response, Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let result = proxy_service
+        .fetch_artifact_streaming(&repo, path)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))?;
+    build_streaming_response_with_disposition(result, default_content_type, None).map_err(|e| {
+        map_proxy_error(
+            repo_key,
+            path,
+            crate::error::AppError::Internal(e.to_string()),
+        )
+    })
+}
+
 /// Streaming sibling of [`proxy_fetch`] that also forwards a
 /// `Content-Disposition: attachment; filename="…"` header on the
 /// outbound response.
@@ -1008,7 +1104,7 @@ async fn try_member_cache_redirect(
         return None;
     }
     let storage = proxy.cache_storage_backend();
-    let cache_key = ProxyService::cache_storage_key(&member.key, path).ok()?;
+    let cache_key = ProxyService::cache_storage_key(proxy.cache_scope(), &member.key, path).ok()?;
     if !(storage.supports_redirect() && proxy.is_cache_fresh(&member.key, path).await) {
         return None;
     }
@@ -1152,7 +1248,7 @@ pub async fn proxy_fetch_or_redirect(
     path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let cache_key = ProxyService::cache_storage_key(repo_key, path)
+    let cache_key = ProxyService::cache_storage_key(proxy_service.cache_scope(), repo_key, path)
         .map_err(|e| map_proxy_error(repo_key, path, e))?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     // #3209 (sibling of #3181): a presigned URL is signed for ONE HTTP method —
@@ -2421,14 +2517,14 @@ where
     let had_members = !members.is_empty();
     let members = authorize_virtual_members(db, auth, virtual_repo_id, members).await;
     if had_members && members.is_empty() {
-        // Do NOT fall through to the "has no members" message: that would
-        // distinguish "this virtual is empty" from "this virtual has members
-        // you may not see", an existence oracle over private repositories.
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response());
+        // Do NOT fall through to a DIFFERENT message: that would distinguish
+        // "this virtual is empty" from "this virtual has members you may not
+        // see", an existence oracle over private repositories. Both arms now
+        // answer `no_accessible_members_response`, which is what makes that
+        // property hold — this arm used to say "Artifact not found in any
+        // member repository" while the empty arm below said "Virtual repository
+        // has no members", so the two stayed distinguishable (#3452).
+        return Err(no_accessible_members_response());
     }
     resolve_virtual_download_from_members(members, proxy_service, path, local_fetch).await
 }
@@ -2458,7 +2554,7 @@ where
     Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
     if members.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+        return Err(no_accessible_members_response());
     }
 
     // Two-phase, priority-preserving resolution (#2069). Pass 1 (the `probe`
@@ -2535,11 +2631,7 @@ where
     match outcome {
         Some(MemberResolveOutcome::Hit(result)) => Ok(result),
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response()),
+        _ => Err(member_miss_response()),
     }
 }
 
@@ -2628,7 +2720,7 @@ where
     let members = fetch_virtual_members(&state.db, virtual_repo_id).await?;
 
     if members.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+        return Err(no_accessible_members_response());
     }
 
     // #3178: narrow to the members this caller may read BEFORE any member is
@@ -2636,11 +2728,7 @@ where
     // download` for why it must not be distinguishable from a genuine miss.
     let members = authorize_virtual_members(&state.db, auth, virtual_repo_id, members).await;
     if members.is_empty() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response());
+        return Err(no_accessible_members_response());
     }
 
     // Two-phase, priority-preserving resolution (#2069), streaming sibling of
@@ -2755,11 +2843,7 @@ where
             Ok(response)
         }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            "Artifact not found in any member repository",
-        )
-            .into_response()),
+        _ => Err(member_miss_response()),
     }
 }
 
@@ -2811,7 +2895,7 @@ where
     let members = authorized_virtual_members(db, auth, virtual_repo_id).await?;
 
     if members.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+        return Err(no_accessible_members_response());
     }
 
     // Two-phase, priority-preserving first-match resolution (#2069). Metadata is
@@ -3323,6 +3407,7 @@ pub async fn try_authorize_virtual_members(
     if members.is_empty() {
         return Ok(members);
     }
+    let member_count = members.len();
     let member_ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
     let granted: std::collections::HashSet<Uuid> =
         match crate::services::repository_service::RepositoryService::new(db.clone())
@@ -3360,12 +3445,22 @@ pub async fn try_authorize_virtual_members(
     let Some(principal) = auth else {
         // Anonymous: the grant half already reduced to `is_public`, so every
         // surviving member is public and the read baseline applies.
-        return Ok(tenant_admitted);
+        return Ok(log_narrowed(
+            virtual_repo_id,
+            auth,
+            member_count,
+            tenant_admitted,
+        ));
     };
     if principal.is_admin {
         // A global admin satisfies the action for every repository; skip the
         // per-member round trips rather than asking a question with one answer.
-        return Ok(tenant_admitted);
+        return Ok(log_narrowed(
+            virtual_repo_id,
+            auth,
+            member_count,
+            tenant_admitted,
+        ));
     }
 
     // The checks are independent single-row reads, so they are issued together
@@ -3409,11 +3504,71 @@ pub async fn try_authorize_virtual_members(
         }
     }))
     .await;
-    Ok(tenant_admitted
-        .into_iter()
-        .zip(decisions)
-        .filter_map(|(member, ok)| ok.then_some(member))
-        .collect())
+    Ok(log_narrowed(
+        virtual_repo_id,
+        auth,
+        member_count,
+        tenant_admitted
+            .into_iter()
+            .zip(decisions)
+            .filter_map(|(member, ok)| ok.then_some(member))
+            .collect(),
+    ))
+}
+
+/// Record, in the SERVER LOG only, that caller authorization removed members
+/// from a virtual walk — the operator-facing half of #3452.
+///
+/// Every caller collapses a fully-filtered member set into the same not-found
+/// the genuinely-empty set produces, deliberately, so the response is not an
+/// existence oracle over private repositories (see
+/// [`NO_ACCESSIBLE_MEMBERS_MSG`]). The cost of that collapse was that an
+/// operator had no way to tell the two apart EITHER: one reporter re-checked
+/// the members through the admin API, found them configured exactly as
+/// expected, and filed a member-resolution bug against a working resolver.
+/// This is the one place that knows both numbers, so it is where the
+/// distinction is recorded — at `info`, once per walk, and only when the filter
+/// actually removed something, so a fully-authorized walk stays silent.
+///
+/// Returns `admitted` unchanged so the three return sites in
+/// [`try_authorize_virtual_members`] (anonymous, admin, and the per-member
+/// action fan-out) can each wrap their result without repeating the call.
+fn log_narrowed(
+    virtual_repo_id: Uuid,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    member_count: usize,
+    admitted: Vec<Repository>,
+) -> Vec<Repository> {
+    if admitted.len() < member_count {
+        // Level depends on the PRINCIPAL, not on the outcome. An authenticated
+        // caller is the diagnostic case an operator needs at default verbosity,
+        // and the volume is bounded by who holds a credential. The ANONYMOUS
+        // arm is reached by any unauthenticated GET to a public virtual that
+        // lists a private member, which is 1:1 with request volume and emitted
+        // nothing extra before this change — logging that at `info` turns a
+        // public read path into unsampled log amplification, so it goes to
+        // `debug`. The message and fields are identical either way.
+        let message = "virtual member walk narrowed by caller authorization; members the caller \
+                       holds no read grant on (or that a repository-scoped token's ceiling \
+                       excludes) are dropped";
+        match auth {
+            Some(principal) => tracing::info!(
+                virtual_repo_id = %virtual_repo_id,
+                user_id = %principal.user_id,
+                members_total = member_count,
+                members_accessible = admitted.len(),
+                message
+            ),
+            None => tracing::debug!(
+                virtual_repo_id = %virtual_repo_id,
+                user_id = tracing::field::Empty,
+                members_total = member_count,
+                members_accessible = admitted.len(),
+                message
+            ),
+        }
+    }
+    admitted
 }
 
 /// Fetch a virtual repository's members already narrowed to the ones the
@@ -3447,6 +3602,89 @@ pub async fn authorized_virtual_members(
 ) -> Result<Vec<Repository>, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     try_authorize_virtual_members(db, auth, virtual_repo_id, members).await
+}
+
+/// The ONE 404 body every virtual-repository member walk answers with when it
+/// resolves to zero usable members (#3452).
+///
+/// Two conditions reach this, and they MUST stay indistinguishable on the wire:
+///
+/// 1. the virtual genuinely has no `virtual_repo_members` rows; and
+/// 2. it has members, but [`try_authorize_virtual_members`] dropped every one
+///    of them — the caller holds no read grant on any member, or a
+///    repository-scoped token's ceiling does not carry them.
+///
+/// Emitting different bodies for (1) and (2) is an existence oracle over
+/// private repositories: it tells an unprivileged caller "this virtual
+/// aggregates at least one repository you may not see". `resolve_virtual_
+/// download` already carried a comment saying so, but only closed the oracle
+/// from ONE side — its authorization-filtered arm said "Artifact not found in
+/// any member repository" while the genuinely-empty arm, reached through
+/// [`resolve_virtual_download_from_members`], still said "Virtual repository
+/// has no members". The pair remained distinguishable, so the property the
+/// comment claimed was never actually held. One constant holds it for the
+/// RESPONSE BODY by construction.
+///
+/// Scope of that claim, stated because "by construction" invites a stronger
+/// reading than it deserves: this makes the status, headers and bytes
+/// identical. It does not make the two arms indistinguishable by TIMING — the
+/// filtered arm does strictly more work (`fetch_virtual_members` ->
+/// `filter_visible_repo_ids` -> a per-member `check_repository_action`) than
+/// the empty arm, which early-returns at the `members.is_empty()` guard in
+/// `try_authorize_virtual_members`. Measured at ~2x median (roughly 3 ms vs
+/// 2 ms over 120 samples), with disjoint quartiles. That side channel is
+/// structural and pre-existing — closing it means doing the filter work for a
+/// virtual with no members — so it is not addressed here, only recorded so the
+/// property is not over-claimed.
+///
+/// The wording is the second half of #3452. `"Virtual repository has no
+/// members"` is not merely inconsistent, it is actively misdiagnosing: it names
+/// a *configuration* fault, so an operator whose members are plainly configured
+/// re-checks them through the admin API, finds them present, and concludes the
+/// member resolver is broken. "no ACCESSIBLE members" is true under both
+/// conditions, is the same string under both, and points at the authorization
+/// decision that actually produced it. The distinguishing detail belongs in the
+/// server log — [`try_authorize_virtual_members`] emits it — not in the body.
+pub const NO_ACCESSIBLE_MEMBERS_MSG: &str = "Virtual repository has no accessible members";
+
+/// [`NO_ACCESSIBLE_MEMBERS_MSG`] as the response every one of these paths
+/// returns.
+///
+/// Built from `AppError::NotFound` rather than a bare
+/// `(StatusCode::NOT_FOUND, msg)` tuple so the body is the project's JSON error
+/// envelope (`{"code":"NOT_FOUND","message":…}`) on EVERY format. The tuple
+/// form renders `text/plain`, which is how one caller could observe maven
+/// answer `text/plain` 33 bytes and npm/pypi answer `application/json` 66 bytes
+/// for the same repository, the same principal and the same authorization
+/// outcome (#3452's per-format divergence). A format client that parses an
+/// error body should not have to special-case which AK route it asked.
+pub fn no_accessible_members_response() -> Response {
+    crate::error::AppError::NotFound(NO_ACCESSIBLE_MEMBERS_MSG.to_string()).into_response()
+}
+
+/// The 404 body for a virtual walk that DID have members the caller may read
+/// and simply did not find the artifact in any of them.
+///
+/// Distinct from [`NO_ACCESSIBLE_MEMBERS_MSG`] on purpose, and safely so: a
+/// caller who sees this has already learned that at least one member is visible
+/// to it, which it can equally learn by listing. The dangerous distinction is
+/// *within* the zero-visible-members case, and that one is collapsed.
+///
+/// Exists as a helper for the same reason its sibling does: four call sites
+/// (`cargo`, `pypi`, and two in `repositories`) already emitted this exact text
+/// through `AppError::NotFound` — i.e. the JSON error envelope — while the two
+/// `proxy_helpers` primitives that maven's download path funnels into emitted
+/// it as a bare `(StatusCode, &str)` tuple, which renders `text/plain`. So the
+/// same message, for the same condition, came back as `application/json` on
+/// pypi and `text/plain` on maven. That is the per-format divergence #3452
+/// reported, surviving in the miss case after the zero-members case was
+/// unified; a client should not have to special-case which AK route it asked.
+pub const MEMBER_MISS_MSG: &str = "Artifact not found in any member repository";
+
+/// [`MEMBER_MISS_MSG`] in the JSON error envelope every other emitter of this
+/// text already used.
+pub fn member_miss_response() -> Response {
+    crate::error::AppError::NotFound(MEMBER_MISS_MSG.to_string()).into_response()
 }
 
 /// True when any member of a virtual repository is NOT public (#3323).
@@ -3586,7 +3824,8 @@ impl LocalLookup<'_> {
     /// DB error to 500. Behavior is identical across selectors apart from the
     /// `WHERE` clause and its bound parameters.
     async fn fetch_row(&self, db: &PgPool, repo_id: Uuid) -> Result<LocalArtifactRow, Response> {
-        let query = sqlx::query_as::<_, LocalArtifactRow>(self.select_sql()).bind(repo_id);
+        let query = sqlx::query_as::<_, LocalArtifactRow>(sqlx::AssertSqlSafe(self.select_sql()))
+            .bind(repo_id);
         let query = match self {
             LocalLookup::Path(path) => query.bind(*path),
             LocalLookup::NameVersion(name, version) => query.bind(*name).bind(*version),
@@ -4759,9 +4998,16 @@ pub(crate) async fn record_proxy_download(
     // later authoritative upsert refines the same `(repo, path)` row in place.
     // A path whose key exceeds the object-store limit can never be cached, so
     // there is nothing to count — skip.
+    // The scope must come from the live `ProxyService` (#3454): a placeholder
+    // row keyed under a different scope than the tee writes would never be
+    // refined in place, leaving a permanently orphaned catalog row.
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return;
+    };
+    let scope = proxy.cache_scope();
     let (storage_key, metadata_key) = match (
-        crate::services::proxy_service::ProxyService::cache_storage_key(repo_key, path),
-        crate::services::proxy_service::ProxyService::cache_metadata_key(repo_key, path),
+        crate::services::proxy_service::ProxyService::cache_storage_key(scope, repo_key, path),
+        crate::services::proxy_service::ProxyService::cache_metadata_key(scope, repo_key, path),
     ) {
         (Ok(s), Ok(m)) => (s, m),
         _ => return,
@@ -6553,14 +6799,82 @@ pub(crate) fn proxy_rescan_synthetic_artifact(
     }
 }
 
-/// Run the leaf scanners over the buffered bytes within the inline budget and
-/// persist the digest-keyed verdict. The caller supplies the format-specific
+/// Why [`proxy_scan_and_record`] could not produce a verdict (#3455).
+///
+/// Exactly three things make a scan inconclusive, and they collapse to this
+/// one discriminated result instead of `Option`'s single `None` so a caller
+/// that cares WHICH one fired -- currently only the rescan endpoint (#3396) --
+/// can say so. The inline download gate's two call sites do not care: they
+/// map every arm back onto the SAME fail-open/fail-closed handling they had
+/// before this change (`.ok()`-shaped), because that posture is #2954's and
+/// is explicitly out of scope here.
+#[derive(Debug)]
+pub(crate) enum ProxyScanInconclusive {
+    /// No scanner is configured for this instance.
+    NoScanner,
+    /// The scan ran and returned an error. This also covers an OCI
+    /// blob-staging failure (#3003 PR-2): staging surfaces as an `Err` from
+    /// the scan future, not as a distinct arm -- there is no separate
+    /// "staging failed" case to discriminate.
+    ScanFailed,
+    /// The scan did not finish inside its budget.
+    BudgetExceeded,
+}
+
+/// Outcome of racing `scan_fut` against `budget`, before any logging or
+/// verdict-recording side effects.
+///
+/// Pulled out of [`proxy_scan_and_record`] (#3455) so the ScanFailed /
+/// BudgetExceeded split is unit-testable with millisecond-scale budgets and
+/// stub futures -- no scanner service, no DB, no grype subprocess. The error
+/// value is carried through rather than discarded so the caller can still log
+/// it before collapsing to [`ProxyScanInconclusive`].
+enum ScanTimeoutOutcome<E> {
+    Failed(E),
+    TimedOut,
+}
+
+async fn run_scan_within_budget<T, E>(
+    budget: std::time::Duration,
+    scan_fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, ScanTimeoutOutcome<E>> {
+    match tokio::time::timeout(budget, scan_fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(ScanTimeoutOutcome::Failed(e)),
+        Err(_) => Err(ScanTimeoutOutcome::TimedOut),
+    }
+}
+
+/// The inline scan budget for `mode` (#3455).
+///
+/// Kept as one function rather than inlined at each of [`proxy_scan_and_record`]'s
+/// callers so the File-vs-OCI rationale (blob staging happens inside the OCI
+/// budget; file bytes are already in hand before the gate) lives in exactly
+/// ONE place. `proxy_scan_and_record` itself no longer chooses a budget --
+/// every caller, including the rescan endpoint with its own derived
+/// [`proxy_rescan_budget`](crate::services::scanner_service::proxy_rescan_budget),
+/// passes one in explicitly.
+pub(crate) fn proxy_scan_mode_budget(mode: &ProxyScanMode) -> std::time::Duration {
+    match mode {
+        ProxyScanMode::File => crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
+        ProxyScanMode::OciImage(_) => {
+            crate::services::scanner_service::OCI_PROXY_SCAN_INLINE_BUDGET
+        }
+    }
+}
+
+/// Run the leaf scanners over the buffered bytes within `budget` and persist
+/// the digest-keyed verdict. The caller supplies the format-specific
 /// `synthetic` [`Artifact`](crate::models::artifact::Artifact) (filename /
-/// content-type drive scanner applicability + archive extraction) and the
-/// [`ProxyScanMode`] selecting the scan invocation. Returns the verdict, or
-/// `None` when the scan was inconclusive (no scanner configured, budget
-/// exceeded, blob staging failed, or scanner error) — the caller maps `None`
-/// onto the fail-open/closed decision.
+/// content-type drive scanner applicability + archive extraction), the
+/// [`ProxyScanMode`] selecting the scan invocation, and the wall-clock
+/// `budget` itself -- the inline gate call sites derive theirs from `mode`
+/// via [`proxy_scan_mode_budget`]; the rescan endpoint (#3396, #3455) passes
+/// its own wider, context-specific budget. Returns the verdict, or a
+/// [`ProxyScanInconclusive`] reason -- the inline gate callers map every
+/// reason onto the fail-open/closed decision exactly as they mapped `None`
+/// before this change.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_scan_and_record(
     state: &crate::api::SharedState,
     repo_id: Uuid,
@@ -6569,17 +6883,14 @@ pub(crate) async fn proxy_scan_and_record(
     bytes: &Bytes,
     expected: Option<&crate::services::scanner_service::ExpectedComponent>,
     mode: &ProxyScanMode,
-) -> Option<crate::services::scanner_service::ProxyScanVerdict> {
-    let scanner = state.scanner_service.as_ref()?;
+    budget: std::time::Duration,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
+    let scanner = state
+        .scanner_service
+        .as_ref()
+        .ok_or(ProxyScanInconclusive::NoScanner)?;
     let filename = synthetic.name.clone();
-    // The OCI budget is wider: blob staging (an upstream fetch the file
-    // formats pay BEFORE the gate) happens inside it.
-    let budget = match mode {
-        ProxyScanMode::File => crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
-        ProxyScanMode::OciImage(_) => {
-            crate::services::scanner_service::OCI_PROXY_SCAN_INLINE_BUDGET
-        }
-    };
     let scan_fut = async {
         match mode {
             ProxyScanMode::File => {
@@ -6593,21 +6904,21 @@ pub(crate) async fn proxy_scan_and_record(
             }
         }
     };
-    let verdict = match tokio::time::timeout(budget, scan_fut).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
+    let verdict = match run_scan_within_budget(budget, scan_fut).await {
+        Ok(v) => v,
+        Err(ScanTimeoutOutcome::Failed(e)) => {
             tracing::warn!(
                 repo_id = %repo_id, file = %filename, error = %e,
                 "inline proxy scan failed; treating as inconclusive"
             );
-            return None;
+            return Err(ProxyScanInconclusive::ScanFailed);
         }
-        Err(_) => {
+        Err(ScanTimeoutOutcome::TimedOut) => {
             tracing::warn!(
                 repo_id = %repo_id, file = %filename,
                 "inline proxy scan exceeded the budget; treating as inconclusive"
             );
-            return None;
+            return Err(ProxyScanInconclusive::BudgetExceeded);
         }
     };
 
@@ -6666,7 +6977,7 @@ pub(crate) async fn proxy_scan_and_record(
         }
     }
 
-    Some(verdict)
+    Ok(verdict)
 }
 
 /// What the serve path was able to establish about WHAT these bytes are being
@@ -6738,6 +7049,38 @@ pub(crate) fn stored_verdict_blocks_under_gate(
     match row {
         None => true,
         Some(_) => severity_gate.blocks(row_max_severity),
+    }
+}
+
+/// Pure decision for the `ScanInline` (fail-closed) arm of
+/// [`gate_proxy_scan_serve`]: given the outcome of one
+/// [`proxy_scan_and_record`] call, decide serve vs. deny.
+///
+/// Pulled out (#3455) so this decision is provable WITHOUT a DB or a scanner
+/// subprocess -- including for [`ProxyScanInconclusive::BudgetExceeded`],
+/// which is otherwise only reachable by actually exceeding a 30s+ budget.
+/// The `Err(_)` arm is a wildcard on purpose and must stay one: every one of
+/// [`ProxyScanInconclusive`]'s three reasons (NoScanner / ScanFailed /
+/// BudgetExceeded) maps here identically -- this gate does not discriminate,
+/// see the type's own doc comment.
+fn scan_inline_serve_decision(
+    result: std::result::Result<
+        crate::services::scanner_service::ProxyScanVerdict,
+        ProxyScanInconclusive,
+    >,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    repo_id: Uuid,
+    filename: &str,
+    digest: &str,
+) -> ProxyScanServeOutcome {
+    match result {
+        Ok(verdict) if verdict.is_vulnerable() && severity_gate.blocks(verdict.max_severity) => {
+            tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
+            ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
+        }
+        Ok(_) => ProxyScanServeOutcome::Serve { pending: false },
+        // Inconclusive under fail-closed => 423, never unscanned bytes.
+        Err(_) => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
     }
 }
 
@@ -6813,19 +7156,12 @@ pub(crate) async fn gate_proxy_scan_serve(
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
-            match proxy_scan_and_record(state, repo_id, digest, &synthetic, bytes, expected, &mode)
-                .await
-            {
-                Some(verdict)
-                    if verdict.is_vulnerable() && severity_gate.blocks(verdict.max_severity) =>
-                {
-                    tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
-                    ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
-                }
-                Some(_) => ProxyScanServeOutcome::Serve { pending: false },
-                // Inconclusive under fail-closed => 423, never unscanned bytes.
-                None => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
-            }
+            let budget = proxy_scan_mode_budget(&mode);
+            let result = proxy_scan_and_record(
+                state, repo_id, digest, &synthetic, bytes, expected, &mode, budget,
+            )
+            .await;
+            scan_inline_serve_decision(result, severity_gate, repo_id, filename, digest)
         }
         ServeDecision::ServePendingScanAsync => {
             // Fail-open: serve immediately (loud: X-AK-Scan pending) and scan
@@ -6862,6 +7198,7 @@ pub(crate) async fn gate_proxy_scan_serve(
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
+            let budget = proxy_scan_mode_budget(&mode);
             tokio::spawn(async move {
                 let _ = proxy_scan_and_record(
                     &state_bg,
@@ -6871,6 +7208,7 @@ pub(crate) async fn gate_proxy_scan_serve(
                     &bytes_bg,
                     expected.as_ref(),
                     &mode,
+                    budget,
                 )
                 .await;
             });
@@ -6940,6 +7278,267 @@ mod tests {
         let b = proxy_rescan_synthetic_artifact(repo, "x/y.tgz", "d", 1, None);
         assert_eq!(b.content_type, "application/octet-stream");
         assert_eq!(b.name, "y.tgz");
+    }
+
+    // ── #3455: proxy_scan_and_record's Option -> discriminated Result ──
+    //
+    // Part 1 changed `proxy_scan_and_record`'s return type from `Option` to
+    // `Result<_, ProxyScanInconclusive>` so the rescan endpoint (security.rs)
+    // can tell NoScanner / ScanFailed / BudgetExceeded apart. The inline
+    // download gate must NOT change behavior: both its call sites (the
+    // fail-closed `ScanInline` match and the fail-open `ServePendingScanAsync`
+    // spawn) still collapse every arm through a `Err(_)` wildcard, exactly as
+    // they collapsed every `None` before. The tests below prove that for all
+    // three arms.
+
+    /// [`run_scan_within_budget`] was pulled out of `proxy_scan_and_record`
+    /// specifically so the ScanFailed/BudgetExceeded split is testable with
+    /// millisecond-scale budgets and stub futures -- no scanner service, no
+    /// DB, no grype subprocess. It is a NEW helper: there is no pre-existing
+    /// behavior to run it against, so there is no meaningful red baseline for
+    /// it in isolation. The conflation bug itself (all three arms producing
+    /// the SAME response) is what the handler-mapping tests in security.rs
+    /// prove red -> green.
+    #[tokio::test]
+    async fn run_scan_within_budget_classifies_ok_failed_and_timed_out() {
+        // A future that resolves Ok passes the value through untouched.
+        let ok = run_scan_within_budget(std::time::Duration::from_secs(5), async {
+            Ok::<i32, &str>(42)
+        })
+        .await;
+        assert!(matches!(ok, Ok(42)));
+
+        // A future that resolves Err classifies as Failed, carrying the
+        // original error through for the caller to log before mapping it to
+        // ProxyScanInconclusive::ScanFailed.
+        let failed = run_scan_within_budget(std::time::Duration::from_secs(5), async {
+            Err::<i32, &str>("boom")
+        })
+        .await;
+        assert!(matches!(failed, Err(ScanTimeoutOutcome::Failed("boom"))));
+
+        // A future that never resolves classifies as TimedOut once the
+        // budget elapses -- millisecond-scale here, proving the
+        // BudgetExceeded trigger without waiting out a real 30s/120s budget.
+        let timed_out = run_scan_within_budget(
+            std::time::Duration::from_millis(5),
+            std::future::pending::<std::result::Result<i32, &str>>(),
+        )
+        .await;
+        assert!(matches!(timed_out, Err(ScanTimeoutOutcome::TimedOut)));
+    }
+
+    /// `proxy_scan_and_record` must short-circuit to `NoScanner` BEFORE
+    /// touching the database or constructing a scan future. Provable with a
+    /// pool that never actually connects (`lazy_pool`): if the function
+    /// touched the DB on this path the test would hang or error instead of
+    /// returning promptly.
+    #[tokio::test]
+    async fn proxy_scan_and_record_short_circuits_to_no_scanner_without_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let dir = std::env::temp_dir().join(format!("ph-no-scanner-{}", Uuid::new_v4()));
+        let state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        assert!(state.scanner_service.is_none());
+
+        let repo_id = Uuid::new_v4();
+        let digest = format!("{:0>64}", Uuid::new_v4().simple());
+        let bytes = Bytes::from_static(b"stub content");
+        let synthetic = proxy_rescan_synthetic_artifact(
+            repo_id,
+            "pkg/pkg-1.0.tgz",
+            &digest,
+            bytes.len() as i64,
+            None,
+        );
+
+        let result = proxy_scan_and_record(
+            &state,
+            repo_id,
+            &digest,
+            &synthetic,
+            &bytes,
+            None,
+            &ProxyScanMode::File,
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert!(matches!(result, Err(ProxyScanInconclusive::NoScanner)));
+    }
+
+    /// Drive [`gate_proxy_scan_serve`] once with a fresh (unseeded) digest so
+    /// `decide_serve` always lands on `ScanInline` / `ServePendingScanAsync`
+    /// for the given `action`, and return its outcome. Shared by the three
+    /// #3455 inline-gate regression tests below so each carries only its own
+    /// scanner-state setup and assertions.
+    async fn run_gate(
+        state: &crate::api::SharedState,
+        action: crate::services::proxy_scan_service::ProxyScanAction,
+    ) -> ProxyScanServeOutcome {
+        let repo_id = Uuid::new_v4();
+        let digest = format!("{:0>64}", Uuid::new_v4().simple());
+        let bytes = Bytes::from_static(b"stub content");
+        let synthetic = proxy_rescan_synthetic_artifact(
+            repo_id,
+            "pkg/pkg-1.0.tgz",
+            &digest,
+            bytes.len() as i64,
+            None,
+        );
+        gate_proxy_scan_serve(
+            state,
+            repo_id,
+            "pkg-1.0.tgz",
+            &digest,
+            synthetic,
+            &bytes,
+            action,
+            crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+            ProxyScanIdentity::NotApplicable,
+            ProxyScanMode::File,
+        )
+        .await
+    }
+
+    /// NoScanner arm: fail-closed still 423s and fail-open still serves
+    /// pending, exactly as when the gate saw `None` pre-#3455.
+    #[tokio::test]
+    async fn inline_gate_no_scanner_arm_is_byte_identical_fail_closed_and_fail_open() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        assert!(
+            fx.state.scanner_service.is_none(),
+            "the default test state has no scanner wired -- exactly the NoScanner arm"
+        );
+
+        match run_gate(&fx.state, ProxyScanAction::FailClosed).await {
+            ProxyScanServeOutcome::Deny(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::LOCKED,
+                "inconclusive under fail-closed must 423, never serve unscanned bytes"
+            ),
+            ProxyScanServeOutcome::Serve { .. } => {
+                panic!("fail-closed must never serve on an inconclusive scan")
+            }
+        }
+
+        assert!(
+            matches!(
+                run_gate(&fx.state, ProxyScanAction::FailOpen).await,
+                ProxyScanServeOutcome::Serve { pending: true }
+            ),
+            "inconclusive under fail-open must still serve loudly pending"
+        );
+    }
+
+    /// ScanFailed arm: a CVE-authoritative scanner that hard-errors is
+    /// exactly the pre-#3455 `Ok(Err(e))` branch. Same 423 / pending contract.
+    #[tokio::test]
+    async fn inline_gate_scan_failed_arm_is_byte_identical_fail_closed_and_fail_open() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let scanner = || {
+            std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-test"),
+                rescan: MockCveRescan::Error,
+            }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>
+        };
+
+        let fail_closed_state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
+        match run_gate(&fail_closed_state, ProxyScanAction::FailClosed).await {
+            ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
+            ProxyScanServeOutcome::Serve { .. } => {
+                panic!("fail-closed must never serve when the scan errored")
+            }
+        }
+
+        let fail_open_state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner()]);
+        assert!(matches!(
+            run_gate(&fail_open_state, ProxyScanAction::FailOpen).await,
+            ProxyScanServeOutcome::Serve { pending: true }
+        ));
+    }
+
+    // BudgetExceeded arm (#3455). Split in two rather than driven end-to-end
+    // through an actually-hung scanner under a paused clock (#2974 follow-up):
+    // genuinely exceeding the 30s inline File-mode budget needs either a real
+    // 30s wait or a paused tokio clock, and the fail-closed half of this gate
+    // does real Postgres I/O (`ProxyScanService::lookup_verdict`, inside
+    // `gate_proxy_scan_serve`) before the scan future is even polled. Pairing
+    // that DB round trip with a paused virtual clock is exactly the hazard
+    // documented at `http_client.rs:884` (#2974): `pool.acquire()` arms
+    // sqlx's own acquire-timeout in virtual time across a real socket await,
+    // so tokio's auto-advance can fire it early -- a spurious `PoolTimedOut`
+    // that either panics the test or makes `Fixture::setup` return `None`,
+    // which this test module's `let Some(fx) = ... else { return; }` idiom
+    // turns into a SILENT no-op reported as green. This repo has hit
+    // `PoolTimedOut` flakes from exactly this shape before.
+    //
+    // fail-closed is proven against `scan_inline_serve_decision` directly --
+    // the very function `gate_proxy_scan_serve`'s `ScanInline` arm now calls
+    // -- with zero DB, zero clock, zero scanner subprocess.
+    //
+    // fail-open is proven end-to-end with a real, UNPAUSED clock and is safe
+    // to do so: `ServePendingScanAsync` fires the scan in a background
+    // `tokio::spawn` and returns `Serve { pending: true }` without ever
+    // looking at its outcome (see that arm in `gate_proxy_scan_serve`), so
+    // the assertion below returns long before the mock's hang could matter --
+    // there is no timer this test needs to wait out, paused or otherwise.
+
+    /// Pure fail-closed half: `BudgetExceeded` denies via the SAME decision
+    /// function `gate_proxy_scan_serve` calls, byte-identical to the
+    /// NoScanner/ScanFailed arms proven end-to-end below and above.
+    #[test]
+    fn inline_gate_budget_exceeded_arm_fail_closed_denies_via_shared_decision() {
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        match scan_inline_serve_decision(
+            Err(ProxyScanInconclusive::BudgetExceeded),
+            ProxySeverityGate::BlockOnAny,
+            Uuid::new_v4(),
+            "pkg-1.0.tgz",
+            "deadbeef",
+        ) {
+            ProxyScanServeOutcome::Deny(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
+            ProxyScanServeOutcome::Serve { .. } => {
+                panic!("fail-closed must never serve on a budget-exceeded scan")
+            }
+        }
+    }
+
+    /// Fail-open half: `ServePendingScanAsync` ignores the scan outcome
+    /// entirely, so this proves the gate returns immediately without waiting
+    /// on the mock's (arbitrarily long) hang -- see the module comment above.
+    #[tokio::test]
+    async fn inline_gate_budget_exceeded_arm_fail_open_serves_pending_without_waiting() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let scanner = std::sync::Arc::new(VersionedCveScanner {
+            live_version: Some("grype-test"),
+            // Far longer than any budget in this suite: irrelevant, since
+            // fail-open never awaits the scan before answering.
+            rescan: MockCveRescan::Hang(std::time::Duration::from_secs(3600)),
+        }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+
+        let fail_open_state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner]);
+        assert!(matches!(
+            run_gate(&fail_open_state, ProxyScanAction::FailOpen).await,
+            ProxyScanServeOutcome::Serve { pending: true }
+        ));
     }
 
     // ── #3243 stage 3 / #3246: severity gate over a stored verdict ──
@@ -7755,6 +8354,164 @@ mod tests {
         r.repo_type = RepositoryType::Local;
         r.upstream_url = None;
         r
+    }
+
+    // =====================================================================
+    // #3454 revert-proofs: the presigned-redirect + download-record paths
+    // must derive their cache key from the LIVE `proxy.cache_scope()`, not a
+    // hardcoded `ProxyCacheScope::unscoped()`. Each seeds a fresh cache entry
+    // at the SCOPED key over a presign-capable in-memory backend and asserts
+    // the signed 302 Location (or the persisted catalog row) carries the scope
+    // segment. Reverting the hunk to `unscoped()` makes the freshness probe
+    // miss (no object at the unscoped key) or sign the wrong key -> the test
+    // fails, which is what the previous coverage did not do.
+    // =====================================================================
+
+    fn scoped_test_scope() -> crate::services::proxy_cache_scope::ProxyCacheScope {
+        crate::services::proxy_cache_scope::ProxyCacheScope::from_env_and_identity(
+            Some("prod-eu"),
+            Uuid::from_u128(0x3454_0000_0000_0000_0000_0000_0000_0001),
+        )
+        .unwrap()
+    }
+
+    fn get_ctx() -> crate::api::middleware::download_telemetry::DownloadContext {
+        crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        }
+    }
+
+    /// `try_member_cache_redirect` (proxy_helpers.rs virtual-member fast path).
+    #[tokio::test]
+    async fn try_member_cache_redirect_signs_the_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let member = test_local_member("maven-proxy");
+        let path = "org/example/lib/1.0/lib-1.0.jar";
+        let content_key = ProxyService::cache_storage_key(&scope, &member.key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, &member.key, path).unwrap();
+        assert!(content_key.contains("proxy-cache/prod-eu/maven-proxy/"));
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("mcr-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+        let ctx = get_ctx();
+
+        let resp = try_member_cache_redirect(state.as_ref(), proxy.as_ref(), &member, path, &ctx)
+            .await
+            .expect("a fresh presign-capable member cache hit must 302-redirect");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("proxy-cache/prod-eu/maven-proxy/"),
+            "member redirect signed a non-scoped key (a revert to unscoped drops the \
+             scope segment): {loc}"
+        );
+    }
+
+    /// `proxy_fetch_or_redirect` (proxy_helpers.rs generic presign fast path).
+    #[tokio::test]
+    async fn proxy_fetch_or_redirect_signs_the_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let repo_key = "npm-proxy";
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let content_key = ProxyService::cache_storage_key(&scope, repo_key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, repo_key, path).unwrap();
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("pfor-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+        let ctx = get_ctx();
+
+        let resp = proxy_fetch_or_redirect(
+            proxy.as_ref(),
+            state.as_ref(),
+            Uuid::new_v4(),
+            repo_key,
+            "https://unused.example.com",
+            path,
+            &ctx,
+        )
+        .await
+        .expect("a fresh cache hit must take the redirect fast path, not fetch upstream");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("proxy-cache/prod-eu/npm-proxy/"),
+            "generic redirect signed a non-scoped key (a revert to unscoped drops the \
+             scope segment): {loc}"
+        );
+    }
+
+    /// `record_proxy_download` (proxy_helpers.rs) persists a catalog placeholder
+    /// keyed under the LIVE scope, so the streaming tee's later upsert refines
+    /// the same row. A revert to unscoped keys the placeholder under
+    /// `proxy-cache/<repo>/...`, orphaning it. DB-backed.
+    #[tokio::test]
+    async fn record_proxy_download_persists_scoped_storage_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let storage_path = std::env::temp_dir()
+            .join(format!("rpd-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state = tdh::build_state_with_proxy(pool.clone(), &storage_path, proxy.clone());
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let ctx = get_ctx();
+
+        record_proxy_download(&state, repo_id, &repo_key, path, &ctx).await;
+
+        let storage_key: Option<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(&pool)
+        .await
+        .expect("query catalog row");
+        let storage_key = storage_key.expect("record_proxy_download must persist a catalog row");
+        assert!(
+            storage_key.starts_with("proxy-cache/prod-eu/"),
+            "placeholder catalog row keyed under a non-scoped key (a revert to unscoped): {storage_key}"
+        );
+        // cleanup
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
     }
 
     #[tokio::test]
@@ -10155,6 +10912,7 @@ mod tests {
                 stuck_scan_reap_limit: 1000,
                 allow_local_admin_login: false,
                 sso_disable_admin_break_glass: false,
+                oidc_silent_sso_enabled: true,
                 totp_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,
@@ -10301,7 +11059,7 @@ mod tests {
                  VALUES ($1, $2, $3, $4, '{}'::repository_type, '{}'::repository_format, $5)",
                 repo_type, format
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .bind(id)
                 .bind(&key)
                 .bind(format!("ph-test-{}", id))
@@ -11808,6 +12566,17 @@ mod tests {
     const VERIFIED_STREAMING_CALL_TOKEN: &str =
         "proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(";
 
+    /// The format-carrying streaming sibling: same streaming/tee semantics as
+    /// `proxy_fetch_streaming` (no buffering), plus the repository's REAL
+    /// format, so `cache_classifier::classify` can reach its per-format arm
+    /// instead of the `Generic` stand-in `build_remote_repo` synthesizes. The
+    /// Maven and sbt artifact downloads moved to this helper in #3459 — with
+    /// `Generic` every released coordinate was stamped with the conservative
+    /// 5-minute mutable TTL and re-fetched from upstream after it — so their
+    /// pins assert this token. A revert to the buffered `proxy_fetch` OR to
+    /// the format-less streaming helper must fail the pin.
+    const FORMAT_STREAMING_CALL_TOKEN: &str = "proxy_helpers::proxy_fetch_streaming_with_format(";
+
     /// One pin test per handler. Kept as separate `#[test]` functions
     /// (rather than a single loop) so a CI failure points directly at
     /// the regressing handler. The macro keeps the surface area small
@@ -11834,8 +12603,14 @@ mod tests {
     streaming_pin_test!(
         test_maven_remote_fetch_uses_streaming_helper_1183,
         "maven.rs",
-        STREAMING_CALL_TOKEN,
+        FORMAT_STREAMING_CALL_TOKEN,
         "the remote catch-all download"
+    );
+    streaming_pin_test!(
+        test_sbt_remote_fetch_uses_streaming_helper_1183,
+        "sbt.rs",
+        FORMAT_STREAMING_CALL_TOKEN,
+        "the remote sbt/ivy artifact download"
     );
     streaming_pin_test!(
         test_goproxy_remote_fetch_uses_streaming_helper_1183,
@@ -12273,6 +13048,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 StdArc::new(FreshProxyCacheStorage),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
 
         let resp = resolve_virtual_download_streaming(
@@ -12378,6 +13154,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 cache.clone(),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
         // Per-test coordinate isolates the process-global metadata LRU (#2758).
         let path = format!("pkg/pkg-{}-py3-none-any.whl", Uuid::new_v4());
@@ -12545,6 +13322,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 backend,
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         )
     }
 
@@ -12661,6 +13439,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 fresh.clone(),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
         let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
         let state = db_helpers::build_state_presigned(pool, "s3-test", registry_storage.clone());
@@ -12756,6 +13535,7 @@ mod tests {
             StdArc::new(crate::services::storage_service::StorageService::new(
                 held.clone(),
             )),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         );
 
         let err = resolve_virtual_download_streaming(
@@ -12928,6 +13708,7 @@ mod tests {
             let proxy = StdArc::new(crate::services::proxy_service::ProxyService::new(
                 fx.pool.clone(),
                 service,
+                crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
             ));
             let state =
                 tdh::build_state_with_proxy_presigned(fx.pool.clone(), &storage_path, proxy);
@@ -13649,6 +14430,237 @@ mod tests {
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
             iat_ms: None,
         }
+    }
+
+    /// Verified-bug regression for #3452 (with #3387 / #3386).
+    ///
+    /// A virtual member walk that resolves to ZERO usable members has two
+    /// causes, and both must produce the SAME response. Before this fix they
+    /// did not, and the divergence was visible three ways at once:
+    ///
+    /// | condition | body (pre-fix) | content-type |
+    /// |---|---|---|
+    /// | virtual has no member rows | `Virtual repository has no members` | `text/plain` (maven) |
+    /// | every member filtered by authz | `Artifact not found in any member repository` | `text/plain` |
+    /// | same, via the metadata primitive | `Virtual repository has no members` | `application/json` |
+    ///
+    /// The adjacent "members were visible, the artifact simply was not there"
+    /// case keeps its own distinct message (`MEMBER_MISS_MSG`) — a caller that
+    /// reaches it has already learned a member is visible to it — but it, too,
+    /// now renders as the JSON envelope on every format rather than
+    /// `text/plain` on maven and JSON on pypi.
+    ///
+    /// Two properties were broken by that:
+    ///
+    /// 1. **The existence oracle `resolve_virtual_download`'s own comment
+    ///    claims to close was open.** The comment says the filtered arm must
+    ///    not be distinguishable from "this virtual is empty" — but it only
+    ///    changed the FILTERED arm, leaving the empty arm (reached through
+    ///    `resolve_virtual_download_from_members`) saying something else. A
+    ///    caller could still tell "this virtual aggregates at least one
+    ///    repository I may not see" from "this virtual is empty".
+    /// 2. **The message misdiagnosed.** "has no members" names a
+    ///    *configuration* fault, so an operator whose members are configured
+    ///    correctly re-checks them, finds them present, and files a
+    ///    member-resolution bug against a working resolver.
+    ///
+    /// Both reported principals are exercised against the same fixture:
+    ///
+    ///   * (a) a user holding a `read` grant on the virtual PARENT only;
+    ///   * (b) a repository-scoped token holding grants on parent AND member
+    ///     but whose ceiling carries only the parent.
+    ///
+    /// Neither may read the member, so both must see exactly what a caller of
+    /// a genuinely empty virtual sees.
+    ///
+    /// The POSITIVE CONTROL is load-bearing: a "fix" that made every virtual
+    /// answer this body unconditionally would satisfy every equality assertion
+    /// above. The control grants the caller `read` on the member with an
+    /// unrestricted ceiling and asserts the walk gets PAST the gate — it
+    /// reaches the member and misses on content, which is a DIFFERENT response.
+    #[tokio::test]
+    async fn test_3452_zero_accessible_members_is_one_indistinguishable_response() {
+        use crate::api::handlers::test_db_helpers as tdh3452;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        // Two real virtual repositories: one with no members at all, one whose
+        // single member is a private repository. Real rows, because both the
+        // membership fetch and the grant half are evaluated in SQL.
+        let (empty_virtual_id, _ek, empty_dir) =
+            db_helpers::create_repo(&pool, "virtual", "maven").await;
+        let (parent_id, _pk, parent_dir) = db_helpers::create_repo(&pool, "virtual", "maven").await;
+        let (member_id, _mk, member_dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+        tdh3452::link_virtual_member(&pool, parent_id, member_id, 1).await;
+
+        let (user_id, _un) = tdh3452::create_user(&pool).await;
+        // (a) granted on the PARENT only.
+        tdh3452::grant_repo_actions(&pool, parent_id, user_id, &["read"]).await;
+        let parent_only = nonadmin_auth(user_id);
+
+        // (b) granted on BOTH, but the token ceiling carries only the parent,
+        //     so the member is out of scope. Same denial, different half of
+        //     `require_visible`.
+        let (scoped_user_id, _sn) = tdh3452::create_user(&pool).await;
+        tdh3452::grant_repo_actions(&pool, parent_id, scoped_user_id, &["read"]).await;
+        tdh3452::grant_repo_actions(&pool, member_id, scoped_user_id, &["read"]).await;
+        let parent_scoped_token = crate::api::middleware::auth::AuthExtension {
+            is_api_token: true,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![parent_id]),
+            ..nonadmin_auth(scoped_user_id)
+        };
+
+        // `local_fetch` is never invoked on the paths under test (they return
+        // before any member is probed); on the positive control it IS invoked
+        // and reports a miss, which is what makes the control's response
+        // distinguishable from a gate refusal.
+        let never_serves = |_id: Uuid, _loc: crate::storage::registry::StorageLocation| async {
+            Err::<StreamingFetchResult, Response>(
+                (StatusCode::NOT_FOUND, "member has no such artifact").into_response(),
+            )
+        };
+        async fn describe(
+            r: Result<StreamingFetchResult, Response>,
+        ) -> (StatusCode, Option<String>, String) {
+            let resp = match r {
+                Ok(_) => panic!("no member can serve in this fixture"),
+                Err(resp) => resp,
+            };
+            let status = resp.status();
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, ct, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let genuinely_empty = describe(
+            resolve_virtual_download(&pool, None, None, empty_virtual_id, "a/b/c", never_serves)
+                .await,
+        )
+        .await;
+        let filtered_parent_grant = describe(
+            resolve_virtual_download(
+                &pool,
+                Some(&parent_only),
+                None,
+                parent_id,
+                "a/b/c",
+                never_serves,
+            )
+            .await,
+        )
+        .await;
+        let filtered_token_scope = describe(
+            resolve_virtual_download(
+                &pool,
+                Some(&parent_scoped_token),
+                None,
+                parent_id,
+                "a/b/c",
+                never_serves,
+            )
+            .await,
+        )
+        .await;
+
+        // The metadata primitive is the other family of format callers (npm
+        // packument, composer, cargo sparse index, pypi simple index) and used
+        // to answer with its own third wording.
+        let metadata_filtered = {
+            let r = resolve_virtual_metadata(
+                &pool,
+                Some(&parent_only),
+                None,
+                parent_id,
+                "a/b/c",
+                |_b, _ct, _ce, _u| async {
+                    Err::<Response, Response>(
+                        (StatusCode::NOT_FOUND, "no metadata").into_response(),
+                    )
+                },
+            )
+            .await;
+            let resp = r.expect_err("no member can serve metadata in this fixture");
+            let status = resp.status();
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, ct, String::from_utf8_lossy(&body).into_owned())
+        };
+
+        // POSITIVE CONTROL, before any cleanup: a caller who MAY read the
+        // member gets past the gate and reaches the member.
+        let (allowed_user_id, _an) = tdh3452::create_user(&pool).await;
+        tdh3452::grant_repo_actions(&pool, member_id, allowed_user_id, &["read"]).await;
+        let allowed = nonadmin_auth(allowed_user_id);
+        let walked = describe(
+            resolve_virtual_download(
+                &pool,
+                Some(&allowed),
+                None,
+                parent_id,
+                "a/b/c",
+                never_serves,
+            )
+            .await,
+        )
+        .await;
+
+        tdh3452::cleanup_member_repo(&pool, member_id, &member_dir).await;
+        for (id, dir) in [(empty_virtual_id, &empty_dir), (parent_id, &parent_dir)] {
+            tdh3452::cleanup_member_repo(&pool, id, dir).await;
+        }
+        for id in [user_id, scoped_user_id, allowed_user_id] {
+            tdh3452::cleanup_user(&pool, id).await;
+        }
+
+        let expected = (
+            StatusCode::NOT_FOUND,
+            Some("application/json".to_string()),
+            format!(
+                "{{\"code\":\"NOT_FOUND\",\"message\":\"{}\"}}",
+                NO_ACCESSIBLE_MEMBERS_MSG
+            ),
+        );
+        assert_eq!(
+            genuinely_empty, expected,
+            "a virtual with no member rows must answer the shared no-accessible-members body \
+             in the JSON error envelope"
+        );
+        assert_eq!(
+            filtered_parent_grant, genuinely_empty,
+            "#3452 (a): a caller granted on the PARENT only must not be able to tell that this \
+             virtual aggregates a member it may not see -- the response must be byte-identical \
+             to the genuinely-empty one"
+        );
+        assert_eq!(
+            filtered_token_scope, genuinely_empty,
+            "#3452 (b): a repository-scoped token whose ceiling excludes the member must get the \
+             same response as (a) and as the empty virtual"
+        );
+        assert_eq!(
+            metadata_filtered, genuinely_empty,
+            "#3452: the metadata primitive (npm/composer/cargo/pypi) must answer with the same \
+             body and content-type as the download primitive (maven); the per-format divergence \
+             is the reported defect"
+        );
+        assert_ne!(
+            walked.2, genuinely_empty.2,
+            "POSITIVE CONTROL: a caller who MAY read the member must get PAST the member gate. \
+             If this equals the refusal body, the walk is refusing everyone and every equality \
+             above is vacuous"
+        );
     }
 
     /// Verified-bug regression for #1804, CORRECTED by #3178.
@@ -15501,6 +16513,7 @@ mod proxy_download_recording_tests {
     const SERVE_PRIMITIVES: &[&str] = &[
         "proxy_fetch_streaming(",
         "proxy_fetch_streaming_with_disposition(",
+        "proxy_fetch_streaming_with_format(",
         "proxy_fetch_streaming_with_cache_key(",
         "proxy_fetch_streaming_with_cache_key_verified(",
         "proxy_fetch_streaming_response_with_cache_key(",
@@ -15681,6 +16694,14 @@ mod proxy_download_recording_tests {
         // span heuristic, or the top-level-`fn` parser stops seeing the code it
         // is supposed to police. Without this a gate that matched NOTHING would
         // report the same green as a gate that matched everything.
+        //
+        // The floor is deliberately slack, so it is NOT what catches a handler
+        // silently dropping out: #3459 moved maven.rs and sbt.rs onto
+        // `proxy_fetch_streaming_with_format`, the count fell 33 -> 31, and
+        // this assertion stayed green while the gate had stopped watching
+        // either file. That is what
+        // `the_recording_gate_actually_scans_live_serve_sites` now pins
+        // per-handler.
         assert!(
             scanned >= 25,
             "#3446: the recording gate only reached {scanned} proxy serve sites, which \
@@ -15711,6 +16732,35 @@ mod proxy_download_recording_tests {
             cargo.1.contains("record_proxy_download("),
             "#3446: cargo's proxied crate download must record"
         );
+
+        // Per-handler pins for the serve sites a rename can silently drop.
+        // The coverage floor below is slack by design (25 against 33), so it
+        // does NOT catch two handlers falling out — which is exactly what
+        // happened when #3459 moved these two onto the format-carrying
+        // streaming sibling and SERVE_PRIMITIVES was not updated with it:
+        // maven.rs and sbt.rs each went 1 scanned site -> 0, the total went
+        // 33 -> 31, and the gate stayed green while no longer policing
+        // maven's `record_proxy_download` (#3265) or sbt's deferral marker.
+        for (format, primitive) in [
+            ("maven.rs", "proxy_fetch_streaming_with_format("),
+            ("sbt.rs", "proxy_fetch_streaming_with_format("),
+        ] {
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(n, _)| *n == format)
+                .unwrap_or_else(|| panic!("{format} is scanned"));
+            assert!(
+                src.contains(primitive),
+                "#3446: {format}'s Remote download arm must still call `{primitive}`"
+            );
+            assert!(
+                SERVE_PRIMITIVES.contains(&primitive),
+                "#3446: `{primitive}` is a live serve primitive in {format} but is \
+                 not in SERVE_PRIMITIVES, so the recording gate no longer sees that \
+                 handler at all"
+            );
+        }
+
         for format in [
             "debian.rs",
             "goproxy.rs",

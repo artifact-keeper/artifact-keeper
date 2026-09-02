@@ -1,6 +1,24 @@
 # ---------- Base: Rust toolchain on UBI 9 ----------
 # syntax=docker/dockerfile:1
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
+
+# Build toolchain versions, declared once per image rather than inline.
+#
+# RUST_VERSION must match rust-toolchain.toml's `channel` (#3551). rustup reads
+# that file at build time and it outranks the toolchain installed here, so a
+# mismatch does not fail — it silently downloads a second toolchain and builds
+# with the file's version, leaving this ARG looking authoritative while being
+# dead weight. scripts/ci/check-toolchain-pin.sh does not cover Dockerfiles.
+ARG RUST_VERSION=1.98.0
+ARG PROTOC_VERSION=36.1
+
+# sha256 of the protoc release assets, per architecture. Fetching over HTTPS
+# authenticates the host, not the bytes; these pin the bytes. Refresh both when
+# PROTOC_VERSION moves:
+#   curl -sL https://github.com/protocolbuffers/protobuf/releases/download/v${V}/protoc-${V}-linux-x86_64.zip | sha256sum
+ARG PROTOC_SHA256_X86_64=c4bc672d9d49214dc8cafdceadf4df92182d6ca8e3ec65a56b2d7de5602669b4
+ARG PROTOC_SHA256_AARCH64=237a68856edf1bd28b6204bddd0596c1cf46d298bc29c620012540b2e44c73e7
+
 RUN dnf install -y --nodocs \
     gcc gcc-c++ make pkg-config perl-core \
     openssl-devel zlib-devel xz-devel bzip2-devel \
@@ -8,14 +26,15 @@ RUN dnf install -y --nodocs \
     && dnf clean all && \
     ARCH=$(uname -m) && \
     case "$ARCH" in \
-      x86_64)  PROTOC_ARCH="linux-x86_64" ;; \
-      aarch64) PROTOC_ARCH="linux-aarch_64" ;; \
+      x86_64)  PROTOC_ARCH="linux-x86_64";   PROTOC_SHA256="${PROTOC_SHA256_X86_64}" ;; \
+      aarch64) PROTOC_ARCH="linux-aarch_64"; PROTOC_SHA256="${PROTOC_SHA256_AARCH64}" ;; \
       *)       echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac && \
-    curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PROTOC_ARCH}.zip" \
+    curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip" \
       -o /tmp/protoc.zip && \
+    echo "${PROTOC_SHA256}  /tmp/protoc.zip" | sha256sum -c - && \
     unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_VERSION} && \
     . "$HOME/.cargo/env" && \
     cargo install cargo-chef --locked
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -233,7 +252,7 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # of silently shipping a vulnerable stdlib. Raise it when a new Go stdlib
 # advisory lands; that one-line bump replaces what used to be a .trivyignore
 # entry.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS grype-bin
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
 ARG TARGETOS
 ARG TARGETARCH
 ARG GRYPE_VERSION=0.117.0
@@ -425,7 +444,7 @@ RUN set -eu; \
 #
 # Uses the GHCR mirror (maintained by .github/workflows/mirror-images.yml) to
 # avoid Docker Hub anonymous-pull rate limits that intermittently break CI.
-FROM ghcr.io/artifact-keeper/ci-mirror/alpine:3.23 AS grype-db-seed
+FROM ghcr.io/artifact-keeper/ci-mirror/alpine:3.24 AS grype-db-seed
 RUN apk add --no-cache ca-certificates
 COPY --from=grype-bin /grype /usr/local/bin/grype
 ENV GRYPE_DB_CACHE_DIR=/grype-db

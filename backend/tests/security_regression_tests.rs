@@ -1076,10 +1076,12 @@ mod scan_sbom_leak_2439 {
             "role_assignments",
             "artifacts",
         ] {
-            let _ = sqlx::query(&format!("DELETE FROM {tbl} WHERE repository_id = $1"))
-                .bind(repo_id)
-                .execute(pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {tbl} WHERE repository_id = $1"
+            )))
+            .bind(repo_id)
+            .execute(pool)
+            .await;
         }
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
@@ -1433,10 +1435,10 @@ mod xrepo_authz_2443 {
                 "role_assignments",
                 "artifacts",
             ] {
-                let _ = sqlx::query(&format!(
+                let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
                     "DELETE FROM {tbl} WHERE staging_repo_id = $1 OR source_repo_id = $1 \
                      OR repository_id = $1 OR remote_repo_id = $1 OR target_repo_id = $1"
-                ))
+                )))
                 .bind(r)
                 .execute(pool)
                 .await;

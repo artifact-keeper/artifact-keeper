@@ -1348,6 +1348,30 @@ fn validate_repository_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a repository key that collides with this deployment's active
+/// proxy-cache scope segment (#3454 follow-up).
+///
+/// `proxy-cache/<segment>/` is the root of this deployment's ENTIRE proxy
+/// cache, and it is also the exact shape of the legacy per-repository purge
+/// prefix `proxy-cache/<repo_key>/`. A repository whose key equals the scope
+/// segment makes those two namespaces ambiguous, so deleting that repository
+/// would otherwise sweep every other repository's cached content. Refusing the
+/// key at creation and rename removes the ambiguity structurally — it survives
+/// a future refactor of the purge path, whereas the guard in
+/// `ProxyService::purge_repo_cache` alone leaves the ambiguity in place.
+///
+/// Kept scope-aware and side-effect free (`scope_segment` is the resolved
+/// segment or `None` for the unscoped/legacy layout, in which nothing can
+/// collide) so it is unit-testable without a live `ProxyService`.
+fn validate_key_not_scope_collision(key: &str, scope_segment: Option<&str>) -> Result<()> {
+    if scope_segment == Some(key) {
+        return Err(AppError::Validation(format!(
+            "Repository key '{key}' collides with this deployment's proxy-cache scope segment and is reserved"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a custom outbound User-Agent string for a remote repository.
 ///
 /// Enforces a pragmatic 256-character cap and rejects control characters per
@@ -1475,7 +1499,9 @@ pub(crate) fn clamp_per_page(per_page: Option<u32>) -> u32 {
 /// with no members.
 ///
 /// Such repos are unusable: every fetch returns
-/// `404 Resource not found: Virtual repository has no members`. Pre-fix
+/// `404 Resource not found: Virtual repository has no accessible members`
+/// (`proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG`, shared with the case where the
+/// members exist but the caller may read none of them — see #3452). Pre-fix
 /// (#1279) the create handler tolerated both broken shapes silently:
 ///
 ///   * `member_repos` field omitted entirely. Operators who naturally
@@ -2672,6 +2698,13 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
+    validate_key_not_scope_collision(
+        &payload.key,
+        state
+            .proxy_service
+            .as_ref()
+            .and_then(|p| p.cache_scope().segment()),
+    )?;
     // Resolve the format string via the service. The service owns both the
     // built-in enum mapping and the `format_handlers` fallback for WASM
     // plugin formats, so the handler keeps no business logic of its own here.
@@ -3622,6 +3655,13 @@ pub async fn update_repository(
     // Validate new key if provided
     if let Some(ref new_key) = payload.key {
         validate_repository_key(new_key)?;
+        validate_key_not_scope_collision(
+            new_key,
+            state
+                .proxy_service
+                .as_ref()
+                .and_then(|p| p.cache_scope().segment()),
+        )?;
     }
 
     // Validate quota_bytes is within a reasonable range (max 100 TiB)
@@ -4185,6 +4225,23 @@ async fn purge_repo_artifact_objects(
 ///
 /// The exclusivity and OCI-exclusion rules are documented on
 /// [`purge_repo_artifact_objects`].
+///
+/// `proxy-cache/%` is excluded for the same reason the storage GC excludes it
+/// (#3368), and the reason is worth restating because the exclusivity guard
+/// above does NOT cover it: that guard only asks whether another *`artifacts`*
+/// row shares the key, and a proxy-cache object's real owner is a
+/// `proxy_cache_artifacts` row, which this query cannot see. A legacy
+/// `artifacts` row carrying a proxy-cache key therefore looks exclusively
+/// owned while the live cache entry it names belongs to the proxy catalog —
+/// deleting the object would strand that catalog row and its `size_bytes`.
+///
+/// Cache keys are derived from `(repo_key, path)`, so this is normally the
+/// repository's own cache content, which `purge_repo_cache` reclaims properly
+/// on delete anyway. It stops being the repository's own content after a key
+/// rename with reuse, at which point this sweep would reach into another
+/// repository's cache. Before the layout was anchored the delete resolved to a
+/// key nothing had written and silently hit nothing; anchoring it makes the
+/// delete land, so the exclusion lands with it.
 async fn collect_repo_artifact_object_keys(
     state: &SharedState,
     repo_id: Uuid,
@@ -4193,6 +4250,7 @@ async fn collect_repo_artifact_object_keys(
     let mut keys: std::collections::BTreeSet<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.storage_key FROM artifacts a \
          WHERE a.repository_id = $1 \
+           AND a.storage_key NOT LIKE 'proxy-cache/%' \
            AND a.storage_key NOT LIKE 'oci-manifests/%' \
            AND a.storage_key NOT LIKE 'oci-blobs/%' \
            AND NOT EXISTS ( \
@@ -4352,8 +4410,27 @@ async fn purge_storage_object_keys(
 ///   the guard *does* test `is_deleted` and reclaims the key once those rows
 ///   are hard-deleted. A leak GC later collects is recoverable; a purge is not.
 async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
+    let sql = repo_maven_flat_keys_sql();
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
+        .bind(repo_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Failed to list Maven flat-object keys to purge before repository delete"
+            );
+            Vec::new()
+        })
+}
+
+/// The purge-list SQL [`collect_repo_maven_flat_keys`] runs, split out so the
+/// anti-drift test can assert its shape without a database. `$1` is the
+/// repository being deleted.
+fn repo_maven_flat_keys_sql() -> String {
     use crate::services::maven_flat_attribution as mfa;
-    let sql = format!(
+    format!(
         "SELECT o.storage_key \
          FROM maven_flat_object_owner o \
          WHERE o.repository_id = $1 \
@@ -4395,7 +4472,7 @@ async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec
                WHERE {is_rollup} \
                  AND mb.repository_id <> $1 \
                  AND mrb.storage_backend = o.storage_backend \
-                 AND mb.storage_key LIKE {rollup_dir} || '%' \
+                 AND {rollup_anchor} \
            )",
         files_match = mfa::metadata_files_name_key_sql("am.metadata->'files'", "o.storage_key"),
         is_sidecar = mfa::is_sidecar_key_sql("o.storage_key"),
@@ -4405,20 +4482,8 @@ async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec
             &mfa::sidecar_base_key_sql("o.storage_key"),
         ),
         is_rollup = mfa::is_metadata_rollup_key_sql("o.storage_key"),
-        rollup_dir = mfa::metadata_rollup_dir_prefix_sql("o.storage_key"),
-    );
-    sqlx::query_scalar(&sql)
-        .bind(repo_id)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                repo_id = %repo_id,
-                error = %e,
-                "Failed to list Maven flat-object keys to purge before repository delete"
-            );
-            Vec::new()
-        })
+        rollup_anchor = mfa::metadata_rollup_dir_anchor_sql("mb.storage_key", "o.storage_key"),
+    )
 }
 
 /// Derived row-less Maven keys for a FILESYSTEM repository being deleted:
@@ -6252,7 +6317,7 @@ async fn maven_component_keys_from_catalog(
     let search_pattern = search_query.map(|q| format!("%{}%", q));
     let sql = maven_component_keys_sql(search_pattern.is_some(), keyset.is_some());
 
-    let mut query = sqlx::query(&sql).bind(repository_ids);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_ids);
     if let Some(pattern) = &search_pattern {
         query = query.bind(pattern);
     }
@@ -6331,7 +6396,7 @@ async fn count_maven_catalog_component_keys(
              AND ($2::text IS NULL OR p.name ILIKE $2) \
          ) t"
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_ids)
         .bind(&search_pattern)
         .fetch_one(db)
@@ -6629,7 +6694,7 @@ async fn maven_components_from_catalog(
         next_param + 1
     ));
 
-    let mut query = sqlx::query(&sql).bind(repository_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(pattern) = &search_pattern {
         query = query.bind(pattern);
     }
@@ -6687,7 +6752,7 @@ async fn count_maven_catalog_components(
            AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
            AND ($2::text IS NULL OR p.name ILIKE $2)"
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_id)
         .bind(&search_pattern)
         .fetch_one(db)
@@ -7001,6 +7066,25 @@ const DOCKER_TAG_ROWS_FROM_SQL: &str = r#"FROM oci_tags t
 const DOCKER_TAG_ROWS_WHERE_SQL: &str = r#"WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0"#;
 
+/// The `?search=` substring filter for the docker-tag listing, as a format
+/// template over the parameter index.
+///
+/// #3500: carries `ESCAPE '\'` and is fed [`super::escape_like_literal`]
+/// output. The search term is REQUEST input concatenated into a `LIKE`
+/// pattern, so unescaped a `%` or `_` in the term acted as a wildcard —
+/// searching for `1_0` matched `1.0`, `120`, `1a0` — and a backslash quoted
+/// the character after it, so a tag containing one could not be found by
+/// typing it. Both arms of the listing (the page and the `?count=exact`
+/// total) build the filter from this one fragment so they cannot drift and
+/// report a count that disagrees with the rows.
+///
+/// The operand is bound by the callers, not here, so the #3500 class gate is
+/// pointed at them explicitly and checks each one for the escaper:
+/// LIKE-OPERAND-ESCAPED-BY-CALLER: fetch_docker_tag_rows, count_docker_tag_rows
+fn docker_tag_search_sql(param: usize) -> String {
+    format!(" AND LOWER(t.tag) LIKE '%' || LOWER(${param}) || '%' ESCAPE '\\'")
+}
+
 /// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
 /// latest `scan_results` rows. Returns at most `limit` rows, ordered by
 /// `(name, tag)`.
@@ -7055,9 +7139,7 @@ async fn fetch_docker_tag_rows(
     );
     let mut next_param = 2;
     if search_query.is_some() {
-        sql.push_str(&format!(
-            " AND LOWER(t.tag) LIKE '%' || LOWER(${next_param}) || '%'"
-        ));
+        sql.push_str(&docker_tag_search_sql(next_param));
         next_param += 1;
     }
     if keyset.is_some() {
@@ -7074,9 +7156,9 @@ async fn fetch_docker_tag_rows(
         next_param + 1
     ));
 
-    let mut query = sqlx::query(&sql).bind(repository_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(q) = search_query {
-        query = query.bind(q);
+        query = query.bind(super::escape_like_literal(q));
     }
     if let Some((name, tag)) = keyset {
         query = query.bind(name.as_str()).bind(tag.as_str());
@@ -7136,11 +7218,11 @@ async fn count_docker_tag_rows(
 ) -> Result<i64> {
     let mut sql = format!("SELECT COUNT(*) {DOCKER_TAG_ROWS_FROM_SQL} {DOCKER_TAG_ROWS_WHERE_SQL}");
     if search_query.is_some() {
-        sql.push_str(" AND LOWER(t.tag) LIKE '%' || LOWER($2) || '%'");
+        sql.push_str(&docker_tag_search_sql(2));
     }
-    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(repository_id);
+    let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(q) = search_query {
-        query = query.bind(q);
+        query = query.bind(super::escape_like_literal(q));
     }
     query
         .fetch_one(db)
@@ -7711,9 +7793,40 @@ async fn authorize_generic_upload(
 ///
 /// The raw-`PUT` and multipart entry points authorize the request and stream the
 /// body to a bounded scratch file (computing the content digests in one pass);
-/// this shared tail verifies declared checksums, runs any WASM format plugin,
-/// derives the artifact coordinates, and persists via the streaming service
-/// method — never buffering the whole artifact in memory.
+/// Derive `(name, version)` from a generic-upload path's `/`-separated
+/// segments.
+///
+/// The flat convention is `{name}/{version}/{filename...}`. #3604 defect 3: an
+/// npm SCOPED package's name is itself `@scope/name` and so spans TWO segments
+/// before the version — `@babel/traverse/7.23.0/x.tgz` is
+/// `@babel/traverse@7.23.0`. The flat parse reads that as `@babel@traverse`,
+/// and once #3442 turns the coordinate into a scan pin that pins a component
+/// which does not exist, so a genuinely vulnerable scoped package reads clean.
+/// Only npm-family repos use the `@scope/` convention (`is_npm_format`); every
+/// other format keeps the flat parse byte for byte. `fallback_name` is returned
+/// when the path is too short to carry a coordinate.
+fn derive_generic_path_coordinate(
+    path: &str,
+    is_npm_format: bool,
+    fallback_name: String,
+) -> (String, Option<String>) {
+    let segments: Vec<&str> = path.split('/').collect();
+    let npm_scoped = is_npm_format && segments.first().is_some_and(|s| s.starts_with('@'));
+    if npm_scoped && segments.len() >= 4 {
+        (
+            format!("{}/{}", segments[0], segments[1]),
+            Some(segments[2].to_string()),
+        )
+    } else if segments.len() >= 3 {
+        (segments[0].to_string(), Some(segments[1].to_string()))
+    } else {
+        (fallback_name, None)
+    }
+}
+
+/// After verifying declared checksums and running any WASM format plugin,
+/// this shared tail derives the artifact coordinates and persists via the
+/// streaming service method — never buffering the whole artifact in memory.
 #[allow(clippy::too_many_arguments)]
 async fn persist_generic_staged_upload(
     state: &SharedState,
@@ -7802,13 +7915,7 @@ async fn persist_generic_staged_upload(
     let (name, version) = if let Some(ref meta) = wasm_metadata {
         (name, meta.version.clone())
     } else {
-        let segments: Vec<&str> = path.split('/').collect();
-        if segments.len() >= 3 {
-            // Path follows {package_name}/{version}/{filename...} convention
-            (segments[0].to_string(), Some(segments[1].to_string()))
-        } else {
-            (name, None)
-        }
+        derive_generic_path_coordinate(&path, repo.format.handler_key() == "npm", name)
     };
 
     // #2367: on versioning-enabled Generic/Mlmodel repos an explicit
@@ -8959,7 +9066,7 @@ pub async fn delete_artifact(
     let artifact_service = state.create_artifact_service(storage);
 
     // Find the artifact
-    let artifact = sqlx::query_scalar!(
+    let artifact_id = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
         repo.id,
         path
@@ -8969,9 +9076,96 @@ pub async fn delete_artifact(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
+    // Pre-flight the soft-delete (row load + the `BeforeDelete` veto) BEFORE
+    // opening the transaction below: a veto must abort before any index row is
+    // touched, and plugin I/O must never hold a Postgres transaction open.
+    let artifact = artifact_service.prepare_delete(artifact_id).await?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Docker/OCI manifests are indexed in `oci_tags`/`oci_manifest_refs`/
+    // `manifest_blob_refs` in addition to the `artifacts` row. Soft-deleting the
+    // artifacts row alone leaves those rows orphaned, so a re-push's HEAD
+    // manifest resolves the surviving tag and the client skips the PUT — the
+    // artifacts row is never resurrected (#3476). Unwind the OCI index here,
+    // mirroring `handle_delete_manifest`, so a later re-push cleanly re-creates
+    // it.
+    //
+    // The unwind acts ONLY on the index rows this artifact actually owns:
+    //   * the digest comes from the OCI index for `(repo, image, reference)`,
+    //     never from the row's own checksum — the index is the authority on what
+    //     a reference resolves to;
+    //   * it runs only when that indexed manifest IS this row (checksum
+    //     equality), so a row that is not the indexed manifest cannot drive the
+    //     removal of index rows belonging to a different image;
+    //   * it is scoped to the single `(name = image, tag = reference)` row this
+    //     REST path names, never to a repo-wide content-address sweep — that
+    //     scope is only correct on `/v2`, where the reference IS the resolved
+    //     digest.
+    //
+    // A reference with no index row (peer-replicated Docker artifacts and
+    // non-manifest files under an OCI repository both have `artifacts` rows and
+    // no index rows) simply has nothing to unwind: skip it and still soft-delete.
+    if crate::services::repository_service::format_handler_key(&repo.format) == "oci" {
+        if let Some((image, reference)) = path
+            .strip_prefix("v2/")
+            .and_then(|rest| rest.split_once("/manifests/"))
+        {
+            let indexed = crate::api::handlers::oci_v2::resolve_indexed_manifest_digest(
+                &mut *tx, repo.id, image, reference,
+            )
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            match crate::api::handlers::oci_v2::rest_unwind_digest(
+                indexed.as_deref(),
+                &artifact.checksum_sha256,
+            ) {
+                Some(digest) => {
+                    crate::api::handlers::oci_v2::delete_oci_manifest_content_in_tx(
+                        &mut tx,
+                        repo.id,
+                        image,
+                        reference,
+                        digest,
+                        crate::api::handlers::oci_v2::OciIndexDeleteScope::NamedReference,
+                    )
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+                None => {
+                    tracing::warn!(
+                        repository_id = %repo.id,
+                        path = %path,
+                        indexed_digest = indexed.as_deref().unwrap_or("<none>"),
+                        "OCI index unwind skipped: the reference is not indexed as this artifact's manifest"
+                    );
+                }
+            }
+        }
+    }
+
+    // The index unwind and the soft-delete are ONE transaction: a failure of
+    // either can never leave the index destroyed while the artifacts row still
+    // reads as present (or vice versa).
     artifact_service
-        .delete_with_sync_options(artifact, !is_replication)
+        .commit_delete_in_tx(&mut tx, artifact_id)
         .await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Best-effort side effects, deliberately after COMMIT: sync-task fan-out,
+    // the audit entry, the AfterDelete hook and the search-index removal must
+    // not hold the transaction open, and the audit write must not roll back
+    // with it.
+    artifact_service
+        .finish_delete(&artifact, !is_replication)
+        .await;
 
     // Deleting a Maven artifact changes the version set for its GAV. Drop both
     // the in-memory generation cache AND the *stored* verbatim maven-metadata.xml
@@ -12254,6 +12448,44 @@ mod tests {
     #[test]
     fn test_validate_repository_key_valid_simple() {
         assert!(validate_repository_key("my-repo").is_ok());
+    }
+
+    // ---- #3454 follow-up: a key equal to the proxy-cache scope segment is
+    // reserved. `proxy-cache/<segment>/` is the whole deployment's cache root
+    // AND the legacy per-repository purge prefix `proxy-cache/<repo_key>/`, so
+    // a repository keyed as the segment makes deleting it sweep every other
+    // repository's cached content. Refusing it at creation/rename is the half
+    // of the fix that survives a refactor of the purge path.
+    #[test]
+    fn test_reject_repository_key_equal_to_scope_segment() {
+        let err = validate_key_not_scope_collision("prod-eu", Some("prod-eu"))
+            .expect_err("a key equal to the scope segment must be rejected");
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("proxy-cache scope segment"),
+                    "unexpected: {msg}"
+                );
+                assert!(msg.contains("prod-eu"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The UUID default segment is a legal repository key too, and equally
+        // reserved.
+        let uuid = "7ff7c6bf-e184-4d77-a541-0b23b208b3b4";
+        assert!(validate_key_not_scope_collision(uuid, Some(uuid)).is_err());
+    }
+
+    #[test]
+    fn test_scope_collision_permits_non_colliding_and_unscoped() {
+        // A different key under the same scope is fine.
+        assert!(validate_key_not_scope_collision("maven-proxy", Some("prod-eu")).is_ok());
+        // An unscoped/legacy deployment (no segment) can never collide.
+        assert!(validate_key_not_scope_collision("prod-eu", None).is_ok());
+        // The colliding key is still a well-formed key by the base validator —
+        // i.e. the base validator does NOT already reject it, so this check is
+        // load-bearing.
+        assert!(validate_repository_key("prod-eu").is_ok());
     }
 
     #[test]
@@ -16098,6 +16330,518 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -----------------------------------------------------------------------
+    // REST delete: OCI index unwind (#3476)
+    //
+    // The unwind must remove the index rows the deleted artifact OWNS, and
+    // nothing else. Every fixture below seeds the index independently of the
+    // `artifacts` row's checksum so a divergence between the two is observable
+    // — a fixture that derives both sides from one value cannot see it.
+    // -----------------------------------------------------------------------
+
+    /// Test scaffolding for a Docker repo the fixture user may read/write/delete.
+    struct OciDeleteRig {
+        pool: sqlx::PgPool,
+        repo_id: Uuid,
+        key: String,
+        user_id: Uuid,
+        username: String,
+        auth: Option<AuthExtension>,
+        dir: std::path::PathBuf,
+    }
+
+    impl OciDeleteRig {
+        async fn setup() -> Option<Self> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let pool = tdh::try_pool().await?;
+            let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "docker").await;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            tdh::grant_repo_access(&pool, repo_id, user_id).await;
+            tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+            let auth = Some(tdh::make_auth(user_id, &username));
+            Some(Self {
+                pool,
+                repo_id,
+                key,
+                user_id,
+                username,
+                auth,
+                dir,
+            })
+        }
+
+        /// Insert an `artifacts` row at `path` whose content hash is `checksum`,
+        /// exactly as `upsert_manifest_artifact` writes it on a manifest push.
+        async fn seed_artifact(&self, path: &str, checksum: &str) {
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    repository_id, path, name, version, size_bytes,
+                    checksum_sha256, content_type, storage_key
+                )
+                VALUES ($1, $2, $2, 'v', 100,
+                        $3, 'application/vnd.oci.image.manifest.v1+json', $4)
+                "#,
+            )
+            .bind(self.repo_id)
+            .bind(path)
+            .bind(checksum)
+            .bind(format!("sha256:{checksum}"))
+            .execute(&self.pool)
+            .await
+            .expect("seed artifacts row");
+        }
+
+        /// Insert the `oci_tags` index row for `(image, reference)`. `digest` is
+        /// supplied independently of any artifacts row so the fixture can model
+        /// agreement AND divergence.
+        async fn seed_tag(&self, image: &str, reference: &str, digest: &str) {
+            sqlx::query(
+                "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+                 VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')",
+            )
+            .bind(self.repo_id)
+            .bind(image)
+            .bind(reference)
+            .bind(digest)
+            .execute(&self.pool)
+            .await
+            .expect("seed oci_tags row");
+        }
+
+        /// Insert the config + layer `manifest_blob_refs` a pushed manifest pins.
+        async fn seed_blob_refs(&self, digest: &str) {
+            for (kind, blob) in [("config", "cfg"), ("layer", "lay")] {
+                sqlx::query(
+                    "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) \
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(digest)
+                .bind(format!("sha256:{}{}", blob, "0".repeat(61)))
+                .bind(self.repo_id)
+                .bind(kind)
+                .execute(&self.pool)
+                .await
+                .expect("seed manifest_blob_refs");
+            }
+        }
+
+        async fn delete(&self, path: &str) -> Result<()> {
+            self.delete_as(path, self.auth.clone()).await
+        }
+
+        /// Delete as an admin. A literal `sha256:` manifest path classifies as
+        /// immutable, so only the admin retraction escape hatch reaches the
+        /// unwind for a digest-addressed path.
+        async fn delete_as_admin(&self, path: &str) -> Result<()> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let auth = Some(tdh::admin_auth(self.user_id, &self.username));
+            self.delete_as(path, auth).await
+        }
+
+        async fn delete_as(&self, path: &str, auth: Option<AuthExtension>) -> Result<()> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            delete_artifact(
+                State(tdh::build_state(
+                    self.pool.clone(),
+                    self.dir.to_string_lossy().as_ref(),
+                )),
+                Extension(auth),
+                Path((self.key.clone(), path.to_string())),
+                HeaderMap::new(),
+            )
+            .await
+        }
+
+        async fn tag_count(&self, image: &str, reference: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+            )
+            .bind(self.repo_id)
+            .bind(image)
+            .bind(reference)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn blob_ref_count(&self, digest: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+            )
+            .bind(self.repo_id)
+            .bind(digest)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn is_deleted(&self, path: &str) -> bool {
+            sqlx::query_scalar(
+                "SELECT is_deleted FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(self.repo_id)
+            .bind(path)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn teardown(self) {
+            use crate::api::handlers::test_db_helpers as tdh;
+            tdh::cleanup(&self.pool, self.repo_id, self.user_id).await;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// #3476 negative control (STRENGTHENED): a REST delete of a normally-pushed
+    /// manifest must still unwind the whole index footprint it owns — the tag
+    /// row AND the `manifest_blob_refs` that pin its config/layer blobs — while
+    /// leaving another image's tag in the same repository alone.
+    ///
+    /// The blob-ref half is the storage-reclaim half of #3476; the second image
+    /// pins the blast radius so a later "unwind everything with this digest"
+    /// regression cannot pass.
+    #[tokio::test]
+    async fn delete_artifact_docker_removes_oci_tags_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "a".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine";
+
+        rig.seed_artifact(path, &checksum).await;
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+
+        // A second, unrelated image in the same repository at its own digest.
+        let bystander_checksum = "b".repeat(64);
+        let bystander_digest = format!("sha256:{bystander_checksum}");
+        rig.seed_tag("nginx", "stable", &bystander_digest).await;
+        rig.seed_blob_refs(&bystander_digest).await;
+
+        let result = rig.delete(path).await;
+        assert!(
+            result.is_ok(),
+            "docker delete must succeed, got: {result:?}"
+        );
+
+        assert_eq!(
+            rig.tag_count("redis", "7-alpine").await,
+            0,
+            "oci_tags row must be removed by the REST delete"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&digest).await,
+            0,
+            "the deleted manifest's blob refs must be released so GC can reclaim them"
+        );
+        assert!(
+            rig.is_deleted(path).await,
+            "artifacts row must be soft-deleted"
+        );
+
+        assert_eq!(
+            rig.tag_count("nginx", "stable").await,
+            1,
+            "an unrelated image's tag must be untouched"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&bystander_digest).await,
+            2,
+            "an unrelated image's blob refs must be untouched"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// The REST delete resolves the digest it unwinds FROM THE OCI INDEX for
+    /// `(repository, image, reference)` — never from the deleted row's own
+    /// checksum. An `artifacts` row that merely *carries the same content hash*
+    /// as an indexed manifest, under an unrelated image name and a reference the
+    /// index does not know, owns no index rows and must not be able to remove
+    /// any.
+    #[tokio::test]
+    async fn rest_delete_of_decoy_manifest_must_not_unwind_victim_index_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let victim = "1".repeat(64);
+        let victim_digest = format!("sha256:{victim}");
+
+        // Victim: a real, indexed manifest.
+        rig.seed_artifact("v2/prodimg/manifests/1.0.0", &victim)
+            .await;
+        rig.seed_tag("prodimg", "1.0.0", &victim_digest).await;
+        rig.seed_blob_refs(&victim_digest).await;
+
+        // A second tag on the same digest, so a repo-wide content-addressed
+        // sweep would be visible here too.
+        rig.seed_tag("prodimg", "latest", &victim_digest).await;
+
+        // Decoy: an artifacts row under an unrelated image at a digest-SHAPED
+        // reference, holding the victim's content hash, with NO index row of its
+        // own (which is all the generic upload path creates).
+        let decoy_path = "v2/attackersandbox/manifests/blake3:00";
+        rig.seed_artifact(decoy_path, &victim).await;
+
+        let result = rig.delete(decoy_path).await;
+        assert!(
+            result.is_ok(),
+            "deleting an unindexed artifact must still succeed, got: {result:?}"
+        );
+
+        assert_eq!(
+            rig.tag_count("prodimg", "1.0.0").await,
+            1,
+            "the victim image's tag must survive a delete of an unrelated artifact"
+        );
+        assert_eq!(
+            rig.tag_count("prodimg", "latest").await,
+            1,
+            "a second tag on the same digest must survive too"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&victim_digest).await,
+            2,
+            "the victim image's blob refs must survive (they pin its blobs against GC)"
+        );
+        assert!(
+            rig.is_deleted(decoy_path).await,
+            "the deleted artifact must still be soft-deleted"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// Same invariant under a NON-digest-shaped reference: the decision is
+    /// "is this row the manifest the index names?", not "does the reference look
+    /// like a digest?". Guards the index-authority and checksum-identity rules
+    /// independently of the delete SCOPE rule.
+    #[tokio::test]
+    async fn rest_delete_of_unindexed_manifest_path_must_not_touch_index_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let victim = "3".repeat(64);
+        let victim_digest = format!("sha256:{victim}");
+
+        rig.seed_artifact("v2/prodimg/manifests/1.0.0", &victim)
+            .await;
+        rig.seed_tag("prodimg", "1.0.0", &victim_digest).await;
+        rig.seed_blob_refs(&victim_digest).await;
+
+        let decoy_path = "v2/attackersandbox/manifests/rogue";
+        rig.seed_artifact(decoy_path, &victim).await;
+
+        let result = rig.delete(decoy_path).await;
+        assert!(result.is_ok(), "delete must succeed, got: {result:?}");
+
+        assert_eq!(rig.tag_count("prodimg", "1.0.0").await, 1);
+        assert_eq!(rig.blob_ref_count(&victim_digest).await, 2);
+        assert!(rig.is_deleted(decoy_path).await);
+
+        rig.teardown().await;
+    }
+
+    /// The unwind requires the `artifacts` row to BE the manifest the index
+    /// names. When the two have diverged — the row carries different bytes than
+    /// the tag resolves to — the row does not own that tag, so deleting it must
+    /// leave the tag (which still names a stored manifest) alone rather than
+    /// making a live image unpullable.
+    #[tokio::test]
+    async fn rest_delete_of_diverged_artifact_row_must_not_unwind_indexed_manifest_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        // What the index says `prodimg:1.0.0` is...
+        let indexed = "5".repeat(64);
+        let indexed_digest = format!("sha256:{indexed}");
+        // ...and what the artifacts row at that path actually holds.
+        let stored = "6".repeat(64);
+
+        let path = "v2/prodimg/manifests/1.0.0";
+        rig.seed_artifact(path, &stored).await;
+        rig.seed_tag("prodimg", "1.0.0", &indexed_digest).await;
+        rig.seed_blob_refs(&indexed_digest).await;
+
+        let result = rig.delete(path).await;
+        assert!(result.is_ok(), "delete must still succeed, got: {result:?}");
+
+        assert_eq!(
+            rig.tag_count("prodimg", "1.0.0").await,
+            1,
+            "a row that is not the indexed manifest must not remove its tag"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&indexed_digest).await,
+            2,
+            "the indexed manifest's blob refs must stay pinned"
+        );
+        assert!(rig.is_deleted(path).await, "the row is still soft-deleted");
+
+        rig.teardown().await;
+    }
+
+    /// A digest-shaped reference on the REST route is NOT a content-addressed
+    /// delete. The REST verb removes one `artifacts` row, so its index footprint
+    /// is the single `(name, tag)` row that path names — sibling tags pointing
+    /// at the same digest keep the manifest live.
+    #[tokio::test]
+    async fn rest_delete_by_digest_reference_without_index_row_preserves_sibling_tags_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "c".repeat(64);
+        let digest = format!("sha256:{checksum}");
+
+        // Two tags on the same digest, and an artifacts row addressed BY DIGEST
+        // with no `('redis', 'sha256:C')` index row of its own. A literal
+        // `sha256:` manifest path is classified immutable, so this delete runs
+        // through the admin retraction escape hatch.
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_tag("redis", "7", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+        let path = format!("v2/redis/manifests/{digest}");
+        rig.seed_artifact(&path, &checksum).await;
+
+        let result = rig.delete_as_admin(&path).await;
+        assert!(result.is_ok(), "delete must succeed, got: {result:?}");
+
+        assert_eq!(
+            rig.tag_count("redis", "7-alpine").await,
+            1,
+            "a digest-addressed REST delete must not sweep every tag on the digest"
+        );
+        assert_eq!(rig.tag_count("redis", "7").await, 1);
+        assert_eq!(
+            rig.blob_ref_count(&digest).await,
+            2,
+            "the manifest is still tagged, so its blob refs must stay pinned"
+        );
+        assert!(rig.is_deleted(&path).await);
+
+        rig.teardown().await;
+    }
+
+    /// Concurrent deletes of the SAME artifact must produce exactly one
+    /// success. The handler's lookup and `prepare_delete` are non-locking
+    /// reads, so several racers can pass both; the soft-delete UPDATE is what
+    /// serializes them, and its `is_deleted = false` predicate is what makes
+    /// the losers report `NotFound` instead of each claiming a delete it did
+    /// not perform (and each writing an audit entry for it).
+    #[tokio::test]
+    async fn concurrent_rest_deletes_of_one_artifact_yield_exactly_one_success_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "7".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine";
+        rig.seed_artifact(path, &checksum).await;
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+
+        let results = futures::future::join_all((0..6).map(|_| rig.delete(path))).await;
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok, 1,
+            "exactly one concurrent delete may report success, got {ok}: {results:?}"
+        );
+        assert_eq!(rig.tag_count("redis", "7-alpine").await, 0);
+        assert_eq!(rig.blob_ref_count(&digest).await, 0);
+        assert!(rig.is_deleted(path).await);
+
+        rig.teardown().await;
+    }
+
+    /// The index unwind and the `artifacts` soft-delete are ONE transaction: if
+    /// the soft-delete fails, the index must be exactly as it was. Otherwise a
+    /// database hiccup destroys the image while the API reports the delete
+    /// failed — with no audit record of it.
+    ///
+    /// The failure is injected with a BEFORE UPDATE trigger scoped to this
+    /// fixture's single row id, so a leaked trigger is inert for every other row
+    /// in the shared cluster. Pinned to the `db-serial` nextest group all the
+    /// same (see `.config/nextest.toml`).
+    #[tokio::test]
+    async fn rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db() {
+        let Some(rig) = OciDeleteRig::setup().await else {
+            return;
+        };
+        let checksum = "d".repeat(64);
+        let digest = format!("sha256:{checksum}");
+        let path = "v2/redis/manifests/7-alpine";
+
+        rig.seed_artifact(path, &checksum).await;
+        rig.seed_tag("redis", "7-alpine", &digest).await;
+        rig.seed_blob_refs(&digest).await;
+
+        let artifact_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(rig.repo_id)
+                .bind(path)
+                .fetch_one(&rig.pool)
+                .await
+                .unwrap();
+
+        // Drop first, unconditionally, so a previously panicked run cannot leak
+        // the trigger into this one.
+        let drop_trigger = "DROP TRIGGER IF EXISTS ak_test_block_delete_3475 ON artifacts";
+        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
+            .execute(&rig.pool)
+            .await
+            .ok();
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION ak_test_block_delete_3475() RETURNS trigger AS \
+             $$ BEGIN RAISE EXCEPTION 'ak-test-3475 injected failure'; END $$ LANGUAGE plpgsql",
+        )
+        .execute(&rig.pool)
+        .await
+        .expect("create abort function");
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "CREATE TRIGGER ak_test_block_delete_3475 BEFORE UPDATE ON artifacts \
+             FOR EACH ROW WHEN (NEW.is_deleted AND NEW.id = '{artifact_id}') \
+             EXECUTE FUNCTION ak_test_block_delete_3475()"
+        )))
+        .execute(&rig.pool)
+        .await
+        .expect("create abort trigger");
+
+        let result = rig.delete(path).await;
+
+        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
+            .execute(&rig.pool)
+            .await
+            .ok();
+        sqlx::query("DROP FUNCTION IF EXISTS ak_test_block_delete_3475()")
+            .execute(&rig.pool)
+            .await
+            .ok();
+
+        assert!(
+            result.is_err(),
+            "the delete must fail when the soft-delete cannot be applied"
+        );
+        assert_eq!(
+            rig.tag_count("redis", "7-alpine").await,
+            1,
+            "a failed delete must not leave the index unwound"
+        );
+        assert_eq!(
+            rig.blob_ref_count(&digest).await,
+            2,
+            "a failed delete must not release the manifest's blob refs"
+        );
+        assert!(
+            !rig.is_deleted(path).await,
+            "the artifacts row must still be live after a failed delete"
+        );
+
+        rig.teardown().await;
+    }
+
     /// #2603 G1 core: `require_repo_action` is DENY-BY-DEFAULT. On a RULES-LESS
     /// repository (no fine-grained rows) it must:
     ///   * deny a bare authenticated non-member `write`/`delete` on a PUBLIC
@@ -17239,8 +17983,18 @@ mod tests {
         let mut cached_files = Vec::new();
         for path in [html_path, json_path] {
             for key in [
-                ProxyService::cache_storage_key(&fx.repo_key, path).unwrap(),
-                ProxyService::cache_metadata_key(&fx.repo_key, path).unwrap(),
+                ProxyService::cache_storage_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
+                ProxyService::cache_metadata_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
             ] {
                 let file = fx.storage_dir.join(&key);
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -19648,18 +20402,18 @@ mod tests {
         // sharing the `repositories` table never collide.
         let fn_name = format!("ph_block_repo_delete_{}", fx.repo_id.simple());
         let trg_name = format!("ph_block_repo_delete_trg_{}", fx.repo_id.simple());
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {fn_name}() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ph blocked repo delete'; END; $$ LANGUAGE plpgsql"
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create blocking trigger function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trg_name} BEFORE DELETE ON repositories \
              FOR EACH ROW WHEN (OLD.id = '{}'::uuid) EXECUTE FUNCTION {fn_name}()",
             fx.repo_id
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create blocking trigger");
@@ -19687,11 +20441,13 @@ mod tests {
         );
 
         // Drop the trigger (and function) so the fixture can tear down cleanly.
-        sqlx::query(&format!("DROP TRIGGER {trg_name} ON repositories"))
-            .execute(&fx.pool)
-            .await
-            .expect("drop blocking trigger");
-        sqlx::query(&format!("DROP FUNCTION {fn_name}()"))
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP TRIGGER {trg_name} ON repositories"
+        )))
+        .execute(&fx.pool)
+        .await
+        .expect("drop blocking trigger");
+        sqlx::query(sqlx::AssertSqlSafe(&*format!("DROP FUNCTION {fn_name}()")))
             .execute(&fx.pool)
             .await
             .expect("drop blocking trigger function");
@@ -20141,6 +20897,83 @@ mod tests {
             .await
             .expect("delete other repo");
         fx.teardown().await;
+    }
+
+    /// #3368: the repository-delete purge must not reclaim proxy-cache
+    /// objects.
+    ///
+    /// The purge's exclusivity guard asks only whether another *`artifacts`*
+    /// row shares the key. A proxy-cache object's real owner is a
+    /// `proxy_cache_artifacts` row, which that query cannot see, so a legacy
+    /// `artifacts` row carrying a cache key looks exclusively owned while the
+    /// object it names is live cache content. Cache keys embed the *cache
+    /// owner's* repository key, so after a repository key rename with reuse
+    /// this reaches into a different repository's cache entirely.
+    ///
+    /// Before the layout was anchored the delete resolved to a key nothing had
+    /// written and silently hit nothing; anchoring it makes the delete land.
+    ///
+    /// FAILS ON MAIN (with the anchoring in place): the cache object is
+    /// deleted while its `proxy_cache_artifacts` row survives.
+    #[tokio::test]
+    async fn purge_repo_artifact_objects_spares_proxy_cache_objects_3368() {
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = state.storage_for_repo(&location).expect("resolve storage");
+
+        // One cache object (owned by a DIFFERENT repository's cache key space)
+        // and one ordinary hosted object, both referenced by rows on the
+        // repository being deleted.
+        let uid = Uuid::new_v4().simple().to_string();
+        let cache_key =
+            format!("proxy-cache/some-other-remote-{uid}/simple/six/six-1.0.whl/__content__");
+        let hosted_key = format!("pypi/six/1.0/six-1.0-{uid}.whl");
+        for key in [&cache_key, &hosted_key] {
+            storage
+                .put(key, bytes::Bytes::from_static(b"payload"))
+                .await
+                .expect("seed object");
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by) \
+                 VALUES ($1, $2, 'six', '1.0', 7, 'cafe', 'application/zip', $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(key)
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await
+            .expect("insert artifacts row");
+        }
+
+        purge_repo_artifact_objects(&state, fx.repo_id, &location).await;
+
+        let cache_object = storage
+            .exists(&cache_key)
+            .await
+            .expect("probe cache object");
+        let hosted_object = storage
+            .exists(&hosted_key)
+            .await
+            .expect("probe hosted object");
+        fx.teardown().await;
+
+        assert!(
+            cache_object,
+            "#3368: proxy-cache content belongs to proxy_cache_artifacts, which this purge \
+             cannot see; deleting it strands that catalog row and its size_bytes"
+        );
+        assert!(
+            !hosted_object,
+            "negative control: the repository's own hosted object must still be purged, or \
+             the sweep has been disabled rather than scoped"
+        );
     }
 
     #[tokio::test]
@@ -22823,6 +23656,176 @@ mod tests {
 // --------------------------------------------------------------------------
 
 #[cfg(test)]
+mod generic_path_coordinate_tests {
+    use super::derive_generic_path_coordinate;
+
+    #[test]
+    fn flat_coordinate_is_name_then_version() {
+        let (name, version) =
+            derive_generic_path_coordinate("lodash/4.17.11/lodash.tgz", true, "fallback".into());
+        assert_eq!(name, "lodash");
+        assert_eq!(version.as_deref(), Some("4.17.11"));
+    }
+
+    #[test]
+    fn npm_scoped_package_keeps_scope_with_name() {
+        // #3604 defect 3: the scope is PART of the name; the flat parse would
+        // read name=`@babel`, version=`traverse` and pin a component that does
+        // not exist, letting a vulnerable scoped package read clean.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/babel-traverse-7.23.0.tgz",
+            true,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel/traverse");
+        assert_eq!(version.as_deref(), Some("7.23.0"));
+    }
+
+    #[test]
+    fn scope_prefix_is_only_special_for_npm_formats() {
+        // A non-npm format never uses the `@scope/` convention, so the leading
+        // `@` segment is treated as an ordinary name and behavior is unchanged.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/x.tgz",
+            false,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel");
+        assert_eq!(version.as_deref(), Some("traverse"));
+    }
+
+    #[test]
+    fn too_short_path_falls_back() {
+        let (name, version) = derive_generic_path_coordinate("just-a-file.txt", true, "fb".into());
+        assert_eq!(name, "fb");
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn scoped_without_a_version_segment_falls_back_to_flat() {
+        // `@scope/name/file` has only three segments: not enough for a scoped
+        // coordinate, so the flat parse applies rather than mis-reading.
+        let (name, version) =
+            derive_generic_path_coordinate("@scope/name/file.tgz", true, "fb".into());
+        assert_eq!(name, "@scope");
+        assert_eq!(version.as_deref(), Some("name"));
+    }
+}
+
+#[cfg(test)]
+mod docker_tag_search_escape_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Seed one `oci_tags` row plus the `artifacts` row the listing joins to.
+    async fn seed_tag(pool: &sqlx::PgPool, repo_id: Uuid, image: &str, tag: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, $2, $3, 1, \
+             '0000000000000000000000000000000000000000000000000000000000000000', \
+             'application/vnd.oci.image.manifest.v1+json', $2)",
+        )
+        .bind(repo_id)
+        .bind(format!("v2/{image}/manifests/{tag}"))
+        .bind(image)
+        .execute(pool)
+        .await
+        .expect("seed manifest artifact");
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest) \
+             VALUES ($1, $2, $3, 'sha256:0000000000000000000000000000000000000000000000000000000000000000')",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .bind(tag)
+        .execute(pool)
+        .await
+        .expect("seed oci tag");
+    }
+
+    /// #3500. The docker-tag listing's `?search=` filter builds its `LIKE`
+    /// pattern in SQL (`LIKE '%' || LOWER($n) || '%'`) from REQUEST input.
+    /// Unescaped, a `%` or `_` in the search term was a wildcard — searching
+    /// `1_0` also returned `1.0` and `120` — and a backslash quoted the
+    /// character after it, so a tag containing one could not be found by
+    /// typing it.
+    ///
+    /// The `?count=exact` arm is asserted alongside the rows, because it is a
+    /// SEPARATE query: a fix applied to one arm and not the other reports a
+    /// total that disagrees with the page.
+    #[tokio::test]
+    async fn test_docker_tag_search_treats_wildcards_literally_3500() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "docker").await;
+        for tag in ["1_0", "1.0", "120", r"we\ird", "weird", "plain"] {
+            seed_tag(&pool, repo_id, "app", tag).await;
+        }
+
+        async fn search(pool: &sqlx::PgPool, repo_id: Uuid, q: &str) -> (Vec<String>, i64) {
+            let rows = fetch_docker_tag_rows(pool, repo_id, Some(q), None, 0, 50)
+                .await
+                .expect("tag rows");
+            let mut tags: Vec<String> = rows.into_iter().map(|r| r.tag).collect();
+            tags.sort();
+            let total = count_docker_tag_rows(pool, repo_id, Some(q))
+                .await
+                .expect("tag count");
+            (tags, total)
+        }
+
+        let underscore = search(&pool, repo_id, "1_0").await;
+        let backslash = search(&pool, repo_id, r"we\ir").await;
+        let plain = search(&pool, repo_id, "plain").await;
+        let substring = search(&pool, repo_id, "ir").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            underscore.0,
+            vec!["1_0".to_string()],
+            "searching `1_0` must match the tag literally named `1_0`; \
+             unescaped, `_` matches any single character and `1.0` and `120` \
+             come back too"
+        );
+        assert_eq!(
+            underscore.1, 1,
+            "the ?count=exact arm is a separate query and must agree with the page"
+        );
+        assert_eq!(
+            backslash.0,
+            vec![r"we\ird".to_string()],
+            r"searching `we\ir` must find the tag containing a backslash; \
+              unescaped, the backslash quotes the `i` and the pattern becomes \
+              `weir`, which matches the OTHER tag instead"
+        );
+        assert_eq!(
+            backslash.1, 1,
+            "count arm must agree for the backslash term"
+        );
+        assert_eq!(
+            plain.0,
+            vec!["plain".to_string()],
+            "positive control: an ordinary search term must still work"
+        );
+        assert_eq!(
+            substring.0,
+            vec![r"we\ird".to_string(), "weird".to_string()],
+            "positive control: this is still a SUBSTRING search — escaping the \
+             term must not turn it into an exact match"
+        );
+        assert_eq!(
+            substring.1, 2,
+            "count arm must agree for the substring term"
+        );
+    }
+}
+
+#[cfg(test)]
 mod apt_validation_tests {
     use super::*;
 
@@ -23465,6 +24468,142 @@ mod apt_validation_tests {
             collected.contains(&orphan_key),
             "positive control: a key no repository references must still be \
              collected for purge; collected: {collected:?}"
+        );
+    }
+
+    /// Deleting one repository must not purge the `maven-metadata.xml` of a
+    /// subtree ANOTHER repository is still serving when that subtree's key
+    /// contains a literal backslash.
+    ///
+    /// This collector runs on every repository delete on a cloud backend — it
+    /// carries no opt-in gate — and the guard it depends on builds its `LIKE`
+    /// pattern FROM the stored key. Postgres's default `LIKE` escape character
+    /// is a backslash, so without an `ESCAPE` clause `.../com/ba\ck/lib/`
+    /// becomes the pattern `.../com/back/lib/`, the foreign repository's live
+    /// artifact no longer matches, and the `NOT EXISTS` guard reports
+    /// "unanchored" for a document the other tenant is still serving. The
+    /// rollup is what resolves version ranges and `LATEST`/`RELEASE`, so the
+    /// loss breaks resolution for a repository that was not being deleted.
+    ///
+    /// The fixture deliberately has NO artifact under the collapsed
+    /// `.../com/back/lib/` directory: a fixture whose collapsed sibling exists
+    /// is spared even without the fix and proves nothing.
+    ///
+    /// Three positive controls keep the fix honest — the `<> $1` scoping (the
+    /// doomed repository's own live artifact under a backslash directory must
+    /// not anchor its own rollup, or the object leaks forever), a rollup over
+    /// an empty backslash subtree, and a plain unreferenced backslash key.
+    #[tokio::test]
+    async fn collect_repo_maven_flat_keys_spares_foreign_rollup_whose_directory_contains_a_backslash(
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_repo, _, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (other_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let uid = Uuid::new_v4().simple().to_string();
+        let root = format!("maven/rd3431/{uid}/com");
+
+        // The surviving tenant's live artifact, under a backslash directory.
+        seed_flat_artifact_row(
+            &pool,
+            other_repo,
+            &format!(r"{root}/ba\ck/lib/1.0/lib-1.0.jar"),
+        )
+        .await;
+        let foreign_rollup = format!(r"{root}/ba\ck/lib/maven-metadata.xml");
+        let foreign_rollup_sha1 = format!("{foreign_rollup}.sha1");
+        let foreign_rollup_asc = format!("{foreign_rollup}.asc");
+
+        // Control 1: the doomed repository's OWN live artifact, likewise under
+        // a backslash directory, must not anchor its own rollup.
+        seed_flat_artifact_row(
+            &pool,
+            owner_repo,
+            &format!(r"{root}/sel\f/lib/1.0/own-1.0.jar"),
+        )
+        .await;
+        let own_rollup = format!(r"{root}/sel\f/lib/maven-metadata.xml");
+        // Controls 2 and 3: nothing anchors either of these anywhere.
+        let dead_rollup = format!(r"{root}/de\ad/lib/maven-metadata.xml");
+        let orphan_key = format!(r"{root}/or\ph/lib/9.9.9/gone-9.9.9.pom");
+
+        // Every attribution row belongs to the repository being deleted.
+        for key in [
+            &foreign_rollup,
+            &foreign_rollup_sha1,
+            &foreign_rollup_asc,
+            &own_rollup,
+            &dead_rollup,
+            &orphan_key,
+        ] {
+            seed_flat_claim(&pool, owner_repo, key).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let collected = collect_repo_maven_flat_keys(&state, owner_repo).await;
+
+        tdh::cleanup(&pool, other_repo, Uuid::nil()).await;
+        tdh::cleanup(&pool, owner_repo, Uuid::nil()).await;
+
+        for key in [&foreign_rollup, &foreign_rollup_sha1, &foreign_rollup_asc] {
+            assert!(
+                !collected.contains(key),
+                "deleting this repository must NOT purge `{key}` — another \
+                 repository still has a live artifact under that directory, \
+                 and the only reason the guard misses it is that the literal \
+                 backslash in the stored key is read as a LIKE escape \
+                 character; collected: {collected:?}"
+            );
+        }
+        assert!(
+            collected.contains(&own_rollup),
+            "positive control: only the DOOMED repository's own artifact sits \
+             under this directory, so its rollup must still be collected even \
+             though the directory contains a backslash — otherwise the anchor \
+             is unscoped and every such object leaks forever; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&dead_rollup),
+            "positive control: a rollup over an empty subtree must still be \
+             collected even though its directory contains a backslash — \
+             otherwise sparing every backslash key would pass; \
+             collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&orphan_key),
+            "positive control: a plain key no repository references must still \
+             be collected for purge; collected: {collected:?}"
+        );
+    }
+
+    /// The repository-delete collector's rollup anchor must come from the
+    /// shared fragment, carrying `ESCAPE ''`, exactly as the GC sweep's guard 3
+    /// does (`test_flat_predicate_rollup_guard_uses_shared_fragments`).
+    ///
+    /// A shape test, not an oracle: it would pass with the wrong escape
+    /// character. It exists so a future edit cannot quietly re-inline the
+    /// anchor at one of the two delete paths and let them drift again — the
+    /// #1180 lesson, and the direct cause of #3156 and #3197.
+    #[test]
+    fn repo_maven_flat_keys_rollup_anchor_disables_like_escape() {
+        use crate::services::maven_flat_attribution as mfa;
+        let sql = repo_maven_flat_keys_sql();
+        let anchor = mfa::metadata_rollup_dir_anchor_sql("mb.storage_key", "o.storage_key");
+        assert!(
+            sql.contains(&anchor),
+            "the purge list's rollup guard must use the shared anchor fragment \
+             `{anchor}`, not an inline copy; sql: {sql}"
+        );
+        assert!(
+            anchor.contains("ESCAPE ''"),
+            "the rollup anchor must disable LIKE escape processing: without it \
+             a literal backslash in a stored key is read as an escape \
+             character and the guard misses the directory it was derived from, \
+             so deleting one repository purges a rollup another repository is \
+             still serving; anchor: {anchor}"
         );
     }
 

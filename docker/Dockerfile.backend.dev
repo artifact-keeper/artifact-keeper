@@ -1,5 +1,9 @@
 # Development Dockerfile for backend with cargo-watch hot-reload
-FROM rust:1.97-bookworm
+
+# Must match rust-toolchain.toml's `channel` (#3551) - see Dockerfile.backend.
+ARG RUST_VERSION=1.98
+
+FROM rust:${RUST_VERSION}-trixie
 
 # Install build dependencies, cargo-watch, and sccache
 RUN apt-get update && apt-get install -y --no-install-recommends \

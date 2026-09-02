@@ -140,7 +140,11 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
                 repo_id,
             )
         };
-        sqlx::query(&sql).bind(bind_id).execute(pool).await.ok();
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
+            .bind(bind_id)
+            .execute(pool)
+            .await
+            .ok();
     }
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)

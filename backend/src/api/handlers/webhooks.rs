@@ -333,7 +333,7 @@ pub async fn list_webhooks(
         )
     }
 
-    let webhooks = sqlx::query(&format!(
+    let webhooks = sqlx::query(sqlx::AssertSqlSafe(&*format!(
         r#"
         SELECT id, name, url, events, is_enabled, repository_id, headers,
                payload_template, event_schema_version, secret_digest,
@@ -347,7 +347,7 @@ pub async fn list_webhooks(
         LIMIT $4
         "#,
         scope = scope_sql("$5"),
-    ))
+    )))
     .bind(query.repository_id)
     .bind(query.enabled)
     .bind(offset)
@@ -357,7 +357,7 @@ pub async fn list_webhooks(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total_row = sqlx::query(&format!(
+    let total_row = sqlx::query(sqlx::AssertSqlSafe(&*format!(
         r#"
         SELECT COUNT(*) as count
         FROM webhooks
@@ -366,7 +366,7 @@ pub async fn list_webhooks(
           AND {scope}
         "#,
         scope = scope_sql("$3"),
-    ))
+    )))
     .bind(query.repository_id)
     .bind(query.enabled)
     .bind(scope_user)

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, is_service_account, must_change_password,\n            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n            failed_login_attempts, locked_until, last_failed_login_at,\n            password_changed_at, last_login_at, created_at, updated_at\n        FROM users\n        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)\n          AND ($2::boolean IS NULL OR is_active = $2)\n          AND ($3::boolean IS NULL OR is_admin = $3)\n        ORDER BY username\n        OFFSET $4\n        LIMIT $5\n        ",
+  "query": "\n        SELECT\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, is_service_account, must_change_password,\n            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n            failed_login_attempts, locked_until, last_failed_login_at,\n            password_changed_at, last_login_at, created_at, updated_at\n        FROM users\n        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)\n          AND ($2::boolean IS NULL OR is_active = $2)\n          AND ($3::boolean IS NULL OR is_admin = $3)\n          AND ($4::boolean IS NULL OR is_service_account = $4)\n        ORDER BY username\n        OFFSET $5\n        LIMIT $6\n        ",
   "describe": {
     "columns": [
       {
@@ -132,6 +132,7 @@
         "Text",
         "Bool",
         "Bool",
+        "Bool",
         "Int8",
         "Int8"
       ]
@@ -161,5 +162,5 @@
       false
     ]
   },
-  "hash": "bf1229d219c3f9ee20cb52d8b73d6a37dae9513efb79f35b591ca59e5d1b7239"
+  "hash": "458031004dab8f698fd40d84691101dd3ddc4250a2a72ecb8e1a98f2468b4232"
 }

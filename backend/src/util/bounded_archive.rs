@@ -598,10 +598,21 @@ impl<R: Read> Read for BudgetReader<R> {
     }
 }
 
+/// Whether an `io::Error` raised during an archive walk is a [`BudgetReader`]
+/// budget breach rather than a genuine I/O or format error.
+///
+/// Callers that wrap their own stream with [`budgeted_to`] and drive their own
+/// tar walk need this to tell "this archive is a decompression bomb" apart from
+/// "this archive is corrupt", so they can emit their own message naming their
+/// own limits instead of the generic one [`map_archive_err`] produces.
+pub fn is_decompression_budget_breach(err: &io::Error) -> bool {
+    err.to_string().contains(BOMB_SENTINEL)
+}
+
 /// Translate a low-level archive `io::Error` into an [`AppError::Validation`],
 /// mapping a budget breach to an explicit decompression-bomb message.
 fn map_archive_err(context: &str, err: &io::Error) -> AppError {
-    if err.to_string().contains(BOMB_SENTINEL) {
+    if is_decompression_budget_breach(err) {
         AppError::Validation(
             "Archive expands beyond the decompression budget; refusing suspected decompression bomb"
                 .to_string(),

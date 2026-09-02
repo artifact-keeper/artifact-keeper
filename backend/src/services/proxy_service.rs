@@ -27,6 +27,7 @@ use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
 use crate::services::metrics_service::record_proxy_cache_lookup;
+use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_catalog;
 use crate::services::proxy_hydration::{
     Coordinator, HydrationCoordinator, StreamHandle, StreamHeaders,
@@ -507,7 +508,24 @@ const TEE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 /// just fail and degrade like a rejected write). Filesystem-backed
 /// deployments have no equivalent lifecycle mechanism and need a cron/
 /// tmpwatch-style sweep instead.
+/// Kept in lockstep with [`crate::storage::BUCKET_ROOT_KEY_NAMESPACES`]: the
+/// staging objects are written by the prefix-less proxy-cache handle, so the
+/// storage layer must know this namespace is anchored at the bucket root or a
+/// prefixed deployment resolves the same key to two different objects (#3368).
+/// `assert_bucket_root_namespaces_cover_proxy_cache_keys` pins the pairing.
 const TEE_STAGING_KEY_PREFIX: &str = "proxy-cache-staging/";
+
+/// Root of the proxy cache's own key space. Also a bucket-root namespace.
+///
+/// This is the *namespace*, not the layout: every key underneath it carries a
+/// per-deployment scope segment (`proxy-cache/<scope>/...`, #3454) supplied by
+/// [`ProxyCacheScope`]. Consumers that only need to CLASSIFY a key as
+/// proxy-cache content — `is_proxy_cache_key`, `key_is_bucket_root_anchored`,
+/// the `storage_key NOT LIKE 'proxy-cache/%'` accounting predicates — match on
+/// this prefix and are unaffected by the scope. Consumers that BUILD or PARSE a
+/// key must go through [`ProxyCacheScope::root`] / [`ProxyCacheScope::repo_root`]
+/// instead, or they address another deployment's key space.
+const PROXY_CACHE_KEY_PREFIX: &str = crate::services::proxy_cache_scope::PROXY_CACHE_NAMESPACE;
 
 /// Default TTL for APT InRelease/Release index files (5 minutes).
 /// Controls how often the proxy re-checks upstream for changes.
@@ -1106,14 +1124,14 @@ struct RegistryTokenResponse {
 /// semantics for that entry.
 /// Extract the repository key from a proxy-cache storage key for the
 /// Prometheus `repository` label. Cache keys are formatted by
-/// `cache_storage_key` as `proxy-cache/<repo_key>/<path>/__content__`;
+/// `cache_storage_key` as `<scope.root()><repo_key>/<path>/__content__`;
 /// the metadata sidecar uses the same prefix. If the key doesn't match
 /// this shape (e.g. caller passed a non-cache key), we fall back to
 /// `"unknown"` so the counter stays low-cardinality and never panics on
 /// a malformed input. Used by `record_proxy_cache_lookup` callsites.
-fn repo_key_from_cache_key(cache_key: &str) -> &str {
+fn repo_key_from_cache_key<'k>(scope: &ProxyCacheScope, cache_key: &'k str) -> &'k str {
     cache_key
-        .strip_prefix("proxy-cache/")
+        .strip_prefix(scope.root())
         .and_then(|s| s.split('/').next())
         .filter(|s| !s.is_empty())
         .unwrap_or("unknown")
@@ -1188,11 +1206,16 @@ impl CacheKeys {
     /// Byte-for-byte equivalent to calling
     /// [`ProxyService::cache_storage_key`] and `cache_metadata_key`
     /// individually: same validation order, same error values, same key format.
-    pub(crate) fn derive(repo_key: &str, path: &str) -> Result<CacheKeys> {
+    pub(crate) fn derive(scope: &ProxyCacheScope, repo_key: &str, path: &str) -> Result<CacheKeys> {
         let trimmed = ProxyService::validate_cache_path(path)?;
-        let content = format!("proxy-cache/{}/{}/__content__", repo_key, trimmed);
-        let metadata = format!("proxy-cache/{}/{}/__cache_meta__.json", repo_key, trimmed);
-        ProxyService::check_cache_key_length(repo_key, trimmed)?;
+        // Built from the scope's precomputed root, never from a literal, so
+        // the namespace declared in `BUCKET_ROOT_KEY_NAMESPACES` (#3368) and
+        // the per-deployment segment (#3454) are one string that every key
+        // builder, prefix listing and prefix parser shares.
+        let repo_root = scope.repo_root(repo_key);
+        let content = format!("{repo_root}{trimmed}/__content__");
+        let metadata = format!("{repo_root}{trimmed}/__cache_meta__.json");
+        ProxyService::check_cache_key_length(scope, repo_key, trimmed)?;
         Ok(CacheKeys { content, metadata })
     }
 }
@@ -1242,12 +1265,16 @@ pub struct DirectUpstreamBody {
 
 pub(crate) struct CacheStore {
     storage: Arc<StorageService>,
+    /// This deployment's proxy-cache scope (#3454). Only needed to recover the
+    /// `repository` metric label from a cache key; the keys themselves arrive
+    /// already derived.
+    scope: ProxyCacheScope,
 }
 
 impl CacheStore {
     /// Construct a `CacheStore` over the given storage handle.
-    pub(crate) fn new(storage: Arc<StorageService>) -> Self {
-        Self { storage }
+    pub(crate) fn new(storage: Arc<StorageService>, scope: ProxyCacheScope) -> Self {
+        Self { storage, scope }
     }
 
     /// Load cache metadata from storage.
@@ -1297,7 +1324,7 @@ impl CacheStore {
         // for the same request (via `revalidate_stale`), so counting it too
         // would double-count. The repo label is derived from the cache_key
         // prefix; see `repo_key_from_cache_key`.
-        let repo_label = repo_key_from_cache_key(cache_key);
+        let repo_label = repo_key_from_cache_key(&self.scope, cache_key);
 
         // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
         // propagates it via `?` to match the original behavior precisely.
@@ -3121,6 +3148,11 @@ pub struct ProxyService {
     /// load. Saturating this limiter simply skips the backfill for that
     /// hit rather than queuing — never blocks the serve.
     backfill_limiter: Arc<Semaphore>,
+    /// This deployment's proxy-cache key scope (#3454). Every cache key,
+    /// listing prefix and prefix parser in this service is composed from it,
+    /// so two deployments sharing one bucket address disjoint key spaces
+    /// instead of exchanging each other's cached upstream bytes.
+    cache_scope: ProxyCacheScope,
 }
 
 impl ProxyService {
@@ -3149,7 +3181,7 @@ impl ProxyService {
     const MAX_CONCURRENT_CATALOG_BACKFILLS: usize = 8;
 
     /// Create a new proxy service
-    pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
+    pub fn new(db: PgPool, storage: Arc<StorageService>, cache_scope: ProxyCacheScope) -> Self {
         let http_client = crate::services::http_client::base_client_builder()
             .connect_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .read_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
@@ -3157,7 +3189,7 @@ impl ProxyService {
             .build()
             .expect("Failed to create HTTP client");
 
-        let cache_store = CacheStore::new(Arc::clone(&storage));
+        let cache_store = CacheStore::new(Arc::clone(&storage), cache_scope.clone());
         let cache_persister = CachePersister::new(db.clone(), Arc::clone(&storage));
         let upstream_client = UpstreamClient::new(db.clone(), http_client);
         // #1631 layer 1/3: select the single-flight coordinator from config.
@@ -3176,7 +3208,16 @@ impl ProxyService {
             upstream_client,
             coordinator,
             backfill_limiter,
+            cache_scope,
         }
+    }
+
+    /// This deployment's proxy-cache key scope (#3454). Handlers that derive a
+    /// cache key outside `ProxyService` (presigned-redirect fast paths, the
+    /// Debian release-epoch invalidation) must compose it from this, never
+    /// from the bare `proxy-cache/` namespace.
+    pub fn cache_scope(&self) -> &ProxyCacheScope {
+        &self.cache_scope
     }
 
     /// Fetch artifact from upstream if not cached or cache expired.
@@ -3367,8 +3408,8 @@ impl ProxyService {
         repo_key: &str,
         path: &str,
     ) -> Result<Option<CachedBody>> {
-        let cache_key = Self::cache_storage_key(repo_key, path)?;
-        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
+        let cache_key = Self::cache_storage_key(&self.cache_scope, repo_key, path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
         self.get_cached_artifact(&cache_key, &metadata_key).await
     }
 
@@ -3443,7 +3484,7 @@ impl ProxyService {
         // we'd want to redirect to anyway: treat it as a miss so the caller
         // falls through to the slow path / upstream fetch, where the same
         // validation will surface the error to the client.
-        let Ok(keys) = CacheKeys::derive(repo_key, path) else {
+        let Ok(keys) = CacheKeys::derive(&self.cache_scope, repo_key, path) else {
             return false;
         };
         self.cache_store.is_fresh(&keys).await
@@ -3467,7 +3508,7 @@ impl ProxyService {
     /// still-active `quarantine_until` returns `Err` (Conflict/Authorization),
     /// which the handler maps to 409/403 — no redirect, no upstream refetch.
     pub async fn cache_quarantine_gate(&self, repo_key: &str, path: &str) -> Result<()> {
-        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
         if let Some(metadata) = self
             .load_cache_metadata(&metadata_key)
             .await
@@ -3560,8 +3601,8 @@ impl ProxyService {
         let upstream_url = Self::remote_target(repo)?;
 
         // Cache keys use the caller-supplied cache_path
-        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
-        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
+        let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
 
         // #1611: classify the path and evaluate cache freshness up front.
         //   * Immutable Fresh hit  -> serve directly, NEVER contact upstream.
@@ -3984,8 +4025,8 @@ impl ProxyService {
         repo: &Repository,
         cache_path: &str,
     ) -> Result<Option<StreamingFetchResult>> {
-        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
-        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
+        let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
         self.try_streaming_cache_hit(repo, cache_path, cache_path, &cache_key, &metadata_key)
             .await
     }
@@ -4002,8 +4043,8 @@ impl ProxyService {
         cache_path: &str,
         expected_checksum: Option<CacheCommitDigest>,
     ) -> Result<Option<StreamingFetchResult>> {
-        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
-        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
+        let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
 
         // Cache hit fast path: load metadata sidecar, stream content
         // straight from storage. The slow-path SHA verification done by
@@ -4517,8 +4558,8 @@ impl ProxyService {
         cache_path: &str,
         expected_checksum: Option<CacheCommitDigest>,
     ) -> Result<StreamingFetchResult> {
-        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
-        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
+        let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
 
         if let Some(result) = self
             .try_streaming_cache_hit(repo, fetch_path, cache_path, &cache_key, &metadata_key)
@@ -4546,7 +4587,7 @@ impl ProxyService {
         // Validate repository type
         let upstream_url = Self::remote_target(repo)?;
 
-        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
 
         // Try to load existing cache metadata
         let metadata = match self.load_cache_metadata(&metadata_key).await? {
@@ -4663,7 +4704,7 @@ impl ProxyService {
     /// content and metadata blobs in that order, ignoring delete errors — is
     /// identical, so it lives here as a single source of truth (#1618 S3).
     async fn invalidate_cache_keys(&self, repo_key: &str, path: &str) -> Result<()> {
-        let keys = CacheKeys::derive(repo_key, path)?;
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, path)?;
         // #2218/#2270: drop the persisted catalog row for the purged object so
         // storage accounting does not drift after an eviction. Keyed on the
         // physical content storage key (the catalog's `storage_key`). Best-
@@ -4700,7 +4741,7 @@ impl ProxyService {
         repo_key: &str,
         path: &str,
     ) -> Result<Option<CacheMetadata>> {
-        let metadata_key = match Self::cache_metadata_key(repo_key, path) {
+        let metadata_key = match Self::cache_metadata_key(&self.cache_scope, repo_key, path) {
             Ok(k) => k,
             Err(_) => return Ok(None),
         };
@@ -4730,8 +4771,8 @@ impl ProxyService {
         distribution: &str,
         dists_ttl_secs: i64,
     ) -> Result<(Bytes, Option<String>, bool)> {
-        let cache_key = Self::cache_storage_key(&repo.key, path)?;
-        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
+        let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
 
         // Step 1: Load cache metadata and epoch (single read each)
         let metadata = self.load_cache_metadata(&metadata_key).await?;
@@ -4996,7 +5037,7 @@ impl ProxyService {
         distribution: &str,
         content_changed_at: DateTime<Utc>,
     ) {
-        let epoch_key = match Self::release_epoch_key(repo_key, distribution) {
+        let epoch_key = match Self::release_epoch_key(&self.cache_scope, repo_key, distribution) {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(
@@ -5059,7 +5100,7 @@ impl ProxyService {
     /// [`ReleaseEpochRead::Unreadable`] (treat cached siblings as expired
     /// and force revalidation) rather than silently pass as fresh.
     pub async fn read_release_epoch(&self, repo_key: &str, distribution: &str) -> ReleaseEpochRead {
-        let epoch_key = match Self::release_epoch_key(repo_key, distribution) {
+        let epoch_key = match Self::release_epoch_key(&self.cache_scope, repo_key, distribution) {
             Ok(k) => k,
             // No valid sidecar key can exist for this distribution, so
             // epoch-based invalidation cannot vouch for freshness: fail
@@ -5105,11 +5146,16 @@ impl ProxyService {
     /// future caller using `write_release_epoch`/`read_release_epoch`
     /// directly with a raw `distribution` would otherwise have no
     /// protection (#1018 R3-7 / #1052).
-    fn release_epoch_key(repo_key: &str, distribution: &str) -> Result<String> {
+    fn release_epoch_key(
+        scope: &ProxyCacheScope,
+        repo_key: &str,
+        distribution: &str,
+    ) -> Result<String> {
         let validated = Self::validate_cache_path(distribution)?;
         Ok(format!(
-            "proxy-cache/{}/dists/{}/__release_epoch__.json",
-            repo_key, validated
+            "{}dists/{}/__release_epoch__.json",
+            scope.repo_root(repo_key),
+            validated
         ))
     }
 
@@ -5144,7 +5190,7 @@ impl ProxyService {
         path: &str,
         ttl_secs: i64,
     ) -> Result<()> {
-        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
         if let Some(mut metadata) = self.load_cache_metadata(&metadata_key).await? {
             let now = Utc::now();
             metadata.cached_at = now;
@@ -5180,7 +5226,7 @@ impl ProxyService {
         repo_key: &str,
         cache_path: &str,
     ) -> Result<Option<(BoxStream<'static, Result<Bytes>>, i64)>> {
-        let keys = CacheKeys::derive(repo_key, cache_path)?;
+        let keys = CacheKeys::derive(&self.cache_scope, repo_key, cache_path)?;
         let Some(meta) = self.load_cache_metadata(&keys.metadata).await? else {
             return Ok(None);
         };
@@ -5212,7 +5258,7 @@ impl ProxyService {
     /// (B8). Falls back to an empty list when the storage backend cannot list
     /// the prefix.
     pub async fn list_cached_pypi_packages(&self, repo_key: &str) -> Vec<String> {
-        let prefix = format!("proxy-cache/{}/simple/", repo_key);
+        let prefix = format!("{}simple/", self.cache_scope.repo_root(repo_key));
         let keys = match self.storage.list(Some(&prefix)).await {
             Ok(keys) => keys,
             Err(e) => {
@@ -5225,7 +5271,11 @@ impl ProxyService {
                 return Vec::new();
             }
         };
-        Self::pypi_package_names_from_cache_keys(repo_key, keys.iter().map(String::as_str))
+        Self::pypi_package_names_from_cache_keys(
+            &self.cache_scope,
+            repo_key,
+            keys.iter().map(String::as_str),
+        )
     }
 
     /// Extract the distinct PyPI project names from a set of proxy-cache
@@ -5237,11 +5287,15 @@ impl ProxyService {
     /// segment (`simple/<name>/...`), pull the `<name>` segment out, and
     /// dedupe. Pure so the parsing can be unit-tested without a storage
     /// backend.
-    fn pypi_package_names_from_cache_keys<'a, I>(repo_key: &str, keys: I) -> Vec<String>
+    fn pypi_package_names_from_cache_keys<'a, I>(
+        scope: &ProxyCacheScope,
+        repo_key: &str,
+        keys: I,
+    ) -> Vec<String>
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let simple_prefix = format!("proxy-cache/{}/simple/", repo_key);
+        let simple_prefix = format!("{}simple/", scope.repo_root(repo_key));
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for key in keys {
             let Some(rest) = key.strip_prefix(&simple_prefix) else {
@@ -5311,7 +5365,7 @@ impl ProxyService {
     /// Returns paths sorted + deduped (see [`Self::cached_artifact_paths`]),
     /// or an empty list when the storage backend cannot list the prefix.
     pub async fn list_cached_paths(&self, repo_key: &str) -> Vec<String> {
-        let prefix = format!("proxy-cache/{}/", repo_key);
+        let prefix = self.cache_scope.repo_root(repo_key);
         let keys = match self.storage.list(Some(&prefix)).await {
             Ok(keys) => keys,
             Err(e) => {
@@ -5325,7 +5379,7 @@ impl ProxyService {
             }
         };
 
-        Self::cached_artifact_paths(repo_key, keys.iter().map(String::as_str))
+        Self::cached_artifact_paths(&self.cache_scope, repo_key, keys.iter().map(String::as_str))
     }
 
     /// Load sidecar metadata for a specific, already-paginated set of cached
@@ -5345,7 +5399,8 @@ impl ProxyService {
     ) -> Vec<CachedArtifactEntry> {
         let mut entries: Vec<CachedArtifactEntry> = futures::stream::iter(paths.iter().cloned())
             .map(|path| async move {
-                let metadata_key = Self::cache_metadata_key(repo_key, &path).ok()?;
+                let metadata_key =
+                    Self::cache_metadata_key(&self.cache_scope, repo_key, &path).ok()?;
                 match self.load_cache_metadata(&metadata_key).await {
                     Ok(Some(m)) => Some(Self::build_cached_entry(path, m)),
                     Ok(None) => None,
@@ -5401,11 +5456,11 @@ impl ProxyService {
     /// the `proxy-cache/<repo_key>/` prefix and the `/__content__` suffix to
     /// return `<path>`, deduped and sorted. Pure so the parsing can be
     /// unit-tested without a storage backend.
-    fn cached_artifact_paths<'a, I>(repo_key: &str, keys: I) -> Vec<String>
+    fn cached_artifact_paths<'a, I>(scope: &ProxyCacheScope, repo_key: &str, keys: I) -> Vec<String>
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let prefix = format!("proxy-cache/{}/", repo_key);
+        let prefix = scope.repo_root(repo_key);
         let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for key in keys {
             let Some(rest) = key.strip_prefix(&prefix) else {
@@ -5577,8 +5632,12 @@ impl ProxyService {
     /// in `is_cache_fresh` checks. Keeping a single source of truth for
     /// the key formula prevents the freshness check and the presign
     /// target from drifting out of sync (#1018).
-    pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> Result<String> {
-        CacheKeys::derive(repo_key, path).map(|k| k.content)
+    pub(crate) fn cache_storage_key(
+        scope: &ProxyCacheScope,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<String> {
+        CacheKeys::derive(scope, repo_key, path).map(|k| k.content)
     }
 
     /// Whether `storage_key` addresses proxy-cache content.
@@ -5588,7 +5647,7 @@ impl ProxyService {
     /// distinction matters when presigning: cache keys must be signed through
     /// the no-prefix [`Self::cache_storage_backend`] handle (#1555).
     pub fn is_proxy_cache_key(storage_key: &str) -> bool {
-        storage_key.starts_with("proxy-cache/")
+        storage_key.starts_with(PROXY_CACHE_KEY_PREFIX)
     }
 
     /// Purge every proxy-cache object for a repository from the global default
@@ -5617,9 +5676,36 @@ impl ProxyService {
     /// prefix is repo-key scoped, so calling this for a hosted repository (which
     /// has no proxy cache) is a harmless empty list.
     pub async fn purge_repo_cache(&self, repo_key: &str) -> Result<usize> {
-        let prefix = format!("proxy-cache/{}/", repo_key);
-        let keys = self.storage.list(Some(&prefix)).await?;
+        // Both this deployment's scoped subtree AND the pre-#3454 unscoped one.
+        // The unscoped sweep is what stops a repository delete from stranding
+        // the objects this deployment cached before the upgrade — without it
+        // the #2047 hazard (a repository recreated with the same key serving
+        // the deleted one's upstream content) would survive as long as the
+        // legacy tree does. It deletes only; it can never serve bytes.
         let mut deleted = 0usize;
+        let mut prefixes = vec![self.cache_scope.repo_root(repo_key)];
+        // The legacy unscoped sweep (`proxy-cache/<repo_key>/`) reclaims objects
+        // this deployment cached before #3454. But `proxy-cache/<repo_key>/` is
+        // ALSO the shape of a scope root: when `repo_key` equals THIS
+        // deployment's own scope segment the legacy prefix collapses to
+        // `proxy-cache/<scope>/` — the root of the ENTIRE deployment's cache —
+        // and sweeping it would delete every other repository's cached content.
+        // A repository key can legally equal the scope segment (both are drawn
+        // from `[A-Za-z0-9._-]`, so a UUID or a token like `prod-eu` is a valid
+        // key), so guard the collision explicitly and sweep only the scoped
+        // subtree in that case. Repository creation/rename rejects the collision
+        // too (`repositories::validate_key_not_scope_collision`); this guard is
+        // the half that still holds for a repository that predates that check.
+        if self.cache_scope.segment() != Some(repo_key) {
+            let legacy = ProxyCacheScope::unscoped().repo_root(repo_key);
+            if !prefixes.contains(&legacy) {
+                prefixes.push(legacy);
+            }
+        }
+        let mut keys = Vec::new();
+        for prefix in &prefixes {
+            keys.extend(self.storage.list(Some(prefix)).await?);
+        }
         for key in keys {
             match self.storage.delete(&key).await {
                 Ok(()) => deleted += 1,
@@ -5638,8 +5724,12 @@ impl ProxyService {
     }
 
     /// Generate storage key for cache metadata
-    pub(crate) fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
-        CacheKeys::derive(repo_key, path).map(|k| k.metadata)
+    pub(crate) fn cache_metadata_key(
+        scope: &ProxyCacheScope,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<String> {
+        CacheKeys::derive(scope, repo_key, path).map(|k| k.metadata)
     }
 
     /// Reject cache paths whose final formatted key would exceed
@@ -5655,12 +5745,23 @@ impl ProxyService {
     /// Returning `Validation` early keeps the failure local to the helper
     /// instead of surfacing as an opaque 400/500 from the object-store SDK
     /// mid-fetch (#1044).
-    fn check_cache_key_length(repo_key: &str, trimmed_path: &str) -> Result<()> {
-        const PREFIX: &str = "proxy-cache/";
+    fn check_cache_key_length(
+        scope: &ProxyCacheScope,
+        repo_key: &str,
+        trimmed_path: &str,
+    ) -> Result<()> {
         const WORST_SUFFIX: &str = "__cache_meta__.json";
+        // The scope root (`proxy-cache/` or `proxy-cache/<scope>/`) is charged
+        // here, not the bare namespace: otherwise the budget under-counts by
+        // the scope segment and a path that passed validation would still be
+        // rejected by the object store (#3454).
         // Two interior '/' separators are added by the format!() calls.
-        let worst_len =
-            PREFIX.len() + repo_key.len() + 1 + trimmed_path.len() + 1 + WORST_SUFFIX.len();
+        let worst_len = scope.key_overhead_bytes()
+            + repo_key.len()
+            + 1
+            + trimmed_path.len()
+            + 1
+            + WORST_SUFFIX.len();
         if worst_len > Self::MAX_STORAGE_KEY_BYTES {
             return Err(AppError::Validation(format!(
                 "Proxy cache key exceeds {}-byte object-store limit (would be {} bytes)",
@@ -5869,8 +5970,8 @@ impl ProxyService {
         repo: &Repository,
         cache_path: &str,
     ) -> Result<Option<CachedBody>> {
-        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
-        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
+        let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
         let mutability = cache_classifier::classify(&repo.format, cache_path);
         let metadata = self
             .load_cache_metadata(&metadata_key)
@@ -6860,6 +6961,69 @@ mod tests {
         )));
     }
 
+    /// #3368 drift guard: BOTH key spaces the proxy cache writes must be
+    /// declared bucket-root-anchored in the storage layer.
+    ///
+    /// The prefix policy now follows the key, not the handle. If a new cache
+    /// namespace is introduced here (or one of these constants is renamed)
+    /// without updating `BUCKET_ROOT_KEY_NAMESPACES`, S3 would compose
+    /// `<S3_PREFIX>/<key>` for objects the prefix-less proxy handle writes at
+    /// the root — reopening exactly the split this closed. There is no
+    /// compiler link between the two lists, so it is asserted.
+    #[test]
+    fn test_proxy_cache_namespaces_are_declared_bucket_root_anchored_3368() {
+        for prefix in [PROXY_CACHE_KEY_PREFIX, TEE_STAGING_KEY_PREFIX] {
+            assert!(
+                crate::storage::BUCKET_ROOT_KEY_NAMESPACES.contains(&prefix),
+                "{prefix} is written by the prefix-less proxy-cache handle but is not \
+                 declared in BUCKET_ROOT_KEY_NAMESPACES (#3368)"
+            );
+        }
+
+        // Not just the constants: the keys actually derived from them.
+        let keys = CacheKeys::derive(
+            &ProxyCacheScope::unscoped(),
+            "pypi-remote",
+            "simple/six/six-1.17.0.whl",
+        )
+        .expect("derive cache keys");
+        for key in [keys.content.as_str(), keys.metadata.as_str()] {
+            assert!(
+                crate::storage::key_is_bucket_root_anchored(key),
+                "derived cache key {key} must resolve at the bucket root"
+            );
+        }
+        assert!(crate::storage::key_is_bucket_root_anchored(&format!(
+            "{TEE_STAGING_KEY_PREFIX}0f8fad5b-d9cb-469f-a165-70867728950e"
+        )));
+
+        // Not only the content/sidecar pair: every key space the proxy cache
+        // addresses through its own prefix-less handle must be anchored, or a
+        // prefixed S3 deployment would resolve it to two different objects.
+        // These used to be hand-written `"proxy-cache/"` literals; they are
+        // built from the constant now, and this pins the results.
+        let epoch = ProxyService::release_epoch_key(
+            &ProxyCacheScope::unscoped(),
+            "debian-remote",
+            "bookworm",
+        )
+        .expect("derive release epoch key");
+        assert!(
+            crate::storage::key_is_bucket_root_anchored(&epoch),
+            "release-epoch sidecar {epoch} must resolve at the bucket root"
+        );
+        for listing_prefix in [
+            format!("{PROXY_CACHE_KEY_PREFIX}pypi-remote/simple/"),
+            format!("{PROXY_CACHE_KEY_PREFIX}pypi-remote/"),
+        ] {
+            assert!(
+                crate::storage::key_is_bucket_root_anchored(&listing_prefix),
+                "listing prefix {listing_prefix} must resolve at the bucket root, or a purge \
+                 sweep would enumerate a different key space than the writes it reclaims"
+            );
+        }
+    }
+
     #[test]
     fn test_legacy_sidecar_without_quarantine_deserializes_to_none() {
         // A sidecar written before the quarantine field existed (and before
@@ -7122,7 +7286,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key() {
         assert_eq!(
-            ProxyService::cache_storage_key("maven-central", "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar").unwrap(),
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "maven-central", "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar").unwrap(),
             "proxy-cache/maven-central/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar/__content__"
         );
     }
@@ -7130,7 +7294,8 @@ mod tests {
     #[test]
     fn test_cache_storage_key_strips_leading_slash() {
         assert_eq!(
-            ProxyService::cache_storage_key("npm-proxy", "/express").unwrap(),
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "npm-proxy", "/express")
+                .unwrap(),
             "proxy-cache/npm-proxy/express/__content__"
         );
     }
@@ -7138,7 +7303,8 @@ mod tests {
     #[test]
     fn test_cache_storage_key_no_leading_slash() {
         assert_eq!(
-            ProxyService::cache_storage_key("npm-proxy", "express").unwrap(),
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "npm-proxy", "express")
+                .unwrap(),
             "proxy-cache/npm-proxy/express/__content__"
         );
     }
@@ -7146,7 +7312,12 @@ mod tests {
     #[test]
     fn test_cache_storage_key_scoped_npm_package() {
         assert_eq!(
-            ProxyService::cache_storage_key("npm-proxy", "@types/node/-/node-18.0.0.tgz").unwrap(),
+            ProxyService::cache_storage_key(
+                &ProxyCacheScope::unscoped(),
+                "npm-proxy",
+                "@types/node/-/node-18.0.0.tgz"
+            )
+            .unwrap(),
             "proxy-cache/npm-proxy/@types/node/-/node-18.0.0.tgz/__content__"
         );
     }
@@ -7169,10 +7340,18 @@ mod tests {
         // Path as the npm handler constructs it (encode_package_name_for_upstream).
         let encoded_path = "@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz";
 
-        let write_key = ProxyService::cache_storage_key("npm-proxy", encoded_path)
-            .expect("encoded scoped path must derive a cache key");
-        let read_key = ProxyService::cache_storage_key("npm-proxy", encoded_path)
-            .expect("encoded scoped path must derive a cache key on read");
+        let write_key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            encoded_path,
+        )
+        .expect("encoded scoped path must derive a cache key");
+        let read_key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            encoded_path,
+        )
+        .expect("encoded scoped path must derive a cache key on read");
 
         assert_eq!(
             write_key, read_key,
@@ -7189,8 +7368,12 @@ mod tests {
         // The matching metadata key must round-trip too, otherwise the
         // freshness probe and the content lookup land in different
         // storage namespaces.
-        let meta_key = ProxyService::cache_metadata_key("npm-proxy", encoded_path)
-            .expect("encoded scoped path must derive a metadata key");
+        let meta_key = ProxyService::cache_metadata_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            encoded_path,
+        )
+        .expect("encoded scoped path must derive a metadata key");
         assert_eq!(
             meta_key,
             "proxy-cache/npm-proxy/@e2escope%2Ftestpkg/-/testpkg-1.0.0.tgz/__cache_meta__.json"
@@ -7200,6 +7383,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key_deeply_nested_path() {
         let key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
             "maven",
             "com/example/group/artifact/1.0/artifact-1.0.pom",
         )
@@ -7215,7 +7399,12 @@ mod tests {
     #[test]
     fn test_cache_metadata_key() {
         assert_eq!(
-            ProxyService::cache_metadata_key("npm-registry", "express").unwrap(),
+            ProxyService::cache_metadata_key(
+                &ProxyCacheScope::unscoped(),
+                "npm-registry",
+                "express"
+            )
+            .unwrap(),
             "proxy-cache/npm-registry/express/__cache_meta__.json"
         );
     }
@@ -7223,7 +7412,8 @@ mod tests {
     #[test]
     fn test_cache_metadata_key_strips_leading_slash() {
         assert_eq!(
-            ProxyService::cache_metadata_key("repo", "/some/path").unwrap(),
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), "repo", "/some/path")
+                .unwrap(),
             "proxy-cache/repo/some/path/__cache_meta__.json"
         );
     }
@@ -7231,7 +7421,12 @@ mod tests {
     #[test]
     fn test_cache_metadata_key_strips_trailing_slash() {
         assert_eq!(
-            ProxyService::cache_metadata_key("pypi-remote", "simple/numpy/").unwrap(),
+            ProxyService::cache_metadata_key(
+                &ProxyCacheScope::unscoped(),
+                "pypi-remote",
+                "simple/numpy/"
+            )
+            .unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__cache_meta__.json"
         );
     }
@@ -7239,7 +7434,12 @@ mod tests {
     #[test]
     fn test_cache_storage_key_strips_trailing_slash() {
         assert_eq!(
-            ProxyService::cache_storage_key("pypi-remote", "simple/numpy/").unwrap(),
+            ProxyService::cache_storage_key(
+                &ProxyCacheScope::unscoped(),
+                "pypi-remote",
+                "simple/numpy/"
+            )
+            .unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__content__"
         );
     }
@@ -7247,11 +7447,21 @@ mod tests {
     #[test]
     fn test_cache_keys_strip_both_slashes() {
         assert_eq!(
-            ProxyService::cache_metadata_key("pypi-remote", "/simple/numpy/").unwrap(),
+            ProxyService::cache_metadata_key(
+                &ProxyCacheScope::unscoped(),
+                "pypi-remote",
+                "/simple/numpy/"
+            )
+            .unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__cache_meta__.json"
         );
         assert_eq!(
-            ProxyService::cache_storage_key("pypi-remote", "/simple/numpy/").unwrap(),
+            ProxyService::cache_storage_key(
+                &ProxyCacheScope::unscoped(),
+                "pypi-remote",
+                "/simple/numpy/"
+            )
+            .unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__content__"
         );
     }
@@ -7261,8 +7471,10 @@ mod tests {
         // Both keys should share the same prefix structure
         let repo_key = "npm-proxy";
         let path = "lodash";
-        let storage_key = ProxyService::cache_storage_key(repo_key, path).unwrap();
-        let metadata_key = ProxyService::cache_metadata_key(repo_key, path).unwrap();
+        let storage_key =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), repo_key, path).unwrap();
+        let metadata_key =
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), repo_key, path).unwrap();
 
         // Both start with the same prefix
         let storage_prefix = storage_key.rsplit_once('/').unwrap().0;
@@ -7282,9 +7494,15 @@ mod tests {
     fn test_cache_keys_no_file_directory_collision() {
         // Metadata cached at "is-odd" and tarball at "is-odd/-/is-odd-3.0.1.tgz"
         // must not collide (one as file, other needing it as directory)
-        let meta_key = ProxyService::cache_storage_key("npm-proxy", "is-odd").unwrap();
-        let tarball_key =
-            ProxyService::cache_storage_key("npm-proxy", "is-odd/-/is-odd-3.0.1.tgz").unwrap();
+        let meta_key =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "npm-proxy", "is-odd")
+                .unwrap();
+        let tarball_key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            "is-odd/-/is-odd-3.0.1.tgz",
+        )
+        .unwrap();
 
         // Both should be inside the "is-odd" directory, not at the same level
         assert!(meta_key.contains("is-odd/__content__"));
@@ -7293,15 +7511,21 @@ mod tests {
 
     #[test]
     fn test_cache_keys_different_repos_do_not_collide() {
-        let key1 = ProxyService::cache_storage_key("npm-proxy-1", "express").unwrap();
-        let key2 = ProxyService::cache_storage_key("npm-proxy-2", "express").unwrap();
+        let key1 =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "npm-proxy-1", "express")
+                .unwrap();
+        let key2 =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "npm-proxy-2", "express")
+                .unwrap();
         assert_ne!(key1, key2);
     }
 
     #[test]
     fn test_cache_keys_different_paths_do_not_collide() {
-        let key1 = ProxyService::cache_storage_key("repo", "path/a").unwrap();
-        let key2 = ProxyService::cache_storage_key("repo", "path/b").unwrap();
+        let key1 = ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "repo", "path/a")
+            .unwrap();
+        let key2 = ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "repo", "path/b")
+            .unwrap();
         assert_ne!(key1, key2);
     }
 
@@ -7324,10 +7548,12 @@ mod tests {
         let path_len = ProxyService::MAX_STORAGE_KEY_BYTES - fixed;
         let path = "a".repeat(path_len);
 
-        let storage_key = ProxyService::cache_storage_key(repo, &path)
-            .expect("storage key just under limit should succeed");
-        let metadata_key = ProxyService::cache_metadata_key(repo, &path)
-            .expect("metadata key just under limit should succeed");
+        let storage_key =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), repo, &path)
+                .expect("storage key just under limit should succeed");
+        let metadata_key =
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), repo, &path)
+                .expect("metadata key just under limit should succeed");
 
         assert_eq!(metadata_key.len(), ProxyService::MAX_STORAGE_KEY_BYTES);
         assert!(storage_key.len() <= ProxyService::MAX_STORAGE_KEY_BYTES);
@@ -7343,8 +7569,10 @@ mod tests {
         let path_len = ProxyService::MAX_STORAGE_KEY_BYTES - storage_fixed + 1;
         let path = "a".repeat(path_len);
 
-        let storage_result = ProxyService::cache_storage_key(repo, &path);
-        let metadata_result = ProxyService::cache_metadata_key(repo, &path);
+        let storage_result =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), repo, &path);
+        let metadata_result =
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), repo, &path);
 
         assert!(matches!(storage_result, Err(AppError::Validation(_))));
         assert!(matches!(metadata_result, Err(AppError::Validation(_))));
@@ -7374,8 +7602,10 @@ mod tests {
         // But the metadata variant overflows by 8 bytes (suffix delta),
         // and the helper rejects both because we measure against the
         // worst-case suffix.
-        let storage_result = ProxyService::cache_storage_key(repo, &path);
-        let metadata_result = ProxyService::cache_metadata_key(repo, &path);
+        let storage_result =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), repo, &path);
+        let metadata_result =
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), repo, &path);
 
         assert!(matches!(storage_result, Err(AppError::Validation(_))));
         assert!(matches!(metadata_result, Err(AppError::Validation(_))));
@@ -7388,7 +7618,11 @@ mod tests {
     #[test]
     fn test_cache_storage_key_rejects_dotdot_segment() {
         // `../foo` would escape the proxy-cache/<repo>/ namespace.
-        let result = ProxyService::cache_storage_key("npm-proxy", "../etc/passwd");
+        let result = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            "../etc/passwd",
+        );
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
 
@@ -7396,14 +7630,22 @@ mod tests {
     fn test_cache_storage_key_rejects_dotdot_in_middle() {
         // `foo/../bar` escapes one level even though there is a leading
         // legitimate segment.
-        let result = ProxyService::cache_storage_key("npm-proxy", "express/../lodash");
+        let result = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            "express/../lodash",
+        );
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
 
     #[test]
     fn test_cache_storage_key_rejects_dot_segment() {
         // `.` is a no-op on filesystems but ambiguous to object stores.
-        let result = ProxyService::cache_storage_key("npm-proxy", "express/./latest");
+        let result = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            "express/./latest",
+        );
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
 
@@ -7411,13 +7653,27 @@ mod tests {
     fn test_cache_storage_key_accepts_dotdot_substring() {
         // `..foo` and `foo..bar` are not segments containing exactly `..`,
         // they are legitimate filename bytes.
-        assert!(ProxyService::cache_storage_key("npm-proxy", "..foo").is_ok());
-        assert!(ProxyService::cache_storage_key("npm-proxy", "package..tgz").is_ok());
+        assert!(ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            "..foo"
+        )
+        .is_ok());
+        assert!(ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            "package..tgz"
+        )
+        .is_ok());
     }
 
     #[test]
     fn test_cache_storage_key_rejects_nul_byte() {
-        let result = ProxyService::cache_storage_key("npm-proxy", "express\0evil");
+        let result = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            "express\0evil",
+        );
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
 
@@ -7427,11 +7683,19 @@ mod tests {
         // segment check because split('/') leaves it as a single segment,
         // and some object-store SDKs normalize `\` to `/` before signing.
         assert!(matches!(
-            ProxyService::cache_storage_key("npm-proxy", "..\\etc\\passwd"),
+            ProxyService::cache_storage_key(
+                &ProxyCacheScope::unscoped(),
+                "npm-proxy",
+                "..\\etc\\passwd"
+            ),
             Err(AppError::Validation(_))
         ));
         assert!(matches!(
-            ProxyService::cache_storage_key("npm-proxy", "express\\latest"),
+            ProxyService::cache_storage_key(
+                &ProxyCacheScope::unscoped(),
+                "npm-proxy",
+                "express\\latest"
+            ),
             Err(AppError::Validation(_))
         ));
     }
@@ -7439,26 +7703,35 @@ mod tests {
     #[test]
     fn test_cache_storage_key_rejects_control_chars() {
         // CR/LF can split log lines and confuse some sign-URL paths.
-        let result = ProxyService::cache_storage_key("npm-proxy", "express\nevil");
+        let result = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            "express\nevil",
+        );
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
 
     #[test]
     fn test_cache_storage_key_rejects_empty_path() {
-        let result = ProxyService::cache_storage_key("npm-proxy", "");
+        let result = ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "npm-proxy", "");
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
 
     #[test]
     fn test_cache_storage_key_rejects_only_slashes() {
-        let result = ProxyService::cache_storage_key("npm-proxy", "//");
+        let result =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "npm-proxy", "//");
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
 
     #[test]
     fn test_cache_storage_key_rejects_double_slash() {
         // `foo//bar` after trim-edges still has an empty middle segment.
-        let result = ProxyService::cache_storage_key("npm-proxy", "express//latest");
+        let result = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-proxy",
+            "express//latest",
+        );
         assert!(matches!(result, Err(AppError::Validation(_))));
     }
 
@@ -7469,19 +7742,31 @@ mod tests {
         // path produces a valid metadata key but invalid storage key, or
         // vice-versa).
         assert!(matches!(
-            ProxyService::cache_metadata_key("npm-proxy", "../etc/passwd"),
+            ProxyService::cache_metadata_key(
+                &ProxyCacheScope::unscoped(),
+                "npm-proxy",
+                "../etc/passwd"
+            ),
             Err(AppError::Validation(_))
         ));
         assert!(matches!(
-            ProxyService::cache_metadata_key("npm-proxy", "express\0evil"),
+            ProxyService::cache_metadata_key(
+                &ProxyCacheScope::unscoped(),
+                "npm-proxy",
+                "express\0evil"
+            ),
             Err(AppError::Validation(_))
         ));
     }
 
     #[test]
     fn test_storage_and_metadata_keys_do_not_collide() {
-        let storage = ProxyService::cache_storage_key("repo", "package").unwrap();
-        let metadata = ProxyService::cache_metadata_key("repo", "package").unwrap();
+        let storage =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), "repo", "package")
+                .unwrap();
+        let metadata =
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), "repo", "package")
+                .unwrap();
         assert_ne!(storage, metadata);
     }
 
@@ -7529,32 +7814,46 @@ mod tests {
         ];
 
         for (repo_key, path) in cases {
-            let derived = CacheKeys::derive(repo_key, path);
+            let derived = CacheKeys::derive(&ProxyCacheScope::unscoped(), repo_key, path);
             let derived_content = derived.as_ref().map(|k| k.content.clone()).ok();
             let derived_metadata = derived.as_ref().map(|k| k.metadata.clone()).ok();
 
             // Content key equivalence (Ok value and Err message).
             assert_eq!(
-                as_msg(CacheKeys::derive(repo_key, path).map(|k| k.content)),
-                as_msg(ProxyService::cache_storage_key(repo_key, path)),
+                as_msg(
+                    CacheKeys::derive(&ProxyCacheScope::unscoped(), repo_key, path)
+                        .map(|k| k.content)
+                ),
+                as_msg(ProxyService::cache_storage_key(
+                    &ProxyCacheScope::unscoped(),
+                    repo_key,
+                    path
+                )),
                 "content key mismatch for ({repo_key:?}, {path:?})"
             );
             // Metadata key equivalence (Ok value and Err message).
             assert_eq!(
-                as_msg(CacheKeys::derive(repo_key, path).map(|k| k.metadata)),
-                as_msg(ProxyService::cache_metadata_key(repo_key, path)),
+                as_msg(
+                    CacheKeys::derive(&ProxyCacheScope::unscoped(), repo_key, path)
+                        .map(|k| k.metadata)
+                ),
+                as_msg(ProxyService::cache_metadata_key(
+                    &ProxyCacheScope::unscoped(),
+                    repo_key,
+                    path
+                )),
                 "metadata key mismatch for ({repo_key:?}, {path:?})"
             );
 
             // The struct fields must agree with the legacy helpers directly.
             assert_eq!(
                 derived_content,
-                ProxyService::cache_storage_key(repo_key, path).ok(),
+                ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), repo_key, path).ok(),
                 "CacheKeys.content mismatch for ({repo_key:?}, {path:?})"
             );
             assert_eq!(
                 derived_metadata,
-                ProxyService::cache_metadata_key(repo_key, path).ok(),
+                ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), repo_key, path).ok(),
                 "CacheKeys.metadata mismatch for ({repo_key:?}, {path:?})"
             );
         }
@@ -8005,6 +8304,7 @@ mod tests {
     #[test]
     fn test_cache_key_for_pypi_local_path() {
         let key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
             "my-pypi-remote",
             "simple/requests/requests-2.31.0.tar.gz",
         )
@@ -8018,6 +8318,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_key_for_pypi_local_path() {
         let key = ProxyService::cache_metadata_key(
+            &ProxyCacheScope::unscoped(),
             "my-pypi-remote",
             "simple/requests/requests-2.31.0.tar.gz",
         )
@@ -8031,6 +8332,7 @@ mod tests {
     #[test]
     fn test_cache_key_for_pypi_wheel() {
         let key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
             "pypi-proxy",
             "simple/flask/flask-3.0.0-py3-none-any.whl",
         )
@@ -8042,13 +8344,17 @@ mod tests {
     #[test]
     fn test_cache_key_pypi_and_npm_do_not_collide() {
         let pypi_key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
             "pypi-remote",
             "simple/requests/requests-2.31.0.tar.gz",
         )
         .unwrap();
-        let npm_key =
-            ProxyService::cache_storage_key("npm-remote", "simple/requests/requests-2.31.0.tar.gz")
-                .unwrap();
+        let npm_key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "npm-remote",
+            "simple/requests/requests-2.31.0.tar.gz",
+        )
+        .unwrap();
         assert_ne!(pypi_key, npm_key);
     }
 
@@ -8065,8 +8371,18 @@ mod tests {
         // distinct cache keys.
         let upstream_relative = "packages/ab/cd/requests-2.31.0.tar.gz";
         let cache_path = "simple/requests/requests-2.31.0.tar.gz";
-        let fetch_key = ProxyService::cache_storage_key("pypi-remote", upstream_relative).unwrap();
-        let cache_key = ProxyService::cache_storage_key("pypi-remote", cache_path).unwrap();
+        let fetch_key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "pypi-remote",
+            upstream_relative,
+        )
+        .unwrap();
+        let cache_key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "pypi-remote",
+            cache_path,
+        )
+        .unwrap();
         assert_ne!(
             fetch_key, cache_key,
             "cache key should differ when distinct paths are used"
@@ -8076,6 +8392,7 @@ mod tests {
         // funny-looking cache key.
         assert!(matches!(
             ProxyService::cache_storage_key(
+                &ProxyCacheScope::unscoped(),
                 "pypi-remote",
                 "https://files.pythonhosted.org/packages/ab/cd/requests-2.31.0.tar.gz",
             ),
@@ -8086,7 +8403,12 @@ mod tests {
     #[test]
     fn test_cache_metadata_key_with_custom_path() {
         let cache_path = "simple/numpy/numpy-1.26.0.tar.gz";
-        let key = ProxyService::cache_metadata_key("pypi-remote", cache_path).unwrap();
+        let key = ProxyService::cache_metadata_key(
+            &ProxyCacheScope::unscoped(),
+            "pypi-remote",
+            cache_path,
+        )
+        .unwrap();
         assert!(key.contains("pypi-remote"));
         assert!(key.contains("numpy"));
     }
@@ -8116,8 +8438,10 @@ mod tests {
         // as manual cache_storage_key + cache_metadata_key calls
         let repo_key = "test-pypi";
         let path = "simple/flask/flask-3.0.0.tar.gz";
-        let expected_storage = ProxyService::cache_storage_key(repo_key, path).unwrap();
-        let expected_meta = ProxyService::cache_metadata_key(repo_key, path).unwrap();
+        let expected_storage =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), repo_key, path).unwrap();
+        let expected_meta =
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), repo_key, path).unwrap();
         // The function internally calls these same methods, so keys should match
         assert!(expected_storage.contains("test-pypi"));
         assert!(expected_meta.contains("test-pypi"));
@@ -8402,10 +8726,16 @@ mod tests {
 
     #[test]
     fn test_catalog_indexable_format_other_formats_not_indexed() {
+        // These formats stay OUT of the shared proxy-fetch allow-list. For
+        // docker that does NOT mean "not catalog-indexed": proxied images ARE
+        // indexed (#3441), but at the manifest seam
+        // (`oci_v2::index_proxied_manifest_package`), after the inline scan
+        // gate -- the paths that flow through THIS layer for OCI are blobs,
+        // which must never become catalog rows.
         for f in ["npm", "pypi", "docker", "generic", "cargo", "nuget"] {
             assert!(
                 catalog_indexable_format(Some(f)).is_none(),
-                "{f} must not be catalog-indexed yet"
+                "{f} must not be indexed through the shared proxy-fetch layer"
             );
         }
     }
@@ -8732,7 +9062,11 @@ mod tests {
     ) -> ProxyService {
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy should not fail");
-        ProxyService::new(pool, Arc::new(StorageService::new(storage)))
+        ProxyService::new(
+            pool,
+            Arc::new(StorageService::new(storage)),
+            ProxyCacheScope::unscoped(),
+        )
     }
 
     /// Minimal [`CacheMetadata`] for tests that only need `spawn_lazy_catalog_backfill`
@@ -8769,6 +9103,7 @@ mod tests {
             Arc::new(StorageService::new(Arc::new(CacheFreshMock::new(
                 None, false,
             )))),
+            ProxyCacheScope::unscoped(),
         );
         let before = service.backfill_limiter.available_permits();
         assert_eq!(before, ProxyService::MAX_CONCURRENT_CATALOG_BACKFILLS);
@@ -8817,6 +9152,7 @@ mod tests {
             Arc::new(StorageService::new(Arc::new(CacheFreshMock::new(
                 None, false,
             )))),
+            ProxyCacheScope::unscoped(),
         );
 
         // Simulate a burst that has already claimed every permit.
@@ -10245,7 +10581,7 @@ mod tests {
     async fn test_write_negative_cache_skips_delete_when_nothing_present() {
         let backend = TeeRecordingBackend::ok();
         let storage = Arc::new(RealStorageService::new(backend.clone()));
-        let proxy = ProxyService::new(test_catalog_pool(), storage);
+        let proxy = ProxyService::new(test_catalog_pool(), storage, ProxyCacheScope::unscoped());
 
         // Two consecutive negative-cache writes, simulating the initial
         // write plus one TTL renewal against a path that never had real
@@ -10287,7 +10623,7 @@ mod tests {
             .object_written
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let storage = Arc::new(RealStorageService::new(backend.clone()));
-        let proxy = ProxyService::new(test_catalog_pool(), storage);
+        let proxy = ProxyService::new(test_catalog_pool(), storage, ProxyCacheScope::unscoped());
 
         proxy
             .write_negative_cache("cache-key", "meta-key", "some/path")
@@ -10886,7 +11222,7 @@ mod tests {
 
         let backend = TeeRecordingBackend::ok();
         let storage = Arc::new(RealStorageService::new(backend));
-        let service = ProxyService::new(fx.pool.clone(), storage);
+        let service = ProxyService::new(fx.pool.clone(), storage, ProxyCacheScope::unscoped());
 
         let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
             fx.repo_id,
@@ -12237,7 +12573,11 @@ mod tests {
             "proxy-cache/pypi-remote/simple/requests/__content__",
             "proxy-cache/pypi-remote/simple/numpy/__content__",
         ];
-        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        let names = ProxyService::pypi_package_names_from_cache_keys(
+            &ProxyCacheScope::unscoped(),
+            "pypi-remote",
+            keys,
+        );
         // Deduped (flask appears twice across content + metadata) and sorted.
         assert_eq!(names, vec!["flask", "numpy", "requests"]);
     }
@@ -12258,7 +12598,11 @@ mod tests {
             // index-only project, still listed
             "proxy-cache/pypi-remote/simple/flask/__content__",
         ];
-        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        let names = ProxyService::pypi_package_names_from_cache_keys(
+            &ProxyCacheScope::unscoped(),
+            "pypi-remote",
+            keys,
+        );
         assert_eq!(
             names,
             vec!["flask", "requests", "urllib3"],
@@ -12278,7 +12622,11 @@ mod tests {
             "proxy-cache/pypi-remote/simple/ghost/__content__.tee-staging.0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
             "proxy-cache/pypi-remote/simple/ghost/ghost-1.0.tar.gz/__content__.tee-staging.0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
         ];
-        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        let names = ProxyService::pypi_package_names_from_cache_keys(
+            &ProxyCacheScope::unscoped(),
+            "pypi-remote",
+            keys,
+        );
         assert!(
             names.is_empty(),
             "a leftover staging object must not make a failed write look cached: {names:?}"
@@ -12299,7 +12647,11 @@ mod tests {
             // a real project — kept
             "proxy-cache/pypi-remote/simple/flask/__content__",
         ];
-        let names = ProxyService::pypi_package_names_from_cache_keys("pypi-remote", keys);
+        let names = ProxyService::pypi_package_names_from_cache_keys(
+            &ProxyCacheScope::unscoped(),
+            "pypi-remote",
+            keys,
+        );
         assert_eq!(names, vec!["flask"]);
     }
 
@@ -12311,7 +12663,8 @@ mod tests {
             "proxy-cache/npm-remote/lodash/__content__",
             "proxy-cache/npm-remote/lodash/__cache_meta__.json",
         ];
-        let paths = ProxyService::cached_artifact_paths("npm-remote", keys);
+        let paths =
+            ProxyService::cached_artifact_paths(&ProxyCacheScope::unscoped(), "npm-remote", keys);
         // Only content keys, sidecars dropped, prefix + suffix stripped, sorted.
         assert_eq!(
             paths,
@@ -12334,7 +12687,8 @@ mod tests {
             // a real entry — kept
             "proxy-cache/npm-remote/express/__content__",
         ];
-        let paths = ProxyService::cached_artifact_paths("npm-remote", keys);
+        let paths =
+            ProxyService::cached_artifact_paths(&ProxyCacheScope::unscoped(), "npm-remote", keys);
         assert_eq!(paths, vec!["express".to_string()]);
     }
 
@@ -13773,7 +14127,7 @@ mod tests {
         // Build the service with a `lazy` PgPool: we never call any
         // code path that touches the DB on this test.
         let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
-        let proxy = ProxyService::new(pool, storage);
+        let proxy = ProxyService::new(pool, storage, ProxyCacheScope::unscoped());
 
         let repo_key = "npm-proxy";
         let cache_path = "abbrev/-/abbrev-1.1.1.tgz";
@@ -13781,8 +14135,12 @@ mod tests {
 
         // Drive cache_artifact directly with the same keys
         // `fetch_artifact_with_cache_path` derives.
-        let cache_key = ProxyService::cache_storage_key(repo_key, cache_path).unwrap();
-        let metadata_key = ProxyService::cache_metadata_key(repo_key, cache_path).unwrap();
+        let cache_key =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), repo_key, cache_path)
+                .unwrap();
+        let metadata_key =
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), repo_key, cache_path)
+                .unwrap();
         proxy
             .cache_artifact(
                 &cache_key,
@@ -14498,7 +14856,8 @@ mod tests {
         let fetch_path = "packages/ab/cd/numpy-2.0.0-py3-none-any.whl";
         let wheel_body = Bytes::from_static(b"fake wheel bytes");
 
-        let keys = CacheKeys::derive("pypi-remote", cache_path).unwrap();
+        let keys =
+            CacheKeys::derive(&ProxyCacheScope::unscoped(), "pypi-remote", cache_path).unwrap();
         let mut entries = std::collections::HashMap::new();
         entries.insert(keys.metadata.clone(), fresh_metadata_bytes());
         entries.insert(keys.content.clone(), wheel_body.clone());
@@ -15660,7 +16019,7 @@ mod tests {
         // commit rather than the content file's existence: reading on first
         // sight can observe a created-but-unwritten file and collect 0 bytes.
         tdh::wait_for_cache_commit(&tmp, collected.len() as u64).await;
-        let content_rel = CacheKeys::derive("pypi-split", cache_path)
+        let content_rel = CacheKeys::derive(&ProxyCacheScope::unscoped(), "pypi-split", cache_path)
             .expect("derive")
             .content;
         let content_file = tmp.join(&content_rel);
@@ -16087,8 +16446,12 @@ mod tests {
         body: Option<&[u8]>,
         metadata: &CacheMetadata,
     ) {
-        let content_key = ProxyService::cache_storage_key(repo_key, cache_path).unwrap();
-        let meta_key = ProxyService::cache_metadata_key(repo_key, cache_path).unwrap();
+        let content_key =
+            ProxyService::cache_storage_key(&ProxyCacheScope::unscoped(), repo_key, cache_path)
+                .unwrap();
+        let meta_key =
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), repo_key, cache_path)
+                .unwrap();
         let mut writes: Vec<(String, Bytes)> =
             vec![(meta_key, Bytes::from(serde_json::to_vec(metadata).unwrap()))];
         if let Some(body) = body {
@@ -16558,6 +16921,7 @@ mod tests {
     fn test_repo_key_from_cache_key_content_key() {
         assert_eq!(
             repo_key_from_cache_key(
+                &ProxyCacheScope::unscoped(),
                 "proxy-cache/pypi-remote/simple/click/click-8.0.0-py3-none-any.whl/__content__"
             ),
             "pypi-remote"
@@ -16568,6 +16932,7 @@ mod tests {
     fn test_repo_key_from_cache_key_metadata_key() {
         assert_eq!(
             repo_key_from_cache_key(
+                &ProxyCacheScope::unscoped(),
                 "proxy-cache/npm-remote/lodash/-/lodash-4.17.21.tgz/__cache_meta__.json"
             ),
             "npm-remote"
@@ -16580,7 +16945,10 @@ mod tests {
         // `validate_repository_key`. The split-by-`/` extractor should
         // preserve them verbatim.
         assert_eq!(
-            repo_key_from_cache_key("proxy-cache/my_repo-v1.2/a/b/__content__"),
+            repo_key_from_cache_key(
+                &ProxyCacheScope::unscoped(),
+                "proxy-cache/my_repo-v1.2/a/b/__content__"
+            ),
             "my_repo-v1.2"
         );
     }
@@ -16591,19 +16959,33 @@ mod tests {
         // function returns "unknown" instead of panicking so the
         // counter cardinality stays bounded.
         assert_eq!(
-            repo_key_from_cache_key("maven/org/example/lib/1.0/lib-1.0.jar"),
+            repo_key_from_cache_key(
+                &ProxyCacheScope::unscoped(),
+                "maven/org/example/lib/1.0/lib-1.0.jar"
+            ),
             "unknown"
         );
-        assert_eq!(repo_key_from_cache_key(""), "unknown");
-        assert_eq!(repo_key_from_cache_key("proxy-cache/"), "unknown");
-        assert_eq!(repo_key_from_cache_key("proxy-cache//foo"), "unknown");
+        assert_eq!(
+            repo_key_from_cache_key(&ProxyCacheScope::unscoped(), ""),
+            "unknown"
+        );
+        assert_eq!(
+            repo_key_from_cache_key(&ProxyCacheScope::unscoped(), "proxy-cache/"),
+            "unknown"
+        );
+        assert_eq!(
+            repo_key_from_cache_key(&ProxyCacheScope::unscoped(), "proxy-cache//foo"),
+            "unknown"
+        );
     }
 
     // ---- release_epoch_key path validation ------------------------------
 
     #[test]
     fn test_release_epoch_key_valid_distribution() {
-        let key = ProxyService::release_epoch_key("my-repo", "bookworm").unwrap();
+        let key =
+            ProxyService::release_epoch_key(&ProxyCacheScope::unscoped(), "my-repo", "bookworm")
+                .unwrap();
         assert_eq!(
             key,
             "proxy-cache/my-repo/dists/bookworm/__release_epoch__.json"
@@ -16612,7 +16994,9 @@ mod tests {
 
     #[test]
     fn test_release_epoch_key_strips_leading_trailing_slashes() {
-        let key = ProxyService::release_epoch_key("repo", "/bookworm/").unwrap();
+        let key =
+            ProxyService::release_epoch_key(&ProxyCacheScope::unscoped(), "repo", "/bookworm/")
+                .unwrap();
         assert_eq!(
             key,
             "proxy-cache/repo/dists/bookworm/__release_epoch__.json"
@@ -16621,20 +17005,42 @@ mod tests {
 
     #[test]
     fn test_release_epoch_key_rejects_path_traversal() {
-        assert!(ProxyService::release_epoch_key("repo", "../etc/passwd").is_err());
-        assert!(ProxyService::release_epoch_key("repo", "bookworm/../..").is_err());
+        assert!(ProxyService::release_epoch_key(
+            &ProxyCacheScope::unscoped(),
+            "repo",
+            "../etc/passwd"
+        )
+        .is_err());
+        assert!(ProxyService::release_epoch_key(
+            &ProxyCacheScope::unscoped(),
+            "repo",
+            "bookworm/../.."
+        )
+        .is_err());
     }
 
     #[test]
     fn test_release_epoch_key_rejects_backslash_and_nul() {
-        assert!(ProxyService::release_epoch_key("repo", "book\\worm").is_err());
-        assert!(ProxyService::release_epoch_key("repo", "book\0worm").is_err());
+        assert!(ProxyService::release_epoch_key(
+            &ProxyCacheScope::unscoped(),
+            "repo",
+            "book\\worm"
+        )
+        .is_err());
+        assert!(ProxyService::release_epoch_key(
+            &ProxyCacheScope::unscoped(),
+            "repo",
+            "book\0worm"
+        )
+        .is_err());
     }
 
     #[test]
     fn test_release_epoch_key_rejects_empty() {
-        assert!(ProxyService::release_epoch_key("repo", "").is_err());
-        assert!(ProxyService::release_epoch_key("repo", "/").is_err());
+        assert!(ProxyService::release_epoch_key(&ProxyCacheScope::unscoped(), "repo", "").is_err());
+        assert!(
+            ProxyService::release_epoch_key(&ProxyCacheScope::unscoped(), "repo", "/").is_err()
+        );
     }
 
     // ---- is_dists_epoch_expired boundary logic --------------------------
@@ -16961,8 +17367,12 @@ mod tests {
         let epoch = proxy.read_release_epoch("dists-chg", "bookworm").await;
         assert!(epoch.is_found(), "epoch must be written on first change");
         // The Release's own cache should NOT be self-expired.
-        let meta_key =
-            ProxyService::cache_metadata_key("dists-chg", "dists/bookworm/Release").unwrap();
+        let meta_key = ProxyService::cache_metadata_key(
+            &ProxyCacheScope::unscoped(),
+            "dists-chg",
+            "dists/bookworm/Release",
+        )
+        .unwrap();
         let metadata = proxy.load_cache_metadata_pub(&meta_key).await;
         assert!(metadata.is_some(), "cache metadata must exist");
         if let Some(meta) = metadata {
@@ -17053,8 +17463,12 @@ mod tests {
         assert!(epoch.is_found(), "epoch must be seeded");
 
         // Release's own cache must NOT be self-invalidated.
-        let meta_key =
-            ProxyService::cache_metadata_key("dists-304", "dists/bookworm/Release").unwrap();
+        let meta_key = ProxyService::cache_metadata_key(
+            &ProxyCacheScope::unscoped(),
+            "dists-304",
+            "dists/bookworm/Release",
+        )
+        .unwrap();
         if let Some(meta) = proxy.load_cache_metadata_pub(&meta_key).await {
             assert!(
                 !proxy
@@ -17303,8 +17717,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
 
         // Delete the cached body, keeping only metadata.
-        let content_key =
-            ProxyService::cache_storage_key("dists-304-mb", "dists/bookworm/Release").unwrap();
+        let content_key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "dists-304-mb",
+            "dists/bookworm/Release",
+        )
+        .unwrap();
         proxy
             .storage
             .delete(&content_key)
@@ -17398,8 +17816,12 @@ mod tests {
 
         // Delete the cached body so stale-if-error cannot mask the
         // bearer-exchange rejection.
-        let content_key =
-            ProxyService::cache_storage_key("dists-401br", "dists/bookworm/Release").unwrap();
+        let content_key = ProxyService::cache_storage_key(
+            &ProxyCacheScope::unscoped(),
+            "dists-401br",
+            "dists/bookworm/Release",
+        )
+        .unwrap();
         proxy
             .storage
             .delete(&content_key)
@@ -17865,7 +18287,8 @@ mod tests {
     #[tokio::test]
     async fn test_load_cache_metadata_awaiting_publish_sees_fresh_sidecar_3335() {
         let repo_key = format!("tee-3335-{}", Uuid::new_v4());
-        let keys = CacheKeys::derive(&repo_key, "some/artifact.bin").unwrap();
+        let keys = CacheKeys::derive(&ProxyCacheScope::unscoped(), &repo_key, "some/artifact.bin")
+            .unwrap();
         let storage = Arc::new(MutableMapStorage {
             entries: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -17973,7 +18396,11 @@ mod tests {
         let storage = Arc::new(MutableMapStorage {
             entries: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
-        let svc = ProxyService::new(pool, Arc::new(StorageService::new(storage)));
+        let svc = ProxyService::new(
+            pool,
+            Arc::new(StorageService::new(storage)),
+            ProxyCacheScope::unscoped(),
+        );
         let mut repo = remote_repo_for(
             &format!("pypi-3290-{}", Uuid::new_v4()),
             &upstream.uri(),
@@ -18010,6 +18437,508 @@ mod tests {
             matches!(verdict, RevalidationVerdict::Refill),
             "a probe without the selecting header is answered for a different \
              representation and must not 304-extend the JSON variant"
+        );
+    }
+
+    // =====================================================================
+    // #3454 — per-deployment proxy-cache scoping.
+    //
+    // Proxy-cache content is anchored at the storage ROOT (#3368/#3513), so
+    // before the scope segment existed two deployments sharing one bucket and
+    // separated only by `S3_PREFIX` wrote the SAME
+    // `proxy-cache/<repo_key>/<path>/__content__` keys. Two repositories that
+    // happened to carry the same key addressed one physical object, and each
+    // deployment served the other's cached upstream bytes.
+    // =====================================================================
+
+    const SCOPE_3454_A: Uuid = Uuid::from_u128(0xaaaa_0000_0000_0000_0000_0000_0000_0001);
+    const SCOPE_3454_B: Uuid = Uuid::from_u128(0xbbbb_0000_0000_0000_0000_0000_0000_0002);
+
+    /// One shared storage root standing in for one shared S3 bucket, plus one
+    /// `ProxyService` per deployment over it. Each deployment gets its OWN
+    /// `StorageService` handle (as two separate processes would) rooted at the
+    /// same directory, so anything the two see of each other travels through
+    /// the key space and nothing else.
+    struct SharedBucket {
+        dir: std::path::PathBuf,
+    }
+
+    impl SharedBucket {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("ak3454-{tag}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create shared bucket dir");
+            Self { dir }
+        }
+
+        fn storage(&self) -> Arc<StorageService> {
+            use crate::services::storage_service::FilesystemBackend;
+            Arc::new(StorageService::new(Arc::new(FilesystemBackend::new(
+                self.dir.clone(),
+            ))))
+        }
+
+        /// A deployment addressing this bucket under `scope`.
+        fn deployment(&self, scope: ProxyCacheScope) -> ProxyService {
+            ProxyService::new(test_catalog_pool(), self.storage(), scope)
+        }
+    }
+
+    impl Drop for SharedBucket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Write `body` into `proxy`'s proxy cache through the production buffered
+    /// write path, keyed exactly as that deployment would key it.
+    async fn cache_through(proxy: &ProxyService, repo_key: &str, path: &str, body: &[u8]) {
+        let keys =
+            CacheKeys::derive(proxy.cache_scope(), repo_key, path).expect("cache key derivation");
+        proxy
+            .cache_persister
+            .write_buffered(
+                &keys.content,
+                &keys.metadata,
+                &Bytes::from(body.to_vec()),
+                Some("application/octet-stream".to_string()),
+                None,
+                None,
+                None,
+                None,
+                3600,
+                Uuid::new_v4(),
+                path,
+                None,
+            )
+            .await
+            .expect("buffered cache write");
+    }
+
+    /// THE regression test. Two deployments, one bucket, one repository key,
+    /// two different sets of upstream bytes. Neither may see the other's.
+    ///
+    /// Fails on `main`: deployment B's read resolves
+    /// `proxy-cache/shared-key/org/lib/1.0/lib.jar/__content__` — the exact key
+    /// deployment A wrote — and returns A's bytes.
+    #[tokio::test]
+    async fn deployments_sharing_a_bucket_do_not_serve_each_others_cached_bytes_3454() {
+        let bucket = SharedBucket::new("isolation");
+        let a = bucket.deployment(ProxyCacheScope::from_deployment_id(SCOPE_3454_A));
+        let b = bucket.deployment(ProxyCacheScope::from_deployment_id(SCOPE_3454_B));
+
+        const REPO: &str = "shared-key";
+        const PATH: &str = "org/lib/1.0/lib.jar";
+
+        cache_through(&a, REPO, PATH, b"ALPHA-from-deployment-a-upstream").await;
+
+        // (1) Isolation: B must NOT serve what A cached.
+        let seen_by_b = b
+            .get_cached_artifact_by_path(REPO, PATH)
+            .await
+            .expect("cache read must not error");
+        assert!(
+            seen_by_b.is_none(),
+            "deployment B served deployment A's cached upstream bytes: {:?}",
+            seen_by_b.map(|(body, _, _)| String::from_utf8_lossy(&body).into_owned())
+        );
+        assert!(
+            !b.is_cache_fresh(REPO, PATH).await,
+            "deployment B reported a fresh cache hit on deployment A's object"
+        );
+
+        // (2) ...and B's own cache write does not overwrite A's object.
+        cache_through(&b, REPO, PATH, b"BRAVO-from-deployment-b-upstream").await;
+
+        // (3) A still hits its OWN cache. Without this, "isolate everything by
+        // making every read a miss" would pass (1) and (2).
+        let (body_a, _, _) = a
+            .get_cached_artifact_by_path(REPO, PATH)
+            .await
+            .expect("cache read must not error")
+            .expect("deployment A must still hit its own warm cache");
+        assert_eq!(&body_a[..], b"ALPHA-from-deployment-a-upstream");
+        assert!(a.is_cache_fresh(REPO, PATH).await);
+
+        let (body_b, _, _) = b
+            .get_cached_artifact_by_path(REPO, PATH)
+            .await
+            .expect("cache read must not error")
+            .expect("deployment B must hit its own warm cache");
+        assert_eq!(&body_b[..], b"BRAVO-from-deployment-b-upstream");
+    }
+
+    /// Control for the test above: the SAME fixture, with both deployments on
+    /// the pre-#3454 unscoped layout, really does share one key space. If this
+    /// stops holding, the isolation assertion above has stopped proving
+    /// anything (the two services would no longer be sharing storage at all).
+    #[tokio::test]
+    async fn unscoped_layout_is_the_shared_key_space_3454_control() {
+        let bucket = SharedBucket::new("control");
+        let a = bucket.deployment(ProxyCacheScope::unscoped());
+        let b = bucket.deployment(ProxyCacheScope::unscoped());
+
+        const REPO: &str = "shared-key";
+        const PATH: &str = "org/lib/1.0/lib.jar";
+
+        cache_through(&a, REPO, PATH, b"ALPHA-from-deployment-a-upstream").await;
+
+        let (body, _, _) = b
+            .get_cached_artifact_by_path(REPO, PATH)
+            .await
+            .expect("cache read must not error")
+            .expect(
+                "fixture is broken: two unscoped services over one directory must share \
+                 the key space, which is the defect #3454 describes",
+            );
+        assert_eq!(&body[..], b"ALPHA-from-deployment-a-upstream");
+    }
+
+    /// The scope segment goes INSIDE the reserved `proxy-cache/` namespace, so
+    /// every consumer that only classifies a key by that leading token keeps
+    /// working: the bucket-root anchoring that #3368/#3513 depends on, the
+    /// `is_proxy_cache_key` presign/GC branches, and the
+    /// `storage_key NOT LIKE 'proxy-cache/%'` accounting predicates.
+    #[test]
+    fn scoped_cache_keys_stay_classifiable_as_proxy_cache_content_3454() {
+        let scope = ProxyCacheScope::from_deployment_id(SCOPE_3454_A);
+        let keys = CacheKeys::derive(&scope, "maven-proxy", "org/x/1.0/x.jar").unwrap();
+
+        assert_eq!(
+            keys.content,
+            format!("proxy-cache/{SCOPE_3454_A}/maven-proxy/org/x/1.0/x.jar/__content__")
+        );
+        assert_eq!(
+            keys.metadata,
+            format!("proxy-cache/{SCOPE_3454_A}/maven-proxy/org/x/1.0/x.jar/__cache_meta__.json")
+        );
+
+        for key in [&keys.content, &keys.metadata] {
+            assert!(
+                ProxyService::is_proxy_cache_key(key),
+                "{key} stopped being recognised as proxy-cache content"
+            );
+            assert!(
+                crate::storage::key_is_bucket_root_anchored(key),
+                "{key} would get S3_PREFIX prepended, re-opening #3368"
+            );
+            // The shape the accounting SQL matches with LIKE 'proxy-cache/%'.
+            assert!(key.starts_with("proxy-cache/"));
+        }
+
+        // Two deployments, one repository key, one path -> two objects.
+        let other = CacheKeys::derive(
+            &ProxyCacheScope::from_deployment_id(SCOPE_3454_B),
+            "maven-proxy",
+            "org/x/1.0/x.jar",
+        )
+        .unwrap();
+        assert_ne!(keys.content, other.content);
+        assert_ne!(keys.metadata, other.metadata);
+    }
+
+    /// The object-store key budget must charge the scope segment. Left
+    /// uncharged, a path that passes validation produces a key the object
+    /// store rejects with `KeyTooLongError` mid-fetch (#1044).
+    #[test]
+    fn key_length_budget_charges_the_scope_segment_3454() {
+        let scope = ProxyCacheScope::from_deployment_id(SCOPE_3454_A);
+        let overhead =
+            scope.key_overhead_bytes() - ProxyCacheScope::unscoped().key_overhead_bytes();
+        assert!(overhead > 0, "scope must cost something to be a scope");
+
+        // Longest path that still fits UNDER the scope.
+        let repo = "r";
+        let fixed = scope.key_overhead_bytes() + repo.len() + 1 + 1 + "__cache_meta__.json".len();
+        let longest = ProxyService::MAX_STORAGE_KEY_BYTES - fixed;
+
+        let ok = CacheKeys::derive(&scope, repo, &"p".repeat(longest));
+        assert!(ok.is_ok(), "longest in-budget path was rejected");
+        assert!(
+            ok.unwrap().metadata.len() <= ProxyService::MAX_STORAGE_KEY_BYTES,
+            "in-budget key still exceeded the object-store limit"
+        );
+
+        // One byte more must be rejected, and the message must quote the real
+        // scoped length rather than the unscoped one.
+        let msg = match CacheKeys::derive(&scope, repo, &"p".repeat(longest + 1)) {
+            Err(e) => e.to_string(),
+            Ok(k) => panic!(
+                "a path one byte over the budget was accepted: {} ({} bytes)",
+                k.content,
+                k.metadata.len()
+            ),
+        };
+        assert!(
+            msg.contains(&(ProxyService::MAX_STORAGE_KEY_BYTES + 1).to_string()),
+            "budget message {msg:?} did not account for the scope segment"
+        );
+    }
+
+    /// A repository listing must enumerate only this deployment's cached
+    /// objects. `cached_artifact_paths` parses raw storage keys, so on a shared
+    /// bucket an unscoped parse would list paths this deployment never cached.
+    #[test]
+    fn cached_artifact_paths_ignores_another_deployments_objects_3454() {
+        let mine = ProxyCacheScope::from_deployment_id(SCOPE_3454_A);
+        let theirs = ProxyCacheScope::from_deployment_id(SCOPE_3454_B);
+
+        let keys = [
+            format!("{}{}", mine.repo_root("npm-remote"), "is-odd/__content__"),
+            format!("{}{}", theirs.repo_root("npm-remote"), "leaked/__content__"),
+            // Pre-#3454 objects at the shared root belong to nobody in
+            // particular; they must not be attributed to this deployment.
+            "proxy-cache/npm-remote/legacy/__content__".to_string(),
+        ];
+        let paths = ProxyService::cached_artifact_paths(
+            &mine,
+            "npm-remote",
+            keys.iter().map(String::as_str),
+        );
+        assert_eq!(paths, vec!["is-odd".to_string()]);
+    }
+
+    /// Same isolation requirement for the PyPI root simple index, which is
+    /// built by parsing cache keys rather than from database rows (#1278).
+    #[test]
+    fn pypi_simple_index_ignores_another_deployments_objects_3454() {
+        let mine = ProxyCacheScope::from_deployment_id(SCOPE_3454_A);
+        let theirs = ProxyCacheScope::from_deployment_id(SCOPE_3454_B);
+
+        let keys = [
+            format!(
+                "{}simple/requests/__content__",
+                mine.repo_root("pypi-remote")
+            ),
+            format!(
+                "{}simple/leaked/__content__",
+                theirs.repo_root("pypi-remote")
+            ),
+            "proxy-cache/pypi-remote/simple/legacy/__content__".to_string(),
+        ];
+        let names = ProxyService::pypi_package_names_from_cache_keys(
+            &mine,
+            "pypi-remote",
+            keys.iter().map(String::as_str),
+        );
+        assert_eq!(names, vec!["requests".to_string()]);
+    }
+
+    /// The Prometheus `repository` label is recovered by stripping the cache
+    /// root off a key. Strip only the bare namespace and every scoped key
+    /// reports the SCOPE segment as its repository, collapsing per-repository
+    /// cache metrics onto one label.
+    #[test]
+    fn cache_metric_label_is_the_repository_not_the_scope_3454() {
+        let scope = ProxyCacheScope::from_deployment_id(SCOPE_3454_A);
+        let keys = CacheKeys::derive(&scope, "maven-proxy", "org/x/1.0/x.jar").unwrap();
+        assert_eq!(
+            repo_key_from_cache_key(&scope, &keys.content),
+            "maven-proxy"
+        );
+        assert_ne!(
+            repo_key_from_cache_key(&scope, &keys.content),
+            SCOPE_3454_A.to_string()
+        );
+        // A key from another deployment is not attributable here.
+        let theirs = CacheKeys::derive(
+            &ProxyCacheScope::from_deployment_id(SCOPE_3454_B),
+            "maven-proxy",
+            "org/x/1.0/x.jar",
+        )
+        .unwrap();
+        assert_eq!(repo_key_from_cache_key(&scope, &theirs.content), "unknown");
+    }
+
+    /// The Debian release-epoch sidecar is a third key shape in the same
+    /// namespace and drives cross-file invalidation for a whole distribution.
+    /// Left unscoped, one deployment's `Release` change would invalidate the
+    /// other's cached indexes.
+    #[test]
+    fn release_epoch_key_is_deployment_scoped_3454() {
+        let a = ProxyCacheScope::from_deployment_id(SCOPE_3454_A);
+        let b = ProxyCacheScope::from_deployment_id(SCOPE_3454_B);
+        let key_a = ProxyService::release_epoch_key(&a, "debian-remote", "bookworm").unwrap();
+        let key_b = ProxyService::release_epoch_key(&b, "debian-remote", "bookworm").unwrap();
+        assert_eq!(
+            key_a,
+            format!(
+                "proxy-cache/{SCOPE_3454_A}/debian-remote/dists/bookworm/__release_epoch__.json"
+            )
+        );
+        assert_ne!(key_a, key_b);
+        assert!(crate::storage::key_is_bucket_root_anchored(&key_a));
+    }
+
+    /// Deleting a repository must reclaim its cache. After #3454 that means
+    /// BOTH this deployment's scoped subtree and the pre-upgrade unscoped one —
+    /// otherwise every object cached before the upgrade leaks forever, and the
+    /// #2047 hazard (a repository recreated with the same key serving the
+    /// deleted one's upstream content) survives in the legacy tree.
+    /// It must NOT reach another deployment's scoped subtree.
+    #[tokio::test]
+    async fn purge_repo_cache_sweeps_legacy_and_scoped_but_not_another_deployment_3454() {
+        let bucket = SharedBucket::new("purge");
+        let mine = ProxyCacheScope::from_deployment_id(SCOPE_3454_A);
+        let theirs = ProxyCacheScope::from_deployment_id(SCOPE_3454_B);
+        let proxy = bucket.deployment(mine.clone());
+        let storage = bucket.storage();
+
+        let scoped = format!("{}pkg/__content__", mine.repo_root("doomed"));
+        let legacy = "proxy-cache/doomed/pkg/__content__".to_string();
+        let other_deployment = format!("{}pkg/__content__", theirs.repo_root("doomed"));
+        let other_repo = format!("{}pkg/__content__", mine.repo_root("survivor"));
+        for key in [&scoped, &legacy, &other_deployment, &other_repo] {
+            storage
+                .put(key, Bytes::from_static(b"x"))
+                .await
+                .expect("seed object");
+        }
+
+        let deleted = proxy.purge_repo_cache("doomed").await.expect("purge");
+        assert_eq!(deleted, 2, "expected the scoped and legacy objects to go");
+
+        assert!(!storage.exists(&scoped).await.unwrap());
+        assert!(
+            !storage.exists(&legacy).await.unwrap(),
+            "pre-#3454 cached objects leak forever if the purge stops sweeping them"
+        );
+        assert!(
+            storage.exists(&other_deployment).await.unwrap(),
+            "purge reached into another deployment's cache"
+        );
+        assert!(storage.exists(&other_repo).await.unwrap());
+    }
+
+    /// #3454 follow-up (the destructive-collision defect). A repository key is
+    /// drawn from the same `[A-Za-z0-9._-]` alphabet as the scope segment, so a
+    /// repository can be created keyed EXACTLY as this deployment's scope
+    /// segment (`prod-eu`, or the default peer-instance UUID). For such a
+    /// repository the legacy unscoped sweep prefix
+    /// `ProxyCacheScope::unscoped().repo_root("prod-eu")` == `proxy-cache/prod-eu/`
+    /// collapses onto the deployment's WHOLE scoped cache root
+    /// `proxy-cache/<scope=prod-eu>/`. Before the guard, deleting that one
+    /// repository listed and deleted every other repository's cached objects in
+    /// this deployment.
+    ///
+    /// This is the real, live-reproduced blast radius, so it asserts on
+    /// before/after object COUNTS of an unrelated victim repository — not that
+    /// two scopes merely produce different keys.
+    #[tokio::test]
+    async fn purge_of_repo_keyed_as_scope_segment_spares_other_repos_3454() {
+        let bucket = SharedBucket::new("purge-collision");
+        // A legible, operator-set scope (`PROXY_CACHE_SCOPE=prod-eu`) — the
+        // trivially-guessable configuration the finding calls out.
+        let scope = ProxyCacheScope::from_env_and_identity(Some("prod-eu"), SCOPE_3454_A).unwrap();
+        assert_eq!(scope.segment(), Some("prod-eu"));
+        let proxy = bucket.deployment(scope.clone());
+        let storage = bucket.storage();
+
+        // The victim: a DIFFERENT repository in the SAME deployment, with two
+        // cached objects.
+        let victim_prefix = scope.repo_root("victim-proxy"); // proxy-cache/prod-eu/victim-proxy/
+        let victim_a = format!("{victim_prefix}org/a/1.0/a.jar/__content__");
+        let victim_b = format!("{victim_prefix}org/b/2.0/b.jar/__cache_meta__.json");
+        // The attacker-controlled repository, keyed EXACTLY as the scope
+        // segment, with its own single cached object.
+        let colliding_own = format!("{}pkg/__content__", scope.repo_root("prod-eu"));
+        // A third deployment's object at the true unscoped root, owned by nobody
+        // here — must also survive (the guard must not widen the sweep either).
+        let foreign = "proxy-cache/some-other-repo/x/__content__".to_string();
+
+        for key in [&victim_a, &victim_b, &colliding_own, &foreign] {
+            storage
+                .put(key, Bytes::from_static(b"x"))
+                .await
+                .expect("seed object");
+        }
+
+        // Before: the victim holds exactly its two objects.
+        let victim_before = storage.list(Some(&victim_prefix)).await.unwrap().len();
+        assert_eq!(
+            victim_before, 2,
+            "fixture: victim must start with 2 objects"
+        );
+
+        // Delete the repository that is keyed as the scope segment. This is the
+        // exact call a `repository:admin`-on-that-repo, non-admin caller drives.
+        let deleted = proxy
+            .purge_repo_cache("prod-eu")
+            .await
+            .expect("purge must not error");
+
+        // Only the colliding repository's OWN object is reclaimed.
+        assert_eq!(
+            deleted, 1,
+            "purge of the scope-keyed repo must delete only its own object, not the              whole deployment cache"
+        );
+        assert!(
+            !storage.exists(&colliding_own).await.unwrap(),
+            "the scope-keyed repository's own cache must still be purged"
+        );
+
+        // After: the victim's objects are INTACT — same count as before.
+        let victim_after = storage.list(Some(&victim_prefix)).await.unwrap().len();
+        assert_eq!(
+            victim_after, victim_before,
+            "deleting a repository keyed as the scope segment destroyed another              repository's cached objects ({victim_before} -> {victim_after})"
+        );
+        assert!(storage.exists(&victim_a).await.unwrap());
+        assert!(storage.exists(&victim_b).await.unwrap());
+        assert!(
+            storage.exists(&foreign).await.unwrap(),
+            "the guard must not reach unrelated root-level objects"
+        );
+    }
+
+    /// The repository "cached artifacts" listing and the PyPI root simple
+    /// index are both built by LISTING a storage prefix. On a shared bucket an
+    /// unscoped prefix enumerates every deployment's objects, so one
+    /// deployment's UI would show — and its PyPI index would advertise —
+    /// packages another deployment cached and it cannot serve.
+    #[tokio::test]
+    async fn cache_listings_enumerate_only_this_deployments_objects_3454() {
+        let bucket = SharedBucket::new("listing");
+        let mine = ProxyCacheScope::from_deployment_id(SCOPE_3454_A);
+        let theirs = ProxyCacheScope::from_deployment_id(SCOPE_3454_B);
+        let proxy = bucket.deployment(mine.clone());
+        let seeder = bucket.storage();
+
+        for (root, name) in [(&mine, "mine"), (&theirs, "theirs")] {
+            for repo in ["npm-remote", "pypi-remote"] {
+                seeder
+                    .put(
+                        &format!("{}{name}/__content__", root.repo_root(repo)),
+                        Bytes::from_static(b"x"),
+                    )
+                    .await
+                    .expect("seed");
+            }
+            seeder
+                .put(
+                    &format!("{}simple/{name}/__content__", root.repo_root("pypi-remote")),
+                    Bytes::from_static(b"x"),
+                )
+                .await
+                .expect("seed");
+        }
+        // A pre-#3454 object at the shared root, owned by nobody.
+        seeder
+            .put(
+                "proxy-cache/npm-remote/legacy/__content__",
+                Bytes::from_static(b"x"),
+            )
+            .await
+            .expect("seed");
+
+        assert_eq!(
+            proxy.list_cached_paths("npm-remote").await,
+            vec!["mine".to_string()],
+            "cached-artifact listing enumerated objects outside this deployment"
+        );
+        assert_eq!(
+            proxy.list_cached_pypi_packages("pypi-remote").await,
+            vec!["mine".to_string()],
+            "PyPI simple index advertised another deployment's cached projects"
         );
     }
 }

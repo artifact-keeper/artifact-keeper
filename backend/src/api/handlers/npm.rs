@@ -1130,6 +1130,102 @@ async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 // npm security advisories (npm audit) -- issue #1400
 // ---------------------------------------------------------------------------
 
+/// Maximum number of bytes accepted from a *decompressed* npm audit request
+/// body.
+///
+/// A gzip body small enough to pass the router's request-size limit can still
+/// expand to far more, so the decoded size needs its own ceiling: without one a
+/// hostile client turns a few KiB of upload into an unbounded allocation. Set to
+/// the same 16 MiB used for the upstream-response read below so the two limbs of
+/// the audit round-trip are bounded alike.
+const MAX_AUDIT_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Build the JSON error response used when an audit request body cannot be
+/// decoded.
+///
+/// Deliberately an error status rather than an empty advisory set (#3644): an
+/// audit that could not be *performed* must not be reported as an audit that
+/// found nothing, because npm renders the latter as "found 0 vulnerabilities".
+fn audit_request_error(status: StatusCode, message: &str) -> Response {
+    (status, axum::Json(serde_json::json!({"error": message}))).into_response()
+}
+
+/// Decode a possibly-compressed npm audit request body.
+///
+/// npm sends the bulk-advisory and quick-audit POSTs with
+/// `Content-Encoding: gzip`. axum hands a handler the body exactly as it arrived
+/// and there is no request-decompression layer in this stack — the `tower-http`
+/// compression features enabled for the router are response-side only — so
+/// before #3644 the handlers received gzip bytes wherever they expected JSON.
+/// The body was then forwarded upstream still compressed but labelled
+/// `Content-Type: application/json` with no `Content-Encoding`, upstream
+/// rejected it, and the failure path returned `{}` with HTTP 200: a silent
+/// all-clear.
+///
+/// `identity` and an absent header pass through untouched. `gzip`/`x-gzip` and
+/// `deflate` are decoded. Anything else is refused rather than guessed at.
+///
+/// Runs inline rather than on a blocking thread: these bodies are dependency
+/// maps (kilobytes in practice), the decoded size is capped, and the router's
+/// global concurrency layer is what sheds load if CPU-bound work does pile up.
+fn decode_audit_request_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Response> {
+    use std::io::Read;
+
+    let encoding = headers
+        .get(CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase());
+
+    let encoding = match encoding.as_deref() {
+        None | Some("") | Some("identity") => return Ok(body),
+        Some(other) => other.to_string(),
+    };
+
+    let mut decoded = Vec::new();
+    // `take` one byte past the cap so an over-cap body is detectable rather
+    // than silently truncated into valid-looking JSON.
+    let limit = (MAX_AUDIT_REQUEST_BODY_BYTES as u64).saturating_add(1);
+    let read = match encoding.as_str() {
+        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(body.as_ref())
+            .take(limit)
+            .read_to_end(&mut decoded),
+        "deflate" => flate2::read::ZlibDecoder::new(body.as_ref())
+            .take(limit)
+            .read_to_end(&mut decoded),
+        _ => {
+            return Err(audit_request_error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                &format!(
+                    "unsupported Content-Encoding '{}' on audit request",
+                    encoding
+                ),
+            ));
+        }
+    };
+
+    if let Err(err) = read {
+        debug!(
+            target: "npm_audit",
+            encoding = %encoding,
+            error = %err,
+            "audit request body failed to decompress"
+        );
+        return Err(audit_request_error(
+            StatusCode::BAD_REQUEST,
+            "audit request body did not decode as the declared Content-Encoding",
+        ));
+    }
+
+    if decoded.len() > MAX_AUDIT_REQUEST_BODY_BYTES {
+        return Err(audit_request_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "decompressed audit request body exceeds the size limit",
+        ));
+    }
+
+    Ok(Bytes::from(decoded))
+}
+
 /// Build the empty `advisories/bulk` response shape that npm clients expect
 /// when no advisories are known for any of the requested packages. An empty
 /// JSON object signals "no advisories" without producing a parse error.
@@ -1828,9 +1924,12 @@ async fn npm_meta_get(
 async fn security_advisories_bulk(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     const PATH: &str = "/-/npm/v1/security/advisories/bulk";
+    // npm gzips this POST; decode before anything inspects or forwards it (#3644).
+    let body = decode_audit_request_body(&headers, body)?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Remote {
@@ -1879,9 +1978,12 @@ async fn security_advisories_bulk(
 async fn security_audits_quick(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     const PATH: &str = "/-/npm/v1/security/audits/quick";
+    // npm gzips this POST; decode before anything inspects or forwards it (#3644).
+    let body = decode_audit_request_body(&headers, body)?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Remote {
@@ -2826,9 +2928,7 @@ async fn collect_virtual_packument(
     // versions, dist-tags, tarball URLs or shasums to it.
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
     if members.is_empty() {
-        return Err(
-            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
-        );
+        return Err(proxy_helpers::no_accessible_members_response());
     }
 
     // Batch-load per-member npm scope policies once per request (#2327).
@@ -6144,7 +6244,10 @@ mod tests {
                 "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
                 "DELETE FROM repositories WHERE id = $1",
             ] {
-                let _ = sqlx::query(sql).bind(member_id).execute(&fx.pool).await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(member_id)
+                    .execute(&fx.pool)
+                    .await;
             }
         }
         let _ = std::fs::remove_dir_all(&local_dir);
@@ -8575,6 +8678,134 @@ mod tests {
     // npm audit advisories endpoint (issue #1400)
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // decode_audit_request_body (#3644)
+    // -----------------------------------------------------------------------
+
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).expect("gzip write");
+        enc.finish().expect("gzip finish")
+    }
+
+    fn headers_with_encoding(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_ENCODING, HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    const AUDIT_BODY: &str = r#"{"lodash":["4.17.15"],"minimist":["1.2.0"]}"#;
+
+    /// The regression this fixes: npm sends the bulk-advisory POST gzipped, and
+    /// the decoded body must equal what an uncompressed client would have sent.
+    /// Before #3644 the gzip bytes reached the forwarder untouched and the
+    /// endpoint answered `{}` with HTTP 200 — a silent "0 vulnerabilities".
+    #[test]
+    fn test_decode_audit_request_body_gunzips_gzip_encoding() {
+        let gz = gzip_bytes(AUDIT_BODY.as_bytes());
+        assert_ne!(
+            gz.as_slice(),
+            AUDIT_BODY.as_bytes(),
+            "fixture must actually be compressed"
+        );
+        assert_eq!(&gz[..2], &[0x1f, 0x8b], "gzip magic");
+
+        let decoded =
+            super::decode_audit_request_body(&headers_with_encoding("gzip"), Bytes::from(gz))
+                .expect("gzip body must decode");
+        assert_eq!(decoded, Bytes::from(AUDIT_BODY));
+        // And it must be parseable as the advisory map the handlers expect.
+        serde_json::from_slice::<serde_json::Value>(&decoded).expect("decoded body is JSON");
+    }
+
+    /// npm has historically also used `x-gzip`; treat it as gzip.
+    #[test]
+    fn test_decode_audit_request_body_accepts_x_gzip() {
+        let gz = gzip_bytes(AUDIT_BODY.as_bytes());
+        let decoded =
+            super::decode_audit_request_body(&headers_with_encoding("x-gzip"), Bytes::from(gz))
+                .expect("x-gzip body must decode");
+        assert_eq!(decoded, Bytes::from(AUDIT_BODY));
+    }
+
+    #[test]
+    fn test_decode_audit_request_body_inflates_deflate_encoding() {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(AUDIT_BODY.as_bytes()).unwrap();
+        let deflated = enc.finish().unwrap();
+
+        let decoded = super::decode_audit_request_body(
+            &headers_with_encoding("deflate"),
+            Bytes::from(deflated),
+        )
+        .expect("deflate body must decode");
+        assert_eq!(decoded, Bytes::from(AUDIT_BODY));
+    }
+
+    /// No header, an empty header, and `identity` all mean "already plain".
+    #[test]
+    fn test_decode_audit_request_body_passthrough_when_uncompressed() {
+        let plain = Bytes::from(AUDIT_BODY);
+
+        let decoded = super::decode_audit_request_body(&HeaderMap::new(), plain.clone()).unwrap();
+        assert_eq!(decoded, plain, "absent header passes through");
+
+        let decoded =
+            super::decode_audit_request_body(&headers_with_encoding("identity"), plain.clone())
+                .unwrap();
+        assert_eq!(decoded, plain, "identity passes through");
+    }
+
+    /// Encoding matching is case- and whitespace-insensitive per RFC 9110.
+    #[test]
+    fn test_decode_audit_request_body_encoding_match_is_case_insensitive() {
+        let gz = gzip_bytes(AUDIT_BODY.as_bytes());
+        let decoded =
+            super::decode_audit_request_body(&headers_with_encoding(" GZIP "), Bytes::from(gz))
+                .expect("uppercase/padded gzip must decode");
+        assert_eq!(decoded, Bytes::from(AUDIT_BODY));
+    }
+
+    /// A body that does not decode must be an error, NOT an empty advisory set:
+    /// an audit that could not run must be distinguishable from a clean audit.
+    #[test]
+    fn test_decode_audit_request_body_malformed_gzip_is_an_error() {
+        let err = super::decode_audit_request_body(
+            &headers_with_encoding("gzip"),
+            Bytes::from_static(b"this is definitely not gzip"),
+        )
+        .expect_err("malformed gzip must not be treated as a valid empty audit");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An encoding we cannot decode is refused rather than forwarded blind.
+    #[test]
+    fn test_decode_audit_request_body_unsupported_encoding_is_refused() {
+        let err = super::decode_audit_request_body(
+            &headers_with_encoding("br"),
+            Bytes::from_static(b"\x00\x01\x02"),
+        )
+        .expect_err("unsupported encoding must be refused");
+        assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// A small gzip payload that expands past the cap is rejected, not
+    /// truncated into valid-looking JSON.
+    #[test]
+    fn test_decode_audit_request_body_rejects_decompression_bomb() {
+        let huge = vec![b'a'; super::MAX_AUDIT_REQUEST_BODY_BYTES + 1024];
+        let gz = gzip_bytes(&huge);
+        assert!(
+            gz.len() < super::MAX_AUDIT_REQUEST_BODY_BYTES,
+            "compressed fixture should be small relative to its decoded size"
+        );
+        let err = super::decode_audit_request_body(&headers_with_encoding("gzip"), Bytes::from(gz))
+            .expect_err("over-cap decoded body must be rejected");
+        assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     /// The empty `advisories/bulk` response must be a JSON object so npm
     /// parses it as "zero advisories" instead of bailing out. An array or
     /// non-JSON body causes the npm client to print a parse error.
@@ -10949,7 +11180,10 @@ mod db_cov_tests {
             "DELETE FROM artifacts WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(sql).bind(member_id).execute(&fx.pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await;
         }
         let _ = std::fs::remove_dir_all(member_dir);
     }
@@ -11693,7 +11927,10 @@ mod proxy_scan_block_tests {
             "DELETE FROM artifacts WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member_id)
+                .execute(pool)
+                .await;
         }
         let _ = std::fs::remove_dir_all(dir);
     }

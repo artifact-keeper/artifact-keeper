@@ -79,6 +79,13 @@ cat > "$STUB/gh" <<'STUBGH'
 case "$1" in
   api)
     case "$2" in
+      graphql)
+        # The PR -> closing-issue map for check 5. $FAKE_CLOSES_MAP is already
+        # in the `<pr>:<issue>,<issue>` shape the real --jq produces.
+        [ "${FAKE_GRAPHQL_FAIL-0}" = "1" ] && exit 1
+        [ -n "${FAKE_CLOSES_MAP-}" ] && printf '%s\n' "$FAKE_CLOSES_MAP"
+        exit 0
+        ;;
       *actions/workflows/docker-publish.yml/runs*)
         [ "${FAKE_API_FAIL-0}" = "1" ] && exit 1
         run_id="${FAKE_RUN_ID-12345}"
@@ -118,6 +125,7 @@ run_case() {
   ( cd "$REPO_DIR" && PATH="$STUB:$PATH" \
       PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
       PREFLIGHT_SKIP_VERSION_PIN=1 \
+      PREFLIGHT_SKIP_CHANGELOG_RECON=1 \
       bash scripts/ci/release-preflight.sh >"$WORK/out.txt" 2>&1 )
   echo $?
 }
@@ -177,6 +185,7 @@ FAKE_RUN_STATUS=in_progress FAKE_SECURITY_SCAN=success FAKE_MANIFEST=success \
 ( cd "$REPO_DIR" && PATH="$STUB:$PATH" PREFLIGHT_REPO=x/y \
     FAKE_SECURITY_SCAN=failure FAKE_MANIFEST=skipped PREFLIGHT_ALLOW_RED_PUBLISH=1 \
     PREFLIGHT_SKIP_VERSION_PIN=1 \
+    PREFLIGHT_SKIP_CHANGELOG_RECON=1 \
     bash scripts/ci/release-preflight.sh >"$WORK/out.txt" 2>&1 )
 rc=$?
 if [ "$rc" -eq 0 ] && grep -qF "PREFLIGHT_ALLOW_RED_PUBLISH=1 was set" "$WORK/out.txt"; then
@@ -209,6 +218,7 @@ expect1() { # <label> <expected-exit> <expected-substring> <main-trivyignore> <r
       FAKE_RELEASE_REFS="$REL_REFS" \
       FAKE_REL_TRIVYIGNORE="$rel_ti" \
       PREFLIGHT_SKIP_VERSION_PIN=1 \
+      PREFLIGHT_SKIP_CHANGELOG_RECON=1 \
       bash scripts/ci/release-preflight.sh >"$WORK/out.txt" 2>&1 )
   got=$?
   rm -f "$REPO_DIR/.trivyignore"
@@ -251,6 +261,160 @@ CVE-2099-0002"
 expect1 "token both live and tombstoned -> NOT READY" 1 "BOTH as live suppressions" \
   "CVE-2099-0001
 # RETIRED: CVE-2099-0001" \
+  "CVE-2099-0001"
+
+echo
+echo "release-preflight ref-awareness"
+
+# --- ref-awareness fixtures -------------------------------------------------
+#   release-preflight.yml hardcoded `ref: main` in its checkout, so a preflight
+#   DISPATCHED on release/1.7.x ran that branch's workflow against MAIN's tree.
+#   v1.7.5, v1.7.6 and v1.7.7 were each cut on a READY verdict that was a
+#   statement about a different branch. Two properties fix that and both are
+#   asserted here, because both are invisible from the happy path:
+#
+#     * the verdict NAMES the ref and sha it evaluated, so a transcript cannot
+#       be mistaken for one about another branch;
+#     * check 1 -- "does MAIN account for every release/* suppression?" -- is
+#       skipped when the audited ref is itself a release branch, because
+#       another branch's suppressions are not a claim about this cut and the
+#       branch comparing against itself is vacuous.
+#
+#   The second must stay NARROW in both directions: skipping it for main (or
+#   for a detached HEAD, which is what a sha checkout gives) would silently
+#   delete the #3039 gate, so case 3 below re-runs the exact forward-port miss
+#   from check-1 case 1 with PREFLIGHT_REF=main and demands it still fails.
+#
+#   These cases are SCOPED to check 1, the same way every other helper in this
+#   file is scoped to the check it is about (checks 3 and 4 are neutralised
+#   here; check 5's own cases at the bottom neutralise 3 and 4 symmetrically).
+#   That is deliberate and it should stay that way: the alternative -- giving
+#   this fixture a CHANGELOG.md, a reachable stable tag and a gh stub that
+#   answers check 5's GraphQL PR->issue query -- would make a check-1 assertion
+#   fail whenever check 5's fixture requirements change, which is the coupling
+#   that made these two changes collide in the first place. A case should be a
+#   statement about one check.
+expectref() { # <label> <expected-exit> <expected-substring> <preflight-ref> [main-trivyignore] [rel-trivyignore]
+  local label="$1" want="$2" needle="$3" pref="$4" main_ti="${5:-}" rel_ti="${6:-}" got
+  [ -n "$main_ti" ] && printf '%s\n' "$main_ti" > "$REPO_DIR/.trivyignore"
+  ( cd "$REPO_DIR" && PATH="$STUB:$PATH" \
+      PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
+      PREFLIGHT_REF="$pref" \
+      FAKE_RELEASE_REFS="$REL_REFS" \
+      FAKE_REL_TRIVYIGNORE="$rel_ti" \
+      PREFLIGHT_SKIP_VERSION_PIN=1 \
+      PREFLIGHT_SKIP_CHANGELOG_RECON=1 \
+      bash scripts/ci/release-preflight.sh > "$WORK/out.txt" 2>&1 )
+  got=$?
+  rm -f "$REPO_DIR/.trivyignore"
+  if [ "$got" != "$want" ]; then
+    fail "$label: expected exit $want, got $got"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  elif ! grep -qF "$needle" "$WORK/out.txt"; then
+    fail "$label: exit $got correct but output lacks '$needle'"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  else
+    pass "$label (exit $got)"
+  fi
+}
+
+# 1. The verdict names the ref it evaluated, and strips refs/heads/ so the
+#    caller can pass either spelling.
+expectref "verdict names the audited ref" 0 "READY to cut from release/1.7.x@" \
+  refs/heads/release/1.7.x
+
+# 2. On a release branch, the main-centric drift check does not manufacture a
+#    finding no cut from that branch could act on.
+expectref "release ref -> check 1 is NOT APPLICABLE, not a failure" 0 "NOT APPLICABLE" \
+  release/1.7.x \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+# 3. ...and the exemption stays narrow: the same fixture on main is still the
+#    #3039 hard failure it has always been.
+expectref "main ref -> forward-port miss still blocks" 1 "main is MISSING suppressions" \
+  refs/heads/main \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+# 4. A NOT READY verdict names the ref too -- an unnamed failure is as
+#    ambiguous as an unnamed pass.
+expectref "NOT READY names the audited ref" 1 "NOT READY to cut from main@" \
+  main \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+echo
+echo "release-preflight INFRA precedence (#3538)"
+
+# --- exit 1 outranks exit 2 -------------------------------------------------
+#   Every INFRA site exits the script immediately, which used to DISCARD the
+#   `problems` the earlier checks had already counted. A run where check 1
+#   found real forward-port drift and a later check could not be measured
+#   reported exit 2 -- "retryable" -- when the true answer was "you are not
+#   ready, and retrying will not help". Telling an operator to retry a definite
+#   red is how a red gets laundered into a rerun, which is the same species of
+#   defect as #3308 one layer along.
+#
+#   This is not hypothetical: it is exactly what surfaced when #3539's check 5
+#   (which reports INFRA on a repo with no CHANGELOG.md) landed alongside the
+#   ref-awareness cases above, whose synthetic repos have none. The state is
+#   reproduced here on purpose rather than only skipped away, so the precedence
+#   stays asserted after the skip that scopes those cases.
+#
+#   The pair matters in both directions. A definite red must survive a later
+#   indeterminate (case 1), and an indeterminate must NOT be promoted into a
+#   verdict when there is no blocking problem to promote (case 2) -- that would
+#   turn "I could not measure" into "not ready", which is a different lie.
+expectinfra() { # <label> <expected-exit> <expected-substring> <main-trivyignore> <rel-trivyignore>
+  local label="$1" want="$2" needle="$3" main_ti="$4" rel_ti="$5" got
+  [ -n "$main_ti" ] && printf '%s\n' "$main_ti" > "$REPO_DIR/.trivyignore"
+  # No CHANGELOG.md in the fixture, and check 5 is NOT skipped -- so check 5
+  # reports INFRA after check 1 has had its say.
+  ( cd "$REPO_DIR" && PATH="$STUB:$PATH" \
+      PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
+      PREFLIGHT_REF=main \
+      FAKE_RELEASE_REFS="$REL_REFS" \
+      FAKE_REL_TRIVYIGNORE="$rel_ti" \
+      PREFLIGHT_SKIP_VERSION_PIN=1 \
+      bash scripts/ci/release-preflight.sh > "$WORK/out.txt" 2>&1 )
+  got=$?
+  rm -f "$REPO_DIR/.trivyignore"
+  if [ "$got" != "$want" ]; then
+    fail "$label: expected exit $want, got $got"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  elif ! grep -qF "$needle" "$WORK/out.txt"; then
+    fail "$label: exit $got correct but output lacks '$needle'"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  else
+    pass "$label (exit $got)"
+  fi
+}
+
+# 1. A blocking problem already counted, then a check that cannot be measured:
+#    NOT READY wins. Retrying does not forward-port a suppression.
+expectinfra "blocking problem then INFRA -> NOT READY (exit 1)" 1 \
+  "blocking problem(s) found before a later check could not be measured" \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+# 2. ...and the transcript says the audit is incomplete rather than implying a
+#    clean sweep of every check.
+expectinfra "the incomplete-audit caveat is stated" 1 \
+  "this audit is incomplete" \
+  "CVE-2099-0001" \
+  "CVE-2099-0001
+CVE-2099-0002"
+
+# 3. Nothing blocking counted: an unmeasurable check is still INFRA, never a
+#    manufactured verdict and never a pass.
+expectinfra "no blocking problem, then INFRA -> still INFRA (exit 2)" 2 \
+  "INFRA: no CHANGELOG.md at the repo root" \
+  "CVE-2099-0001" \
   "CVE-2099-0001"
 
 echo
@@ -335,6 +499,7 @@ expect4() { # <label> <expected-exit> <expected-substring>
       PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
       PREFLIGHT_TAG_STATE_CMD="$PROBES/state" \
       PREFLIGHT_TAG_REVISION_CMD="$PROBES/revision" \
+      PREFLIGHT_SKIP_CHANGELOG_RECON=1 \
       bash scripts/ci/release-preflight.sh >"$WORK/out.txt" 2>&1 )
   got=$?
   if [ "$got" != "$want" ]; then
@@ -377,6 +542,225 @@ FAKE_TAG_STATE=indeterminate \
 #    publish job hard-fails on it too, so it blocks rather than retries.
 FAKE_TAG_STATE=present FAKE_TAG_REVISION=none \
   expect4 "published without provenance -> NOT READY" 1 "NOT READY"
+
+echo
+echo "release-preflight check 5 (#3537)"
+
+# --- check 5 fixture --------------------------------------------------------
+#   Check 5 reconciles the pending CHANGELOG section against
+#   `<previous stable tag>..HEAD` in both directions. It exists because four
+#   of the last eight releases shipped with wrong bookkeeping and the only
+#   automated check asserted that a `## [X.Y.Z]` heading exists and is
+#   non-empty -- which a section describing a DIFFERENT release also satisfies.
+#
+#   The three shapes below are the ones that actually shipped:
+#     forward   an entry whose commits are not in the range (v1.7.1 left 8
+#               already-shipped entries under [Unreleased]; v1.8.1 filed two
+#               scanner-CVE fixes there instead of under [1.8.1])
+#     backward  a commit in the range that no pending entry mentions (a PR
+#               merged ~5h after the v1.7.3 tag filed its bullet under the
+#               released `## [1.7.3]` heading)
+#     no open [Unreleased] at all (#3433)
+#
+#   Case 4 is the counterweight: run AFTER the promotion and before the tag,
+#   the same work sits under a `## [X.Y.Z]` heading for a version that has not
+#   shipped. Reconciling against `[Unreleased]` alone would call every commit
+#   in the range undocumented -- replayed against the v1.7.1 cut that is 27
+#   false failures next to the one true one. Narrow the pending-section
+#   definition back to `[Unreleased]` only and case 4 goes red.
+#
+#   The GitHub API is reached exactly once, for the PR -> closing-issue map,
+#   and it is stubbed here. CHANGELOG entries cite ISSUE numbers while
+#   squash-merge subjects carry PR numbers, so without that map nothing
+#   resolves.
+REPO5="$WORK/repo5"
+mkdir -p "$REPO5/scripts/ci" "$REPO5/backend/src/api"
+cp "$SCRIPT" "$REPO5/scripts/ci/release-preflight.sh"
+printf 'version = "9.9.9"\n' > "$REPO5/Cargo.toml"
+printf 'version = "9.9.9"\n' > "$REPO5/backend/src/api/openapi.rs"
+printf 'name = "artifact-keeper-backend"\nversion = "9.9.9"\n' > "$REPO5/Cargo.lock"
+printf '# Changelog\n\n## [Unreleased]\n' > "$REPO5/CHANGELOG.md"
+git -C "$REPO5" init -q
+git -C "$REPO5" remote add origin https://github.com/artifact-keeper/artifact-keeper.git
+git5() { git -C "$REPO5" -c user.email=t@t -c user.name=t "$@"; }
+git5 add -A; git5 commit -qm "chore(release): prepare 9.9.8 (#100)"
+git5 tag v9.9.8
+git5 commit -q --allow-empty -m "fix(a): alpha (#101)"
+git5 commit -q --allow-empty -m "fix(b): beta (#102)"
+git5 commit -q --allow-empty -m "chore: bump dep from 1.0 to 1.1 (#103)"
+git5 commit -q --allow-empty -m "docs(changelog): record the late fix (#104)"
+# PR 101 closes issue 201, PR 102 closes issue 202; the bump and the changelog
+# commit close nothing.
+CLOSES_MAP=$'101:201\n102:202\n103:\n104:'
+
+expect5() { # <label> <expected-exit> <expected-substring> <changelog on stdin>
+  local label="$1" want="$2" needle="$3" got
+  cat > "$REPO5/CHANGELOG.md"
+  ( cd "$REPO5" && PATH="$STUB4:$PATH" \
+      PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
+      PREFLIGHT_SKIP_DOCKER_HEALTH=1 PREFLIGHT_SKIP_VERSION_PIN=1 \
+      FAKE_CLOSES_MAP="${FAKE_CLOSES_MAP-$CLOSES_MAP}" \
+      bash scripts/ci/release-preflight.sh >"$WORK/out.txt" 2>&1 )
+  got=$?
+  if [ "$got" != "$want" ]; then
+    fail "$label: expected exit $want, got $got"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  elif ! grep -qF "$needle" "$WORK/out.txt"; then
+    fail "$label: exit $got correct but output lacks '$needle'"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  else
+    pass "$label (exit $got)"
+  fi
+}
+
+# 1. Both directions satisfied: every entry's lead issue is closed by a PR in
+#    the range, and every non-exempt PR in the range is cited. The dependency
+#    bump is exempt and needs no entry. Guards against a gate that blocks
+#    every cut.
+expect5 "pending section reconciles -> READY" 0 "pending sections reconcile" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+
+# 2. THE FORWARD REGRESSION (v1.7.1 / v1.8.1). An entry whose work is not in
+#    the range: it was left behind when its commits shipped, so it describes
+#    some other release. Delete the forward direction and this goes green.
+expect5 "entry referencing out-of-range work -> NOT READY" 1 "reference work that is NOT in" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+- **something that already shipped** (#999). prose.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+
+# 3. THE BACKWARD REGRESSION (post-v1.7.3). A merged PR in the range that the
+#    pending section does not mention -- because its bullet was filed under an
+#    already-released heading. Delete the backward direction and this goes
+#    green, and that is the direction no existing check has at all.
+expect5 "commit in range with no pending entry -> NOT READY" 1 "are not described by the pending section" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+
+## [9.9.8] - 2026-01-01
+- older work
+- **beta is fixed** (#202). filed under the RELEASED section, after the tag.
+EOF
+
+# 3b. THE RECURSION. A `docs(changelog):` commit cannot describe itself: its
+#     entire content IS the changelog entry, so demanding an entry for it
+#     produces another such commit, and so on. Real occurrence: cutting 1.8.2,
+#     #3613 merged after the pending section was written and this check
+#     correctly blocked; the fix added the missing entry and then blocked the
+#     cut itself. Drop the `docs(changelog)` arm from the exemption and this
+#     goes red.
+expect5 "docs(changelog) commit is exempt -> READY" 0 "" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+EOF
+
+# 4. THE COUNTERWEIGHT. Run after the CHANGELOG promotion and before the tag,
+#    the same work sits under `## [9.9.9]` -- a version newer than the previous
+#    stable tag and therefore still pending. This must reconcile, or the check
+#    is unusable at the last moment it can help.
+expect5 "promoted-but-untagged section counts as pending -> READY" 0 "## [9.9.9]" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+## [9.9.9] - 2026-08-24
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+
+# 5. `### Sponsors` / `### Thank You` bullets credit the person who FILED an
+#    issue. That is not a claim the work is in this range, and those sections
+#    are mandatory in every release, so treating their references as entries
+#    would fail every real cut.
+expect5 "recognition sections are not entries -> READY" 0 "READY" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Sponsors
+- **Someone** ([@someone](https://github.com/someone))
+
+### Thank You
+- @reporter for reporting a bug filed long ago (#42)
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+
+# 6. No open `## [Unreleased]` at all (#3433): there is nothing to reconcile
+#    against, which is blocking rather than vacuously clean.
+expect5 "no [Unreleased] section -> NOT READY" 1 "nothing to reconcile" << 'EOF'
+# Changelog
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+
+# 7. Could not measure is NOT a readiness verdict. Without the PR -> issue map
+#    every entry would look unresolved, so a failed query must be INFRA and
+#    never a pass -- the same lesson as #3308.
+FAKE_GRAPHQL_FAIL=1 \
+  expect5 "PR->issue map unqueryable -> INFRA" 2 "INFRA" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose.
+EOF
+
+# 8. A range that cannot be bounded is also indeterminate, not clean: a clone
+#    with no tags has no previous stable tag to measure from.
+REPO5B="$WORK/repo5b"
+cp -r "$REPO5" "$REPO5B"
+git -C "$REPO5B" tag -d v9.9.8 >/dev/null
+( cd "$REPO5B" && PATH="$STUB4:$PATH" PREFLIGHT_REPO=x/y \
+    PREFLIGHT_SKIP_DOCKER_HEALTH=1 PREFLIGHT_SKIP_VERSION_PIN=1 \
+    FAKE_CLOSES_MAP="$CLOSES_MAP" \
+    bash scripts/ci/release-preflight.sh >"$WORK/out.txt" 2>&1 )
+rc=$?
+if [ "$rc" = "2" ] && grep -qF "no previous stable tag" "$WORK/out.txt"; then
+  pass "no previous stable tag -> INFRA (exit 2)"
+else
+  fail "no previous stable tag: expected exit 2 with INFRA, got $rc"
+  sed 's/^/        /' "$WORK/out.txt" >&2
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then

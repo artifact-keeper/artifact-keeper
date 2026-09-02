@@ -486,6 +486,7 @@ async fn fetch_remote_simple_root(
         &effective_upstream,
         &upstream_path,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Pypi,
     )
     .await
     {
@@ -849,6 +850,7 @@ async fn simple_project(
                         &effective_upstream,
                         &upstream_path,
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                        RepositoryFormat::Pypi,
                     )
                     .await?
                 };
@@ -967,10 +969,7 @@ async fn simple_project(
                     .await?;
 
             if members.is_empty() {
-                return Err(
-                    AppError::NotFound("Virtual repository has no members".to_string())
-                        .into_response(),
-                );
+                return Err(proxy_helpers::no_accessible_members_response());
             }
 
             // PEP 708 (#1600, priority-aware per #2311): when a local member
@@ -1151,6 +1150,7 @@ async fn simple_project(
                         &effective_upstream,
                         &upstream_path,
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                        RepositoryFormat::Pypi,
                     )
                     .await
                 };
@@ -1777,14 +1777,7 @@ async fn download_or_metadata(
                 .await;
             }
         }
-        return serve_metadata(
-            &state,
-            &state.db,
-            repo.id,
-            &repo.storage_location(),
-            real_filename,
-        )
-        .await;
+        return serve_metadata(&state, &state.db, &repo, real_filename).await;
     }
 
     // Regular file download.
@@ -1912,13 +1905,17 @@ async fn serve_virtual_metadata(
 ) -> Result<Response, Response> {
     let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo.id).await?;
     if members.is_empty() {
-        return Err(
-            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
-        );
+        return Err(proxy_helpers::no_accessible_members_response());
     }
 
     let members =
         proxy_helpers::authorize_virtual_members(&state.db, auth, virtual_repo.id, members).await;
+    // #3452: a fully-filtered member set must answer the SAME body the
+    // genuinely-empty set above answers, or the pair is an existence oracle
+    // over the private members this virtual aggregates.
+    if members.is_empty() {
+        return Err(proxy_helpers::no_accessible_members_response());
+    }
 
     // Keep PEP 658 metadata resolution symmetric with the simple-index and
     // distribution-download paths. A higher-priority local owner suppresses a
@@ -1981,20 +1978,17 @@ async fn serve_virtual_metadata(
         // Set when this member owns the name but its bytes are temporarily
         // unavailable; confines the fallback to this member (#3372).
         let mut owns_unavailable_bytes = false;
-        match serve_metadata(
-            state,
-            &state.db,
-            member.id,
-            &member.storage_location(),
-            filename,
-        )
-        .await
-        {
+        match serve_metadata(state, &state.db, &member_info, filename).await {
             Ok(response) => return Ok(response),
             Err(response) if response.status() == StatusCode::NOT_FOUND => {}
             // 507: this member HAS an `artifacts` row for the file, but
-            // storage could not produce the bytes even after the coordinated
-            // re-read. That is NOT "this member does not have it" -- the
+            // storage could not produce the bytes. For a hosted row that is
+            // after the coordinated re-read; for a proxy-cache-backed row
+            // `serve_metadata` answers immediately, because no local writer
+            // owns that key and the re-read cannot succeed -- the recovery
+            // that works is the upstream re-fetch just below, which is exactly
+            // why it hands us the 507 straight away (#3463). Either way this
+            // is NOT "this member does not have it" -- the
             // member owns the name, so falling through to a lower-priority
             // member would serve THAT member's upstream METADATA for a
             // distribution this one owns. We still try this member's OWN
@@ -2732,10 +2726,7 @@ async fn serve_file(
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
                 if members.is_empty() {
-                    return Err(AppError::NotFound(
-                        "Virtual repository has no members".to_string(),
-                    )
-                    .into_response());
+                    return Err(proxy_helpers::no_accessible_members_response());
                 }
 
                 // #2073 (sibling of #1804, fixed for Maven by #1816): authorize
@@ -2750,6 +2741,13 @@ async fn serve_file(
                 let members =
                     proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
                         .await;
+                // #3452: a fully-filtered member set must answer the SAME body
+                // the genuinely-empty set above answers, or the pair is an
+                // existence oracle over the private members this virtual
+                // aggregates.
+                if members.is_empty() {
+                    return Err(proxy_helpers::no_accessible_members_response());
+                }
 
                 // PEP 708 dependency-confusion guard (#1600), superseding the
                 // version-aware shadowing guard (#1217, #1582) and the
@@ -3169,12 +3167,7 @@ where
              refusing to serve it and re-fetching from upstream (#3147)"
         );
         let result = refetch().await?;
-        return Ok(tee_refetch_to_storage(
-            storage,
-            storage_key.to_string(),
-            result.content_length,
-            result.body,
-        ));
+        return Ok(write_back_refetch(storage, storage_key, result));
     }
 
     match storage.get_stream(storage_key).await {
@@ -3187,15 +3180,59 @@ where
                 "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream (streaming)"
             );
             let result = refetch().await?;
-            Ok(tee_refetch_to_storage(
-                storage,
-                storage_key.to_string(),
-                result.content_length,
-                result.body,
-            ))
+            Ok(write_back_refetch(storage, storage_key, result))
         }
         Err(e) => Err(map_storage_err(e)),
     }
+}
+
+/// Forward a refetched body to the client, teeing it back into storage only
+/// when this handle is the one that owns the key.
+///
+/// `refetch` runs through the proxy service's normal streaming cache path,
+/// which commits the body **and** its `__cache_meta__.json` sidecar under the
+/// `CachePersister` contract (#1618 S9): #1365 zero-byte guard, #1051 ETag
+/// pin, body-before-sidecar ordering, and the `proxy_cache_artifacts` catalog
+/// upsert. For a `proxy-cache/` key that write has therefore already happened,
+/// to the same key, by the owner of the key.
+///
+/// Teeing a second copy through the ARTIFACT handle would write the body with
+/// none of that: no sidecar update, no zero-byte guard, no ETag re-pin, no
+/// catalog row, no quota accounting — and it races the proxy's own writer for
+/// the same object. It is not merely redundant, it is unsafe: `is_fresh` falls
+/// back to comparing `size(cache_key)` against the sidecar's `size_bytes` when
+/// the pinned ETag is multipart-shaped, so a same-length body written out of
+/// band keeps the entry "fresh" and the redirect path hands out a presigned
+/// URL to bytes the sidecar never vouched for — the hole #3147 exists to
+/// close. The truncation compensator in [`tee_refetch_to_storage`] would also
+/// issue a `delete()` against the live cache object.
+///
+/// Before #3368 this was masked rather than absent: on a prefixed S3
+/// deployment the tee landed on `<S3_PREFIX>/proxy-cache/...`, a shadow path
+/// nothing read. On every unprefixed deployment the two writers have always
+/// collided. Restricting the tee to keys this handle actually owns fixes both.
+fn write_back_refetch(
+    storage: std::sync::Arc<dyn crate::storage::StorageBackend>,
+    storage_key: &str,
+    result: crate::services::proxy_service::StreamingFetchResult,
+) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
+    if crate::services::proxy_service::ProxyService::is_proxy_cache_key(storage_key) {
+        tracing::debug!(
+            storage_key = %storage_key,
+            "refetched proxy-cache content is written back by the proxy cache itself; \
+             not teeing a second unguarded copy through the artifact handle (#3368)"
+        );
+        return result
+            .body
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .boxed();
+    }
+    tee_refetch_to_storage(
+        storage,
+        storage_key.to_string(),
+        result.content_length,
+        result.body,
+    )
 }
 
 /// Whether the object stored at an `artifacts.storage_key` may be streamed
@@ -3521,9 +3558,12 @@ async fn pypi_proxy_cache_redirect(
     if !proxy.is_cache_fresh(repo_key, cache_path).await {
         return None;
     }
-    let cache_key =
-        crate::services::proxy_service::ProxyService::cache_storage_key(repo_key, cache_path)
-            .ok()?;
+    let cache_key = crate::services::proxy_service::ProxyService::cache_storage_key(
+        proxy.cache_scope(),
+        repo_key,
+        cache_path,
+    )
+    .ok()?;
     let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
     proxy_helpers::try_proxy_cache_redirect(
         storage.as_ref(),
@@ -3882,13 +3922,80 @@ async fn serve_scanned_pypi_file(
     }
 }
 
+/// What to do when the storage read behind a PEP 658 `.metadata` request
+/// misses — the "row present, object absent" state.
+///
+/// Pure decision, split out from [`serve_metadata`] so the routing rule is
+/// unit-testable without storage, a database or an upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataMissRepair {
+    /// The local missing-file repair path: take the cluster-wide hydration
+    /// lease, re-read, and answer 507 if the object is still absent.
+    ///
+    /// Correct for a row whose bytes a local writer owns — a hosted artifact
+    /// on any repository type, where another replica really may be mid-write.
+    CoordinatedRetry,
+    /// Answer 507 immediately; the caller owns recovery.
+    ///
+    /// Chosen for a proxy-cache-backed row. Nothing local writes a
+    /// `proxy-cache/` key except the proxy cache itself, so re-reading the
+    /// same key under a hydration lease cannot produce the bytes — the
+    /// reported deployment logged the miss and the 507 at a 1:1 ratio, 32,681
+    /// times in 24h, without one coordinated re-read ever succeeding (#3463).
+    /// Running it costs a Postgres advisory lock, a second storage round trip
+    /// and an ERROR-level log line per request, and buys nothing.
+    ///
+    /// The recovery that DOES work is a re-fetch from this repository's own
+    /// upstream, and `serve_virtual_metadata` — the only caller that reaches
+    /// this state — already performs exactly that: a 507 sets
+    /// `owns_unavailable_bytes` and falls into the member's own
+    /// `serve_remote_metadata`. Answering 507 straight away hands it that
+    /// signal one round trip sooner. It must stay 507 and never 404: 404 is
+    /// the member loop's "this member does not have it", which would let
+    /// resolution fall through to a DIFFERENT member (#3372).
+    CallerRecoversFromUpstream,
+}
+
+/// Route a `.metadata` storage miss to the repair that can actually succeed.
+///
+/// Keyed on the storage key alone, because the key is what determines who can
+/// write those bytes: `coordinated_retry_get` is documented as the repair path
+/// for a **locally stored** artifact, and a `proxy-cache/` key is never
+/// written by a local publish, replication or promotion — only by the proxy
+/// cache, whose own writer is not waiting on this lease.
+///
+/// Note what does NOT reach this function: a non-`NotFound` storage error.
+/// A real backend fault (auth, timeout, genuine insufficient storage) is still
+/// mapped by `map_storage_err` and surfaced, never reinterpreted as a missing
+/// cache entry.
+fn metadata_miss_repair(storage_key: &str) -> MetadataMissRepair {
+    if crate::services::proxy_service::ProxyService::is_proxy_cache_key(storage_key) {
+        MetadataMissRepair::CallerRecoversFromUpstream
+    } else {
+        MetadataMissRepair::CoordinatedRetry
+    }
+}
+
+/// The single 507 answer for "this repository owns the name but its bytes are
+/// unavailable", worded identically to the one `serve_virtual_metadata`
+/// synthesises so a client sees one message whichever layer produced it.
+#[allow(clippy::result_large_err)]
+fn insufficient_storage_metadata_response() -> Response {
+    (
+        StatusCode::INSUFFICIENT_STORAGE,
+        "artifact metadata unavailable; retry later",
+    )
+        .into_response()
+}
+
 async fn serve_metadata(
     state: &SharedState,
     db: &PgPool,
-    repo_id: uuid::Uuid,
-    location: &crate::storage::StorageLocation,
+    repo: &RepoInfo,
     filename: &str,
 ) -> Result<Response, Response> {
+    let repo_id = repo.id;
+    let location = &repo.storage_location();
     // Find the artifact through the SAME resolver the distribution download
     // uses (#3405).
     //
@@ -3931,15 +4038,42 @@ async fn serve_metadata(
         // 507 keeps metadata and the wheel failing together, which is the
         // invariant that matters. The caller's loop treats it as "owns the
         // name, bytes unavailable" and confines the fallback to this member.
-        Err(AppError::NotFound(_)) => {
-            crate::api::handlers::proxy_helpers::coordinated_retry_get(
-                db,
-                artifact.id,
-                &artifact.storage_key,
-                storage.as_ref(),
-            )
-            .await?
-        }
+        //
+        // #3463: that reasoning holds for a LOCALLY stored row. It does not
+        // hold for a proxy-cache-backed row, where "the bytes are not in the
+        // cache" is the ordinary state and no local writer will ever produce
+        // them — re-reading the same key under the hydration lease 507s
+        // forever, which is what the reporter measured 1:1 with the miss.
+        //
+        // Answer 507 without the dead repair. The caller
+        // (`serve_virtual_metadata`) treats 507 as "owns the name, bytes
+        // unavailable" and re-fetches from this member's OWN upstream, which
+        // is the recovery that works and the same provenance the wheel
+        // download resolves to. Deliberately NOT re-fetching here as well:
+        // that would duplicate the upstream resolution the caller is about to
+        // perform, doubling upstream load on exactly the hot failing key this
+        // issue is about.
+        Err(AppError::NotFound(_)) => match metadata_miss_repair(&artifact.storage_key) {
+            MetadataMissRepair::CallerRecoversFromUpstream => {
+                tracing::debug!(
+                    artifact_id = %artifact.id,
+                    storage_key = %artifact.storage_key,
+                    repo_key = %repo.key,
+                    "proxy-cache-backed metadata row is not in the cache; no local repair \
+                     is possible, deferring to the caller's upstream re-fetch (#3463)"
+                );
+                return Err(insufficient_storage_metadata_response());
+            }
+            MetadataMissRepair::CoordinatedRetry => {
+                crate::api::handlers::proxy_helpers::coordinated_retry_get(
+                    db,
+                    artifact.id,
+                    &artifact.storage_key,
+                    storage.as_ref(),
+                )
+                .await?
+            }
+        },
         Err(other) => return Err(map_storage_err(other)),
     };
 
@@ -8821,8 +8955,16 @@ mod tests {
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
-        let storage_key =
-            "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
+        // A hosted `artifacts` row on a Remote repository (locally published,
+        // replicated or promoted) — `verdict == NotProxyCache`, so this handle
+        // OWNS the key and the #1283 write-back below is its job.
+        //
+        // Deliberately NOT a `proxy-cache/` key (#3368): for those the refetch
+        // itself commits body + sidecar through `CachePersister`, and a second
+        // write through the artifact handle would be an unguarded overwrite of
+        // the live cache object. `test_streaming_refetch_does_not_double_write_proxy_cache_3368`
+        // below pins that.
+        let storage_key = "pypi/fastapi/0.136.1/fastapi-0.136.1-py3-none-any.whl";
         let stream = super::get_remote_cached_or_refetch_stream(
             storage.clone(),
             storage_key,
@@ -9267,7 +9409,8 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_refetch_tees_multi_chunk_body_to_cache() {
         let storage = std::sync::Arc::new(RecordingStorage::new());
-        let key = "proxy-cache/pypi-remote/simple/big/big-9.9.9-py3-none-any.whl/__content__";
+        // Hosted-row key: the handle that owns it, so the tee applies (#3368).
+        let key = "pypi/big/9.9.9/big-9.9.9-py3-none-any.whl";
         let stream = super::get_remote_cached_or_refetch_stream(
             storage.clone(),
             key,
@@ -9295,7 +9438,8 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_refetch_deletes_truncated_writeback() {
         let storage = std::sync::Arc::new(RecordingStorage::new());
-        let key = "proxy-cache/pypi-remote/simple/trunc/trunc-1.0.0-py3-none-any.whl/__content__";
+        // Hosted-row key: the handle that owns it, so the tee applies (#3368).
+        let key = "pypi/trunc/1.0.0/trunc-1.0.0-py3-none-any.whl";
         // Advertise 100 bytes but only deliver 4: the guard must delete.
         let stream = super::get_remote_cached_or_refetch_stream(
             storage.clone(),
@@ -9314,6 +9458,127 @@ mod tests {
             deletes.as_slice(),
             &[key.to_string()],
             "a truncated write-back must be deleted, not served warm"
+        );
+    }
+
+    /// #3368/#3147: a refetch for a `proxy-cache/` key must NOT be teed back
+    /// through the ARTIFACT handle.
+    ///
+    /// The refetch runs through the proxy service's streaming cache path,
+    /// which commits the body *and* its `__cache_meta__.json` sidecar under
+    /// the `CachePersister` contract (#1618 S9). A second write here would put
+    /// the body with none of it — no sidecar, no #1365 zero-byte guard, no
+    /// #1051 ETag re-pin, no catalog row — while racing the proxy's own writer
+    /// for the same object. `is_fresh` falls back to comparing
+    /// `size(cache_key)` against the sidecar's `size_bytes` when the pinned
+    /// ETag is multipart-shaped, so a same-length out-of-band body keeps the
+    /// entry "fresh" and the redirect path signs a URL for bytes the sidecar
+    /// never vouched for.
+    ///
+    /// The truncation compensator makes it worse: it would `delete()` the live
+    /// cache object.
+    ///
+    /// Before #3368 this was masked on prefixed S3 (the write landed on a
+    /// shadow path nothing read) and live everywhere else. Anchoring the key
+    /// layout would have made it live everywhere, so the two must land
+    /// together.
+    ///
+    /// FAILS ON MAIN: the write-back is unconditional.
+    #[tokio::test]
+    async fn test_streaming_refetch_does_not_double_write_proxy_cache_3368() {
+        let storage = std::sync::Arc::new(RecordingStorage::new());
+        let key = "proxy-cache/pypi-remote/simple/big/big-9.9.9-py3-none-any.whl/__content__";
+        let stream = super::get_remote_cached_or_refetch_stream(
+            storage.clone(),
+            key,
+            true,
+            move || async move { Ok(multi_chunk_result(vec![b"aaaa", b"bbbb", b"cc"], Some(10))) },
+        )
+        .await
+        .expect("streaming refetch should succeed");
+        let content = collect_stream(stream).await;
+
+        // The caller is still served every byte: only the redundant, unguarded
+        // second write is gone.
+        assert_eq!(content, Bytes::from_static(b"aaaabbbbcc"));
+        assert!(
+            storage.puts.lock().expect("puts mutex").is_empty(),
+            "proxy-cache content must not be written through the artifact handle; the \
+             refetch already committed it, with its sidecar, through CachePersister"
+        );
+        assert!(
+            storage.deletes.lock().expect("deletes mutex").is_empty(),
+            "and the truncation compensator must never delete the live cache object"
+        );
+    }
+
+    /// The property the #3368 tee removal RESTS ON: the refetch writes the
+    /// same key the tee would have written.
+    ///
+    /// Dropping the write-back is only safe because `refetch` already commits
+    /// that object — through `fetch_from_pypi_remote_streaming`, which caches
+    /// under `target.cache_path` = `build_pypi_proxy_cache_path(project,
+    /// filename)`, which `CacheKeys::derive` turns into
+    /// `proxy-cache/<repo_key>/simple/<project>/<file>/__content__`. If that
+    /// algebra ever drifts from the `artifacts.storage_key` shape the read
+    /// path resolves, the refetch would warm one key while the row names
+    /// another, and the entry would be permanently cold with nothing to say
+    /// so. The sibling tests above prove the tee does NOT write; this one
+    /// proves the cache DOES.
+    #[test]
+    fn test_refetch_cache_key_matches_the_row_key_the_tee_no_longer_writes_3368() {
+        let project = proj("six");
+        let filename = "six-1.17.0-py2.py3-none-any.whl";
+        let cache_path = build_pypi_proxy_cache_path(&project, filename);
+
+        let derived = crate::services::proxy_service::ProxyService::cache_storage_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+            "pypi-remote",
+            &cache_path,
+        )
+        .expect("derive cache key");
+
+        assert_eq!(
+            derived,
+            "proxy-cache/pypi-remote/simple/six/six-1.17.0-py2.py3-none-any.whl/__content__",
+            "the key the refetch warms must be exactly the `artifacts.storage_key` shape the \
+             read path resolves, or removing the tee leaves the entry permanently cold"
+        );
+        assert!(
+            crate::services::proxy_service::ProxyService::is_proxy_cache_key(&derived),
+            "and it must be classified as proxy-cache content, which is what routes the \
+             read to the shared root and suppresses the tee"
+        );
+        // The sidecar the verdict is read from sits beside it, so a warmed
+        // entry is immediately servable rather than Unvouched.
+        assert_eq!(
+            proxy_cache_metadata_key_for(&derived).as_deref(),
+            Some("proxy-cache/pypi-remote/simple/six/six-1.17.0-py2.py3-none-any.whl/__cache_meta__.json"),
+            "the refetch commits body AND sidecar; without the sidecar the next read would \
+             be Unvouched and re-fetch forever"
+        );
+    }
+
+    /// Same for the unvouched arm (#3147): refusing a sidecar-less entry
+    /// re-fetches, and that re-fetch must not be written back here either —
+    /// otherwise the arm that exists BECAUSE the sidecar is missing would
+    /// itself write a body with no sidecar, permanently.
+    #[tokio::test]
+    async fn test_unvouched_refetch_does_not_double_write_proxy_cache_3368() {
+        let storage = std::sync::Arc::new(RecordingStorage::new());
+        let key = "proxy-cache/pypi-remote/simple/unv/unv-1.0.0-py3-none-any.whl/__content__";
+        let stream = super::get_remote_cached_or_refetch_stream(
+            storage.clone(),
+            key,
+            /* may_serve_stored_object = */ false,
+            move || async move { Ok(multi_chunk_result(vec![b"zz"], Some(2))) },
+        )
+        .await
+        .expect("unvouched refetch should succeed");
+        assert_eq!(collect_stream(stream).await, Bytes::from_static(b"zz"));
+        assert!(
+            storage.puts.lock().expect("puts mutex").is_empty(),
+            "the unvouched arm must not write a sidecar-less body through the artifact handle"
         );
     }
 
@@ -9719,7 +9984,10 @@ mod tests {
             "DELETE FROM repository_config WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member_id)
+                .execute(pool)
+                .await;
         }
         let _ = std::fs::remove_dir_all(member_dir);
     }
@@ -11946,7 +12214,11 @@ mod tests {
         let storage_svc = std::sync::Arc::new(StorageService::new(storage));
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy");
-        crate::services::proxy_service::ProxyService::new(pool, storage_svc)
+        crate::services::proxy_service::ProxyService::new(
+            pool,
+            storage_svc,
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -12009,6 +12281,7 @@ mod tests {
         crate::services::proxy_service::ProxyService::new(
             pool,
             std::sync::Arc::new(StorageService::new(storage)),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
         )
     }
 
@@ -12189,6 +12462,7 @@ mod tests {
         tdh::wait_for_cache_commit(&tmp, wheel_body.len() as u64).await;
         let cache_path = "simple/numpy/numpy-2.0.0-py3-none-any.whl";
         let metadata_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
             "pypi-remote",
             cache_path,
         )
@@ -13632,6 +13906,57 @@ mod tests {
         assert!(
             result.is_none(),
             "presigned disabled must short-circuit before any redirect"
+        );
+    }
+
+    /// #3454 revert-proof: `pypi_proxy_cache_redirect` must sign through the
+    /// LIVE scope. Seeds a fresh entry at the SCOPED key over a presign-capable
+    /// backend and asserts the 302 Location carries the scope segment; a revert
+    /// to `unscoped()` makes the freshness probe miss the unscoped key (no
+    /// redirect) or sign the wrong key.
+    #[tokio::test]
+    async fn test_pypi_proxy_cache_redirect_signs_scoped_key_3454() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = crate::services::proxy_cache_scope::ProxyCacheScope::from_env_and_identity(
+            Some("prod-eu"),
+            uuid::Uuid::from_u128(0x3454_0000_0000_0000_0000_0000_0000_0001),
+        )
+        .unwrap();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let repo_key = "pypi-remote";
+        let cache_path = "simple/click/click-8.1.7-py3-none-any.whl";
+        let content_key = crate::services::proxy_service::ProxyService::cache_storage_key(
+            &scope, repo_key, cache_path,
+        )
+        .unwrap();
+        let meta_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
+            &scope, repo_key, cache_path,
+        )
+        .unwrap();
+        assert!(content_key.contains("proxy-cache/prod-eu/pypi-remote/"));
+        backend.seed_fresh_entry(&content_key, &meta_key);
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("pypi-scoped-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state =
+            tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
+
+        let resp = super::pypi_proxy_cache_redirect(&state, proxy.as_ref(), repo_key, cache_path)
+            .await
+            .expect("a fresh presign-capable pypi cache hit must 302-redirect");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("proxy-cache/prod-eu/pypi-remote/"),
+            "pypi redirect signed a non-scoped key (a revert to unscoped drops the scope): {loc}"
         );
     }
 
@@ -15116,9 +15441,8 @@ mod tests {
             .await;
         }
 
-        let bare_meta = super::serve_metadata(&state, &fx.pool, fx.repo_id, &location, bare).await;
-        let nested_meta =
-            super::serve_metadata(&state, &fx.pool, fx.repo_id, &location, nested).await;
+        let bare_meta = super::serve_metadata(&state, &fx.pool, &repo_info, bare).await;
+        let nested_meta = super::serve_metadata(&state, &fx.pool, &repo_info, nested).await;
         // The wheel itself resolved fine before this fix; assert the pair stays
         // consistent rather than trusting that separately.
         let bare_wheel = proxy_helpers::local_fetch_or_redirect_by_suffix(
@@ -15159,6 +15483,203 @@ mod tests {
              keep resolving"
         );
         assert!(String::from_utf8_lossy(&nested_body).contains("Version: 2.0.0"));
+    }
+
+    /// Verified-bug regression for the PyPI half of #3452, and the guard the
+    /// rest of the PR's tests do NOT reach.
+    ///
+    /// `serve_file` and `serve_virtual_metadata` walk their members by hand
+    /// rather than going through the `proxy_helpers` primitives, so the shared
+    /// `no_accessible_members_response` collapse in those primitives does not
+    /// apply to them. Both fetch members, filter with
+    /// `authorize_virtual_members`, and — before this PR — carried on with an
+    /// EMPTY set, ultimately answering a different body from the one the
+    /// genuinely-empty virtual gets a few lines above. Measured on a build of
+    /// the parent commit, one caller holding `read` on the virtual PARENT only:
+    ///
+    /// ```text
+    /// /pypi/{virtual-with-private-member}/simple/demo/demo-1.0.tar.gz  404 "Artifact not found in any member repository"
+    /// /pypi/{virtual-with-no-members}/simple/demo/demo-1.0.tar.gz      404 "Virtual repository has no members"
+    /// ```
+    ///
+    /// — a live existence oracle over the private repositories a virtual
+    /// aggregates, on the byte-serving route and on the PEP 658 metadata route.
+    ///
+    /// This test exists because reverting ONLY those two guards left all five
+    /// of the PR's other tests green: `proxy_helpers`' test drives the shared
+    /// primitives, which PyPI's two hand-rolled walks bypass, and coverage
+    /// measures execution rather than assertion, so 94% new-code coverage did
+    /// not contradict it either. Without this, a later refactor can delete the
+    /// guards and re-open the oracle with CI green.
+    ///
+    /// Both routes are asserted, and both against the same principal, so a fix
+    /// applied to one walk and not its sibling fails here.
+    #[tokio::test]
+    async fn test_3452_pypi_virtual_filtered_members_answer_the_empty_virtual_body() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // A virtual with a PRIVATE member, and a virtual with no members at
+        // all. Both real rows: the member filter is evaluated in SQL.
+        let (parent_id, parent_key, parent_dir) = tdh::create_repo(&pool, "virtual", "pypi").await;
+        let (empty_id, empty_key, empty_dir) = tdh::create_repo(&pool, "virtual", "pypi").await;
+        let (member_id, _mk, member_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        tdh::link_virtual_member(&pool, parent_id, member_id, 1).await;
+
+        // The reported principal: granted on the PARENT, nothing on the member.
+        let (user_id, uname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, parent_id, user_id, &["read"]).await;
+        tdh::grant_repo_actions(&pool, empty_id, user_id, &["read"]).await;
+        let auth = tdh::make_auth(user_id, &uname);
+
+        let state = tdh::build_state(pool.clone(), &parent_dir.to_string_lossy());
+        let parent = tdh::make_repo_info(parent_id, &parent_key, &parent_dir, "virtual", None);
+        let empty = tdh::make_repo_info(empty_id, &empty_key, &empty_dir, "virtual", None);
+
+        async fn describe(r: Result<Response, Response>) -> (StatusCode, Option<String>, String) {
+            let resp = match r {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            };
+            let status = resp.status();
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, ct, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let project = proj("demo");
+        let sdist = "demo-1.0.tar.gz";
+
+        // Route 1: the byte-serving download walk.
+        let filtered_file = describe(
+            super::serve_file(
+                &state,
+                &parent,
+                &parent_key,
+                &project,
+                sdist,
+                Some(&auth),
+                &Default::default(),
+            )
+            .await,
+        )
+        .await;
+        let empty_file = describe(
+            super::serve_file(
+                &state,
+                &empty,
+                &empty_key,
+                &project,
+                sdist,
+                Some(&auth),
+                &Default::default(),
+            )
+            .await,
+        )
+        .await;
+
+        // Route 2: the PEP 658 `.metadata` walk.
+        let filtered_meta = describe(
+            super::serve_virtual_metadata(&state, Some(&auth), &parent, &project, None, sdist)
+                .await,
+        )
+        .await;
+        let empty_meta = describe(
+            super::serve_virtual_metadata(&state, Some(&auth), &empty, &project, None, sdist).await,
+        )
+        .await;
+
+        // POSITIVE CONTROL, before cleanup: a caller who MAY read the member
+        // must get PAST the member gate on both routes, so an implementation
+        // that refused everyone cannot satisfy the equalities below.
+        let (allowed_id, allowed_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, parent_id, allowed_id, &["read"]).await;
+        tdh::grant_repo_actions(&pool, member_id, allowed_id, &["read"]).await;
+        let allowed_auth = tdh::make_auth(allowed_id, &allowed_name);
+        let walked_file = describe(
+            super::serve_file(
+                &state,
+                &parent,
+                &parent_key,
+                &project,
+                sdist,
+                Some(&allowed_auth),
+                &Default::default(),
+            )
+            .await,
+        )
+        .await;
+        let walked_meta = describe(
+            super::serve_virtual_metadata(
+                &state,
+                Some(&allowed_auth),
+                &parent,
+                &project,
+                None,
+                sdist,
+            )
+            .await,
+        )
+        .await;
+
+        for (id, dir) in [
+            (member_id, &member_dir),
+            (parent_id, &parent_dir),
+            (empty_id, &empty_dir),
+        ] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
+        for uid in [user_id, allowed_id] {
+            tdh::cleanup_user(&pool, uid).await;
+        }
+
+        let expected = (
+            StatusCode::NOT_FOUND,
+            Some("application/json".to_string()),
+            format!(
+                "{{\"code\":\"NOT_FOUND\",\"message\":\"{}\"}}",
+                proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG
+            ),
+        );
+        assert_eq!(
+            empty_file, expected,
+            "a pypi virtual with no member rows must answer the shared \
+             no-accessible-members body on the download route"
+        );
+        assert_eq!(
+            filtered_file, empty_file,
+            "#3452: `serve_file` walks its members by hand, so the collapse in the shared \
+             proxy_helpers primitives does not cover it. A caller granted on the PARENT only \
+             must not be able to tell that this virtual aggregates a member it may not see"
+        );
+        assert_eq!(
+            empty_meta, expected,
+            "the PEP 658 metadata route must answer the same body as the download route"
+        );
+        assert_eq!(
+            filtered_meta, empty_meta,
+            "#3452: `serve_virtual_metadata` is the sibling hand-rolled walk; fixing one route \
+             and not the other leaves the oracle open on `.metadata` URLs"
+        );
+        assert_ne!(
+            walked_file.2, empty_file.2,
+            "POSITIVE CONTROL (download): a caller who MAY read the member must get PAST the \
+             member gate. If this equals the refusal body the walk refuses everyone and every \
+             equality above is vacuous"
+        );
+        assert_ne!(
+            walked_meta.2, empty_meta.2,
+            "POSITIVE CONTROL (metadata): as above, for the sibling route"
+        );
     }
 
     /// Clean via virtual -> 200 (no over-block).
@@ -16215,6 +16736,165 @@ mod tests {
         assert!(
             html.contains("data-core-metadata"),
             "wheel core-metadata not advertised in the HTML branch"
+        );
+    }
+
+    // -- #3463: PEP 658 metadata repair on a proxy-cache-backed row --------
+
+    /// The routing rule. `coordinated_retry_get` is the repair path for a
+    /// LOCALLY stored artifact: it re-reads the same key under a cluster-wide
+    /// hydration lease and 507s if the object is still absent. Nothing local
+    /// ever writes a `proxy-cache/` key, so on such a row the lease, the
+    /// second read and the ERROR log buy nothing — measured 1:1 with the miss,
+    /// 32,681 times in 24h, never once succeeding.
+    ///
+    /// This pins the rule; `test_serve_metadata_defers_proxy_cache_repair_3463`
+    /// below pins that `serve_metadata` actually consults it. Neither is
+    /// sufficient alone.
+    #[test]
+    fn test_metadata_miss_repair_rule_3463() {
+        assert_eq!(
+            super::metadata_miss_repair(
+                "proxy-cache/pypi-remote/simple/six/six-1.17.0.whl/__content__"
+            ),
+            super::MetadataMissRepair::CallerRecoversFromUpstream,
+            "no local writer owns a proxy-cache key, so the local repair cannot succeed"
+        );
+
+        // Controls: a fix that returned CallerRecoversFromUpstream
+        // unconditionally would pass the assertion above while stripping the
+        // genuine local-storage repair from every hosted row.
+        for key in [
+            "pypi/six/1.17.0/six-1.17.0.whl",
+            "maven/org/example/demo/1.0/demo-1.0.jar",
+            // Not the reserved root: an ordinary key that merely looks similar.
+            "npm/proxy-cache-notes/-/proxy-cache-notes-1.0.0.tgz",
+        ] {
+            assert_eq!(
+                super::metadata_miss_repair(key),
+                super::MetadataMissRepair::CoordinatedRetry,
+                "{key} is a locally-written artifact and keeps the hydration repair"
+            );
+        }
+    }
+
+    /// End-to-end on the real function, pinning the CALL SITE rather than the
+    /// helper: a `.metadata` request against a proxy-cache-backed row whose
+    /// object is absent must skip the local repair and answer the
+    /// metadata-specific 507 that tells the caller to recover from upstream —
+    /// and must NOT re-read the key under the hydration lease (#3463).
+    ///
+    /// The two paths are distinguishable by the body they emit:
+    /// `coordinated_retry_get` answers `artifact file unavailable`, the new
+    /// path answers `artifact metadata unavailable` (which is also the wording
+    /// `serve_virtual_metadata` already synthesises, so one resource now has
+    /// one message whichever layer produced it). The read count is asserted
+    /// too, because the message alone would be satisfied by a fix that still
+    /// paid for the dead lease and re-read.
+    ///
+    /// The second half is the negative control that keeps a legitimate 507
+    /// distinguishable: an identically-absent object behind a HOSTED key must
+    /// still take the coordinated-retry path — same status, different message,
+    /// and the extra read.
+    ///
+    /// FAILS ON MAIN: both rows answer `artifact file unavailable` after two
+    /// reads.
+    #[tokio::test]
+    async fn test_serve_metadata_defers_proxy_cache_repair_3463() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        // A registered cloud backend, so the read goes through a handle whose
+        // every `get` is observable.
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        sqlx::query("UPDATE repositories SET storage_backend = 's3' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("point the repo at the observable backend");
+        let repo_info = tdh::make_repo_info(repo_id, &repo_key, &storage_dir, "remote", None);
+        let repo_info = crate::api::handlers::proxy_helpers::RepoInfo {
+            storage_backend: "s3".to_string(),
+            ..repo_info
+        };
+
+        // Two rows, same repository, same absent-object state, different key
+        // layouts. Nothing is written to storage for either.
+        let cached_file = "demo-1.0-py3-none-any.whl";
+        let hosted_file = "demo-2.0-py3-none-any.whl";
+        for (filename, storage_key) in [
+            (
+                cached_file,
+                "proxy-cache/pypi-remote/simple/demo/demo-1.0-py3-none-any.whl/__content__",
+            ),
+            (hosted_file, "pypi/demo/2.0/demo-2.0-py3-none-any.whl"),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts ( \
+                     repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by \
+                 ) VALUES ($1, $2, 'demo', '1.0', 42, $3, 'application/zip', $4, $5)",
+            )
+            .bind(repo_id)
+            .bind(format!("demo/1.0/{filename}"))
+            .bind(format!("sha-{filename}"))
+            .bind(storage_key)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed artifact row");
+        }
+
+        let before = mem.get_count();
+        let cached = super::serve_metadata(&state, &pool, &repo_info, cached_file).await;
+        let cached_reads = mem.get_count() - before;
+        let (cached_status, cached_body) = collect_serve_3220(cached).await;
+
+        let before = mem.get_count();
+        let hosted = super::serve_metadata(&state, &pool, &repo_info, hosted_file).await;
+        let hosted_reads = mem.get_count() - before;
+        let (hosted_status, hosted_body) = collect_serve_3220(hosted).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            cached_status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "the member still owns the name, so it must stay 507 and never 404 (#3372)"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&cached_body),
+            "artifact metadata unavailable; retry later",
+            "#3463: a proxy-cache-backed row must skip the local repair and hand the caller \
+             the signal it recovers from, not `coordinated_retry_get`'s answer"
+        );
+        assert_eq!(
+            cached_reads, 1,
+            "#3463: the key must be read once; the coordinated re-read cannot succeed on a \
+             key no local writer owns and only costs a lease plus a second round trip"
+        );
+
+        assert_eq!(
+            hosted_status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "negative control: a hosted row with an absent object is still 507"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&hosted_body),
+            "artifact file unavailable; retry later",
+            "negative control: a hosted row is a real local-storage fault and must KEEP the \
+             coordinated hydration repair"
+        );
+        assert!(
+            hosted_reads > cached_reads && hosted_reads >= 2,
+            "negative control: the hosted row must still be re-read under the hydration lease \
+             (observed {hosted_reads} reads vs {cached_reads} for the proxy-cache row); an \
+             exact count is not pinned because it is an internal of the coordinator"
         );
     }
 }

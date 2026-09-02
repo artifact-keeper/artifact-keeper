@@ -446,6 +446,84 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Build a client for the tests in this module that talk to a loopback or
+    /// wiremock listener, immune to a process-wide proxy env (#3377).
+    ///
+    /// `reqwest` reads `HTTP_PROXY`/`NO_PROXY` at client-BUILD time, and
+    /// `std::env::set_var` is process-wide. Under `cargo test`'s
+    /// single-process, multi-threaded runner a sibling test that briefly sets
+    /// `HTTP_PROXY` (see `test_configured_proxy_host_is_exempted_from_guard`,
+    /// which also clears `NO_PROXY`, removing the usual loopback exemption)
+    /// captured every client built in that window — including the ones aimed
+    /// at a test's own listener, which then never received the request.
+    /// `no_proxy()` makes that structurally impossible instead of relying on
+    /// every call site remembering to take `PROXY_ENV_LOCK`.
+    ///
+    /// This is only correct because every user targets a listener the test
+    /// itself started. A test that exercises proxy routing must NOT use it.
+    fn loopback_test_client() -> reqwest::Client {
+        loopback_client_from(reqwest::Client::builder())
+    }
+
+    /// The proxy-clearing step of [`loopback_test_client`], split out so it can
+    /// be exercised against a builder that carries a proxy
+    /// (`test_loopback_client_is_not_captured_by_a_proxy_3377`). `no_proxy()`
+    /// both clears the proxies configured so far and turns off reqwest's
+    /// system/environment proxy detection, which is what makes the result
+    /// independent of whatever a concurrent test has put in the process env.
+    fn loopback_client_from(builder: reqwest::ClientBuilder) -> reqwest::Client {
+        builder
+            .no_proxy()
+            .build()
+            .expect("build proxy-immune loopback test client")
+    }
+
+    /// Build a client while [`PROXY_ENV_LOCK`] is held, excluding the build
+    /// from the process-wide `HTTP_PROXY` window
+    /// `test_configured_proxy_host_is_exempted_from_guard` opens (#3377).
+    ///
+    /// For the tests that assert the SSRF resolver REFUSES a loopback host,
+    /// `no_proxy()` is not enough. The leaked proxy env reaches a second
+    /// consumer: the SSRF DNS resolver parses the SAME variables to build its
+    /// proxy-host exempt-set (#2570). A resolver constructed inside that window
+    /// exempts `localhost`, so the loopback hard-block under test stops firing
+    /// and the listener accepts a connection it must never receive — a red
+    /// security control that is in fact intact. Disabling reqwest's proxy
+    /// routing cannot undo that; only building outside the window can.
+    ///
+    /// The closure must construct the builder AND build it: the exempt-set is
+    /// read when the BUILDER is constructed, not at `.build()`. It runs under a
+    /// synchronous `std` mutex, so it must not `.await`.
+    fn build_client_outside_proxy_env_window(
+        build: impl FnOnce() -> reqwest::Client,
+    ) -> reqwest::Client {
+        let _proxy_env_guard = PROXY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        build()
+    }
+
+    /// Join a spawned loopback-server task under a wall-clock bound (#3377).
+    ///
+    /// These server tasks block on `listener.accept()`, which never returns if
+    /// the request under test was routed somewhere else. Awaiting the handle
+    /// bare turned that into an INDEFINITE hang of the whole test binary — the
+    /// symptom reported in #3377 — rather than a failing test. The bound is
+    /// generous (a loaded CI run is slow) but finite, so a miswired test fails
+    /// with a diagnosis instead of wedging the suite.
+    async fn join_loopback_server(server: tokio::task::JoinHandle<()>) {
+        match tokio::time::timeout(Duration::from_secs(30), server).await {
+            Ok(joined) => {
+                joined.expect("loopback server task panicked");
+            }
+            Err(_) => panic!(
+                "the loopback server task never finished: the request under test never \
+                 reached this test's own listener (a process-wide HTTP_PROXY leaked from \
+                 a concurrent test is the usual cause -- see #3377)"
+            ),
+        }
+    }
+
     #[test]
     fn test_default_client_builds_successfully() {
         let _client = default_client();
@@ -541,7 +619,12 @@ mod tests {
             }
         });
 
-        let client = base_client_builder().build().unwrap();
+        // `no_proxy()`: this test asserts on the REDIRECT policy, and its entry
+        // hop must reach the loopback listener above. A process-wide
+        // `HTTP_PROXY` leaked by a concurrent test would otherwise route the
+        // request away from it (#3377). Proxy configuration is orthogonal to
+        // the redirect policy under test.
+        let client = base_client_builder().no_proxy().build().unwrap();
         let url = format!("http://127.0.0.1:{}/start", addr.port());
         // Bypassing `validate_outbound_url` deliberately — this test
         // exercises the redirect policy specifically. A request that
@@ -552,7 +635,7 @@ mod tests {
         let result = client.get(&url).send().await;
 
         // Drain the server task.
-        let _ = server.await;
+        join_loopback_server(server).await;
 
         let err = result.expect_err("redirect to ::ffff:127.0.0.1 must be refused");
         assert!(
@@ -591,10 +674,16 @@ mod tests {
         // test (and CI) instead of failing it. With the resolver correctly
         // in place, rejection happens at the DNS stage well within this
         // bound, so the timeout never fires on the passing path.
-        let client = base_client_builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
+        // Built outside the proxy-env window: this test asserts the SSRF
+        // resolver refuses `localhost`, and a resolver built while a
+        // concurrent test's `HTTP_PROXY` is set exempts that very host
+        // (#2570), so the block under test stops firing (#3377).
+        let client = build_client_outside_proxy_env_window(|| {
+            base_client_builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+        });
         let url = format!("http://localhost:{port}/");
         let err = client
             .get(&url)
@@ -639,10 +728,14 @@ mod tests {
             .expect("bind test listener");
         let port = listener.local_addr().expect("local addr").port();
 
-        let client = internal_service_client_builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
+        // Built outside the proxy-env window for the same reason as
+        // `test_client_refuses_host_resolving_to_blocked_ip` (#3377).
+        let client = build_client_outside_proxy_env_window(|| {
+            internal_service_client_builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+        });
         let url = format!("http://localhost:{port}/");
         let err = client
             .get(&url)
@@ -687,13 +780,27 @@ mod tests {
         std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
         std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
 
-        for builder in [webhook_client_builder(), sso_client_builder()] {
+        // The BUILDERS are constructed inside the locked window below, not
+        // here: each one installs an SSRF resolver whose proxy-host exempt-set
+        // is parsed from the process env at construction (#2570/#3377), so
+        // building the pair up front would put them right back in the race.
+        for make_builder in [
+            webhook_client_builder as fn() -> reqwest::ClientBuilder,
+            sso_client_builder as fn() -> reqwest::ClientBuilder,
+        ] {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind test listener");
             let port = listener.local_addr().expect("local addr").port();
 
-            let client = builder.timeout(Duration::from_secs(2)).build().unwrap();
+            // Built outside the proxy-env window for the same reason as
+            // `test_client_refuses_host_resolving_to_blocked_ip` (#3377).
+            let client = build_client_outside_proxy_env_window(|| {
+                make_builder()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap()
+            });
             let url = format!("http://localhost:{port}/");
             let err = client
                 .get(&url)
@@ -753,14 +860,18 @@ mod tests {
         // never consults the DNS resolver (and the redirect policy fires
         // only on redirect hops) — this test exercises the redirect policy
         // specifically, mirroring `test_redirect_to_blocked_ip_is_refused`.
+        // `no_proxy()` for the same reason as
+        // `test_redirect_to_blocked_ip_is_refused`: the entry hop must reach
+        // this test's own loopback listener (#3377).
         let client = webhook_client_builder()
+            .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
         let url = format!("http://127.0.0.1:{}/start", addr.port());
         let result = client.post(&url).send().await;
 
-        let _ = server.await;
+        join_loopback_server(server).await;
         std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS");
 
         let err = result.expect_err("redirect to the metadata endpoint must be refused");
@@ -810,18 +921,15 @@ mod tests {
             body_finished_tx.send(()).expect("signal body finished");
         });
 
-        // Serialize the client build against `test_configured_proxy_host_is_
-        // exempted_from_guard`, which briefly sets a process-wide `HTTP_PROXY`
-        // while building its own client. Without this, a concurrent build here
-        // could observe that proxy and route this round-trip away from the
-        // test's own listener. The guard is dropped before any `.await`, so it
-        // never crosses an await point.
-        let client = {
-            let _proxy_env_guard = PROXY_ENV_LOCK.lock().unwrap();
-            large_object_client_builder(true)
-                .build()
-                .expect("build large-object client")
-        };
+        // `no_proxy()` rather than serializing against
+        // `test_configured_proxy_host_is_exempted_from_guard`, which briefly
+        // sets a process-wide `HTTP_PROXY` while building its own client: a
+        // lock only helps while every call site remembers to take it, and this
+        // round-trip must reach the test's own listener (#3377).
+        let client = large_object_client_builder(true)
+            .no_proxy()
+            .build()
+            .expect("build large-object client");
         let (headers_received_tx, headers_received_rx) = tokio::sync::oneshot::channel::<()>();
         let request = tokio::spawn(async move {
             let response = client
@@ -998,7 +1106,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let resp = reqwest::Client::new()
+        let resp = loopback_test_client()
             .get(server.uri())
             .send()
             .await
@@ -1023,7 +1131,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let resp = reqwest::Client::new()
+        let resp = loopback_test_client()
             .get(server.uri())
             .send()
             .await
@@ -1060,7 +1168,7 @@ mod tests {
             }
         });
 
-        let resp = reqwest::Client::new()
+        let resp = loopback_test_client()
             .get(format!("http://127.0.0.1:{}/", addr.port()))
             .send()
             .await
@@ -1074,7 +1182,7 @@ mod tests {
         let err = read_json_capped::<serde_json::Value>(resp, 64)
             .await
             .expect_err("a 256-byte chunked body must exceed the 64-byte cap");
-        let _ = server.await;
+        join_loopback_server(server).await;
         assert!(
             err.contains("exceeds the 64-byte limit"),
             "expected size-cap error, got: {err}"
@@ -1107,7 +1215,7 @@ mod tests {
             }
         });
 
-        let resp = reqwest::Client::new()
+        let resp = loopback_test_client()
             .get(format!("http://127.0.0.1:{}/", addr.port()))
             .send()
             .await
@@ -1140,7 +1248,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let resp = reqwest::Client::new()
+        let resp = loopback_test_client()
             .get(server.uri())
             .send()
             .await
@@ -1151,6 +1259,130 @@ mod tests {
         assert!(
             err.contains("invalid JSON"),
             "expected JSON parse error, got: {err}"
+        );
+    }
+    // -------------------------------------------------------------------
+    // #3377: process-wide proxy env must not capture this module's tests
+    // -------------------------------------------------------------------
+
+    /// Regression test for #3377: a client built for this module's own
+    /// loopback listeners must not be routed through a proxy.
+    ///
+    /// The proxy is supplied EXPLICITLY rather than through `HTTP_PROXY`,
+    /// deliberately. `std::env::set_var` is process-wide, so under `cargo
+    /// test`'s single-process runner a test that sets it can capture any client
+    /// another test builds at that moment — which is the bug being fixed here,
+    /// and reproducing it that way would inflict it on unrelated tests
+    /// elsewhere in the binary. reqwest keeps environment proxies in the same
+    /// proxy list an explicit `Proxy::all` goes into, and `no_proxy()` clears
+    /// that list and disables the environment lookup, so an explicit proxy
+    /// exercises exactly the step `loopback_test_client()` depends on, with no
+    /// process-wide side effect.
+    ///
+    /// The proxy is a socket that is bound but never `accept()`ed: the TCP
+    /// handshake still completes from the kernel backlog, so a captured client
+    /// CONNECTS and then waits forever — the shape of the reported hang rather
+    /// than a fast connection-refused.
+    #[tokio::test]
+    async fn test_loopback_client_is_not_captured_by_a_proxy_3377() {
+        use tokio::net::TcpListener;
+
+        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_url = format!(
+            "http://127.0.0.1:{}",
+            blackhole.local_addr().unwrap().port()
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        let server = tokio::spawn(async move {
+            // Two requests: the negative control's (if it ever arrives) and the
+            // proxy-immune client's.
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Type: application/json\r\n\
+                          Content-Length: 14\r\n\
+                          Connection: close\r\n\r\n\
+                          {\"issuer\":\"x\"}",
+                    )
+                    .await;
+            }
+        });
+
+        let proxied_builder = || {
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(&blackhole_url).expect("proxy url"))
+        };
+
+        // Negative control: without the helper the proxy DOES capture the
+        // request, so the black hole is real and the positive case below is not
+        // passing vacuously.
+        let captured = proxied_builder().build().expect("build captured client");
+        let control =
+            tokio::time::timeout(Duration::from_secs(3), captured.get(&target).send()).await;
+        assert!(
+            control.is_err(),
+            "the black-hole proxy must swallow a client that honours it, or this \
+             test proves nothing; got {control:?}"
+        );
+
+        // The helper must reach the listener directly regardless.
+        let client = loopback_client_from(proxied_builder());
+        let resp = tokio::time::timeout(Duration::from_secs(10), client.get(&target).send())
+            .await
+            .expect(
+                "a client built through `loopback_client_from` must go DIRECT to the \
+                 test's own listener instead of waiting on the proxy (#3377)",
+            )
+            .expect("the direct loopback request must succeed");
+
+        let value: serde_json::Value = read_json_capped(resp, 1024)
+            .await
+            .expect("the listener's small JSON body must parse");
+        assert_eq!(value["issuer"], "x");
+
+        server.abort();
+        drop(blackhole);
+    }
+
+    /// Source guard for #3377: keeps the two failure modes from creeping back
+    /// into a test added later, when the flake they cause would again be
+    /// blamed on whatever branch happened to surface it.
+    ///
+    /// The needles are assembled at runtime — a contiguous literal would match
+    /// this test's own source and make the guard fail vacuously.
+    #[test]
+    fn test_module_avoids_env_proxy_sensitive_clients_and_unbounded_joins_3377() {
+        let src = include_str!("http_client.rs");
+        let tests_start = src
+            .find("\nmod tests {")
+            .expect("the tests module must exist");
+        let window = &src[tests_start..];
+
+        let bare_client = format!("{}{}", "reqwest::Client::", "new()");
+        assert!(
+            !window.contains(&bare_client),
+            "a test in this module builds its HTTP client with the bare constructor, \
+             which inherits the process-wide proxy env and can be captured by a \
+             concurrent test that sets HTTP_PROXY. Use `loopback_test_client()` (#3377)."
+        );
+
+        let bare_join = format!("{} server.await;", "let _ =");
+        assert!(
+            !window.contains(&bare_join),
+            "a spawned loopback server task is awaited without a bound. That await \
+             never returns when the request under test was routed elsewhere, hanging \
+             the whole test binary. Use `join_loopback_server(server)` (#3377)."
         );
     }
 }

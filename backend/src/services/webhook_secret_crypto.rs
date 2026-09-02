@@ -23,7 +23,7 @@ use base64::{
     },
     Engine as _,
 };
-use rand::RngCore;
+use rand::Rng;
 use thiserror::Error;
 
 use crate::services::encryption::{CredentialEncryption, EncryptionError};

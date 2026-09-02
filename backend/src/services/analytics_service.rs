@@ -1074,7 +1074,7 @@ mod tests {
             // from a clean slate.
             for table in ["manifest_blob_refs", "oci_blobs", "proxy_cache_artifacts"] {
                 let sql = format!("DELETE FROM {table} WHERE repository_id = ANY($1)");
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(&*sql))
                     .bind(&repo_ids[..])
                     .execute(&pool)
                     .await

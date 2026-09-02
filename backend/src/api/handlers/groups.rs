@@ -249,7 +249,7 @@ pub async fn list_groups(
         LIMIT $3
         "#
     );
-    let mut select_query = sqlx::query_as::<_, GroupRow>(&select_sql)
+    let mut select_query = sqlx::query_as::<_, GroupRow>(sqlx::AssertSqlSafe(&*select_sql))
         .bind(&search_pattern)
         .bind(offset)
         .bind(per_page as i64);
@@ -274,7 +274,8 @@ pub async fn list_groups(
         WHERE ($1::text IS NULL OR g.name ILIKE $1 OR g.description ILIKE $1){count_scope}
         "#
     );
-    let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql).bind(&search_pattern);
+    let mut count_query =
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql)).bind(&search_pattern);
     if scoped {
         count_query = count_query.bind(auth.user_id);
     }
@@ -447,7 +448,7 @@ pub async fn get_group(
         GROUP BY g.id
         "#
     );
-    let mut group_query = sqlx::query_as::<_, GroupRow>(&group_sql).bind(id);
+    let mut group_query = sqlx::query_as::<_, GroupRow>(sqlx::AssertSqlSafe(&*group_sql)).bind(id);
     if scoped {
         group_query = group_query.bind(auth.user_id);
     }

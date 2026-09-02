@@ -117,7 +117,7 @@ impl PackageService {
         // guard rejected the update (in which case that row is unchanged and
         // still the representative).
         if should_update_package_row {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
                 {VERSION_UPSERT_CTE}
                 UPDATE packages
@@ -136,7 +136,7 @@ impl PackageService {
                     updated_at = NOW()
                 WHERE id = $1
                 "#
-            ))
+            )))
             .bind(package_id)
             .bind(version)
             .bind(size_bytes)
@@ -148,14 +148,14 @@ impl PackageService {
         } else {
             // Data-modifying CTEs execute exactly once even when
             // unreferenced, so the version upsert still runs.
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
                 {VERSION_UPSERT_CTE}
                 UPDATE packages
                 SET updated_at = NOW()
                 WHERE id = $1
                 "#
-            ))
+            )))
             .bind(package_id)
             .bind(version)
             .bind(size_bytes)

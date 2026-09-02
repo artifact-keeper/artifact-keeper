@@ -270,7 +270,7 @@ pub async fn renew_row_claim(
     claim_token: Uuid,
     ttl_secs: f64,
 ) -> Result<bool> {
-    let result = sqlx::query(sql)
+    let result = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(row_id)
         .bind(claim_token)
         .bind(ttl_secs)

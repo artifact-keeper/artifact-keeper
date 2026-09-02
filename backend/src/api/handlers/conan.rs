@@ -3741,6 +3741,7 @@ mod tests {
                 stuck_scan_reap_limit: 1000,
                 allow_local_admin_login: false,
                 sso_disable_admin_break_glass: false,
+                oidc_silent_sso_enabled: true,
                 totp_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,
@@ -3812,10 +3813,16 @@ mod tests {
             let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
                 crate::storage::filesystem::FilesystemStorage::new(storage_path),
             );
-            let registry = Arc::new(crate::storage::StorageRegistry::new(
-                std::collections::HashMap::new(),
-                "filesystem".to_string(),
-            ));
+            // Production parity (#3368): the registry knows the global storage
+            // root, matching `test_db_helpers`' filesystem builders, so
+            // reserved bucket-root namespaces resolve there.
+            let registry = Arc::new(
+                crate::storage::StorageRegistry::new(
+                    std::collections::HashMap::new(),
+                    "filesystem".to_string(),
+                )
+                .with_filesystem_bucket_root(storage_path),
+            );
             Arc::new(AppState::new(
                 test_config(storage_path),
                 pool,
@@ -3879,7 +3886,7 @@ mod tests {
                  VALUES ($1, $2, $3, $4, '{}'::repository_type, 'conan'::repository_format, $5)",
                 repo_type
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .bind(id)
                 .bind(&key)
                 .bind(format!("conan-test-{}", id))

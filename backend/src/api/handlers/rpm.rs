@@ -314,10 +314,10 @@ async fn try_proxy_repodata(
 /// Build the 200 response for a buffered proxy-metadata document, tying its
 /// [`ProxyMetadataBudget`] reservation to the response-body lifetime (#2665).
 ///
-/// The `permit` rides the body stream (see [`metadata_body_stream`]) and is
-/// released only after the buffered chunk has been handed to the response
-/// writer, so the global byte budget accounts for the resident body until it
-/// leaves the server rather than releasing at handler return.
+/// The `permit` rides the body stream (see [`proxy_helpers::budgeted_body`])
+/// and is released only after the buffered chunk has been handed to the
+/// response writer, so the global byte budget accounts for the resident body
+/// until it leaves the server rather than releasing at handler return.
 fn buffered_metadata_response(
     content: Bytes,
     content_type: String,
@@ -328,29 +328,8 @@ fn buffered_metadata_response(
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, content_length.to_string())
-        .body(Body::from_stream(metadata_body_stream(content, permit)))
+        .body(proxy_helpers::budgeted_body(content, permit))
         .unwrap()
-}
-
-/// One-shot body stream over an already-buffered metadata document that also
-/// owns its budget reservation (#2665). The permit is carried in the stream
-/// state and dropped only after the buffered chunk has been yielded to the
-/// response writer, so the budget stays debited for the body's whole lifetime.
-fn metadata_body_stream(
-    content: Bytes,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
-    enum State {
-        Data(Bytes, tokio::sync::OwnedSemaphorePermit),
-        Done(tokio::sync::OwnedSemaphorePermit),
-    }
-    futures::stream::unfold(State::Data(content, permit), |state| async move {
-        match state {
-            State::Data(bytes, permit) => Some((Ok(bytes), State::Done(permit))),
-            // Permit dropped here, after the chunk reached the response writer.
-            State::Done(_permit) => None,
-        }
-    })
 }
 
 /// Build the HTTP 200 response for serving an RPM package body.

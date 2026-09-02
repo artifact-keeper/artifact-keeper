@@ -611,7 +611,7 @@ pub async fn checksum_search(
         col = checksum_column,
     );
 
-    let rows: Vec<ChecksumRow> = sqlx::query_as(&sql)
+    let rows: Vec<ChecksumRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(&checksum)
         .bind(accessible_repo_ids.as_allowed_repo_ids())
         .fetch_all(&state.db)
