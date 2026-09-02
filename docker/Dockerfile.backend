@@ -233,7 +233,7 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # of silently shipping a vulnerable stdlib. Raise it when a new Go stdlib
 # advisory lands; that one-line bump replaces what used to be a .trivyignore
 # entry.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS grype-bin
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
 ARG TARGETOS
 ARG TARGETARCH
 ARG GRYPE_VERSION=0.117.0
