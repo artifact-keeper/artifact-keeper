@@ -160,7 +160,7 @@ pub struct CreateUserRequest {
 
 /// Generate a secure random password
 pub(crate) fn generate_password() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%&*";
     let mut rng = rand::rng();
     (0..16)

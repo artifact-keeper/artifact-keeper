@@ -22,7 +22,7 @@ single-flight races across replicas serving partial/truncated artifacts).
 | File | Purpose |
 | --- | --- |
 | `mock_upstream.py` | Stdlib-only HTTP server: serves ONE large artifact with a fixed SHA-256, injects per-response latency to widen the race window, and exposes a **fetch counter**. |
-| `Dockerfile.mock-upstream` | Containerises the mock upstream on stock `python:3.12-slim` (no pip install). |
+| `Dockerfile.mock-upstream` | Containerises the mock upstream on stock `python:3.14-slim` (no pip install). |
 | `nginx-lb.conf` | Round-robin LB that re-resolves the `backend` service via Docker DNS so the storm spreads across all replicas. |
 | `assert_lib.sh` | Pure, side-effect-free assertion helpers (digest match, counter==1, blob count). Unit-tested without Docker. |
 | `run-singleflight-race.sh` | Driver: creates the proxy repo, fires N concurrent GETs, asserts A1/A2/A3, prints a PASS/FAIL summary. |

@@ -28,7 +28,7 @@ use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use rand::Rng;
+use rand::RngExt;
 
 // Gallery clients identify themselves and, when telemetry is enabled, carry a
 // per-machine/session identifier. CORS_ORIGINS remains the authority for which

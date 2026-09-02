@@ -456,7 +456,7 @@ jobs:
       # DATABASE_URL is unset. Provide the same Postgres the coverage job uses
       # so they actually run (#1409 review).
       postgres:
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -888,7 +888,7 @@ jobs:
         # Use the GHCR mirror maintained by .github/workflows/mirror-images.yml
         # to avoid Docker Hub anonymous-pull rate limits, which were aborting
         # the coverage job before tests could compile.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -1517,7 +1517,7 @@ jobs:
     services:
       postgres:
         # Use the GHCR mirror to avoid Docker Hub anonymous-pull rate limits.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -1889,7 +1889,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Build backend image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -1944,7 +1944,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Build openscap image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
