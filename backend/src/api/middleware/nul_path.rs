@@ -39,6 +39,17 @@ use crate::error::AppError;
 /// without a router or a server. The two early returns keep this off the
 /// allocation path for ordinary requests: a raw NUL cannot survive the HTTP
 /// parser, and a path with no `%` decodes to itself.
+///
+/// The decision is made on **bytes**, never on a `String`: a NUL is a byte and
+/// finding one needs no UTF-8 judgement. `urlencoding::decode` is
+/// `decode_binary` plus a `String::from_utf8`, so it fails on a path whose
+/// decoded bytes are not valid UTF-8 *anywhere* — and one stray `%C0%80` or
+/// `%FF` in any segment would then hide a `%00` sitting in another one
+/// (`/maven/pub%00key/a%C0%80b`), which the key-decoding visibility middleware
+/// would still bind to a query. `decode_binary` is infallible, so no escape
+/// elsewhere in the path can blind the check. A malformed escape (`%zz`) is
+/// copied through literally by the decoder and yields no NUL, so it keeps
+/// whatever status it had before.
 pub(crate) fn decoded_path_has_nul(raw_path: &str) -> bool {
     if raw_path.contains('\0') {
         return true;
@@ -46,9 +57,7 @@ pub(crate) fn decoded_path_has_nul(raw_path: &str) -> bool {
     if !raw_path.contains('%') {
         return false;
     }
-    // A decode failure means the escapes are not valid UTF-8 at all; leave
-    // that to the extractor that already rejects it, and change nothing here.
-    matches!(urlencoding::decode(raw_path), Ok(decoded) if decoded.contains('\0'))
+    urlencoding::decode_binary(raw_path.as_bytes()).contains(&0)
 }
 
 /// Global layer rejecting a NUL byte in the decoded request path with a 400,
@@ -93,6 +102,23 @@ mod tests {
         assert!(decoded_path_has_nul("/x/a\0b"));
     }
 
+    /// An invalid-UTF-8 escape ANYWHERE else in the path must not hide a NUL.
+    /// Deciding on a decoded `String` made any such escape return `Err`, which
+    /// read as "no NUL" and walked the `%00` straight into
+    /// `repo_visibility_middleware`, which decodes the key segment on its own
+    /// and binds it — one pool checkout and one wire-protocol failure per
+    /// anonymous request, exactly the primitive this guard exists to remove.
+    #[test]
+    fn a_non_utf8_escape_elsewhere_does_not_blind_the_guard() {
+        // Overlong encoding of NUL in a later segment, NUL in the key segment.
+        assert!(decoded_path_has_nul("/maven/pub%00key/a%C0%80b"));
+        // A lone continuation byte, same shape.
+        assert!(decoded_path_has_nul("/maven/re%00po/%FF"));
+        // ...and the plain control still detected, so the pair differs only in
+        // the invalid escape.
+        assert!(decoded_path_has_nul("/maven/re%00po/x"));
+    }
+
     #[test]
     fn ordinary_paths_are_untouched() {
         assert!(!decoded_path_has_nul("/"));
@@ -110,8 +136,13 @@ mod tests {
         assert!(!decoded_path_has_nul("/x/weird%09name%0A.bin"));
         // Double-encoded: `%2500` decodes to the literal text "%00".
         assert!(!decoded_path_has_nul("/x/a%2500b"));
-        // Invalid escapes decode-fail and are left to the extractor.
+        // A malformed escape is copied through literally by the decoder, so
+        // it yields no NUL and keeps whatever status it had before.
         assert!(!decoded_path_has_nul("/x/a%zzb"));
+        // Invalid UTF-8 with no NUL anywhere: not our refusal to make. Axum's
+        // own param decoding already answers these with a 400.
+        assert!(!decoded_path_has_nul("/x/%FF"));
+        assert!(!decoded_path_has_nul("/maven/repo/a%C0%80b"));
     }
 
     async fn ok_handler() -> &'static str {
@@ -306,6 +337,96 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a legitimate missing artifact must still 404"
         );
+
+        fx.teardown().await;
+    }
+
+    /// The mixed vector end to end (F1 of the #3665 review): a NUL in the
+    /// **key** segment plus an invalid-UTF-8 escape elsewhere. Deciding on a
+    /// decoded `String` let this through the guard, and
+    /// `repo_visibility_middleware` — which percent-decodes the key segment on
+    /// its own, before axum's `Path` extractor ever runs — bound `re\0po` to
+    /// `SELECT ... FROM repositories WHERE key = $1`. The status was a
+    /// fail-closed 401/404 rather than a 500, but the pool checkout and the
+    /// wire-protocol failure this guard exists to remove both survived.
+    #[tokio::test]
+    async fn mixed_invalid_utf8_escape_is_still_refused_at_the_boundary_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let app = crate::api::routes::create_router(fx.state.clone());
+
+        for uri in ["/maven/pub%00key/a%C0%80b", "/maven/re%00po/%FF"] {
+            let (status, body) = tdh::send(app.clone(), tdh::get(uri.to_string())).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{uri}: an invalid-UTF-8 escape elsewhere must not hide the NUL \
+                 (body: {})",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // Control: percent escapes that are valid UTF-8 and carry no NUL are
+        // untouched — the guard fires on the NUL, not on the presence of `%`.
+        let (control, _) =
+            tdh::send(app, tdh::get(format!("/maven/{}/a%C3%A9b", fx.repo_key))).await;
+        assert_eq!(
+            control,
+            StatusCode::NOT_FOUND,
+            "an escaped but NUL-free path must still reach the handler and 404"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// The two properties the registration comment in `routes.rs` asserts:
+    /// the refusal is emitted INSIDE correlation-id (so it still carries the
+    /// header operators correlate on), and it is byte-identical for a real
+    /// repository, an unknown one and an unrouted path — answering before
+    /// authentication must not become an existence oracle.
+    #[tokio::test]
+    async fn nul_refusal_carries_correlation_id_and_is_byte_identical_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::tracing::CORRELATION_ID_HEADER;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let app = crate::api::routes::create_router(fx.state.clone());
+
+        let mut bodies: Vec<(String, bytes::Bytes)> = Vec::new();
+        for uri in [
+            // real, public repository
+            format!("/api/v1/repositories/{}/artifacts/a%00b", fx.repo_key),
+            // repository that does not exist
+            "/api/v1/repositories/no%00such/artifacts/a".to_string(),
+            // no route at all
+            "/nothing/here/a%00b".to_string(),
+        ] {
+            let (status, body, headers) =
+                tdh::send_with_headers(app.clone(), tdh::get(uri.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(
+                headers.get(CORRELATION_ID_HEADER).is_some(),
+                "{uri}: the refusal must be emitted inside correlation-id, so \
+                 moving the layer outside it fails here rather than silently \
+                 dropping the header"
+            );
+            bodies.push((uri, body));
+        }
+        let (first_uri, first) = &bodies[0];
+        for (uri, body) in &bodies[1..] {
+            assert_eq!(
+                body, first,
+                "{uri} and {first_uri} must be byte-identical: the refusal \
+                 depends only on the request bytes, never on what exists"
+            );
+        }
 
         fx.teardown().await;
     }
