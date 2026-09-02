@@ -952,6 +952,17 @@ mod like_pattern_escape_class_tests {
     // pattern built by `push_str`, `+`, `concat!` or a raw string literal;
     // those evade it, and a contributor could plausibly write them.
     //
+    // It WILL over-flag a percentage string -- `format!("{:.1}%", pct)` is the
+    // ordinary way to render one, and nothing distinguishes it from a prefix
+    // pattern at the literal level. `backend/src` contains none today. That is
+    // a false positive rather than a hole, and it fails loudly with its own
+    // file and line, so the cost is one puzzled minute: name the value for what
+    // it is (`percent_label`) so the failure message reads as
+    // obviously-not-a-pattern, then widen this recogniser to exclude it.
+    // Trading that for the two live sites the narrow form walked past is the
+    // right way round for a gate whose failure mode should be noisy, never
+    // silent.
+    //
     // STILL OUT OF SCOPE: `LIKE ANY($n)` over a Rust-built array, where the site
     // deliberately over-fetches and re-checks the match exactly in Rust. Those
     // wrap the pattern in [`like_any_overmatch_accepted`], which the gate
@@ -1615,8 +1626,20 @@ mod like_pattern_escape_class_tests {
             }) else {
                 continue;
             };
+            let item = item.trim_end();
             let item = item.trim_start();
             if !(item.starts_with("mod ") || item.contains(" mod ")) {
+                continue;
+            }
+            // An OUT-OF-LINE declaration (`#[cfg(test)] mod tests;`) opens no
+            // brace, so there is no region: its body is a separate file, which
+            // is scanned on its own terms. Searching for a closing brace here
+            // would find an unrelated one further down and silently swallow
+            // every line between — live in this tree at `api/handlers/mod.rs`
+            // (`mod test_db_helpers;`) and `formats/mod.rs` (`mod
+            // format_tests;`), which between them hid ~140 production lines
+            // including the whole `FormatHandler` trait.
+            if item.ends_with(';') {
                 continue;
             }
             // The module ends at the first line that is this item's indent
@@ -1625,13 +1648,32 @@ mod like_pattern_escape_class_tests {
             // unbalanced brace inside a string — both of which this very
             // module contains — from ending the region early and silently
             // re-exposing the scanners' own probe strings as offenders.
+            //
+            // A trailing comment on that brace (`} // end of tests`) is still
+            // the brace: comparing the raw line would walk past it to the next
+            // one at the same indent — the closing brace of a PRODUCTION item
+            // — and absorb it.
             let closing = format!("{indent}}}");
-            let Some(offset) = lines[index + 1..].iter().position(|l| *l == closing) else {
+            let Some(offset) = lines[index + 1..]
+                .iter()
+                .position(|l| strip_trailing_comment(l) == closing)
+            else {
                 continue;
             };
             out.push((index + 1, index + 1 + offset + 1));
         }
         out
+    }
+
+    /// `line` with a trailing `//` comment and trailing whitespace removed.
+    /// Only used to recognise a block's closing brace, so a `//` inside a
+    /// string literal on such a line is not a concern — a line that closes a
+    /// block at its item's indent carries nothing else.
+    fn strip_trailing_comment(line: &str) -> &str {
+        match line.find("//") {
+            Some(at) => line[..at].trim_end(),
+            None => line.trim_end(),
+        }
     }
 
     /// Whether 1-based `line_no` falls inside any range from
@@ -1640,6 +1682,24 @@ mod like_pattern_escape_class_tests {
         ranges
             .iter()
             .any(|(from, to)| line_no >= *from && line_no <= *to)
+    }
+
+    /// `owner` from its `fn` header onward, i.e. with the doc comment
+    /// [`enclosing_fn`] deliberately includes stripped off. Anything that must
+    /// be true of the CODE is checked against this, not against prose.
+    fn fn_body(owner: &str) -> &str {
+        line_offsets(owner)
+            .find(|(_, line)| {
+                let t = line.trim_start();
+                t.starts_with("fn ")
+                    || t.starts_with("async fn ")
+                    || t.starts_with("pub fn ")
+                    || t.starts_with("pub async fn ")
+                    || (t.starts_with("pub(") && t.contains(") fn "))
+                    || (t.starts_with("pub(") && t.contains(") async fn "))
+            })
+            .map(|(at, _)| &owner[at..])
+            .unwrap_or(owner)
     }
 
     /// Whether the `format!` at `at` is directly enclosed by
@@ -1668,10 +1728,19 @@ mod like_pattern_escape_class_tests {
                     continue;
                 }
                 examined += 1;
-                if wrapped_in_overmatch_marker(&raw, at) {
+                let owner = enclosing_fn(&raw, at);
+                // The over-match opt-out needs BOTH halves: the wrapper around
+                // THIS `format!` (value-scoped — a wrapper on a different
+                // pattern in the same function excuses nothing), and a real
+                // `LIKE ANY` in the function's BODY. The wrapper alone would
+                // let an ordinary search site be silenced by wrapping it; the
+                // `LIKE ANY` alone was the round-1 defect, satisfiable by two
+                // lines of prose, which is why it is matched below the `fn`
+                // header rather than across the doc comment `enclosing_fn`
+                // deliberately includes.
+                if wrapped_in_overmatch_marker(&raw, at) && fn_body(owner).contains("LIKE ANY(") {
                     continue;
                 }
-                let owner = enclosing_fn(&raw, at);
                 if escapes_operand(&raw, owner) {
                     continue;
                 }
@@ -1786,6 +1855,47 @@ mod like_pattern_escape_class_tests {
         assert!(
             !in_test_module(&ranges, 5),
             "production code after the module stays scanned"
+        );
+        // An OUT-OF-LINE `#[cfg(test)] mod name;` opens no region at all.
+        // Before this was handled, the search for a closing brace found an
+        // unrelated one and swallowed everything up to it — live in this very
+        // file (`mod test_db_helpers;`) and in `formats/mod.rs`.
+        let out_of_line = "#[cfg(test)]\nmod b_tests;\npub fn prod() {\n    let _ = 1;\n}\n";
+        assert!(
+            test_module_line_ranges(out_of_line).is_empty(),
+            "an out-of-line test module declaration opens no region"
+        );
+        // The same shape with an inner attribute and a doc comment in between.
+        let out_of_line_attrs =
+            "#[cfg(test)]\n/// docs\n#[allow(dead_code)]\npub(crate) mod c;\npub fn prod() {\n}\n";
+        assert!(
+            test_module_line_ranges(out_of_line_attrs).is_empty(),
+            "attributes and docs before an out-of-line declaration change nothing"
+        );
+        // A trailing comment on the closing brace is still the closing brace.
+        // Comparing raw lines walked past it to the NEXT brace at that indent
+        // — a production item's — and absorbed everything between.
+        let commented = "#[cfg(test)]\nmod d {\n    fn t() {}\n} // end of d\npub fn prod() {\n    let _ = 1;\n}\n";
+        let ranges = test_module_line_ranges(commented);
+        assert_eq!(
+            ranges,
+            vec![(1, 4)],
+            "a trailing comment on the closing brace must not extend the region"
+        );
+        assert!(
+            !in_test_module(&ranges, 6),
+            "production code after a commented closing brace stays scanned"
+        );
+        // `fn_body` drops the doc comment `enclosing_fn` includes, so a phrase
+        // in prose cannot satisfy a check meant for code.
+        let documented = "/// mentions LIKE ANY( in prose\nfn f() {\n    let _ = 1;\n}\n";
+        assert!(
+            !fn_body(documented).contains("LIKE ANY("),
+            "a doc comment must not satisfy a check on the function body"
+        );
+        assert!(
+            fn_body("fn f() {\n    let sql = \"x LIKE ANY($1)\";\n}\n").contains("LIKE ANY("),
+            "the body's own SQL must still satisfy it"
         );
         // The over-match wrapper excuses the expression it encloses, and only
         // that one: a mention elsewhere on the line does not count.
