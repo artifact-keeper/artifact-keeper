@@ -23,7 +23,8 @@ storage backends.
 flowchart TD
     client[Client: browser, package manager, CI] --> backstop[Load-shed + timeout backstop]
     backstop --> corr[Correlation ID]
-    corr --> demo[Demo-mode guard, if enabled]
+    corr --> nul[NUL-path guard: rejects a NUL byte in the decoded path]
+    nul --> demo[Demo-mode guard, if enabled]
     demo --> setup[Setup guard: locks mutations until admin password changed]
     setup --> guest[Guest-access guard]
     guest --> cors[CORS + security headers]
@@ -52,12 +53,13 @@ outermost. The effective order a request sees is:
 |-------|-------|---------|
 | 1 | Backstop | Optional global concurrency load-shed and request timeout, returning 503 so clients back off. Disabled by sentinel config values. |
 | 2 | Correlation ID | Extracts or generates a request correlation ID and records it on the tracing span. |
-| 3 | Demo guard | Blocks mutating verbs when `DEMO_MODE` is on. |
-| 4 | Setup guard | Blocks API mutations until the default admin password has been changed on first boot. |
-| 5 | Guest-access guard | When guest access is disabled, requires authentication for everything except a small allowlist (login, setup, health, OCI challenge). |
-| 6 | CORS + security headers | Same-origin in production, explicit allowlist plus private-network origins in development. |
-| 7 | Auth | Per-route. Resolves a principal into an `AuthExtension` request extension. See below. |
-| 8 | Rate limiter | Per-IP and per-principal buckets, plus a stricter login limiter. Keys on the real TCP peer via `ConnectInfo<SocketAddr>`. |
+| 3 | NUL-path guard | Rejects a percent-encoded NUL anywhere in the decoded request path with a 400, before routing — `\0` is rejected by Postgres at the wire protocol, so it must never reach a handler's first query (#3622). |
+| 4 | Demo guard | Blocks mutating verbs when `DEMO_MODE` is on. |
+| 5 | Setup guard | Blocks API mutations until the default admin password has been changed on first boot. |
+| 6 | Guest-access guard | When guest access is disabled, requires authentication for everything except a small allowlist (login, setup, health, OCI challenge). |
+| 7 | CORS + security headers | Same-origin in production, explicit allowlist plus private-network origins in development. |
+| 8 | Auth | Per-route. Resolves a principal into an `AuthExtension` request extension. See below. |
+| 9 | Rate limiter | Per-IP and per-principal buckets, plus a stricter login limiter. Keys on the real TCP peer via `ConnectInfo<SocketAddr>`. |
 
 Authentication is applied per route group rather than globally, because the two
 API surfaces have different rules (documented in `api/openapi.rs`):
@@ -101,7 +103,7 @@ backend/src/
     routes.rs          Router assembly and middleware layering
     openapi.rs         Root OpenAPI doc + build_openapi() module merge
     middleware/        auth, rate_limit, demo, setup, guest_access, tracing,
-                       security_headers, metrics
+                       security_headers, metrics, nul_path
     handlers/          ~90 handler modules, one per format + core feature
     validation.rs      Shared input validation, SSRF guards
     extractors.rs      Custom Axum extractors
