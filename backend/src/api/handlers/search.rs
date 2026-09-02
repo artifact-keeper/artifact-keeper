@@ -1834,6 +1834,86 @@ mod tests {
     // diff touched on every short-circuit / per_page=0 path.
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // build_search_result_item_from_doc -- OpenSearch document -> API item
+    // (#3670). The mapping must be indistinguishable from the PostgreSQL
+    // path's output so a caller cannot tell which backend served the request.
+    // -----------------------------------------------------------------------
+
+    fn mk_artifact_doc() -> crate::services::opensearch_service::ArtifactDocument {
+        crate::services::opensearch_service::ArtifactDocument {
+            id: "8f14e45f-ceea-467a-9575-1b1cf3f1e111".to_string(),
+            name: "lodash".to_string(),
+            path: "lodash/-/lodash-4.17.21.tgz".to_string(),
+            version: Some("4.17.21".to_string()),
+            format: "npm".to_string(),
+            repository_id: Uuid::new_v4().to_string(),
+            repository_key: "npm-remote".to_string(),
+            repository_name: "npm remote".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            size_bytes: 1234,
+            download_count: 7,
+            is_public: true,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn test_build_search_result_item_from_doc_maps_every_field() {
+        let doc = mk_artifact_doc();
+        let item = build_search_result_item_from_doc(doc.clone());
+
+        assert_eq!(item.id.to_string(), doc.id);
+        assert_eq!(item.result_type, "artifact");
+        assert_eq!(item.name, "lodash");
+        assert_eq!(item.path.as_deref(), Some("lodash/-/lodash-4.17.21.tgz"));
+        assert_eq!(item.repository_key, "npm-remote");
+        assert_eq!(item.format.as_deref(), Some("npm"));
+        assert_eq!(item.version.as_deref(), Some("4.17.21"));
+        assert_eq!(item.size_bytes, Some(1234));
+        assert_eq!(item.created_at.timestamp(), 1_700_000_000);
+        assert!(item.highlights.is_none());
+    }
+
+    /// The shape must match the PostgreSQL path's, since both feed the same
+    /// response type and a divergence would be visible to clients.
+    #[test]
+    fn test_doc_and_row_mappings_agree_on_result_type() {
+        let from_doc = build_search_result_item_from_doc(mk_artifact_doc());
+        let from_row = build_search_result_item(mk_search_result("lodash"));
+        assert_eq!(from_doc.result_type, from_row.result_type);
+    }
+
+    /// A document id that is not a UUID must not drop the hit; it degrades to
+    /// the nil UUID rather than panicking or filtering the result out.
+    #[test]
+    fn test_build_search_result_item_from_doc_tolerates_bad_uuid() {
+        let mut doc = mk_artifact_doc();
+        doc.id = "not-a-uuid".to_string();
+        let item = build_search_result_item_from_doc(doc);
+        assert_eq!(item.id, Uuid::nil());
+        assert_eq!(item.name, "lodash", "the rest of the hit must survive");
+    }
+
+    /// An out-of-range stored timestamp falls back to the epoch instead of
+    /// dropping the hit.
+    #[test]
+    fn test_build_search_result_item_from_doc_tolerates_bad_timestamp() {
+        let mut doc = mk_artifact_doc();
+        doc.created_at = i64::MAX;
+        let item = build_search_result_item_from_doc(doc);
+        assert_eq!(item.created_at.timestamp(), 0);
+    }
+
+    /// A missing version stays missing rather than becoming an empty string.
+    #[test]
+    fn test_build_search_result_item_from_doc_preserves_absent_version() {
+        let mut doc = mk_artifact_doc();
+        doc.version = None;
+        let item = build_search_result_item_from_doc(doc);
+        assert!(item.version.is_none());
+    }
+
     fn mk_search_result(name: &str) -> crate::services::search_service::SearchResult {
         crate::services::search_service::SearchResult {
             id: Uuid::nil(),

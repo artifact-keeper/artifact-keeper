@@ -1410,6 +1410,175 @@ mod tests {
         assert!(!scope.grants(Uuid::new_v4()));
     }
 
+    /// Canned OpenSearch `_search` response carrying one artifact hit.
+    fn one_hit_response(repo_id: &str) -> serde_json::Value {
+        json!({
+            "took": 5,
+            "hits": {
+                "total": { "value": 1 },
+                "hits": [{
+                    "_source": {
+                        "id": "8f14e45f-ceea-467a-9575-1b1cf3f1e111",
+                        "name": "lodash",
+                        "path": "lodash/-/lodash-4.17.21.tgz",
+                        "version": "4.17.21",
+                        "format": "npm",
+                        "repository_id": repo_id,
+                        "repository_key": "npm-remote",
+                        "repository_name": "npm remote",
+                        "content_type": "application/octet-stream",
+                        "size_bytes": 1234,
+                        "download_count": 7,
+                        "is_public": true,
+                        "created_at": 1_700_000_000
+                    }
+                }]
+            }
+        })
+    }
+
+    /// An empty allowlist must return no results **without querying the
+    /// cluster** — deny-by-default that does not depend on how OpenSearch
+    /// treats an empty `terms` array. Asserted by pointing the service at a
+    /// mock server and requiring it received zero requests.
+    #[tokio::test]
+    async fn test_search_artifacts_empty_scope_returns_early_without_querying() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let svc = OpenSearchService::new(&server.uri(), None, None, false).expect("service");
+
+        let results = svc
+            .search_artifacts(
+                "lodash",
+                None,
+                None,
+                10,
+                0,
+                &AccessScope::Restricted(vec![]),
+            )
+            .await
+            .expect("empty scope must succeed, not error");
+
+        assert!(results.hits.is_empty());
+        assert_eq!(results.total_hits, 0);
+        assert_eq!(results.query, "lodash");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "an empty allowlist must not reach the cluster at all"
+        );
+    }
+
+    /// A restricted scope must put a `terms` filter on `repository_id` into the
+    /// request actually sent to OpenSearch. Asserted against the wire body
+    /// rather than the function's source text.
+    #[tokio::test]
+    async fn test_search_artifacts_sends_repository_id_filter_on_the_wire() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let repo = Uuid::new_v4();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(one_hit_response(&repo.to_string())),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = OpenSearchService::new(&server.uri(), None, None, false).expect("service");
+        let results = svc
+            .search_artifacts(
+                "lodash",
+                None,
+                None,
+                10,
+                0,
+                &AccessScope::Restricted(vec![repo]),
+            )
+            .await
+            .expect("search should succeed");
+
+        assert_eq!(results.total_hits, 1);
+        assert_eq!(results.hits.len(), 1);
+        assert_eq!(results.hits[0].name, "lodash");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        let body: Value = serde_json::from_slice(&reqs[0].body).expect("request body is JSON");
+        let filters = body["query"]["bool"]["filter"]
+            .as_array()
+            .expect("filter must be an array");
+        let terms = filters
+            .iter()
+            .find(|c| c.get("terms").is_some())
+            .expect("a terms filter must be present");
+        assert_eq!(
+            terms["terms"]["repository_id"],
+            json!([repo.to_string()]),
+            "visibility must be filtered on repository_id"
+        );
+        assert!(
+            !body.to_string().contains("is_public"),
+            "the query must never filter on the stale indexed is_public flag"
+        );
+    }
+
+    /// Admin scope means no restriction: the request carries no `terms` filter.
+    #[tokio::test]
+    async fn test_search_artifacts_admin_scope_sends_no_repository_filter() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(one_hit_response(&Uuid::new_v4().to_string())),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = OpenSearchService::new(&server.uri(), None, None, false).expect("service");
+        svc.search_artifacts("lodash", None, None, 10, 0, &AccessScope::Admin)
+            .await
+            .expect("search should succeed");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        let body: Value = serde_json::from_slice(&reqs[0].body).expect("request body is JSON");
+        let filters = body["query"]["bool"]["filter"]
+            .as_array()
+            .expect("filter must be an array");
+        assert!(
+            filters.iter().all(|c| c.get("terms").is_none()),
+            "admin scope must not emit a repository_id terms filter, got {filters:?}"
+        );
+    }
+
+    /// A non-2xx from the cluster is an error the caller can fall back on, not
+    /// a silently empty result set.
+    #[tokio::test]
+    async fn test_search_artifacts_upstream_failure_is_an_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+
+        let svc = OpenSearchService::new(&server.uri(), None, None, false).expect("service");
+        let err = svc
+            .search_artifacts("lodash", None, None, 10, 0, &AccessScope::Admin)
+            .await
+            .expect_err("a 503 must surface as an error so the caller can fall back");
+        assert!(err.to_string().contains("503"), "got: {err}");
+    }
+
     #[test]
     fn test_constants() {
         assert_eq!(ARTIFACTS_INDEX, "artifacts");
