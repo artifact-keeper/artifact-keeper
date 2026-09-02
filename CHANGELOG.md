@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Consumers still have to opt in. In artifact-keeper-web five admin screens read this endpoint — the permissions principal picker, the users list, the group member picker, the audit actor filter and the age-gate approver picker — and four of them have no other source for the distinction; the picker is fixed page-locally in artifact-keeper-web#823, the rest wait on an SDK release carrying this field.
 
+### Security
+
+- **A percent-encoded NUL in any URL path turned an anonymous request into a 500 from the database driver** (#3622). `%00` in a wildcard path segment is decoded by the router into a literal `\0`, and Postgres rejects that byte at the wire protocol — so a trivially craftable unauthenticated read of a *public* repository cost a connection checkout plus a failing query and answered `500 DATABASE_ERROR`, a cheap pool-amplification and log-noise primitive as well as a coarse implementation-detail leak. #3545 closed the four generic repository-scoped routes at their own path extraction; the same class still reached the driver through the format-native wildcard routes (`/maven/{key}/*path`, `/rpm/{key}/packages/*path`, `/hex/{key}/tarballs/*path`, `/puppet/{key}/v3/files/*path`, `/ansible/{key}/download/*path`) and through the repository **key** segment itself (`GET /api/v1/repositories/pub%00gen/artifacts/a`, via `get_by_key`).
+
+  With ~40 format handlers on that surface, the fix is a single shared boundary rather than a per-handler check: a global layer inspects the percent-decoded request path and refuses a NUL with a 400 before routing, so every current and future handler is covered at once. It is deliberately NUL-only — no other byte a client may legitimately percent-encode is touched — and a NUL can appear in neither a stored artifact path (uploads already reject it) nor a repository key, so no request that could ever have succeeded changes status; a refusal on the `/v2` OCI surface is emitted as the distribution-spec error envelope rather than the REST body, matching #3284.
+
 ## [1.8.2] - 2026-09-01
 
 ### Added
