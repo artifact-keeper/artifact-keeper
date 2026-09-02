@@ -27,7 +27,7 @@ use crate::services::audit_service::{
     ResourceType,
 };
 use crate::services::auth_config_service::AuthConfigService;
-use crate::services::auth_service::AuthService;
+use crate::services::auth_service::{AuthService, TimingPad};
 use crate::services::totp_policy;
 
 /// Fire-and-forget auth audit log. Failures are silently ignored so audit
@@ -306,6 +306,7 @@ async fn enforce_local_login_sso_policy(
 pub async fn login(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    pad_budget: Option<Extension<crate::api::middleware::rate_limit::LoginPadBudget>>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
@@ -321,8 +322,17 @@ pub async fn login(
     // unauthenticated credential surface, so it pays the bcrypt timing pad
     // that the Basic-auth package-manager paths must not, and it hands back
     // the server-side reason behind the deliberately uniform error (#3504).
+    //
+    // The pad runs while this source IP is within its failed-login budget,
+    // which the login rate-limit middleware tracks. An absent extension means
+    // the handler was mounted without that middleware (unit tests, or a
+    // hand-rolled router), so it pads — the safe default.
+    let pad = match pad_budget {
+        Some(Extension(budget)) if !budget.within_budget => TimingPad::Off,
+        _ => TimingPad::On,
+    };
     let (user, tokens) = match auth_service
-        .authenticate_for_login(&payload.username, &payload.password)
+        .authenticate_for_login(&payload.username, &payload.password, pad)
         .await
     {
         Ok(result) => result,
@@ -1214,8 +1224,10 @@ mod tests {
             password: password.to_string(),
         };
 
-        let gated = login(State(enforcing), HeaderMap::new(), Json(req())).await;
-        let ungated = login(State(permissive), HeaderMap::new(), Json(req())).await;
+        // `None` pad budget: no login limiter in front of a direct call, so
+        // the handler pads (the safe default, #3504).
+        let gated = login(State(enforcing), HeaderMap::new(), None, Json(req())).await;
+        let ungated = login(State(permissive), HeaderMap::new(), None, Json(req())).await;
 
         tdh::cleanup_user(&pool, user_id).await;
 

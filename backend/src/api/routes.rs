@@ -437,11 +437,12 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_login_per_window,
         state.config.rate_limit_login_window_secs,
     ));
-    // Per-source-IP cap on FAILED logins, independent of the username (#3504).
-    // The bucket above is keyed per-(username, IP), so cycling usernames gets
-    // a fresh bucket every request; this one bounds the sweep itself. Only
-    // failures are charged, so successful logins from a shared egress are
-    // unaffected. Default: 30 failures / 5 minutes per IP.
+    // Per-source-IP budget for the login bcrypt timing pad (#3504). The bucket
+    // above is keyed per-(username, IP), so cycling usernames gets a fresh one
+    // every request; this one accrues against the source IP. It gates the pad,
+    // never the request — an exhausted budget makes logins run unpadded, it
+    // does not refuse them — and a successful login clears it. Default: 30
+    // failures / 5 minutes per IP; 0 disables it.
     let login_failed_ip_rate_limiter = Arc::new(RateLimiter::new(
         state.config.rate_limit_login_failed_per_ip_per_window,
         state.config.rate_limit_login_failed_per_ip_window_secs,

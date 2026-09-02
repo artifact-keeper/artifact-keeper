@@ -1065,21 +1065,77 @@ pub(crate) const LOCAL_AUTH_FAILURE_MESSAGE: &str = "Invalid username or passwor
 /// Whether a credential-level rejection should pay the same bcrypt cost as a
 /// wrong password (#3504).
 ///
-/// The pad closes the timing half of the enumeration oracle, but it is charged
-/// per call, so it is applied only where the oracle exists.
+/// The pad closes the timing half of the enumeration oracle, but it costs a
+/// full bcrypt per rejected request, so it is applied only where the oracle
+/// exists and only while the source IP still has failed-login budget — see
+/// [`AuthEntry`] and `rate_limit::LoginPadBudget`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TimingPad {
-    /// Pad. Used by [`AuthService::authenticate_for_login`] — the
-    /// unauthenticated `POST /api/v1/auth/login` surface an attacker probes.
+pub enum TimingPad {
+    /// Pad: run one bcrypt verify against `dummy_bcrypt_hash()` on the arms
+    /// that never reach a stored hash.
     On,
-    /// Do not pad. Used by [`AuthService::authenticate`], which the API
-    /// middleware tries *before* the API-token path on every Basic-auth
-    /// package-manager request (`middleware/auth.rs`, `oci_v2.rs`,
-    /// `conda.rs`). In an SSO-only deployment every one of those requests
-    /// takes a rejection arm, so padding here would put a cost-12 bcrypt in
-    /// front of traffic that never reaches the login form and would halve the
-    /// auth-permit headroom that #1437/#1442 exist to protect.
+    /// Do not pad: return as soon as the arm is known, the way `origin/main`
+    /// always did. Arms that *do* have a stored hash still verify it normally.
     Off,
+}
+
+/// Which entry point is running an authentication, and how it should behave
+/// (#3504).
+///
+/// Two properties travel together and must not be conflated:
+///
+/// * **the pad** — whether a hashless rejection arm still runs a bcrypt; and
+/// * **the log** — whether a rejection is announced at WARN under the
+///   `security` target.
+///
+/// They are separate because the pad is budgeted per source IP while the log
+/// is not: an attacker who has burned an IP's pad budget must still be logged,
+/// or the sweep would silence exactly the signal that was added to replace the
+/// lockout message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthEntry {
+    /// The shared credential primitive, [`AuthService::authenticate`].
+    ///
+    /// The API middleware tries it *before* the API-token path on every
+    /// Basic-auth package-manager request (`middleware/auth.rs`,
+    /// `oci_v2.rs`, `conda.rs`). A user who authenticates `cargo`/`pip` as
+    /// `username:<api-token>` therefore takes a rejection arm on **every**
+    /// request, and an SSO-only deployment takes the federated arm on every
+    /// request. So this entry point neither pads (a cost-12 bcrypt in front of
+    /// traffic that never reaches the login form, halving the auth-permit
+    /// headroom #1437/#1442 exist to protect) nor logs (a WARN per package
+    /// request would bury the login signal in routine traffic, at the same
+    /// target and level, and would let any anonymous caller write
+    /// attacker-chosen text to the log). `origin/main` did neither here.
+    Shared,
+    /// The unauthenticated `POST /api/v1/auth/login` endpoint — the one
+    /// surface where the enumeration oracle is reachable.
+    ///
+    /// Always logs rejections at WARN under the `security` target. Pads
+    /// according to `pad`, which the login rate-limit middleware sets from the
+    /// source IP's remaining failed-login budget.
+    Login {
+        /// Whether this request still has pad budget.
+        pad: TimingPad,
+    },
+}
+
+impl AuthEntry {
+    /// The pad this entry point runs. The shared primitive never pads.
+    fn pad(self) -> TimingPad {
+        match self {
+            Self::Shared => TimingPad::Off,
+            Self::Login { pad } => pad,
+        }
+    }
+
+    /// Whether a rejection is announced at WARN under the `security` target.
+    ///
+    /// True for the login endpoint regardless of its pad budget: suppressing
+    /// the log once an attacker exhausts the budget would hide the sweep.
+    fn logs_rejections(self) -> bool {
+        matches!(self, Self::Login { .. })
+    }
 }
 
 /// Which credential-level arm rejected a login (#3504).
@@ -1253,27 +1309,33 @@ impl AuthService {
     /// The distinguishing detail — which arm, and for the federated arm which
     /// identity provider — stays here, on the server, where operators
     /// debugging a login still have it.
-    fn reject_login(username: &str, reason: LoginRejection) -> LoginFailure {
-        match reason {
-            LoginRejection::UnknownOrInactive => tracing::warn!(
-                target: "security",
-                username = %username,
-                "local login for an unknown or inactive username"
-            ),
-            LoginRejection::Federated(provider) => tracing::warn!(
-                target: "security",
-                username = %username,
-                auth_provider = ?provider,
-                "local login attempted against a federated account"
-            ),
-            LoginRejection::NoPasswordHash => tracing::warn!(
-                target: "security",
-                username = %username,
-                "local login for an account with no stored password hash"
-            ),
-            // The wrong-password arms log at their own call site, which has
-            // the counters to report.
-            LoginRejection::InvalidPassword | LoginRejection::Locked => {}
+    fn reject_login(username: &str, reason: LoginRejection, entry: AuthEntry) -> LoginFailure {
+        // Only the login endpoint logs. `AuthEntry::Shared` runs on every
+        // Basic-auth package-manager request, where a WARN per rejection would
+        // bury this very signal in routine `cargo`/`pip`/`docker` traffic —
+        // see [`AuthEntry`]. `origin/main` logged nothing on any of these arms.
+        if entry.logs_rejections() {
+            match reason {
+                LoginRejection::UnknownOrInactive => tracing::warn!(
+                    target: "security",
+                    username = %username,
+                    "local login for an unknown or inactive username"
+                ),
+                LoginRejection::Federated(provider) => tracing::warn!(
+                    target: "security",
+                    username = %username,
+                    auth_provider = ?provider,
+                    "local login attempted against a federated account"
+                ),
+                LoginRejection::NoPasswordHash => tracing::warn!(
+                    target: "security",
+                    username = %username,
+                    "local login for an account with no stored password hash"
+                ),
+                // The wrong-password arms log at their own call site, which
+                // has the counters to report.
+                LoginRejection::InvalidPassword | LoginRejection::Locked => {}
+            }
         }
         LoginFailure {
             error: AppError::Authentication(LOCAL_AUTH_FAILURE_MESSAGE.to_string()),
@@ -1290,27 +1352,36 @@ impl AuthService {
     /// [`Self::authenticate_for_login`] for the unauthenticated login
     /// endpoint.
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<(User, TokenPair)> {
-        self.authenticate_inner(username, password, TimingPad::Off)
+        self.authenticate_inner(username, password, AuthEntry::Shared)
             .await
             .map_err(|failure| failure.error)
     }
 
     /// Authenticate for `POST /api/v1/auth/login` (#3504).
     ///
-    /// Same credential logic as [`Self::authenticate`], with two additions the
-    /// unauthenticated login surface needs and the machine-to-machine callers
-    /// must not pay for:
+    /// Same credential logic as [`Self::authenticate`], with three additions
+    /// the unauthenticated login surface needs and the machine-to-machine
+    /// callers must not pay for:
     ///
-    /// * the bcrypt timing pad ([`TimingPad::On`]), so an arm that never
-    ///   reaches a stored hash costs the same as a wrong password; and
+    /// * the bcrypt timing pad, so an arm that never reaches a stored hash
+    ///   costs the same as a wrong password;
+    /// * a WARN under the `security` target naming the arm; and
     /// * a [`LoginFailure`] carrying the server-side `reason`, so the handler
     ///   can record on the audit event what the response no longer says.
+    ///
+    /// `pad` comes from the source IP's remaining failed-login budget, which
+    /// the login rate-limit middleware computes. With [`TimingPad::Off`] the
+    /// hashless arms return without bcrypt — the timing oracle is back for
+    /// that IP — while an account that *has* a stored hash is still verified
+    /// normally. That is the deliberate trade: it bounds an attacker's bcrypt
+    /// amplification per IP per window without ever refusing a correct login.
     pub async fn authenticate_for_login(
         &self,
         username: &str,
         password: &str,
+        pad: TimingPad,
     ) -> std::result::Result<(User, TokenPair), LoginFailure> {
-        self.authenticate_inner(username, password, TimingPad::On)
+        self.authenticate_inner(username, password, AuthEntry::Login { pad })
             .await
     }
 
@@ -1318,7 +1389,7 @@ impl AuthService {
         &self,
         username: &str,
         password: &str,
-        pad: TimingPad,
+        entry: AuthEntry,
     ) -> std::result::Result<(User, TokenPair), LoginFailure> {
         // Fetch user from database
         let user = sqlx::query_as!(
@@ -1372,11 +1443,12 @@ impl AuthService {
             .is_some_and(|u| Self::is_account_locked(u.locked_until, now));
 
         // Unpadded callers reject here, before any bcrypt work — the fast arm
-        // `authenticate` has always had, and the one the package-manager paths
-        // depend on (see [`TimingPad`]).
+        // `authenticate` has always had, the one the package-manager paths
+        // depend on, and the one the login endpoint falls back to once its
+        // source IP has burned its failed-login budget (see [`AuthEntry`]).
         if let Some(reason) = rejection {
-            if pad == TimingPad::Off {
-                return Err(Self::reject_login(username, reason));
+            if entry.pad() == TimingPad::Off {
+                return Err(Self::reject_login(username, reason, entry));
             }
         }
 
@@ -1396,7 +1468,7 @@ impl AuthService {
         let password_matches = Self::verify_password(password, hash_to_verify).await?;
 
         if let Some(reason) = rejection {
-            return Err(Self::reject_login(username, reason));
+            return Err(Self::reject_login(username, reason, entry));
         }
 
         // `rejection` is `None`, which the match above produces only for a
@@ -1443,18 +1515,25 @@ impl AuthService {
             } else {
                 LoginRejection::InvalidPassword
             };
-            tracing::warn!(
-                target: "security",
-                username = %username,
-                user_id = %user.id,
-                failed_login_attempts = new_count,
-                newly_locked = lock_until.is_some(),
-                already_locked,
-                reason = reason.audit_reason(),
-                "rejected local login with a wrong password"
-            );
+            // Login endpoint only. `AuthEntry::Shared` reaches this arm on
+            // every Basic-auth request that carries an API token in the
+            // password field (the middleware tries `authenticate` first), so
+            // an unconditional WARN here is one log line per `cargo`/`pip`
+            // request — see [`AuthEntry`].
+            if entry.logs_rejections() {
+                tracing::warn!(
+                    target: "security",
+                    username = %username,
+                    user_id = %user.id,
+                    failed_login_attempts = new_count,
+                    newly_locked = lock_until.is_some(),
+                    already_locked,
+                    reason = reason.audit_reason(),
+                    "rejected local login with a wrong password"
+                );
+            }
 
-            return Err(Self::reject_login(username, reason));
+            return Err(Self::reject_login(username, reason, entry));
         }
 
         // Successful login: reset lockout counters and record last login.
@@ -7590,7 +7669,10 @@ mod tests {
     ) -> (axum::http::StatusCode, String, Option<&'static str>) {
         // `expect_err` would need `Debug` on `(User, TokenPair)`, which
         // deliberately does not derive it.
-        let Err(failure) = svc.authenticate_for_login(username, password).await else {
+        let Err(failure) = svc
+            .authenticate_for_login(username, password, TimingPad::On)
+            .await
+        else {
             panic!("this login must not succeed");
         };
         let reason = failure.reason;
@@ -7799,6 +7881,11 @@ mod tests {
     }
 
     /// Count the `verify_password` calls one closure makes.
+    ///
+    /// Relies on `cargo nextest`'s process-per-test isolation, which CI and
+    /// `CLAUDE.md` both mandate: the counter is a process-global, so under a
+    /// plain `cargo test` (still what `.githooks/pre-push` runs) a concurrent
+    /// test that verifies a password would inflate this delta. Not fixed here.
     async fn bcrypt_verifies_during<F, Fut>(f: F) -> u64
     where
         F: FnOnce() -> Fut,
@@ -7850,6 +7937,65 @@ mod tests {
             federated, 1,
             "a federated account returned without running bcrypt: the timing \
              pad is gone, which reopens the timing half of the oracle (#3504)"
+        );
+
+        drop_test_user(&pool, user_id).await;
+    }
+
+    /// With the source IP's pad budget spent the login path runs unpadded —
+    /// but only the *hashless* arms skip bcrypt. An account that has a stored
+    /// hash must still be verified normally, or a spent budget would turn into
+    /// an authentication bypass rather than a timing regression (#3504).
+    #[tokio::test]
+    async fn test_login_without_pad_budget_skips_the_pad_but_still_verifies_real_hashes() {
+        let Some((pool, svc)) = login_test_service().await else {
+            return;
+        };
+        let username = format!("enum_nobudget_{}", &Uuid::new_v4().to_string()[..8]);
+        let password = "Correct-Horse-Battery-2026";
+        let user_id = insert_test_user_with_password(&pool, &username, password).await;
+
+        // Hashless arm, unpadded: no bcrypt at all, same as `origin/main`.
+        let verifies = bcrypt_verifies_during(|| async {
+            let _ = svc
+                .authenticate_for_login(&ghost_username(), "x", TimingPad::Off)
+                .await;
+        })
+        .await;
+        assert_eq!(
+            verifies, 0,
+            "an unpadded login must not run bcrypt for an unknown username"
+        );
+
+        // Real account, unpadded: still one verify, and still rejected.
+        let verifies = bcrypt_verifies_during(|| async {
+            let (status, body, reason) = {
+                let Err(failure) = svc
+                    .authenticate_for_login(&username, "wrong-password", TimingPad::Off)
+                    .await
+                else {
+                    panic!("a wrong password must not authenticate");
+                };
+                let reason = failure.reason;
+                let (status, body) = login_client_visible(failure.error).await;
+                (status, body, reason)
+            };
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+            assert!(body.contains(LOCAL_AUTH_FAILURE_MESSAGE));
+            assert_eq!(reason, Some("invalid_password"));
+        })
+        .await;
+        assert_eq!(
+            verifies, 1,
+            "an unpadded login must still verify a real stored hash"
+        );
+
+        // And the correct password must still authenticate with no budget.
+        assert!(
+            svc.authenticate_for_login(&username, password, TimingPad::Off)
+                .await
+                .is_ok(),
+            "a spent pad budget must never refuse a correct password"
         );
 
         drop_test_user(&pool, user_id).await;

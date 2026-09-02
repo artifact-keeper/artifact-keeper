@@ -694,24 +694,30 @@ pub struct Config {
     /// longer, lockout-style window (default 15 minutes). Env var:
     /// `RATE_LIMIT_LOGIN_WINDOW_SECS`. Default: 900.
     pub rate_limit_login_window_secs: u64,
-    /// Maximum **failed** login attempts per source IP per
-    /// `rate_limit_login_failed_per_ip_window_secs`, counted regardless of
-    /// which username each attempt named (#3504).
+    /// How many **failed** logins one source IP may accrue per
+    /// `rate_limit_login_failed_per_ip_window_secs` before the login endpoint
+    /// stops running its bcrypt timing pad for that IP (#3504).
     ///
-    /// `rate_limit_login_per_window` is keyed per-`(username, IP)`, which is
-    /// what keeps a flood against one identity from locking out others — and
-    /// what leaves a caller who changes the username on every request with a
-    /// fresh bucket each time, bounded only by the global backstop. This
-    /// budget is the username-independent companion: it charges the source IP
-    /// for every failed attempt, so a username sweep from one origin stops
-    /// after this many failures. Only failures are charged, so a shared NAT
-    /// egress whose users log in successfully never reaches it. Env var:
-    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW`. Default: 30.
+    /// **This budget gates the pad, not the request.** It never returns 429
+    /// and never refuses a login: past the budget the hashless rejection arms
+    /// answer without bcrypt — so the timing side-channel returns for that IP
+    /// until the window rolls — while any account that has a stored password
+    /// hash is still verified normally. That is the trade: it bounds an
+    /// attacker's bcrypt amplification to this many verifies per IP per
+    /// window without ever shedding a legitimate user, which a shedding cap
+    /// could not do (behind a reverse proxy without
+    /// `rate_limit_trusted_proxy_cidrs` every user shares one source IP, so
+    /// shedding would deny the whole deployment). A successful login clears
+    /// the IP's bucket.
+    ///
+    /// It exists because `rate_limit_login_per_window` is keyed
+    /// per-`(username, IP)` — which is what keeps a flood against one identity
+    /// from locking out others, and what leaves a caller who changes the
+    /// username on every request with a fresh bucket each time. Env var:
+    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW`. Default: 30. **0 disables
+    /// the budget**, so the pad always runs.
     pub rate_limit_login_failed_per_ip_per_window: u32,
-    /// Window length for the per-IP failed-login cap, in seconds. Shorter than
-    /// `rate_limit_login_window_secs` because it bounds a sweep rather than
-    /// locking an account: a legitimate user who mistypes a password a few
-    /// times recovers in minutes. Env var:
+    /// Window length for the per-IP pad budget, in seconds. Env var:
     /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_WINDOW_SECS`. Default: 300.
     pub rate_limit_login_failed_per_ip_window_secs: u64,
     /// Maximum self-password-change attempts per user per
