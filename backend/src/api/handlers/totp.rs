@@ -167,7 +167,7 @@ async fn check_provisioned_totp_code(
 async fn mint_backup_codes() -> Result<(Vec<String>, String)> {
     // Scoped so the rng drops before any `.await` -- the rng is not Send.
     let backup_codes: Vec<String> = {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng = rand::rng();
         (0..10)
             .map(|_| {

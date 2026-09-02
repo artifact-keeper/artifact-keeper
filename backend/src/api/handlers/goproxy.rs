@@ -276,6 +276,13 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
             .into_response());
     }
 
+    // The toolchain probes this before routing sumdb traffic through us, and the
+    // upstream has no such endpoint, so answering it here is what keeps go from
+    // falling back to a direct connection to the checksum database.
+    if path == "supported" {
+        return Ok((StatusCode::OK, "").into_response());
+    }
+
     let url = format!("https://{}/{}", host, path);
 
     tracing::debug!("Proxying sumdb request to {}", url);
@@ -2040,6 +2047,13 @@ mod tests {
             }
             _ => panic!("Expected SumDb"),
         }
+    }
+
+    // Answered locally (no upstream call): a non-200 here makes go bypass us.
+    #[tokio::test]
+    async fn test_sumdb_supported_answered_locally() {
+        let resp = proxy_sumdb("sum.golang.org", "supported").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]

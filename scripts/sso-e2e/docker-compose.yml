@@ -30,23 +30,29 @@ services:
 
   # Keycloak for OIDC and SAML testing
   keycloak:
-    image: quay.io/keycloak/keycloak:24.0
+    image: quay.io/keycloak/keycloak:26.7.3
     container_name: sso-test-keycloak
     environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
+      # Renamed in Keycloak 26.0: KEYCLOAK_ADMIN/_PASSWORD no longer create the
+      # bootstrap admin, so the old names leave the realm with no admin and
+      # setup-keycloak.sh fails at "Failed to get admin token".
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
       KC_HEALTH_ENABLED: "true"
     command: start-dev
     ports:
       - "8180:8080"
     volumes:
-      - keycloak_data:/opt/keycloak/data
+      # Fresh volume for the 26.x data store. 24.0 -> 26.7 is two majors on the
+      # dev-mode H2 file, which is not a supported in-place upgrade path; the
+      # suffix forces a clean store instead of failing on the old one.
+      - keycloak_data_v26:/opt/keycloak/data
     # Note: Healthcheck disabled - script handles wait via external curl
     # Keycloak image doesn't have curl/wget installed
 
   # PostgreSQL for Artifact Keeper
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: sso-test-db
     environment:
       POSTGRES_USER: registry
@@ -112,5 +118,5 @@ services:
 volumes:
   ldap_data:
   ldap_config:
-  keycloak_data:
+  keycloak_data_v26:
   backend_data:
