@@ -3553,7 +3553,7 @@ pub async fn get_repository_storage_tree(
           FROM repository_path_storage_stats
          WHERE repository_id = $1
            AND depth > $2 AND depth <= $3
-           AND ($4::text IS NULL OR prefix LIKE $4)
+           AND ($4::text IS NULL OR prefix LIKE $4 ESCAPE '\')
          ORDER BY logical_bytes DESC, prefix ASC
          LIMIT $5
         "#,
@@ -6314,7 +6314,9 @@ async fn maven_component_keys_from_catalog(
         return Ok(Vec::new());
     }
 
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
     let sql = maven_component_keys_sql(search_pattern.is_some(), keyset.is_some());
 
     let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_ids);
@@ -6354,7 +6356,7 @@ fn maven_component_keys_sql(has_search: bool, has_keyset: bool) -> String {
     );
     let mut next_param = 2;
     if has_search {
-        sql.push_str(&format!(" AND p.name ILIKE ${next_param}"));
+        sql.push_str(&format!(" AND p.name ILIKE ${next_param} ESCAPE '\\'"));
         next_param += 1;
     }
     if has_keyset {
@@ -6385,7 +6387,9 @@ async fn count_maven_catalog_component_keys(
     if repository_ids.is_empty() {
         return Ok(0);
     }
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
     let sql = format!(
         "SELECT COUNT(*) FROM ( \
            SELECT DISTINCT p.name, pv.version \
@@ -6393,7 +6397,7 @@ async fn count_maven_catalog_component_keys(
            JOIN package_versions pv ON pv.package_id = p.id \
            WHERE p.repository_id = ANY($1) \
              AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
-             AND ($2::text IS NULL OR p.name ILIKE $2) \
+             AND ($2::text IS NULL OR p.name ILIKE $2 ESCAPE '\\') \
          ) t"
     );
     sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
@@ -6667,7 +6671,9 @@ async fn maven_components_from_catalog(
 ) -> Result<Vec<MavenComponentResponse>> {
     use sqlx::Row;
 
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
 
     let mut sql = format!(
         "SELECT p.id, p.name, p.version, p.size_bytes, p.download_count, p.created_at \
@@ -6677,7 +6683,7 @@ async fn maven_components_from_catalog(
     );
     let mut next_param = 2;
     if search_pattern.is_some() {
-        sql.push_str(&format!(" AND p.name ILIKE ${next_param}"));
+        sql.push_str(&format!(" AND p.name ILIKE ${next_param} ESCAPE '\\'"));
         next_param += 1;
     }
     if keyset.is_some() {
@@ -6745,12 +6751,14 @@ async fn count_maven_catalog_components(
     repository_id: Uuid,
     search_query: Option<&str>,
 ) -> Result<i64> {
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
     let sql = format!(
         "SELECT COUNT(*) FROM packages p \
          WHERE p.repository_id = $1 \
            AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
-           AND ($2::text IS NULL OR p.name ILIKE $2)"
+           AND ($2::text IS NULL OR p.name ILIKE $2 ESCAPE '\\')"
     );
     sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_id)

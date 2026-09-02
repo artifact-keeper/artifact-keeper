@@ -368,8 +368,16 @@ pub(crate) fn format_handler_key(format: &RepositoryFormat) -> String {
 }
 
 /// Build a SQL LIKE search pattern from a user query string.
+///
+/// #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+/// must match themselves; escaped here and matched under `ESCAPE '\'`.
 pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
-    query.map(|q| format!("%{}%", q.to_lowercase()))
+    query.map(|q| {
+        format!(
+            "%{}%",
+            crate::api::handlers::escape_like_literal(&q.to_lowercase())
+        )
+    })
 }
 
 /// SQL fragment: true when the user bound at `$user_param` holds a non-empty
@@ -1294,7 +1302,7 @@ impl RepositoryService {
             WHERE ($1::repository_format IS NULL OR format = $1)
               AND ($2::repository_type IS NULL OR repo_type = $2)
               AND ({visibility_clause})
-              AND ($4::text IS NULL OR LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR LOWER(COALESCE(description, '')) LIKE $4)
+              AND ($4::text IS NULL OR LOWER(key) LIKE $4 ESCAPE '\' OR LOWER(name) LIKE $4 ESCAPE '\' OR LOWER(COALESCE(description, '')) LIKE $4 ESCAPE '\')
               AND ($7::uuid IS NULL OR project_id = $7)
             ORDER BY name
             OFFSET $5
@@ -1327,7 +1335,7 @@ impl RepositoryService {
             WHERE ($1::repository_format IS NULL OR format = $1)
               AND ($2::repository_type IS NULL OR repo_type = $2)
               AND ({visibility_clause})
-              AND ($4::text IS NULL OR LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR LOWER(COALESCE(description, '')) LIKE $4)
+              AND ($4::text IS NULL OR LOWER(key) LIKE $4 ESCAPE '\' OR LOWER(name) LIKE $4 ESCAPE '\' OR LOWER(COALESCE(description, '')) LIKE $4 ESCAPE '\')
               AND ($5::uuid IS NULL OR project_id = $5)
             "#
         );
@@ -3209,6 +3217,26 @@ mod tests {
         assert_eq!(
             build_search_pattern(Some("my repo")),
             Some("%my repo%".to_string())
+        );
+    }
+
+    /// #3557. The repository listing's `?search=` term is bound whole to
+    /// `LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR ...`, so a `LIKE`
+    /// metacharacter must match itself rather than widen the listing (and its
+    /// `total`) to rows the caller never asked for.
+    #[test]
+    fn test_build_search_pattern_escapes_like_metacharacters_3557() {
+        assert_eq!(
+            build_search_pattern(Some("100%")),
+            Some(r"%100\%%".to_string())
+        );
+        assert_eq!(
+            build_search_pattern(Some("A_B")),
+            Some(r"%a\_b%".to_string())
+        );
+        assert_eq!(
+            build_search_pattern(Some(r"A\B")),
+            Some(r"%a\\b%".to_string())
         );
     }
 

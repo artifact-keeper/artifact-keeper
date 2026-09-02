@@ -958,7 +958,7 @@ async fn search_packages(
         FROM artifacts a
         WHERE a.repository_id = ANY($1::uuid[])
           AND a.is_deleted = false
-          AND LOWER(a.name) LIKE $2
+          AND LOWER(a.name) LIKE $2 ESCAPE '\'
         GROUP BY LOWER(a.name), a.name
         ORDER BY LOWER(a.name)
         LIMIT $3 OFFSET $4
@@ -979,7 +979,7 @@ async fn search_packages(
         FROM artifacts
         WHERE repository_id = ANY($1::uuid[])
           AND is_deleted = false
-          AND LOWER(name) LIKE $2
+          AND LOWER(name) LIKE $2 ESCAPE '\'
         "#,
     )
     .bind(&repo_ids)
@@ -2653,8 +2653,14 @@ fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
 }
 
 /// Build the search pattern for NuGet package queries.
+///
+/// #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+/// must match themselves; escaped here and matched under `ESCAPE '\'`.
 fn build_nuget_search_pattern(query_term: &str) -> String {
-    format!("%{}%", query_term.to_lowercase())
+    format!(
+        "%{}%",
+        crate::api::handlers::escape_like_literal(&query_term.to_lowercase())
+    )
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -3460,6 +3466,17 @@ mod tests {
             build_nuget_search_pattern("Newtonsoft.Json"),
             "%newtonsoft.json%"
         );
+    }
+
+    /// #3557. The `?q=` term is bound whole to `LOWER(a.name) LIKE $2`, so a
+    /// `LIKE` metacharacter in the package search must match itself. The
+    /// escape happens AFTER the lowercase so the escaping backslashes are
+    /// added to the string the query actually matches.
+    #[test]
+    fn test_build_nuget_search_pattern_escapes_like_metacharacters_3557() {
+        assert_eq!(build_nuget_search_pattern("100%"), r"%100\%%");
+        assert_eq!(build_nuget_search_pattern("A_B"), r"%a\_b%");
+        assert_eq!(build_nuget_search_pattern(r"A\B"), r"%a\\b%");
     }
 
     // -----------------------------------------------------------------------
