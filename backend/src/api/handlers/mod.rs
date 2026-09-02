@@ -600,7 +600,7 @@ mod tests {
              VALUES ($1, $2, $3, $4, 'local'::repository_type, '{}'::repository_format)",
             format
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(id)
             .bind(&key)
             .bind(&key)

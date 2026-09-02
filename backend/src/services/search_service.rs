@@ -358,7 +358,7 @@ impl SearchService {
             order_by = order_by,
         );
 
-        let rows: Vec<SearchResultRow> = sqlx::query_as(&sql)
+        let rows: Vec<SearchResultRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
             .bind(&q_filter)
             .bind(&query.format)
             .bind(&name_filter)
@@ -395,7 +395,7 @@ impl SearchService {
             q_match = SEARCH_VECTOR_MATCH,
         );
 
-        let count: (i64,) = sqlx::query_as(&sql)
+        let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
             .bind(&q_filter)
             .bind(&query.format)
             .bind(&name_filter)
@@ -433,7 +433,7 @@ impl SearchService {
             expr = group_expr,
         );
 
-        let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+        let rows: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
             .bind(accessible_repo_ids)
             .bind(public_only)
             .fetch_all(&self.db)

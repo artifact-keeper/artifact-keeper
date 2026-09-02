@@ -5887,7 +5887,7 @@ impl ScannerService {
         );
         #[allow(clippy::type_complexity)]
         let package_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as(&package_sql)
+            sqlx::query_as(sqlx::AssertSqlSafe(&*package_sql))
                 .bind(artifact.id)
                 .fetch_all(&self.db)
                 .await
@@ -5911,7 +5911,7 @@ impl ScannerService {
                 LATEST_SCANS_FOR_ARTIFACT_CTE,
             );
             let findings_rows: Vec<(String, Option<String>, Option<String>)> =
-                sqlx::query_as(&findings_sql)
+                sqlx::query_as(sqlx::AssertSqlSafe(&*findings_sql))
                     .bind(artifact.id)
                     .fetch_all(&self.db)
                     .await

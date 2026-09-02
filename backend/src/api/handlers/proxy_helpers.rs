@@ -3824,7 +3824,8 @@ impl LocalLookup<'_> {
     /// DB error to 500. Behavior is identical across selectors apart from the
     /// `WHERE` clause and its bound parameters.
     async fn fetch_row(&self, db: &PgPool, repo_id: Uuid) -> Result<LocalArtifactRow, Response> {
-        let query = sqlx::query_as::<_, LocalArtifactRow>(self.select_sql()).bind(repo_id);
+        let query = sqlx::query_as::<_, LocalArtifactRow>(sqlx::AssertSqlSafe(self.select_sql()))
+            .bind(repo_id);
         let query = match self {
             LocalLookup::Path(path) => query.bind(*path),
             LocalLookup::NameVersion(name, version) => query.bind(*name).bind(*version),
@@ -11058,7 +11059,7 @@ mod tests {
                  VALUES ($1, $2, $3, $4, '{}'::repository_type, '{}'::repository_format, $5)",
                 repo_type, format
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .bind(id)
                 .bind(&key)
                 .bind(format!("ph-test-{}", id))

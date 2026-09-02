@@ -135,9 +135,9 @@ impl BlastRadiusTarget {
 /// target. Deduplication matters: one artifact can carry several
 /// `scan_findings` rows for the same CVE (one per affected component), and a
 /// naive join would multiply every download count by the number of findings.
-fn push_affected_artifacts<'a>(
-    builder: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
-    target: &'a BlastRadiusTarget,
+fn push_affected_artifacts(
+    builder: &mut sqlx::QueryBuilder<sqlx::Postgres>,
+    target: &BlastRadiusTarget,
 ) {
     builder.push("(SELECT DISTINCT artifact_id FROM scan_findings WHERE ");
     match target {
@@ -153,8 +153,8 @@ fn push_affected_artifacts<'a>(
 
 /// Append the optional `downloaded_at` window to a query that has already
 /// opened its WHERE clause.
-fn push_download_window<'a>(
-    builder: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
+fn push_download_window(
+    builder: &mut sqlx::QueryBuilder<sqlx::Postgres>,
     from: Option<chrono::DateTime<chrono::Utc>>,
     to: Option<chrono::DateTime<chrono::Utc>>,
 ) {
@@ -821,7 +821,7 @@ async fn accessible_users_core(
 
     // (1) COUNT over the predicate for pagination + everyone-threshold.
     let count_sql = format!("SELECT COUNT(*) FROM users u WHERE {predicate}");
-    let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql).bind(repo_id);
+    let mut count_q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql)).bind(repo_id);
     count_q = bind_target(count_q, &target);
     let accessible_count: i64 = count_q.fetch_one(db).await.map_err(db_err)?;
 
@@ -862,7 +862,8 @@ async fn accessible_users_core(
         perms = permissions_grant_exists_for("$1", "u.id"),
         predicate = predicate,
     );
-    let mut page_q = sqlx::query_as::<_, AccessibleUserRow>(&page_sql).bind(repo_id);
+    let mut page_q =
+        sqlx::query_as::<_, AccessibleUserRow>(sqlx::AssertSqlSafe(&*page_sql)).bind(repo_id);
     page_q = bind_target_as(page_q, &target);
     let rows: Vec<AccessibleUserRow> = page_q
         .bind(limit)
@@ -1598,7 +1599,10 @@ mod tests {
             "DELETE FROM artifacts WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(q).bind(repo_acl).execute(&pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(q))
+                .bind(repo_acl)
+                .execute(&pool)
+                .await;
         }
     }
 
@@ -1871,7 +1875,7 @@ mod tests {
                 "DELETE FROM artifacts WHERE repository_id = $1",
                 "DELETE FROM repositories WHERE id = $1",
             ] {
-                let _ = sqlx::query(q).bind(repo).execute(&pool).await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(q)).bind(repo).execute(&pool).await;
             }
         }
         for u in [u_direct, u_group, u_role, u_global, u_admin, u_dl, u_none] {
@@ -1982,7 +1986,7 @@ mod tests {
                 "DELETE FROM artifacts WHERE repository_id = $1",
                 "DELETE FROM repositories WHERE id = $1",
             ] {
-                let _ = sqlx::query(q).bind(repo).execute(&pool).await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(q)).bind(repo).execute(&pool).await;
             }
         }
         for u in [xspan, ydl] {

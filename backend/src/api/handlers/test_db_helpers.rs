@@ -853,7 +853,7 @@ pub async fn create_repo(pool: &PgPool, repo_type: &str, format: &str) -> (Uuid,
          VALUES ($1, $2, $3, $4, '{}'::repository_type, '{}'::repository_format, $5)",
         repo_type, format
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(id)
         .bind(&key)
         .bind(&key)
@@ -1287,7 +1287,10 @@ pub async fn cleanup_member_repo(pool: &PgPool, member_id: Uuid, dir: &std::path
         "DELETE FROM artifacts WHERE repository_id = $1",
         "DELETE FROM repositories WHERE id = $1",
     ] {
-        let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(member_id)
+            .execute(pool)
+            .await;
     }
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1372,10 +1375,12 @@ pub async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
         .execute(pool)
         .await;
     for table in ["refresh_token_jti", "totp_pending_jti", "password_history"] {
-        let _ = sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
-            .bind(user_id)
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DELETE FROM {table} WHERE user_id = $1"
+        )))
+        .bind(user_id)
+        .execute(pool)
+        .await;
     }
     let _ = sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)

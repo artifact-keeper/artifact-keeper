@@ -3886,7 +3886,7 @@ mod tests {
                  VALUES ($1, $2, $3, $4, '{}'::repository_type, 'conan'::repository_format, $5)",
                 repo_type
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .bind(id)
                 .bind(&key)
                 .bind(format!("conan-test-{}", id))

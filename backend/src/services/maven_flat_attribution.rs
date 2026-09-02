@@ -360,7 +360,7 @@ async fn query_layer(
     storage_backend: &str,
     storage_key: &str,
 ) -> Result<LayerResult> {
-    let owners: Vec<Uuid> = sqlx::query_scalar(sql)
+    let owners: Vec<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .bind(storage_key)
         .bind(storage_backend)
         .fetch_all(db)

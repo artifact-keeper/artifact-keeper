@@ -198,7 +198,7 @@ pub async fn list_packages(
         LIMIT $5
         "#
     );
-    let page_query = sqlx::query_as::<_, PackageRow>(&page_sql)
+    let page_query = sqlx::query_as::<_, PackageRow>(sqlx::AssertSqlSafe(&*page_sql))
         .bind(&query.repository_key)
         .bind(&query.format)
         .bind(&search_pattern)
@@ -225,7 +225,7 @@ pub async fn list_packages(
           AND ({count_clause})
         "#
     );
-    let count_query = sqlx::query_scalar::<_, i64>(&count_sql)
+    let count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql))
         .bind(&query.repository_key)
         .bind(&query.format)
         .bind(&search_pattern);
@@ -293,7 +293,7 @@ pub async fn get_package(
           AND ({clause})
         "#
     );
-    let query = sqlx::query_as::<_, PackageRow>(&sql).bind(id);
+    let query = sqlx::query_as::<_, PackageRow>(sqlx::AssertSqlSafe(&*sql)).bind(id);
     // $2 shape depends on the visibility variant (single uuid vs uuid[]).
     let query = match &ids {
         Some(ids) => query.bind(ids.clone()),
@@ -387,7 +387,7 @@ pub async fn get_package_versions(
         )
         "#
     );
-    let exists_query = sqlx::query_scalar::<_, bool>(&exists_sql).bind(id);
+    let exists_query = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(&*exists_sql)).bind(id);
     // $2 shape depends on the visibility variant (single uuid vs uuid[]).
     let exists_query = match &ids {
         Some(ids) => exists_query.bind(ids.clone()),

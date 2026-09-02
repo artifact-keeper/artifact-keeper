@@ -118,7 +118,7 @@ async fn insert_scan(
         "#,
         completed_at,
     );
-    sqlx::query(&query)
+    sqlx::query(sqlx::AssertSqlSafe(&*query))
         .bind(scan_id)
         .bind(artifact_id)
         .bind(repo_id)

@@ -1734,26 +1734,32 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
             }
         }
 
-        sqlx::query(&format!("SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "SAVEPOINT {GROUP_SYNC_SAVEPOINT}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         match sync_one_federated_group(&mut tx, user_id, provider_id, source, name).await {
             // (savepoint bookkeeping below keeps one bad group from poisoning
             // the transaction the rest of the sync runs in)
             Ok(Some(group_id)) => {
-                sqlx::query(&format!("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
                 current_group_ids.push(group_id);
             }
             Ok(None) => {
-                sqlx::query(&format!("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
                 tracing::warn!(
                     group = %name,
                     source = %source,
@@ -1765,10 +1771,12 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
                 );
             }
             Err(e) => {
-                sqlx::query(&format!("ROLLBACK TO SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "ROLLBACK TO SAVEPOINT {GROUP_SYNC_SAVEPOINT}"
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
                 tracing::warn!(
                     group = %name,
                     source = %source,

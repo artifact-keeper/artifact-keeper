@@ -1402,7 +1402,7 @@ impl StorageGcService {
             "#,
             protected = BLOB_PROTECTED_BY_REFS_SQL,
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(MIN_BLOB_AGE_SECS as i64)
             .fetch_all(&self.db)
             .await
@@ -1439,7 +1439,7 @@ impl StorageGcService {
             "#,
             protected = BLOB_PROTECTED_BY_REFS_SQL,
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(sweep_grace_secs)
             .fetch_all(&self.db)
             .await
@@ -1483,7 +1483,7 @@ impl StorageGcService {
             predicate = ORPHAN_PREDICATE_SQL,
             scope = repo_scope_clause("a.repository_id", 1, repo_scope),
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql));
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -1525,7 +1525,7 @@ impl StorageGcService {
             GROUP BY repository_id
             ORDER BY logical_bytes DESC, repository_id ASC
         "#;
-        let per_repo_rows = sqlx::query(per_repo_sql)
+        let per_repo_rows = sqlx::query(sqlx::AssertSqlSafe(per_repo_sql))
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1632,7 +1632,7 @@ impl StorageGcService {
             FROM per_object
         "#;
 
-        let totals = sqlx::query(totals_sql)
+        let totals = sqlx::query(sqlx::AssertSqlSafe(totals_sql))
             .bind(grace_hours)
             .bind(digest_scope)
             .fetch_one(&self.db)
@@ -1809,7 +1809,8 @@ impl StorageGcService {
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
             scope = repo_scope_clause("repository_id", 2, repo_scope),
         );
-        let mut query = sqlx::query(&sql).bind(ABANDONED_OCI_UPLOAD_SCAN_LIMIT);
+        let mut query =
+            sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(ABANDONED_OCI_UPLOAD_SCAN_LIMIT);
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -2035,7 +2036,8 @@ impl StorageGcService {
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 2, repo_scope),
         );
-        let mut query = sqlx::query(&sql).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
+        let mut query =
+            sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -2102,7 +2104,7 @@ impl StorageGcService {
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 3, repo_scope),
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
             .bind(crate::services::cluster_work::WorkerIdentity::for_process().as_str());
         if let Some(id) = repo_scope {
@@ -2215,7 +2217,7 @@ impl StorageGcService {
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             liveness = kind.liveness_predicate_sql(),
         );
-        match sqlx::query(&sql)
+        match sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(cleanup_key.id)
             .bind(cleanup_key.claim_token)
             .execute(&self.db)
@@ -2444,7 +2446,8 @@ impl StorageGcService {
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 2, repo_scope),
         );
-        let mut query = sqlx::query(&sql).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
+        let mut query =
+            sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -2660,7 +2663,7 @@ impl StorageGcService {
             predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL.as_str(),
             scope = repo_scope_clause("o.repository_id", 2, repo_scope),
         );
-        let mut query = sqlx::query(&sql).bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT);
         if let Some(id) = repo_scope {
             query = query.bind(id);
         }
@@ -2719,7 +2722,7 @@ impl StorageGcService {
             claim_ttl = OCI_CLEANUP_KEY_CLAIM_TTL_SQL,
             scope = repo_scope_clause("c.repository_id", 3, repo_scope),
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
             .bind(crate::services::cluster_work::WorkerIdentity::for_process().as_str());
         if let Some(id) = repo_scope {
@@ -2855,7 +2858,7 @@ async fn is_maven_flat_object_still_orphan(
         "#,
         predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL.as_str(),
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(storage_backend)
         .bind(storage_key)
         .fetch_one(&mut **tx)
@@ -2906,7 +2909,7 @@ async fn lock_abandoned_oci_upload_session(
         "#,
         ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
     );
-    let Some(row) = sqlx::query(&sql)
+    let Some(row) = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(session_id)
         .fetch_optional(&mut **tx)
         .await?
@@ -3033,7 +3036,7 @@ async fn is_still_orphan(
         predicate = ORPHAN_PREDICATE_SQL,
     );
 
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(storage_key)
         .bind(storage_backend)
         .bind(storage_path)
@@ -3100,7 +3103,7 @@ async fn is_blob_still_orphan(
         "#,
         protected = BLOB_PROTECTED_BY_REFS_SQL,
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_id)
         .bind(digest)
         .bind(require_pending_mark)
@@ -5125,7 +5128,7 @@ mod tests {
     }
 
     async fn count_rows(pool: &PgPool, table_sql: &str, key: &str) -> i64 {
-        sqlx::query_scalar(table_sql)
+        sqlx::query_scalar(sqlx::AssertSqlSafe(table_sql))
             .bind(key)
             .fetch_one(pool)
             .await
@@ -7445,7 +7448,7 @@ mod tests {
             "#,
             protected = BLOB_PROTECTED_BY_REFS_SQL,
         );
-        sqlx::query_scalar::<_, bool>(&sql)
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(&*sql))
             .bind(repo_id)
             .bind(digest)
             .bind(MIN_BLOB_AGE_SECS as i64)
@@ -9349,11 +9352,11 @@ mod tests {
             "NULL"
         };
 
-        let journal_id: i64 = sqlx::query(&format!(
+        let journal_id: i64 = sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "INSERT INTO oci_upload_cleanup_keys \
                  (repository_id, storage_key, created_at, storage_write_completed_at) \
              VALUES ($1, $2, NOW() - INTERVAL '72 hours', {marker}) RETURNING id"
-        ))
+        )))
         .bind(fixture.repo_id)
         .bind(&blob_key)
         .fetch_one(&fixture.pool)
@@ -9362,11 +9365,11 @@ mod tests {
         .try_get("id")
         .expect("journal id");
 
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "INSERT INTO oci_upload_cleanup_keys \
                  (repository_id, storage_key, created_at, storage_write_completed_at) \
              VALUES ($1, $2, NOW() - INTERVAL '71 hours', {marker})"
-        ))
+        )))
         .bind(fixture.repo_id)
         .bind(&control_key)
         .execute(&fixture.pool)

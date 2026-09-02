@@ -5375,14 +5375,14 @@ mod streaming_pipeline_regression_tests {
         } else {
             "NOW() + INTERVAL '1 hour'"
         };
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "INSERT INTO incus_upload_sessions \
              (id, repository_id, user_id, artifact_path, product, version, filename, \
               bytes_received, storage_temp_path, status, finalize_token, \
               finalize_claimed_until) \
              VALUES ($1, $2, $3, $4, 'alpine', '3.20', 'rootfs.tar.gz', $5, $6, 'finalizing', \
                      $7, {lease})"
-        ))
+        )))
         .bind(session_id)
         .bind(f.repo_id)
         .bind(f.user_id)

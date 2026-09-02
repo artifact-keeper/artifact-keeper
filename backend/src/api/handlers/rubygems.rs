@@ -424,7 +424,7 @@ async fn query_gem_specs(
     repo_id: uuid::Uuid,
     sql: &str,
 ) -> Result<Vec<serde_json::Value>, Response> {
-    let rows = sqlx::query(sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(repo_id)
         .fetch_all(db)
         .await

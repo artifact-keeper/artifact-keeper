@@ -366,7 +366,7 @@ impl PermissionService {
                  service_account, group"
             ))
         })?;
-        let exists: bool = sqlx::query_scalar(query)
+        let exists: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
             .bind(principal_id)
             .fetch_one(&self.db)
             .await

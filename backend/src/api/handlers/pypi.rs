@@ -9984,7 +9984,10 @@ mod tests {
             "DELETE FROM repository_config WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member_id)
+                .execute(pool)
+                .await;
         }
         let _ = std::fs::remove_dir_all(member_dir);
     }

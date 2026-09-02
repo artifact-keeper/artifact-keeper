@@ -659,19 +659,22 @@ async fn list_sboms(
 
         let docs: Vec<SbomDocument> = if let Some(repo_id) = query.repository_id {
             if let Some(fmt) = &query.format {
-                sqlx::query_as(&sql)
+                sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
                     .bind(repo_id)
                     .bind(fmt)
                     .fetch_all(&state.db)
                     .await?
             } else {
-                sqlx::query_as(&sql)
+                sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
                     .bind(repo_id)
                     .fetch_all(&state.db)
                     .await?
             }
         } else if let Some(fmt) = &query.format {
-            sqlx::query_as(&sql).bind(fmt).fetch_all(&state.db).await?
+            sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+                .bind(fmt)
+                .fetch_all(&state.db)
+                .await?
         } else {
             sqlx::query_as("SELECT * FROM sbom_documents ORDER BY created_at DESC LIMIT 100")
                 .fetch_all(&state.db)
@@ -1614,7 +1617,7 @@ async fn extract_dependencies_for_artifact(
     );
     #[allow(clippy::type_complexity)]
     let packages: Vec<(String, Option<String>, Option<String>, Option<String>)> =
-        sqlx::query_as(&packages_sql)
+        sqlx::query_as(sqlx::AssertSqlSafe(&*packages_sql))
             .bind(artifact_id)
             .bind(SBOM_INVENTORY_ROW_CAP)
             .fetch_all(db)
@@ -1650,11 +1653,12 @@ async fn extract_dependencies_for_artifact(
             LIMIT 1000",
             crate::services::scanner_service::LATEST_SCANS_FOR_ARTIFACT_CTE,
         );
-        let findings: Vec<(String, Option<String>)> = sqlx::query_as(&findings_sql)
-            .bind(artifact_id)
-            .fetch_all(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        let findings: Vec<(String, Option<String>)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(&*findings_sql))
+                .bind(artifact_id)
+                .fetch_all(db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
 
         scanner_deps = findings
             .into_iter()

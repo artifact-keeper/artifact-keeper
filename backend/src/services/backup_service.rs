@@ -1281,7 +1281,7 @@ impl BackupService {
 
         // Export table data as JSON array
         let query = format!("SELECT row_to_json(t) FROM {} t", table);
-        let rows: Vec<serde_json::Value> = sqlx::query_scalar(&query)
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(&*query))
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1808,7 +1808,11 @@ impl BackupService {
                 "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
             );
 
-            match sqlx::query(&query).bind(row).execute(&self.db).await {
+            match sqlx::query(sqlx::AssertSqlSafe(&*query))
+                .bind(row)
+                .execute(&self.db)
+                .await
+            {
                 Ok(result) => {
                     restored += result.rows_affected() as usize;
                 }

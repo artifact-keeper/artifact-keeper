@@ -4411,7 +4411,7 @@ async fn purge_storage_object_keys(
 ///   are hard-deleted. A leak GC later collects is recoverable; a purge is not.
 async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
     let sql = repo_maven_flat_keys_sql();
-    sqlx::query_scalar(&sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
         .bind(repo_id)
         .fetch_all(&state.db)
         .await
@@ -6317,7 +6317,7 @@ async fn maven_component_keys_from_catalog(
     let search_pattern = search_query.map(|q| format!("%{}%", q));
     let sql = maven_component_keys_sql(search_pattern.is_some(), keyset.is_some());
 
-    let mut query = sqlx::query(&sql).bind(repository_ids);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_ids);
     if let Some(pattern) = &search_pattern {
         query = query.bind(pattern);
     }
@@ -6396,7 +6396,7 @@ async fn count_maven_catalog_component_keys(
              AND ($2::text IS NULL OR p.name ILIKE $2) \
          ) t"
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_ids)
         .bind(&search_pattern)
         .fetch_one(db)
@@ -6694,7 +6694,7 @@ async fn maven_components_from_catalog(
         next_param + 1
     ));
 
-    let mut query = sqlx::query(&sql).bind(repository_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(pattern) = &search_pattern {
         query = query.bind(pattern);
     }
@@ -6752,7 +6752,7 @@ async fn count_maven_catalog_components(
            AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
            AND ($2::text IS NULL OR p.name ILIKE $2)"
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_id)
         .bind(&search_pattern)
         .fetch_one(db)
@@ -7156,7 +7156,7 @@ async fn fetch_docker_tag_rows(
         next_param + 1
     ));
 
-    let mut query = sqlx::query(&sql).bind(repository_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(q) = search_query {
         query = query.bind(super::escape_like_literal(q));
     }
@@ -7220,7 +7220,7 @@ async fn count_docker_tag_rows(
     if search_query.is_some() {
         sql.push_str(&docker_tag_search_sql(2));
     }
-    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(repository_id);
+    let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(q) = search_query {
         query = query.bind(super::escape_like_literal(q));
     }
@@ -16789,7 +16789,10 @@ mod tests {
         // Drop first, unconditionally, so a previously panicked run cannot leak
         // the trigger into this one.
         let drop_trigger = "DROP TRIGGER IF EXISTS ak_test_block_delete_3475 ON artifacts";
-        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
+            .execute(&rig.pool)
+            .await
+            .ok();
         sqlx::query(
             "CREATE OR REPLACE FUNCTION ak_test_block_delete_3475() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ak-test-3475 injected failure'; END $$ LANGUAGE plpgsql",
@@ -16797,18 +16800,21 @@ mod tests {
         .execute(&rig.pool)
         .await
         .expect("create abort function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER ak_test_block_delete_3475 BEFORE UPDATE ON artifacts \
              FOR EACH ROW WHEN (NEW.is_deleted AND NEW.id = '{artifact_id}') \
              EXECUTE FUNCTION ak_test_block_delete_3475()"
-        ))
+        )))
         .execute(&rig.pool)
         .await
         .expect("create abort trigger");
 
         let result = rig.delete(path).await;
 
-        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
+            .execute(&rig.pool)
+            .await
+            .ok();
         sqlx::query("DROP FUNCTION IF EXISTS ak_test_block_delete_3475()")
             .execute(&rig.pool)
             .await
@@ -20396,18 +20402,18 @@ mod tests {
         // sharing the `repositories` table never collide.
         let fn_name = format!("ph_block_repo_delete_{}", fx.repo_id.simple());
         let trg_name = format!("ph_block_repo_delete_trg_{}", fx.repo_id.simple());
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {fn_name}() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ph blocked repo delete'; END; $$ LANGUAGE plpgsql"
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create blocking trigger function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trg_name} BEFORE DELETE ON repositories \
              FOR EACH ROW WHEN (OLD.id = '{}'::uuid) EXECUTE FUNCTION {fn_name}()",
             fx.repo_id
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create blocking trigger");
@@ -20435,11 +20441,13 @@ mod tests {
         );
 
         // Drop the trigger (and function) so the fixture can tear down cleanly.
-        sqlx::query(&format!("DROP TRIGGER {trg_name} ON repositories"))
-            .execute(&fx.pool)
-            .await
-            .expect("drop blocking trigger");
-        sqlx::query(&format!("DROP FUNCTION {fn_name}()"))
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP TRIGGER {trg_name} ON repositories"
+        )))
+        .execute(&fx.pool)
+        .await
+        .expect("drop blocking trigger");
+        sqlx::query(sqlx::AssertSqlSafe(&*format!("DROP FUNCTION {fn_name}()")))
             .execute(&fx.pool)
             .await
             .expect("drop blocking trigger function");

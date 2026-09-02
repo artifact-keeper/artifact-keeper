@@ -221,7 +221,7 @@ pub async fn list_builds(
         order_clause
     );
 
-    let builds: Vec<BuildRow> = sqlx::query_as(&sql)
+    let builds: Vec<BuildRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(&query.status)
         .bind(&search_pattern)
         .bind(offset)

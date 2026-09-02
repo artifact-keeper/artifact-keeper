@@ -6142,7 +6142,10 @@ mod tests {
                 "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
                 "DELETE FROM repositories WHERE id = $1",
             ] {
-                let _ = sqlx::query(sql).bind(member_id).execute(&fx.pool).await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(member_id)
+                    .execute(&fx.pool)
+                    .await;
             }
         }
         let _ = std::fs::remove_dir_all(&local_dir);
@@ -10947,7 +10950,10 @@ mod db_cov_tests {
             "DELETE FROM artifacts WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(sql).bind(member_id).execute(&fx.pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await;
         }
         let _ = std::fs::remove_dir_all(member_dir);
     }
@@ -11691,7 +11697,10 @@ mod proxy_scan_block_tests {
             "DELETE FROM artifacts WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member_id)
+                .execute(pool)
+                .await;
         }
         let _ = std::fs::remove_dir_all(dir);
     }

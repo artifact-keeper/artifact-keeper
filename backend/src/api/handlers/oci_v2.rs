@@ -2380,7 +2380,7 @@ pub fn extract_blob_refs(body: &[u8]) -> Vec<BlobRef> {
 /// the DB round-trip.
 ///
 /// Pure and DB-free so the array-pairing logic is unit-testable without a
-/// database (the raw `sqlx::query(...).execute()` is exercised only by the
+/// database (the raw `sqlx::query(sqlx::AssertSqlSafe(&*...)).execute()` is exercised only by the
 /// Tier-2 integration tests).
 fn blob_refs_to_columns(refs: &[BlobRef]) -> Option<(Vec<String>, Vec<String>)> {
     if refs.is_empty() {
@@ -10160,7 +10160,7 @@ async fn tags_list_local(
 ) -> Result<LocalTagsPage, Response> {
     let limit = (n.saturating_add(1)) as i64;
     let rows = if let Some(last) = last {
-        sqlx::query_scalar::<_, String>(local_tags_query(true))
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(local_tags_query(true)))
             .bind(repo_id)
             .bind(image_name)
             .bind(last)
@@ -10168,7 +10168,7 @@ async fn tags_list_local(
             .fetch_all(db)
             .await
     } else {
-        sqlx::query_scalar::<_, String>(local_tags_query(false))
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(local_tags_query(false)))
             .bind(repo_id)
             .bind(image_name)
             .bind(limit)
@@ -10864,7 +10864,7 @@ async fn catalog_local_entries(
     let limit = (n as i64).saturating_add(1);
 
     let sql = catalog_page_sql(last.is_some(), authorized.is_some());
-    let mut query = sqlx::query_as::<_, (String,)>(&sql);
+    let mut query = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(&*sql));
     if let Some(cursor) = last {
         query = query.bind(cursor);
     }
@@ -17813,10 +17813,13 @@ mod manifest_digest_db_tests {
             "oci_tags",
             "oci_blobs",
         ] {
-            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
-                .bind(fx.repo_id)
-                .execute(&fx.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                table
+            )))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
         }
         fx.teardown().await;
     }
@@ -18215,10 +18218,13 @@ mod manifest_digest_db_tests {
             "oci_blobs",
             "artifacts",
         ] {
-            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
-                .bind(other_id)
-                .execute(&fx.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                table
+            )))
+            .bind(other_id)
+            .execute(&fx.pool)
+            .await;
         }
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(other_id)
@@ -18276,25 +18282,25 @@ mod manifest_digest_db_tests {
         let suffix = Uuid::new_v4().simple().to_string();
         let function_name = format!("ak_test_fail_mbr_delete_{}", suffix);
         let trigger_name = format!("ak_test_fail_mbr_delete_{}", suffix);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {function_name}() RETURNS trigger
              LANGUAGE plpgsql AS $$
              BEGIN
                  RAISE EXCEPTION 'forced manifest_blob_refs delete failure';
              END;
              $$"
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create failure function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trigger_name}
              BEFORE DELETE ON manifest_blob_refs
              FOR EACH ROW
              WHEN (OLD.repository_id = '{}'::uuid)
              EXECUTE FUNCTION {function_name}()",
             fx.repo_id
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create failure trigger");
@@ -18328,14 +18334,16 @@ mod manifest_digest_db_tests {
         .await
         .expect("count refs");
 
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        ))
+        )))
         .execute(&fx.pool)
         .await;
-        let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {function_name}()"))
-            .execute(&fx.pool)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP FUNCTION IF EXISTS {function_name}()"
+        )))
+        .execute(&fx.pool)
+        .await;
         cleanup(&fx).await;
 
         assert_eq!(
@@ -19177,7 +19185,7 @@ mod oci_blob_upload_streaming_tests {
                 trigger_name = trigger.trigger_name,
                 function_name = trigger.function_name,
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .execute(pool)
                 .await
                 .expect("create deferred upload-session trigger");
@@ -19196,7 +19204,7 @@ mod oci_blob_upload_streaming_tests {
                 trigger_name = trigger.trigger_name,
                 function_name = trigger.function_name,
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .execute(pool)
                 .await
                 .expect("create deferred upload-part trigger");
@@ -19208,10 +19216,14 @@ mod oci_blob_upload_streaming_tests {
                 "DROP TRIGGER IF EXISTS {} ON {}",
                 self.trigger_name, self.table
             );
-            let _ = sqlx::query(&drop_trigger).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_trigger))
+                .execute(pool)
+                .await;
 
             let drop_function = format!("DROP FUNCTION IF EXISTS {}()", self.function_name);
-            let _ = sqlx::query(&drop_function).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_function))
+                .execute(pool)
+                .await;
         }
 
         async fn create(pool: &PgPool, table: &'static str) -> Self {
@@ -19227,7 +19239,7 @@ mod oci_blob_upload_streaming_tests {
                  $$",
                 function_name = function_name,
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .execute(pool)
                 .await
                 .expect("create deferred failure function");
@@ -19788,7 +19800,7 @@ mod oci_blob_upload_streaming_tests {
             // handler's `oci_blobs` INSERT fails like a real DB constraint
             // error while every other row (and the journal) is untouched.
             let fn_name = format!("{}_fn", self.trigger_name);
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
                 CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
                 BEGIN
@@ -19802,11 +19814,11 @@ mod oci_blob_upload_streaming_tests {
                 fn_name = fn_name,
                 repo = self.repository_id,
                 digest = self.digest,
-            ))
+            )))
             .execute(&self.pool)
             .await
             .map_err(AppError::from)?;
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
                 CREATE TRIGGER {trig}
                     BEFORE INSERT ON oci_blobs
@@ -19814,7 +19826,7 @@ mod oci_blob_upload_streaming_tests {
                 "#,
                 trig = self.trigger_name,
                 fn_name = fn_name,
-            ))
+            )))
             .execute(&self.pool)
             .await
             .map_err(AppError::from)?;
@@ -20629,17 +20641,17 @@ mod oci_blob_upload_streaming_tests {
 
         // Drop the injected trigger so it cannot affect other tests sharing the
         // `oci_blobs` table.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP TRIGGER IF EXISTS {trig} ON oci_blobs",
             trig = storage.trigger_name
-        ))
+        )))
         .execute(&f.inner.pool)
         .await
         .expect("drop injected trigger");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP FUNCTION IF EXISTS {trig}_fn()",
             trig = storage.trigger_name
-        ))
+        )))
         .execute(&f.inner.pool)
         .await
         .expect("drop injected trigger function");
@@ -24490,24 +24502,24 @@ mod proxy_manifest_artifact_indexing_tests {
         let suffix = Uuid::new_v4().simple().to_string();
         let function_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
         let trigger_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {function_name}() RETURNS trigger
              LANGUAGE plpgsql AS $$
              BEGIN
                  RAISE EXCEPTION 'forced manifest_blob_refs insert failure for atomicity test';
              END;
              $$"
-        ))
+        )))
         .execute(&pool)
         .await
         .expect("create failure function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trigger_name}
              BEFORE INSERT ON manifest_blob_refs
              FOR EACH ROW
              WHEN (NEW.repository_id = '{repo_id}'::uuid)
              EXECUTE FUNCTION {function_name}()"
-        ))
+        )))
         .execute(&pool)
         .await
         .expect("create failure trigger");
@@ -24545,14 +24557,16 @@ mod proxy_manifest_artifact_indexing_tests {
                 .expect("count refs");
 
         // Cleanup (trigger first, so the cascade delete on repositories works).
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        ))
+        )))
         .execute(&pool)
         .await;
-        let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {function_name}()"))
-            .execute(&pool)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP FUNCTION IF EXISTS {function_name}()"
+        )))
+        .execute(&pool)
+        .await;
         let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
             .bind(repo_id)
             .execute(&pool)
@@ -25831,7 +25845,7 @@ mod cross_repo_session_regression_tests {
              VALUES ($1, $2, $2, $3, '{}'::repository_type, 'docker'::repository_format, true, $4)",
             repo_type
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(id)
             .bind(&key)
             .bind(&*storage_dir.to_string_lossy())
@@ -32473,10 +32487,12 @@ mod oci_read_authz_tests {
 
         async fn teardown(&self) {
             for table in ["oci_tags", "oci_blobs"] {
-                let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                    .bind(self.repo_id)
-                    .execute(&self.pool)
-                    .await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "DELETE FROM {table} WHERE repository_id = $1"
+                )))
+                .bind(self.repo_id)
+                .execute(&self.pool)
+                .await;
             }
             for user_id in &self.extra_users {
                 tdh::cleanup_user(&self.pool, *user_id).await;
@@ -32960,10 +32976,12 @@ mod oci_read_authz_tests {
             .execute(&f.pool)
             .await;
         for table in ["oci_tags", "oci_blobs"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                .bind(public_id)
-                .execute(&f.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {table} WHERE repository_id = $1"
+            )))
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
         }
         for repo in [public_id, virt_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -33122,10 +33140,12 @@ mod oci_read_authz_tests {
             .execute(&f.pool)
             .await;
         for table in ["oci_tags", "oci_blobs"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                .bind(public_id)
-                .execute(&f.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {table} WHERE repository_id = $1"
+            )))
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
         }
         for repo in [public_id, virt_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -33282,10 +33302,12 @@ mod oci_read_authz_tests {
             .execute(&f.pool)
             .await;
         for table in ["oci_tags", "oci_blobs"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                .bind(public_id)
-                .execute(&f.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {table} WHERE repository_id = $1"
+            )))
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
         }
         for repo in [public_id, virt_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -33499,10 +33521,13 @@ mod oci_error_envelope_db_tests {
             .execute(&fx.pool)
             .await;
         for table in ["oci_manifest_refs", "manifest_blob_refs", "oci_tags"] {
-            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
-                .bind(fx.repo_id)
-                .execute(&fx.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                table
+            )))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
         }
         fx.teardown().await;
 

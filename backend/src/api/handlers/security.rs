@@ -1685,7 +1685,7 @@ impl ProxyScanEntry {
 
 /// Per-state counts over distinct digests for one repository.
 async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxyScanSummary> {
-    sqlx::query_as::<_, ProxyScanSummary>(&format!(
+    sqlx::query_as::<_, ProxyScanSummary>(sqlx::AssertSqlSafe(&*format!(
         r#"
         SELECT
             COUNT(DISTINCT pca.checksum_sha256)
@@ -1706,7 +1706,7 @@ async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxySca
            AND {not_index}
         "#,
         not_index = proxy_catalog::not_cached_index_sql("pca.path"),
-    ))
+    )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
     .fetch_one(db)
@@ -1721,13 +1721,16 @@ async fn fetch_proxy_scan_path(
     repo_id: Uuid,
     path: &str,
 ) -> Result<Option<ProxyScanRow>> {
-    sqlx::query_as::<_, ProxyScanRow>(&format!("{} AND pca.path = $3", proxy_scan_select()))
-        .bind(repo_id)
-        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
-        .bind(path)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))
+    sqlx::query_as::<_, ProxyScanRow>(sqlx::AssertSqlSafe(&*format!(
+        "{} AND pca.path = $3",
+        proxy_scan_select()
+    )))
+    .bind(repo_id)
+    .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// One page of catalog paths, newest cache entry first.
@@ -1737,11 +1740,11 @@ async fn fetch_proxy_scan_page(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ProxyScanRow>> {
-    sqlx::query_as::<_, ProxyScanRow>(&format!(
+    sqlx::query_as::<_, ProxyScanRow>(sqlx::AssertSqlSafe(&*format!(
         "{} AND pca.checksum_sha256 IS NOT NULL \
          ORDER BY pca.cached_at DESC, pca.path ASC LIMIT $3 OFFSET $4",
         proxy_scan_select()
-    ))
+    )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
     .bind(limit)
@@ -1754,11 +1757,11 @@ async fn fetch_proxy_scan_page(
 /// Paths eligible for the paged list (NULL-checksum placeholders excluded, to
 /// match the rows the page actually returns).
 async fn count_proxy_scan_paths(db: &PgPool, repo_id: Uuid) -> Result<i64> {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*format!(
         "SELECT COUNT(*) FROM proxy_cache_artifacts \
          WHERE repository_id = $1 AND checksum_sha256 IS NOT NULL AND {not_index}",
         not_index = proxy_catalog::not_cached_index_sql("path"),
-    ))
+    )))
     .bind(repo_id)
     .fetch_one(db)
     .await
