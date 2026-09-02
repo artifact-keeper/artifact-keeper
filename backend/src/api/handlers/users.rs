@@ -262,7 +262,12 @@ pub async fn list_users(
     let per_page = crate::api::handlers::repositories::clamp_per_page(query.per_page);
     let offset = ((page - 1) * per_page) as i64;
 
-    let search_pattern = query.search.as_ref().map(|s| format!("%{}%", s));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = query
+        .search
+        .as_ref()
+        .map(|s| format!("%{}%", crate::api::handlers::escape_like_literal(s)));
 
     let users = sqlx::query_as!(
         User,
@@ -275,7 +280,7 @@ pub async fn list_users(
             failed_login_attempts, locked_until, last_failed_login_at,
             password_changed_at, last_login_at, created_at, updated_at
         FROM users
-        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
+        WHERE ($1::text IS NULL OR username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\' OR display_name ILIKE $1 ESCAPE '\')
           AND ($2::boolean IS NULL OR is_active = $2)
           AND ($3::boolean IS NULL OR is_admin = $3)
           AND ($4::boolean IS NULL OR is_service_account = $4)
@@ -304,7 +309,7 @@ pub async fn list_users(
         r#"
         SELECT COUNT(*) as "count!"
         FROM users
-        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
+        WHERE ($1::text IS NULL OR username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\' OR display_name ILIKE $1 ESCAPE '\')
           AND ($2::boolean IS NULL OR is_active = $2)
           AND ($3::boolean IS NULL OR is_admin = $3)
           AND ($4::boolean IS NULL OR is_service_account = $4)

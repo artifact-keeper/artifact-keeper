@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT DISTINCT name, version, created_at\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND name ILIKE $2\n          AND version IS NOT NULL\n        ORDER BY created_at DESC\n        LIMIT $3 OFFSET $4\n        ",
+  "query": "\n        SELECT DISTINCT name, version, created_at\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND name ILIKE $2 ESCAPE '\\'\n          AND version IS NOT NULL\n        ORDER BY created_at DESC\n        LIMIT $3 OFFSET $4\n        ",
   "describe": {
     "columns": [
       {
@@ -33,5 +33,5 @@
       false
     ]
   },
-  "hash": "1804bfbfff4b2fdb953524a2f43845469f30813ad300af8a90d54e66a36c43a9"
+  "hash": "afaeb364f3aeb7c1d3758db2d815bb319c9d55b57df545406a6c7d3bbd0f9da8"
 }

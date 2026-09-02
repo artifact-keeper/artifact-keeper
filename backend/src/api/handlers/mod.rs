@@ -139,22 +139,19 @@ pub fn json_response(value: &serde_json::Value) -> axum::response::Response {
 /// Centralizes the boilerplate that every format handler otherwise repeats
 /// after `sqlx::query!(...).fetch_*().await.map_err(...)` calls.
 ///
+/// Every failure goes through `map_db_err` -> `AppError::Database`, which is
+/// the same sanitizer the generic routes use: the client gets the stable
+/// `{"code":"DATABASE_ERROR","message":"Database operation failed"}` envelope
+/// and the raw sqlx/Postgres text is logged server-side only (#3623). It used
+/// to be interpolated into a 500 plain-text "Database error: {e}" body, which
+/// handed anonymous callers on public repositories the driver message
+/// verbatim (e.g. `invalid byte sequence for encoding "UTF8": 0x00`).
+///
 /// A saturated sqlx pool is a transient capacity event, not a server fault, so
-/// it is shed to 503 + `Retry-After` (via `map_db_err`, which also sanitizes
-/// the body) so clients back off instead of retrying into the saturation
-/// (#2083). Every other DB failure keeps the previous behaviour: a 500
-/// plain-text "Database error: {e}" response.
+/// it is still shed to 503 + `Retry-After` so clients back off instead of
+/// retrying into the saturation (#2083).
 pub fn db_err(e: impl std::fmt::Display) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let text = e.to_string();
-    if crate::error::is_pool_timeout(&text) {
-        return error_helpers::map_db_err(text);
-    }
-    (
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Database error: {}", text),
-    )
-        .into_response()
+    error_helpers::map_db_err(e.to_string())
 }
 
 /// Pick the HTTP status for a database error when the response envelope is
@@ -199,6 +196,19 @@ pub fn escape_path_prefix(components: &[&str]) -> String {
         out.push('/');
     }
     out
+}
+
+/// Identity function marking a `LIKE` pattern that is DELIBERATELY bound
+/// unescaped (#3557).
+///
+/// The two call sites fan their patterns out through `LIKE ANY($n)` and then
+/// re-check every returned row exactly in Rust, so an over-broad match can
+/// only over-fetch, never mis-attribute. Wrapping the pattern says that in
+/// code rather than in a comment: the class gate accepts a site only when this
+/// wrapper encloses THAT `format!`, so the exception cannot be pasted onto an
+/// ordinary search site the way a comment marker could.
+pub fn like_any_overmatch_accepted(pattern: String) -> String {
+    pattern
 }
 
 pub mod error_helpers;
@@ -509,14 +519,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_db_err_body_includes_label_and_message() {
+    async fn test_db_err_body_is_sanitized_envelope() {
+        // The body is the same envelope `AppError::Database` emits on the
+        // generic routes -- no driver text (#3623).
         let resp = db_err("disk full");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.starts_with("Database error: "));
-        assert!(text.contains("disk full"));
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "DATABASE_ERROR");
+        assert_eq!(json["message"], "Database operation failed");
+        assert!(!String::from_utf8_lossy(&body).contains("disk full"));
+    }
+
+    #[tokio::test]
+    async fn test_db_err_does_not_leak_raw_postgres_text() {
+        // SECURITY (#3623): `db_err` is reached by unauthenticated callers on
+        // public repositories (rpm, ansible, hex, debian, ...). A raw driver
+        // message -- here the encoding error a NUL byte in a client-supplied
+        // string produces -- must never reach the response body.
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let resp = db_err(raw);
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence"),
+            "db_err leaked the driver message: {text}"
+        );
+        assert!(
+            !text.contains("UTF8"),
+            "db_err leaked the encoding name: {text}"
+        );
+        assert!(
+            text.contains("DATABASE_ERROR"),
+            "unexpected envelope: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_db_err_pool_timeout_body_matches_generic_path() {
+        // The 503 shed keeps its own user-facing message and Retry-After, and
+        // still carries no driver text.
+        let resp = db_err(sqlx::Error::PoolTimedOut.to_string());
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "1"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "POOL_EXHAUSTED");
+        assert_eq!(
+            json["message"],
+            "Database connection pool is saturated, retry shortly"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -825,50 +887,88 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// #3500: a SQL-assembled `LIKE` pattern must escape its operand.
-//
-// The class is narrow and mechanically recognisable: a predicate that builds
-// its `LIKE` *pattern* inside SQL by concatenating an operand (`LIKE $2 ||
-// '%'`, `LIKE '%' || $2 || '%'`, `$2 LIKE a.name || '-%'`, `LIKE concat($2,
-// '%')`). At those sites the Rust call site shows a plain bind and nothing
-// hints that a pattern is being assembled, which is why four of them survived
-// the #998/#1000 escaping wave and the #3492 audit. A constant pattern
-// (`LIKE 'maven/%'`) is not in the class — escaping applies to the pattern,
-// not to the column being probed.
-//
-// WHAT ACTUALLY FIXES IT, and why this gate checks a PAIR. `ESCAPE '\'` names
-// the character Postgres already uses by default, so on its own that clause
-// changes nothing: `'ab/x' LIKE 'a\b/' || '%'` and the same predicate with
-// `ESCAPE '\'` are both true, and `_` stays a wildcard either way. What fixes
-// the bug is [`escape_like_literal`] on the value that becomes the pattern.
-// A gate that demanded only the clause would therefore be green while #3500
-// was fully live. So a site must satisfy BOTH:
-//
-//   1. an `ESCAPE` clause on the predicate, and
-//   2. either `ESCAPE ''` — for an operand derived in SQL, which the Rust
-//      helper cannot reach (see `maven_flat_attribution::
-//      metadata_rollup_dir_anchor_sql`, #3492/#3493) — or an
-//      `escape_like_literal` in the same function, for an operand that is a
-//      bind parameter.
-//
-// WHAT THIS CANNOT PROVE. Requirement 2 is function-scoped: it shows an
-// escaper is applied somewhere in the function that owns the predicate, NOT
-// that it is applied to *this* operand. A function that escapes one value and
-// binds another raw still passes. Only the per-site behavioural tests
-// (`tree.rs`, `rubygems.rs`, `repositories.rs`, `cargo.rs`,
-// `artifact_service.rs`) prove the operand half, and they are what caught the
-// bug. This gate's job is narrower: stop a NEW site in this shape from being
-// added with no escaping story at all.
-//
-// OUT OF SCOPE, tracked separately: patterns built in RUST
-// (`format!("%{}%", q)`) for free-text search listings, and `LIKE ANY($n)`
-// over a Rust-built array. Those have no SQL-side assembly for this scanner
-// to key on, and several of them are correct today because their caller
-// pre-escapes or their handler re-checks the match exactly.
-// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod like_pattern_escape_class_tests {
+    // ---------------------------------------------------------------------------
+    // #3500: a SQL-assembled `LIKE` pattern must escape its operand.
+    //
+    // The class is narrow and mechanically recognisable: a predicate that builds
+    // its `LIKE` *pattern* inside SQL by concatenating an operand (`LIKE $2 ||
+    // '%'`, `LIKE '%' || $2 || '%'`, `$2 LIKE a.name || '-%'`, `LIKE concat($2,
+    // '%')`). At those sites the Rust call site shows a plain bind and nothing
+    // hints that a pattern is being assembled, which is why four of them survived
+    // the #998/#1000 escaping wave and the #3492 audit. A constant pattern
+    // (`LIKE 'maven/%'`) is not in the class — escaping applies to the pattern,
+    // not to the column being probed.
+    //
+    // WHAT ACTUALLY FIXES IT, and why this gate checks a PAIR. `ESCAPE '\'` names
+    // the character Postgres already uses by default, so on its own that clause
+    // changes nothing: `'ab/x' LIKE 'a\b/' || '%'` and the same predicate with
+    // `ESCAPE '\'` are both true, and `_` stays a wildcard either way. What fixes
+    // the bug is [`escape_like_literal`] on the value that becomes the pattern.
+    // A gate that demanded only the clause would therefore be green while #3500
+    // was fully live. So a site must satisfy BOTH:
+    //
+    //   1. an `ESCAPE` clause on the predicate, and
+    //   2. either `ESCAPE ''` — for an operand derived in SQL, which the Rust
+    //      helper cannot reach (see `maven_flat_attribution::
+    //      metadata_rollup_dir_anchor_sql`, #3492/#3493) — or an
+    //      `escape_like_literal` in the same function, for an operand that is a
+    //      bind parameter.
+    //
+    // WHAT THIS CANNOT PROVE. Requirement 2 is function-scoped: it shows an
+    // escaper is applied somewhere in the function that owns the predicate, NOT
+    // that it is applied to *this* operand. A function that escapes one value and
+    // binds another raw still passes. Only the per-site behavioural tests
+    // (`tree.rs`, `rubygems.rs`, `repositories.rs`, `cargo.rs`,
+    // `artifact_service.rs`) prove the operand half, and they are what caught the
+    // bug. This gate's job is narrower: stop a NEW site in this shape from being
+    // added with no escaping story at all.
+    //
+    // THE SECOND SHAPE (#3557): the pattern is assembled in RUST -- `format!(
+    // "%{}%", q)` for a free-text search box, `format!("{}%", p)` for a prefix,
+    // `format!("{}/%", key)` for a directory -- and bound whole to a bare `path
+    // LIKE $2`. The SQL scanner above cannot see those: by the time the string
+    // reaches SQL it is a single bind, with no concatenation to key on. So they
+    // get their own scanner, keyed on the RUST literal instead, in
+    // `every_rust_assembled_like_pattern_escapes_its_operand`.
+    //
+    // WHAT THAT ONE CANNOT PROVE EITHER -- and it matters more here, so say it
+    // plainly. It is function-scoped in exactly the way requirement 2 above is:
+    // it proves an escaper is used SOMEWHERE in the function that owns the
+    // `format!`, not that it is used on THIS value. Four sites in #3557 itself
+    // (`artifact_service`'s `list_page`/`count`/`list_for_repos_page`/
+    // `count_for_repos`) escape a path prefix on the line above the search term,
+    // so reverting only the search term leaves this gate green. The DB-backed
+    // behavioural tests are the real regression pin for those; this gate's job
+    // is narrower -- stop a NEW site in this shape from being added with no
+    // escaping story at all -- and it is a lint, not a proof.
+    //
+    // Its shape recogniser is a `format!` whose literal ends in `%` and carries
+    // an interpolation. That is broader than the `%{...}%` / `{...}%` cohort
+    // #3557 first audited (it also sees `{}/%` and `{}-%`, which walked past the
+    // narrow form) and still matches nothing else in the tree: a
+    // `format!("%{b:02X}")` percent-encoder ends at the `}`. It does NOT see a
+    // pattern built by `push_str`, `+`, `concat!` or a raw string literal;
+    // those evade it, and a contributor could plausibly write them.
+    //
+    // It WILL over-flag a percentage string -- `format!("{:.1}%", pct)` is the
+    // ordinary way to render one, and nothing distinguishes it from a prefix
+    // pattern at the literal level. `backend/src` contains none today. That is
+    // a false positive rather than a hole, and it fails loudly with its own
+    // file and line, so the cost is one puzzled minute: name the value for what
+    // it is (`percent_label`) so the failure message reads as
+    // obviously-not-a-pattern, then widen this recogniser to exclude it.
+    // Trading that for the two live sites the narrow form walked past is the
+    // right way round for a gate whose failure mode should be noisy, never
+    // silent.
+    //
+    // STILL OUT OF SCOPE: `LIKE ANY($n)` over a Rust-built array, where the site
+    // deliberately over-fetches and re-checks the match exactly in Rust. Those
+    // wrap the pattern in [`like_any_overmatch_accepted`], which the gate
+    // recognises only when it encloses THAT `format!` -- a code construct that
+    // has to compile, not a phrase in a comment.
+    // ---------------------------------------------------------------------------
     /// A `LIKE`-family operator, in every spelling that reaches the same
     /// pattern-matching semantics. `~~` is `LIKE`'s operator form and is what
     /// `LIKE ... ESCAPE` is rewritten to before planning, so a site written
@@ -1047,10 +1147,12 @@ mod like_pattern_escape_class_tests {
         let mut examined = 0usize;
 
         for (path, raw) in rust_sources() {
-            // This module's own prose describes the shape it hunts for.
-            if path.ends_with("api/handlers/mod.rs") {
-                continue;
-            }
+            // `#[cfg(test)] mod` regions are skipped rather than the whole of
+            // `api/handlers/mod.rs` (#3557): this module's own prose and probe
+            // strings describe the shapes both scanners hunt for, and a
+            // file-wide exclusion would also blind them to the production
+            // functions that live here (`escape_like_literal` among them).
+            let tests = test_module_line_ranges(&raw);
             let (flat, lines) = flatten(&raw);
             for operator in OPERATORS {
                 for (at, _) in flat.match_indices(operator) {
@@ -1079,6 +1181,9 @@ mod like_pattern_escape_class_tests {
                     let line_no = lines.get(at).copied().unwrap_or(0);
                     let line = raw.lines().nth(line_no.saturating_sub(1)).unwrap_or("");
                     if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    if in_test_module(&tests, line_no) {
                         continue;
                     }
                     examined += 1;
@@ -1430,6 +1535,392 @@ mod like_pattern_escape_class_tests {
                 enclosing_fn(src, at).contains("escape_like_literal("),
                 "#3500: `{wrapper}` is accepted as an escaper by the class gate, so it \
                  must route through `escape_like_literal`"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #3557: the same class, assembled in RUST instead of in SQL.
+    // -----------------------------------------------------------------------
+
+    /// The identity wrapper a site uses to say, in code, that its pattern is
+    /// deliberately bound unescaped because the query fans it out through
+    /// `LIKE ANY($n)` and re-checks each row in Rust.
+    ///
+    /// Checked as an ENCLOSING CALL on the very `format!` it excuses, not as a
+    /// phrase anywhere in the function — the previous comment marker was
+    /// satisfied by two lines of prose, which is not an exception a gate can
+    /// rely on.
+    const OVERMATCH_WRAPPER: &str = "like_any_overmatch_accepted(";
+
+    /// Whether a `format!` literal IS a `LIKE` pattern: it ends in `%` and
+    /// carries at least one interpolation.
+    ///
+    /// Deliberately broader than the `%{…}%` / `{…}%` cohort #3557 audited, so
+    /// that a directory prefix (`"{}/%"`, `services/migration_service.rs`) or a
+    /// segment join (`"{}-%"`, `api/handlers/maven.rs`) is in the class too —
+    /// both are ordinary Rust-assembled `LIKE` prefixes and the narrow form
+    /// missed them. `{{`/`}}` (an escaped brace, so no interpolation at all)
+    /// disqualifies, and so does a literal that merely CONTAINS a `%`: the
+    /// percent-encoders in `saml_service`, `sync_worker` and
+    /// `popularity_source` all write `format!("%{b:02X}")`, which ends at the
+    /// `}`.
+    fn rust_like_pattern_literal(literal: &str) -> bool {
+        if !literal.ends_with('%') || literal.contains("{{") || literal.contains("}}") {
+            return false;
+        }
+        let Some(open) = literal.find('{') else {
+            return false;
+        };
+        literal[open..].find('}').is_some()
+    }
+
+    /// Byte offset of every `format!("…")` in `src` whose literal is a
+    /// Rust-assembled `LIKE` pattern. The literals in this class hold no
+    /// escapes, so the closing quote is the next one.
+    fn rust_assembled_pattern_sites(src: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (at, _) in src.match_indices("format!(") {
+            let rest = &src[at + "format!(".len()..];
+            // rustfmt wraps a long `format!` after the paren, so the literal
+            // is not reliably on the same line as the macro.
+            let Some(quoted) = rest.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = quoted.find('"') else {
+                continue;
+            };
+            if rust_like_pattern_literal(&quoted[..end]) {
+                out.push(at);
+            }
+        }
+        out
+    }
+
+    /// 1-based, inclusive line ranges covered by `#[cfg(test)] mod … { … }`.
+    ///
+    /// Test fixtures build `LIKE` patterns out of literals they chose
+    /// themselves (`target_has_artifact(pool, repo, "pr1940/x")` in
+    /// `approval.rs` and `promotion.rs`), and this module's own prose and probe
+    /// strings spell out the shapes both scanners hunt for. Skipping the
+    /// regions rather than whole files is what lets both scanners cover
+    /// `api/handlers/mod.rs`, which holds production code including
+    /// [`escape_like_literal`] itself. A `#[cfg(test)] use …` — a test-only
+    /// import, of which `terraform.rs` has two ABOVE its production code —
+    /// introduces no region, so the check is on the attributed ITEM.
+    fn test_module_line_ranges(src: &str) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() != "#[cfg(test)]" {
+                continue;
+            }
+            let indent = &line[..line.len() - line.trim_start().len()];
+            // The attributed ITEM, skipping further attributes and comments.
+            // A `#[cfg(test)] use …` (a test-only import, of which
+            // `terraform.rs` has two ABOVE its production code) opens no
+            // region, so the check is on the item and not on the attribute.
+            let Some(item) = lines[index + 1..].iter().find(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("#["))
+            }) else {
+                continue;
+            };
+            let item = item.trim_end();
+            let item = item.trim_start();
+            if !(item.starts_with("mod ") || item.contains(" mod ")) {
+                continue;
+            }
+            // An OUT-OF-LINE declaration (`#[cfg(test)] mod tests;`) opens no
+            // brace, so there is no region: its body is a separate file, which
+            // is scanned on its own terms. Searching for a closing brace here
+            // would find an unrelated one further down and silently swallow
+            // every line between — live in this tree at `api/handlers/mod.rs`
+            // (`mod test_db_helpers;`) and `formats/mod.rs` (`mod
+            // format_tests;`), which between them hid ~140 production lines
+            // including the whole `FormatHandler` trait.
+            if item.ends_with(';') {
+                continue;
+            }
+            // The module ends at the first line that is this item's indent
+            // followed by a bare `}`. Anchoring on indentation rather than
+            // counting braces is what keeps a `'{'` char literal or an
+            // unbalanced brace inside a string — both of which this very
+            // module contains — from ending the region early and silently
+            // re-exposing the scanners' own probe strings as offenders.
+            //
+            // A trailing comment on that brace (`} // end of tests`) is still
+            // the brace: comparing the raw line would walk past it to the next
+            // one at the same indent — the closing brace of a PRODUCTION item
+            // — and absorb it.
+            let closing = format!("{indent}}}");
+            let Some(offset) = lines[index + 1..]
+                .iter()
+                .position(|l| strip_trailing_comment(l) == closing)
+            else {
+                continue;
+            };
+            out.push((index + 1, index + 1 + offset + 1));
+        }
+        out
+    }
+
+    /// `line` with a trailing `//` comment and trailing whitespace removed.
+    /// Only used to recognise a block's closing brace, so a `//` inside a
+    /// string literal on such a line is not a concern — a line that closes a
+    /// block at its item's indent carries nothing else.
+    fn strip_trailing_comment(line: &str) -> &str {
+        match line.find("//") {
+            Some(at) => line[..at].trim_end(),
+            None => line.trim_end(),
+        }
+    }
+
+    /// Whether 1-based `line_no` falls inside any range from
+    /// [`test_module_line_ranges`].
+    fn in_test_module(ranges: &[(usize, usize)], line_no: usize) -> bool {
+        ranges
+            .iter()
+            .any(|(from, to)| line_no >= *from && line_no <= *to)
+    }
+
+    /// `owner` from its `fn` header onward, i.e. with the doc comment
+    /// [`enclosing_fn`] deliberately includes stripped off. Anything that must
+    /// be true of the CODE is checked against this, not against prose.
+    fn fn_body(owner: &str) -> &str {
+        line_offsets(owner)
+            .find(|(_, line)| {
+                let t = line.trim_start();
+                t.starts_with("fn ")
+                    || t.starts_with("async fn ")
+                    || t.starts_with("pub fn ")
+                    || t.starts_with("pub async fn ")
+                    || (t.starts_with("pub(") && t.contains(") fn "))
+                    || (t.starts_with("pub(") && t.contains(") async fn "))
+            })
+            .map(|(at, _)| &owner[at..])
+            .unwrap_or(owner)
+    }
+
+    /// Whether the `format!` at `at` is directly enclosed by
+    /// [`OVERMATCH_WRAPPER`]. Value-scoped, unlike everything else here: it
+    /// excuses one expression, not a function.
+    fn wrapped_in_overmatch_marker(src: &str, at: usize) -> bool {
+        src[..at].trim_end().ends_with(OVERMATCH_WRAPPER)
+    }
+
+    /// Scan the tree for Rust-assembled patterns; `(offenders, examined)`.
+    fn scan_rust_assembled() -> (Vec<Offender>, usize) {
+        let mut offenders = Vec::new();
+        let mut examined = 0usize;
+
+        for (path, raw) in rust_sources() {
+            let tests = test_module_line_ranges(&raw);
+            for at in rust_assembled_pattern_sites(&raw) {
+                let line_no = raw[..at].matches('\n').count() + 1;
+                if in_test_module(&tests, line_no) {
+                    continue;
+                }
+                let line = raw.lines().nth(line_no - 1).unwrap_or("");
+                // Prose quoting the shape is not a site; the SQL scanner above
+                // makes the same exclusion.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                examined += 1;
+                let owner = enclosing_fn(&raw, at);
+                // The over-match opt-out needs BOTH halves: the wrapper around
+                // THIS `format!` (value-scoped — a wrapper on a different
+                // pattern in the same function excuses nothing), and a real
+                // `LIKE ANY` in the function's BODY. The wrapper alone would
+                // let an ordinary search site be silenced by wrapping it; the
+                // `LIKE ANY` alone was the round-1 defect, satisfiable by two
+                // lines of prose, which is why it is matched below the `fn`
+                // header rather than across the doc comment `enclosing_fn`
+                // deliberately includes.
+                if wrapped_in_overmatch_marker(&raw, at) && fn_body(owner).contains("LIKE ANY(") {
+                    continue;
+                }
+                if escapes_operand(&raw, owner) {
+                    continue;
+                }
+                offenders.push(Offender {
+                    location: format!("{}:{}", path.display(), line_no),
+                    line: line.trim().to_string(),
+                    reason: "a pattern built in Rust binds whole, so the SQL text shows \
+                             nothing to key on; the interpolated value must go through \
+                             one of the escape_like_literal helpers BEFORE the `%` is \
+                             appended",
+                });
+            }
+        }
+        (offenders, examined)
+    }
+
+    /// The Rust-assembled half of the class (#3557), in one assertion.
+    ///
+    /// A LINT, not a proof. It is function-scoped in the same way the SQL gate
+    /// above is: it shows an escaper is applied somewhere in the function that
+    /// owns the `format!`, NOT that it is applied to this value. Four sites
+    /// this very issue fixed (`artifact_service`'s `list_page`, `count`,
+    /// `list_for_repos_page`, `count_for_repos`) escape a path prefix on the
+    /// line above the search term, so reverting only the search term keeps
+    /// this green — the DB-backed behavioural tests are what fail there, and
+    /// they are the real regression pin. What this gate buys is the NEW site:
+    /// one added in this shape with no escaping story at all fails the build
+    /// with its own file and line.
+    #[test]
+    fn every_rust_assembled_like_pattern_escapes_its_operand() {
+        let (offenders, examined) = scan_rust_assembled();
+        assert!(
+            examined >= 20,
+            "#3557: the scan examined only {examined} Rust-assembled pattern sites (32 at \
+             the time of writing); it has stopped recognising the shape and would pass \
+             vacuously"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#3557: a `LIKE` pattern assembled in Rust must escape the value it \
+             interpolates. Wrap it in `escape_like_literal` before appending the `%`, \
+             and match it under `ESCAPE '\\'`. Offenders:\n{}",
+            offenders
+                .iter()
+                .map(|o| format!("  {}: {}\n      -> {}", o.location, o.line, o.reason))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// The Rust scanner's own recognisers, pinned against the shapes that made
+    /// the #3557 audit a per-site read rather than a sweep, and against the
+    /// evasions found in review.
+    #[test]
+    fn the_rust_pattern_scanner_recognises_the_shapes_it_claims_to() {
+        for probe in [
+            "%{}%",
+            "{}%",
+            "%{q}%",
+            "{prefix}%",
+            // Widened in review: these are ordinary Rust-assembled prefixes
+            // and the narrow `%{…}%`/`{…}%` form walked past live ones.
+            "{}/%",
+            "{}-%",
+            "{}/{}%",
+            // A trailing `%%` is the same LIKE pattern with one literal `%`.
+            "%{}%%",
+        ] {
+            assert!(
+                rust_like_pattern_literal(probe),
+                "{probe:?} is a Rust-assembled LIKE pattern"
+            );
+        }
+        // A `%` that is not a wildcard: percent-encoders, a path join with no
+        // trailing `%`, and a literal with no interpolation at all.
+        for probe in ["%{b:02X}", "%{:02x}{}", "{}", "%%", "{}/%/", "{{}}%"] {
+            assert!(
+                !rust_like_pattern_literal(probe),
+                "{probe:?} is not a LIKE pattern"
+            );
+        }
+        // Wrapped by rustfmt: the literal need not share the macro's line.
+        assert_eq!(
+            rust_assembled_pattern_sites("let p = format!(\n    \"%{}%\",\n    q,\n);").len(),
+            1,
+            "a `format!` wrapped after the paren must still be seen"
+        );
+        // `#[cfg(test)] use` starts no region; `#[cfg(test)] mod` does.
+        let src =
+            "#[cfg(test)]\nuse bytes::Bytes;\nfn f() {}\n#[cfg(test)]\nmod t {\n    fn g() {}\n}\n";
+        let ranges = test_module_line_ranges(src);
+        assert_eq!(ranges.len(), 1, "only the `mod` item introduces a region");
+        assert_eq!(
+            ranges[0],
+            (4, 7),
+            "the region must span the test module only, not the test-only import above it"
+        );
+        assert!(!in_test_module(&ranges, 3), "`fn f` is production code");
+        assert!(
+            in_test_module(&ranges, 6),
+            "`fn g` is inside the test module"
+        );
+        // A brace inside a string or a `'{'` char literal must not end the
+        // region early — this module itself contains both.
+        let tricky = "#[cfg(test)]\nmod t {\n    fn g() { let _ = \"{\"; }\n}\nfn after() {}\n";
+        let ranges = test_module_line_ranges(tricky);
+        assert_eq!(
+            ranges,
+            vec![(1, 4)],
+            "an unbalanced brace in a string must not end the region early"
+        );
+        assert!(
+            !in_test_module(&ranges, 5),
+            "production code after the module stays scanned"
+        );
+        // An OUT-OF-LINE `#[cfg(test)] mod name;` opens no region at all.
+        // Before this was handled, the search for a closing brace found an
+        // unrelated one and swallowed everything up to it — live in this very
+        // file (`mod test_db_helpers;`) and in `formats/mod.rs`.
+        let out_of_line = "#[cfg(test)]\nmod b_tests;\npub fn prod() {\n    let _ = 1;\n}\n";
+        assert!(
+            test_module_line_ranges(out_of_line).is_empty(),
+            "an out-of-line test module declaration opens no region"
+        );
+        // The same shape with an inner attribute and a doc comment in between.
+        let out_of_line_attrs =
+            "#[cfg(test)]\n/// docs\n#[allow(dead_code)]\npub(crate) mod c;\npub fn prod() {\n}\n";
+        assert!(
+            test_module_line_ranges(out_of_line_attrs).is_empty(),
+            "attributes and docs before an out-of-line declaration change nothing"
+        );
+        // A trailing comment on the closing brace is still the closing brace.
+        // Comparing raw lines walked past it to the NEXT brace at that indent
+        // — a production item's — and absorbed everything between.
+        let commented = "#[cfg(test)]\nmod d {\n    fn t() {}\n} // end of d\npub fn prod() {\n    let _ = 1;\n}\n";
+        let ranges = test_module_line_ranges(commented);
+        assert_eq!(
+            ranges,
+            vec![(1, 4)],
+            "a trailing comment on the closing brace must not extend the region"
+        );
+        assert!(
+            !in_test_module(&ranges, 6),
+            "production code after a commented closing brace stays scanned"
+        );
+        // `fn_body` drops the doc comment `enclosing_fn` includes, so a phrase
+        // in prose cannot satisfy a check meant for code.
+        let documented = "/// mentions LIKE ANY( in prose\nfn f() {\n    let _ = 1;\n}\n";
+        assert!(
+            !fn_body(documented).contains("LIKE ANY("),
+            "a doc comment must not satisfy a check on the function body"
+        );
+        assert!(
+            fn_body("fn f() {\n    let sql = \"x LIKE ANY($1)\";\n}\n").contains("LIKE ANY("),
+            "the body's own SQL must still satisfy it"
+        );
+        // The over-match wrapper excuses the expression it encloses, and only
+        // that one: a mention elsewhere on the line does not count.
+        let wrapped = "let p = like_any_overmatch_accepted(format!(\"{}%\", x));";
+        let at = wrapped.find("format!(").unwrap();
+        assert!(wrapped_in_overmatch_marker(wrapped, at));
+        let adjacent = "// like_any_overmatch_accepted(\nlet p = format!(\"{}%\", x);";
+        let at = adjacent.find("format!(").unwrap();
+        assert!(
+            !wrapped_in_overmatch_marker(adjacent, at),
+            "a mention of the wrapper that does not enclose the format! must not excuse it"
+        );
+    }
+
+    /// The wrapper the gate accepts must be an identity function, so that
+    /// naming it can never change what is bound — the whole point of using a
+    /// call rather than a comment is that it is checkable, and this is the
+    /// check.
+    #[test]
+    fn the_overmatch_wrapper_returns_its_input_unchanged() {
+        for probe in ["", "%", r"com/example/lib_1%/", "plain"] {
+            assert_eq!(
+                super::like_any_overmatch_accepted(probe.to_string()),
+                probe,
+                "`like_any_overmatch_accepted` must not alter the pattern"
             );
         }
     }
