@@ -1961,8 +1961,9 @@ impl ArtifactService {
     /// members of a virtual repository, matching the virtual listing's
     /// de-duplication contract.
     ///
-    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards here
-    /// (LIKE-PATTERN-OVERMATCHES-RECHECKED-IN-RUST, #3557), and an
+    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards here — the
+    /// patterns are wrapped in [`like_any_overmatch_accepted`] to say so in
+    /// code (#3557) — and an
     /// over-broad match is harmless because the grouped caller re-parses each
     /// artifact's GAV from its path and discards rows outside the requested
     /// component keys. These prefixes are DERIVED (the GAV directory of each
@@ -1986,7 +1987,10 @@ impl ArtifactService {
             return Ok(Vec::new());
         }
 
-        let patterns: Vec<String> = path_prefixes.iter().map(|p| format!("{}%", p)).collect();
+        let patterns: Vec<String> = path_prefixes
+            .iter()
+            .map(|p| crate::api::handlers::like_any_overmatch_accepted(format!("{}%", p)))
+            .collect();
 
         let artifacts: Vec<Artifact> = sqlx::query_as(
             r#"
@@ -2840,10 +2844,39 @@ mod tests {
             }
         };
 
+        // The virtual (multi-repository) listing is the SAME defect in a
+        // second pair of statements — `GET /api/v1/repositories/{key}/artifacts
+        // ?q=` routes to these for a virtual repo — and neither the class gate
+        // nor anything else covers them: they escape a path prefix on the line
+        // above, which satisfies the gate's function-scoped check whatever
+        // happens to the search term. This is their only regression pin.
+        let found_virtual = |term: &'static str| {
+            let service = &service;
+            async move {
+                let mut paths: Vec<String> = service
+                    .list_for_repos_page(&[repo_id], None, Some(term), None, 0, 50)
+                    .await
+                    .expect("list for repos page")
+                    .into_iter()
+                    .map(|a| a.path)
+                    .collect();
+                paths.sort();
+                let total = service
+                    .count_for_repos(&[repo_id], None, Some(term))
+                    .await
+                    .expect("count for repos");
+                (paths, total)
+            }
+        };
+
         let percent = found("a%b").await;
         let underscore = found("a_b").await;
         let backslash = found(r"a\b").await;
         let plain = found("aQb").await;
+        let virtual_percent = found_virtual("a%b").await;
+        let virtual_underscore = found_virtual("a_b").await;
+        let virtual_backslash = found_virtual(r"a\b").await;
+        let virtual_plain = found_virtual("aQb").await;
 
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
@@ -2879,6 +2912,28 @@ mod tests {
              that escaped its way into matching nothing fails here"
         );
         assert_eq!(plain.1, 1, "count must agree with the page");
+
+        // The virtual listing must agree with the single-repo one term for term.
+        assert_eq!(
+            (virtual_percent.0, virtual_percent.1),
+            (vec!["pkg/a%b-lib.bin".to_string()], 1),
+            "the virtual (multi-repository) listing must treat `%` literally too"
+        );
+        assert_eq!(
+            (virtual_underscore.0, virtual_underscore.1),
+            (vec!["pkg/a_b-lib.bin".to_string()], 1),
+            "the virtual listing must treat `_` literally too"
+        );
+        assert_eq!(
+            (virtual_backslash.0, virtual_backslash.1),
+            (vec![r"pkg/a\b-lib.bin".to_string()], 1),
+            "the virtual listing must let a name containing a backslash be found"
+        );
+        assert_eq!(
+            (virtual_plain.0, virtual_plain.1),
+            (vec!["pkg/aQb-lib.bin".to_string()], 1),
+            "positive control for the virtual listing"
+        );
     }
 
     #[tokio::test]

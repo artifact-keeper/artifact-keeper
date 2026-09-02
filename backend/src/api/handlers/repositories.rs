@@ -3553,7 +3553,7 @@ pub async fn get_repository_storage_tree(
           FROM repository_path_storage_stats
          WHERE repository_id = $1
            AND depth > $2 AND depth <= $3
-           AND ($4::text IS NULL OR prefix LIKE $4)
+           AND ($4::text IS NULL OR prefix LIKE $4 ESCAPE '\')
          ORDER BY logical_bytes DESC, prefix ASC
          LIMIT $5
         "#,
