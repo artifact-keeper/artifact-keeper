@@ -22,6 +22,7 @@ use super::middleware::auth::{
 };
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
+use super::middleware::nul_path::nul_path_guard;
 use super::middleware::rate_limit::{
     login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware,
     LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
@@ -203,6 +204,15 @@ pub fn create_router(state: SharedState) -> Router {
         tracing::info!("Demo mode enabled — write operations will be blocked");
         router = router.layer(middleware::from_fn_with_state(state.clone(), demo_guard));
     }
+
+    // #3622: reject a NUL byte in the decoded request path. A single shared
+    // boundary rather than ~40 per-handler checks: `%00` in any wildcard path
+    // segment (or in the repository key) decodes to a `\0` that Postgres
+    // rejects at the wire protocol, so it must be a 400 here and never an
+    // anonymous 500 from a handler's first query. Layered inside correlation-id
+    // so the refusal still carries X-Correlation-ID, and outside the routing
+    // table so it covers every surface at once.
+    router = router.layer(middleware::from_fn(nul_path_guard));
 
     // Correlation ID middleware (runs first on every request after the global
     // backstop below). Extracts or generates a correlation ID and sets the
