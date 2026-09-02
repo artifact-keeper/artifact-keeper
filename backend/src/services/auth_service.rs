@@ -1032,6 +1032,22 @@ pub(crate) fn is_user_api_tokens_invalidated_after(user_id: Uuid, cached_at: Ins
     false
 }
 
+/// The single client-facing message for every credential-level failure on the
+/// local login path (issue #3504).
+///
+/// `POST /api/v1/auth/login` is unauthenticated and `AppError::Authentication`
+/// passes its message through to the response body verbatim (see
+/// `crate::error::AppError::user_message`). Any wording that varies with
+/// whether the submitted username exists turns that endpoint into a
+/// user-enumeration oracle: an attacker walks a username list, keeps the ones
+/// that answer differently, and sprays passwords at a confirmed account list
+/// instead of a guessed one. So every credential-level arm — unknown or
+/// inactive username, federated account, missing password hash, wrong
+/// password, locked account — returns this exact string, and the distinguishing
+/// detail stays in the server log at WARN under the `security` target. Same
+/// shape as the LDAP fix in #3371 (see `ldap_service::LDAP_AUTH_FAILURE_MESSAGE`).
+pub(crate) const LOCAL_AUTH_FAILURE_MESSAGE: &str = "Invalid username or password";
+
 /// Authentication service
 pub struct AuthService {
     db: PgPool,
@@ -1124,19 +1140,35 @@ impl AuthService {
         }
     }
 
-    /// Decide whether a *rejected* (wrong-password) login attempt should be
-    /// reported to the caller as a lockout rather than a plain invalid
-    /// credential.
+    /// Decide whether a *rejected* (wrong-password) login attempt happened
+    /// against a locked account.
     ///
     /// `newly_locked` is true when this failed attempt crossed the lockout
     /// threshold (i.e. `should_lock` returned a timestamp); `already_locked`
     /// is true when the account's existing `locked_until` was still in the
-    /// future when the attempt arrived. Either condition surfaces the locked
-    /// message, so brute-force feedback is preserved both at the moment the
-    /// threshold is crossed and on every subsequent wrong guess while the lock
-    /// holds. Pure function so it can be unit-tested without a database.
+    /// future when the attempt arrived. Either condition means the lock is in
+    /// force, both at the moment the threshold is crossed and on every
+    /// subsequent wrong guess while it holds. Since #3504 this only selects
+    /// the server-side security log line — the caller always gets
+    /// [`LOCAL_AUTH_FAILURE_MESSAGE`], because an unknown username can never
+    /// produce a lockout and a distinct message therefore confirmed the
+    /// account exists. Pure function so it can be unit-tested without a
+    /// database.
     pub fn failed_attempt_is_locked(newly_locked: bool, already_locked: bool) -> bool {
         newly_locked || already_locked
+    }
+
+    /// Burn one bcrypt verification against [`Self::dummy_bcrypt_hash`] so a
+    /// credential-level rejection that never reaches the stored hash still
+    /// costs the same wall-clock time as a wrong password (#3504).
+    ///
+    /// Without this, the unified message of [`LOCAL_AUTH_FAILURE_MESSAGE`]
+    /// would still be a timing oracle: the unknown-user, federated-account and
+    /// missing-hash arms all return before any bcrypt work, while a wrong
+    /// password pays the full cost factor. Mirrors what
+    /// [`Self::validate_api_token`] already does for token lookups.
+    async fn burn_password_timing(password: &str) {
+        let _ = Self::verify_password(password, Self::dummy_bcrypt_hash()).await;
     }
 
     /// Authenticate user with username and password
@@ -1159,32 +1191,65 @@ impl AuthService {
         )
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::Authentication("Invalid username or password".to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // No row: either the username does not exist or the account is
+        // inactive (the query filters on `is_active`). Burn the bcrypt cost
+        // and answer with the shared message so neither the body nor the
+        // response time distinguishes this from a wrong password (#3504).
+        let Some(user) = user else {
+            Self::burn_password_timing(password).await;
+            tracing::warn!(
+                target: "security",
+                username = %username,
+                "local login for an unknown or inactive username"
+            );
+            return Err(AppError::Authentication(
+                LOCAL_AUTH_FAILURE_MESSAGE.to_string(),
+            ));
+        };
 
         // Capture whether the account is currently locked, but do NOT
         // short-circuit on it here. The lockout must not lock out the
         // legitimate owner: a caller presenting the CORRECT password always
         // authenticates and clears the lock (the success branch below resets
         // failed_login_attempts and locked_until). Only a WRONG password is
-        // rejected, and it still surfaces the lockout message while the lock
+        // rejected, and the lock is recorded in the security log while it
         // holds (see `failed_attempt_is_locked`). This removes the
         // unauthenticated DoS where 5 wrong guesses for a known username would
         // bar even the owner's correct password.
         let now = Utc::now();
         let already_locked = Self::is_account_locked(user.locked_until, now);
 
-        // Verify password for local auth
+        // Verify password for local auth. This arm is only reachable for a
+        // username that exists and is active, so answering "Use SSO provider
+        // to authenticate" confirmed both the account and its identity source
+        // to an anonymous caller in a single request (#3504). The provider
+        // now goes to the log only.
         if user.auth_provider != AuthProvider::Local {
+            Self::burn_password_timing(password).await;
+            tracing::warn!(
+                target: "security",
+                username = %username,
+                auth_provider = ?user.auth_provider,
+                "local login attempted against a federated account"
+            );
             return Err(AppError::Authentication(
-                "Use SSO provider to authenticate".to_string(),
+                LOCAL_AUTH_FAILURE_MESSAGE.to_string(),
             ));
         }
 
-        let password_hash = user
-            .password_hash
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("Invalid username or password".to_string()))?;
+        let Some(password_hash) = user.password_hash.as_ref() else {
+            Self::burn_password_timing(password).await;
+            tracing::warn!(
+                target: "security",
+                username = %username,
+                "local login for an account with no stored password hash"
+            );
+            return Err(AppError::Authentication(
+                LOCAL_AUTH_FAILURE_MESSAGE.to_string(),
+            ));
+        };
 
         if !Self::verify_password(password, password_hash).await? {
             // Record failed attempt
@@ -1213,14 +1278,27 @@ impl AuthService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+            // The lockout state is recorded and logged, but no longer told to
+            // the caller (#3504). An unknown username has no row to lock, so
+            // it can never produce a lockout message; surfacing one therefore
+            // confirmed the account's existence to anyone willing to send
+            // `account_lockout_threshold` requests. Operators keep the signal
+            // in the security log, where a brute-force sweep is visible across
+            // accounts rather than only to the attacker driving it.
             if Self::failed_attempt_is_locked(lock_until.is_some(), already_locked) {
-                return Err(AppError::Authentication(
-                    "Account temporarily locked due to too many failed login attempts".to_string(),
-                ));
+                tracing::warn!(
+                    target: "security",
+                    username = %username,
+                    user_id = %user.id,
+                    failed_login_attempts = new_count,
+                    newly_locked = lock_until.is_some(),
+                    already_locked,
+                    "rejected login for a locked account"
+                );
             }
 
             return Err(AppError::Authentication(
-                "Invalid username or password".to_string(),
+                LOCAL_AUTH_FAILURE_MESSAGE.to_string(),
             ));
         }
 
@@ -6172,10 +6250,11 @@ mod tests {
         assert!(result.is_some());
     }
 
-    // Truth table for `failed_attempt_is_locked`: a rejected attempt is reported
-    // as locked when it just crossed the threshold (newly_locked) OR when the
-    // account's existing lock was still holding (already_locked). Only a wrong
-    // password below threshold on an unlocked account reports plain-invalid.
+    // Truth table for `failed_attempt_is_locked`: a rejected attempt counts as
+    // locked when it just crossed the threshold (newly_locked) OR when the
+    // account's existing lock was still holding (already_locked). Since #3504
+    // that selects the security log line only; the client-facing message is
+    // the same either way.
     #[test]
     fn test_failed_attempt_is_locked_neither() {
         assert!(!AuthService::failed_attempt_is_locked(false, false));
@@ -7224,7 +7303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_locked_account_wrong_password_still_reports_locked() {
+    async fn test_locked_account_wrong_password_reports_generic_failure() {
         let url = match std::env::var("DATABASE_URL") {
             Ok(v) => v,
             Err(_) => return,
@@ -7243,19 +7322,31 @@ mod tests {
             let _ = svc.authenticate(&username, "wrong-password").await;
         }
 
-        // Brute-force feedback preserved: a wrong password while locked still
-        // returns the locked message, not "invalid".
+        // A wrong password while locked returns the same message as any other
+        // credential failure. This assertion used to pin the lockout wording,
+        // which was the second half of the enumeration oracle in #3504: an
+        // unknown username has no row to lock and so can never produce it.
         let err = svc
             .authenticate(&username, "still-wrong")
             .await
             .expect_err("wrong password on a locked account must error");
         match err {
-            AppError::Authentication(msg) => assert_eq!(
-                msg,
-                "Account temporarily locked due to too many failed login attempts"
-            ),
-            other => panic!("expected locked Authentication error, got {other:?}"),
+            AppError::Authentication(msg) => assert_eq!(msg, LOCAL_AUTH_FAILURE_MESSAGE),
+            other => panic!("expected Authentication error, got {other:?}"),
         }
+
+        // The lock itself is unchanged — only its disclosure to the caller is.
+        let row = sqlx::query!(
+            "SELECT failed_login_attempts, locked_until FROM users WHERE id = $1",
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load user");
+        assert!(
+            row.locked_until.is_some(),
+            "the account must still be locked in the database"
+        );
 
         let _ = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
@@ -7291,6 +7382,184 @@ mod tests {
             }
             other => panic!("expected invalid Authentication error, got {other:?}"),
         }
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3504: the unauthenticated local login endpoint must not tell an
+    // attacker whether a username exists.
+    //
+    // These tests drive the real `authenticate()` path and then render the
+    // resulting `AppError` through `IntoResponse` — i.e. they assert on the
+    // exact status and bytes an anonymous HTTP client receives from
+    // `POST /api/v1/auth/login`, which is where the oracle lived. Same shape
+    // as the LDAP tests added for #3371.
+    // -----------------------------------------------------------------------
+
+    /// Render an `AppError` exactly as the HTTP layer would and return
+    /// `(status, body)` — what an anonymous client actually observes.
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn login_client_visible(err: AppError) -> (axum::http::StatusCode, String) {
+        use axum::response::IntoResponse;
+        let response = err.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .expect("read error body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn test_unknown_username_and_wrong_password_are_indistinguishable() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let svc = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("enum_known_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id =
+            insert_test_user_with_password(&pool, &username, "Correct-Horse-Battery-2026").await;
+
+        let unknown = login_client_visible(
+            svc.authenticate(&format!("enum_ghost_{}", Uuid::new_v4()), "any-password")
+                .await
+                .expect_err("an unknown username must not authenticate"),
+        )
+        .await;
+        let wrong = login_client_visible(
+            svc.authenticate(&username, "wrong-password")
+                .await
+                .expect_err("a wrong password must not authenticate"),
+        )
+        .await;
+
+        assert_eq!(
+            unknown.0,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "unexpected status: {unknown:?}"
+        );
+        assert_eq!(
+            unknown, wrong,
+            "the local login endpoint distinguishes an unknown username from a \
+             wrong password, which is a user-enumeration oracle (#3504)"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_federated_account_is_indistinguishable_from_unknown_username() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let svc = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("enum_sso_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        sqlx::query("UPDATE users SET auth_provider = 'oidc' WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("mark user as federated");
+
+        let federated = login_client_visible(
+            svc.authenticate(&username, "any-password")
+                .await
+                .expect_err("a federated account must not authenticate locally"),
+        )
+        .await;
+        let unknown = login_client_visible(
+            svc.authenticate(&format!("enum_ghost_{}", Uuid::new_v4()), "any-password")
+                .await
+                .expect_err("an unknown username must not authenticate"),
+        )
+        .await;
+
+        assert_eq!(
+            federated, unknown,
+            "the local login endpoint reveals that a username belongs to a \
+             federated account (#3504)"
+        );
+        // The historical wording that made this a one-request oracle must not
+        // come back in any form.
+        let lowered = federated.1.to_lowercase();
+        assert!(
+            !lowered.contains("sso") && !lowered.contains("provider"),
+            "response names the account's identity source: {}",
+            federated.1
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_locked_account_is_indistinguishable_from_unknown_username() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let svc = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("enum_lock_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id =
+            insert_test_user_with_password(&pool, &username, "Correct-Horse-Battery-2026").await;
+
+        // Drive the account past the lockout threshold. An unknown username
+        // has no row to lock, so before the fix this was all it took to
+        // confirm the account existed.
+        for _ in 0..svc.config.account_lockout_threshold {
+            let _ = svc.authenticate(&username, "wrong-password").await;
+        }
+
+        let locked = login_client_visible(
+            svc.authenticate(&username, "still-wrong")
+                .await
+                .expect_err("a wrong password on a locked account must error"),
+        )
+        .await;
+        let unknown = login_client_visible(
+            svc.authenticate(&format!("enum_ghost_{}", Uuid::new_v4()), "any-password")
+                .await
+                .expect_err("an unknown username must not authenticate"),
+        )
+        .await;
+
+        assert_eq!(
+            locked, unknown,
+            "the local login endpoint reveals that a username is locked, which \
+             an unknown username can never be (#3504)"
+        );
+        let lowered = locked.1.to_lowercase();
+        assert!(
+            !lowered.contains("locked"),
+            "response discloses the lockout: {}",
+            locked.1
+        );
 
         let _ = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)

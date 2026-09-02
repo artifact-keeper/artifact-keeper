@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Consumers still have to opt in. In artifact-keeper-web five admin screens read this endpoint — the permissions principal picker, the users list, the group member picker, the audit actor filter and the age-gate approver picker — and four of them have no other source for the distinction; the picker is fixed page-locally in artifact-keeper-web#823, the rest wait on an SDK release carrying this field.
 
+### Security
+
+- **The local login endpoint no longer reveals whether a username exists** (#3504). `POST /api/v1/auth/login` is unauthenticated, and `AppError::Authentication` passes its message straight through to the response body, so the wording of a failed login was visible to anyone. Two arms of `AuthService::authenticate` answered only for usernames that exist and are active: a username belonging to an LDAP/OIDC/SAML account answered `401 {"message":"Use SSO provider to authenticate"}` — one request per candidate, with any password, confirming both the account and its identity source — and an account driven past `account_lockout_threshold` answered `401 {"message":"Account temporarily locked due to too many failed login attempts"}`, which an unknown username can never produce because there is no row to lock. Every credential-level arm — unknown or inactive username, federated account, missing password hash, wrong password, locked account — now returns the identical status and body, and the username, the auth provider and the lockout state stay in the server log at WARN under the `security` target. This is the same fix, in the same shape, that #3371 applied to the LDAP login endpoint; it was called out as outstanding in that entry.
+
+  All versions through 1.8.2 carry both leaks. No configuration change is needed and no credentials were exposed — what leaked is account existence, not authentication material.
+
+  **The lockout is no longer disclosed to the caller.** It is still enforced and recorded exactly as before, and a correct password still authenticates past it and clears the counters (#1871); only the message changed, so a user whose account is locked now sees the same "Invalid username or password" as any other failure. That is a deliberate trade of self-service diagnosis for the enumeration oracle, and operators keep the signal in the security log, where a spray is visible across accounts rather than only to the attacker driving it. The rejection arms that previously returned before reaching bcrypt now verify against the existing dummy hash used by API-token validation, so closing the message oracle does not leave a timing one in its place.
+
 ## [1.8.2] - 2026-09-01
 
 ### Added
