@@ -673,21 +673,17 @@ impl CurationService {
         // `q` becomes a case-insensitive substring match; NULL binds disable the
         // corresponding predicate. A single parameterized query keeps the name
         // ILIKE index-usable and avoids per-filter SQL string assembly.
-        let name_like = q.map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| {
-            format!(
-                "%{}%",
-                s.replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_")
-            )
-        });
+        let name_like = q
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", crate::api::handlers::escape_like_literal(s)));
         let arch = arch.map(|s| s.trim()).filter(|s| !s.is_empty());
         let status = status.map(|s| s.trim()).filter(|s| !s.is_empty());
 
         sqlx::query_as(
             r#"SELECT * FROM curation_packages
                WHERE staging_repo_id = $1
-                 AND ($2::text IS NULL OR package_name ILIKE $2)
+                 AND ($2::text IS NULL OR package_name ILIKE $2 ESCAPE '\')
                  AND ($3::text IS NULL OR architecture = $3)
                  AND ($4::text IS NULL OR status = $4)
                ORDER BY package_name ASC, version ASC

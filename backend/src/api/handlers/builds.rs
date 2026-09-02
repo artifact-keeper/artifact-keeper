@@ -177,7 +177,12 @@ pub async fn list_builds(
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
 
-    let search_pattern = query.search.as_ref().map(|s| format!("%{}%", s));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = query
+        .search
+        .as_ref()
+        .map(|s| format!("%{}%", super::escape_like_literal(s)));
     let sort_desc = query.sort_order.as_deref() == Some("desc");
 
     // Check if builds table exists first
@@ -213,7 +218,7 @@ pub async fn list_builds(
                duration_ms, agent, created_at, updated_at, artifact_count
         FROM builds
         WHERE ($1::text IS NULL OR status = $1)
-          AND ($2::text IS NULL OR name ILIKE $2)
+          AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
         {}
         OFFSET $3
         LIMIT $4
@@ -235,7 +240,7 @@ pub async fn list_builds(
         SELECT COUNT(*)
         FROM builds
         WHERE ($1::text IS NULL OR status = $1)
-          AND ($2::text IS NULL OR name ILIKE $2)
+          AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
         "#,
     )
     .bind(&query.status)

@@ -861,11 +861,21 @@ mod tests {
 // bug. This gate's job is narrower: stop a NEW site in this shape from being
 // added with no escaping story at all.
 //
-// OUT OF SCOPE, tracked separately: patterns built in RUST
-// (`format!("%{}%", q)`) for free-text search listings, and `LIKE ANY($n)`
-// over a Rust-built array. Those have no SQL-side assembly for this scanner
-// to key on, and several of them are correct today because their caller
-// pre-escapes or their handler re-checks the match exactly.
+// THE SECOND SHAPE (#3557): the pattern is assembled in RUST -- `format!(
+// "%{}%", q)` for a free-text search box, `format!("{}%", p)` for a prefix --
+// and bound whole to a bare `path LIKE $2`. The SQL scanner above cannot see
+// those: by the time the string reaches SQL it is a single bind, with no
+// concatenation to key on. So they get their own scanner, keyed on the RUST
+// literal instead, in `every_rust_assembled_like_pattern_escapes_its_operand`.
+// Its shape recogniser is deliberately narrow -- a `format!` whose entire
+// literal is `%{...}%` or `{...}%` -- which is exactly the cohort #3557
+// audited and matches nothing else in the tree (a `format!("%{b:02X}")`
+// percent-encoder ends at `}`, not `%`).
+//
+// STILL OUT OF SCOPE: `LIKE ANY($n)` over a Rust-built array, where the site
+// deliberately over-fetches and re-checks the match exactly in Rust. Those
+// carry [`OVERMATCH_MARKER`], and the marker is only honoured on a function
+// that really does use `LIKE ANY`, so it cannot become a blanket opt-out.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod like_pattern_escape_class_tests {
@@ -1432,5 +1442,226 @@ mod like_pattern_escape_class_tests {
                  must route through `escape_like_literal`"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #3557: the same class, assembled in RUST instead of in SQL.
+    // -----------------------------------------------------------------------
+
+    /// Marker for a Rust-assembled pattern that is deliberately left
+    /// unescaped: a `LIKE ANY($n)` fan-out that may over-fetch because its
+    /// caller re-checks every returned row exactly in Rust
+    /// (`ArtifactService::list_by_path_prefixes`,
+    /// `proxy_catalog::paths_under_prefixes`). Honoured only on a function
+    /// that really does use `LIKE ANY`, so it cannot be pasted onto an
+    /// ordinary search site to silence the gate.
+    const OVERMATCH_MARKER: &str = "LIKE-PATTERN-OVERMATCHES-RECHECKED-IN-RUST";
+
+    /// Whether a `format!` literal IS a `LIKE` pattern: the whole literal is
+    /// one interpolation with a `%` on the end (`"{…}%"`, a prefix match) or
+    /// on both ends (`"%{…}%"`, a substring match).
+    ///
+    /// The recogniser insists on the WHOLE literal rather than a `%` anywhere
+    /// in one, because the tree is full of strings that carry a `%` for
+    /// unrelated reasons — the percent-encoders in `saml_service`,
+    /// `sync_worker` and `popularity_source` all write `format!("%{b:02X}")`,
+    /// which ends at the `}` and is not a pattern.
+    fn rust_like_pattern_literal(literal: &str) -> bool {
+        let Some(body) = literal.strip_suffix('%') else {
+            return false;
+        };
+        let body = body.strip_prefix('%').unwrap_or(body);
+        body.len() >= 2
+            && body.starts_with('{')
+            && body.ends_with('}')
+            && !body[1..body.len() - 1].contains(['{', '}'])
+    }
+
+    /// Byte offset of every `format!("…")` in `src` whose literal is a
+    /// Rust-assembled `LIKE` pattern. The literals in this class hold a single
+    /// interpolation and no escapes, so the closing quote is the next one.
+    fn rust_assembled_pattern_sites(src: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (at, _) in src.match_indices("format!(") {
+            let rest = &src[at + "format!(".len()..];
+            // rustfmt wraps a long `format!` after the paren, so the literal
+            // is not reliably on the same line as the macro.
+            let Some(quoted) = rest.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = quoted.find('"') else {
+                continue;
+            };
+            if rust_like_pattern_literal(&quoted[..end]) {
+                out.push(at);
+            }
+        }
+        out
+    }
+
+    /// Byte ranges covered by `#[cfg(test)] mod … { … }` blocks.
+    ///
+    /// Test fixtures build `LIKE` patterns out of literals they chose
+    /// themselves (`target_has_artifact(pool, repo, "pr1940/x")` in
+    /// `approval.rs` and `promotion.rs`), so they are not part of the class
+    /// and flagging them would only teach the next author to silence the
+    /// gate. A `#[cfg(test)] use …` — a test-only import, of which
+    /// `terraform.rs` has two ABOVE its production code — introduces no
+    /// region, so the check is on the attributed ITEM, not the attribute.
+    fn test_module_ranges(src: &str) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (at, _) in src.match_indices("#[cfg(test)]") {
+            let mut cursor = at;
+            let item = loop {
+                let Some(newline) = src[cursor..].find('\n') else {
+                    break None;
+                };
+                cursor += newline + 1;
+                let line = src[cursor..].lines().next().unwrap_or("").trim_start();
+                if line.starts_with("//") || line.starts_with("#[") {
+                    continue;
+                }
+                break Some(line);
+            };
+            let Some(item) = item else { continue };
+            if !(item.starts_with("mod ") || item.contains(" mod ")) {
+                continue;
+            }
+            let Some(open) = src[cursor..].find('{') else {
+                continue;
+            };
+            let open = cursor + open;
+            let mut depth = 0usize;
+            for (offset, ch) in src[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            out.push((at, open + offset));
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// Scan the tree for Rust-assembled patterns; `(offenders, examined)`.
+    fn scan_rust_assembled() -> (Vec<Offender>, usize) {
+        let mut offenders = Vec::new();
+        let mut examined = 0usize;
+
+        for (path, raw) in rust_sources() {
+            // This module's own prose describes the shape it hunts for.
+            if path.ends_with("api/handlers/mod.rs") {
+                continue;
+            }
+            let tests = test_module_ranges(&raw);
+            for at in rust_assembled_pattern_sites(&raw) {
+                if tests.iter().any(|(from, to)| at >= *from && at <= *to) {
+                    continue;
+                }
+                examined += 1;
+                let owner = enclosing_fn(&raw, at);
+                if escapes_operand(&raw, owner) {
+                    continue;
+                }
+                let line_no = raw[..at].matches('\n').count() + 1;
+                let line = raw
+                    .lines()
+                    .nth(line_no - 1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let location = format!("{}:{}", path.display(), line_no);
+                if owner.contains(OVERMATCH_MARKER) {
+                    if owner.contains("LIKE ANY(") {
+                        continue;
+                    }
+                    offenders.push(Offender {
+                        location,
+                        line,
+                        reason: "the over-match marker is honoured only on a `LIKE ANY` \
+                                 fan-out whose rows are re-checked in Rust",
+                    });
+                    continue;
+                }
+                offenders.push(Offender {
+                    location,
+                    line,
+                    reason: "a pattern built in Rust binds whole, so the SQL text shows \
+                             nothing to key on; the interpolated value must go through \
+                             one of the escape_like_literal helpers BEFORE the `%` is \
+                             appended",
+                });
+            }
+        }
+        (offenders, examined)
+    }
+
+    /// The Rust-assembled half of the class (#3557), in one assertion.
+    ///
+    /// Same function-scoped limitation as the SQL gate above: this shows an
+    /// escaper is applied somewhere in the function that owns the `format!`,
+    /// not that it is applied to THIS value. The per-endpoint behavioural
+    /// tests (`repositories.rs`, `users.rs`) prove the operand half.
+    #[test]
+    fn every_rust_assembled_like_pattern_escapes_its_operand() {
+        let (offenders, examined) = scan_rust_assembled();
+        assert!(
+            examined >= 20,
+            "#3557: the scan examined only {examined} Rust-assembled pattern sites (29 at \
+             the time of writing); it has stopped recognising the shape and would pass \
+             vacuously"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#3557: a `LIKE` pattern assembled in Rust must escape the value it \
+             interpolates. Wrap it in `escape_like_literal` before appending the `%`, \
+             and match it under `ESCAPE '\\'`. Offenders:\n{}",
+            offenders
+                .iter()
+                .map(|o| format!("  {}: {}\n      -> {}", o.location, o.line, o.reason))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// The Rust scanner's own recognisers, pinned against the shapes that
+    /// made the #3557 audit a per-site read rather than a sweep.
+    #[test]
+    fn the_rust_pattern_scanner_recognises_the_shapes_it_claims_to() {
+        for probe in ["%{}%", "{}%", "%{q}%", "{prefix}%"] {
+            assert!(
+                rust_like_pattern_literal(probe),
+                "{probe:?} is a Rust-assembled LIKE pattern"
+            );
+        }
+        // A `%` that is not a wildcard: percent-encoders, path joins, and a
+        // literal that interpolates twice.
+        for probe in ["%{b:02X}", "%{:02x}{}", "{}", "%%", "{}/%/", "{}/{}%"] {
+            assert!(
+                !rust_like_pattern_literal(probe),
+                "{probe:?} is not a LIKE pattern"
+            );
+        }
+        // Wrapped by rustfmt: the literal need not share the macro's line.
+        assert_eq!(
+            rust_assembled_pattern_sites("let p = format!(\n    \"%{}%\",\n    q,\n);").len(),
+            1,
+            "a `format!` wrapped after the paren must still be seen"
+        );
+        // `#[cfg(test)] use` starts no region; `#[cfg(test)] mod` does.
+        let src =
+            "#[cfg(test)]\nuse bytes::Bytes;\nfn f() {}\n#[cfg(test)]\nmod t {\n    fn g() {}\n}\n";
+        let ranges = test_module_ranges(src);
+        assert_eq!(ranges.len(), 1, "only the `mod` item introduces a region");
+        assert!(
+            ranges[0].0 > src.find("fn f()").unwrap(),
+            "the region must start at the test module, not at the test-only import"
+        );
     }
 }

@@ -551,7 +551,7 @@ async fn search_modules(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND name ILIKE $2
+          AND name ILIKE $2 ESCAPE '\'
           AND version IS NOT NULL
         ORDER BY created_at DESC
         LIMIT $3 OFFSET $4
@@ -2091,8 +2091,11 @@ fn parse_module_name(full_name: &str) -> (String, String, String) {
 }
 
 /// Build a SQL LIKE search pattern from a query string.
+///
+/// #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+/// must match themselves; escaped here and matched under `ESCAPE '\'`.
 fn build_search_pattern(query: &str) -> String {
-    format!("%{}%", query)
+    format!("%{}%", crate::api::handlers::escape_like_literal(query))
 }
 
 #[cfg(test)]
@@ -2804,6 +2807,17 @@ mod tests {
     #[test]
     fn test_build_search_pattern_special_chars() {
         assert_eq!(build_search_pattern("my-module"), "%my-module%");
+    }
+
+    /// #3557. The `?q=` term is bound whole to `name ILIKE $2`, so a `LIKE`
+    /// metacharacter typed into the module search must match itself: `%` and
+    /// `_` are wildcards otherwise, and a backslash is Postgres's default
+    /// escape character.
+    #[test]
+    fn test_build_search_pattern_escapes_like_metacharacters_3557() {
+        assert_eq!(build_search_pattern("100%"), r"%100\%%");
+        assert_eq!(build_search_pattern("a_b"), r"%a\_b%");
+        assert_eq!(build_search_pattern(r"a\b"), r"%a\\b%");
     }
 
     // -----------------------------------------------------------------------

@@ -419,7 +419,8 @@ pub async fn browse_count(
 /// from the proxy cache catalog the way the hosted one fills it from the
 /// `artifacts` table. The caller passes O(page) prefixes and re-checks the
 /// prefix in Rust, so an artifactId containing a `LIKE` wildcard (`_` is
-/// legal in Maven coordinates) can only over-fetch, never mis-attribute.
+/// legal in Maven coordinates) can only over-fetch, never mis-attribute
+/// (LIKE-PATTERN-OVERMATCHES-RECHECKED-IN-RUST, #3557).
 pub async fn paths_under_prefixes(
     db: &PgPool,
     repository_id: Uuid,
